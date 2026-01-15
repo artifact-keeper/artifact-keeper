@@ -17,7 +17,8 @@ import {
   Modal,
   Upload,
   Form,
-  Progress
+  Progress,
+  Tooltip
 } from 'antd'
 import {
   ArrowLeftOutlined,
@@ -27,7 +28,10 @@ import {
   FileOutlined,
   FolderOutlined,
   UploadOutlined,
-  InboxOutlined
+  InboxOutlined,
+  InfoCircleOutlined,
+  CopyOutlined,
+  CheckOutlined
 } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
@@ -36,7 +40,7 @@ import { repositoriesApi, artifactsApi } from '../api'
 import type { Artifact } from '../types'
 
 const { Search } = Input
-const { Text } = Typography
+const { Text, Paragraph } = Typography
 const { Dragger } = Upload
 
 const formatBytes = (bytes: number): string => {
@@ -53,9 +57,12 @@ const RepositoryDetail = () => {
   const queryClient = useQueryClient()
   const [searchQuery, setSearchQuery] = useState('')
   const [uploadModalOpen, setUploadModalOpen] = useState(false)
+  const [detailModalOpen, setDetailModalOpen] = useState(false)
+  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [uploading, setUploading] = useState(false)
   const [fileList, setFileList] = useState<UploadFile[]>([])
+  const [copiedField, setCopiedField] = useState<string | null>(null)
   const [form] = Form.useForm()
 
   const { data: repository, isLoading: repoLoading } = useQuery({
@@ -76,6 +83,8 @@ const RepositoryDetail = () => {
       message.success('Artifact deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['artifacts', key] })
       queryClient.invalidateQueries({ queryKey: ['repository', key] })
+      setDetailModalOpen(false)
+      setSelectedArtifact(null)
     },
     onError: () => {
       message.error('Failed to delete artifact')
@@ -91,6 +100,17 @@ const RepositoryDetail = () => {
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
+  }
+
+  const handleCopy = async (text: string, field: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedField(field)
+      message.success('Copied to clipboard')
+      setTimeout(() => setCopiedField(null), 2000)
+    } catch {
+      message.error('Failed to copy')
+    }
   }
 
   const handleUpload = async () => {
@@ -115,12 +135,21 @@ const RepositoryDetail = () => {
       setUploadModalOpen(false)
       setFileList([])
       form.resetFields()
-    } catch (error) {
+    } catch {
       message.error('Failed to upload artifact')
     } finally {
       setUploading(false)
       setUploadProgress(0)
     }
+  }
+
+  const showArtifactDetails = (artifact: Artifact) => {
+    setSelectedArtifact(artifact)
+    setDetailModalOpen(true)
+  }
+
+  const getDownloadUrlForDisplay = (artifact: Artifact) => {
+    return artifactsApi.getDownloadUrl(key!, artifact.path)
   }
 
   const columns: ColumnsType<Artifact> = [
@@ -135,7 +164,7 @@ const RepositoryDetail = () => {
           ) : (
             <FileOutlined style={{ color: '#1890ff' }} />
           )}
-          <span>{name}</span>
+          <a onClick={() => showArtifactDetails(record)}>{name}</a>
         </Space>
       ),
     },
@@ -176,6 +205,15 @@ const RepositoryDetail = () => {
       key: 'actions',
       render: (_, record) => (
         <Space>
+          <Tooltip title="View details">
+            <Button
+              type="link"
+              icon={<InfoCircleOutlined />}
+              onClick={() => showArtifactDetails(record)}
+            >
+              Details
+            </Button>
+          </Tooltip>
           <Button
             type="link"
             icon={<DownloadOutlined />}
@@ -287,6 +325,7 @@ const RepositoryDetail = () => {
         />
       </Card>
 
+      {/* Upload Modal */}
       <Modal
         title="Upload Artifact"
         open={uploadModalOpen}
@@ -358,6 +397,120 @@ const RepositoryDetail = () => {
             </Form.Item>
           )}
         </Form>
+      </Modal>
+
+      {/* Artifact Detail Modal */}
+      <Modal
+        title={
+          <Space>
+            <FileOutlined />
+            <span>Artifact Details</span>
+          </Space>
+        }
+        open={detailModalOpen}
+        onCancel={() => {
+          setDetailModalOpen(false)
+          setSelectedArtifact(null)
+        }}
+        width={700}
+        footer={[
+          <Button
+            key="download"
+            type="primary"
+            icon={<DownloadOutlined />}
+            onClick={() => selectedArtifact && handleDownload(selectedArtifact)}
+          >
+            Download
+          </Button>,
+          <Popconfirm
+            key="delete"
+            title="Delete artifact"
+            description="Are you sure you want to delete this artifact?"
+            onConfirm={() => selectedArtifact && deleteMutation.mutate(selectedArtifact.path)}
+            okText="Yes"
+            cancelText="No"
+          >
+            <Button danger icon={<DeleteOutlined />}>
+              Delete
+            </Button>
+          </Popconfirm>,
+          <Button key="close" onClick={() => setDetailModalOpen(false)}>
+            Close
+          </Button>,
+        ]}
+      >
+        {selectedArtifact && (
+          <Descriptions column={1} bordered size="small">
+            <Descriptions.Item label="Name">
+              <Text strong>{selectedArtifact.name}</Text>
+            </Descriptions.Item>
+            <Descriptions.Item label="Path">
+              <Space>
+                <Text code>{selectedArtifact.path}</Text>
+                <Tooltip title="Copy path">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={copiedField === 'path' ? <CheckOutlined style={{ color: '#52c41a' }} /> : <CopyOutlined />}
+                    onClick={() => handleCopy(selectedArtifact.path, 'path')}
+                  />
+                </Tooltip>
+              </Space>
+            </Descriptions.Item>
+            {selectedArtifact.version && (
+              <Descriptions.Item label="Version">
+                <Tag color="blue">{selectedArtifact.version}</Tag>
+              </Descriptions.Item>
+            )}
+            <Descriptions.Item label="Size">
+              {formatBytes(selectedArtifact.size_bytes)} ({selectedArtifact.size_bytes.toLocaleString()} bytes)
+            </Descriptions.Item>
+            <Descriptions.Item label="Content Type">
+              <Tag>{selectedArtifact.content_type}</Tag>
+            </Descriptions.Item>
+            <Descriptions.Item label="Downloads">
+              {selectedArtifact.download_count.toLocaleString()}
+            </Descriptions.Item>
+            <Descriptions.Item label="Created">
+              {new Date(selectedArtifact.created_at).toLocaleString()}
+            </Descriptions.Item>
+            <Descriptions.Item label="SHA-256 Checksum">
+              <Space direction="vertical" style={{ width: '100%' }}>
+                <Paragraph
+                  code
+                  copyable={{
+                    text: selectedArtifact.checksum_sha256,
+                    tooltips: ['Copy checksum', 'Copied!'],
+                  }}
+                  style={{ margin: 0, wordBreak: 'break-all' }}
+                >
+                  {selectedArtifact.checksum_sha256}
+                </Paragraph>
+              </Space>
+            </Descriptions.Item>
+            <Descriptions.Item label="Download URL">
+              <Space direction="vertical" style={{ width: '100%' }}>
+                <Paragraph
+                  code
+                  copyable={{
+                    text: getDownloadUrlForDisplay(selectedArtifact),
+                    tooltips: ['Copy URL', 'Copied!'],
+                  }}
+                  style={{ margin: 0, wordBreak: 'break-all', fontSize: 12 }}
+                >
+                  {getDownloadUrlForDisplay(selectedArtifact)}
+                </Paragraph>
+              </Space>
+            </Descriptions.Item>
+            {selectedArtifact.metadata && Object.keys(selectedArtifact.metadata).length > 0 && (
+              <Descriptions.Item label="Metadata">
+                <pre style={{ margin: 0, fontSize: 12, background: '#f5f5f5', padding: 8, borderRadius: 4 }}>
+                  {JSON.stringify(selectedArtifact.metadata, null, 2)}
+                </pre>
+              </Descriptions.Item>
+            )}
+          </Descriptions>
+        )}
       </Modal>
     </div>
   )
