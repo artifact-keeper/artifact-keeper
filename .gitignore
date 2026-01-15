@@ -48,6 +48,9 @@ __pycache__/
 *.db
 *.sqlite
 
+# Local artifact storage (test data)
+backend/data/
+
 # Secrets (never commit these)
 *.pem
 *.key
