@@ -66,6 +66,66 @@ Create a `.env` file (see `.env.example`):
 VITE_API_URL=http://localhost:9080
 ```
 
+## Testing
+
+### Unit & Component Tests (Vitest)
+
+```bash
+# Run tests in watch mode
+npm run test
+
+# Run tests once
+npm run test:run
+
+# Run tests with coverage
+npm run test:coverage
+
+# Run tests with UI
+npm run test:ui
+```
+
+Tests use:
+- **Vitest** - Fast, Vite-native test runner
+- **React Testing Library** - Component testing
+- **MSW (Mock Service Worker)** - API mocking
+
+### E2E Tests (Playwright)
+
+```bash
+# Run E2E tests
+npm run test:e2e
+
+# Run with UI mode
+npm run test:e2e:ui
+
+# Run headed (visible browser)
+npm run test:e2e:headed
+```
+
+**Note:** E2E tests require the backend server running on `http://localhost:9080`.
+
+### Test Structure
+
+```
+src/
+├── test/             # Test utilities and mocks
+│   ├── setup.ts      # Test setup (jest-dom, MSW)
+│   ├── utils.tsx     # Custom render with providers
+│   └── mocks/        # MSW handlers and server
+├── api/
+│   ├── auth.test.ts  # API unit tests
+│   └── repositories.test.ts
+└── pages/
+    ├── Login.test.tsx
+    └── Dashboard.test.tsx
+
+e2e/                  # Playwright E2E tests
+├── auth.spec.ts      # Authentication flows
+├── dashboard.spec.ts # Dashboard functionality
+├── repositories.spec.ts
+└── artifacts.spec.ts
+```
+
 ## Project Structure
 
 ```
@@ -91,10 +151,13 @@ src/
 │   ├── Users.tsx
 │   ├── Settings.tsx
 │   └── NotFound.tsx
+├── test/             # Test utilities and mocks
 ├── types/            # TypeScript type definitions
 ├── App.tsx           # Main app component with routing
 ├── main.tsx          # Entry point
 └── index.css         # Global styles
+
+e2e/                  # Playwright E2E tests
 ```
 
 ## Supported Artifact Formats
