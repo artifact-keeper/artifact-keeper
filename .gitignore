@@ -2,7 +2,7 @@
 /target/
 **/target/
 **/*.rs.bk
-Cargo.lock
+# Note: Cargo.lock is committed for reproducible builds (binary application)
 
 # Build artifacts
 *.so
