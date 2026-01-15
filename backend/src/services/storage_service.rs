@@ -154,172 +154,10 @@ impl StorageBackend for FilesystemBackend {
     }
 }
 
-/// S3-compatible storage backend
-#[cfg(feature = "s3")]
-pub struct S3Backend {
-    client: aws_sdk_s3::Client,
-    bucket: String,
-}
-
-#[cfg(feature = "s3")]
-impl S3Backend {
-    pub async fn new(bucket: String, region: Option<String>, endpoint: Option<String>) -> Result<Self> {
-        let mut config_loader = aws_config::from_env();
-
-        if let Some(region) = region {
-            config_loader = config_loader.region(aws_sdk_s3::config::Region::new(region));
-        }
-
-        let config = config_loader.load().await;
-
-        let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
-        if let Some(endpoint) = endpoint {
-            s3_config = s3_config.endpoint_url(endpoint).force_path_style(true);
-        }
-
-        let client = aws_sdk_s3::Client::from_conf(s3_config.build());
-
-        Ok(Self { client, bucket })
-    }
-}
-
-#[cfg(feature = "s3")]
-#[async_trait]
-impl StorageBackend for S3Backend {
-    async fn put(&self, key: &str, content: Bytes) -> Result<()> {
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(content.into())
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn get(&self, key: &str) -> Result<Bytes> {
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("NoSuchKey") {
-                    AppError::NotFound(format!("Storage key not found: {}", key))
-                } else {
-                    AppError::Storage(msg)
-                }
-            })?;
-
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| AppError::Storage(e.to_string()))?
-            .into_bytes();
-
-        Ok(bytes)
-    }
-
-    async fn exists(&self, key: &str) -> Result<bool> {
-        match self.client.head_object().bucket(&self.bucket).key(key).send().await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("NotFound") || msg.contains("NoSuchKey") {
-                    Ok(false)
-                } else {
-                    Err(AppError::Storage(msg))
-                }
-            }
-        }
-    }
-
-    async fn delete(&self, key: &str) -> Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let mut request = self.client.list_objects_v2().bucket(&self.bucket);
-
-            if let Some(p) = prefix {
-                request = request.prefix(p);
-            }
-
-            if let Some(token) = continuation_token {
-                request = request.continuation_token(token);
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| AppError::Storage(e.to_string()))?;
-
-            if let Some(contents) = response.contents {
-                for obj in contents {
-                    if let Some(key) = obj.key {
-                        keys.push(key);
-                    }
-                }
-            }
-
-            if response.is_truncated.unwrap_or(false) {
-                continuation_token = response.next_continuation_token;
-            } else {
-                break;
-            }
-        }
-
-        Ok(keys)
-    }
-
-    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
-        self.client
-            .copy_object()
-            .bucket(&self.bucket)
-            .copy_source(format!("{}/{}", self.bucket, source))
-            .key(dest)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn size(&self, key: &str) -> Result<u64> {
-        let response = self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("NotFound") || msg.contains("NoSuchKey") {
-                    AppError::NotFound(format!("Storage key not found: {}", key))
-                } else {
-                    AppError::Storage(msg)
-                }
-            })?;
-
-        Ok(response.content_length.unwrap_or(0) as u64)
-    }
-}
+// S3 storage backend - disabled until AWS SDK supports Rust 1.85+
+// The S3Backend implementation has been temporarily removed due to AWS SDK
+// requiring Rust 1.88+. Re-enable when Rust 1.88+ is stable.
+// For S3 support, consider using the `rust-s3` crate as an alternative.
 
 /// Storage service facade
 pub struct StorageService {
@@ -335,21 +173,10 @@ impl StorageService {
                 fs::create_dir_all(&path).await?;
                 Arc::new(FilesystemBackend::new(path))
             }
-            #[cfg(feature = "s3")]
-            "s3" => {
-                let bucket = config
-                    .s3_bucket
-                    .clone()
-                    .ok_or_else(|| AppError::Config("S3_BUCKET required for S3 backend".into()))?;
-                Arc::new(
-                    S3Backend::new(bucket, config.s3_region.clone(), config.s3_endpoint.clone())
-                        .await?,
-                )
-            }
-            #[cfg(not(feature = "s3"))]
+            // S3 backend temporarily disabled - AWS SDK requires Rust 1.88+
             "s3" => {
                 return Err(AppError::Config(
-                    "S3 backend not available - compile with 's3' feature".into(),
+                    "S3 backend temporarily disabled - AWS SDK requires Rust 1.88+. Use 'filesystem' backend for now.".into(),
                 ))
             }
             other => {
