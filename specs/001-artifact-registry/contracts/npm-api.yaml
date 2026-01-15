@@ -1,0 +1,881 @@
+openapi: 3.1.0
+info:
+  title: npm Registry API
+  description: |
+    npm Registry API for Node.js package management.
+
+    Reference:
+    - Registry API: https://github.com/npm/registry/blob/master/docs/REGISTRY-API.md
+    - CommonJS Package Registry: https://wiki.commonjs.org/wiki/Packages/Registry
+
+    Clients: npm, yarn, pnpm, bun
+  version: 1.0.0
+
+servers:
+  - url: /repository/{repo-key}
+    description: npm registry base URL
+    variables:
+      repo-key:
+        default: npm-repo
+
+paths:
+  /:
+    get:
+      summary: Registry info
+      operationId: getRegistryInfo
+      description: Get registry metadata
+      security: []
+      responses:
+        '200':
+          description: Registry information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  db_name:
+                    type: string
+                  doc_count:
+                    type: integer
+                  doc_del_count:
+                    type: integer
+                  update_seq:
+                    type: integer
+
+  /{package}:
+    parameters:
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Package name. Scoped packages use URL encoding.
+          Examples:
+          - express
+          - @types%2Fnode (URL-encoded @types/node)
+
+    get:
+      summary: Get package metadata
+      operationId: getPackage
+      description: |
+        Get full package document with all versions.
+        Usage: `npm view package`
+      responses:
+        '200':
+          description: Package document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageDocument'
+        '404':
+          description: Package not found
+
+    put:
+      summary: Publish package
+      operationId: publishPackage
+      description: |
+        Publish a new package or version.
+        Usage: `npm publish`
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishRequest'
+      responses:
+        '201':
+          description: Package published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+                  rev:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Not authorized to publish
+        '409':
+          description: Version already exists
+
+  /{package}/{version}:
+    parameters:
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get specific version
+      operationId: getPackageVersion
+      description: Get metadata for a specific version
+      responses:
+        '200':
+          description: Version metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionInfo'
+        '404':
+          description: Version not found
+
+  /{package}/-/{filename}:
+    parameters:
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Tarball filename (package-version.tgz)
+
+    get:
+      summary: Download tarball
+      operationId: downloadTarball
+      description: |
+        Download package tarball.
+        Usage: `npm install package`
+      responses:
+        '200':
+          description: Package tarball
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: application/octet-stream
+            Content-Disposition:
+              schema:
+                type: string
+            X-Checksum-SHA1:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Tarball not found
+
+  /@{scope}/{package}:
+    parameters:
+      - name: scope
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Package scope (without @)
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get scoped package
+      operationId: getScopedPackage
+      description: Get full package document for scoped package
+      responses:
+        '200':
+          description: Package document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageDocument'
+        '404':
+          description: Package not found
+
+    put:
+      summary: Publish scoped package
+      operationId: publishScopedPackage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishRequest'
+      responses:
+        '201':
+          description: Package published
+
+  /@{scope}/{package}/-/{filename}:
+    parameters:
+      - name: scope
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Download scoped package tarball
+      operationId: downloadScopedTarball
+      responses:
+        '200':
+          description: Package tarball
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  /-/v1/search:
+    get:
+      summary: Search packages
+      operationId: searchPackages
+      description: |
+        Search for packages.
+        Usage: `npm search query`
+      parameters:
+        - name: text
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: size
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 250
+        - name: from
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Offset for pagination
+        - name: quality
+          in: query
+          schema:
+            type: number
+            default: 0.65
+        - name: popularity
+          in: query
+          schema:
+            type: number
+            default: 0.98
+        - name: maintenance
+          in: query
+          schema:
+            type: number
+            default: 0.5
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResults'
+
+  /-/npm/v1/user:
+    post:
+      summary: Create user / Login
+      operationId: createUser
+      description: |
+        Create new user or login to get token.
+        Usage: `npm login` or `npm adduser`
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                password:
+                  type: string
+                email:
+                  type: string
+      responses:
+        '201':
+          description: User created / logged in
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+                  token:
+                    type: string
+
+  /-/user/org.couchdb.user:{username}:
+    parameters:
+      - name: username
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get user
+      operationId: getUser
+      responses:
+        '200':
+          description: User info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+
+    put:
+      summary: Create/update user (legacy)
+      operationId: putUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/User'
+      responses:
+        '201':
+          description: User created
+
+  /-/package/{package}/dist-tags:
+    parameters:
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get dist-tags
+      operationId: getDistTags
+      description: Get distribution tags (latest, next, beta, etc.)
+      responses:
+        '200':
+          description: Dist-tags
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: string
+                example:
+                  latest: "1.0.0"
+                  next: "2.0.0-beta.1"
+
+    post:
+      summary: Add dist-tag
+      operationId: addDistTag
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '201':
+          description: Tag added
+
+  /-/package/{package}/dist-tags/{tag}:
+    parameters:
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tag
+        in: path
+        required: true
+        schema:
+          type: string
+
+    put:
+      summary: Set dist-tag
+      operationId: setDistTag
+      description: |
+        Set a distribution tag to point to a version.
+        Usage: `npm dist-tag add package@version tag`
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: string
+              description: Version string
+      responses:
+        '200':
+          description: Tag set
+
+    delete:
+      summary: Delete dist-tag
+      operationId: deleteDistTag
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Tag deleted
+
+  /-/package/{package}/access:
+    parameters:
+      - name: package
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get package access
+      operationId: getPackageAccess
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Access info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  public:
+                    type: boolean
+
+    post:
+      summary: Set package access
+      operationId: setPackageAccess
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                access:
+                  type: string
+                  enum: [public, restricted]
+      responses:
+        '200':
+          description: Access updated
+
+  /-/npm/v1/tokens:
+    get:
+      summary: List tokens
+      operationId: listTokens
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Token list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  objects:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TokenInfo'
+
+    post:
+      summary: Create token
+      operationId: createToken
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                password:
+                  type: string
+                readonly:
+                  type: boolean
+                cidr_whitelist:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Token created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+
+  /-/npm/v1/tokens/token/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+
+    delete:
+      summary: Delete token
+      operationId: deleteToken
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Token deleted
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: npm token (from `npm login`)
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              reason:
+                type: string
+
+  schemas:
+    PackageDocument:
+      type: object
+      description: Full package document (packument)
+      required:
+        - _id
+        - name
+        - versions
+      properties:
+        _id:
+          type: string
+          description: Package name
+        _rev:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        dist-tags:
+          type: object
+          additionalProperties:
+            type: string
+        versions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/VersionInfo'
+        time:
+          type: object
+          description: Publication times
+          additionalProperties:
+            type: string
+            format: date-time
+        maintainers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Maintainer'
+        author:
+          $ref: '#/components/schemas/Maintainer'
+        repository:
+          type: object
+          properties:
+            type:
+              type: string
+            url:
+              type: string
+        readme:
+          type: string
+        readmeFilename:
+          type: string
+        license:
+          type: string
+        keywords:
+          type: array
+          items:
+            type: string
+        bugs:
+          type: object
+          properties:
+            url:
+              type: string
+        homepage:
+          type: string
+
+    VersionInfo:
+      type: object
+      description: Package version metadata
+      required:
+        - name
+        - version
+        - dist
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        description:
+          type: string
+        main:
+          type: string
+        types:
+          type: string
+        scripts:
+          type: object
+          additionalProperties:
+            type: string
+        dependencies:
+          type: object
+          additionalProperties:
+            type: string
+        devDependencies:
+          type: object
+          additionalProperties:
+            type: string
+        peerDependencies:
+          type: object
+          additionalProperties:
+            type: string
+        optionalDependencies:
+          type: object
+          additionalProperties:
+            type: string
+        engines:
+          type: object
+          additionalProperties:
+            type: string
+        dist:
+          $ref: '#/components/schemas/Dist'
+        deprecated:
+          type: string
+        _id:
+          type: string
+        _npmVersion:
+          type: string
+        _nodeVersion:
+          type: string
+        _npmUser:
+          $ref: '#/components/schemas/Maintainer'
+
+    Dist:
+      type: object
+      required:
+        - shasum
+        - tarball
+      properties:
+        shasum:
+          type: string
+          description: SHA-1 checksum
+        tarball:
+          type: string
+          format: uri
+        integrity:
+          type: string
+          description: Subresource Integrity hash (sha512)
+        fileCount:
+          type: integer
+        unpackedSize:
+          type: integer
+        signatures:
+          type: array
+          items:
+            type: object
+            properties:
+              keyid:
+                type: string
+              sig:
+                type: string
+
+    Maintainer:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        url:
+          type: string
+          format: uri
+
+    PublishRequest:
+      type: object
+      description: Package publish payload
+      required:
+        - _id
+        - name
+        - versions
+        - _attachments
+      properties:
+        _id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        dist-tags:
+          type: object
+          additionalProperties:
+            type: string
+        versions:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/VersionInfo'
+        readme:
+          type: string
+        _attachments:
+          type: object
+          description: Tarball attachments (base64 encoded)
+          additionalProperties:
+            type: object
+            properties:
+              content_type:
+                type: string
+              data:
+                type: string
+                format: byte
+              length:
+                type: integer
+
+    SearchResults:
+      type: object
+      properties:
+        objects:
+          type: array
+          items:
+            type: object
+            properties:
+              package:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  scope:
+                    type: string
+                  version:
+                    type: string
+                  description:
+                    type: string
+                  keywords:
+                    type: array
+                    items:
+                      type: string
+                  date:
+                    type: string
+                    format: date-time
+                  links:
+                    type: object
+                    properties:
+                      npm:
+                        type: string
+                      homepage:
+                        type: string
+                      repository:
+                        type: string
+                  author:
+                    $ref: '#/components/schemas/Maintainer'
+                  publisher:
+                    $ref: '#/components/schemas/Maintainer'
+                  maintainers:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Maintainer'
+              score:
+                type: object
+                properties:
+                  final:
+                    type: number
+                  detail:
+                    type: object
+                    properties:
+                      quality:
+                        type: number
+                      popularity:
+                        type: number
+                      maintenance:
+                        type: number
+              searchScore:
+                type: number
+        total:
+          type: integer
+        time:
+          type: string
+
+    User:
+      type: object
+      properties:
+        _id:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        type:
+          type: string
+          enum: [user]
+        roles:
+          type: array
+          items:
+            type: string
+        date:
+          type: string
+          format: date-time
+
+    TokenInfo:
+      type: object
+      properties:
+        key:
+          type: string
+        token:
+          type: string
+          description: Masked token (first chars only)
+        cidr_whitelist:
+          type: array
+          items:
+            type: string
+        readonly:
+          type: boolean
+        created:
+          type: string
+          format: date-time
+        updated:
+          type: string
+          format: date-time

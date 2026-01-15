@@ -1,0 +1,572 @@
+openapi: 3.1.0
+info:
+  title: Cargo Registry API
+  description: |
+    Rust Cargo Registry API implementing the sparse registry protocol.
+
+    Reference:
+    - Sparse Protocol: https://doc.rust-lang.org/cargo/reference/registry-index.html
+    - Registry Web API: https://doc.rust-lang.org/cargo/reference/registry-web-api.html
+
+    Cargo 1.68+ uses sparse protocol by default (faster than git-based index).
+
+    Clients: cargo
+  version: 1.0.0
+
+servers:
+  - url: /repository/{repo-key}
+    description: Cargo registry base URL
+    variables:
+      repo-key:
+        default: cargo-repo
+
+paths:
+  /config.json:
+    get:
+      summary: Get registry configuration
+      operationId: getConfig
+      description: |
+        Registry configuration file.
+        Required for cargo to understand registry capabilities.
+      security: []
+      responses:
+        '200':
+          description: Registry configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistryConfig'
+
+  /index/{prefix}/{crate}:
+    parameters:
+      - name: prefix
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Crate name prefix path. Rules:
+          - 1 char: 1/{name}
+          - 2 chars: 2/{name}
+          - 3 chars: 3/{first-char}/{name}
+          - 4+ chars: {first-two}/{second-two}/{name}
+          Example: "serde" -> "se/rd/serde"
+      - name: crate
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Crate name (lowercase)
+
+    get:
+      summary: Get crate index
+      operationId: getCrateIndex
+      description: |
+        Sparse index entry for a crate.
+        Returns all versions as newline-delimited JSON.
+
+        Usage: Configure in .cargo/config.toml:
+        ```toml
+        [registries.my-registry]
+        index = "sparse+http://registry/repository/cargo-repo/index/"
+        ```
+      responses:
+        '200':
+          description: Crate index (newline-delimited JSON)
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: |
+                  Each line is a JSON object for one version.
+                  Example:
+                  ```
+                  {"name":"serde","vers":"1.0.0","deps":[...],"cksum":"abc...","features":{},"yanked":false}
+                  {"name":"serde","vers":"1.0.1","deps":[...],"cksum":"def...","features":{},"yanked":false}
+                  ```
+        '404':
+          description: Crate not found
+        '304':
+          description: Not modified (if ETag matches)
+
+  /api/v1/crates:
+    get:
+      summary: Search crates
+      operationId: searchCrates
+      description: Search for crates by name
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 10
+            maximum: 100
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResults'
+
+  /api/v1/crates/new:
+    put:
+      summary: Publish crate
+      operationId: publishCrate
+      description: |
+        Publish a new crate version.
+
+        Usage: `cargo publish --registry my-registry`
+
+        Request body format:
+        - 4 bytes: JSON length (u32 LE)
+        - N bytes: JSON metadata
+        - 4 bytes: Crate file length (u32 LE)
+        - M bytes: .crate file (gzipped tarball)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Binary format with JSON metadata + crate file
+      responses:
+        '200':
+          description: Crate published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  warnings:
+                    type: object
+                    properties:
+                      invalid_categories:
+                        type: array
+                        items:
+                          type: string
+                      invalid_badges:
+                        type: array
+                        items:
+                          type: string
+                      other:
+                        type: array
+                        items:
+                          type: string
+        '400':
+          description: Invalid crate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Not authorized
+
+  /api/v1/crates/{crate}:
+    parameters:
+      - name: crate
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get crate metadata
+      operationId: getCrateMetadata
+      responses:
+        '200':
+          description: Crate metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CrateInfo'
+        '404':
+          description: Crate not found
+
+  /api/v1/crates/{crate}/{version}/download:
+    parameters:
+      - name: crate
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Download crate
+      operationId: downloadCrate
+      description: Download .crate file (gzipped tarball)
+      responses:
+        '200':
+          description: Crate file
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+            X-Checksum-SHA256:
+              schema:
+                type: string
+          content:
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Version not found
+
+  /api/v1/crates/{crate}/{version}/yank:
+    parameters:
+      - name: crate
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+
+    delete:
+      summary: Yank version
+      operationId: yankVersion
+      description: Mark a version as yanked (not recommended for new installs)
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Version yanked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '403':
+          description: Not authorized
+
+    put:
+      summary: Unyank version
+      operationId: unyankVersion
+      description: Remove yanked status from a version
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Version unyanked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
+  /api/v1/crates/{crate}/owners:
+    parameters:
+      - name: crate
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: List crate owners
+      operationId: listOwners
+      responses:
+        '200':
+          description: Owner list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Owner'
+
+    put:
+      summary: Add owner
+      operationId: addOwner
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                users:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Owner added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  msg:
+                    type: string
+
+    delete:
+      summary: Remove owner
+      operationId: removeOwner
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                users:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Owner removed
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Cargo login token
+
+  schemas:
+    RegistryConfig:
+      type: object
+      required:
+        - dl
+        - api
+      properties:
+        dl:
+          type: string
+          format: uri
+          description: Download URL template. Use {crate} and {version} placeholders.
+          example: "http://registry/repository/cargo-repo/api/v1/crates/{crate}/{version}/download"
+        api:
+          type: string
+          format: uri
+          description: API base URL
+          example: "http://registry/repository/cargo-repo"
+        auth-required:
+          type: boolean
+          default: false
+          description: Whether authentication is required for all operations
+
+    IndexEntry:
+      type: object
+      required:
+        - name
+        - vers
+        - deps
+        - cksum
+        - features
+        - yanked
+      properties:
+        name:
+          type: string
+          description: Crate name
+        vers:
+          type: string
+          description: Version (semver)
+        deps:
+          type: array
+          items:
+            $ref: '#/components/schemas/Dependency'
+        cksum:
+          type: string
+          description: SHA256 checksum of .crate file
+        features:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          description: Feature flags and their dependencies
+        features2:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          description: Extended features (weak dependencies)
+        yanked:
+          type: boolean
+        links:
+          type: string
+          description: Native library this crate links to
+        v:
+          type: integer
+          description: Schema version (2 = features2 support)
+        rust_version:
+          type: string
+          description: Minimum supported Rust version
+
+    Dependency:
+      type: object
+      required:
+        - name
+        - req
+        - features
+        - optional
+        - default_features
+        - target
+        - kind
+      properties:
+        name:
+          type: string
+          description: Dependency name
+        req:
+          type: string
+          description: Version requirement (semver)
+        features:
+          type: array
+          items:
+            type: string
+        optional:
+          type: boolean
+        default_features:
+          type: boolean
+        target:
+          type: string
+          nullable: true
+          description: Platform-specific dependency
+        kind:
+          type: string
+          enum: [normal, dev, build]
+        registry:
+          type: string
+          nullable: true
+          description: Alternative registry URL
+        package:
+          type: string
+          description: Actual package name if renamed
+
+    SearchResults:
+      type: object
+      properties:
+        crates:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              max_version:
+                type: string
+              description:
+                type: string
+              downloads:
+                type: integer
+        meta:
+          type: object
+          properties:
+            total:
+              type: integer
+
+    CrateInfo:
+      type: object
+      properties:
+        crate:
+          type: object
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            description:
+              type: string
+            license:
+              type: string
+            documentation:
+              type: string
+            homepage:
+              type: string
+            repository:
+              type: string
+            downloads:
+              type: integer
+            max_version:
+              type: string
+            newest_version:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+        versions:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              crate:
+                type: string
+              num:
+                type: string
+              dl_path:
+                type: string
+              yanked:
+                type: boolean
+              created_at:
+                type: string
+                format: date-time
+
+    Owner:
+      type: object
+      properties:
+        id:
+          type: integer
+        login:
+          type: string
+        name:
+          type: string
+
+    Error:
+      type: object
+      properties:
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              detail:
+                type: string

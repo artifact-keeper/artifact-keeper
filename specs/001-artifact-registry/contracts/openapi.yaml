@@ -1,0 +1,1355 @@
+openapi: 3.1.0
+info:
+  title: Indiana Jones Artifact Registry API
+  description: |
+    Open-source artifact registry API supporting multiple package formats.
+    This is the administrative and generic artifact API. Format-specific
+    endpoints (Maven, npm, Docker, etc.) are defined in separate specs.
+  version: 1.0.0
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: /api/v1
+    description: API v1
+
+tags:
+  - name: repositories
+    description: Repository management
+  - name: artifacts
+    description: Artifact operations
+  - name: users
+    description: User management
+  - name: auth
+    description: Authentication
+  - name: admin
+    description: System administration
+  - name: edge
+    description: Edge node management
+  - name: plugins
+    description: Plugin management
+  - name: health
+    description: Health and metrics
+
+paths:
+  # ============================================================================
+  # Health & System
+  # ============================================================================
+  /health:
+    get:
+      tags: [health]
+      summary: Health check
+      operationId: healthCheck
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Service is unhealthy
+
+  /ready:
+    get:
+      tags: [health]
+      summary: Readiness check
+      operationId: readinessCheck
+      security: []
+      responses:
+        '200':
+          description: Service is ready
+        '503':
+          description: Service is not ready
+
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus metrics
+      operationId: getMetrics
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Metrics in Prometheus format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ============================================================================
+  # Authentication
+  # ============================================================================
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Login with credentials
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Logout current session
+      operationId: logout
+      responses:
+        '204':
+          description: Logged out successfully
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Refresh access token
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: Token refreshed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Get current user info
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: Current user information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ============================================================================
+  # Repositories
+  # ============================================================================
+  /repositories:
+    get:
+      tags: [repositories]
+      summary: List repositories
+      operationId: listRepositories
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+        - name: format
+          in: query
+          schema:
+            $ref: '#/components/schemas/RepositoryFormat'
+        - name: type
+          in: query
+          schema:
+            $ref: '#/components/schemas/RepositoryType'
+      responses:
+        '200':
+          description: List of repositories
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepositoryList'
+
+    post:
+      tags: [repositories]
+      summary: Create repository
+      operationId: createRepository
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRepositoryRequest'
+      responses:
+        '201':
+          description: Repository created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Repository'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /repositories/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Repository key
+
+    get:
+      tags: [repositories]
+      summary: Get repository details
+      operationId: getRepository
+      responses:
+        '200':
+          description: Repository details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Repository'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [repositories]
+      summary: Update repository
+      operationId: updateRepository
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRepositoryRequest'
+      responses:
+        '200':
+          description: Repository updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Repository'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [repositories]
+      summary: Delete repository
+      operationId: deleteRepository
+      parameters:
+        - name: force
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Force delete even if repository contains artifacts
+      responses:
+        '204':
+          description: Repository deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  # ============================================================================
+  # Artifacts (Generic API)
+  # ============================================================================
+  /repositories/{key}/artifacts:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      tags: [artifacts]
+      summary: List artifacts in repository
+      operationId: listArtifacts
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search query
+        - name: path_prefix
+          in: query
+          schema:
+            type: string
+          description: Filter by path prefix
+      responses:
+        '200':
+          description: List of artifacts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactList'
+
+  /repositories/{key}/artifacts/{path}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Artifact path (URL-encoded)
+
+    get:
+      tags: [artifacts]
+      summary: Get artifact metadata
+      operationId: getArtifactMetadata
+      responses:
+        '200':
+          description: Artifact metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [artifacts]
+      summary: Upload artifact
+      operationId: uploadArtifact
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Artifact uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '409':
+          description: Artifact version already exists (immutable)
+          $ref: '#/components/responses/Conflict'
+
+    delete:
+      tags: [artifacts]
+      summary: Delete artifact
+      operationId: deleteArtifact
+      responses:
+        '204':
+          description: Artifact deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /repositories/{key}/artifacts/{path}/download:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      tags: [artifacts]
+      summary: Download artifact
+      operationId: downloadArtifact
+      responses:
+        '200':
+          description: Artifact content
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+            X-Checksum-SHA256:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ============================================================================
+  # Search
+  # ============================================================================
+  /search/artifacts:
+    get:
+      tags: [artifacts]
+      summary: Search artifacts across repositories
+      operationId: searchArtifacts
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: repos
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          description: Limit to specific repositories
+        - name: formats
+          in: query
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/RepositoryFormat'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResults'
+
+  # ============================================================================
+  # Users
+  # ============================================================================
+  /users:
+    get:
+      tags: [users]
+      summary: List users
+      operationId: listUsers
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PerPageParam'
+      responses:
+        '200':
+          description: List of users
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserList'
+
+    post:
+      tags: [users]
+      summary: Create local user
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      tags: [users]
+      summary: Get user details
+      operationId: getUser
+      responses:
+        '200':
+          description: User details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [users]
+      summary: Update user
+      operationId: updateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: User updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+
+    delete:
+      tags: [users]
+      summary: Delete user
+      operationId: deleteUser
+      responses:
+        '204':
+          description: User deleted
+
+  /users/{id}/tokens:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      tags: [users]
+      summary: List user's API tokens
+      operationId: listUserTokens
+      responses:
+        '200':
+          description: List of tokens
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiTokenList'
+
+    post:
+      tags: [users]
+      summary: Create API token
+      operationId: createApiToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiTokenRequest'
+      responses:
+        '201':
+          description: Token created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiTokenCreated'
+
+  # ============================================================================
+  # Edge Nodes
+  # ============================================================================
+  /edge-nodes:
+    get:
+      tags: [edge]
+      summary: List edge nodes
+      operationId: listEdgeNodes
+      responses:
+        '200':
+          description: List of edge nodes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeNodeList'
+
+    post:
+      tags: [edge]
+      summary: Register edge node
+      operationId: registerEdgeNode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterEdgeNodeRequest'
+      responses:
+        '201':
+          description: Edge node registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeNodeCreated'
+
+  /edge-nodes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      tags: [edge]
+      summary: Get edge node details
+      operationId: getEdgeNode
+      responses:
+        '200':
+          description: Edge node details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EdgeNode'
+
+    delete:
+      tags: [edge]
+      summary: Unregister edge node
+      operationId: unregisterEdgeNode
+      responses:
+        '204':
+          description: Edge node unregistered
+
+  /edge-nodes/{id}/sync:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    post:
+      tags: [edge]
+      summary: Trigger sync for edge node
+      operationId: triggerEdgeSync
+      responses:
+        '202':
+          description: Sync triggered
+
+  # ============================================================================
+  # Backups
+  # ============================================================================
+  /admin/backups:
+    get:
+      tags: [admin]
+      summary: List backups
+      operationId: listBackups
+      responses:
+        '200':
+          description: List of backups
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackupList'
+
+    post:
+      tags: [admin]
+      summary: Create backup
+      operationId: createBackup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBackupRequest'
+      responses:
+        '202':
+          description: Backup started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Backup'
+
+  /admin/backups/{id}/restore:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    post:
+      tags: [admin]
+      summary: Restore from backup
+      operationId: restoreBackup
+      responses:
+        '202':
+          description: Restore started
+
+  # ============================================================================
+  # Plugins
+  # ============================================================================
+  /plugins:
+    get:
+      tags: [plugins]
+      summary: List installed plugins
+      operationId: listPlugins
+      responses:
+        '200':
+          description: List of plugins
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PluginList'
+
+    post:
+      tags: [plugins]
+      summary: Install plugin
+      operationId: installPlugin
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                package:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: Plugin installed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plugin'
+
+  /plugins/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    get:
+      tags: [plugins]
+      summary: Get plugin details
+      operationId: getPlugin
+      responses:
+        '200':
+          description: Plugin details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plugin'
+
+    delete:
+      tags: [plugins]
+      summary: Uninstall plugin
+      operationId: uninstallPlugin
+      responses:
+        '204':
+          description: Plugin uninstalled
+
+  /plugins/{id}/enable:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    post:
+      tags: [plugins]
+      summary: Enable plugin
+      operationId: enablePlugin
+      responses:
+        '200':
+          description: Plugin enabled
+
+  /plugins/{id}/disable:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+
+    post:
+      tags: [plugins]
+      summary: Disable plugin
+      operationId: disablePlugin
+      responses:
+        '200':
+          description: Plugin disabled
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+
+    PerPageParam:
+      name: per_page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Forbidden:
+      description: Permission denied
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Conflict:
+      description: Resource conflict
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    # Common
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+
+    Pagination:
+      type: object
+      properties:
+        page:
+          type: integer
+        per_page:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+
+    # Health
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        version:
+          type: string
+        checks:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status:
+                type: string
+              message:
+                type: string
+
+    # Auth
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+
+    LoginResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in:
+          type: integer
+        token_type:
+          type: string
+          default: Bearer
+
+    RefreshTokenRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+
+    # Repository
+    RepositoryFormat:
+      type: string
+      enum:
+        - maven
+        - gradle
+        - npm
+        - pypi
+        - nuget
+        - go
+        - rubygems
+        - docker
+        - helm
+        - rpm
+        - debian
+        - conan
+        - cargo
+        - generic
+
+    RepositoryType:
+      type: string
+      enum: [local, remote, virtual]
+
+    Repository:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        key:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        format:
+          $ref: '#/components/schemas/RepositoryFormat'
+        repo_type:
+          $ref: '#/components/schemas/RepositoryType'
+        is_public:
+          type: boolean
+        artifact_count:
+          type: integer
+        storage_used_bytes:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RepositoryList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Repository'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    CreateRepositoryRequest:
+      type: object
+      required: [key, name, format, repo_type]
+      properties:
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+          minLength: 3
+          maxLength: 255
+        name:
+          type: string
+        description:
+          type: string
+        format:
+          $ref: '#/components/schemas/RepositoryFormat'
+        repo_type:
+          $ref: '#/components/schemas/RepositoryType'
+        is_public:
+          type: boolean
+          default: false
+        upstream_url:
+          type: string
+          format: uri
+          description: Required for remote repositories
+
+    UpdateRepositoryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        is_public:
+          type: boolean
+
+    # Artifact
+    Artifact:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        repository_key:
+          type: string
+        path:
+          type: string
+        name:
+          type: string
+        version:
+          type: string
+        size_bytes:
+          type: integer
+          format: int64
+        checksum_sha256:
+          type: string
+        content_type:
+          type: string
+        download_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        metadata:
+          type: object
+          description: Format-specific metadata
+
+    ArtifactList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    SearchResults:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        query:
+          type: string
+
+    # User
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        auth_provider:
+          type: string
+          enum: [local, ldap, saml, oidc]
+        is_active:
+          type: boolean
+        is_admin:
+          type: boolean
+        last_login_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    UserList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    CreateUserRequest:
+      type: object
+      required: [username, email, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 255
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          minLength: 12
+        display_name:
+          type: string
+        is_admin:
+          type: boolean
+          default: false
+
+    UpdateUserRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        is_active:
+          type: boolean
+        is_admin:
+          type: boolean
+
+    # API Token
+    ApiToken:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        token_prefix:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        expires_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    ApiTokenList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiToken'
+
+    CreateApiTokenRequest:
+      type: object
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+            enum: [read, write, delete, admin]
+        expires_at:
+          type: string
+          format: date-time
+
+    ApiTokenCreated:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        token:
+          type: string
+          description: Full token (only shown once)
+
+    # Edge Node
+    EdgeNode:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        status:
+          type: string
+          enum: [online, offline, syncing]
+        last_heartbeat:
+          type: string
+          format: date-time
+        storage_used_bytes:
+          type: integer
+          format: int64
+        storage_limit_bytes:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+
+    EdgeNodeList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EdgeNode'
+
+    RegisterEdgeNodeRequest:
+      type: object
+      required: [name, url]
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        storage_limit_bytes:
+          type: integer
+          format: int64
+
+    EdgeNodeCreated:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        api_key:
+          type: string
+          description: API key for edge node authentication (only shown once)
+
+    # Backup
+    Backup:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          type: string
+          enum: [full, incremental]
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        size_bytes:
+          type: integer
+          format: int64
+        artifact_count:
+          type: integer
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    BackupList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Backup'
+
+    CreateBackupRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [full, incremental]
+          default: full
+
+    # Plugin
+    Plugin:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        version:
+          type: string
+        display_name:
+          type: string
+        description:
+          type: string
+        author:
+          type: string
+        status:
+          type: string
+          enum: [installed, enabled, disabled, error]
+        plugin_type:
+          type: string
+          enum: [webhook, validator, integration]
+        installed_at:
+          type: string
+          format: date-time
+
+    PluginList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Plugin'
+
+security:
+  - bearerAuth: []

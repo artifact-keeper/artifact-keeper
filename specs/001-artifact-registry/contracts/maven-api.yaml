@@ -1,0 +1,489 @@
+openapi: 3.1.0
+info:
+  title: Maven Repository API
+  description: |
+    Maven Repository format implementing the Maven repository layout.
+    Compatible with Maven, Gradle, Ivy, and SBT clients.
+
+    Reference:
+    - Maven Repository Layout: https://maven.apache.org/repository/layout.html
+    - Maven Central: https://repo1.maven.org/maven2/
+
+    Layout: /{groupId-as-path}/{artifactId}/{version}/{artifactId}-{version}[-{classifier}].{extension}
+
+    Example: /com/example/mylib/1.0.0/mylib-1.0.0.jar
+
+    Clients: mvn, gradle, sbt, ivy, leiningen
+  version: 1.0.0
+
+servers:
+  - url: /repository/{repo-key}
+    description: Maven repository base URL
+    variables:
+      repo-key:
+        default: maven-repo
+
+paths:
+  /{groupPath}/{artifactId}/{version}/{filename}:
+    parameters:
+      - name: groupPath
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Group ID as path (dots replaced with slashes).
+          Example: com.example.project -> com/example/project
+      - name: artifactId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Artifact filename. Format: {artifactId}-{version}[-{classifier}].{extension}
+          Examples:
+          - mylib-1.0.0.jar
+          - mylib-1.0.0.pom
+          - mylib-1.0.0-sources.jar
+          - mylib-1.0.0-javadoc.jar
+
+    get:
+      summary: Download artifact
+      operationId: downloadArtifact
+      description: Download a Maven artifact (JAR, POM, etc.)
+      responses:
+        '200':
+          description: Artifact content
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+            X-Checksum-SHA1:
+              schema:
+                type: string
+            X-Checksum-MD5:
+              schema:
+                type: string
+          content:
+            application/java-archive:
+              schema:
+                type: string
+                format: binary
+            application/xml:
+              schema:
+                type: string
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Artifact not found
+
+    put:
+      summary: Deploy artifact
+      operationId: deployArtifact
+      description: |
+        Deploy a Maven artifact.
+        Usage: `mvn deploy` with distributionManagement configured
+      security:
+        - basicAuth: []
+      requestBody:
+        required: true
+        content:
+          application/java-archive:
+            schema:
+              type: string
+              format: binary
+          application/xml:
+            schema:
+              type: string
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Artifact deployed
+        '409':
+          description: Artifact already exists (immutable release version)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    head:
+      summary: Check artifact existence
+      operationId: headArtifact
+      description: Check if artifact exists and get metadata
+      responses:
+        '200':
+          description: Artifact exists
+          headers:
+            Content-Length:
+              schema:
+                type: integer
+            Content-Type:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+            Last-Modified:
+              schema:
+                type: string
+        '404':
+          description: Artifact not found
+
+  /{groupPath}/{artifactId}/{version}/{filename}.sha1:
+    parameters:
+      - name: groupPath
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: artifactId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get SHA-1 checksum
+      operationId: getSha1Checksum
+      description: Get SHA-1 checksum file for artifact verification
+      responses:
+        '200':
+          description: SHA-1 checksum (40 hex characters)
+          content:
+            text/plain:
+              schema:
+                type: string
+                pattern: '^[a-f0-9]{40}$'
+        '404':
+          description: Checksum not found
+
+    put:
+      summary: Upload SHA-1 checksum
+      operationId: putSha1Checksum
+      security:
+        - basicAuth: []
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: Checksum uploaded
+
+  /{groupPath}/{artifactId}/{version}/{filename}.md5:
+    parameters:
+      - name: groupPath
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: artifactId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get MD5 checksum
+      operationId: getMd5Checksum
+      description: Get MD5 checksum file (legacy, SHA-1 preferred)
+      responses:
+        '200':
+          description: MD5 checksum (32 hex characters)
+          content:
+            text/plain:
+              schema:
+                type: string
+                pattern: '^[a-f0-9]{32}$'
+        '404':
+          description: Checksum not found
+
+    put:
+      summary: Upload MD5 checksum
+      operationId: putMd5Checksum
+      security:
+        - basicAuth: []
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '201':
+          description: Checksum uploaded
+
+  /{groupPath}/{artifactId}/maven-metadata.xml:
+    parameters:
+      - name: groupPath
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: artifactId
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get artifact metadata
+      operationId: getArtifactMetadata
+      description: |
+        Get maven-metadata.xml listing all versions of an artifact.
+        Used by Maven to resolve version ranges and find latest version.
+      responses:
+        '200':
+          description: Maven metadata XML
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/MavenMetadata'
+        '404':
+          description: Metadata not found
+
+  /{groupPath}/{artifactId}/{version}/maven-metadata.xml:
+    parameters:
+      - name: groupPath
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: artifactId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get snapshot metadata
+      operationId: getSnapshotMetadata
+      description: |
+        For SNAPSHOT versions, lists available snapshot builds.
+        Example: 1.0.0-SNAPSHOT/maven-metadata.xml
+      responses:
+        '200':
+          description: Snapshot metadata XML
+          content:
+            application/xml:
+              schema:
+                $ref: '#/components/schemas/SnapshotMetadata'
+        '404':
+          description: Metadata not found
+
+  /:
+    get:
+      summary: Browse repository root
+      operationId: browseRoot
+      description: HTML directory listing for repository browsing
+      responses:
+        '200':
+          description: Directory listing
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /{path}:
+    parameters:
+      - name: path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Any path in the repository
+
+    get:
+      summary: Browse directory or download file
+      operationId: browseOrDownload
+      description: |
+        If path is a directory, returns HTML listing.
+        If path is a file, returns file content.
+      responses:
+        '200':
+          description: Directory listing or file content
+          content:
+            text/html:
+              schema:
+                type: string
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: Maven uses HTTP Basic Auth for deployment
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            example: Basic realm="Maven Repository"
+
+  schemas:
+    MavenMetadata:
+      type: object
+      description: |
+        Maven metadata XML structure.
+        Example:
+        ```xml
+        <?xml version="1.0" encoding="UTF-8"?>
+        <metadata>
+          <groupId>com.example</groupId>
+          <artifactId>mylib</artifactId>
+          <versioning>
+            <latest>1.2.0</latest>
+            <release>1.2.0</release>
+            <versions>
+              <version>1.0.0</version>
+              <version>1.1.0</version>
+              <version>1.2.0</version>
+            </versions>
+            <lastUpdated>20260114120000</lastUpdated>
+          </versioning>
+        </metadata>
+        ```
+      xml:
+        name: metadata
+      properties:
+        groupId:
+          type: string
+        artifactId:
+          type: string
+        versioning:
+          type: object
+          properties:
+            latest:
+              type: string
+            release:
+              type: string
+            versions:
+              type: array
+              items:
+                type: string
+              xml:
+                wrapped: true
+                name: versions
+            lastUpdated:
+              type: string
+              description: Timestamp in yyyyMMddHHmmss format
+
+    SnapshotMetadata:
+      type: object
+      description: |
+        Snapshot version metadata.
+        Example:
+        ```xml
+        <?xml version="1.0" encoding="UTF-8"?>
+        <metadata>
+          <groupId>com.example</groupId>
+          <artifactId>mylib</artifactId>
+          <version>1.0.0-SNAPSHOT</version>
+          <versioning>
+            <snapshot>
+              <timestamp>20260114.120000</timestamp>
+              <buildNumber>5</buildNumber>
+            </snapshot>
+            <lastUpdated>20260114120000</lastUpdated>
+            <snapshotVersions>
+              <snapshotVersion>
+                <extension>jar</extension>
+                <value>1.0.0-20260114.120000-5</value>
+                <updated>20260114120000</updated>
+              </snapshotVersion>
+              <snapshotVersion>
+                <extension>pom</extension>
+                <value>1.0.0-20260114.120000-5</value>
+                <updated>20260114120000</updated>
+              </snapshotVersion>
+            </snapshotVersions>
+          </versioning>
+        </metadata>
+        ```
+      xml:
+        name: metadata
+      properties:
+        groupId:
+          type: string
+        artifactId:
+          type: string
+        version:
+          type: string
+        versioning:
+          type: object
+          properties:
+            snapshot:
+              type: object
+              properties:
+                timestamp:
+                  type: string
+                buildNumber:
+                  type: integer
+            lastUpdated:
+              type: string
+            snapshotVersions:
+              type: array
+              items:
+                type: object
+                properties:
+                  classifier:
+                    type: string
+                  extension:
+                    type: string
+                  value:
+                    type: string
+                  updated:
+                    type: string

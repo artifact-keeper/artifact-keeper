@@ -1,0 +1,400 @@
+openapi: 3.1.0
+info:
+  title: PyPI Simple Repository API
+  description: |
+    Python Package Index (PyPI) Simple Repository API.
+    Implements PEP 503 (Simple Repository API) and PEP 691 (JSON Simple API).
+
+    Reference:
+    - PEP 503: https://peps.python.org/pep-0503/
+    - PEP 691: https://peps.python.org/pep-0691/
+    - PEP 658: https://peps.python.org/pep-0658/ (metadata)
+
+    Clients: pip, poetry, pipenv, uv
+  version: 1.0.0
+
+servers:
+  - url: /repository/{repo-key}
+    description: PyPI repository base URL
+    variables:
+      repo-key:
+        default: pypi-repo
+
+paths:
+  /simple/:
+    get:
+      summary: List all packages
+      operationId: listPackages
+      description: |
+        Returns list of all packages in the repository.
+        PEP 503 compliant index page.
+
+        Usage: `pip install --index-url http://registry/repository/pypi-repo/simple/ package`
+      responses:
+        '200':
+          description: Package index
+          content:
+            text/html:
+              schema:
+                type: string
+                description: |
+                  HTML page with anchor links to each package.
+                  Example:
+                  ```html
+                  <!DOCTYPE html>
+                  <html>
+                    <body>
+                      <a href="/simple/package1/">package1</a>
+                      <a href="/simple/package2/">package2</a>
+                    </body>
+                  </html>
+                  ```
+            application/vnd.pypi.simple.v1+json:
+              schema:
+                $ref: '#/components/schemas/ProjectList'
+
+  /simple/{project}/:
+    parameters:
+      - name: project
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Normalized project name (lowercase, hyphens).
+          PEP 503 normalization: re.sub(r"[-_.]+", "-", name).lower()
+
+    get:
+      summary: Get package files
+      operationId: getPackageFiles
+      description: |
+        Returns list of files (distributions) for a package.
+        PEP 503 compliant package page with download links.
+      responses:
+        '200':
+          description: Package file list
+          content:
+            text/html:
+              schema:
+                type: string
+                description: |
+                  HTML page with anchor links to each distribution file.
+                  Links include hash for verification.
+                  Example:
+                  ```html
+                  <!DOCTYPE html>
+                  <html>
+                    <body>
+                      <a href="package-1.0.0.tar.gz#sha256=abc123"
+                         data-requires-python=">=3.8">package-1.0.0.tar.gz</a>
+                      <a href="package-1.0.0-py3-none-any.whl#sha256=def456"
+                         data-requires-python=">=3.8"
+                         data-dist-info-metadata="sha256=789ghi">package-1.0.0-py3-none-any.whl</a>
+                    </body>
+                  </html>
+                  ```
+            application/vnd.pypi.simple.v1+json:
+              schema:
+                $ref: '#/components/schemas/ProjectDetail'
+        '404':
+          description: Package not found
+
+  /simple/{project}/{filename}:
+    parameters:
+      - name: project
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Distribution filename (.whl, .tar.gz, .zip)
+
+    get:
+      summary: Download distribution file
+      operationId: downloadDistribution
+      description: Download a wheel, sdist, or egg file
+      responses:
+        '200':
+          description: Distribution file
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+            X-PyPI-File-SHA256:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            application/zip:
+              schema:
+                type: string
+                format: binary
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: File not found
+
+  /simple/{project}/{filename}.metadata:
+    parameters:
+      - name: project
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: filename
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get distribution metadata
+      operationId: getDistributionMetadata
+      description: |
+        PEP 658 - Get METADATA file without downloading entire package.
+        Enables faster dependency resolution.
+      responses:
+        '200':
+          description: METADATA file content
+          content:
+            text/plain:
+              schema:
+                type: string
+                description: |
+                  RFC 822 style metadata.
+                  Example:
+                  ```
+                  Metadata-Version: 2.1
+                  Name: package
+                  Version: 1.0.0
+                  Requires-Python: >=3.8
+                  Requires-Dist: requests>=2.0
+                  ```
+        '404':
+          description: Metadata not found
+
+  /:
+    post:
+      summary: Upload distribution
+      operationId: uploadDistribution
+      description: |
+        Upload a new distribution file.
+        Twine-compatible upload endpoint.
+
+        Usage: `twine upload --repository-url http://registry/repository/pypi-repo/ dist/*`
+      security:
+        - basicAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - ':action'
+                - name
+                - version
+                - content
+              properties:
+                ':action':
+                  type: string
+                  enum: [file_upload]
+                protocol_version:
+                  type: string
+                  enum: ['1']
+                name:
+                  type: string
+                  description: Package name
+                version:
+                  type: string
+                  description: Package version
+                filetype:
+                  type: string
+                  enum: [sdist, bdist_wheel, bdist_egg]
+                pyversion:
+                  type: string
+                  description: Python version (e.g., py3, cp39)
+                content:
+                  type: string
+                  format: binary
+                  description: Distribution file
+                md5_digest:
+                  type: string
+                sha256_digest:
+                  type: string
+                blake2_256_digest:
+                  type: string
+                metadata_version:
+                  type: string
+                summary:
+                  type: string
+                description:
+                  type: string
+                description_content_type:
+                  type: string
+                keywords:
+                  type: string
+                home_page:
+                  type: string
+                author:
+                  type: string
+                author_email:
+                  type: string
+                maintainer:
+                  type: string
+                maintainer_email:
+                  type: string
+                license:
+                  type: string
+                classifier:
+                  type: array
+                  items:
+                    type: string
+                platform:
+                  type: string
+                requires_dist:
+                  type: array
+                  items:
+                    type: string
+                provides_dist:
+                  type: array
+                  items:
+                    type: string
+                obsoletes_dist:
+                  type: array
+                  items:
+                    type: string
+                requires_python:
+                  type: string
+                requires_external:
+                  type: array
+                  items:
+                    type: string
+                project_urls:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Upload successful
+        '400':
+          description: Invalid upload
+          content:
+            text/plain:
+              schema:
+                type: string
+        '409':
+          description: File already exists
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+
+  schemas:
+    ProjectList:
+      type: object
+      description: PEP 691 JSON project list
+      required:
+        - meta
+        - projects
+      properties:
+        meta:
+          type: object
+          properties:
+            api-version:
+              type: string
+              enum: ['1.0', '1.1']
+        projects:
+          type: array
+          items:
+            type: object
+            required:
+              - name
+            properties:
+              name:
+                type: string
+
+    ProjectDetail:
+      type: object
+      description: PEP 691 JSON project detail
+      required:
+        - meta
+        - name
+        - files
+      properties:
+        meta:
+          type: object
+          properties:
+            api-version:
+              type: string
+        name:
+          type: string
+        versions:
+          type: array
+          items:
+            type: string
+          description: Available versions (PEP 700)
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileInfo'
+
+    FileInfo:
+      type: object
+      required:
+        - filename
+        - url
+        - hashes
+      properties:
+        filename:
+          type: string
+        url:
+          type: string
+          format: uri
+        hashes:
+          type: object
+          properties:
+            sha256:
+              type: string
+            md5:
+              type: string
+            blake2b:
+              type: string
+        requires-python:
+          type: string
+        dist-info-metadata:
+          oneOf:
+            - type: boolean
+            - type: object
+              properties:
+                sha256:
+                  type: string
+          description: PEP 658 metadata availability
+        gpg-sig:
+          type: boolean
+        yanked:
+          oneOf:
+            - type: boolean
+            - type: string
+          description: PEP 592 yanked status
+        size:
+          type: integer
+          description: File size in bytes
+        upload-time:
+          type: string
+          format: date-time
+
+security:
+  - {}
+  - basicAuth: []

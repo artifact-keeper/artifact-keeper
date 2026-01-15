@@ -1,0 +1,80 @@
+[package]
+name = "indiana-jones-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "indiana-jones"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Web framework
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Authentication
+jsonwebtoken.workspace = true
+bcrypt.workspace = true
+
+# Checksums
+sha2.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+
+# S3 storage
+aws-sdk-s3.workspace = true
+aws-config.workspace = true
+
+# Logging/Tracing
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Metrics
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Config
+dotenvy.workspace = true
+
+# UUID
+uuid.workspace = true
+
+# Time
+chrono.workspace = true
+
+# HTTP client
+reqwest.workspace = true
+
+# Async streams
+futures.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+
+# Additional
+async-trait = "0.1"
+hex = "0.4"
+
+# Format parsing
+quick-xml = { version = "0.31", features = ["serialize"] }
+flate2 = "1.0"
+tar = "0.4"
+mime_guess = "2.0"
+
+[dev-dependencies]
+tokio-test = "0.4"

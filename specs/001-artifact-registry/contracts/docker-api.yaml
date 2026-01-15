@@ -1,0 +1,501 @@
+openapi: 3.1.0
+info:
+  title: Docker Registry API v2
+  description: |
+    OCI Distribution Specification compliant container registry API.
+    Implements Docker Registry HTTP API V2.
+  version: 2.0.0
+
+servers:
+  - url: /v2
+    description: Docker Registry API v2
+
+paths:
+  /:
+    get:
+      summary: API version check
+      operationId: checkVersion
+      description: Verify registry implements v2 API
+      security: []
+      responses:
+        '200':
+          description: Registry supports v2 API
+          headers:
+            Docker-Distribution-Api-Version:
+              schema:
+                type: string
+                example: registry/2.0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /{name}/blobs/{digest}:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+      - $ref: '#/components/parameters/Digest'
+
+    head:
+      summary: Check blob existence
+      operationId: headBlob
+      responses:
+        '200':
+          description: Blob exists
+          headers:
+            Content-Length:
+              schema:
+                type: integer
+            Docker-Content-Digest:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    get:
+      summary: Pull blob
+      operationId: getBlob
+      responses:
+        '200':
+          description: Blob content
+          headers:
+            Docker-Content-Digest:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      summary: Delete blob
+      operationId: deleteBlob
+      responses:
+        '202':
+          description: Blob deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /{name}/blobs/uploads/:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+
+    post:
+      summary: Initiate blob upload
+      operationId: initiateUpload
+      parameters:
+        - name: digest
+          in: query
+          schema:
+            type: string
+          description: Digest for monolithic upload
+        - name: mount
+          in: query
+          schema:
+            type: string
+          description: Mount blob from another repository
+        - name: from
+          in: query
+          schema:
+            type: string
+          description: Source repository for mount
+      responses:
+        '202':
+          description: Upload session started
+          headers:
+            Location:
+              schema:
+                type: string
+            Docker-Upload-UUID:
+              schema:
+                type: string
+            Range:
+              schema:
+                type: string
+        '201':
+          description: Blob mounted or monolithic upload complete
+          headers:
+            Location:
+              schema:
+                type: string
+            Docker-Content-Digest:
+              schema:
+                type: string
+
+  /{name}/blobs/uploads/{uuid}:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+      - name: uuid
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get upload status
+      operationId: getUploadStatus
+      responses:
+        '204':
+          description: Upload status
+          headers:
+            Range:
+              schema:
+                type: string
+            Docker-Upload-UUID:
+              schema:
+                type: string
+
+    patch:
+      summary: Upload blob chunk
+      operationId: uploadChunk
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '202':
+          description: Chunk accepted
+          headers:
+            Location:
+              schema:
+                type: string
+            Range:
+              schema:
+                type: string
+            Docker-Upload-UUID:
+              schema:
+                type: string
+
+    put:
+      summary: Complete blob upload
+      operationId: completeUpload
+      parameters:
+        - name: digest
+          in: query
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Upload complete
+          headers:
+            Location:
+              schema:
+                type: string
+            Docker-Content-Digest:
+              schema:
+                type: string
+
+    delete:
+      summary: Cancel upload
+      operationId: cancelUpload
+      responses:
+        '204':
+          description: Upload cancelled
+
+  /{name}/manifests/{reference}:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+      - $ref: '#/components/parameters/Reference'
+
+    head:
+      summary: Check manifest existence
+      operationId: headManifest
+      responses:
+        '200':
+          description: Manifest exists
+          headers:
+            Docker-Content-Digest:
+              schema:
+                type: string
+            Content-Type:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    get:
+      summary: Pull manifest
+      operationId: getManifest
+      responses:
+        '200':
+          description: Manifest content
+          headers:
+            Docker-Content-Digest:
+              schema:
+                type: string
+          content:
+            application/vnd.docker.distribution.manifest.v2+json:
+              schema:
+                $ref: '#/components/schemas/ManifestV2'
+            application/vnd.oci.image.manifest.v1+json:
+              schema:
+                $ref: '#/components/schemas/OCIManifest'
+            application/vnd.oci.image.index.v1+json:
+              schema:
+                $ref: '#/components/schemas/OCIIndex'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      summary: Push manifest
+      operationId: putManifest
+      requestBody:
+        required: true
+        content:
+          application/vnd.docker.distribution.manifest.v2+json:
+            schema:
+              $ref: '#/components/schemas/ManifestV2'
+          application/vnd.oci.image.manifest.v1+json:
+            schema:
+              $ref: '#/components/schemas/OCIManifest'
+      responses:
+        '201':
+          description: Manifest created
+          headers:
+            Location:
+              schema:
+                type: string
+            Docker-Content-Digest:
+              schema:
+                type: string
+
+    delete:
+      summary: Delete manifest
+      operationId: deleteManifest
+      responses:
+        '202':
+          description: Manifest deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /{name}/tags/list:
+    parameters:
+      - $ref: '#/components/parameters/Name'
+
+    get:
+      summary: List tags
+      operationId: listTags
+      parameters:
+        - name: n
+          in: query
+          schema:
+            type: integer
+          description: Maximum number of results
+        - name: last
+          in: query
+          schema:
+            type: string
+          description: Last tag for pagination
+      responses:
+        '200':
+          description: Tag list
+          headers:
+            Link:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagList'
+
+  /_catalog:
+    get:
+      summary: List repositories
+      operationId: listRepositories
+      parameters:
+        - name: n
+          in: query
+          schema:
+            type: integer
+        - name: last
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Repository list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepositoryCatalog'
+
+components:
+  parameters:
+    Name:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Repository name (may include slashes)
+
+    Digest:
+      name: digest
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-zA-Z0-9_+.-]+:[a-fA-F0-9]+$'
+      description: Content-addressable digest
+
+    Reference:
+      name: reference
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Tag name or digest
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Errors'
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Errors'
+
+  schemas:
+    Errors:
+      type: object
+      properties:
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              code:
+                type: string
+              message:
+                type: string
+              detail:
+                type: object
+
+    TagList:
+      type: object
+      properties:
+        name:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+
+    RepositoryCatalog:
+      type: object
+      properties:
+        repositories:
+          type: array
+          items:
+            type: string
+
+    ManifestV2:
+      type: object
+      properties:
+        schemaVersion:
+          type: integer
+          const: 2
+        mediaType:
+          type: string
+        config:
+          $ref: '#/components/schemas/Descriptor'
+        layers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Descriptor'
+
+    OCIManifest:
+      type: object
+      properties:
+        schemaVersion:
+          type: integer
+          const: 2
+        mediaType:
+          type: string
+        config:
+          $ref: '#/components/schemas/Descriptor'
+        layers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Descriptor'
+        annotations:
+          type: object
+          additionalProperties:
+            type: string
+
+    OCIIndex:
+      type: object
+      properties:
+        schemaVersion:
+          type: integer
+          const: 2
+        mediaType:
+          type: string
+        manifests:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/Descriptor'
+              - type: object
+                properties:
+                  platform:
+                    $ref: '#/components/schemas/Platform'
+        annotations:
+          type: object
+          additionalProperties:
+            type: string
+
+    Descriptor:
+      type: object
+      required: [mediaType, size, digest]
+      properties:
+        mediaType:
+          type: string
+        size:
+          type: integer
+          format: int64
+        digest:
+          type: string
+        urls:
+          type: array
+          items:
+            type: string
+        annotations:
+          type: object
+          additionalProperties:
+            type: string
+
+    Platform:
+      type: object
+      properties:
+        architecture:
+          type: string
+        os:
+          type: string
+        os.version:
+          type: string
+        os.features:
+          type: array
+          items:
+            type: string
+        variant:
+          type: string

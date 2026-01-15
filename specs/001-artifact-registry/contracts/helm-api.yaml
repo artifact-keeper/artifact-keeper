@@ -1,0 +1,450 @@
+openapi: 3.1.0
+info:
+  title: Helm Chart Repository API
+  description: |
+    Helm Chart Repository specification for hosting Helm charts.
+    Implements the Helm Chart Repository protocol.
+
+    Helm clients interact with repositories via:
+    - index.yaml - Chart index containing all chart metadata
+    - *.tgz - Packaged chart archives
+
+    Reference: https://helm.sh/docs/topics/chart_repository/
+  version: 1.0.0
+
+servers:
+  - url: /repository/{repo-key}
+    description: Helm repository base URL
+    variables:
+      repo-key:
+        default: helm-repo
+        description: Repository key
+
+paths:
+  /index.yaml:
+    get:
+      summary: Get chart repository index
+      operationId: getIndex
+      description: |
+        Returns the repository index containing metadata for all charts.
+        This is the main entry point for Helm clients.
+
+        Usage: `helm repo add myrepo http://registry/repository/helm-repo`
+      security: []
+      responses:
+        '200':
+          description: Repository index
+          content:
+            application/x-yaml:
+              schema:
+                $ref: '#/components/schemas/ChartIndex'
+            text/yaml:
+              schema:
+                $ref: '#/components/schemas/ChartIndex'
+
+  /{chart}-{version}.tgz:
+    parameters:
+      - name: chart
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Chart name
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Chart version (semver)
+
+    get:
+      summary: Download chart package
+      operationId: downloadChart
+      description: |
+        Download a packaged Helm chart (.tgz archive).
+
+        Usage: `helm pull myrepo/mychart --version 1.0.0`
+      responses:
+        '200':
+          description: Chart package
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment; filename="mychart-1.0.0.tgz"
+            X-Checksum-SHA256:
+              schema:
+                type: string
+          content:
+            application/x-tar:
+              schema:
+                type: string
+                format: binary
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Chart not found
+
+  /api/charts:
+    get:
+      summary: List all charts
+      operationId: listCharts
+      description: |
+        List all charts in the repository.
+        ChartMuseum-compatible API extension.
+      responses:
+        '200':
+          description: Chart list
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ChartVersion'
+
+    post:
+      summary: Upload chart
+      operationId: uploadChart
+      description: |
+        Upload a new chart package.
+        ChartMuseum-compatible API extension.
+
+        Usage: `curl -F "chart=@mychart-1.0.0.tgz" http://registry/repository/helm-repo/api/charts`
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                chart:
+                  type: string
+                  format: binary
+                  description: Chart package (.tgz)
+                prov:
+                  type: string
+                  format: binary
+                  description: Provenance file (.prov) - optional
+                force:
+                  type: boolean
+                  default: false
+                  description: Overwrite existing version
+      responses:
+        '201':
+          description: Chart uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+        '409':
+          description: Chart version already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/charts/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get chart versions
+      operationId: getChartVersions
+      description: List all versions of a specific chart
+      responses:
+        '200':
+          description: Chart versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ChartVersion'
+        '404':
+          description: Chart not found
+
+    delete:
+      summary: Delete all versions of chart
+      operationId: deleteChart
+      responses:
+        '200':
+          description: Chart deleted
+        '404':
+          description: Chart not found
+
+  /api/charts/{name}/{version}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Get specific chart version
+      operationId: getChartVersion
+      responses:
+        '200':
+          description: Chart version metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChartVersion'
+        '404':
+          description: Chart version not found
+
+    delete:
+      summary: Delete specific chart version
+      operationId: deleteChartVersion
+      responses:
+        '200':
+          description: Chart version deleted
+        '404':
+          description: Chart version not found
+
+  /api/prov/{name}-{version}.tgz.prov:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: path
+        required: true
+        schema:
+          type: string
+
+    get:
+      summary: Download provenance file
+      operationId: getProvenance
+      description: |
+        Download chart provenance file for verification.
+
+        Usage: `helm verify mychart-1.0.0.tgz`
+      responses:
+        '200':
+          description: Provenance file
+          content:
+            application/pgp-signature:
+              schema:
+                type: string
+        '404':
+          description: Provenance not found
+
+components:
+  schemas:
+    ChartIndex:
+      type: object
+      description: |
+        Helm repository index (index.yaml).
+        See: https://helm.sh/docs/topics/chart_repository/#the-index-file
+      required:
+        - apiVersion
+        - entries
+        - generated
+      properties:
+        apiVersion:
+          type: string
+          enum: [v1]
+          description: Index file version
+        entries:
+          type: object
+          description: Map of chart name to versions
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/ChartEntry'
+        generated:
+          type: string
+          format: date-time
+          description: Index generation timestamp
+        publicKeys:
+          type: array
+          items:
+            type: string
+          description: PGP public keys for verification
+
+    ChartEntry:
+      type: object
+      description: Chart metadata in index
+      required:
+        - apiVersion
+        - name
+        - version
+        - digest
+        - urls
+      properties:
+        apiVersion:
+          type: string
+          enum: [v1, v2]
+          description: Chart API version
+        name:
+          type: string
+          description: Chart name
+        version:
+          type: string
+          description: Chart version (semver)
+        kubeVersion:
+          type: string
+          description: Compatible Kubernetes versions
+        description:
+          type: string
+          description: Chart description
+        type:
+          type: string
+          enum: [application, library]
+          default: application
+        keywords:
+          type: array
+          items:
+            type: string
+        home:
+          type: string
+          format: uri
+          description: Project home page
+        sources:
+          type: array
+          items:
+            type: string
+            format: uri
+          description: Source code URLs
+        dependencies:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChartDependency'
+        maintainers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Maintainer'
+        icon:
+          type: string
+          format: uri
+          description: Icon URL
+        appVersion:
+          type: string
+          description: Application version
+        deprecated:
+          type: boolean
+          default: false
+        annotations:
+          type: object
+          additionalProperties:
+            type: string
+        created:
+          type: string
+          format: date-time
+        digest:
+          type: string
+          description: SHA256 digest of chart package
+        urls:
+          type: array
+          items:
+            type: string
+            format: uri
+          description: Download URLs (relative or absolute)
+
+    ChartDependency:
+      type: object
+      required:
+        - name
+        - version
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        repository:
+          type: string
+          format: uri
+        condition:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        enabled:
+          type: boolean
+        import-values:
+          type: array
+          items:
+            type: string
+        alias:
+          type: string
+
+    Maintainer:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        url:
+          type: string
+          format: uri
+
+    ChartVersion:
+      type: object
+      description: ChartMuseum API chart version response
+      properties:
+        name:
+          type: string
+        home:
+          type: string
+        sources:
+          type: array
+          items:
+            type: string
+        version:
+          type: string
+        description:
+          type: string
+        keywords:
+          type: array
+          items:
+            type: string
+        maintainers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Maintainer'
+        icon:
+          type: string
+        apiVersion:
+          type: string
+        appVersion:
+          type: string
+        urls:
+          type: array
+          items:
+            type: string
+        created:
+          type: string
+          format: date-time
+        digest:
+          type: string
+
+    UploadResponse:
+      type: object
+      properties:
+        saved:
+          type: boolean
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
