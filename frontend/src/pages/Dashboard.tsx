@@ -1,17 +1,20 @@
-import { Card, Row, Col, Statistic, Spin, Alert, Table, Tag } from 'antd'
+import { Card, Row, Col, Statistic, Spin, Alert, Table, Tag, Button, Space, Tooltip } from 'antd'
 import {
   DatabaseOutlined,
   FileOutlined,
   UserOutlined,
   HddOutlined,
   CheckCircleOutlined,
-  CloseCircleOutlined
+  CloseCircleOutlined,
+  ReloadOutlined
 } from '@ant-design/icons'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
 import { adminApi, repositoriesApi } from '../api'
 import type { Repository } from '../types'
 import { useAuth } from '../contexts'
+import { useDocumentTitle } from '../hooks'
+import { useNavigate } from 'react-router-dom'
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B'
@@ -22,29 +25,41 @@ const formatBytes = (bytes: number): string => {
 }
 
 const Dashboard = () => {
+  useDocumentTitle('Dashboard')
   const { user } = useAuth()
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
 
-  const { data: stats, isLoading: statsLoading, error: statsError } = useQuery({
+  const { data: stats, isLoading: statsLoading, error: statsError, isFetching: statsFetching } = useQuery({
     queryKey: ['admin-stats'],
     queryFn: () => adminApi.getStats(),
     enabled: user?.is_admin,
   })
 
-  const { data: health, isLoading: healthLoading } = useQuery({
+  const { data: health, isLoading: healthLoading, isFetching: healthFetching } = useQuery({
     queryKey: ['health'],
     queryFn: () => adminApi.getHealth(),
   })
 
-  const { data: recentRepos, isLoading: reposLoading } = useQuery({
+  const { data: recentRepos, isLoading: reposLoading, isFetching: reposFetching } = useQuery({
     queryKey: ['recent-repositories'],
     queryFn: () => repositoriesApi.list({ per_page: 5 }),
   })
+
+  const handleRefresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['admin-stats'] })
+    queryClient.invalidateQueries({ queryKey: ['health'] })
+    queryClient.invalidateQueries({ queryKey: ['recent-repositories'] })
+  }
+
+  const isRefreshing = statsFetching || healthFetching || reposFetching
 
   const repoColumns: ColumnsType<Repository> = [
     {
       title: 'Key',
       dataIndex: 'key',
       key: 'key',
+      render: (key: string) => <a onClick={() => navigate(`/repositories/${key}`)}>{key}</a>,
     },
     {
       title: 'Format',
@@ -79,7 +94,18 @@ const Dashboard = () => {
 
   return (
     <div>
-      <h1>Dashboard</h1>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <h1 style={{ margin: 0 }}>Dashboard</h1>
+        <Tooltip title="Refresh data">
+          <Button
+            icon={<ReloadOutlined spin={isRefreshing} />}
+            onClick={handleRefresh}
+            loading={isRefreshing}
+          >
+            Refresh
+          </Button>
+        </Tooltip>
+      </div>
 
       {/* System Health */}
       <Card title="System Health" style={{ marginBottom: 16 }}>
@@ -122,7 +148,7 @@ const Dashboard = () => {
         ) : (
           <Row gutter={16} style={{ marginBottom: 16 }}>
             <Col span={6}>
-              <Card>
+              <Card hoverable onClick={() => navigate('/repositories')}>
                 <Statistic
                   title="Repositories"
                   value={stats?.total_repositories || 0}
@@ -140,7 +166,7 @@ const Dashboard = () => {
               </Card>
             </Col>
             <Col span={6}>
-              <Card>
+              <Card hoverable onClick={() => navigate('/users')}>
                 <Statistic
                   title="Users"
                   value={stats?.total_users || 0}
@@ -168,7 +194,14 @@ const Dashboard = () => {
       )}
 
       {/* Recent Repositories */}
-      <Card title="Recent Repositories">
+      <Card
+        title="Recent Repositories"
+        extra={
+          <Button type="link" onClick={() => navigate('/repositories')}>
+            View All
+          </Button>
+        }
+      >
         <Table
           columns={repoColumns}
           dataSource={recentRepos?.items || []}
@@ -176,6 +209,7 @@ const Dashboard = () => {
           loading={reposLoading}
           pagination={false}
           size="small"
+          locale={{ emptyText: 'No repositories yet. Create your first repository!' }}
         />
       </Card>
     </div>

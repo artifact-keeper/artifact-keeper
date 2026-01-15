@@ -4,9 +4,11 @@ import type { ColumnsType } from 'antd/es/table'
 import { useQuery } from '@tanstack/react-query'
 import { adminApi } from '../api'
 import { useAuth } from '../contexts'
+import { useDocumentTitle } from '../hooks'
 import type { User } from '../types'
 
 const Users = () => {
+  useDocumentTitle('Users')
   const { user: currentUser } = useAuth()
 
   const { data: users, isLoading, error } = useQuery({

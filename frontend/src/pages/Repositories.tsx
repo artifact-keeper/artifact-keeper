@@ -1,11 +1,12 @@
 import { useState } from 'react'
-import { Table, Button, Space, Tag, Modal, Form, Input, Select, Switch, message, Popconfirm, Row, Col } from 'antd'
-import { PlusOutlined, DeleteOutlined, EyeOutlined, EditOutlined, FilterOutlined } from '@ant-design/icons'
+import { Table, Button, Space, Tag, Modal, Form, Input, Select, Switch, message, Popconfirm, Row, Col, Tooltip } from 'antd'
+import { PlusOutlined, DeleteOutlined, EyeOutlined, EditOutlined, FilterOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnsType, TableProps } from 'antd/es/table'
 import { repositoriesApi } from '../api'
 import type { Repository, CreateRepositoryRequest, RepositoryFormat, RepositoryType } from '../types'
+import { useDocumentTitle } from '../hooks'
 
 const formatOptions: { value: RepositoryFormat; label: string }[] = [
   { value: 'maven', label: 'Maven' },
@@ -36,6 +37,7 @@ const formatBytes = (bytes: number): string => {
 }
 
 const Repositories = () => {
+  useDocumentTitle('Repositories')
   const [createModalOpen, setCreateModalOpen] = useState(false)
   const [editModalOpen, setEditModalOpen] = useState(false)
   const [editingRepo, setEditingRepo] = useState<Repository | null>(null)
@@ -46,7 +48,7 @@ const Repositories = () => {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isFetching } = useQuery({
     queryKey: ['repositories', formatFilter, typeFilter],
     queryFn: () => repositoriesApi.list({ per_page: 100, format: formatFilter, repo_type: typeFilter }),
   })
@@ -207,13 +209,25 @@ const Repositories = () => {
     },
   ]
 
+  const handleRefresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['repositories'] })
+  }
+
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 16 }}>
-        <h1>Repositories</h1>
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>
-          Create Repository
-        </Button>
+        <h1 style={{ margin: 0 }}>Repositories</h1>
+        <Space>
+          <Tooltip title="Refresh">
+            <Button
+              icon={<ReloadOutlined spin={isFetching} />}
+              onClick={handleRefresh}
+            />
+          </Tooltip>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>
+            Create Repository
+          </Button>
+        </Space>
       </div>
 
       {/* Quick Filters */}
