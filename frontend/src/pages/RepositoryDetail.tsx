@@ -13,7 +13,11 @@ import {
   Popconfirm,
   Spin,
   Empty,
-  Typography
+  Typography,
+  Modal,
+  Upload,
+  Form,
+  Progress
 } from 'antd'
 import {
   ArrowLeftOutlined,
@@ -21,15 +25,19 @@ import {
   DeleteOutlined,
   SearchOutlined,
   FileOutlined,
-  FolderOutlined
+  FolderOutlined,
+  UploadOutlined,
+  InboxOutlined
 } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
+import type { UploadFile } from 'antd/es/upload/interface'
 import { repositoriesApi, artifactsApi } from '../api'
 import type { Artifact } from '../types'
 
 const { Search } = Input
 const { Text } = Typography
+const { Dragger } = Upload
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B'
@@ -44,6 +52,11 @@ const RepositoryDetail = () => {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [searchQuery, setSearchQuery] = useState('')
+  const [uploadModalOpen, setUploadModalOpen] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [uploading, setUploading] = useState(false)
+  const [fileList, setFileList] = useState<UploadFile[]>([])
+  const [form] = Form.useForm()
 
   const { data: repository, isLoading: repoLoading } = useQuery({
     queryKey: ['repository', key],
@@ -62,6 +75,7 @@ const RepositoryDetail = () => {
     onSuccess: () => {
       message.success('Artifact deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['artifacts', key] })
+      queryClient.invalidateQueries({ queryKey: ['repository', key] })
     },
     onError: () => {
       message.error('Failed to delete artifact')
@@ -71,14 +85,42 @@ const RepositoryDetail = () => {
   const handleDownload = (artifact: Artifact) => {
     const url = artifactsApi.getDownloadUrl(key!, artifact.path)
     const token = localStorage.getItem('access_token')
-
-    // Create a temporary link to download with auth header
     const link = document.createElement('a')
     link.href = `${url}?token=${token}`
     link.download = artifact.name
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)
+  }
+
+  const handleUpload = async () => {
+    if (fileList.length === 0) {
+      message.error('Please select a file to upload')
+      return
+    }
+
+    const values = await form.validateFields()
+    const file = fileList[0].originFileObj as File
+
+    setUploading(true)
+    setUploadProgress(0)
+
+    try {
+      await artifactsApi.upload(key!, file, values.path, (percent) => {
+        setUploadProgress(percent)
+      })
+      message.success('Artifact uploaded successfully')
+      queryClient.invalidateQueries({ queryKey: ['artifacts', key] })
+      queryClient.invalidateQueries({ queryKey: ['repository', key] })
+      setUploadModalOpen(false)
+      setFileList([])
+      form.resetFields()
+    } catch (error) {
+      message.error('Failed to upload artifact')
+    } finally {
+      setUploading(false)
+      setUploadProgress(0)
+    }
   }
 
   const columns: ColumnsType<Artifact> = [
@@ -178,9 +220,16 @@ const RepositoryDetail = () => {
         <Breadcrumb.Item>{repository.key}</Breadcrumb.Item>
       </Breadcrumb>
 
-      <div style={{ marginBottom: 16 }}>
+      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between' }}>
         <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/repositories')}>
           Back to Repositories
+        </Button>
+        <Button
+          type="primary"
+          icon={<UploadOutlined />}
+          onClick={() => setUploadModalOpen(true)}
+        >
+          Upload Artifact
         </Button>
       </div>
 
@@ -237,6 +286,79 @@ const RepositoryDetail = () => {
           }}
         />
       </Card>
+
+      <Modal
+        title="Upload Artifact"
+        open={uploadModalOpen}
+        onCancel={() => {
+          if (!uploading) {
+            setUploadModalOpen(false)
+            setFileList([])
+            form.resetFields()
+          }
+        }}
+        footer={[
+          <Button
+            key="cancel"
+            onClick={() => {
+              setUploadModalOpen(false)
+              setFileList([])
+              form.resetFields()
+            }}
+            disabled={uploading}
+          >
+            Cancel
+          </Button>,
+          <Button
+            key="upload"
+            type="primary"
+            onClick={handleUpload}
+            loading={uploading}
+            disabled={fileList.length === 0}
+          >
+            Upload
+          </Button>,
+        ]}
+      >
+        <Form form={form} layout="vertical">
+          <Form.Item
+            name="path"
+            label="Path (optional)"
+            help="Specify a custom path for the artifact, e.g., 'libs/mylib-1.0.jar'"
+          >
+            <Input placeholder="path/to/artifact" />
+          </Form.Item>
+
+          <Form.Item label="File" required>
+            <Dragger
+              fileList={fileList}
+              beforeUpload={(file) => {
+                setFileList([file as unknown as UploadFile])
+                return false
+              }}
+              onRemove={() => {
+                setFileList([])
+              }}
+              maxCount={1}
+              disabled={uploading}
+            >
+              <p className="ant-upload-drag-icon">
+                <InboxOutlined />
+              </p>
+              <p className="ant-upload-text">Click or drag file to this area to upload</p>
+              <p className="ant-upload-hint">
+                Upload a single artifact file to this repository
+              </p>
+            </Dragger>
+          </Form.Item>
+
+          {uploading && (
+            <Form.Item label="Upload Progress">
+              <Progress percent={uploadProgress} status="active" />
+            </Form.Item>
+          )}
+        </Form>
+      </Modal>
     </div>
   )
 }

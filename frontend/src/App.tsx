@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Layout, Spin } from 'antd'
 import { useAuth } from './contexts'
+import ErrorBoundary from './components/ErrorBoundary'
 import AppHeader from './components/layout/Header'
 import AppSidebar from './components/layout/Sidebar'
 import Dashboard from './pages/Dashboard'
@@ -9,6 +10,7 @@ import RepositoryDetail from './pages/RepositoryDetail'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
 import Login from './pages/Login'
+import NotFound from './pages/NotFound'
 
 const { Content } = Layout
 
@@ -45,6 +47,7 @@ function AppContent() {
             <Route path="/users" element={<Users />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/login" element={<Navigate to="/" replace />} />
+            <Route path="*" element={<NotFound />} />
           </Routes>
         </Content>
       </Layout>
@@ -54,9 +57,11 @@ function AppContent() {
 
 function App() {
   return (
-    <BrowserRouter>
-      <AppContent />
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <AppContent />
+      </BrowserRouter>
+    </ErrorBoundary>
   )
 }
 

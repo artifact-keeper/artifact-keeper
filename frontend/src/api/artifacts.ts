@@ -34,6 +34,36 @@ export const artifactsApi = {
     const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:9080';
     return `${baseUrl}/api/v1/repositories/${repoKey}/artifacts/${encodeURIComponent(artifactPath)}/download`;
   },
+
+  upload: async (
+    repoKey: string,
+    file: File,
+    path?: string,
+    onProgress?: (percent: number) => void
+  ): Promise<Artifact> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (path) {
+      formData.append('path', path);
+    }
+
+    const response = await apiClient.post<Artifact>(
+      `/api/v1/repositories/${repoKey}/artifacts`,
+      formData,
+      {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+        onUploadProgress: (progressEvent) => {
+          if (progressEvent.total && onProgress) {
+            const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            onProgress(percent);
+          }
+        },
+      }
+    );
+    return response.data;
+  },
 };
 
 export default artifactsApi;
