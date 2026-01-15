@@ -1,0 +1,25 @@
+# Playwright test runner container
+FROM mcr.microsoft.com/playwright:v1.41.0-jammy
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json* ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy test files and config
+COPY playwright.config.ts ./
+COPY e2e/ ./e2e/
+COPY tsconfig.json ./
+
+# Create test results directory
+RUN mkdir -p /app/test-results /app/playwright-report
+
+# Set environment variables
+ENV CI=true
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+# Default command - run all E2E tests
+CMD ["npx", "playwright", "test", "--reporter=html"]

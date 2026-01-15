@@ -1,0 +1,104 @@
+# Docker Compose configuration for automated E2E testing
+# Usage: ./scripts/run-e2e-tests.sh
+# Or: docker compose -f docker-compose.test.yml up --abort-on-container-exit --exit-code-from playwright
+
+version: '3.8'
+
+services:
+  # PostgreSQL database
+  postgres:
+    image: postgres:16-alpine
+    container_name: e2e-test-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    tmpfs:
+      - /var/lib/postgresql/data  # Use tmpfs for faster tests
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - e2e-test-network
+
+  # Backend API server
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: e2e-test-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      JWT_SECRET: e2e-test-secret-key-32-bytes-long
+      RUST_LOG: info
+      HOST: 0.0.0.0
+      PORT: 8080
+    tmpfs:
+      - /data  # Use tmpfs for faster tests
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 10s
+      start_period: 30s
+      retries: 10
+    networks:
+      - e2e-test-network
+
+  # Frontend development server
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: e2e-test-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      VITE_API_URL: http://backend:8080
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5173"]
+      interval: 5s
+      timeout: 10s
+      start_period: 30s
+      retries: 10
+    networks:
+      - e2e-test-network
+
+  # Playwright test runner
+  playwright:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.playwright
+    container_name: e2e-test-playwright
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    environment:
+      # Point Playwright at the frontend container
+      BASE_URL: http://frontend:5173
+      CI: "true"
+    volumes:
+      # Mount test results for inspection after run
+      - ./test-results:/app/test-results
+      - ./playwright-report:/app/playwright-report
+    command: >
+      npx playwright test
+      --reporter=html
+      --config=playwright.config.ts
+    networks:
+      - e2e-test-network
+
+networks:
+  e2e-test-network:
+    name: e2e-test-network
+    driver: bridge

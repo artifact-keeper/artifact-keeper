@@ -44,6 +44,11 @@ coverage/
 .pytest_cache/
 __pycache__/
 
+# E2E Test Results
+test-results/
+playwright-report/
+playwright/.cache/
+
 # Database
 *.db
 *.sqlite
