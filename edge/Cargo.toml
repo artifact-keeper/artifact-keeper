@@ -1,0 +1,49 @@
+[package]
+name = "indiana-jones-edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "indiana-jones-edge"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Web framework
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# HTTP client
+reqwest.workspace = true
+
+# Logging/Tracing
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Config
+dotenvy.workspace = true
+
+# UUID
+uuid.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Async streams
+futures.workspace = true
+bytes.workspace = true
+
+# LRU cache
+lru = "0.12"

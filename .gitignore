@@ -1,0 +1,66 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node.js (frontend)
+node_modules/
+dist/
+.next/
+.nuxt/
+*.tsbuildinfo
+
+# Coverage
+coverage/
+*.lcov
+
+# Testing
+.pytest_cache/
+__pycache__/
+
+# Database
+*.db
+*.sqlite
+
+# Secrets (never commit these)
+*.pem
+*.key
+secrets/
+credentials/
+
+# Backup files
+*.bak
+*.backup
+
+# Local development
+.local/
+*.local.md
+
+# Claude Code local config
+.claude/
