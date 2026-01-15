@@ -33,9 +33,9 @@ sha2.workspace = true
 md-5.workspace = true
 sha1.workspace = true
 
-# S3 storage
-aws-sdk-s3.workspace = true
-aws-config.workspace = true
+# S3 storage - disabled until AWS SDK supports Rust 1.85+
+# aws-sdk-s3.workspace = true
+# aws-config.workspace = true
 
 # Logging/Tracing
 tracing.workspace = true
