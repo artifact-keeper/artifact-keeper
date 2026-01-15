@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Form, Input, Button, Card, message, Alert } from 'antd'
 import { UserOutlined, LockOutlined } from '@ant-design/icons'
 import { useAuth } from '../contexts'
+import { useDocumentTitle } from '../hooks'
 
 interface LoginValues {
   username: string
@@ -9,6 +10,7 @@ interface LoginValues {
 }
 
 const Login = () => {
+  useDocumentTitle('Login')
   const { login } = useAuth()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)

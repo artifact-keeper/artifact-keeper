@@ -1,7 +1,9 @@
 import { Card, Form, Input, Tabs, Alert } from 'antd'
 import { useAuth } from '../contexts'
+import { useDocumentTitle } from '../hooks'
 
 const Settings = () => {
+  useDocumentTitle('Settings')
   const { user } = useAuth()
 
   if (!user?.is_admin) {

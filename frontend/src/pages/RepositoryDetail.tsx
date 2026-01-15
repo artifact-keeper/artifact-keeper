@@ -38,6 +38,7 @@ import type { ColumnsType } from 'antd/es/table'
 import type { UploadFile } from 'antd/es/upload/interface'
 import { repositoriesApi, artifactsApi } from '../api'
 import type { Artifact } from '../types'
+import { useDocumentTitle } from '../hooks'
 
 const { Search } = Input
 const { Text, Paragraph } = Typography
@@ -53,6 +54,7 @@ const formatBytes = (bytes: number): string => {
 
 const RepositoryDetail = () => {
   const { key } = useParams<{ key: string }>()
+  useDocumentTitle(key ? `Repository: ${key}` : 'Repository')
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [searchQuery, setSearchQuery] = useState('')
