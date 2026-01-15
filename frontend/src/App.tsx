@@ -1,47 +1,61 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { Layout } from 'antd'
+import { Layout, Spin } from 'antd'
+import { useAuth } from './contexts'
 import AppHeader from './components/layout/Header'
 import AppSidebar from './components/layout/Sidebar'
 import Dashboard from './pages/Dashboard'
 import Repositories from './pages/Repositories'
+import RepositoryDetail from './pages/RepositoryDetail'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
 import Login from './pages/Login'
 
 const { Content } = Layout
 
-function App() {
-  // TODO: Implement proper auth state management
-  const isAuthenticated = true
+function AppContent() {
+  const { isAuthenticated, isLoading } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
+        <Spin size="large" tip="Loading..." />
+      </div>
+    )
+  }
 
   if (!isAuthenticated) {
     return (
-      <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route path="*" element={<Navigate to="/login" replace />} />
-        </Routes>
-      </BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
     )
   }
 
   return (
-    <BrowserRouter>
-      <Layout style={{ minHeight: '100vh' }}>
-        <AppSidebar />
-        <Layout>
-          <AppHeader />
-          <Content style={{ margin: '24px 16px', padding: 24, background: '#fff' }}>
-            <Routes>
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/repositories" element={<Repositories />} />
-              <Route path="/users" element={<Users />} />
-              <Route path="/settings" element={<Settings />} />
-              <Route path="/login" element={<Navigate to="/" replace />} />
-            </Routes>
-          </Content>
-        </Layout>
+    <Layout style={{ minHeight: '100vh' }}>
+      <AppSidebar />
+      <Layout>
+        <AppHeader />
+        <Content style={{ margin: '24px 16px', padding: 24, background: '#fff' }}>
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/repositories" element={<Repositories />} />
+            <Route path="/repositories/:key" element={<RepositoryDetail />} />
+            <Route path="/users" element={<Users />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="/login" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Content>
       </Layout>
+    </Layout>
+  )
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <AppContent />
     </BrowserRouter>
   )
 }
