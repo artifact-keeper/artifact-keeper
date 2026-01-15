@@ -33,9 +33,9 @@ sha2 = "0.10"
 md-5 = "0.10"
 sha1 = "0.10"
 
-# S3 storage
-aws-sdk-s3 = "1.15"
-aws-config = "1.1"
+# S3 storage (pinned for Rust 1.85 compatibility)
+aws-sdk-s3 = "=1.65.0"
+aws-config = "=1.5.10"
 
 # Logging/Tracing
 tracing = "0.1"
