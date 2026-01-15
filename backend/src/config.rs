@@ -68,7 +68,7 @@ impl Config {
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             storage_backend: env::var("STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into()),
             storage_path: env::var("STORAGE_PATH")
-                .unwrap_or_else(|_| "/var/lib/indiana-jones/artifacts".into()),
+                .unwrap_or_else(|_| "/var/lib/artifact-keeper/artifacts".into()),
             s3_bucket: env::var("S3_BUCKET").ok(),
             s3_region: env::var("S3_REGION").ok(),
             s3_endpoint: env::var("S3_ENDPOINT").ok(),

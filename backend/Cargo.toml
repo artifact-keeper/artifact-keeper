@@ -1,11 +1,11 @@
 [package]
-name = "indiana-jones-backend"
+name = "artifact-keeper-backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "indiana-jones"
+name = "artifact-keeper"
 path = "src/main.rs"
 
 [dependencies]

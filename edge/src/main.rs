@@ -1,4 +1,4 @@
-//! Indiana Jones Edge Node - Distributed caching node.
+//! Artifact Keeper Edge Node - Distributed caching node.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "indiana_jones_edge=debug".into()),
+                .unwrap_or_else(|_| "artifact_keeper_edge=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap_or(1024);
 
-    tracing::info!("Starting Indiana Jones Edge Node");
+    tracing::info!("Starting Artifact Keeper Edge Node");
     tracing::info!("Primary registry: {}", primary_url);
 
     // Create cache

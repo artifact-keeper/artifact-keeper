@@ -22,7 +22,7 @@ const Login = () => {
       background: '#f0f2f5'
     }}>
       <Card style={{ width: 400 }}>
-        <h1 style={{ textAlign: 'center', marginBottom: 24 }}>Indiana Jones</h1>
+        <h1 style={{ textAlign: 'center', marginBottom: 24 }}>Artifact Keeper</h1>
         <h3 style={{ textAlign: 'center', marginBottom: 24, color: '#666' }}>
           Artifact Registry
         </h3>

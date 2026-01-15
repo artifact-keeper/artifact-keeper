@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Indiana Jones Artifact Registry API
+  title: Artifact Keeper API
   description: |
     Open-source artifact registry API supporting multiple package formats.
     This is the administrative and generic artifact API. Format-specific

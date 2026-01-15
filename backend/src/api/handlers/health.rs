@@ -83,9 +83,9 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
 /// Prometheus metrics endpoint
 pub async fn metrics() -> impl IntoResponse {
     // TODO: Implement proper Prometheus metrics collection
-    let metrics = r#"# HELP indiana_jones_http_requests_total Total HTTP requests
-# TYPE indiana_jones_http_requests_total counter
-indiana_jones_http_requests_total{method="GET",path="/health"} 1
+    let metrics = r#"# HELP artifact_keeper_http_requests_total Total HTTP requests
+# TYPE artifact_keeper_http_requests_total counter
+artifact_keeper_http_requests_total{method="GET",path="/health"} 1
 "#;
 
     (

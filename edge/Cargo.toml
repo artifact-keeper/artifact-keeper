@@ -1,11 +1,11 @@
 [package]
-name = "indiana-jones-edge"
+name = "artifact-keeper-edge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "indiana-jones-edge"
+name = "artifact-keeper-edge"
 path = "src/main.rs"
 
 [dependencies]

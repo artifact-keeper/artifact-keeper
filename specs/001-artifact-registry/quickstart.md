@@ -1,4 +1,4 @@
-# Quickstart: Indiana Jones Artifact Registry
+# Quickstart: Artifact Keeper
 
 Get the artifact registry running locally in under 5 minutes.
 
@@ -13,8 +13,8 @@ Get the artifact registry running locally in under 5 minutes.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourorg/indiana-jones.git
-cd indiana-jones
+git clone https://github.com/yourorg/artifact-keeper.git
+cd artifact-keeper
 
 # Start all services
 docker compose up -d
@@ -165,7 +165,7 @@ Add to `~/.m2/settings.xml`:
 <settings>
   <servers>
     <server>
-      <id>indiana-jones</id>
+      <id>artifact-keeper</id>
       <username>admin</username>
       <password>admin123</password>
     </server>
@@ -178,14 +178,14 @@ Add to your `pom.xml`:
 ```xml
 <repositories>
   <repository>
-    <id>indiana-jones</id>
+    <id>artifact-keeper</id>
     <url>http://localhost:8080/repository/my-maven-repo</url>
   </repository>
 </repositories>
 
 <distributionManagement>
   <repository>
-    <id>indiana-jones</id>
+    <id>artifact-keeper</id>
     <url>http://localhost:8080/repository/my-maven-repo</url>
   </repository>
 </distributionManagement>
@@ -247,7 +247,7 @@ docker run -d \
   -e STORAGE_PATH=/var/lib/registry/cache \
   -p 8080:8080 \
   -v registry-cache:/var/lib/registry/cache \
-  indiana-jones-edge:latest
+  artifact-keeper-edge:latest
 ```
 
 Configure replication in primary UI:

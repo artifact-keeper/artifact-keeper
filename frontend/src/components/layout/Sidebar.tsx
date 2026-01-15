@@ -57,7 +57,7 @@ const AppSidebar = () => {
   return (
     <Sider width={200} theme="dark">
       <div style={{ height: 32, margin: 16, color: '#fff', fontSize: 18, fontWeight: 'bold', textAlign: 'center' }}>
-        Indiana Jones
+        Artifact Keeper
       </div>
       <Menu
         theme="dark"

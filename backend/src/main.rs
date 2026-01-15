@@ -1,4 +1,4 @@
-//! Indiana Jones Artifact Registry - Main Entry Point
+//! Artifact Keeper - Main Entry Point
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use indiana_jones_backend::{api, config::Config, db, error::Result};
+use artifact_keeper_backend::{api, config::Config, db, error::Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,14 +19,14 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "indiana_jones_backend=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "artifact_keeper_backend=debug,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     // Load configuration
     let config = Config::from_env()?;
-    tracing::info!("Starting Indiana Jones Artifact Registry");
+    tracing::info!("Starting Artifact Keeper");
 
     // Connect to database
     let db_pool = db::create_pool(&config.database_url).await?;

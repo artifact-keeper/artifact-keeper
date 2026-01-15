@@ -1,4 +1,4 @@
-//! Indiana Jones Artifact Registry - Backend Library
+//! Artifact Keeper - Backend Library
 //!
 //! Open-source artifact registry supporting 13+ package formats.
 

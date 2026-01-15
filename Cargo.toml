@@ -6,7 +6,7 @@ members = ["backend", "edge"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/yourorg/indiana-jones"
+repository = "https://github.com/yourorg/artifact-keeper"
 
 [workspace.dependencies]
 # Async runtime
