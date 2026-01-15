@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE edge_nodes\n            SET status = 'offline'\n            WHERE status = 'online'\n              AND last_heartbeat_at < NOW() - make_interval(mins => $1)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d26ecd0b536eca704dd66adb3494871728d2d73b2b0969910585ea15e3d28a0c"
+}

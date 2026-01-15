@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT a.content_type as \"value!\", COUNT(*) as \"count!\"\n            FROM artifacts a\n            WHERE a.is_deleted = false\n            GROUP BY a.content_type\n            ORDER BY 2 DESC\n            LIMIT 20\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "value!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "ebdafe1f100cbabe73a8d4efa591d6f973048159a2282e39552779a75705b04f"
+}

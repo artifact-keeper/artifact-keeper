@@ -142,7 +142,7 @@ impl ArtifactService {
         repository_id: Uuid,
         path: &str,
         user_id: Option<Uuid>,
-        ip_address: std::net::IpAddr,
+        ip_address: Option<String>,
         user_agent: Option<&str>,
     ) -> Result<(Artifact, Bytes)> {
         // Find artifact
@@ -176,10 +176,7 @@ impl ArtifactService {
             "#,
             artifact.id,
             user_id,
-            ip_address.to_string().parse::<std::net::IpAddr>().ok().map(|ip| {
-                use std::str::FromStr;
-                sqlx::postgres::types::PgInet(std::net::IpAddr::from_str(&ip.to_string()).unwrap())
-            }),
+            ip_address.as_deref(),
             user_agent
         )
         .execute(&self.db)

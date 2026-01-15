@@ -53,12 +53,12 @@ pub struct AuthService {
 impl AuthService {
     /// Create a new authentication service
     pub fn new(db: PgPool, config: Arc<Config>) -> Self {
-        let secret = config.jwt_secret.as_bytes();
+        let secret = config.jwt_secret.clone();
         Self {
             db,
             config,
-            encoding_key: EncodingKey::from_secret(secret),
-            decoding_key: DecodingKey::from_secret(secret),
+            encoding_key: EncodingKey::from_secret(secret.as_bytes()),
+            decoding_key: DecodingKey::from_secret(secret.as_bytes()),
         }
     }
 

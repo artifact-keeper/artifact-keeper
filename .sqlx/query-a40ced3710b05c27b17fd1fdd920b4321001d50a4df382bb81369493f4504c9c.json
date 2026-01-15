@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE sync_tasks\n            SET\n                status = $2,\n                bytes_transferred = COALESCE($3, bytes_transferred),\n                error_message = $4,\n                started_at = COALESCE($5, started_at),\n                completed_at = COALESCE($6, completed_at)\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "sync_status",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "completed",
+                "failed",
+                "cancelled"
+              ]
+            }
+          }
+        },
+        "Int8",
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a40ced3710b05c27b17fd1fdd920b4321001d50a4df382bb81369493f4504c9c"
+}

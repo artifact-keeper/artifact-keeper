@@ -11,8 +11,7 @@ use uuid::Uuid;
 
 use crate::api::SharedState;
 use crate::error::Result;
-use crate::models::repository::RepositoryFormat;
-use crate::services::search_service::{SearchQuery, SearchService, SearchSort, SortDirection};
+use crate::services::search_service::{SearchQuery, SearchService};
 
 /// Create search routes
 pub fn router() -> Router<SharedState> {
@@ -28,35 +27,11 @@ pub struct SearchArtifactsQuery {
     /// Full-text search query
     pub q: Option<String>,
 
-    /// Filter by repository keys (comma-separated)
-    pub repos: Option<String>,
-
     /// Filter by format
     pub format: Option<String>,
 
     /// Filter by name pattern (supports wildcards)
     pub name: Option<String>,
-
-    /// Filter by version pattern
-    pub version: Option<String>,
-
-    /// Filter by content type
-    pub content_type: Option<String>,
-
-    /// Created after date
-    pub created_after: Option<DateTime<Utc>>,
-
-    /// Created before date
-    pub created_before: Option<DateTime<Utc>>,
-
-    /// Minimum download count
-    pub min_downloads: Option<i64>,
-
-    /// Sort field: relevance, name, created_at, downloads, size
-    pub sort: Option<String>,
-
-    /// Sort direction: asc, desc
-    pub sort_dir: Option<String>,
 
     /// Page number (1-indexed)
     pub page: Option<u32>,
@@ -113,43 +88,10 @@ pub async fn search_artifacts(
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
 
-    let format = query.format.as_ref().and_then(|f| parse_format(f));
-
-    let sort = query.sort.as_ref().and_then(|s| match s.as_str() {
-        "relevance" => Some(SearchSort::Relevance),
-        "name" => Some(SearchSort::Name),
-        "created_at" => Some(SearchSort::CreatedAt),
-        "downloads" => Some(SearchSort::Downloads),
-        "size" => Some(SearchSort::Size),
-        _ => None,
-    });
-
-    let sort_dir = query.sort_dir.as_ref().and_then(|s| match s.as_str() {
-        "asc" => Some(SortDirection::Asc),
-        "desc" => Some(SortDirection::Desc),
-        _ => None,
-    });
-
-    let repositories = query.repos.as_ref().map(|r| {
-        r.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    });
-
     let search_query = SearchQuery {
         q: query.q.clone(),
-        repositories,
-        format,
+        format: query.format.clone(),
         name: query.name.clone(),
-        group: None,
-        version: query.version.clone(),
-        content_type: query.content_type.clone(),
-        created_after: query.created_after,
-        created_before: query.created_before,
-        min_downloads: query.min_downloads,
-        sort,
-        sort_dir,
         offset: Some(offset),
         limit: Some(per_page as i64),
     };
@@ -170,7 +112,7 @@ pub async fn search_artifacts(
                 path: r.path,
                 name: r.name,
                 version: r.version,
-                format: r.format.to_string(),
+                format: r.format,
                 size_bytes: r.size_bytes,
                 content_type: r.content_type,
                 created_at: r.created_at,
@@ -212,25 +154,6 @@ pub async fn search_artifacts(
                 .collect(),
         },
     }))
-}
-
-fn parse_format(s: &str) -> Option<RepositoryFormat> {
-    match s.to_lowercase().as_str() {
-        "maven" => Some(RepositoryFormat::Maven),
-        "npm" => Some(RepositoryFormat::Npm),
-        "docker" | "oci" => Some(RepositoryFormat::Docker),
-        "pypi" => Some(RepositoryFormat::PyPI),
-        "nuget" => Some(RepositoryFormat::NuGet),
-        "helm" => Some(RepositoryFormat::Helm),
-        "cargo" => Some(RepositoryFormat::Cargo),
-        "go" => Some(RepositoryFormat::Go),
-        "debian" => Some(RepositoryFormat::Debian),
-        "rpm" => Some(RepositoryFormat::Rpm),
-        "generic" => Some(RepositoryFormat::Generic),
-        "conda" => Some(RepositoryFormat::Conda),
-        "conan" => Some(RepositoryFormat::Conan),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,7 +207,7 @@ pub async fn trending(
                 path: r.path,
                 name: r.name,
                 version: r.version,
-                format: r.format.to_string(),
+                format: r.format,
                 size_bytes: r.size_bytes,
                 content_type: r.content_type,
                 created_at: r.created_at,
@@ -320,7 +243,7 @@ pub async fn recent(
                 path: r.path,
                 name: r.name,
                 version: r.version,
-                format: r.format.to_string(),
+                format: r.format,
                 size_bytes: r.size_bytes,
                 content_type: r.content_type,
                 created_at: r.created_at,

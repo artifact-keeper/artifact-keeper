@@ -167,8 +167,8 @@ impl RepositoryService {
             OFFSET $4
             LIMIT $5
             "#,
-            format_filter as Option<RepositoryFormat>,
-            type_filter as Option<RepositoryType>,
+            format_filter.clone() as Option<RepositoryFormat>,
+            type_filter.clone() as Option<RepositoryType>,
             public_only,
             offset,
             limit
@@ -185,8 +185,8 @@ impl RepositoryService {
               AND ($2::repository_type IS NULL OR repo_type = $2)
               AND ($3 = false OR is_public = true)
             "#,
-            format_filter as Option<RepositoryFormat>,
-            type_filter as Option<RepositoryType>,
+            format_filter.clone() as Option<RepositoryFormat>,
+            type_filter.clone() as Option<RepositoryType>,
             public_only
         )
         .fetch_one(&self.db)
@@ -345,7 +345,7 @@ impl RepositoryService {
     pub async fn get_storage_usage(&self, repo_id: Uuid) -> Result<i64> {
         let usage = sqlx::query_scalar!(
             r#"
-            SELECT COALESCE(SUM(size_bytes), 0) as "usage!"
+            SELECT COALESCE(SUM(size_bytes), 0)::BIGINT as "usage!"
             FROM artifacts
             WHERE repository_id = $1 AND is_deleted = false
             "#,

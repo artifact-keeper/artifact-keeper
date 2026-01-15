@@ -480,7 +480,7 @@ pub async fn create_api_token(
         return Err(AppError::Authorization("Cannot create tokens for other users".to_string()));
     }
 
-    let auth_service = AuthService::new(state.db.clone(), state.config.clone());
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (token, token_id) = auth_service
         .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
@@ -503,7 +503,7 @@ pub async fn revoke_api_token(
         return Err(AppError::Authorization("Cannot revoke other users' tokens".to_string()));
     }
 
-    let auth_service = AuthService::new(state.db.clone(), state.config.clone());
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, user_id).await?;
 
     Ok(())
