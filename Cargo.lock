@@ -71,6 +71,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime_guess",
  "quick-xml",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

@@ -10,12 +10,13 @@ import RepositoryDetail from './pages/RepositoryDetail'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
 import Login from './pages/Login'
+import ChangePassword from './pages/ChangePassword'
 import NotFound from './pages/NotFound'
 
 const { Content } = Layout
 
 function AppContent() {
-  const { isAuthenticated, isLoading } = useAuth()
+  const { isAuthenticated, isLoading, mustChangePassword } = useAuth()
 
   if (isLoading) {
     return (
@@ -30,6 +31,15 @@ function AppContent() {
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
+    )
+  }
+
+  // If user must change password, show only the password change screen
+  if (mustChangePassword) {
+    return (
+      <Routes>
+        <Route path="*" element={<ChangePassword />} />
       </Routes>
     )
   }

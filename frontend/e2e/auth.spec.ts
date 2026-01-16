@@ -19,7 +19,7 @@ test.describe('Authentication', () => {
     await page.goto('/login')
 
     await page.getByPlaceholder('Username').fill('admin')
-    await page.getByPlaceholder('Password').fill('admin')
+    await page.getByPlaceholder('Password').fill('admin123')
     await page.getByRole('button', { name: /log in/i }).click()
 
     // Should redirect to dashboard after login
@@ -51,7 +51,7 @@ test.describe('Authentication', () => {
     // First login
     await page.goto('/login')
     await page.getByPlaceholder('Username').fill('admin')
-    await page.getByPlaceholder('Password').fill('admin')
+    await page.getByPlaceholder('Password').fill('admin123')
     await page.getByRole('button', { name: /log in/i }).click()
 
     // Wait for dashboard
@@ -69,7 +69,7 @@ test.describe('Authentication', () => {
     // Login
     await page.goto('/login')
     await page.getByPlaceholder('Username').fill('admin')
-    await page.getByPlaceholder('Password').fill('admin')
+    await page.getByPlaceholder('Password').fill('admin123')
     await page.getByRole('button', { name: /log in/i }).click()
 
     await expect(page.getByText('Dashboard')).toBeVisible()

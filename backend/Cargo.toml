@@ -69,6 +69,7 @@ bytes.workspace = true
 # Additional
 async-trait = "0.1"
 hex = "0.4"
+rand = "0.8"
 
 # Format parsing
 quick-xml = { version = "0.31", features = ["serialize"] }

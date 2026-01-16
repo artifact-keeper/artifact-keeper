@@ -71,7 +71,7 @@ impl AuthService {
             SELECT
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
-                external_id, is_admin, is_active,
+                external_id, is_admin, is_active, must_change_password,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE username = $1 AND is_active = true
@@ -169,7 +169,7 @@ impl AuthService {
     }
 
     /// Refresh tokens using a refresh token
-    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<TokenPair> {
+    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<(User, TokenPair)> {
         let token_data = self.decode_token(refresh_token)?;
 
         if token_data.claims.token_type != "refresh" {
@@ -183,7 +183,7 @@ impl AuthService {
             SELECT
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
-                external_id, is_admin, is_active,
+                external_id, is_admin, is_active, must_change_password,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true
@@ -195,7 +195,8 @@ impl AuthService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("User not found".to_string()))?;
 
-        self.generate_tokens(&user)
+        let tokens = self.generate_tokens(&user)?;
+        Ok((user, tokens))
     }
 
     /// Decode and validate a token
@@ -268,7 +269,7 @@ impl AuthService {
             SELECT
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
-                external_id, is_admin, is_active,
+                external_id, is_admin, is_active, must_change_password,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true

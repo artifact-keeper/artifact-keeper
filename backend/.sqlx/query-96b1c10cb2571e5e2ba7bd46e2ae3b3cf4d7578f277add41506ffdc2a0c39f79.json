@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) as \"count!\"\n            FROM artifacts\n            WHERE repository_id = $1\n              AND is_deleted = false\n              AND ($2::text IS NULL OR path LIKE $2)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "96b1c10cb2571e5e2ba7bd46e2ae3b3cf4d7578f277add41506ffdc2a0c39f79"
+}

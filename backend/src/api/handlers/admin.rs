@@ -58,7 +58,7 @@ pub struct BackupResponse {
     pub status: String,
     pub storage_path: Option<String>,
     pub size_bytes: i64,
-    pub artifact_count: i64,
+    pub artifact_count: i32,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub error_message: Option<String>,
@@ -226,7 +226,7 @@ pub struct RestoreRequest {
 #[derive(Debug, Serialize)]
 pub struct RestoreResponse {
     pub tables_restored: Vec<String>,
-    pub artifacts_restored: i64,
+    pub artifacts_restored: i32,
     pub errors: Vec<String>,
 }
 

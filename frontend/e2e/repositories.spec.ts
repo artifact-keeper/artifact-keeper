@@ -5,7 +5,7 @@ test.describe('Repository Management', () => {
     // Login first
     await page.goto('/login')
     await page.getByPlaceholder('Username').fill('admin')
-    await page.getByPlaceholder('Password').fill('admin')
+    await page.getByPlaceholder('Password').fill('admin123')
     await page.getByRole('button', { name: /log in/i }).click()
     await expect(page.getByText('Dashboard')).toBeVisible()
   })

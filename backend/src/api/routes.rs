@@ -26,8 +26,16 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     let auth_service = Arc::new(AuthService::new(state.db.clone(), Arc::new(state.config.clone())));
 
     Router::new()
-        // Auth routes (no auth required)
-        .nest("/auth", handlers::auth::router())
+        // Auth routes - split into public and protected
+        .nest("/auth", handlers::auth::public_router())
+        .nest(
+            "/auth",
+            handlers::auth::protected_router()
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                ))
+        )
         // Repository routes with optional auth middleware
         // (some endpoints require auth, others are optional - handlers will check)
         .nest(

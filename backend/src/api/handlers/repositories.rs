@@ -194,8 +194,8 @@ pub async fn create_repository(
     let format = parse_format(&payload.format)?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
-    // Generate storage path
-    let storage_path = format!("data/repositories/{}", payload.key);
+    // Generate storage path using the configured storage directory
+    let storage_path = format!("{}/{}", state.config.storage_path, payload.key);
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service
