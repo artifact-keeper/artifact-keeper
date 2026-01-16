@@ -62,7 +62,7 @@ const Users = () => {
         message.success('User created successfully')
       }
     },
-    onError: (error: any) => {
+    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
       message.error(error.response?.data?.message || 'Failed to create user')
     },
   })
@@ -79,7 +79,7 @@ const Users = () => {
       editForm.resetFields()
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
     },
-    onError: (error: any) => {
+    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
       message.error(error.response?.data?.message || 'Failed to update user')
     },
   })
@@ -93,7 +93,7 @@ const Users = () => {
       message.success(`User ${variables.is_active ? 'enabled' : 'disabled'} successfully`)
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
     },
-    onError: (error: any) => {
+    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
       message.error(error.response?.data?.message || 'Failed to update user status')
     },
   })
@@ -110,7 +110,7 @@ const Users = () => {
       setPasswordModalOpen(true)
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
     },
-    onError: (error: any) => {
+    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
       message.error(error.response?.data?.message || 'Failed to reset password')
     },
   })

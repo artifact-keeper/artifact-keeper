@@ -7,6 +7,10 @@ import AppSidebar from './components/layout/Sidebar'
 import Dashboard from './pages/Dashboard'
 import Repositories from './pages/Repositories'
 import RepositoryDetail from './pages/RepositoryDetail'
+import Artifacts from './pages/Artifacts'
+import EdgeNodes from './pages/EdgeNodes'
+import Backups from './pages/Backups'
+import Plugins from './pages/Plugins'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
 import Login from './pages/Login'
@@ -54,6 +58,10 @@ function AppContent() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/repositories" element={<Repositories />} />
             <Route path="/repositories/:key" element={<RepositoryDetail />} />
+            <Route path="/artifacts" element={<Artifacts />} />
+            <Route path="/edge-nodes" element={<EdgeNodes />} />
+            <Route path="/backups" element={<Backups />} />
+            <Route path="/plugins" element={<Plugins />} />
             <Route path="/users" element={<Users />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/login" element={<Navigate to="/" replace />} />

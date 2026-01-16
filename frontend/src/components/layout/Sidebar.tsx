@@ -3,8 +3,12 @@ import { Link, useLocation } from 'react-router-dom'
 import {
   DashboardOutlined,
   DatabaseOutlined,
+  FileOutlined,
+  CloudServerOutlined,
+  CloudUploadOutlined,
   UserOutlined,
   SettingOutlined,
+  ApiOutlined,
 } from '@ant-design/icons'
 import type { MenuProps } from 'antd'
 import { useAuth } from '../../contexts'
@@ -29,7 +33,27 @@ const AppSidebar = () => {
       icon: <DatabaseOutlined />,
       label: <Link to="/repositories">Repositories</Link>,
     },
+    {
+      key: '/artifacts',
+      icon: <FileOutlined />,
+      label: <Link to="/artifacts">Artifacts</Link>,
+    },
     ...(user?.is_admin ? [
+      {
+        key: '/edge-nodes',
+        icon: <CloudServerOutlined />,
+        label: <Link to="/edge-nodes">Edge Nodes</Link>,
+      },
+      {
+        key: '/backups',
+        icon: <CloudUploadOutlined />,
+        label: <Link to="/backups">Backups</Link>,
+      },
+      {
+        key: '/plugins',
+        icon: <ApiOutlined />,
+        label: <Link to="/plugins">Plugins</Link>,
+      },
       {
         key: '/users',
         icon: <UserOutlined />,
