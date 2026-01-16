@@ -14,8 +14,9 @@ COPY playwright.config.ts ./
 COPY e2e/ ./e2e/
 COPY tsconfig.json ./
 
-# Create test results directory
-RUN mkdir -p /app/test-results /app/playwright-report
+# Create test results directory with proper permissions
+RUN mkdir -p /app/test-results /app/playwright-report && \
+    chmod -R 777 /app/test-results /app/playwright-report
 
 # Set environment variables
 ENV CI=true
