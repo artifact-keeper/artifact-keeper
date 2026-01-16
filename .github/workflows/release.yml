@@ -1,0 +1,238 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # BUILD BINARIES
+  # ════════════════════════════════════════════════════════════════════════════
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: artifact-keeper-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: artifact-keeper-darwin-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: true
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/artifact-keeper dist/${{ matrix.name }}
+          chmod +x dist/${{ matrix.name }}
+          cd dist
+          tar -czvf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          sha256sum ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}.tar.gz*
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # BUILD FRONTEND
+  # ════════════════════════════════════════════════════════════════════════════
+
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Package
+        run: |
+          cd frontend
+          tar -czvf ../frontend-dist.tar.gz dist/
+          cd ..
+          sha256sum frontend-dist.tar.gz > frontend-dist.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist.tar.gz*
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CREATE RELEASE
+  # ════════════════════════════════════════════════════════════════════════════
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, build-frontend]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          cat << 'EOF' > CHANGELOG.md
+          ## What's Changed
+
+          ### Features
+          - Full-featured artifact registry supporting 11+ package formats
+          - React TypeScript frontend with Ant Design UI
+          - JWT authentication with role-based access control
+          - Repository management (local, remote, virtual)
+          - Artifact upload, download, and search
+          - Admin dashboard with system health monitoring
+
+          ### Supported Formats
+          - Maven, PyPI, NPM, Docker, Helm
+          - RPM, Debian, Go Modules
+          - NuGet, Cargo, Generic
+
+          ### Downloads
+
+          | Platform | Architecture | Download |
+          |----------|--------------|----------|
+          | Linux | amd64 | `artifact-keeper-linux-amd64.tar.gz` |
+          | Linux | arm64 | `artifact-keeper-linux-arm64.tar.gz` |
+          | macOS | amd64 | `artifact-keeper-darwin-amd64.tar.gz` |
+          | macOS | arm64 | `artifact-keeper-darwin-arm64.tar.gz` |
+          | Frontend | - | `frontend-dist.tar.gz` |
+
+          ### Docker Images
+
+          ```bash
+          # Backend
+          docker pull ghcr.io/${{ github.repository }}-backend:${{ steps.version.outputs.tag }}
+
+          # Frontend
+          docker pull ghcr.io/${{ github.repository }}-frontend:${{ steps.version.outputs.tag }}
+          ```
+
+          ### Quick Start
+
+          ```bash
+          # Download and extract
+          tar -xzf artifact-keeper-linux-amd64.tar.gz
+
+          # Run with PostgreSQL
+          export DATABASE_URL=postgresql://user:pass@localhost/artifact_registry
+          ./artifact-keeper-linux-amd64
+          ```
+
+          **Full Changelog**: https://github.com/${{ github.repository }}/commits/${{ steps.version.outputs.tag }}
+          EOF
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -name "*.tar.gz*" -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Artifact Keeper ${{ steps.version.outputs.version }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PUBLISH DOCKER IMAGES
+  # ════════════════════════════════════════════════════════════════════════════
+
+  docker-release:
+    name: Publish Docker Images
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trigger Docker publish
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: docker-publish.yml
+          token: ${{ secrets.GITHUB_TOKEN }}

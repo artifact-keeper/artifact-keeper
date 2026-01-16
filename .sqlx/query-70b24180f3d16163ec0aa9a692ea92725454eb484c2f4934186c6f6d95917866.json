@@ -1,0 +1,126 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO backups (backup_type, storage_path, created_by, metadata)\n            VALUES ($1, $2, $3, $4)\n            RETURNING\n                id, backup_type as \"backup_type: BackupType\",\n                status as \"status: BackupStatus\",\n                storage_path, size_bytes, artifact_count,\n                started_at, completed_at, error_message,\n                metadata, created_by, created_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "backup_type: BackupType",
+        "type_info": {
+          "Custom": {
+            "name": "backup_type",
+            "kind": {
+              "Enum": [
+                "full",
+                "incremental",
+                "metadata_only"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status: BackupStatus",
+        "type_info": {
+          "Custom": {
+            "name": "backup_status",
+            "kind": {
+              "Enum": [
+                "pending",
+                "in_progress",
+                "completed",
+                "failed",
+                "cancelled"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "storage_path",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "artifact_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "backup_type",
+            "kind": {
+              "Enum": [
+                "full",
+                "incremental",
+                "metadata_only"
+              ]
+            }
+          }
+        },
+        "Varchar",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "70b24180f3d16163ec0aa9a692ea92725454eb484c2f4934186c6f6d95917866"
+}

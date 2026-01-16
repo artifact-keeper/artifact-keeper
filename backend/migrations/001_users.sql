@@ -26,6 +26,6 @@ INSERT INTO users (username, email, password_hash, is_admin)
 VALUES (
     'admin',
     'admin@localhost',
-    '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.TMANBAKhFvJU9K',
+    '$2b$12$mDTrYw3xrIZ9N1cJGHACduiUbLDWKk.39QKIIvjI1uBHMiMKUiiSK',
     true
 );

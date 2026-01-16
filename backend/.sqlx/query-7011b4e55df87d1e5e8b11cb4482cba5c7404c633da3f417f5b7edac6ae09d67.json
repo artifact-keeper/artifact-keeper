@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT name\n            FROM artifacts\n            WHERE name ILIKE $1 AND is_deleted = false\n            ORDER BY name\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7011b4e55df87d1e5e8b11cb4482cba5c7404c633da3f417f5b7edac6ae09d67"
+}

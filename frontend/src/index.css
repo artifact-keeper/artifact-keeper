@@ -1,0 +1,96 @@
+/* Global styles for Artifact Keeper */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol',
+    'Noto Color Emoji';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100%;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
+
+/* Links */
+a {
+  color: #1890ff;
+  text-decoration: none;
+}
+
+a:hover {
+  color: #40a9ff;
+}
+
+/* Tables */
+.ant-table-wrapper {
+  overflow-x: auto;
+}
+
+/* Card improvements */
+.ant-card {
+  border-radius: 8px;
+}
+
+/* Modal improvements */
+.ant-modal-content {
+  border-radius: 8px;
+}
+
+/* Form label styling */
+.ant-form-item-label > label {
+  font-weight: 500;
+}
+
+/* Button improvements */
+.ant-btn {
+  border-radius: 6px;
+}
+
+/* Tag improvements */
+.ant-tag {
+  border-radius: 4px;
+}
+
+/* Input improvements */
+.ant-input,
+.ant-input-affix-wrapper,
+.ant-select-selector {
+  border-radius: 6px !important;
+}
+
+/* Breadcrumb styling */
+.ant-breadcrumb a:hover {
+  background: transparent;
+}
+
+/* Spin tip styling */
+.ant-spin-text {
+  margin-top: 12px;
+}

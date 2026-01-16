@@ -2,7 +2,7 @@
 /target/
 **/target/
 **/*.rs.bk
-Cargo.lock
+# Note: Cargo.lock is committed for reproducible builds (binary application)
 
 # Build artifacts
 *.so
@@ -44,9 +44,17 @@ coverage/
 .pytest_cache/
 __pycache__/
 
+# E2E Test Results
+test-results/
+playwright-report/
+playwright/.cache/
+
 # Database
 *.db
 *.sqlite
+
+# Local artifact storage (test data)
+backend/data/
 
 # Secrets (never commit these)
 *.pem

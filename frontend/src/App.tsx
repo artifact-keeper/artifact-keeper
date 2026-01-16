@@ -1,48 +1,77 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { Layout } from 'antd'
+import { Layout, Spin } from 'antd'
+import { useAuth } from './contexts'
+import ErrorBoundary from './components/ErrorBoundary'
 import AppHeader from './components/layout/Header'
 import AppSidebar from './components/layout/Sidebar'
 import Dashboard from './pages/Dashboard'
 import Repositories from './pages/Repositories'
+import RepositoryDetail from './pages/RepositoryDetail'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
 import Login from './pages/Login'
+import ChangePassword from './pages/ChangePassword'
+import NotFound from './pages/NotFound'
 
 const { Content } = Layout
 
-function App() {
-  // TODO: Implement proper auth state management
-  const isAuthenticated = true
+function AppContent() {
+  const { isAuthenticated, isLoading, mustChangePassword } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
+        <Spin size="large" tip="Loading..." />
+      </div>
+    )
+  }
 
   if (!isAuthenticated) {
     return (
-      <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route path="*" element={<Navigate to="/login" replace />} />
-        </Routes>
-      </BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
+    )
+  }
+
+  // If user must change password, show only the password change screen
+  if (mustChangePassword) {
+    return (
+      <Routes>
+        <Route path="*" element={<ChangePassword />} />
+      </Routes>
     )
   }
 
   return (
-    <BrowserRouter>
-      <Layout style={{ minHeight: '100vh' }}>
-        <AppSidebar />
-        <Layout>
-          <AppHeader />
-          <Content style={{ margin: '24px 16px', padding: 24, background: '#fff' }}>
-            <Routes>
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/repositories" element={<Repositories />} />
-              <Route path="/users" element={<Users />} />
-              <Route path="/settings" element={<Settings />} />
-              <Route path="/login" element={<Navigate to="/" replace />} />
-            </Routes>
-          </Content>
-        </Layout>
+    <Layout style={{ minHeight: '100vh' }}>
+      <AppSidebar />
+      <Layout>
+        <AppHeader />
+        <Content style={{ margin: '24px 16px', padding: 24, background: '#fff' }}>
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/repositories" element={<Repositories />} />
+            <Route path="/repositories/:key" element={<RepositoryDetail />} />
+            <Route path="/users" element={<Users />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="/login" element={<Navigate to="/" replace />} />
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </Content>
       </Layout>
-    </BrowserRouter>
+    </Layout>
+  )
+}
+
+function App() {
+  return (
+    <ErrorBoundary>
+      <BrowserRouter>
+        <AppContent />
+      </BrowserRouter>
+    </ErrorBoundary>
   )
 }
 

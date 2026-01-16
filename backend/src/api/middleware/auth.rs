@@ -104,22 +104,29 @@ pub async fn optional_auth_middleware(
         .get(AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
 
-    if let Some(header) = auth_header {
+    let auth_ext = if let Some(header) = auth_header {
         if let Some(token) = extract_bearer_token(header) {
             // Try JWT token first
             if let Ok(claims) = auth_service.validate_access_token(token) {
-                request.extensions_mut().insert(AuthExtension::from(claims));
+                Some(AuthExtension::from(claims))
             } else if let Ok(user) = auth_service.validate_api_token(token).await {
-                request.extensions_mut().insert(AuthExtension {
+                Some(AuthExtension {
                     user_id: user.id,
                     username: user.username,
                     email: user.email,
                     is_admin: user.is_admin,
-                });
+                })
+            } else {
+                None
             }
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
+    request.extensions_mut().insert(auth_ext);
     next.run(request).await
 }
 

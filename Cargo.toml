@@ -33,9 +33,10 @@ sha2 = "0.10"
 md-5 = "0.10"
 sha1 = "0.10"
 
-# S3 storage
-aws-sdk-s3 = "1.15"
-aws-config = "1.1"
+# S3 storage - disabled until AWS SDK supports Rust 1.85+
+# Re-enable when Rust 1.88+ is stable or use rust-s3 alternative
+# aws-sdk-s3 = "1.x"
+# aws-config = "1.x"
 
 # Logging/Tracing
 tracing = "0.1"

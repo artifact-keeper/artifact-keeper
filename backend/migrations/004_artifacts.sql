@@ -1,3 +1,6 @@
+-- Enable pg_trgm extension for text search
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- Create artifacts table
 CREATE TABLE artifacts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -32,7 +35,7 @@ CREATE TABLE download_statistics (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     artifact_id UUID NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    ip_address INET NOT NULL,
+    ip_address VARCHAR(45),
     user_agent VARCHAR(512),
     downloaded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
@@ -45,6 +48,3 @@ CREATE INDEX idx_artifacts_name_gin ON artifacts USING gin(name gin_trgm_ops);
 CREATE INDEX idx_artifact_metadata_gin ON artifact_metadata USING gin(metadata);
 CREATE INDEX idx_download_stats_artifact ON download_statistics(artifact_id, downloaded_at);
 CREATE INDEX idx_download_stats_user ON download_statistics(user_id, downloaded_at);
-
--- Enable pg_trgm extension for text search
-CREATE EXTENSION IF NOT EXISTS pg_trgm;

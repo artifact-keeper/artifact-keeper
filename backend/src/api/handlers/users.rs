@@ -28,6 +28,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/tokens", get(list_user_tokens).post(create_api_token))
         .route("/:id/tokens/:token_id", delete(revoke_api_token))
         .route("/:id/password", post(change_password))
+        .route("/:id/password/reset", post(reset_password))
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,9 +44,22 @@ pub struct ListUsersQuery {
 pub struct CreateUserRequest {
     pub username: String,
     pub email: String,
-    pub password: String,
+    pub password: Option<String>, // Optional - will auto-generate if not provided
     pub display_name: Option<String>,
     pub is_admin: Option<bool>,
+}
+
+/// Generate a secure random password
+fn generate_password() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*";
+    let mut rng = rand::thread_rng();
+    (0..16)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,8 +79,15 @@ pub struct UserResponse {
     pub auth_provider: String,
     pub is_active: bool,
     pub is_admin: bool,
+    pub must_change_password: bool,
     pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateUserResponse {
+    pub user: UserResponse,
+    pub generated_password: Option<String>, // Only returned if password was auto-generated
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +113,7 @@ fn user_to_response(user: User) -> UserResponse {
         auth_provider: format!("{:?}", user.auth_provider).to_lowercase(),
         is_active: user.is_active,
         is_admin: user.is_admin,
+        must_change_password: user.must_change_password,
         last_login_at: user.last_login_at,
         created_at: user.created_at,
     }
@@ -114,7 +136,7 @@ pub async fn list_users(
         SELECT
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
-            external_id, is_admin, is_active,
+            external_id, is_admin, is_active, must_change_password,
             last_login_at, created_at, updated_at
         FROM users
         WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
@@ -168,33 +190,41 @@ pub async fn create_user(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
     Json(payload): Json<CreateUserRequest>,
-) -> Result<Json<UserResponse>> {
-    // Validate password
-    if payload.password.len() < 8 {
-        return Err(AppError::Validation(
-            "Password must be at least 8 characters".to_string(),
-        ));
-    }
+) -> Result<Json<CreateUserResponse>> {
+    // Generate password if not provided, otherwise validate
+    let (password, auto_generated) = match payload.password {
+        Some(ref p) if p.len() >= 8 => (p.clone(), false),
+        Some(_) => {
+            return Err(AppError::Validation(
+                "Password must be at least 8 characters".to_string(),
+            ));
+        }
+        None => (generate_password(), true),
+    };
 
     // Hash password
-    let password_hash = AuthService::hash_password(&payload.password)?;
+    let password_hash = AuthService::hash_password(&password)?;
+
+    // Set must_change_password=true if password was auto-generated
+    let must_change = auto_generated;
 
     let user = sqlx::query_as!(
         User,
         r#"
-        INSERT INTO users (username, email, password_hash, display_name, auth_provider, is_admin)
-        VALUES ($1, $2, $3, $4, 'local', $5)
+        INSERT INTO users (username, email, password_hash, display_name, auth_provider, is_admin, must_change_password)
+        VALUES ($1, $2, $3, $4, 'local', $5, $6)
         RETURNING
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
-            external_id, is_admin, is_active,
+            external_id, is_admin, is_active, must_change_password,
             last_login_at, created_at, updated_at
         "#,
         payload.username,
         payload.email,
         password_hash,
         payload.display_name,
-        payload.is_admin.unwrap_or(false)
+        payload.is_admin.unwrap_or(false),
+        must_change
     )
     .fetch_one(&state.db)
     .await
@@ -213,7 +243,10 @@ pub async fn create_user(
         }
     })?;
 
-    Ok(Json(user_to_response(user)))
+    Ok(Json(CreateUserResponse {
+        user: user_to_response(user),
+        generated_password: if auto_generated { Some(password) } else { None },
+    }))
 }
 
 /// Get user details
@@ -227,7 +260,7 @@ pub async fn get_user(
         SELECT
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
-            external_id, is_admin, is_active,
+            external_id, is_admin, is_active, must_change_password,
             last_login_at, created_at, updated_at
         FROM users
         WHERE id = $1
@@ -263,7 +296,7 @@ pub async fn update_user(
         RETURNING
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
-            external_id, is_admin, is_active,
+            external_id, is_admin, is_active, must_change_password,
             last_login_at, created_at, updated_at
         "#,
         id,
@@ -480,7 +513,7 @@ pub async fn create_api_token(
         return Err(AppError::Authorization("Cannot create tokens for other users".to_string()));
     }
 
-    let auth_service = AuthService::new(state.db.clone(), state.config.clone());
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     let (token, token_id) = auth_service
         .generate_api_token(id, &payload.name, payload.scopes, payload.expires_in_days)
         .await?;
@@ -503,7 +536,7 @@ pub async fn revoke_api_token(
         return Err(AppError::Authorization("Cannot revoke other users' tokens".to_string()));
     }
 
-    let auth_service = AuthService::new(state.db.clone(), state.config.clone());
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
     auth_service.revoke_api_token(token_id, user_id).await?;
 
     Ok(())
@@ -559,8 +592,9 @@ pub async fn change_password(
     // Hash new password
     let new_hash = AuthService::hash_password(&payload.new_password)?;
 
+    // Update password and clear must_change_password flag
     let result = sqlx::query!(
-        "UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1",
+        "UPDATE users SET password_hash = $2, must_change_password = false, updated_at = NOW() WHERE id = $1",
         id,
         new_hash
     )
@@ -573,4 +607,59 @@ pub async fn change_password(
     }
 
     Ok(())
+}
+
+/// Response for password reset
+#[derive(Debug, Serialize)]
+pub struct ResetPasswordResponse {
+    pub temporary_password: String,
+}
+
+/// Reset user password (admin only)
+/// Generates a new temporary password and sets must_change_password=true
+pub async fn reset_password(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ResetPasswordResponse>> {
+    // Only admins can reset passwords
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Only administrators can reset passwords".to_string()));
+    }
+
+    // Prevent admin from resetting their own password this way
+    if auth.user_id == id {
+        return Err(AppError::Validation("Cannot reset your own password. Use change password instead.".to_string()));
+    }
+
+    // Check that user exists and is a local user (reuse existing query pattern)
+    let user = sqlx::query!(
+        "SELECT password_hash FROM users WHERE id = $1",
+        id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    // Local users have password_hash set
+    if user.password_hash.is_none() {
+        return Err(AppError::Validation("Cannot reset password for SSO users".to_string()));
+    }
+
+    // Generate new temporary password
+    let temp_password = generate_password();
+    let password_hash = AuthService::hash_password(&temp_password)?;
+
+    // Update password and set must_change_password=true
+    sqlx::query("UPDATE users SET password_hash = $1, must_change_password = true, updated_at = NOW() WHERE id = $2")
+        .bind(&password_hash)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(ResetPasswordResponse {
+        temporary_password: temp_password,
+    }))
 }

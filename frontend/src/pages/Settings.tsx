@@ -1,16 +1,35 @@
-import { Card, Form, Input, Button, Tabs, Switch, message } from 'antd'
+import { Card, Form, Input, Tabs, Alert } from 'antd'
+import { useAuth } from '../contexts'
+import { useDocumentTitle } from '../hooks'
 
 const Settings = () => {
-  const [form] = Form.useForm()
+  useDocumentTitle('Settings')
+  const { user } = useAuth()
 
-  const onFinish = (values: unknown) => {
-    console.log('Settings:', values)
-    message.success('Settings saved')
+  if (!user?.is_admin) {
+    return (
+      <div>
+        <h1>Settings</h1>
+        <Alert
+          message="Access Denied"
+          description="You must be an administrator to view settings."
+          type="error"
+          showIcon
+        />
+      </div>
+    )
   }
 
   return (
     <div>
       <h1>Settings</h1>
+      <Alert
+        message="Settings Configuration"
+        description="Server settings are configured via environment variables. The settings shown below are read-only."
+        type="info"
+        showIcon
+        style={{ marginBottom: 16 }}
+      />
       <Tabs
         defaultActiveKey="general"
         items={[
@@ -19,21 +38,12 @@ const Settings = () => {
             label: 'General',
             children: (
               <Card>
-                <Form
-                  form={form}
-                  layout="vertical"
-                  onFinish={onFinish}
-                >
-                  <Form.Item label="Server URL" name="serverUrl">
-                    <Input placeholder="https://artifacts.example.com" />
+                <Form layout="vertical">
+                  <Form.Item label="API URL">
+                    <Input disabled value={import.meta.env.VITE_API_URL || 'http://localhost:9080'} />
                   </Form.Item>
-                  <Form.Item label="Allow Anonymous Access" name="allowAnonymous" valuePropName="checked">
-                    <Switch />
-                  </Form.Item>
-                  <Form.Item>
-                    <Button type="primary" htmlType="submit">
-                      Save Settings
-                    </Button>
+                  <Form.Item label="Version">
+                    <Input disabled value="1.0.0" />
                   </Form.Item>
                 </Form>
               </Card>
@@ -45,11 +55,11 @@ const Settings = () => {
             children: (
               <Card>
                 <Form layout="vertical">
-                  <Form.Item label="Storage Backend" name="storageBackend">
-                    <Input disabled value="S3" />
+                  <Form.Item label="Storage Backend">
+                    <Input disabled value="Local Filesystem" />
                   </Form.Item>
-                  <Form.Item label="S3 Bucket" name="s3Bucket">
-                    <Input placeholder="my-artifacts-bucket" />
+                  <Form.Item label="Storage Path">
+                    <Input disabled value="/data/artifacts" />
                   </Form.Item>
                 </Form>
               </Card>
@@ -61,11 +71,11 @@ const Settings = () => {
             children: (
               <Card>
                 <Form layout="vertical">
-                  <Form.Item label="OIDC Issuer" name="oidcIssuer">
-                    <Input placeholder="https://auth.example.com" />
+                  <Form.Item label="Authentication Method">
+                    <Input disabled value="JWT (JSON Web Token)" />
                   </Form.Item>
-                  <Form.Item label="OIDC Client ID" name="oidcClientId">
-                    <Input />
+                  <Form.Item label="Token Expiry">
+                    <Input disabled value="1 hour" />
                   </Form.Item>
                 </Form>
               </Card>

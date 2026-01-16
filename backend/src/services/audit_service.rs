@@ -356,7 +356,7 @@ pub struct AuditLogEntry {
     pub resource_type: String,
     pub resource_id: Option<Uuid>,
     pub details: Option<serde_json::Value>,
-    pub ip_address: Option<std::net::IpAddr>,
+    pub ip_address: Option<String>,
     pub correlation_id: Uuid,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
