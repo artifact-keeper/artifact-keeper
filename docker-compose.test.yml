@@ -88,9 +88,9 @@ services:
       BASE_URL: http://frontend:5173
       CI: "true"
     volumes:
-      # Mount test results for inspection after run
-      - ./test-results:/app/test-results
-      - ./playwright-report:/app/playwright-report
+      # Mount test results for inspection after run (z for SELinux shared label)
+      - ./test-results:/app/test-results:z
+      - ./playwright-report:/app/playwright-report:z
     command: >
       npx playwright test
       --reporter=html
