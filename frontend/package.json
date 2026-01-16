@@ -17,20 +17,20 @@
     "test:e2e:headed": "playwright test --headed"
   },
   "dependencies": {
-    "@tanstack/react-query": "^5.17.0",
-    "antd": "^5.13.0",
+    "@tanstack/react-query": "^5.90.18",
+    "antd": "^6.2.0",
     "axios": "^1.6.5",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "react-router-dom": "^6.21.1"
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "react-router-dom": "^7.12.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.41.0",
     "@testing-library/jest-dom": "^6.2.0",
     "@testing-library/react": "^14.1.2",
     "@testing-library/user-event": "^14.5.2",
-    "@types/react": "^18.2.47",
-    "@types/react-dom": "^18.2.18",
+    "@types/react": "^19.2.8",
+    "@types/react-dom": "^19.2.3",
     "@typescript-eslint/eslint-plugin": "^6.18.0",
     "@typescript-eslint/parser": "^6.18.0",
     "@vitejs/plugin-react": "^4.2.1",
