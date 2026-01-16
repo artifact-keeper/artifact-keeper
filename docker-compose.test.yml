@@ -7,7 +7,7 @@ version: '3.8'
 services:
   # PostgreSQL database
   postgres:
-    image: postgres:16-alpine
+    image: docker.io/postgres:16-alpine
     container_name: e2e-test-db
     environment:
       POSTGRES_USER: registry
