@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE edge_nodes\n                SET status = $2, updated_at = NOW()\n                WHERE id = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "edge_status",
+            "kind": {
+              "Enum": [
+                "online",
+                "offline",
+                "syncing",
+                "degraded"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38b0da878726f80510bcf04e7449865690fbcd4047e0c4d1a58e675a42565c8a"
+}

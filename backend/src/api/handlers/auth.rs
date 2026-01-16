@@ -15,12 +15,17 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::auth_service::AuthService;
 
-/// Create auth routes
-pub fn router() -> Router<SharedState> {
+/// Create public auth routes (no auth required)
+pub fn public_router() -> Router<SharedState> {
     Router::new()
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
+}
+
+/// Create protected auth routes (auth required)
+pub fn protected_router() -> Router<SharedState> {
+    Router::new()
         .route("/me", get(get_current_user))
 }
 
@@ -36,6 +41,7 @@ pub struct LoginResponse {
     pub refresh_token: String,
     pub expires_in: u64,
     pub token_type: String,
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,7 +65,7 @@ pub async fn login(
 ) -> Result<Json<LoginResponse>> {
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (_user, tokens) = auth_service
+    let (user, tokens) = auth_service
         .authenticate(&payload.username, &payload.password)
         .await?;
 
@@ -68,6 +74,7 @@ pub async fn login(
         refresh_token: tokens.refresh_token,
         expires_in: tokens.expires_in,
         token_type: "Bearer".to_string(),
+        must_change_password: user.must_change_password,
     }))
 }
 
@@ -86,13 +93,14 @@ pub async fn refresh_token(
 ) -> Result<Json<LoginResponse>> {
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let tokens = auth_service.refresh_tokens(&payload.refresh_token).await?;
+    let (user, tokens) = auth_service.refresh_tokens(&payload.refresh_token).await?;
 
     Ok(Json(LoginResponse {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
         expires_in: tokens.expires_in,
         token_type: "Bearer".to_string(),
+        must_change_password: user.must_change_password,
     }))
 }
 

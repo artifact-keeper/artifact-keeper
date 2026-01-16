@@ -20,7 +20,11 @@ pub enum AppError {
 
     /// Database error
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(String),
+
+    /// SQLx error
+    #[error("Database error: {0}")]
+    Sqlx(#[from] sqlx::Error),
 
     /// Migration error
     #[error("Migration error: {0}")]
@@ -29,6 +33,10 @@ pub enum AppError {
     /// Authentication error
     #[error("Authentication failed: {0}")]
     Authentication(String),
+
+    /// Unauthorized error (missing credentials)
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
 
     /// Authorization error
     #[error("Access denied: {0}")]
@@ -79,7 +87,12 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message) = match &self {
             AppError::Config(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR", msg.clone()),
-            AppError::Database(_) => (
+            AppError::Database(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DATABASE_ERROR",
+                msg.clone(),
+            ),
+            AppError::Sqlx(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "DATABASE_ERROR",
                 "Database operation failed".to_string(),
@@ -90,6 +103,7 @@ impl IntoResponse for AppError {
                 "Database migration failed".to_string(),
             ),
             AppError::Authentication(msg) => (StatusCode::UNAUTHORIZED, "AUTH_ERROR", msg.clone()),
+            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg.clone()),
             AppError::Authorization(msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg.clone()),

@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) as \"count!\"\n            FROM audit_log\n            WHERE ($1::uuid IS NULL OR user_id = $1)\n              AND ($2::text IS NULL OR action = $2)\n              AND ($3::text IS NULL OR resource_type = $3)\n              AND ($4::uuid IS NULL OR resource_id = $4)\n              AND ($5::timestamptz IS NULL OR created_at >= $5)\n              AND ($6::timestamptz IS NULL OR created_at <= $6)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "51cbc7046718c2a5f753c8d5a618be90703a430110bda61b9992247d07843d57"
+}

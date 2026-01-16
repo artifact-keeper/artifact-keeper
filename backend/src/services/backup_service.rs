@@ -59,9 +59,9 @@ pub struct Backup {
     pub id: Uuid,
     pub backup_type: BackupType,
     pub status: BackupStatus,
-    pub storage_path: String,
-    pub size_bytes: i64,
-    pub artifact_count: i64,
+    pub storage_path: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub artifact_count: Option<i32>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
@@ -78,7 +78,7 @@ pub struct BackupManifest {
     pub backup_type: BackupType,
     pub created_at: DateTime<Utc>,
     pub database_tables: Vec<String>,
-    pub artifact_count: i64,
+    pub artifact_count: i32,
     pub total_size_bytes: i64,
     pub checksum: String,
 }
@@ -280,7 +280,7 @@ impl BackupService {
 
             // Add artifact storage keys
             let storage_keys = self.get_artifact_storage_keys(backup.metadata.as_ref()).await?;
-            let mut artifact_count = 0i64;
+            let mut artifact_count = 0i32;
 
             for key in storage_keys {
                 if let Ok(content) = self.storage.get(&key).await {
@@ -296,7 +296,7 @@ impl BackupService {
                 }
             }
 
-            // Create manifest
+            // Create manifest placeholder (actual size/checksum set after finalization)
             let manifest = BackupManifest {
                 version: "1.0".to_string(),
                 backup_id,
@@ -304,8 +304,8 @@ impl BackupService {
                 created_at: Utc::now(),
                 database_tables: tables.iter().map(|s| s.to_string()).collect(),
                 artifact_count,
-                total_size_bytes: tar_buffer.len() as i64,
-                checksum: format!("{:x}", sha2::Sha256::digest(&tar_buffer)),
+                total_size_bytes: 0, // Will be actual size in final backup
+                checksum: String::new(), // Will be computed after archive is complete
             };
 
             let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -322,7 +322,9 @@ impl BackupService {
         }
 
         // Store backup
-        self.storage.put(&backup.storage_path, Bytes::from(tar_buffer.clone())).await?;
+        let storage_path = backup.storage_path.as_ref()
+            .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
+        self.storage.put(storage_path, Bytes::from(tar_buffer.clone())).await?;
 
         // Update backup record
         let artifact_count = self.count_artifacts_in_backup(&tar_buffer)?;
@@ -377,10 +379,10 @@ impl BackupService {
         Ok(keys)
     }
 
-    fn count_artifacts_in_backup(&self, tar_data: &[u8]) -> Result<i64> {
+    fn count_artifacts_in_backup(&self, tar_data: &[u8]) -> Result<i32> {
         let decoder = GzDecoder::new(tar_data);
         let mut archive = Archive::new(decoder);
-        let mut count = 0i64;
+        let mut count = 0i32;
 
         for entry in archive.entries().map_err(|e| AppError::Internal(e.to_string()))? {
             let entry = entry.map_err(|e| AppError::Internal(e.to_string()))?;
@@ -443,7 +445,9 @@ impl BackupService {
         }
 
         // Download and extract backup
-        let tar_data = self.storage.get(&backup.storage_path).await?;
+        let storage_path = backup.storage_path.as_ref()
+            .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
+        let tar_data = self.storage.get(storage_path).await?;
         let decoder = GzDecoder::new(tar_data.as_ref());
         let mut archive = Archive::new(decoder);
 
@@ -526,9 +530,11 @@ impl BackupService {
     pub async fn delete(&self, backup_id: Uuid) -> Result<()> {
         let backup = self.get_by_id(backup_id).await?;
 
-        // Delete from storage
-        if self.storage.exists(&backup.storage_path).await? {
-            self.storage.delete(&backup.storage_path).await?;
+        // Delete from storage if path exists
+        if let Some(storage_path) = &backup.storage_path {
+            if self.storage.exists(storage_path).await? {
+                self.storage.delete(storage_path).await?;
+            }
         }
 
         // Delete from database
@@ -568,7 +574,7 @@ impl BackupService {
             AND created_at < NOW() - make_interval(days => $2)
             AND status = 'completed'
             "#,
-            keep_count,
+            keep_count as i64,
             keep_days
         )
         .execute(&self.db)
@@ -591,6 +597,6 @@ pub struct RestoreOptions {
 #[derive(Debug, Serialize)]
 pub struct RestoreResult {
     pub tables_restored: Vec<String>,
-    pub artifacts_restored: i64,
+    pub artifacts_restored: i32,
     pub errors: Vec<String>,
 }

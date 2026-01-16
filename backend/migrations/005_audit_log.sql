@@ -6,7 +6,7 @@ CREATE TABLE audit_log (
     resource_type VARCHAR(100) NOT NULL,
     resource_id UUID,
     details JSONB,
-    ip_address INET,
+    ip_address VARCHAR(45),
     correlation_id UUID NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );

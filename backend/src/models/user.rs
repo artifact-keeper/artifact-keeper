@@ -28,6 +28,7 @@ pub struct User {
     pub display_name: Option<String>,
     pub is_active: bool,
     pub is_admin: bool,
+    pub must_change_password: bool,
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

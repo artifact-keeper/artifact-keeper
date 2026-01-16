@@ -41,7 +41,8 @@ pub fn router() -> Router<SharedState> {
                 .put(upload_artifact)
                 .delete(delete_artifact),
         )
-        .route("/:key/artifacts/*path/download", get(download_artifact))
+        // Download uses a separate route prefix to avoid wildcard conflict
+        .route("/:key/download/*path", get(download_artifact))
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,10 +108,10 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "maven" => Ok(RepositoryFormat::Maven),
         "gradle" => Ok(RepositoryFormat::Gradle),
         "npm" => Ok(RepositoryFormat::Npm),
-        "pypi" => Ok(RepositoryFormat::PyPi),
-        "nuget" => Ok(RepositoryFormat::NuGet),
+        "pypi" => Ok(RepositoryFormat::Pypi),
+        "nuget" => Ok(RepositoryFormat::Nuget),
         "go" => Ok(RepositoryFormat::Go),
-        "rubygems" => Ok(RepositoryFormat::RubyGems),
+        "rubygems" => Ok(RepositoryFormat::Rubygems),
         "docker" => Ok(RepositoryFormat::Docker),
         "helm" => Ok(RepositoryFormat::Helm),
         "rpm" => Ok(RepositoryFormat::Rpm),
@@ -185,14 +186,16 @@ pub async fn list_repositories(
 /// Create a new repository
 pub async fn create_repository(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Json(payload): Json<CreateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
+    // Require authentication
+    let _auth = auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let format = parse_format(&payload.format)?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 
-    // Generate storage path
-    let storage_path = format!("data/repositories/{}", payload.key);
+    // Generate storage path using the configured storage directory
+    let storage_path = format!("{}/{}", state.config.storage_path, payload.key);
 
     let service = RepositoryService::new(state.db.clone());
     let repo = service
@@ -252,10 +255,12 @@ pub async fn get_repository(
 /// Update repository
 pub async fn update_repository(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
     Json(payload): Json<UpdateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
+    // Require authentication
+    let _auth = auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let service = RepositoryService::new(state.db.clone());
 
     // Get existing repo by key
@@ -294,9 +299,11 @@ pub async fn update_repository(
 /// Delete repository
 pub async fn delete_repository(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<()> {
+    // Require authentication
+    let _auth = auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     service.delete(repo.id).await?;
@@ -436,10 +443,11 @@ pub async fn get_artifact_metadata(
 /// Upload artifact
 pub async fn upload_artifact(
     State(state): State<SharedState>,
-    Extension(auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<Json<ArtifactResponse>> {
+    let auth = auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
 
@@ -517,7 +525,7 @@ pub async fn download_artifact(
             repo.id,
             &path,
             auth.map(|a| a.user_id),
-            ip_addr,
+            Some(ip_addr.to_string()),
             user_agent.as_deref(),
         )
         .await?;
@@ -545,9 +553,11 @@ pub async fn download_artifact(
 /// Delete artifact
 pub async fn delete_artifact(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
 ) -> Result<()> {
+    // Require authentication
+    let _auth = auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
 
