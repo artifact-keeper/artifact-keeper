@@ -78,9 +78,10 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-# Create results directories
+# Create results directories with write permissions for container
 echo -e "${BLUE}Creating test results directories...${NC}"
 mkdir -p test-results playwright-report
+chmod 777 test-results playwright-report
 
 # Stop any existing containers
 echo -e "${YELLOW}Stopping any existing test containers...${NC}"
