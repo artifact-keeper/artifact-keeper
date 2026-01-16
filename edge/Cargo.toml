@@ -46,4 +46,4 @@ futures.workspace = true
 bytes.workspace = true
 
 # LRU cache
-lru = "0.12"
+lru = "0.16"
