@@ -8,12 +8,12 @@ export const adminApi = {
   },
 
   listUsers: async (): Promise<User[]> => {
-    const response = await apiClient.get<User[]>('/api/v1/admin/users');
-    return response.data;
+    const response = await apiClient.get<{ items: User[] }>('/api/v1/users');
+    return response.data.items;
   },
 
   getHealth: async (): Promise<HealthResponse> => {
-    const response = await apiClient.get<HealthResponse>('/api/v1/health');
+    const response = await apiClient.get<HealthResponse>('/health');
     return response.data;
   },
 };

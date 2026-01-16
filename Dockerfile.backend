@@ -9,15 +9,15 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Force cache bust for migration changes - pass --build-arg CACHE_BUST=$(date +%s)
+ARG CACHE_BUST=1
+
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
 COPY backend ./backend
 COPY edge ./edge
 
-# Copy SQLx offline cache
-COPY .sqlx ./.sqlx
-
-# Build the backend in release mode
+# SQLx offline mode - use cached query data for compile-time checking
 ENV SQLX_OFFLINE=true
 RUN cargo build --release --bin artifact-keeper
 

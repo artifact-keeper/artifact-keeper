@@ -1,0 +1,57 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*)\n            FROM repositories\n            WHERE ($1::repository_format IS NULL OR format = $1)\n              AND ($2::repository_type IS NULL OR repo_type = $2)\n              AND ($3 = false OR is_public = true)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "repository_format",
+            "kind": {
+              "Enum": [
+                "maven",
+                "gradle",
+                "npm",
+                "pypi",
+                "nuget",
+                "go",
+                "rubygems",
+                "docker",
+                "helm",
+                "rpm",
+                "debian",
+                "conan",
+                "cargo",
+                "generic"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "repository_type",
+            "kind": {
+              "Enum": [
+                "local",
+                "remote",
+                "virtual"
+              ]
+            }
+          }
+        },
+        "Bool"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e2be146bb020607da02ead349d74b1468412586fa9d71590b49d7533484d233b"
+}

@@ -1,6 +1,6 @@
 # Tasks: Artifact Registry Platform
 
-**Feature**: 001-artifact-registry | **Generated**: 2026-01-15
+**Feature**: 001-artifact-registry | **Generated**: 2026-01-16
 **Input**: Design documents from `/specs/001-artifact-registry/`
 **Prerequisites**: plan.md, spec.md, research.md, data-model.md, contracts/openapi.yaml
 

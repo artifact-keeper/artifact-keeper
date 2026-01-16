@@ -61,7 +61,7 @@ pub struct Backup {
     pub status: BackupStatus,
     pub storage_path: Option<String>,
     pub size_bytes: Option<i64>,
-    pub artifact_count: Option<i64>,
+    pub artifact_count: Option<i32>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
@@ -78,7 +78,7 @@ pub struct BackupManifest {
     pub backup_type: BackupType,
     pub created_at: DateTime<Utc>,
     pub database_tables: Vec<String>,
-    pub artifact_count: i64,
+    pub artifact_count: i32,
     pub total_size_bytes: i64,
     pub checksum: String,
 }
@@ -280,7 +280,7 @@ impl BackupService {
 
             // Add artifact storage keys
             let storage_keys = self.get_artifact_storage_keys(backup.metadata.as_ref()).await?;
-            let mut artifact_count = 0i64;
+            let mut artifact_count = 0i32;
 
             for key in storage_keys {
                 if let Ok(content) = self.storage.get(&key).await {
@@ -379,10 +379,10 @@ impl BackupService {
         Ok(keys)
     }
 
-    fn count_artifacts_in_backup(&self, tar_data: &[u8]) -> Result<i64> {
+    fn count_artifacts_in_backup(&self, tar_data: &[u8]) -> Result<i32> {
         let decoder = GzDecoder::new(tar_data);
         let mut archive = Archive::new(decoder);
-        let mut count = 0i64;
+        let mut count = 0i32;
 
         for entry in archive.entries().map_err(|e| AppError::Internal(e.to_string()))? {
             let entry = entry.map_err(|e| AppError::Internal(e.to_string()))?;
@@ -597,6 +597,6 @@ pub struct RestoreOptions {
 #[derive(Debug, Serialize)]
 pub struct RestoreResult {
     pub tables_restored: Vec<String>,
-    pub artifacts_restored: i64,
+    pub artifacts_restored: i32,
     pub errors: Vec<String>,
 }

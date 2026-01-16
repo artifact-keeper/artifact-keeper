@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (virtual_repo_id, member_repo_id) DO UPDATE SET priority = $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f9463f2713ca392b338fbfae845d737b70a0792d105db313dc1d590a4551a93e"
+}

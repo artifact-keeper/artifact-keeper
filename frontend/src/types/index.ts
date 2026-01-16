@@ -6,6 +6,8 @@ export interface User {
   email: string;
   display_name?: string;
   is_admin: boolean;
+  is_active?: boolean;
+  must_change_password?: boolean;
 }
 
 export interface LoginResponse {
@@ -13,6 +15,12 @@ export interface LoginResponse {
   refresh_token: string;
   expires_in: number;
   token_type: string;
+  must_change_password: boolean;
+}
+
+export interface CreateUserResponse {
+  user: User;
+  generated_password?: string;
 }
 
 export interface Repository {

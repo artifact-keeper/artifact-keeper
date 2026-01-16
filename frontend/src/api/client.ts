@@ -1,7 +1,11 @@
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios';
 import type { ApiError } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9080';
+// In development, use relative URL to go through Vite proxy
+// In production, use the configured API URL
+const API_BASE_URL = import.meta.env.PROD
+  ? (import.meta.env.VITE_API_URL || 'http://localhost:9080')
+  : '';
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,

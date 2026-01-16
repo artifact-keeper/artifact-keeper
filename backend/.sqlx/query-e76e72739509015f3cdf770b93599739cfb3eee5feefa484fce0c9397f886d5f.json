@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) as \"count!\"\n        FROM webhooks\n        WHERE ($1::uuid IS NULL OR repository_id = $1)\n          AND ($2::boolean IS NULL OR is_enabled = $2)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e76e72739509015f3cdf770b93599739cfb3eee5feefa484fce0c9397f886d5f"
+}

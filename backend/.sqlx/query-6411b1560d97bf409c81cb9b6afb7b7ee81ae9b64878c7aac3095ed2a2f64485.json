@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO edge_repo_assignments (edge_node_id, repository_id, sync_enabled)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (edge_node_id, repository_id) DO UPDATE SET sync_enabled = $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6411b1560d97bf409c81cb9b6afb7b7ee81ae9b64878c7aac3095ed2a2f64485"
+}

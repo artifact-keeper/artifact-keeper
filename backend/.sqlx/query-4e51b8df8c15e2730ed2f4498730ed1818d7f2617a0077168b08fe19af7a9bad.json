@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO sync_tasks (edge_node_id, artifact_id, priority)\n            VALUES ($1, $2, $3)\n            ON CONFLICT (edge_node_id, artifact_id) DO UPDATE SET priority = GREATEST(sync_tasks.priority, $3)\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4e51b8df8c15e2730ed2f4498730ed1818d7f2617a0077168b08fe19af7a9bad"
+}

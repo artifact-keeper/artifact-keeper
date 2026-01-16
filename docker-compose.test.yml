@@ -40,8 +40,8 @@ services:
       RUST_LOG: info
       HOST: 0.0.0.0
       PORT: 8080
-    tmpfs:
-      - /data  # Use tmpfs for faster tests
+    # Note: Not using tmpfs for /data because it overrides Dockerfile permissions
+    # The artifact user needs write access to /data for artifact storage
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
