@@ -27,7 +27,7 @@ const formatOptions: { value: RepositoryFormat; label: string }[] = [
 export const PackageSearchTab: React.FC<PackageSearchTabProps> = ({ form }) => {
   return (
     <div style={{ padding: `${spacing.md}px 0` }}>
-      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
         <Form.Item
           name={['package', 'name']}
           label="Package Name"

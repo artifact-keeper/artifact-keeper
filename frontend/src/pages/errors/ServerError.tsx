@@ -45,7 +45,7 @@ const ServerError = ({
         title="Server Error"
         subTitle="Sorry, something went wrong on our end. Please try again later."
         extra={
-          <Space direction="vertical" size="middle" align="center">
+          <Space orientation="vertical" size="middle" align="center">
             <Space size="middle">
               <Button
                 type="primary"

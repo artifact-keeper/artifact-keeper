@@ -178,7 +178,7 @@ const EdgeNodes = () => {
       key: 'cache_usage',
       width: 200,
       render: (_: unknown, record: EdgeNode) => (
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <Progress
             percent={Math.round(record.cache_usage_percent)}
             size="small"
@@ -289,7 +289,7 @@ const EdgeNodes = () => {
             <Statistic
               title="Online"
               value={onlineNodes}
-              valueStyle={{ color: '#3f8600' }}
+              styles={{ content: { color: '#3f8600' } }}
               prefix={<WifiOutlined />}
             />
           </Card>

@@ -102,7 +102,7 @@ export const ArtifactCountWidget: React.FC = () => {
             title="Total Artifacts"
             value={stats?.total_artifacts ?? 0}
             prefix={<FileOutlined style={{ color: colors.primary }} />}
-            valueStyle={{ color: colors.textPrimary }}
+            styles={{ content: { color: colors.textPrimary } }}
           />
         </Col>
         <Col span={12}>
@@ -110,7 +110,7 @@ export const ArtifactCountWidget: React.FC = () => {
             title="Repositories"
             value={stats?.total_repositories ?? repositories?.pagination?.total ?? 0}
             prefix={<DatabaseOutlined style={{ color: colors.info }} />}
-            valueStyle={{ color: colors.textPrimary }}
+            styles={{ content: { color: colors.textPrimary } }}
           />
         </Col>
       </Row>

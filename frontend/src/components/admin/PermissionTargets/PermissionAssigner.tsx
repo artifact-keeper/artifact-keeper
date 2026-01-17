@@ -297,7 +297,7 @@ export const PermissionAssigner: React.FC<PermissionAssignerProps> = ({
           </Checkbox>
         </div>
         <Divider style={{ margin: `${spacing.sm}px 0` }} />
-        <Space direction="vertical" style={{ width: '100%' }}>
+        <Space orientation="vertical" style={{ width: '100%' }}>
           {ACTIONS.map((action) => (
             <div
               key={action.key}

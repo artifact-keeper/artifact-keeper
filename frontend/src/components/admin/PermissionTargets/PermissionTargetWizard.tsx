@@ -418,7 +418,7 @@ export const PermissionTargetWizard: React.FC<PermissionTargetWizardProps> = ({
             <Button
               type="primary"
               icon={<ArrowRightOutlined />}
-              iconPosition="end"
+              iconPlacement="end"
               onClick={handleNext}
             >
               Next

@@ -85,7 +85,7 @@ export const MFAEnroll: React.FC<MFAEnrollProps> = ({
         margin: '0 auto',
       }}
     >
-      <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="large" style={{ width: '100%' }}>
         <div style={{ textAlign: 'center' }}>
           <SafetyOutlined
             style={{
@@ -146,7 +146,7 @@ export const MFAEnroll: React.FC<MFAEnrollProps> = ({
                 backgroundColor: colors.bgLayout,
               }}
             >
-              <Space direction="vertical" size="small" style={{ width: '100%' }}>
+              <Space orientation="vertical" size="small" style={{ width: '100%' }}>
                 {accountName && (
                   <div>
                     <Text type="secondary" style={{ fontSize: 12 }}>
@@ -214,7 +214,7 @@ export const MFAEnroll: React.FC<MFAEnrollProps> = ({
           />
         </div>
 
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <Button
             type="primary"
             onClick={handleVerify}

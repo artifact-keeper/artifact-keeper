@@ -477,7 +477,7 @@ const RepositoryDetail = () => {
               {new Date(selectedArtifact.created_at).toLocaleString()}
             </Descriptions.Item>
             <Descriptions.Item label="SHA-256 Checksum">
-              <Space direction="vertical" style={{ width: '100%' }}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
                 <Paragraph
                   code
                   copyable={{
@@ -491,7 +491,7 @@ const RepositoryDetail = () => {
               </Space>
             </Descriptions.Item>
             <Descriptions.Item label="Download URL">
-              <Space direction="vertical" style={{ width: '100%' }}>
+              <Space orientation="vertical" style={{ width: '100%' }}>
                 <Paragraph
                   code
                   copyable={{

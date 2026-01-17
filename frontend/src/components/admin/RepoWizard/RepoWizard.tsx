@@ -346,7 +346,7 @@ export const RepoWizard: React.FC<RepoWizardProps> = ({
             <Button
               type="primary"
               icon={<ArrowRightOutlined />}
-              iconPosition="end"
+              iconPlacement="end"
               onClick={handleNext}
             >
               Next

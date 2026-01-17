@@ -58,7 +58,7 @@ url = "${uploadUrl}"`;
   const poetryAuthCommand = `poetry config http-basic.${repository.key} $ARTIFACT_KEEPER_USER $ARTIFACT_KEEPER_PASSWORD`;
 
   return (
-    <Space direction="vertical" size="large" style={{ width: '100%' }}>
+    <Space orientation="vertical" size="large" style={{ width: '100%' }}>
       <div>
         <Title level={5} style={{ marginBottom: spacing.xs }}>
           Repository URL

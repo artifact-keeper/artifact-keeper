@@ -22,7 +22,7 @@ const checksumTypeOptions: { value: ChecksumType; label: string }[] = [
 export const ChecksumSearchTab: React.FC<ChecksumSearchTabProps> = ({ form }) => {
   return (
     <div style={{ padding: `${spacing.md}px 0` }}>
-      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
         <Form.Item
           name={['checksum', 'type']}
           label="Checksum Type"

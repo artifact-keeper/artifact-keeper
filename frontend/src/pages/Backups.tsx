@@ -373,7 +373,7 @@ const Backups = () => {
             <Statistic
               title="Completed"
               value={completedBackups}
-              valueStyle={{ color: '#3f8600' }}
+              styles={{ content: { color: '#3f8600' } }}
               prefix={<CheckCircleOutlined />}
             />
           </Card>

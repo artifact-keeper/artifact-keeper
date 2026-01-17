@@ -67,7 +67,7 @@ export const QuickActionsWidget: React.FC = () => {
       icon={<ThunderboltOutlined />}
     >
       <Space
-        direction="vertical"
+        orientation="vertical"
         size={spacing.xs}
         style={{ width: '100%' }}
       >

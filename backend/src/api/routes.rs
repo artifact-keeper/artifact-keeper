@@ -64,6 +64,42 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     auth_middleware,
                 ))
         )
+        // Group routes with auth middleware
+        .nest(
+            "/groups",
+            handlers::groups::router()
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                ))
+        )
+        // Permission routes with auth middleware
+        .nest(
+            "/permissions",
+            handlers::permissions::router()
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                ))
+        )
+        // Build routes with optional auth
+        .nest(
+            "/builds",
+            handlers::builds::router()
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                ))
+        )
+        // Package routes with optional auth
+        .nest(
+            "/packages",
+            handlers::packages::router()
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                ))
+        )
         // Search routes with optional auth
         .nest(
             "/search",

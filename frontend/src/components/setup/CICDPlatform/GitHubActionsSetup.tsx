@@ -343,7 +343,7 @@ jobs:
 
   return (
     <div>
-      <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="large" style={{ width: '100%' }}>
         <div>
           <Title level={5}>
             <KeyOutlined style={{ marginRight: spacing.xs }} />

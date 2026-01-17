@@ -40,7 +40,7 @@ npm install <package-name>`;
   const pnpmConfig = `pnpm config set registry ${registryUrl}`;
 
   return (
-    <Space direction="vertical" size="large" style={{ width: '100%' }}>
+    <Space orientation="vertical" size="large" style={{ width: '100%' }}>
       <div>
         <Title level={5} style={{ marginBottom: spacing.xs }}>
           Registry URL
@@ -117,7 +117,7 @@ npm install <package-name>`;
         <Paragraph type="secondary" style={{ marginBottom: spacing.md }}>
           Configure other package managers to use this registry.
         </Paragraph>
-        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
           <CodeBlock code={yarnConfig} language="bash" title="Yarn" />
           <CodeBlock code={pnpmConfig} language="bash" title="pnpm" />
         </Space>

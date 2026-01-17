@@ -158,7 +158,7 @@ export const VersionHistory: React.FC<VersionHistoryProps> = ({
         width: 160,
         render: (dateString: string) => (
           <Tooltip title={new Date(dateString).toLocaleString()}>
-            <Space direction="vertical" size={0}>
+            <Space orientation="vertical" size={0}>
               <Text>{formatDate(dateString)}</Text>
               <Text type="secondary" style={{ fontSize: 12 }}>
                 {formatRelativeTime(dateString)}

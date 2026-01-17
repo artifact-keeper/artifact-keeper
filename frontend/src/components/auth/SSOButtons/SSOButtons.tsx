@@ -65,11 +65,11 @@ export const SSOButtons: React.FC<SSOButtonsProps> = ({
   }
 
   return (
-    <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+    <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
       <Text type="secondary" style={{ textAlign: 'center', display: 'block' }}>
         Or continue with
       </Text>
-      <Space direction="vertical" size="small" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="small" style={{ width: '100%' }}>
         {enabledProviders.map((provider) => {
           const colorConfig = providerColors[provider.id];
           const isLoading = loading && loadingProvider === provider.id;

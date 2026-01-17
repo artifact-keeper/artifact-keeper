@@ -214,7 +214,7 @@ export const RepositoryPatternSelector: React.FC<RepositoryPatternSelectorProps>
             }
             style={{ marginBottom: spacing.md }}
           >
-            <Space direction="vertical" style={{ width: '100%' }}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
               <Input.Search
                 placeholder="Add include pattern (e.g., npm-*)"
                 value={includeInput}
@@ -254,7 +254,7 @@ export const RepositoryPatternSelector: React.FC<RepositoryPatternSelectorProps>
             }
             style={{ marginBottom: spacing.md }}
           >
-            <Space direction="vertical" style={{ width: '100%' }}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
               <Input.Search
                 placeholder="Add exclude pattern (e.g., *-test)"
                 value={excludeInput}
