@@ -28,7 +28,7 @@ const SetupCard = ({ title, description, icon, onClick }: SetupCardProps) => (
     hoverable
     onClick={onClick}
     style={{ height: '100%' }}
-    bodyStyle={{ display: 'flex', flexDirection: 'column', height: '100%' }}
+    styles={{ body: { display: 'flex', flexDirection: 'column', height: '100%' } }}
   >
     <div style={{ textAlign: 'center', marginBottom: spacing.md }}>
       <div style={{ fontSize: 48, color: colors.primary, marginBottom: spacing.sm }}>

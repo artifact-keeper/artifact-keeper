@@ -45,7 +45,7 @@ const Forbidden = ({
         title="Access Denied"
         subTitle="You do not have permission to access this resource."
         extra={
-          <Space direction="vertical" size="middle" align="center">
+          <Space orientation="vertical" size="middle" align="center">
             <Space size="middle">
               <Button
                 type="primary"

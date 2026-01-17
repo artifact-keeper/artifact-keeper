@@ -90,7 +90,7 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({
         </Title>
       }
       subTitle={
-        <Space direction="vertical" size="small">
+        <Space orientation="vertical" size="small">
           <Text type="secondary" style={{ fontSize: 16 }}>
             Your centralized platform for managing artifacts, packages, and dependencies.
           </Text>
@@ -116,7 +116,7 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({
         </Title>
       }
       subTitle={
-        <Space direction="vertical" size="small">
+        <Space orientation="vertical" size="small">
           <Text type="secondary" style={{ fontSize: 16 }}>
             Repositories are containers for your artifacts and packages.
           </Text>
@@ -152,7 +152,7 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({
         </Title>
       }
       subTitle={
-        <Space direction="vertical" size="small">
+        <Space orientation="vertical" size="small">
           <Text type="secondary" style={{ fontSize: 16 }}>
             Add artifacts to your repositories for versioning and distribution.
           </Text>
@@ -330,7 +330,7 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({
           <Button
             type="primary"
             icon={isLastStep ? <CheckCircleOutlined /> : <ArrowRightOutlined />}
-            iconPosition="end"
+            iconPlacement="end"
             onClick={handleNext}
           >
             {isLastStep ? 'Complete' : 'Next'}

@@ -330,7 +330,7 @@ const Plugins = () => {
             <Statistic
               title="Active"
               value={activePlugins}
-              valueStyle={{ color: '#3f8600' }}
+              styles={{ content: { color: '#3f8600' } }}
               prefix={<CheckCircleOutlined />}
             />
           </Card>
@@ -340,7 +340,7 @@ const Plugins = () => {
             <Statistic
               title="Errors"
               value={errorPlugins}
-              valueStyle={errorPlugins > 0 ? { color: '#cf1322' } : undefined}
+              styles={errorPlugins > 0 ? { content: { color: '#cf1322' } } : undefined}
               prefix={<CloseCircleOutlined />}
             />
           </Card>

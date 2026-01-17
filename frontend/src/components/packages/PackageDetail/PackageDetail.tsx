@@ -199,13 +199,13 @@ export const PackageDetail: React.FC<PackageDetailProps> = ({
             </Col>
 
             <Col xs={24} md={8}>
-              <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+              <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
                 <Card style={{ borderRadius: borderRadius.lg }}>
                   <Statistic
                     title="Total Downloads"
                     value={pkg.total_downloads}
                     prefix={<DownloadOutlined />}
-                    valueStyle={{ color: colors.primary }}
+                    styles={{ content: { color: colors.primary } }}
                   />
                 </Card>
 
@@ -213,7 +213,7 @@ export const PackageDetail: React.FC<PackageDetailProps> = ({
                   <Statistic
                     title="Total Size"
                     value={formatFileSize(pkg.total_size_bytes)}
-                    valueStyle={{ fontSize: 20 }}
+                    styles={{ content: { fontSize: 20 } }}
                   />
                 </Card>
 
@@ -274,7 +274,7 @@ export const PackageDetail: React.FC<PackageDetailProps> = ({
           borderBottom: `1px solid ${colors.borderLight}`,
         }}
       >
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: spacing.md }}>
             <div
               style={{

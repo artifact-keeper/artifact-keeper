@@ -163,7 +163,7 @@ export const QuickSearch: React.FC<QuickSearchProps> = ({
 
   return (
     <Dropdown
-      dropdownRender={() => dropdownContent}
+      popupRender={() => dropdownContent}
       open={dropdownOpen}
       onOpenChange={handleDropdownOpenChange}
       trigger={['click']}

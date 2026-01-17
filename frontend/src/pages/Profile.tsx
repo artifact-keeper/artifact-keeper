@@ -139,7 +139,7 @@ const Profile: React.FC = () => {
         </span>
       ),
       children: (
-        <Space direction="vertical" size="large" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="large" style={{ width: '100%' }}>
           <Card>
             <ProfileHeader user={user} />
           </Card>

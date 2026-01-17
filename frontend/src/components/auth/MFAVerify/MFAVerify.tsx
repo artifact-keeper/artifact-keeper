@@ -102,7 +102,7 @@ export const MFAVerify: React.FC<MFAVerifyProps> = ({
         textAlign: 'center',
       }}
     >
-      <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="large" style={{ width: '100%' }}>
         <div>
           <SafetyOutlined
             style={{
@@ -168,7 +168,7 @@ export const MFAVerify: React.FC<MFAVerifyProps> = ({
           </div>
         )}
 
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <Button
             type="primary"
             onClick={handleSubmit}

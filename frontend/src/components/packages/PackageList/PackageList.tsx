@@ -97,7 +97,7 @@ export const PackageList: React.FC<PackageListProps> = ({
         key: 'name',
         sorter: true,
         render: (_, pkg) => (
-          <Space direction="vertical" size={0}>
+          <Space orientation="vertical" size={0}>
             <Text strong>{pkg.name}</Text>
             {pkg.latest_version && (
               <Text type="secondary" style={{ fontSize: 12 }}>

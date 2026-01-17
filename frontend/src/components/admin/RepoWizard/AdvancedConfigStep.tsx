@@ -74,7 +74,7 @@ export const AdvancedConfigStep: React.FC<AdvancedConfigStepProps> = ({
             label="Storage Quota"
             extra="Maximum storage space allowed for this repository."
           >
-            <Space direction="vertical" style={{ width: '100%' }}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
               <Select
                 style={{ width: '100%' }}
                 placeholder="Select quota"

@@ -126,7 +126,7 @@ export const UserForm: React.FC<UserFormProps> = ({
           icon={<KeyOutlined />}
           message="Generated Password"
           description={
-            <Space direction="vertical" style={{ width: '100%' }}>
+            <Space orientation="vertical" style={{ width: '100%' }}>
               <Text>
                 Please save this password. It will not be shown again.
               </Text>

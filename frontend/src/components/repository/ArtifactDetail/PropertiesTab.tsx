@@ -211,7 +211,7 @@ export const PropertiesTab: React.FC<PropertiesTabProps> = ({
       {canEdit && (
         <div style={{ marginBottom: 16 }}>
           {isAdding ? (
-            <Space style={{ width: '100%' }} direction="vertical" size="small">
+            <Space style={{ width: '100%' }} orientation="vertical" size="small">
               <Space>
                 <Input
                   placeholder="Key"

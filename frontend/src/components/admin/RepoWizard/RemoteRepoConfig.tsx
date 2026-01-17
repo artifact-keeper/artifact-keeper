@@ -147,7 +147,7 @@ export const RemoteRepoConfig: React.FC<RemoteRepoConfigProps> = ({ form }) => {
           />
         </Form.Item>
 
-        <Space direction="vertical" style={{ width: '100%', marginBottom: spacing.lg }}>
+        <Space orientation="vertical" style={{ width: '100%', marginBottom: spacing.lg }}>
           <Text strong>Authentication (Optional)</Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
             Provide credentials if the remote repository requires authentication.
@@ -188,7 +188,7 @@ export const RemoteRepoConfig: React.FC<RemoteRepoConfigProps> = ({ form }) => {
           />
         </Form.Item>
 
-        <Space direction="vertical" style={{ width: '100%', marginTop: spacing.lg, marginBottom: spacing.md }}>
+        <Space orientation="vertical" style={{ width: '100%', marginTop: spacing.lg, marginBottom: spacing.md }}>
           <Text strong>Caching Settings</Text>
         </Space>
 

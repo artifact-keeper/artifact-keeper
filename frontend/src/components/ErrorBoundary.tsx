@@ -109,7 +109,7 @@ class ErrorBoundary extends Component<Props, State> {
             title="Something Went Wrong"
             subTitle="An unexpected error occurred while rendering this page."
             extra={
-              <Space direction="vertical" size="large" align="center">
+              <Space orientation="vertical" size="large" align="center">
                 <Space size="middle">
                   <Button
                     type="primary"

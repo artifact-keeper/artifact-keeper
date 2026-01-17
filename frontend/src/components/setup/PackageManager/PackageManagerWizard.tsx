@@ -206,7 +206,7 @@ export const PackageManagerWizard: React.FC<PackageManagerWizardProps> = ({
         return (
           <Empty
             description={
-              <Space direction="vertical">
+              <Space orientation="vertical">
                 <Text>Configuration not available for this package type.</Text>
                 <Text type="secondary">
                   Supported types: Maven, npm, Docker, PyPI
@@ -307,7 +307,7 @@ export const PackageManagerWizard: React.FC<PackageManagerWizardProps> = ({
             <Button
               type="primary"
               icon={<ArrowRightOutlined />}
-              iconPosition="end"
+              iconPlacement="end"
               onClick={handleNext}
             >
               Next

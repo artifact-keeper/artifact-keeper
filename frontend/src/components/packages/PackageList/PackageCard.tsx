@@ -92,7 +92,7 @@ export const PackageCard: React.FC<PackageCardProps> = ({
         },
       }}
     >
-      <Space direction="vertical" size="small" style={{ width: '100%', flex: 1 }}>
+      <Space orientation="vertical" size="small" style={{ width: '100%', flex: 1 }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: spacing.sm }}>
           <div
             style={{

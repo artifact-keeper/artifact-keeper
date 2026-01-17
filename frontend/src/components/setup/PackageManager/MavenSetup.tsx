@@ -83,7 +83,7 @@ export const MavenSetup: React.FC<MavenSetupProps> = ({ repository, baseUrl }) =
   const deployCommand = `mvn deploy -DaltDeploymentRepository=${repository.key}::default::${repoUrl}`;
 
   return (
-    <Space direction="vertical" size="large" style={{ width: '100%' }}>
+    <Space orientation="vertical" size="large" style={{ width: '100%' }}>
       <div>
         <Title level={5} style={{ marginBottom: spacing.xs }}>
           Repository URL

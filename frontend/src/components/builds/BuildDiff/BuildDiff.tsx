@@ -121,7 +121,7 @@ const BuildSummaryCard: React.FC<{ build: BuildSummary; label: string }> = ({ bu
       <Text strong style={{ fontSize: 16 }}>{build.project_name}</Text>
       <Text code style={{ marginLeft: 8 }}>#{build.build_number}</Text>
     </div>
-    <Space direction="vertical" size={4}>
+    <Space orientation="vertical" size={4}>
       <div>
         <Tag color={getStatusTagColor(build.status)}>
           {getStatusIcon(build.status)}

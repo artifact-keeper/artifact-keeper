@@ -62,7 +62,7 @@ export const ProfileHeader: React.FC<ProfileHeaderProps> = ({ user }) => {
       >
         {initials}
       </Avatar>
-      <Space direction="vertical" size={4}>
+      <Space orientation="vertical" size={4}>
         <Space align="center" size="middle">
           <Title level={3} style={{ margin: 0 }}>
             {user.display_name || user.username}

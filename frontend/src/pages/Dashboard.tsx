@@ -170,7 +170,7 @@ const Dashboard = () => {
             <Statistic
               title="Status"
               value={health?.status || 'Unknown'}
-              valueStyle={{ color: health?.status === 'healthy' ? '#3f8600' : '#cf1322' }}
+              styles={{ content: { color: health?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
               prefix={health?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
             />
           </Col>
@@ -178,7 +178,7 @@ const Dashboard = () => {
             <Statistic
               title="Database"
               value={health?.checks?.database?.status || 'Unknown'}
-              valueStyle={{ color: health?.checks?.database?.status === 'healthy' ? '#3f8600' : '#cf1322' }}
+              styles={{ content: { color: health?.checks?.database?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
               prefix={health?.checks?.database?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
             />
           </Col>
@@ -186,7 +186,7 @@ const Dashboard = () => {
             <Statistic
               title="Storage"
               value={health?.checks?.storage?.status || 'Unknown'}
-              valueStyle={{ color: health?.checks?.storage?.status === 'healthy' ? '#3f8600' : '#cf1322' }}
+              styles={{ content: { color: health?.checks?.storage?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
               prefix={health?.checks?.storage?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
             />
           </Col>
