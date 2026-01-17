@@ -225,5 +225,4 @@ export const CICDPlatformWizard: React.FC<CICDPlatformWizardProps> = ({
   );
 };
 
-export { CodeBlock };
 export default CICDPlatformWizard;
