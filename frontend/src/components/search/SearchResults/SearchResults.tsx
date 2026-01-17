@@ -314,7 +314,7 @@ export const SearchResults: React.FC<SearchResultsProps> = ({
             width: '100%',
             borderRadius: borderRadius.md,
           }}
-          bodyStyle={{ padding: spacing.md }}
+          styles={{ body: { padding: spacing.md } }}
           actions={[
             <Tooltip key="download" title="Download">
               <Button
