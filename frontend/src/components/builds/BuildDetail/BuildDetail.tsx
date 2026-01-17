@@ -21,7 +21,7 @@ import type {
   BuildIssue,
   BuildStatus,
 } from '../../../types';
-import { colors } from '../../../styles/tokens';
+import { formatDate, formatDuration, formatFileSize } from '../../../utils';
 
 const { Title, Text } = Typography;
 
@@ -30,42 +30,6 @@ export interface BuildDetailProps {
   artifacts?: BuildModuleArtifact[];
   onCompare?: (build: BuildDetailType) => void;
 }
-
-const formatDate = (dateString: string | undefined): string => {
-  if (!dateString) return '-';
-  const date = new Date(dateString);
-  return date.toLocaleString(undefined, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-};
-
-const formatDuration = (durationMs: number | undefined): string => {
-  if (!durationMs) return '-';
-  const seconds = Math.floor(durationMs / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-
-  if (hours > 0) {
-    return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
-  }
-  if (minutes > 0) {
-    return `${minutes}m ${seconds % 60}s`;
-  }
-  return `${seconds}s`;
-};
-
-const formatFileSize = (bytes: number): string => {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-};
 
 const getStatusIcon = (status: BuildStatus): React.ReactNode => {
   const iconStyle = { marginRight: 4 };

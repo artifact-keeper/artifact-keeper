@@ -27,6 +27,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { colors, spacing, borderRadius } from '../../../styles/tokens';
 import type { ArtifactSearchHit } from '../../../types';
+import { formatFileSize, formatRelativeTime } from '../../../utils';
 
 const { Text, Title } = Typography;
 
@@ -53,46 +54,6 @@ export interface SearchResultsProps {
   sortOrder?: SortOrder;
   onSortChange?: (field: SortField, order: SortOrder) => void;
 }
-
-const formatFileSize = (bytes: number): string => {
-  if (bytes === 0) return '0 B';
-
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const k = 1024;
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  const size = bytes / Math.pow(k, i);
-
-  return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
-};
-
-const formatRelativeTime = (dateString: string): string => {
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffSeconds = Math.floor(diffMs / 1000);
-  const diffMinutes = Math.floor(diffSeconds / 60);
-  const diffHours = Math.floor(diffMinutes / 60);
-  const diffDays = Math.floor(diffHours / 24);
-  const diffWeeks = Math.floor(diffDays / 7);
-  const diffMonths = Math.floor(diffDays / 30);
-  const diffYears = Math.floor(diffDays / 365);
-
-  if (diffSeconds < 60) {
-    return 'just now';
-  } else if (diffMinutes < 60) {
-    return `${diffMinutes} minute${diffMinutes === 1 ? '' : 's'} ago`;
-  } else if (diffHours < 24) {
-    return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`;
-  } else if (diffDays < 7) {
-    return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`;
-  } else if (diffWeeks < 4) {
-    return `${diffWeeks} week${diffWeeks === 1 ? '' : 's'} ago`;
-  } else if (diffMonths < 12) {
-    return `${diffMonths} month${diffMonths === 1 ? '' : 's'} ago`;
-  } else {
-    return `${diffYears} year${diffYears === 1 ? '' : 's'} ago`;
-  }
-};
 
 const getFormatColor = (contentType: string): string => {
   if (contentType.includes('java') || contentType.includes('jar')) {
