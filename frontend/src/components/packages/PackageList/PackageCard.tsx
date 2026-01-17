@@ -17,6 +17,7 @@ import {
 } from '@ant-design/icons';
 import type { Package, PackageType } from '../../../types';
 import { colors, spacing, borderRadius, shadows } from '../../../styles/tokens';
+import { formatDownloadCount, formatRelativeTimeShort } from '../../../utils';
 
 const { Text, Title } = Typography;
 
@@ -57,45 +58,6 @@ const packageTypeLabels: Record<PackageType, string> = {
   conan: 'Conan',
   cargo: 'Cargo',
   generic: 'Generic',
-};
-
-const formatDownloadCount = (count: number): string => {
-  if (count >= 1000000) {
-    return `${(count / 1000000).toFixed(1)}M`;
-  }
-  if (count >= 1000) {
-    return `${(count / 1000).toFixed(1)}K`;
-  }
-  return count.toString();
-};
-
-const formatRelativeTime = (dateString: string): string => {
-  const date = new Date(dateString);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffSeconds = Math.floor(diffMs / 1000);
-  const diffMinutes = Math.floor(diffSeconds / 60);
-  const diffHours = Math.floor(diffMinutes / 60);
-  const diffDays = Math.floor(diffHours / 24);
-  const diffWeeks = Math.floor(diffDays / 7);
-  const diffMonths = Math.floor(diffDays / 30);
-  const diffYears = Math.floor(diffDays / 365);
-
-  if (diffSeconds < 60) {
-    return 'just now';
-  } else if (diffMinutes < 60) {
-    return `${diffMinutes}m ago`;
-  } else if (diffHours < 24) {
-    return `${diffHours}h ago`;
-  } else if (diffDays < 7) {
-    return `${diffDays}d ago`;
-  } else if (diffWeeks < 4) {
-    return `${diffWeeks}w ago`;
-  } else if (diffMonths < 12) {
-    return `${diffMonths}mo ago`;
-  } else {
-    return `${diffYears}y ago`;
-  }
 };
 
 export const PackageCard: React.FC<PackageCardProps> = ({
@@ -224,7 +186,7 @@ export const PackageCard: React.FC<PackageCardProps> = ({
             <Space size={4}>
               <ClockCircleOutlined style={{ color: colors.textTertiary, fontSize: 12 }} />
               <Text type="secondary" style={{ fontSize: 12 }}>
-                {formatRelativeTime(pkg.updated_at)}
+                {formatRelativeTimeShort(pkg.updated_at)}
               </Text>
             </Space>
           </Tooltip>

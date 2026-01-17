@@ -16,12 +16,12 @@ import type {
   BuildDiff as BuildDiffType,
   BuildSummary,
   ModuleDiff,
-  ArtifactChange,
   DependencyChange,
   BuildDependency,
   BuildStatus,
 } from '../../../types';
 import { colors } from '../../../styles/tokens';
+import { formatFileSize } from '../../../utils';
 
 const { Title, Text } = Typography;
 
@@ -31,7 +31,8 @@ export interface BuildDiffProps {
   diffResult: BuildDiffType;
 }
 
-const formatDate = (dateString: string | undefined): string => {
+// Use a shorter date format for build diff views
+const formatDateShort = (dateString: string | undefined): string => {
   if (!dateString) return '-';
   const date = new Date(dateString);
   return date.toLocaleDateString(undefined, {
@@ -110,13 +111,6 @@ const getChangeStatusIcon = (status: string): React.ReactNode => {
   }
 };
 
-const formatFileSize = (bytes: number | undefined): string => {
-  if (!bytes || bytes === 0) return '-';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-};
 
 const BuildSummaryCard: React.FC<{ build: BuildSummary; label: string }> = ({ build, label }) => (
   <Card size="small" style={{ height: '100%' }}>
@@ -146,7 +140,7 @@ const BuildSummaryCard: React.FC<{ build: BuildSummary; label: string }> = ({ bu
       )}
       {build.completed_at && (
         <Text type="secondary" style={{ fontSize: 12 }}>
-          Completed: {formatDate(build.completed_at)}
+          Completed: {formatDateShort(build.completed_at)}
         </Text>
       )}
     </Space>

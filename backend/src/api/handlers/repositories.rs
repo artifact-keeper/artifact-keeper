@@ -103,6 +103,23 @@ pub struct Pagination {
     pub total_pages: u32,
 }
 
+/// Convert a Repository model to a RepositoryResponse with optional storage usage.
+fn repo_to_response(repo: crate::models::repository::Repository, storage_used_bytes: i64) -> RepositoryResponse {
+    RepositoryResponse {
+        id: repo.id,
+        key: repo.key,
+        name: repo.name,
+        description: repo.description,
+        format: format!("{:?}", repo.format).to_lowercase(),
+        repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
+        is_public: repo.is_public,
+        storage_used_bytes,
+        quota_bytes: repo.quota_bytes,
+        created_at: repo.created_at,
+        updated_at: repo.updated_at,
+    }
+}
+
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
     match s.to_lowercase().as_str() {
         "maven" => Ok(RepositoryFormat::Maven),
@@ -157,19 +174,7 @@ pub async fn list_repositories(
 
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
-        .map(|r| RepositoryResponse {
-            id: r.id,
-            key: r.key,
-            name: r.name,
-            description: r.description,
-            format: format!("{:?}", r.format).to_lowercase(),
-            repo_type: format!("{:?}", r.repo_type).to_lowercase(),
-            is_public: r.is_public,
-            storage_used_bytes: 0, // Would need to calculate per repo
-            quota_bytes: r.quota_bytes,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        })
+        .map(|r| repo_to_response(r, 0)) // Storage usage calculated on-demand per repo
         .collect();
 
     Ok(Json(RepositoryListResponse {
@@ -213,19 +218,7 @@ pub async fn create_repository(
         })
         .await?;
 
-    Ok(Json(RepositoryResponse {
-        id: repo.id,
-        key: repo.key,
-        name: repo.name,
-        description: repo.description,
-        format: format!("{:?}", repo.format).to_lowercase(),
-        repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
-        is_public: repo.is_public,
-        storage_used_bytes: 0,
-        quota_bytes: repo.quota_bytes,
-        created_at: repo.created_at,
-        updated_at: repo.updated_at,
-    }))
+    Ok(Json(repo_to_response(repo, 0)))
 }
 
 /// Get repository details
@@ -237,19 +230,7 @@ pub async fn get_repository(
     let repo = service.get_by_key(&key).await?;
     let storage_used = service.get_storage_usage(repo.id).await?;
 
-    Ok(Json(RepositoryResponse {
-        id: repo.id,
-        key: repo.key,
-        name: repo.name,
-        description: repo.description,
-        format: format!("{:?}", repo.format).to_lowercase(),
-        repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
-        is_public: repo.is_public,
-        storage_used_bytes: storage_used,
-        quota_bytes: repo.quota_bytes,
-        created_at: repo.created_at,
-        updated_at: repo.updated_at,
-    }))
+    Ok(Json(repo_to_response(repo, storage_used)))
 }
 
 /// Update repository
@@ -281,19 +262,7 @@ pub async fn update_repository(
 
     let storage_used = service.get_storage_usage(repo.id).await?;
 
-    Ok(Json(RepositoryResponse {
-        id: repo.id,
-        key: repo.key,
-        name: repo.name,
-        description: repo.description,
-        format: format!("{:?}", repo.format).to_lowercase(),
-        repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
-        is_public: repo.is_public,
-        storage_used_bytes: storage_used,
-        quota_bytes: repo.quota_bytes,
-        created_at: repo.created_at,
-        updated_at: repo.updated_at,
-    }))
+    Ok(Json(repo_to_response(repo, storage_used)))
 }
 
 /// Delete repository
