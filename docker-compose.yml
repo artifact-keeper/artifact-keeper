@@ -31,6 +31,7 @@ services:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
       HOST: 0.0.0.0
@@ -38,6 +39,7 @@ services:
     volumes:
       - artifact_storage:/data/storage
       - backup_storage:/data/backups
+      - plugins_storage:/data/plugins
     ports:
       - "30080:8080"
     healthcheck:
@@ -69,6 +71,8 @@ volumes:
   artifact_storage:
     driver: local
   backup_storage:
+    driver: local
+  plugins_storage:
     driver: local
 
 networks:
