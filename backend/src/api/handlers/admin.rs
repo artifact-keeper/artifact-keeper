@@ -58,7 +58,7 @@ pub struct BackupResponse {
     pub status: String,
     pub storage_path: Option<String>,
     pub size_bytes: i64,
-    pub artifact_count: i32,
+    pub artifact_count: i64,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub error_message: Option<String>,

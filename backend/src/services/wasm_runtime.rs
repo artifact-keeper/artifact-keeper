@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::models::plugin::PluginResourceLimits;
 
@@ -72,6 +72,8 @@ pub struct PluginContext {
     pub plugin_id: String,
     pub format_key: String,
     limits: StoreLimits,
+    wasi_ctx: WasiCtx,
+    resource_table: ResourceTable,
 }
 
 impl PluginContext {
@@ -85,11 +87,28 @@ impl PluginContext {
             .memories(1)
             .build();
 
+        // Build minimal WASI context for plugins
+        let wasi_ctx = WasiCtxBuilder::new()
+            .inherit_stdio()
+            .build();
+
         Self {
             plugin_id,
             format_key,
             limits: store_limits,
+            wasi_ctx,
+            resource_table: ResourceTable::new(),
         }
+    }
+}
+
+impl WasiView for PluginContext {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.resource_table
+    }
+
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi_ctx
     }
 }
 
@@ -105,9 +124,9 @@ impl ResourceLimiter for PluginContext {
 
     fn table_growing(
         &mut self,
-        current: usize,
-        desired: usize,
-        maximum: Option<usize>,
+        current: u32,
+        desired: u32,
+        maximum: Option<u32>,
     ) -> anyhow::Result<bool> {
         self.limits.table_growing(current, desired, maximum)
     }

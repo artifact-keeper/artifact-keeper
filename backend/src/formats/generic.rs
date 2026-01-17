@@ -9,6 +9,18 @@ use crate::models::repository::RepositoryFormat;
 
 pub struct GenericHandler;
 
+impl GenericHandler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for GenericHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl FormatHandler for GenericHandler {
     fn format(&self) -> RepositoryFormat {

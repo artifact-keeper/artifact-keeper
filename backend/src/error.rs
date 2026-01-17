@@ -81,6 +81,10 @@ pub enum AppError {
     /// Internal server error
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// WASM execution error
+    #[error("WASM error: {0}")]
+    Wasm(#[from] crate::services::wasm_runtime::WasmError),
 }
 
 impl IntoResponse for AppError {
@@ -134,6 +138,11 @@ impl IntoResponse for AppError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",
                 msg.clone(),
+            ),
+            AppError::Wasm(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WASM_ERROR",
+                e.to_string(),
             ),
         };
 

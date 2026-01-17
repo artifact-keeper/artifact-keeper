@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::Artifact;
-use crate::models::plugin::{Plugin, PluginHook, PluginStatus, PluginType};
+use crate::models::plugin::{Plugin, PluginHook, PluginSourceType, PluginStatus, PluginType};
 
 /// Plugin event types that can trigger hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,30 +169,29 @@ impl PluginService {
         config: Option<serde_json::Value>,
         config_schema: Option<serde_json::Value>,
     ) -> Result<Plugin> {
-        let plugin = sqlx::query_as!(
-            Plugin,
+        let plugin = sqlx::query_as::<_, Plugin>(
             r#"
             INSERT INTO plugins (
                 name, version, display_name, description, author, homepage,
-                plugin_type, config, config_schema
+                plugin_type, config, config_schema, source_type
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'core')
             RETURNING
-                id, name, version, display_name, description, author, homepage,
-                status as "status: PluginStatus",
-                plugin_type as "plugin_type: PluginType",
-                config, config_schema, installed_at, enabled_at, updated_at
+                id, name, version, display_name, description, author, homepage, license,
+                status, plugin_type, source_type,
+                source_url, source_ref, wasm_path, manifest, capabilities, resource_limits,
+                config, config_schema, error_message, installed_at, enabled_at, updated_at
             "#,
-            name,
-            version,
-            display_name,
-            description,
-            author,
-            homepage,
-            plugin_type as PluginType,
-            config,
-            config_schema
         )
+        .bind(name)
+        .bind(version)
+        .bind(display_name)
+        .bind(description)
+        .bind(author)
+        .bind(homepage)
+        .bind(&plugin_type)
+        .bind(&config)
+        .bind(&config_schema)
         .fetch_one(&self.db)
         .await
         .map_err(|e| {
@@ -213,20 +212,19 @@ impl PluginService {
 
     /// Enable a plugin.
     pub async fn enable_plugin(&self, plugin_id: Uuid) -> Result<Plugin> {
-        let plugin = sqlx::query_as!(
-            Plugin,
+        let plugin = sqlx::query_as::<_, Plugin>(
             r#"
             UPDATE plugins
             SET status = 'active', enabled_at = NOW(), updated_at = NOW()
             WHERE id = $1 AND status = 'disabled'
             RETURNING
-                id, name, version, display_name, description, author, homepage,
-                status as "status: PluginStatus",
-                plugin_type as "plugin_type: PluginType",
-                config, config_schema, installed_at, enabled_at, updated_at
+                id, name, version, display_name, description, author, homepage, license,
+                status, plugin_type, source_type,
+                source_url, source_ref, wasm_path, manifest, capabilities, resource_limits,
+                config, config_schema, error_message, installed_at, enabled_at, updated_at
             "#,
-            plugin_id
         )
+        .bind(plugin_id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -242,10 +240,10 @@ impl PluginService {
             }
             None => {
                 // Check if plugin exists
-                let exists = sqlx::query_scalar!(
+                let exists: Option<bool> = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM plugins WHERE id = $1)",
-                    plugin_id
                 )
+                .bind(plugin_id)
                 .fetch_one(&self.db)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
@@ -262,20 +260,19 @@ impl PluginService {
 
     /// Disable a plugin.
     pub async fn disable_plugin(&self, plugin_id: Uuid) -> Result<Plugin> {
-        let plugin = sqlx::query_as!(
-            Plugin,
+        let plugin = sqlx::query_as::<_, Plugin>(
             r#"
             UPDATE plugins
             SET status = 'disabled', updated_at = NOW()
             WHERE id = $1 AND status = 'active'
             RETURNING
-                id, name, version, display_name, description, author, homepage,
-                status as "status: PluginStatus",
-                plugin_type as "plugin_type: PluginType",
-                config, config_schema, installed_at, enabled_at, updated_at
+                id, name, version, display_name, description, author, homepage, license,
+                status, plugin_type, source_type,
+                source_url, source_ref, wasm_path, manifest, capabilities, resource_limits,
+                config, config_schema, error_message, installed_at, enabled_at, updated_at
             "#,
-            plugin_id
         )
+        .bind(plugin_id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -290,10 +287,10 @@ impl PluginService {
                 Ok(p)
             }
             None => {
-                let exists = sqlx::query_scalar!(
+                let exists: Option<bool> = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM plugins WHERE id = $1)",
-                    plugin_id
                 )
+                .bind(plugin_id)
                 .fetch_one(&self.db)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
@@ -313,25 +310,29 @@ impl PluginService {
         let plugin = self.get_plugin(plugin_id).await.ok();
 
         // Delete hooks first (foreign key constraint)
-        sqlx::query!("DELETE FROM plugin_hooks WHERE plugin_id = $1", plugin_id)
+        sqlx::query("DELETE FROM plugin_hooks WHERE plugin_id = $1")
+            .bind(plugin_id)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Delete config entries
-        sqlx::query!("DELETE FROM plugin_config WHERE plugin_id = $1", plugin_id)
+        sqlx::query("DELETE FROM plugin_config WHERE plugin_id = $1")
+            .bind(plugin_id)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Delete plugin events
-        sqlx::query!("DELETE FROM plugin_events WHERE plugin_id = $1", plugin_id)
+        sqlx::query("DELETE FROM plugin_events WHERE plugin_id = $1")
+            .bind(plugin_id)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Delete plugin
-        let result = sqlx::query!("DELETE FROM plugins WHERE id = $1", plugin_id)
+        let result = sqlx::query("DELETE FROM plugins WHERE id = $1")
+            .bind(plugin_id)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -352,19 +353,18 @@ impl PluginService {
 
     /// Get a plugin by ID.
     pub async fn get_plugin(&self, plugin_id: Uuid) -> Result<Plugin> {
-        let plugin = sqlx::query_as!(
-            Plugin,
+        let plugin = sqlx::query_as::<_, Plugin>(
             r#"
             SELECT
-                id, name, version, display_name, description, author, homepage,
-                status as "status: PluginStatus",
-                plugin_type as "plugin_type: PluginType",
-                config, config_schema, installed_at, enabled_at, updated_at
+                id, name, version, display_name, description, author, homepage, license,
+                status, plugin_type, source_type,
+                source_url, source_ref, wasm_path, manifest, capabilities, resource_limits,
+                config, config_schema, error_message, installed_at, enabled_at, updated_at
             FROM plugins
             WHERE id = $1
             "#,
-            plugin_id
         )
+        .bind(plugin_id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -382,25 +382,23 @@ impl PluginService {
         debug!("Loading plugins from database");
 
         // Load all active plugins
-        let plugins = sqlx::query_as!(
-            Plugin,
+        let plugins = sqlx::query_as::<_, Plugin>(
             r#"
             SELECT
-                id, name, version, display_name, description, author, homepage,
-                status as "status: PluginStatus",
-                plugin_type as "plugin_type: PluginType",
-                config, config_schema, installed_at, enabled_at, updated_at
+                id, name, version, display_name, description, author, homepage, license,
+                status, plugin_type, source_type,
+                source_url, source_ref, wasm_path, manifest, capabilities, resource_limits,
+                config, config_schema, error_message, installed_at, enabled_at, updated_at
             FROM plugins
             WHERE status = 'active'
-            "#
+            "#,
         )
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Load hooks for all active plugins
-        let hooks = sqlx::query_as!(
-            PluginHook,
+        let hooks = sqlx::query_as::<_, PluginHook>(
             r#"
             SELECT
                 h.id, h.plugin_id, h.hook_type, h.handler_name, h.priority, h.is_enabled, h.created_at
@@ -408,7 +406,7 @@ impl PluginService {
             INNER JOIN plugins p ON p.id = h.plugin_id
             WHERE p.status = 'active' AND h.is_enabled = true
             ORDER BY h.priority ASC
-            "#
+            "#,
         )
         .fetch_all(&self.db)
         .await
@@ -466,18 +464,17 @@ impl PluginService {
         handler_name: &str,
         priority: i32,
     ) -> Result<PluginHook> {
-        let hook = sqlx::query_as!(
-            PluginHook,
+        let hook = sqlx::query_as::<_, PluginHook>(
             r#"
             INSERT INTO plugin_hooks (plugin_id, hook_type, handler_name, priority)
             VALUES ($1, $2, $3, $4)
             RETURNING id, plugin_id, hook_type, handler_name, priority, is_enabled, created_at
             "#,
-            plugin_id,
-            hook_type.as_str(),
-            handler_name,
-            priority
         )
+        .bind(plugin_id)
+        .bind(hook_type.as_str())
+        .bind(handler_name)
+        .bind(priority)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -978,17 +975,17 @@ impl PluginService {
         message: &str,
         details: Option<serde_json::Value>,
     ) {
-        let result = sqlx::query!(
+        let result = sqlx::query(
             r#"
             INSERT INTO plugin_events (plugin_id, event_type, severity, message, details)
             VALUES ($1, $2, $3, $4, $5)
             "#,
-            plugin_id,
-            event_type,
-            severity,
-            message,
-            details
         )
+        .bind(plugin_id)
+        .bind(event_type)
+        .bind(severity)
+        .bind(message)
+        .bind(&details)
         .execute(&self.db)
         .await;
 

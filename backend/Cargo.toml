@@ -90,6 +90,11 @@ wasmtime-wasi.workspace = true
 # Git operations
 git2.workspace = true
 
+# Base64 encoding
+base64 = "0.22"
+
+# Temp files
+tempfile = "3.16"
+
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.16"

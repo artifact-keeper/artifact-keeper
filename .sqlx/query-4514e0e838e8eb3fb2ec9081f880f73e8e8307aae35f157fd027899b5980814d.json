@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT id, format_key, plugin_id,\n                           handler_type as \"handler_type: FormatHandlerType\",\n                           display_name, description, extensions,\n                           is_enabled, priority, created_at, updated_at\n                    FROM format_handlers\n                    WHERE handler_type = $1\n                    ORDER BY priority DESC, display_name\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "format_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "plugin_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "handler_type: FormatHandlerType",
+        "type_info": {
+          "Custom": {
+            "name": "format_handler_type",
+            "kind": {
+              "Enum": [
+                "core",
+                "wasm"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "extensions",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "is_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "priority",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "format_handler_type",
+            "kind": {
+              "Enum": [
+                "core",
+                "wasm"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4514e0e838e8eb3fb2ec9081f880f73e8e8307aae35f157fd027899b5980814d"
+}

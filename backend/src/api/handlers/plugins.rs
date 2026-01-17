@@ -840,6 +840,6 @@ pub async fn install_from_local(
         name: result.name,
         version: result.version,
         format_key: result.format_key,
-        status: "installed".to_string(),
+        message: "Plugin installed from local path".to_string(),
     }))
 }

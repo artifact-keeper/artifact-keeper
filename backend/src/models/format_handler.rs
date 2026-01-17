@@ -58,7 +58,7 @@ pub struct CreateFormatHandler {
 }
 
 /// Request to update a format handler record.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateFormatHandler {
     pub display_name: Option<String>,
     pub description: Option<String>,

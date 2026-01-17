@@ -62,13 +62,13 @@ VALUES
     ('nuget', 'core', 'NuGet', '.NET package manager', ARRAY['.nupkg'], true, 100),
     ('cargo', 'core', 'Cargo', 'Rust package manager', ARRAY['.crate'], true, 100),
     ('go', 'core', 'Go Modules', 'Go module proxy', ARRAY['.zip', '.mod'], true, 100),
-    ('oci', 'core', 'OCI/Docker', 'Container images (OCI format)', ARRAY[], true, 100),
+    ('oci', 'core', 'OCI/Docker', 'Container images (OCI format)', ARRAY[]::TEXT[], true, 100),
     ('helm', 'core', 'Helm', 'Kubernetes package manager', ARRAY['.tgz'], true, 100),
     ('debian', 'core', 'Debian', 'Debian packages', ARRAY['.deb'], true, 100),
     ('rpm', 'core', 'RPM', 'Red Hat packages', ARRAY['.rpm'], true, 100),
     ('rubygems', 'core', 'RubyGems', 'Ruby gems', ARRAY['.gem'], true, 100),
     ('conan', 'core', 'Conan', 'C/C++ package manager', ARRAY['.tgz'], true, 100),
-    ('generic', 'core', 'Generic', 'Generic artifact storage', ARRAY[], true, 0)
+    ('generic', 'core', 'Generic', 'Generic artifact storage', ARRAY[]::TEXT[], true, 0)
 ON CONFLICT (format_key) DO UPDATE SET
     display_name = EXCLUDED.display_name,
     description = EXCLUDED.description,

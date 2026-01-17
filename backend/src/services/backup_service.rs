@@ -60,7 +60,7 @@ pub struct Backup {
     pub status: BackupStatus,
     pub storage_path: Option<String>,
     pub size_bytes: Option<i64>,
-    pub artifact_count: Option<i32>,
+    pub artifact_count: Option<i64>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
@@ -77,7 +77,7 @@ pub struct BackupManifest {
     pub backup_type: BackupType,
     pub created_at: DateTime<Utc>,
     pub database_tables: Vec<String>,
-    pub artifact_count: i32,
+    pub artifact_count: i64,
     pub total_size_bytes: i64,
     pub checksum: String,
 }
@@ -279,7 +279,7 @@ impl BackupService {
 
             // Add artifact storage keys
             let storage_keys = self.get_artifact_storage_keys(backup.metadata.as_ref()).await?;
-            let mut artifact_count = 0i32;
+            let mut artifact_count = 0i64;
 
             for key in storage_keys {
                 if let Ok(content) = self.storage.get(&key).await {
@@ -327,16 +327,16 @@ impl BackupService {
 
         // Update backup record
         let artifact_count = self.count_artifacts_in_backup(&tar_buffer)?;
-        sqlx::query!(
+        sqlx::query(
             r#"
             UPDATE backups
             SET size_bytes = $2, artifact_count = $3, completed_at = NOW()
             WHERE id = $1
             "#,
-            backup_id,
-            tar_buffer.len() as i64,
-            artifact_count
         )
+        .bind(backup_id)
+        .bind(tar_buffer.len() as i64)
+        .bind(artifact_count)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -378,10 +378,10 @@ impl BackupService {
         Ok(keys)
     }
 
-    fn count_artifacts_in_backup(&self, tar_data: &[u8]) -> Result<i32> {
+    fn count_artifacts_in_backup(&self, tar_data: &[u8]) -> Result<i64> {
         let decoder = GzDecoder::new(tar_data);
         let mut archive = Archive::new(decoder);
-        let mut count = 0i32;
+        let mut count = 0i64;
 
         for entry in archive.entries().map_err(|e| AppError::Internal(e.to_string()))? {
             let entry = entry.map_err(|e| AppError::Internal(e.to_string()))?;
@@ -412,7 +412,7 @@ impl BackupService {
             None
         };
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             UPDATE backups
             SET
@@ -422,12 +422,12 @@ impl BackupService {
                 completed_at = COALESCE($5, completed_at)
             WHERE id = $1
             "#,
-            backup_id,
-            status as BackupStatus,
-            error_message,
-            started_at,
-            completed_at
         )
+        .bind(backup_id)
+        .bind(&status)
+        .bind(&error_message)
+        .bind(started_at)
+        .bind(completed_at)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -537,7 +537,8 @@ impl BackupService {
         }
 
         // Delete from database
-        sqlx::query!("DELETE FROM backups WHERE id = $1", backup_id)
+        sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup_id)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -561,7 +562,7 @@ impl BackupService {
     /// Clean up old backups based on retention policy
     pub async fn cleanup(&self, keep_count: i32, keep_days: i32) -> Result<u64> {
         // Keep the most recent N backups
-        let result = sqlx::query!(
+        let result = sqlx::query(
             r#"
             DELETE FROM backups
             WHERE id NOT IN (
@@ -573,9 +574,9 @@ impl BackupService {
             AND created_at < NOW() - make_interval(days => $2)
             AND status = 'completed'
             "#,
-            keep_count as i64,
-            keep_days
         )
+        .bind(keep_count as i64)
+        .bind(keep_days)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

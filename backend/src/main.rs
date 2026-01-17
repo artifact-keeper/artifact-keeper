@@ -111,7 +111,7 @@ async fn initialize_wasm_plugins(
 
     for plugin in active_plugins {
         if let Some(ref wasm_path) = plugin.wasm_path {
-            match wasm_service.activate_plugin(&plugin, std::path::Path::new(wasm_path)).await {
+            match wasm_service.activate_plugin_at_startup(&plugin, std::path::Path::new(wasm_path)).await {
                 Ok(_) => {
                     tracing::info!("Loaded plugin: {} v{}", plugin.name, plugin.version);
                     loaded_count += 1;
@@ -123,12 +123,10 @@ async fn initialize_wasm_plugins(
                         e
                     );
                     // Update plugin status to error
-                    let _ = sqlx::query!(
-                        "UPDATE plugins SET status = 'error' WHERE id = $1",
-                        plugin.id
-                    )
-                    .execute(&db_pool)
-                    .await;
+                    let _ = sqlx::query("UPDATE plugins SET status = 'error' WHERE id = $1")
+                        .bind(plugin.id)
+                        .execute(&db_pool)
+                        .await;
                     error_count += 1;
                 }
             }
@@ -148,26 +146,21 @@ async fn initialize_wasm_plugins(
 async fn load_active_plugins(
     db_pool: &sqlx::PgPool,
 ) -> Result<Vec<artifact_keeper_backend::models::plugin::Plugin>> {
-    use artifact_keeper_backend::models::plugin::{
-        Plugin, PluginSourceType, PluginStatus, PluginType,
-    };
+    use artifact_keeper_backend::models::plugin::Plugin;
 
-    let plugins = sqlx::query_as!(
-        Plugin,
+    let plugins = sqlx::query_as::<_, Plugin>(
         r#"
         SELECT
             id, name, version, display_name, description, author, homepage, license,
-            status as "status: PluginStatus",
-            plugin_type as "plugin_type: PluginType",
-            config_schema, default_config,
-            source_type as "source_type: PluginSourceType",
+            status, plugin_type, source_type,
             source_url, source_ref, wasm_path, manifest,
             capabilities, resource_limits,
+            config, config_schema, error_message,
             installed_at, enabled_at, updated_at
         FROM plugins
         WHERE status = 'active' AND wasm_path IS NOT NULL
         ORDER BY name
-        "#
+        "#,
     )
     .fetch_all(db_pool)
     .await
