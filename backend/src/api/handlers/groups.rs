@@ -2,10 +2,11 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -29,6 +30,16 @@ pub struct ListGroupsQuery {
     pub per_page: Option<u32>,
 }
 
+#[derive(Debug, Serialize, FromRow)]
+pub struct GroupRow {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub member_count: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GroupResponse {
     pub id: Uuid,
@@ -37,6 +48,19 @@ pub struct GroupResponse {
     pub member_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<GroupRow> for GroupResponse {
+    fn from(row: GroupRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            member_count: row.member_count,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -64,10 +88,30 @@ pub async fn list_groups(
 
     let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
 
-    let groups = sqlx::query!(
+    // Check if groups table exists first
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'groups')"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(Json(GroupListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page,
+                per_page,
+                total: 0,
+                total_pages: 0,
+            },
+        }));
+    }
+
+    let groups: Vec<GroupRow> = sqlx::query_as(
         r#"
         SELECT g.id, g.name, g.description, g.created_at, g.updated_at,
-               COUNT(ugm.user_id) as "member_count!"
+               COALESCE(COUNT(ugm.user_id), 0) as member_count
         FROM groups g
         LEFT JOIN user_group_members ugm ON ugm.group_id = g.id
         WHERE ($1::text IS NULL OR g.name ILIKE $1 OR g.description ILIKE $1)
@@ -75,41 +119,31 @@ pub async fn list_groups(
         ORDER BY g.name
         OFFSET $2
         LIMIT $3
-        "#,
-        search_pattern,
-        offset,
-        per_page as i64
+        "#
     )
+    .bind(&search_pattern)
+    .bind(offset)
+    .bind(per_page as i64)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total = sqlx::query_scalar!(
+    let total: i64 = sqlx::query_scalar(
         r#"
-        SELECT COUNT(*) as "count!"
+        SELECT COUNT(*)
         FROM groups
         WHERE ($1::text IS NULL OR name ILIKE $1 OR description ILIKE $1)
-        "#,
-        search_pattern
+        "#
     )
+    .bind(&search_pattern)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .unwrap_or(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
     Ok(Json(GroupListResponse {
-        items: groups
-            .into_iter()
-            .map(|g| GroupResponse {
-                id: g.id,
-                name: g.name,
-                description: g.description,
-                member_count: g.member_count,
-                created_at: g.created_at,
-                updated_at: g.updated_at,
-            })
-            .collect(),
+        items: groups.into_iter().map(GroupResponse::from).collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -125,20 +159,29 @@ pub struct CreateGroupRequest {
     pub description: Option<String>,
 }
 
+#[derive(Debug, FromRow)]
+pub struct CreatedGroupRow {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Create a group
 pub async fn create_group(
     State(state): State<SharedState>,
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
-    let group = sqlx::query!(
+    let group: CreatedGroupRow = sqlx::query_as(
         r#"
         INSERT INTO groups (name, description)
         VALUES ($1, $2)
         RETURNING id, name, description, created_at, updated_at
-        "#,
-        payload.name,
-        payload.description
+        "#
     )
+    .bind(&payload.name)
+    .bind(&payload.description)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -165,30 +208,35 @@ pub async fn get_group(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<GroupResponse>> {
-    let group = sqlx::query!(
+    // Check if groups table exists first
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'groups')"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !table_exists {
+        return Err(AppError::NotFound("Group not found".to_string()));
+    }
+
+    let group: GroupRow = sqlx::query_as(
         r#"
         SELECT g.id, g.name, g.description, g.created_at, g.updated_at,
-               COUNT(ugm.user_id) as "member_count!"
+               COALESCE(COUNT(ugm.user_id), 0) as member_count
         FROM groups g
         LEFT JOIN user_group_members ugm ON ugm.group_id = g.id
         WHERE g.id = $1
         GROUP BY g.id
-        "#,
-        id
+        "#
     )
+    .bind(id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
-    Ok(Json(GroupResponse {
-        id: group.id,
-        name: group.name,
-        description: group.description,
-        member_count: group.member_count,
-        created_at: group.created_at,
-        updated_at: group.updated_at,
-    }))
+    Ok(Json(GroupResponse::from(group)))
 }
 
 /// Update a group
@@ -197,29 +245,29 @@ pub async fn update_group(
     Path(id): Path<Uuid>,
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
-    let group = sqlx::query!(
+    let group: CreatedGroupRow = sqlx::query_as(
         r#"
         UPDATE groups
         SET name = $2, description = $3, updated_at = NOW()
         WHERE id = $1
         RETURNING id, name, description, created_at, updated_at
-        "#,
-        id,
-        payload.name,
-        payload.description
+        "#
     )
+    .bind(id)
+    .bind(&payload.name)
+    .bind(&payload.description)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
-    let member_count = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) as "count!" FROM user_group_members WHERE group_id = $1"#,
-        id
+    let member_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_group_members WHERE group_id = $1"
     )
+    .bind(id)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .unwrap_or(0);
 
     Ok(Json(GroupResponse {
         id: group.id,
@@ -236,7 +284,8 @@ pub async fn delete_group(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    let result = sqlx::query!("DELETE FROM groups WHERE id = $1", id)
+    let result = sqlx::query("DELETE FROM groups WHERE id = $1")
+        .bind(id)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -260,15 +309,15 @@ pub async fn add_members(
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
     for user_id in payload.user_ids {
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO user_group_members (user_id, group_id)
             VALUES ($1, $2)
             ON CONFLICT DO NOTHING
-            "#,
-            user_id,
-            id
+            "#
         )
+        .bind(user_id)
+        .bind(id)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -284,14 +333,12 @@ pub async fn remove_members(
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
     for user_id in payload.user_ids {
-        sqlx::query!(
-            "DELETE FROM user_group_members WHERE user_id = $1 AND group_id = $2",
-            user_id,
-            id
-        )
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query("DELETE FROM user_group_members WHERE user_id = $1 AND group_id = $2")
+            .bind(user_id)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
     Ok(())

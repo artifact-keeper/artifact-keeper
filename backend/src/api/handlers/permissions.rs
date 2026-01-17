@@ -2,10 +2,11 @@
 
 use axum::{
     extract::{Path, Query, State},
-    routing::{delete, get, post},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -21,23 +22,6 @@ pub fn router() -> Router<SharedState> {
         )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "permission_principal_type", rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum PrincipalType {
-    User,
-    Group,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "permission_target_type", rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum TargetType {
-    Repository,
-    Group,
-    Artifact,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct ListPermissionsQuery {
     pub principal_type: Option<String>,
@@ -46,6 +30,20 @@ pub struct ListPermissionsQuery {
     pub target_id: Option<Uuid>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct PermissionRow {
+    pub id: Uuid,
+    pub principal_type: String,
+    pub principal_id: Uuid,
+    pub principal_name: Option<String>,
+    pub target_type: String,
+    pub target_id: Uuid,
+    pub target_name: Option<String>,
+    pub actions: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +58,23 @@ pub struct PermissionResponse {
     pub actions: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<PermissionRow> for PermissionResponse {
+    fn from(row: PermissionRow) -> Self {
+        Self {
+            id: row.id,
+            principal_type: row.principal_type,
+            principal_id: row.principal_id,
+            principal_name: row.principal_name,
+            target_type: row.target_type,
+            target_id: row.target_id,
+            target_name: row.target_name,
+            actions: row.actions,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -85,7 +100,27 @@ pub async fn list_permissions(
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
 
-    let permissions = sqlx::query!(
+    // Check if permissions table exists first
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'permissions')"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(Json(PermissionListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page,
+                per_page,
+                total: 0,
+                total_pages: 0,
+            },
+        }));
+    }
+
+    let permissions: Vec<PermissionRow> = sqlx::query_as(
         r#"
         SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
                p.actions, p.created_at, p.updated_at,
@@ -107,54 +142,40 @@ pub async fn list_permissions(
         ORDER BY p.created_at DESC
         OFFSET $5
         LIMIT $6
-        "#,
-        query.principal_type,
-        query.principal_id,
-        query.target_type,
-        query.target_id,
-        offset,
-        per_page as i64
+        "#
     )
+    .bind(&query.principal_type)
+    .bind(&query.principal_id)
+    .bind(&query.target_type)
+    .bind(&query.target_id)
+    .bind(offset)
+    .bind(per_page as i64)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total = sqlx::query_scalar!(
+    let total: i64 = sqlx::query_scalar(
         r#"
-        SELECT COUNT(*) as "count!"
+        SELECT COUNT(*)
         FROM permissions
         WHERE ($1::text IS NULL OR principal_type = $1)
           AND ($2::uuid IS NULL OR principal_id = $2)
           AND ($3::text IS NULL OR target_type = $3)
           AND ($4::uuid IS NULL OR target_id = $4)
-        "#,
-        query.principal_type,
-        query.principal_id,
-        query.target_type,
-        query.target_id
+        "#
     )
+    .bind(&query.principal_type)
+    .bind(&query.principal_id)
+    .bind(&query.target_type)
+    .bind(&query.target_id)
     .fetch_one(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .unwrap_or(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
     Ok(Json(PermissionListResponse {
-        items: permissions
-            .into_iter()
-            .map(|p| PermissionResponse {
-                id: p.id,
-                principal_type: p.principal_type,
-                principal_id: p.principal_id,
-                principal_name: p.principal_name,
-                target_type: p.target_type,
-                target_id: p.target_id,
-                target_name: p.target_name,
-                actions: p.actions,
-                created_at: p.created_at,
-                updated_at: p.updated_at,
-            })
-            .collect(),
+        items: permissions.into_iter().map(PermissionResponse::from).collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -173,23 +194,35 @@ pub struct CreatePermissionRequest {
     pub actions: Vec<String>,
 }
 
+#[derive(Debug, FromRow)]
+pub struct CreatedPermissionRow {
+    pub id: Uuid,
+    pub principal_type: String,
+    pub principal_id: Uuid,
+    pub target_type: String,
+    pub target_id: Uuid,
+    pub actions: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Create a permission
 pub async fn create_permission(
     State(state): State<SharedState>,
     Json(payload): Json<CreatePermissionRequest>,
 ) -> Result<Json<PermissionResponse>> {
-    let permission = sqlx::query!(
+    let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
         INSERT INTO permissions (principal_type, principal_id, target_type, target_id, actions)
         VALUES ($1, $2, $3, $4, $5)
         RETURNING id, principal_type, principal_id, target_type, target_id, actions, created_at, updated_at
-        "#,
-        payload.principal_type,
-        payload.principal_id,
-        payload.target_type,
-        payload.target_id,
-        &payload.actions
+        "#
     )
+    .bind(&payload.principal_type)
+    .bind(&payload.principal_id)
+    .bind(&payload.target_type)
+    .bind(&payload.target_id)
+    .bind(&payload.actions)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -220,7 +253,19 @@ pub async fn get_permission(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PermissionResponse>> {
-    let permission = sqlx::query!(
+    // Check if permissions table exists first
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'permissions')"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !table_exists {
+        return Err(AppError::NotFound("Permission not found".to_string()));
+    }
+
+    let permission: PermissionRow = sqlx::query_as(
         r#"
         SELECT p.id, p.principal_type, p.principal_id, p.target_type, p.target_id,
                p.actions, p.created_at, p.updated_at,
@@ -236,26 +281,15 @@ pub async fn get_permission(
         LEFT JOIN groups g ON p.principal_type = 'group' AND p.principal_id = g.id
         LEFT JOIN repositories r ON p.target_type = 'repository' AND p.target_id = r.id
         WHERE p.id = $1
-        "#,
-        id
+        "#
     )
+    .bind(id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
-    Ok(Json(PermissionResponse {
-        id: permission.id,
-        principal_type: permission.principal_type,
-        principal_id: permission.principal_id,
-        principal_name: permission.principal_name,
-        target_type: permission.target_type,
-        target_id: permission.target_id,
-        target_name: permission.target_name,
-        actions: permission.actions,
-        created_at: permission.created_at,
-        updated_at: permission.updated_at,
-    }))
+    Ok(Json(PermissionResponse::from(permission)))
 }
 
 /// Update a permission
@@ -264,21 +298,21 @@ pub async fn update_permission(
     Path(id): Path<Uuid>,
     Json(payload): Json<CreatePermissionRequest>,
 ) -> Result<Json<PermissionResponse>> {
-    let permission = sqlx::query!(
+    let permission: CreatedPermissionRow = sqlx::query_as(
         r#"
         UPDATE permissions
         SET principal_type = $2, principal_id = $3, target_type = $4, target_id = $5,
             actions = $6, updated_at = NOW()
         WHERE id = $1
         RETURNING id, principal_type, principal_id, target_type, target_id, actions, created_at, updated_at
-        "#,
-        id,
-        payload.principal_type,
-        payload.principal_id,
-        payload.target_type,
-        payload.target_id,
-        &payload.actions
+        "#
     )
+    .bind(id)
+    .bind(&payload.principal_type)
+    .bind(&payload.principal_id)
+    .bind(&payload.target_type)
+    .bind(&payload.target_id)
+    .bind(&payload.actions)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
@@ -303,7 +337,8 @@ pub async fn delete_permission(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<()> {
-    let result = sqlx::query!("DELETE FROM permissions WHERE id = $1", id)
+    let result = sqlx::query("DELETE FROM permissions WHERE id = $1")
+        .bind(id)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

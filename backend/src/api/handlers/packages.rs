@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -28,6 +29,21 @@ pub struct ListPackagesQuery {
     pub search: Option<String>,
 }
 
+#[derive(Debug, Serialize, FromRow)]
+pub struct PackageRow {
+    pub id: Uuid,
+    pub repository_key: String,
+    pub name: String,
+    pub version: String,
+    pub format: String,
+    pub description: Option<String>,
+    pub size_bytes: i64,
+    pub download_count: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub metadata: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PackageResponse {
     pub id: Uuid,
@@ -41,6 +57,24 @@ pub struct PackageResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub metadata: Option<serde_json::Value>,
+}
+
+impl From<PackageRow> for PackageResponse {
+    fn from(row: PackageRow) -> Self {
+        Self {
+            id: row.id,
+            repository_key: row.repository_key,
+            name: row.name,
+            version: row.version,
+            format: row.format,
+            description: row.description,
+            size_bytes: row.size_bytes,
+            download_count: row.download_count,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            metadata: row.metadata,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -68,88 +102,71 @@ pub async fn list_packages(
 
     let search_pattern = query.search.as_ref().map(|s| format!("%{}%", s));
 
-    // Query packages table (assuming it exists, otherwise return empty)
-    let packages_result = sqlx::query!(
+    // Check if packages table exists first
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'packages')"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(Json(PackageListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page,
+                per_page,
+                total: 0,
+                total_pages: 0,
+            },
+        }));
+    }
+
+    let packages: Vec<PackageRow> = sqlx::query_as(
         r#"
-        SELECT p.id, r.key as repository_key, p.name, p.version, r.format,
+        SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
                p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
         WHERE ($1::text IS NULL OR r.key = $1)
-          AND ($2::text IS NULL OR r.format = $2)
+          AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3)
         ORDER BY p.updated_at DESC
         OFFSET $4
         LIMIT $5
-        "#,
-        query.repository_key,
-        query.format,
-        search_pattern,
-        offset,
-        per_page as i64
+        "#
     )
+    .bind(&query.repository_key)
+    .bind(&query.format)
+    .bind(&search_pattern)
+    .bind(offset)
+    .bind(per_page as i64)
     .fetch_all(&state.db)
-    .await;
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // If the packages table doesn't exist, return empty list
-    let packages = match packages_result {
-        Ok(rows) => rows,
-        Err(e) => {
-            // Check if it's a "table does not exist" error
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("relation") {
-                // Return empty list - table doesn't exist yet
-                return Ok(Json(PackageListResponse {
-                    items: vec![],
-                    pagination: Pagination {
-                        page,
-                        per_page,
-                        total: 0,
-                        total_pages: 0,
-                    },
-                }));
-            }
-            return Err(AppError::Database(err_str));
-        }
-    };
-
-    let total_result = sqlx::query_scalar!(
+    let total: i64 = sqlx::query_scalar(
         r#"
-        SELECT COUNT(*) as "count!"
+        SELECT COUNT(*)
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
         WHERE ($1::text IS NULL OR r.key = $1)
-          AND ($2::text IS NULL OR r.format = $2)
+          AND ($2::text IS NULL OR r.format::text = $2)
           AND ($3::text IS NULL OR p.name ILIKE $3)
-        "#,
-        query.repository_key,
-        query.format,
-        search_pattern
+        "#
     )
+    .bind(&query.repository_key)
+    .bind(&query.format)
+    .bind(&search_pattern)
     .fetch_one(&state.db)
-    .await;
+    .await
+    .unwrap_or(0);
 
-    let total = total_result.unwrap_or(0);
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
     Ok(Json(PackageListResponse {
-        items: packages
-            .into_iter()
-            .map(|p| PackageResponse {
-                id: p.id,
-                repository_key: p.repository_key,
-                name: p.name,
-                version: p.version,
-                format: p.format,
-                description: p.description,
-                size_bytes: p.size_bytes,
-                download_count: p.download_count,
-                created_at: p.created_at,
-                updated_at: p.updated_at,
-                metadata: p.metadata,
-            })
-            .collect(),
+        items: packages.into_iter().map(PackageResponse::from).collect(),
         pagination: Pagination {
             page,
             per_page,
@@ -164,45 +181,44 @@ pub async fn get_package(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PackageResponse>> {
-    let package_result = sqlx::query!(
+    // Check if packages table exists first
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'packages')"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !table_exists {
+        return Err(AppError::NotFound("Package not found".to_string()));
+    }
+
+    let package: PackageRow = sqlx::query_as(
         r#"
-        SELECT p.id, r.key as repository_key, p.name, p.version, r.format,
+        SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
                p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
         WHERE p.id = $1
-        "#,
-        id
+        "#
     )
+    .bind(id)
     .fetch_optional(&state.db)
-    .await;
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
 
-    let package = match package_result {
-        Ok(Some(p)) => p,
-        Ok(None) => return Err(AppError::NotFound("Package not found".to_string())),
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("relation") {
-                return Err(AppError::NotFound("Package not found".to_string()));
-            }
-            return Err(AppError::Database(err_str));
-        }
-    };
+    Ok(Json(PackageResponse::from(package)))
+}
 
-    Ok(Json(PackageResponse {
-        id: package.id,
-        repository_key: package.repository_key,
-        name: package.name,
-        version: package.version,
-        format: package.format,
-        description: package.description,
-        size_bytes: package.size_bytes,
-        download_count: package.download_count,
-        created_at: package.created_at,
-        updated_at: package.updated_at,
-        metadata: package.metadata,
-    }))
+#[derive(Debug, Serialize, FromRow)]
+pub struct PackageVersionRow {
+    pub version: String,
+    pub size_bytes: i64,
+    pub download_count: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub checksum_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +228,18 @@ pub struct PackageVersionResponse {
     pub download_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub checksum_sha256: String,
+}
+
+impl From<PackageVersionRow> for PackageVersionResponse {
+    fn from(row: PackageVersionRow) -> Self {
+        Self {
+            version: row.version,
+            size_bytes: row.size_bytes,
+            download_count: row.download_count,
+            created_at: row.created_at,
+            checksum_sha256: row.checksum_sha256,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -224,63 +252,57 @@ pub async fn get_package_versions(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PackageVersionsResponse>> {
-    // First verify the package exists
-    let package_exists = sqlx::query_scalar!(
-        r#"SELECT EXISTS(SELECT 1 FROM packages WHERE id = $1) as "exists!""#,
-        id
+    // Check if packages table exists first
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'packages')"
     )
     .fetch_one(&state.db)
-    .await;
+    .await
+    .unwrap_or(false);
 
-    match package_exists {
-        Ok(exists) if !exists => {
-            return Err(AppError::NotFound("Package not found".to_string()));
-        }
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("relation") {
-                return Err(AppError::NotFound("Package not found".to_string()));
-            }
-            return Err(AppError::Database(err_str));
-        }
-        _ => {}
+    if !table_exists {
+        return Err(AppError::NotFound("Package not found".to_string()));
     }
 
-    // Query package versions
-    let versions_result = sqlx::query!(
+    // First verify the package exists
+    let package_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM packages WHERE id = $1)"
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !package_exists {
+        return Err(AppError::NotFound("Package not found".to_string()));
+    }
+
+    // Check if package_versions table exists
+    let versions_table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'package_versions')"
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false);
+
+    if !versions_table_exists {
+        return Ok(Json(PackageVersionsResponse { versions: vec![] }));
+    }
+
+    let versions: Vec<PackageVersionRow> = sqlx::query_as(
         r#"
         SELECT version, size_bytes, download_count, created_at, checksum_sha256
         FROM package_versions
         WHERE package_id = $1
         ORDER BY created_at DESC
-        "#,
-        id
+        "#
     )
+    .bind(id)
     .fetch_all(&state.db)
-    .await;
-
-    let versions = match versions_result {
-        Ok(rows) => rows,
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("does not exist") || err_str.contains("relation") {
-                // Return empty list - table doesn't exist yet
-                return Ok(Json(PackageVersionsResponse { versions: vec![] }));
-            }
-            return Err(AppError::Database(err_str));
-        }
-    };
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(Json(PackageVersionsResponse {
-        versions: versions
-            .into_iter()
-            .map(|v| PackageVersionResponse {
-                version: v.version,
-                size_bytes: v.size_bytes,
-                download_count: v.download_count,
-                created_at: v.created_at,
-                checksum_sha256: v.checksum_sha256,
-            })
-            .collect(),
+        versions: versions.into_iter().map(PackageVersionResponse::from).collect(),
     }))
 }
