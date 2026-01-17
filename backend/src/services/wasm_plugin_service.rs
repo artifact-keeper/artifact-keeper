@@ -6,9 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
 use sqlx::PgPool;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -17,7 +16,7 @@ use crate::models::format_handler::{
     UpdateFormatHandler,
 };
 use crate::models::plugin::{
-    Plugin, PluginCapabilities, PluginResourceLimits, PluginSourceType, PluginStatus, PluginType,
+    Plugin, PluginSourceType, PluginStatus,
 };
 use crate::models::plugin_manifest::{ManifestValidationError, PluginManifest};
 

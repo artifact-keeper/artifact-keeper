@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::Artifact;
-use crate::models::plugin::{Plugin, PluginHook, PluginSourceType, PluginStatus, PluginType};
+use crate::models::plugin::{Plugin, PluginHook, PluginType};
 
 /// Plugin event types that can trigger hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ fn default_accept() -> bool {
 #[derive(Debug, Clone)]
 struct CachedPlugin {
     plugin: Plugin,
-    hooks: Vec<PluginHook>,
+    _hooks: Vec<PluginHook>,
 }
 
 /// Plugin service for managing plugin lifecycle and triggering hooks.
@@ -437,7 +437,7 @@ impl PluginService {
                 plugin.id,
                 CachedPlugin {
                     plugin,
-                    hooks: plugin_hooks,
+                    _hooks: plugin_hooks,
                 },
             );
         }

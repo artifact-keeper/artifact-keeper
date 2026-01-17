@@ -6,9 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::models::plugin::{PluginCapabilities, PluginResourceLimits};
@@ -287,7 +286,7 @@ impl PluginRegistry {
         );
 
         // Create store with resource limits
-        let mut store = self.runtime.create_store(
+        let _store = self.runtime.create_store(
             &plugin.compiled,
             &plugin.id.to_string(),
             &plugin.format_key,
@@ -322,7 +321,7 @@ impl PluginRegistry {
         &self,
         format_key: &str,
         path: &str,
-        data: &[u8],
+        _data: &[u8],
     ) -> WasmResult<Result<(), WasmValidationError>> {
         let plugin = self.get_by_format(format_key).await.ok_or_else(|| {
             WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
@@ -339,7 +338,7 @@ impl PluginRegistry {
         );
 
         // Create store with resource limits
-        let mut store = self.runtime.create_store(
+        let _store = self.runtime.create_store(
             &plugin.compiled,
             &plugin.id.to_string(),
             &plugin.format_key,
@@ -381,7 +380,7 @@ impl PluginRegistry {
         );
 
         // Create store with resource limits
-        let mut store = self.runtime.create_store(
+        let _store = self.runtime.create_store(
             &plugin.compiled,
             &plugin.id.to_string(),
             &plugin.format_key,

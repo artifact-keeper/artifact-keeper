@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Extension, Multipart, Path, Query, State},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::format_handler::{FormatHandlerResponse, FormatHandlerType, UpdateFormatHandler};
+use crate::models::format_handler::{FormatHandlerResponse, FormatHandlerType};
 
 /// Create plugin routes
 pub fn router() -> Router<SharedState> {

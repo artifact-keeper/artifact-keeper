@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryFormat;
