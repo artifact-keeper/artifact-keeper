@@ -32,7 +32,8 @@
               "Enum": [
                 "full",
                 "incremental",
-                "metadata_only"
+                "metadata_only",
+                "metadata"
               ]
             }
           }

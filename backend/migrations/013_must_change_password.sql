@@ -1,3 +1,2 @@
--- This migration has already been applied manually
--- The column exists, so this is a no-op migration
-SELECT 1;
+-- Add must_change_password column to users table
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;

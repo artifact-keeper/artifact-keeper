@@ -15,6 +15,30 @@ use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 
+/// Federated authentication credentials
+#[derive(Debug, Clone)]
+pub struct FederatedCredentials {
+    /// External provider user ID
+    pub external_id: String,
+    /// Username from provider
+    pub username: String,
+    /// Email from provider
+    pub email: String,
+    /// Display name from provider
+    pub display_name: Option<String>,
+    /// Groups/roles from provider claims
+    pub groups: Vec<String>,
+}
+
+/// Result of group-to-role mapping
+#[derive(Debug, Clone, Default)]
+pub struct RoleMapping {
+    /// Whether the user should be an admin
+    pub is_admin: bool,
+    /// Additional role names to assign
+    pub roles: Vec<String>,
+}
+
 /// JWT claims structure
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -339,6 +363,480 @@ impl AuthService {
         }
 
         Ok(())
+    }
+
+    // =========================================================================
+    // T055: Federated Authentication Routing
+    // =========================================================================
+
+    /// Authenticate user by routing to the appropriate provider based on auth_provider type.
+    ///
+    /// This method looks up the user's auth_provider and delegates to the appropriate
+    /// authentication service (LDAP, OIDC, SAML) or performs local authentication.
+    ///
+    /// # Arguments
+    /// * `username` - The username to authenticate
+    /// * `password` - The password (for local/LDAP) or empty for token-based flows
+    /// * `provider_override` - Optional provider to force (useful for SSO initiation)
+    ///
+    /// # Returns
+    /// * `Ok((User, TokenPair))` - Authenticated user and JWT tokens
+    /// * `Err(AppError)` - Authentication failure
+    pub async fn authenticate_by_provider(
+        &self,
+        username: &str,
+        password: &str,
+        provider_override: Option<AuthProvider>,
+    ) -> Result<(User, TokenPair)> {
+        // First, look up the user to determine their auth provider
+        let user_lookup = sqlx::query!(
+            r#"
+            SELECT auth_provider as "auth_provider: AuthProvider"
+            FROM users
+            WHERE username = $1 AND is_active = true
+            "#,
+            username
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Determine which provider to use
+        let provider = provider_override.or_else(|| user_lookup.map(|u| u.auth_provider));
+
+        match provider {
+            Some(AuthProvider::Local) | None => {
+                // Use local authentication
+                self.authenticate(username, password).await
+            }
+            Some(AuthProvider::Ldap) => {
+                // Delegate to LDAP service
+                // Note: ldap_service would be injected or created here in a full implementation
+                self.authenticate_ldap(username, password).await
+            }
+            Some(AuthProvider::Oidc) => {
+                // OIDC authentication is typically handled via callback, not direct auth
+                // This path would be used for token exchange after OIDC redirect
+                Err(AppError::Authentication(
+                    "OIDC authentication requires redirect flow. Use /auth/oidc/login endpoint.".to_string(),
+                ))
+            }
+            Some(AuthProvider::Saml) => {
+                // SAML authentication is handled via SSO assertion
+                // This path would be used for SAML response processing
+                Err(AppError::Authentication(
+                    "SAML authentication requires SSO flow. Use /auth/saml/login endpoint.".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Authenticate via LDAP provider.
+    ///
+    /// This is a placeholder that would delegate to LdapService in a full implementation.
+    async fn authenticate_ldap(&self, username: &str, password: &str) -> Result<(User, TokenPair)> {
+        // In a full implementation, this would:
+        // 1. Bind to LDAP server with user credentials
+        // 2. Fetch user attributes and groups
+        // 3. Call sync_federated_user to create/update user
+        // 4. Generate JWT tokens
+
+        // For now, check if user exists with LDAP provider
+        let user = sqlx::query_as!(
+            User,
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, must_change_password,
+                last_login_at, created_at, updated_at
+            FROM users
+            WHERE username = $1 AND auth_provider = 'ldap' AND is_active = true
+            "#,
+            username
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::Authentication("LDAP user not found".to_string()))?;
+
+        // In production, LDAP bind verification would happen here
+        // For development/testing, we check password if stored (hybrid mode)
+        if let Some(ref hash) = user.password_hash {
+            if !verify(password, hash)
+                .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))?
+            {
+                return Err(AppError::Authentication("Invalid credentials".to_string()));
+            }
+        } else {
+            // Pure LDAP mode - would verify against LDAP server
+            return Err(AppError::Authentication(
+                "LDAP server verification not configured".to_string(),
+            ));
+        }
+
+        // Update last login
+        sqlx::query!(
+            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            user.id
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let tokens = self.generate_tokens(&user)?;
+        Ok((user, tokens))
+    }
+
+    /// Authenticate a federated user after successful SSO (OIDC/SAML).
+    ///
+    /// This is called after the SSO flow completes with validated credentials.
+    pub async fn authenticate_federated(
+        &self,
+        provider: AuthProvider,
+        credentials: FederatedCredentials,
+    ) -> Result<(User, TokenPair)> {
+        // Sync or create the user based on federated credentials
+        let user = self.sync_federated_user(provider, &credentials).await?;
+
+        // Update last login
+        sqlx::query!(
+            "UPDATE users SET last_login_at = NOW() WHERE id = $1",
+            user.id
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let tokens = self.generate_tokens(&user)?;
+        Ok((user, tokens))
+    }
+
+    // =========================================================================
+    // T056: Group-to-Role Mapping
+    // =========================================================================
+
+    /// Map federated group claims to local roles and admin status.
+    ///
+    /// This method takes the groups from an identity provider and maps them
+    /// to the application's role system. Configuration for mapping is stored
+    /// in the application config.
+    ///
+    /// # Default Mapping Rules (configurable via config):
+    /// - Groups containing "admin" or "administrators" -> is_admin = true
+    /// - Groups containing "readonly" -> read-only role
+    /// - All authenticated users get "user" role
+    ///
+    /// # Arguments
+    /// * `groups` - List of group names/DNs from the identity provider
+    ///
+    /// # Returns
+    /// * `RoleMapping` - The mapped roles and admin status
+    pub fn map_groups_to_roles(&self, groups: &[String]) -> RoleMapping {
+        let mut mapping = RoleMapping::default();
+
+        // Normalize groups to lowercase for case-insensitive matching
+        let normalized_groups: Vec<String> = groups
+            .iter()
+            .map(|g| g.to_lowercase())
+            .collect();
+
+        // Check for admin groups
+        // These patterns can be made configurable via Config
+        let admin_patterns = ["admin", "administrators", "superusers", "artifact-admins"];
+        for group in &normalized_groups {
+            for pattern in &admin_patterns {
+                if group.contains(pattern) {
+                    mapping.is_admin = true;
+                    mapping.roles.push("admin".to_string());
+                    break;
+                }
+            }
+        }
+
+        // Map other groups to roles
+        // In a production system, this would read from a config table
+        let role_mappings = [
+            ("developers", "developer"),
+            ("readonly", "reader"),
+            ("deployers", "deployer"),
+            ("artifact-publishers", "publisher"),
+        ];
+
+        for group in &normalized_groups {
+            for (pattern, role) in &role_mappings {
+                if group.contains(pattern) && !mapping.roles.contains(&role.to_string()) {
+                    mapping.roles.push(role.to_string());
+                }
+            }
+        }
+
+        // All authenticated users get at least the "user" role
+        if !mapping.roles.contains(&"user".to_string()) {
+            mapping.roles.push("user".to_string());
+        }
+
+        mapping
+    }
+
+    /// Apply role mapping to a user in the database.
+    ///
+    /// Updates the user's is_admin flag and assigns roles based on the mapping.
+    pub async fn apply_role_mapping(&self, user_id: Uuid, mapping: &RoleMapping) -> Result<()> {
+        // Update is_admin flag
+        sqlx::query!(
+            "UPDATE users SET is_admin = $2, updated_at = NOW() WHERE id = $1",
+            user_id,
+            mapping.is_admin
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Clear existing role assignments and add new ones
+        // First, remove all current roles (for federated users, roles come from provider)
+        sqlx::query!("DELETE FROM user_roles WHERE user_id = $1", user_id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Assign new roles based on mapping
+        for role_name in &mapping.roles {
+            // Look up role by name and assign if it exists
+            let role = sqlx::query!(
+                "SELECT id FROM roles WHERE name = $1",
+                role_name
+            )
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if let Some(role) = role {
+                sqlx::query!(
+                    "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    user_id,
+                    role.id
+                )
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // T060: Federated User Sync and Deactivation
+    // =========================================================================
+
+    /// Sync a federated user from an identity provider.
+    ///
+    /// This method creates a new user or updates an existing user based on
+    /// credentials received from a federated identity provider (LDAP, OIDC, SAML).
+    ///
+    /// # Arguments
+    /// * `provider` - The authentication provider type
+    /// * `credentials` - User information from the identity provider
+    ///
+    /// # Returns
+    /// * `Ok(User)` - The created or updated user
+    /// * `Err(AppError)` - If sync fails
+    pub async fn sync_federated_user(
+        &self,
+        provider: AuthProvider,
+        credentials: &FederatedCredentials,
+    ) -> Result<User> {
+        // Map groups to roles
+        let role_mapping = self.map_groups_to_roles(&credentials.groups);
+
+        // Check if user exists by external_id
+        let existing_user = sqlx::query_as!(
+            User,
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, must_change_password,
+                last_login_at, created_at, updated_at
+            FROM users
+            WHERE external_id = $1 AND auth_provider = $2
+            "#,
+            credentials.external_id,
+            provider as AuthProvider
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let user = if let Some(existing) = existing_user {
+            // Update existing user with latest information from provider
+            sqlx::query_as!(
+                User,
+                r#"
+                UPDATE users
+                SET
+                    username = $2,
+                    email = $3,
+                    display_name = $4,
+                    is_admin = $5,
+                    is_active = true,
+                    updated_at = NOW()
+                WHERE id = $1
+                RETURNING
+                    id, username, email, password_hash, display_name,
+                    auth_provider as "auth_provider: AuthProvider",
+                    external_id, is_admin, is_active, must_change_password,
+                    last_login_at, created_at, updated_at
+                "#,
+                existing.id,
+                credentials.username,
+                credentials.email,
+                credentials.display_name,
+                role_mapping.is_admin
+            )
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+        } else {
+            // Create new user from federated credentials
+            sqlx::query_as!(
+                User,
+                r#"
+                INSERT INTO users (
+                    username, email, display_name, auth_provider,
+                    external_id, is_admin, is_active, must_change_password
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, true, false)
+                RETURNING
+                    id, username, email, password_hash, display_name,
+                    auth_provider as "auth_provider: AuthProvider",
+                    external_id, is_admin, is_active, must_change_password,
+                    last_login_at, created_at, updated_at
+                "#,
+                credentials.username,
+                credentials.email,
+                credentials.display_name,
+                provider as AuthProvider,
+                credentials.external_id,
+                role_mapping.is_admin
+            )
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("duplicate key") {
+                    if msg.contains("username") {
+                        AppError::Conflict("Username already exists".to_string())
+                    } else if msg.contains("email") {
+                        AppError::Conflict("Email already exists".to_string())
+                    } else {
+                        AppError::Conflict("User already exists".to_string())
+                    }
+                } else {
+                    AppError::Database(msg)
+                }
+            })?
+        };
+
+        // Apply role mapping
+        self.apply_role_mapping(user.id, &role_mapping).await?;
+
+        Ok(user)
+    }
+
+    /// Deactivate users who no longer exist in the federated provider.
+    ///
+    /// This method is typically called during a periodic sync job. It compares
+    /// the list of active users from the provider with local users and deactivates
+    /// any that are no longer present.
+    ///
+    /// # Arguments
+    /// * `provider` - The authentication provider type
+    /// * `active_external_ids` - List of external IDs that are still active in the provider
+    ///
+    /// # Returns
+    /// * `Ok(u64)` - Number of users deactivated
+    /// * `Err(AppError)` - If deactivation fails
+    pub async fn deactivate_missing_users(
+        &self,
+        provider: AuthProvider,
+        active_external_ids: &[String],
+    ) -> Result<u64> {
+        // Deactivate users that:
+        // 1. Are from the specified provider
+        // 2. Have an external_id that is NOT in the active list
+        // 3. Are currently active
+        let result = sqlx::query!(
+            r#"
+            UPDATE users
+            SET is_active = false, updated_at = NOW()
+            WHERE auth_provider = $1
+              AND is_active = true
+              AND external_id IS NOT NULL
+              AND external_id != ALL($2)
+            "#,
+            provider as AuthProvider,
+            active_external_ids
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Reactivate a previously deactivated federated user.
+    ///
+    /// This is called when a user who was deactivated (e.g., left the company)
+    /// returns and authenticates again via the federated provider.
+    pub async fn reactivate_federated_user(&self, external_id: &str, provider: AuthProvider) -> Result<User> {
+        let user = sqlx::query_as!(
+            User,
+            r#"
+            UPDATE users
+            SET is_active = true, updated_at = NOW()
+            WHERE external_id = $1 AND auth_provider = $2
+            RETURNING
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, must_change_password,
+                last_login_at, created_at, updated_at
+            "#,
+            external_id,
+            provider as AuthProvider
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+        Ok(user)
+    }
+
+    /// List all users from a specific provider that need sync verification.
+    ///
+    /// Returns users who haven't been verified against the provider recently.
+    pub async fn list_users_for_sync(&self, provider: AuthProvider) -> Result<Vec<User>> {
+        let users = sqlx::query_as!(
+            User,
+            r#"
+            SELECT
+                id, username, email, password_hash, display_name,
+                auth_provider as "auth_provider: AuthProvider",
+                external_id, is_admin, is_active, must_change_password,
+                last_login_at, created_at, updated_at
+            FROM users
+            WHERE auth_provider = $1 AND is_active = true
+            ORDER BY username
+            "#,
+            provider as AuthProvider
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(users)
     }
 }
 

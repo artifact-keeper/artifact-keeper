@@ -5,7 +5,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::header,
     response::IntoResponse,
-    routing::{delete, get, patch, post, put},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT value FROM repository_config\n            WHERE repository_id = $1 AND key = 'cache_ttl_secs'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "value",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "0af50a149ccece8b6b042dd2b3a66e90fda6e7a79482ed9a617045d755ab2530"
+}

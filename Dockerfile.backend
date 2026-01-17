@@ -14,6 +14,7 @@ ARG CACHE_BUST=1
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
+COPY .sqlx ./.sqlx
 COPY backend ./backend
 COPY edge ./edge
 

@@ -4,19 +4,15 @@
 //! the repository-nested artifact routes in repositories.rs.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::artifact_service::ArtifactService;
-use crate::services::repository_service::RepositoryService;
-use crate::storage::filesystem::FilesystemStorage;
 
 /// Create artifact routes
 pub fn router() -> Router<SharedState> {

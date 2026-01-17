@@ -25,7 +25,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Authentication
-jsonwebtoken = "10.2"
+jsonwebtoken = "9.3"
 bcrypt = "0.18"
 
 # Checksums
@@ -33,10 +33,8 @@ sha2 = "0.10"
 md-5 = "0.10"
 sha1 = "0.10"
 
-# S3 storage - disabled until AWS SDK supports Rust 1.85+
-# Re-enable when Rust 1.88+ is stable or use rust-s3 alternative
-# aws-sdk-s3 = "1.x"
-# aws-config = "1.x"
+# S3 storage using rust-s3 crate (works with Rust 1.75+)
+rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 
 # Logging/Tracing
 tracing = "0.1"
@@ -60,9 +58,19 @@ uuid = { version = "1.7", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP client (for proxy repos)
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream", "form"] }
+
+# URL encoding
+serde_urlencoded = "0.7"
 
 # Async streams
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1.5"
+
+# WASM runtime
+wasmtime = { version = "21", features = ["component-model", "async"] }
+wasmtime-wasi = "21"
+
+# Git operations
+git2 = "0.19"

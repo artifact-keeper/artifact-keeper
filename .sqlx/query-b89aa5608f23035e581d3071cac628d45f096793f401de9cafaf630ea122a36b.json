@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO users (username, email, password_hash, display_name, auth_provider, is_admin)\n        VALUES ($1, $2, $3, $4, 'local', $5)\n        RETURNING\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active,\n            last_login_at, created_at, updated_at\n        ",
+  "query": "\n            UPDATE users\n            SET is_active = true, updated_at = NOW()\n            WHERE external_id = $1 AND auth_provider = $2\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                last_login_at, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -62,27 +62,41 @@
       },
       {
         "ordinal": 9,
+        "name": "must_change_password",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Bool"
+        "Text",
+        {
+          "Custom": {
+            "name": "auth_provider",
+            "kind": {
+              "Enum": [
+                "local",
+                "ldap",
+                "saml",
+                "oidc"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": [
@@ -95,10 +109,11 @@
       true,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "17bc553d09e073a6af21a46276b1e542361e6937935722a3f801bd3a3b3a4250"
+  "hash": "b89aa5608f23035e581d3071cac628d45f096793f401de9cafaf630ea122a36b"
 }

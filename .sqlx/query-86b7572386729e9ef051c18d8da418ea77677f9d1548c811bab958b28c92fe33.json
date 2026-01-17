@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users\n            SET is_active = false, updated_at = NOW()\n            WHERE auth_provider = $1\n              AND is_active = true\n              AND external_id IS NOT NULL\n              AND external_id != ALL($2)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "auth_provider",
+            "kind": {
+              "Enum": [
+                "local",
+                "ldap",
+                "saml",
+                "oidc"
+              ]
+            }
+          }
+        },
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "86b7572386729e9ef051c18d8da418ea77677f9d1548c811bab958b28c92fe33"
+}

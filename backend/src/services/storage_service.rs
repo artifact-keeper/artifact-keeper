@@ -154,10 +154,54 @@ impl StorageBackend for FilesystemBackend {
     }
 }
 
-// S3 storage backend - disabled until AWS SDK supports Rust 1.85+
-// The S3Backend implementation has been temporarily removed due to AWS SDK
-// requiring Rust 1.88+. Re-enable when Rust 1.88+ is stable.
-// For S3 support, consider using the `rust-s3` crate as an alternative.
+/// S3 storage backend (wrapper for integration with StorageService)
+pub struct S3BackendWrapper {
+    inner: crate::storage::s3::S3Backend,
+}
+
+impl S3BackendWrapper {
+    pub async fn from_config(config: &Config) -> crate::error::Result<Self> {
+        let s3_config = crate::storage::s3::S3Config::new(
+            config.s3_bucket.clone().unwrap_or_default(),
+            config.s3_region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+            config.s3_endpoint.clone(),
+            None, // No prefix by default
+        );
+        let inner = crate::storage::s3::S3Backend::new(s3_config).await?;
+        Ok(Self { inner })
+    }
+}
+
+#[async_trait]
+impl StorageBackend for S3BackendWrapper {
+    async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+        crate::storage::StorageBackend::put(&self.inner, key, content).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Bytes> {
+        crate::storage::StorageBackend::get(&self.inner, key).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        crate::storage::StorageBackend::exists(&self.inner, key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        crate::storage::StorageBackend::delete(&self.inner, key).await
+    }
+
+    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        self.inner.copy(source, dest).await
+    }
+
+    async fn size(&self, key: &str) -> Result<u64> {
+        self.inner.size(key).await
+    }
+}
 
 /// Storage service facade
 pub struct StorageService {
@@ -173,11 +217,9 @@ impl StorageService {
                 fs::create_dir_all(&path).await?;
                 Arc::new(FilesystemBackend::new(path))
             }
-            // S3 backend temporarily disabled - AWS SDK requires Rust 1.88+
             "s3" => {
-                return Err(AppError::Config(
-                    "S3 backend temporarily disabled - AWS SDK requires Rust 1.88+. Use 'filesystem' backend for now.".into(),
-                ))
+                let s3_backend = S3BackendWrapper::from_config(config).await?;
+                Arc::new(s3_backend)
             }
             other => {
                 return Err(AppError::Config(format!(
@@ -280,15 +322,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    async fn create_test_storage() -> (StorageService, TempDir) {
+    fn create_test_storage() -> (StorageService, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let backend = Arc::new(FilesystemBackend::new(temp_dir.path().to_path_buf()));
+        let backend: Arc<dyn StorageBackend> = Arc::new(FilesystemBackend::new(temp_dir.path().to_path_buf()));
         (StorageService::new(backend), temp_dir)
     }
 
     #[tokio::test]
     async fn test_put_get() {
-        let (storage, _temp) = create_test_storage().await;
+        let (storage, _temp): (StorageService, TempDir) = create_test_storage();
 
         let content = Bytes::from("test content");
         storage.put("test/file.txt", content.clone()).await.unwrap();
@@ -299,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cas_deduplication() {
-        let (storage, _temp) = create_test_storage().await;
+        let (storage, _temp): (StorageService, TempDir) = create_test_storage();
 
         let content = Bytes::from("duplicate content");
         let hash1 = storage.put_cas(content.clone()).await.unwrap();
@@ -315,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_exists() {
-        let (storage, _temp) = create_test_storage().await;
+        let (storage, _temp): (StorageService, TempDir) = create_test_storage();
 
         assert!(!storage.exists("nonexistent").await.unwrap());
 
@@ -325,7 +367,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete() {
-        let (storage, _temp) = create_test_storage().await;
+        let (storage, _temp): (StorageService, TempDir) = create_test_storage();
 
         storage.put("to_delete.txt", Bytes::from("data")).await.unwrap();
         assert!(storage.exists("to_delete.txt").await.unwrap());
@@ -336,7 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list() {
-        let (storage, _temp) = create_test_storage().await;
+        let (storage, _temp): (StorageService, TempDir) = create_test_storage();
 
         storage.put("dir/file1.txt", Bytes::from("1")).await.unwrap();
         storage.put("dir/file2.txt", Bytes::from("2")).await.unwrap();

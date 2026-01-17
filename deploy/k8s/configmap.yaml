@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifact-keeper-config
+  namespace: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: config
+data:
+  # Backend configuration
+  RUST_LOG: "info,artifact_keeper=debug"
+  HOST: "0.0.0.0"
+  PORT: "8080"
+  STORAGE_PATH: "/data/storage"
+  BACKUP_PATH: "/data/backups"
+
+  # Database configuration (host and port only, credentials in secrets)
+  DATABASE_HOST: "postgres"
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: "artifact_registry"
+
+  # MinIO/S3 configuration (credentials in secrets)
+  S3_ENDPOINT: "http://minio:9000"
+  S3_BUCKET: "artifacts"
+  S3_REGION: "us-east-1"
+
+  # Edge node configuration
+  EDGE_HOST: "0.0.0.0"
+  EDGE_PORT: "8081"
+  CACHE_SIZE_MB: "10240"
+  HEARTBEAT_INTERVAL_SECS: "30"

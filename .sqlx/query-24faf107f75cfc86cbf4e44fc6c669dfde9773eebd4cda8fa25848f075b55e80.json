@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                h.id, h.plugin_id, h.hook_type, h.handler_name, h.priority, h.is_enabled, h.created_at\n            FROM plugin_hooks h\n            INNER JOIN plugins p ON p.id = h.plugin_id\n            WHERE p.status = 'active' AND h.is_enabled = true\n            ORDER BY h.priority ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "plugin_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "hook_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "handler_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "priority",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "24faf107f75cfc86cbf4e44fc6c669dfde9773eebd4cda8fa25848f075b55e80"
+}

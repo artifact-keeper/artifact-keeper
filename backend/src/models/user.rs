@@ -6,7 +6,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 /// Auth provider enum
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "auth_provider", rename_all = "lowercase")]
 pub enum AuthProvider {
     Local,

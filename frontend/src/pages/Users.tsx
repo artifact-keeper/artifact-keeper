@@ -24,6 +24,14 @@ interface EditUserForm {
   is_admin: boolean
 }
 
+interface ApiError extends Error {
+  response?: {
+    data?: {
+      message?: string
+    }
+  }
+}
+
 const Users = () => {
   useDocumentTitle('Users')
   const { user: currentUser } = useAuth()
@@ -62,7 +70,7 @@ const Users = () => {
         message.success('User created successfully')
       }
     },
-    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
+    onError: (error: ApiError) => {
       message.error(error.response?.data?.message || 'Failed to create user')
     },
   })
@@ -79,7 +87,7 @@ const Users = () => {
       editForm.resetFields()
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
     },
-    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
+    onError: (error: ApiError) => {
       message.error(error.response?.data?.message || 'Failed to update user')
     },
   })
@@ -93,7 +101,7 @@ const Users = () => {
       message.success(`User ${variables.is_active ? 'enabled' : 'disabled'} successfully`)
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
     },
-    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
+    onError: (error: ApiError) => {
       message.error(error.response?.data?.message || 'Failed to update user status')
     },
   })
@@ -110,7 +118,7 @@ const Users = () => {
       setPasswordModalOpen(true)
       queryClient.invalidateQueries({ queryKey: ['admin-users'] })
     },
-    onError: (error: Error & { response?: { data?: { message?: string } } }) => {
+    onError: (error: ApiError) => {
       message.error(error.response?.data?.message || 'Failed to reset password')
     },
   })

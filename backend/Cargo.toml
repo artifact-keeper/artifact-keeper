@@ -33,9 +33,8 @@ sha2.workspace = true
 md-5.workspace = true
 sha1.workspace = true
 
-# S3 storage - disabled until AWS SDK supports Rust 1.85+
-# aws-sdk-s3.workspace = true
-# aws-config.workspace = true
+# S3 storage using rust-s3 crate
+rust-s3.workspace = true
 
 # Logging/Tracing
 tracing.workspace = true
@@ -61,6 +60,9 @@ chrono.workspace = true
 # HTTP client
 reqwest.workspace = true
 
+# URL encoding
+serde_urlencoded.workspace = true
+
 # Async streams
 futures.workspace = true
 tokio-util.workspace = true
@@ -76,6 +78,18 @@ quick-xml = { version = "0.39", features = ["serialize"] }
 flate2 = "1.0"
 tar = "0.4"
 mime_guess = "2.0"
+zip = "2.2"
+toml = "0.8"
+serde_yaml = "0.9"
+regex = "1.11"
+
+# WASM runtime
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+
+# Git operations
+git2.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3.16"

@@ -47,6 +47,6 @@ function customRender(
   return render(ui, { wrapper: createWrapper(), ...options })
 }
 
-// Re-export everything
-export * from '@testing-library/react'
+// Re-export testing library utilities
+export { screen, waitFor, within, fireEvent } from '@testing-library/react'
 export { customRender as render }

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+// Removed unused vi import
 import { render, screen, waitFor } from '../test/utils'
 import userEvent from '@testing-library/user-event'
 import Login from './Login'

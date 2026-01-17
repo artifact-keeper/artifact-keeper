@@ -100,6 +100,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     auth_middleware,
                 ))
         )
+        // Format handler routes with optional auth (list is public, enable/disable requires auth)
+        .nest(
+            "/formats",
+            handlers::plugins::format_router()
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                ))
+        )
         // Webhook routes with auth middleware
         .nest(
             "/webhooks",

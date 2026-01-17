@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE users\n        SET\n            email = COALESCE($2, email),\n            display_name = COALESCE($3, display_name),\n            is_active = COALESCE($4, is_active),\n            is_admin = COALESCE($5, is_admin),\n            updated_at = NOW()\n        WHERE id = $1\n        RETURNING\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active,\n            last_login_at, created_at, updated_at\n        ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = $2\n            ",
   "describe": {
     "columns": [
       {
@@ -62,27 +62,41 @@
       },
       {
         "ordinal": 9,
+        "name": "must_change_password",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Bool",
-        "Bool"
+        "Text",
+        {
+          "Custom": {
+            "name": "auth_provider",
+            "kind": {
+              "Enum": [
+                "local",
+                "ldap",
+                "saml",
+                "oidc"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": [
@@ -95,10 +109,11 @@
       true,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "3108c686eec4757c95f6204d927f5a8c5a6f210a00640ea2c134fde6a7b5cd12"
+  "hash": "302b8e2bd401b4f11f87fb15240949e4fdd9d48154d98895ed7037c0abc5e97a"
 }

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Table, Button, Space, Tag, Modal, Form, Input, Select, Switch, message, Popconfirm, Card, Row, Col, Statistic, Tooltip, Descriptions, Tabs } from 'antd'
+import { Table, Button, Space, Tag, Modal, Form, Input, Select, message, Popconfirm, Card, Row, Col, Statistic, Tooltip, Descriptions, Tabs } from 'antd'
 import { PlusOutlined, DeleteOutlined, ReloadOutlined, ApiOutlined, CheckCircleOutlined, CloseCircleOutlined, SettingOutlined, PlayCircleOutlined, PauseCircleOutlined } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
@@ -67,7 +67,7 @@ const Plugins = () => {
   const [installModalOpen, setInstallModalOpen] = useState(false)
   const [configModalOpen, setConfigModalOpen] = useState(false)
   const [selectedPlugin, setSelectedPlugin] = useState<Plugin | null>(null)
-  const [typeFilter, setTypeFilter] = useState<string | undefined>()
+  const [typeFilter] = useState<string | undefined>()
   const [statusFilter, setStatusFilter] = useState<string | undefined>()
   const [form] = Form.useForm()
   const [configForm] = Form.useForm()

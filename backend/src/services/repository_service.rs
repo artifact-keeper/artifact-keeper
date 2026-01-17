@@ -53,6 +53,25 @@ impl RepositoryService {
             ));
         }
 
+        // Check if format handler is enabled (T044)
+        let format_key = format!("{:?}", req.format).to_lowercase();
+        let format_enabled: Option<bool> = sqlx::query_scalar!(
+            "SELECT is_enabled FROM format_handlers WHERE format_key = $1",
+            format_key
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .flatten();
+
+        // If format handler exists and is disabled, reject repository creation
+        if format_enabled == Some(false) {
+            return Err(AppError::Validation(format!(
+                "Format handler '{}' is disabled. Enable it before creating repositories.",
+                format_key
+            )));
+        }
+
         let repo = sqlx::query_as!(
             Repository,
             r#"

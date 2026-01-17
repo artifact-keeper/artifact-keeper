@@ -1,6 +1,7 @@
 //! Artifact Keeper - Main Entry Point
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -8,7 +9,10 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use artifact_keeper_backend::{api, config::Config, db, error::Result};
+use artifact_keeper_backend::{
+    api, config::Config, db, error::Result,
+    services::{plugin_registry::PluginRegistry, wasm_plugin_service::WasmPluginService},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,8 +40,20 @@ async fn main() -> Result<()> {
     sqlx::migrate!("./migrations").run(&db_pool).await?;
     tracing::info!("Database migrations complete");
 
-    // Create application state
-    let state = Arc::new(api::AppState::new(config.clone(), db_pool));
+    // Initialize WASM plugin system (T068)
+    let plugins_dir = PathBuf::from(
+        std::env::var("PLUGINS_DIR").unwrap_or_else(|_| "./plugins".to_string()),
+    );
+    let (plugin_registry, wasm_plugin_service) =
+        initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
+
+    // Create application state with WASM plugin support
+    let state = Arc::new(api::AppState::with_wasm_plugins(
+        config.clone(),
+        db_pool,
+        plugin_registry,
+        wasm_plugin_service,
+    ));
 
     // Build router
     let app = Router::new()
@@ -58,4 +74,104 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Initialize the WASM plugin system (T068).
+///
+/// Creates the plugin registry, loads active plugins from the database,
+/// and returns both the registry and the plugin service.
+async fn initialize_wasm_plugins(
+    db_pool: sqlx::PgPool,
+    plugins_dir: PathBuf,
+) -> Result<(Arc<PluginRegistry>, Arc<WasmPluginService>)> {
+    tracing::info!("Initializing WASM plugin system");
+
+    // Create plugin registry
+    let registry = Arc::new(
+        PluginRegistry::new().map_err(|e| artifact_keeper_backend::error::AppError::Internal(
+            format!("Failed to create plugin registry: {}", e),
+        ))?,
+    );
+
+    // Create WASM plugin service
+    let wasm_service = Arc::new(WasmPluginService::new(
+        db_pool.clone(),
+        registry.clone(),
+        plugins_dir.clone(),
+    ));
+
+    // Ensure plugins directory exists
+    wasm_service.ensure_plugins_dir().await?;
+
+    // Load active plugins from database
+    let active_plugins = load_active_plugins(&db_pool).await?;
+
+    let mut loaded_count = 0;
+    let mut error_count = 0;
+
+    for plugin in active_plugins {
+        if let Some(ref wasm_path) = plugin.wasm_path {
+            match wasm_service.activate_plugin(&plugin, std::path::Path::new(wasm_path)).await {
+                Ok(_) => {
+                    tracing::info!("Loaded plugin: {} v{}", plugin.name, plugin.version);
+                    loaded_count += 1;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to load plugin {}: {}. Marking as error state.",
+                        plugin.name,
+                        e
+                    );
+                    // Update plugin status to error
+                    let _ = sqlx::query!(
+                        "UPDATE plugins SET status = 'error' WHERE id = $1",
+                        plugin.id
+                    )
+                    .execute(&db_pool)
+                    .await;
+                    error_count += 1;
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        "WASM plugin system initialized: {} plugins loaded, {} errors",
+        loaded_count,
+        error_count
+    );
+
+    Ok((registry, wasm_service))
+}
+
+/// Load active plugins from the database.
+async fn load_active_plugins(
+    db_pool: &sqlx::PgPool,
+) -> Result<Vec<artifact_keeper_backend::models::plugin::Plugin>> {
+    use artifact_keeper_backend::models::plugin::{
+        Plugin, PluginSourceType, PluginStatus, PluginType,
+    };
+
+    let plugins = sqlx::query_as!(
+        Plugin,
+        r#"
+        SELECT
+            id, name, version, display_name, description, author, homepage, license,
+            status as "status: PluginStatus",
+            plugin_type as "plugin_type: PluginType",
+            config_schema, default_config,
+            source_type as "source_type: PluginSourceType",
+            source_url, source_ref, wasm_path, manifest,
+            capabilities, resource_limits,
+            installed_at, enabled_at, updated_at
+        FROM plugins
+        WHERE status = 'active' AND wasm_path IS NOT NULL
+        ORDER BY name
+        "#
+    )
+    .fetch_all(db_pool)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    Ok(plugins)
 }

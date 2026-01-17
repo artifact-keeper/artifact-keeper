@@ -1,0 +1,43 @@
+# Plugin Manifest for Artifact Keeper
+# This file defines the plugin metadata and capabilities.
+
+[plugin]
+# Unique identifier for the plugin (must match format_key returned by the handler)
+name = "my-format"
+# Semantic version of this plugin
+version = "0.1.0"
+# Human-readable description
+description = "A custom format handler for my artifact type"
+# Plugin author(s)
+author = "Your Name <you@example.com>"
+# Plugin homepage or repository URL (optional)
+homepage = "https://github.com/your-org/my-format-plugin"
+# Minimum Artifact Keeper version required (optional)
+min_keeper_version = "1.0.0"
+
+[format]
+# The format key this plugin handles (must match format_key() return value)
+# Must be lowercase alphanumeric with hyphens, e.g., "my-format", "custom-npm"
+key = "my-format"
+# Human-readable format name
+display_name = "My Custom Format"
+# File extensions this format handles (for content-type detection)
+extensions = [".myf", ".myformat"]
+# MIME type(s) for this format
+content_types = ["application/x-my-format"]
+
+[resources]
+# Maximum memory limit in bytes (default: 16MB)
+max_memory_bytes = 16777216
+# Maximum fuel (CPU cycles) per operation (default: 100M)
+max_fuel = 100000000
+# Maximum execution time in milliseconds (default: 30s)
+max_execution_ms = 30000
+
+[capabilities]
+# Whether this plugin can generate index files
+generates_index = false
+# Whether this plugin validates artifact structure
+validates_content = true
+# Whether this plugin extracts version information
+extracts_version = true

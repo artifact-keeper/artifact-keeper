@@ -1,8 +1,7 @@
 //! Storage backends.
 
 pub mod filesystem;
-// S3 module disabled - AWS SDK requires Rust 1.88+
-// pub mod s3;
+pub mod s3;
 
 use async_trait::async_trait;
 use bytes::Bytes;

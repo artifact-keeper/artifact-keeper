@@ -8,7 +8,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::models::repository::RepositoryFormat;
 
 /// Search result item
 #[derive(Debug, Serialize)]

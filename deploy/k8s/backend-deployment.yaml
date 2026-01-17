@@ -1,0 +1,179 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: artifact-keeper
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: artifact-keeper
+        app.kubernetes.io/component: backend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: backend
+          image: artifact-keeper-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: RUST_LOG
+            - name: HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: HOST
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: PORT
+            - name: STORAGE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: STORAGE_PATH
+            - name: BACKUP_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: BACKUP_PATH
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: artifact-keeper-secrets
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: artifact-keeper-secrets
+                  key: JWT_SECRET
+            - name: S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: S3_ENDPOINT
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: S3_BUCKET
+            - name: S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: S3_REGION
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: artifact-keeper-secrets
+                  key: S3_ACCESS_KEY
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: artifact-keeper-secrets
+                  key: S3_SECRET_KEY
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: storage
+              mountPath: /data/storage
+            - name: backups
+              mountPath: /data/backups
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: artifact-storage
+        - name: backups
+          persistentVolumeClaim:
+            claimName: backup-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: backend
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: backend
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: artifact-storage
+  namespace: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: standard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-storage
+  namespace: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: backups
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: standard

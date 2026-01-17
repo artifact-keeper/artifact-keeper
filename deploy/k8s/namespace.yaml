@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/part-of: artifact-keeper

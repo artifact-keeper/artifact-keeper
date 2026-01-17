@@ -7,7 +7,7 @@
       "Left": [
         "Uuid",
         "Int8",
-        "Int8"
+        "Int4"
       ]
     },
     "nullable": []

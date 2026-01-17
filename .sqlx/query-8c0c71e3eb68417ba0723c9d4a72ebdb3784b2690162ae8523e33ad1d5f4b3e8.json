@@ -1,0 +1,147 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO plugins (\n                name, version, display_name, description, author, homepage,\n                plugin_type, config, config_schema\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING\n                id, name, version, display_name, description, author, homepage,\n                status as \"status: PluginStatus\",\n                plugin_type as \"plugin_type: PluginType\",\n                config, config_schema, installed_at, enabled_at, updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "author",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "homepage",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "status: PluginStatus",
+        "type_info": {
+          "Custom": {
+            "name": "plugin_status",
+            "kind": {
+              "Enum": [
+                "active",
+                "disabled",
+                "error"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "plugin_type: PluginType",
+        "type_info": {
+          "Custom": {
+            "name": "plugin_type",
+            "kind": {
+              "Enum": [
+                "format_handler",
+                "storage_backend",
+                "authentication",
+                "authorization",
+                "webhook",
+                "custom"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "config",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 10,
+        "name": "config_schema",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 11,
+        "name": "installed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "enabled_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Varchar",
+        {
+          "Custom": {
+            "name": "plugin_type",
+            "kind": {
+              "Enum": [
+                "format_handler",
+                "storage_backend",
+                "authentication",
+                "authorization",
+                "webhook",
+                "custom"
+              ]
+            }
+          }
+        },
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "8c0c71e3eb68417ba0723c9d4a72ebdb3784b2690162ae8523e33ad1d5f4b3e8"
+}

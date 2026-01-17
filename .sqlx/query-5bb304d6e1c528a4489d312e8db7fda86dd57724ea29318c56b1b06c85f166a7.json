@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                COUNT(*)::bigint as \"total!: i64\",\n                (COUNT(*) FILTER (WHERE expires_at IS NOT NULL AND expires_at < NOW()))::bigint as \"expired!: i64\",\n                (COUNT(*) FILTER (WHERE last_used_at > NOW() - INTERVAL '24 hours'))::bigint as \"used_last_24h!: i64\",\n                (COUNT(*) FILTER (WHERE last_used_at IS NULL))::bigint as \"never_used!: i64\"\n            FROM api_tokens\n            WHERE user_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "expired!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "used_last_24h!: i64",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "never_used!: i64",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "5bb304d6e1c528a4489d312e8db7fda86dd57724ea29318c56b1b06c85f166a7"
+}

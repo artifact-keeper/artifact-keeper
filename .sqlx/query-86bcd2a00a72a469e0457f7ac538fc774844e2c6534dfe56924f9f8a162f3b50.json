@@ -18,7 +18,8 @@
               "Enum": [
                 "full",
                 "incremental",
-                "metadata_only"
+                "metadata_only",
+                "metadata"
               ]
             }
           }
@@ -45,7 +46,7 @@
       {
         "ordinal": 3,
         "name": "storage_path",
-        "type_info": "Varchar"
+        "type_info": "Text"
       },
       {
         "ordinal": 4,
@@ -55,7 +56,7 @@
       {
         "ordinal": 5,
         "name": "artifact_count",
-        "type_info": "Int8"
+        "type_info": "Int4"
       },
       {
         "ordinal": 6,
@@ -97,7 +98,7 @@
       false,
       false,
       false,
-      true,
+      false,
       true,
       true,
       true,

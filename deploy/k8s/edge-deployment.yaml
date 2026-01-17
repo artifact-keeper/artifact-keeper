@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge
+  namespace: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: artifact-keeper
+      app.kubernetes.io/component: edge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: artifact-keeper
+        app.kubernetes.io/component: edge
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: edge
+          image: artifact-keeper-edge:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: RUST_LOG
+            - name: EDGE_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: EDGE_HOST
+            - name: EDGE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: EDGE_PORT
+            - name: CACHE_SIZE_MB
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: CACHE_SIZE_MB
+            - name: HEARTBEAT_INTERVAL_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: artifact-keeper-config
+                  key: HEARTBEAT_INTERVAL_SECS
+            - name: PRIMARY_URL
+              value: "http://backend:8080"
+            - name: CACHE_PATH
+              value: "/data/cache"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: cache
+              mountPath: /data/cache
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge
+  namespace: artifact-keeper
+  labels:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: edge
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: artifact-keeper
+    app.kubernetes.io/component: edge

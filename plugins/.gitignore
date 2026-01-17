@@ -1,0 +1,22 @@
+# Build artifacts
+target/
+*.wasm
+!plugin-template/**/*.wasm
+!sample-plugin/**/*.wasm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Installed plugins (managed by application)
+installed/
+
+# Temporary files
+*.tmp
+*.bak
