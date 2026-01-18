@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::models::migration::{MigrationItemStatus, MigrationItemType, MigrationJobStatus};
+use crate::models::migration::{MigrationItemType, MigrationJobStatus};
 use crate::services::artifactory_client::ArtifactoryClient;
 use crate::services::migration_service::{MigrationError, MigrationService};
 

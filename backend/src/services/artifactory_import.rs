@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zip::ZipArchive;
@@ -193,9 +193,12 @@ impl ArtifactoryImporter {
         // Find the actual export root (may be nested in the archive)
         let export_root = Self::find_export_root(&temp_path)?;
 
+        // Keep the temp directory so it's not deleted when the function returns
+        let temp_path_owned = temp_dir.keep()?;
+
         Ok(Self {
             root_path: export_root,
-            temp_dir: Some(temp_dir.into_path()),
+            temp_dir: Some(temp_path_owned),
             progress_callback: None,
         })
     }
@@ -980,7 +983,6 @@ impl Drop for ArtifactoryImporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     fn create_test_export() -> TempDir {
