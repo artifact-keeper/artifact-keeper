@@ -38,7 +38,9 @@ pub async fn heartbeat_loop(state: Arc<EdgeState>) {
                 if is_heartbeat_connectivity_error(&e) {
                     if !state.is_offline.load(Ordering::SeqCst) {
                         state.is_offline.store(true, Ordering::SeqCst);
-                        tracing::warn!("Heartbeat connectivity failure - transitioning to offline mode");
+                        tracing::warn!(
+                            "Heartbeat connectivity failure - transitioning to offline mode"
+                        );
                     }
                 }
             }

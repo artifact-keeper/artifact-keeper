@@ -741,7 +741,11 @@ mod tests {
                 "application/gzip",
             )
             .await;
-        assert!(upload_result.is_ok(), "Cargo crate upload failed: {:?}", upload_result);
+        assert!(
+            upload_result.is_ok(),
+            "Cargo crate upload failed: {:?}",
+            upload_result
+        );
 
         // Download and verify
         let downloaded = server
@@ -773,7 +777,11 @@ mod tests {
                 "application/octet-stream",
             )
             .await;
-        assert!(upload_result.is_ok(), "Generic artifact upload failed: {:?}", upload_result);
+        assert!(
+            upload_result.is_ok(),
+            "Generic artifact upload failed: {:?}",
+            upload_result
+        );
 
         // Download and verify
         let downloaded = server
@@ -784,7 +792,11 @@ mod tests {
 
         // Test deletion
         let delete_result = server.delete_artifact(repo_key, artifact_path).await;
-        assert!(delete_result.is_ok(), "Delete artifact failed: {:?}", delete_result);
+        assert!(
+            delete_result.is_ok(),
+            "Delete artifact failed: {:?}",
+            delete_result
+        );
     }
 
     // ============= Search Tests =============

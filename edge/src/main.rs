@@ -54,9 +54,7 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
-            AppError::NotFound(msg) => {
-                (StatusCode::NOT_FOUND, msg).into_response()
-            }
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             AppError::ServiceUnavailable(msg) => {
                 let body = serde_json::json!({
                     "error": "service_unavailable",
@@ -70,9 +68,7 @@ impl IntoResponse for AppError {
                 )
                     .into_response()
             }
-            AppError::Internal(msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-            }
+            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
         }
     }
 }
@@ -91,11 +87,9 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let primary_url =
-        std::env::var("PRIMARY_URL").expect("PRIMARY_URL must be set");
+    let primary_url = std::env::var("PRIMARY_URL").expect("PRIMARY_URL must be set");
     let api_key = std::env::var("EDGE_API_KEY").expect("EDGE_API_KEY must be set");
-    let bind_address =
-        std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let bind_address = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let cache_size: usize = std::env::var("CACHE_SIZE_MB")
         .unwrap_or_else(|_| "1024".to_string())
         .parse()
@@ -152,9 +146,7 @@ async fn main() -> anyhow::Result<()> {
 fn is_connectivity_error(err: &anyhow::Error) -> bool {
     // Check for reqwest errors that indicate network issues
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
-        return reqwest_err.is_connect()
-            || reqwest_err.is_timeout()
-            || reqwest_err.is_request();
+        return reqwest_err.is_connect() || reqwest_err.is_timeout() || reqwest_err.is_request();
     }
     // Check error message for common connectivity indicators
     let msg = err.to_string().to_lowercase();
@@ -276,7 +268,10 @@ async fn serve_artifact(
                 }
             }
 
-            Err(AppError::Internal(format!("Failed to fetch artifact: {}", e)))
+            Err(AppError::Internal(format!(
+                "Failed to fetch artifact: {}",
+                e
+            )))
         }
     }
 }
@@ -292,11 +287,7 @@ async fn health_check(State(state): State<Arc<EdgeState>>) -> impl IntoResponse 
         .map(|t| t.elapsed().as_secs())
         .unwrap_or(u64::MAX);
 
-    let status = if is_offline {
-        "offline"
-    } else {
-        "online"
-    };
+    let status = if is_offline { "offline" } else { "online" };
 
     let body = serde_json::json!({
         "status": status,
