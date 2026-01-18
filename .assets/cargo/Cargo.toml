@@ -1,0 +1,13 @@
+[package]
+name = "test-crate"
+version = "VERSION_PLACEHOLDER"
+edition = "2021"
+description = "Test crate for E2E native client testing"
+license = "MIT"
+authors = ["Test Author <test@artifact-keeper.local>"]
+repository = "https://github.com/artifact-keeper/test-crate"
+readme = "README.md"
+
+[lib]
+name = "test_crate"
+path = "src/lib.rs"

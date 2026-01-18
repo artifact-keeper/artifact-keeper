@@ -7,7 +7,7 @@ import {
   Space,
   Alert,
 } from 'antd';
-import { colors, spacing } from '../../../styles/tokens';
+import { spacing } from '../../../styles/tokens';
 
 const { TextArea } = Input;
 

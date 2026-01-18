@@ -8,7 +8,6 @@ import {
   Input,
   Tooltip,
   Typography,
-  Popconfirm,
   Result,
 } from 'antd';
 import type { ColumnsType, TablePaginationConfig } from 'antd/es/table';

@@ -3,7 +3,7 @@ import { test, expect } from '@playwright/test'
 test.describe('Admin Workflow', () => {
   const testUserName = `e2e-test-user-${Date.now()}`
   const testGroupName = `e2e-test-group-${Date.now()}`
-  const testPermissionName = `e2e-test-perm-${Date.now()}`
+  const _testPermissionName = `e2e-test-perm-${Date.now()}`
 
   test.beforeEach(async ({ page }) => {
     await page.goto('/login')

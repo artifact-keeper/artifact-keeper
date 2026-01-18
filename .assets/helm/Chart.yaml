@@ -1,0 +1,10 @@
+apiVersion: v2
+name: test-chart
+description: Test Helm chart for E2E native client testing
+type: application
+version: VERSION_PLACEHOLDER
+appVersion: "1.0.0"
+maintainers:
+  - name: Test Author
+    email: test@artifact-keeper.local
+home: https://github.com/artifact-keeper/test-chart

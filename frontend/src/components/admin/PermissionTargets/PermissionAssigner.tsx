@@ -26,7 +26,7 @@ import { colors, spacing } from '../../../styles/tokens';
 import type { Group, PermissionAction } from '../../../api';
 import type { User } from '../../../types';
 
-const { Text, Title } = Typography;
+const { Text } = Typography;
 
 export interface PermissionAssignment {
   principalType: 'user' | 'group';
@@ -253,7 +253,7 @@ export const PermissionAssigner: React.FC<PermissionAssignerProps> = ({
           </Space>
         ),
         children: userAssignments
-          .filter((ua) => {
+          .filter(() => {
             return true;
           })
           .slice(0, 3)

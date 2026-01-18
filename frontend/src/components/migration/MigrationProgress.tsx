@@ -131,7 +131,7 @@ export const MigrationProgress: React.FC<MigrationProgressProps> = ({
       try {
         const data: ProgressData = JSON.parse(event.data);
         setProgress(data);
-      } catch (e) {
+      } catch (e: unknown) {
         console.error('Failed to parse progress data:', e);
       }
     });
@@ -146,7 +146,7 @@ export const MigrationProgress: React.FC<MigrationProgressProps> = ({
           setJob(job);
           onComplete?.(job);
         });
-      } catch (e) {
+      } catch (e: unknown) {
         console.error('Failed to parse complete data:', e);
       }
     });

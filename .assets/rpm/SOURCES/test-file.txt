@@ -1,0 +1,2 @@
+Hello from test-package!
+This is a test file for E2E native client testing.

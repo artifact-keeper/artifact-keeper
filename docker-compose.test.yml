@@ -1,11 +1,31 @@
-# Docker Compose configuration for automated E2E testing
-# Usage: ./scripts/run-e2e-tests.sh
-# Or: docker compose -f docker-compose.test.yml up --abort-on-container-exit --exit-code-from playwright
-
-version: '3.8'
+# Docker Compose configuration for E2E Testing
+# Supports Docker Compose profiles for selective test execution
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up --abort-on-container-exit    # Playwright E2E tests
+#   docker compose -f docker-compose.test.yml --profile pypi up               # PyPI native client tests
+#   docker compose -f docker-compose.test.yml --profile all up                # All native client tests
+#
+# Profiles:
+#   (default)   - Playwright E2E tests (frontend/backend)
+#   pypi        - PyPI/pip tests (smoke)
+#   npm         - NPM tests (smoke)
+#   cargo       - Cargo/crates tests (smoke)
+#   maven       - Maven tests
+#   go          - Go modules tests
+#   rpm         - RPM/dnf tests (requires gpg)
+#   deb         - Debian/apt tests (requires gpg)
+#   helm        - Helm chart tests
+#   conda       - Conda package tests
+#   docker      - Docker/OCI image tests
+#   smoke       - Smoke tests only (pypi, npm, cargo)
+#   all         - All native client tests
 
 services:
-  # PostgreSQL database
+  # ==========================================================================
+  # INFRASTRUCTURE SERVICES (Always available)
+  # ==========================================================================
+
   postgres:
     image: docker.io/postgres:16-alpine
     container_name: e2e-test-db
@@ -14,7 +34,7 @@ services:
       POSTGRES_PASSWORD: registry
       POSTGRES_DB: artifact_registry
     tmpfs:
-      - /var/lib/postgresql/data  # Use tmpfs for faster tests
+      - /var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
       interval: 2s
@@ -23,7 +43,6 @@ services:
     networks:
       - e2e-test-network
 
-  # Backend API server
   backend:
     build:
       context: .
@@ -40,8 +59,6 @@ services:
       RUST_LOG: info
       HOST: 0.0.0.0
       PORT: 8080
-    # Note: Not using tmpfs for /data because it overrides Dockerfile permissions
-    # The artifact user needs write access to /data for artifact storage
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 5s
@@ -51,7 +68,36 @@ services:
     networks:
       - e2e-test-network
 
-  # Frontend development server
+  # PKI service generates certificates and GPG keys on startup
+  pki:
+    image: alpine:3.19
+    container_name: e2e-test-pki
+    command: >
+      sh -c "
+        apk add --no-cache openssl gnupg bash curl &&
+        chmod +x /scripts/pki/*.sh &&
+        /scripts/pki/generate-certs.sh /pki &&
+        /scripts/pki/generate-gpg.sh /pki &&
+        echo 'PKI setup complete' &&
+        touch /pki/.ready &&
+        tail -f /dev/null
+      "
+    volumes:
+      - ./scripts/pki:/scripts/pki:ro
+      - pki-data:/pki
+    healthcheck:
+      test: ["CMD", "test", "-f", "/pki/.ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - e2e-test-network
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all"]
+
+  # ==========================================================================
+  # PLAYWRIGHT E2E TESTS (Default Profile)
+  # ==========================================================================
+
   frontend:
     build:
       context: ./frontend
@@ -72,7 +118,6 @@ services:
     networks:
       - e2e-test-network
 
-  # Playwright test runner
   playwright:
     build:
       context: ./frontend
@@ -84,11 +129,9 @@ services:
       backend:
         condition: service_healthy
     environment:
-      # Point Playwright at the frontend container
       BASE_URL: http://frontend:5173
       CI: "true"
     volumes:
-      # Mount test results for inspection after run (z for SELinux shared label)
       - ./test-results:/app/test-results:z
       - ./playwright-report:/app/playwright-report:z
     command: >
@@ -98,7 +141,226 @@ services:
     networks:
       - e2e-test-network
 
+  # ==========================================================================
+  # SMOKE TEST SERVICES (pypi, npm, cargo)
+  # ==========================================================================
+
+  pypi-test:
+    image: python:3.12-slim
+    container_name: e2e-test-pypi
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-pypi
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+    command: ["bash", "/scripts/test-pypi.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["pypi", "smoke", "all"]
+
+  npm-test:
+    image: node:20-slim
+    container_name: e2e-test-npm
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-npm
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+    command: ["bash", "/scripts/test-npm.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["npm", "smoke", "all"]
+
+  cargo-test:
+    image: rust:1.75-slim
+    container_name: e2e-test-cargo
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-cargo
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+    command: ["bash", "/scripts/test-cargo.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["cargo", "smoke", "all"]
+
+  # ==========================================================================
+  # EXTENDED TEST SERVICES (Require specific profiles)
+  # ==========================================================================
+
+  maven-test:
+    image: maven:3.9-eclipse-temurin-21
+    container_name: e2e-test-maven
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-maven
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+      - maven-cache:/root/.m2
+    command: ["bash", "/scripts/test-maven.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["maven", "all"]
+
+  go-test:
+    image: golang:1.22-alpine
+    container_name: e2e-test-go
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-go
+      GOPROXY: http://backend:8080/api/v1/repositories/test-go
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+      - go-cache:/go/pkg
+    command: ["/scripts/test-go.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["go", "all"]
+
+  rpm-test:
+    image: rockylinux/rockylinux:9-ubi-init
+    container_name: e2e-test-rpm
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-rpm
+      CA_CERT: /pki/ca.crt
+      GPG_KEY: /pki/gpg-signing.pub
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+    command: ["bash", "/scripts/test-rpm.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["rpm", "all"]
+
+  deb-test:
+    image: debian:bookworm-slim
+    container_name: e2e-test-deb
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-deb
+      CA_CERT: /pki/ca.crt
+      GPG_KEY: /pki/gpg-signing.pub
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+    command: ["bash", "/scripts/test-deb.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["deb", "all"]
+
+  helm-test:
+    image: alpine/helm:3.14
+    container_name: e2e-test-helm
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-helm
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+    command: ["/scripts/test-helm.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["helm", "all"]
+
+  conda-test:
+    image: continuumio/miniconda3:latest
+    container_name: e2e-test-conda
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-conda
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+    command: ["bash", "/scripts/test-conda.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["conda", "all"]
+
+  docker-test:
+    image: docker:24-cli
+    container_name: e2e-test-docker
+    depends_on:
+      backend:
+        condition: service_healthy
+      pki:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: backend:8080
+      CA_CERT: /pki/ca.crt
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+      - ./.assets:/assets:ro
+      - pki-data:/pki:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["/scripts/test-docker.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["docker", "all"]
+
 networks:
   e2e-test-network:
     name: e2e-test-network
     driver: bridge
+
+volumes:
+  pki-data:
+  maven-cache:
+  go-cache:

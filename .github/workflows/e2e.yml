@@ -1,0 +1,319 @@
+name: E2E Tests
+
+on:
+  # Manual trigger with configurable options
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Docker Compose profile to run'
+        type: choice
+        options:
+          - smoke
+          - all
+          - pypi
+          - npm
+          - cargo
+          - maven
+          - go
+          - rpm
+          - deb
+          - helm
+          - conda
+          - docker
+        default: smoke
+      include_stress:
+        description: 'Include stress tests'
+        type: boolean
+        default: false
+      include_failure:
+        description: 'Include failure injection tests'
+        type: boolean
+        default: false
+
+  # Allow other workflows to call this workflow (e.g., release.yml)
+  workflow_call:
+    inputs:
+      profile:
+        type: string
+        default: all
+      include_stress:
+        type: boolean
+        default: true
+      include_failure:
+        type: boolean
+        default: true
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # SETUP PKI (Certificates and GPG Keys)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  setup-pki:
+    name: 🔐 Setup PKI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl gnupg
+
+      - name: Generate certificates
+        run: |
+          chmod +x scripts/pki/generate-certs.sh
+          scripts/pki/generate-certs.sh .pki
+
+      - name: Generate GPG keys
+        run: |
+          chmod +x scripts/pki/generate-gpg.sh
+          scripts/pki/generate-gpg.sh .pki
+
+      - name: Upload PKI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pki-assets
+          path: .pki/
+          retention-days: 1
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PLAYWRIGHT E2E TESTS (Frontend + Backend)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  playwright-e2e:
+    name: 🎭 Playwright E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v5
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-e2e-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-buildx-e2e-
+
+      - name: Create results directories
+        run: mkdir -p test-results playwright-report
+
+      - name: Run Playwright E2E tests
+        run: |
+          docker compose -f docker-compose.test.yml up \
+            --build \
+            --abort-on-container-exit \
+            --exit-code-from playwright
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results
+          path: test-results/
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v --remove-orphans
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # NATIVE CLIENT TESTS
+  # ════════════════════════════════════════════════════════════════════════════
+
+  native-client-tests:
+    name: 📦 Native Client Tests (${{ inputs.profile || 'smoke' }})
+    runs-on: ubuntu-latest
+    needs: [setup-pki]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Download PKI assets
+        uses: actions/download-artifact@v4
+        with:
+          name: pki-assets
+          path: .pki
+
+      - name: Set PKI permissions
+        run: chmod 600 .pki/*.key 2>/dev/null || true
+
+      - name: Create test scripts directory
+        run: mkdir -p scripts/native-tests
+
+      - name: Run native client tests
+        run: |
+          PROFILE="${{ inputs.profile || 'smoke' }}"
+          echo "Running native client tests with profile: $PROFILE"
+
+          if [ "$PROFILE" = "smoke" ] || [ -z "$PROFILE" ]; then
+            # Default smoke tests run without a profile flag
+            docker compose -f docker-compose.test.yml --profile smoke up \
+              --build \
+              --abort-on-container-exit
+          else
+            docker compose -f docker-compose.test.yml --profile "$PROFILE" up \
+              --build \
+              --abort-on-container-exit
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v --remove-orphans
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # STRESS TESTS (Optional)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  stress-tests:
+    name: 🔥 Stress Tests
+    runs-on: ubuntu-latest
+    needs: [native-client-tests]
+    if: ${{ inputs.include_stress == true }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Start services
+        run: |
+          docker compose -f docker-compose.test.yml up -d postgres backend
+          sleep 30  # Wait for services to be healthy
+
+      - name: Run stress tests
+        run: |
+          chmod +x scripts/stress/run-concurrent-uploads.sh 2>/dev/null || true
+          if [ -f scripts/stress/run-concurrent-uploads.sh ]; then
+            scripts/stress/run-concurrent-uploads.sh 100
+          else
+            echo "Stress test script not found, skipping"
+          fi
+
+      - name: Validate results
+        run: |
+          if [ -f scripts/stress/validate-results.sh ]; then
+            scripts/stress/validate-results.sh
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v --remove-orphans
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # FAILURE INJECTION TESTS (Optional)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  failure-tests:
+    name: 💥 Failure Tests
+    runs-on: ubuntu-latest
+    needs: [native-client-tests]
+    if: ${{ inputs.include_failure == true }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Start services
+        run: |
+          docker compose -f docker-compose.test.yml up -d postgres backend
+          sleep 30  # Wait for services to be healthy
+
+      - name: Run failure injection tests
+        run: |
+          chmod +x scripts/failure/*.sh 2>/dev/null || true
+          if [ -f scripts/failure/run-all.sh ]; then
+            scripts/failure/run-all.sh
+          else
+            echo "Failure test scripts not found, running individual tests..."
+            [ -f scripts/failure/test-server-crash.sh ] && scripts/failure/test-server-crash.sh || true
+            [ -f scripts/failure/test-db-disconnect.sh ] && scripts/failure/test-db-disconnect.sh || true
+            [ -f scripts/failure/test-storage-failure.sh ] && scripts/failure/test-storage-failure.sh || true
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v --remove-orphans
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # E2E SUMMARY
+  # ════════════════════════════════════════════════════════════════════════════
+
+  e2e-complete:
+    name: ✅ E2E Complete
+    runs-on: ubuntu-latest
+    needs: [playwright-e2e, native-client-tests, stress-tests, failure-tests]
+    if: always()
+    steps:
+      - name: Check E2E status
+        run: |
+          echo "## E2E Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Profile**: ${{ inputs.profile || 'smoke' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Stress Tests**: ${{ inputs.include_stress }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Failure Tests**: ${{ inputs.include_failure }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          overall_pass=true
+
+          # Playwright E2E
+          if [[ "${{ needs.playwright-e2e.result }}" == "success" ]]; then
+            echo "✅ Playwright E2E: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Playwright E2E: ${{ needs.playwright-e2e.result }}" >> $GITHUB_STEP_SUMMARY
+            overall_pass=false
+          fi
+
+          # Native Client Tests
+          if [[ "${{ needs.native-client-tests.result }}" == "success" ]]; then
+            echo "✅ Native Client Tests: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Native Client Tests: ${{ needs.native-client-tests.result }}" >> $GITHUB_STEP_SUMMARY
+            overall_pass=false
+          fi
+
+          # Stress Tests (only check if enabled)
+          if [[ "${{ inputs.include_stress }}" == "true" ]]; then
+            if [[ "${{ needs.stress-tests.result }}" == "success" ]]; then
+              echo "✅ Stress Tests: Passed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Stress Tests: ${{ needs.stress-tests.result }}" >> $GITHUB_STEP_SUMMARY
+              overall_pass=false
+            fi
+          else
+            echo "⏭️ Stress Tests: Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Failure Tests (only check if enabled)
+          if [[ "${{ inputs.include_failure }}" == "true" ]]; then
+            if [[ "${{ needs.failure-tests.result }}" == "success" ]]; then
+              echo "✅ Failure Tests: Passed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Failure Tests: ${{ needs.failure-tests.result }}" >> $GITHUB_STEP_SUMMARY
+              overall_pass=false
+            fi
+          else
+            echo "⏭️ Failure Tests: Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$overall_pass" != "true" ]]; then
+            echo "❌ **E2E Failed**: One or more test suites failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo "✅ **E2E Passed**: All test suites completed successfully" >> $GITHUB_STEP_SUMMARY

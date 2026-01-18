@@ -83,7 +83,7 @@ class ErrorBoundary extends Component<Props, State> {
     const {
       children,
       fallback,
-      showErrorDetails = process.env.NODE_ENV === 'development',
+      showErrorDetails = import.meta.env.DEV,
       supportEmail = 'support@example.com',
     } = this.props
     const { hasError, error } = this.state

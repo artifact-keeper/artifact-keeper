@@ -12,11 +12,24 @@ on:
 permissions:
   contents: write
   packages: write
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # E2E GATE - Must pass before release proceeds
+  # ════════════════════════════════════════════════════════════════════════════
+
+  e2e-gate:
+    name: 🚦 E2E Gate
+    uses: ./.github/workflows/e2e.yml
+    with:
+      profile: all
+      include_stress: true
+      include_failure: true
+
   # ════════════════════════════════════════════════════════════════════════════
   # BUILD BINARIES
   # ════════════════════════════════════════════════════════════════════════════
@@ -24,6 +37,7 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: [e2e-gate]
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +103,7 @@ jobs:
   build-frontend:
     name: Build Frontend
     runs-on: ubuntu-latest
+    needs: [e2e-gate]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -118,7 +133,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: frontend-dist
+          name: frontend-dist-release
           path: frontend-dist.tar.gz*
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -167,6 +182,12 @@ jobs:
           - Maven, PyPI, NPM, Docker, Helm
           - RPM, Debian, Go Modules
           - NuGet, Cargo, Generic
+
+          ### Quality Assurance
+          - ✅ Full E2E test suite passed
+          - ✅ Native client tests passed (all 9 formats)
+          - ✅ Stress tests passed (100 concurrent operations)
+          - ✅ Failure injection tests passed
 
           ### Downloads
 

@@ -1,0 +1,26 @@
+package:
+  name: test-package
+  version: VERSION_PLACEHOLDER
+
+source:
+  path: .
+
+build:
+  number: 0
+  script: bash build.sh
+
+requirements:
+  build:
+    - python >=3.10
+  run:
+    - python >=3.10
+
+test:
+  commands:
+    - echo "Test package installed successfully"
+
+about:
+  home: https://github.com/artifact-keeper/test-package
+  license: MIT
+  summary: Test package for E2E native client testing
+  description: A test package for E2E native client testing of the Artifact Keeper registry.
