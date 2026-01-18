@@ -1,0 +1,281 @@
+# CI Workflow Contracts
+# Defines the expected behavior of GitHub Actions workflows for the staged testing strategy
+#
+# This is a contract specification, not an executable workflow file.
+# Implementation will be in .github/workflows/*.yml
+
+version: "1.0"
+description: "Staged Testing CI/CD Workflow Contracts"
+
+# ============================================================================
+# TIER 1: Fast CI (Every Push/PR)
+# ============================================================================
+
+workflows:
+  ci:
+    name: "CI"
+    description: "Tier 1 and Tier 2 tests - runs on push/PR"
+
+    triggers:
+      push:
+        branches: [main, master, develop]
+      pull_request:
+        branches: [main, master, develop]
+      workflow_dispatch: {}
+
+    concurrency:
+      group: "ci-${{ github.ref }}"
+      cancel-in-progress: true
+
+    jobs:
+      # Tier 1: Always runs
+      lint-rust:
+        tier: 1
+        runs-on: ubuntu-latest
+        steps:
+          - cargo fmt --check
+          - cargo clippy
+        timeout: 5m
+
+      lint-typescript:
+        tier: 1
+        runs-on: ubuntu-latest
+        steps:
+          - npm run lint
+          - npx tsc --noEmit
+        timeout: 3m
+
+      test-backend-unit:
+        tier: 1
+        runs-on: ubuntu-latest
+        needs: [lint-rust]
+        steps:
+          - cargo test --workspace --lib
+        timeout: 5m
+
+      test-frontend-unit:
+        tier: 1
+        runs-on: ubuntu-latest
+        needs: [lint-typescript]
+        steps:
+          - npm run test:run
+        timeout: 3m
+
+      # Tier 2: Main branch only
+      test-backend-integration:
+        tier: 2
+        runs-on: ubuntu-latest
+        needs: [lint-rust]
+        condition: "github.ref == 'refs/heads/main' && github.event_name == 'push'"
+        services:
+          postgres:
+            image: postgres:16-alpine
+        steps:
+          - cargo test --workspace --test '*'
+        timeout: 10m
+
+      build-backend:
+        tier: 2
+        runs-on: ubuntu-latest
+        needs: [test-backend-unit]
+        steps:
+          - cargo build --release
+        timeout: 10m
+
+      build-frontend:
+        tier: 2
+        runs-on: ubuntu-latest
+        needs: [test-frontend-unit]
+        steps:
+          - npm run build
+        timeout: 5m
+
+      docker-build:
+        tier: 2
+        runs-on: ubuntu-latest
+        needs: [build-backend, build-frontend]
+        steps:
+          - docker build (backend)
+          - docker build (frontend)
+        timeout: 15m
+
+    success_criteria:
+      - "Tier 1 jobs complete within 5 minutes total"
+      - "E2E tests do NOT run on push/PR events"
+      - "Integration tests only run on main branch push"
+
+# ============================================================================
+# TIER 3: E2E Tests (Release/Manual Only)
+# ============================================================================
+
+  e2e:
+    name: "E2E Tests"
+    description: "Tier 3 comprehensive testing - manual trigger or release"
+
+    triggers:
+      workflow_dispatch:
+        inputs:
+          profile:
+            description: "Docker Compose profile to run"
+            type: choice
+            options: [smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker]
+            default: smoke
+          include_stress:
+            description: "Include stress tests"
+            type: boolean
+            default: false
+          include_failure:
+            description: "Include failure injection tests"
+            type: boolean
+            default: false
+      workflow_call:
+        inputs:
+          profile:
+            type: string
+            default: all
+          include_stress:
+            type: boolean
+            default: true
+          include_failure:
+            type: boolean
+            default: true
+
+    jobs:
+      setup-pki:
+        description: "Generate test certificates and GPG keys"
+        runs-on: ubuntu-latest
+        steps:
+          - scripts/pki/generate-certs.sh
+          - scripts/pki/generate-gpg.sh
+        outputs:
+          ca_cert: ${{ steps.pki.outputs.ca_cert }}
+          gpg_pub: ${{ steps.pki.outputs.gpg_pub }}
+        timeout: 2m
+
+      generate-packages:
+        description: "Generate test packages from templates"
+        runs-on: ubuntu-latest
+        needs: [setup-pki]
+        strategy:
+          matrix:
+            format: [pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker]
+            size: [small, medium, large]
+        steps:
+          - .assets/${{ matrix.format }}/generate.sh ${{ matrix.size }}
+        timeout: 5m
+
+      native-client-tests:
+        description: "Run native package manager tests"
+        runs-on: ubuntu-latest
+        needs: [setup-pki, generate-packages]
+        steps:
+          - docker compose -f docker-compose.test.yml --profile ${{ inputs.profile }} up
+        timeout: 30m
+
+      stress-tests:
+        description: "Run 100 concurrent operations"
+        runs-on: ubuntu-latest
+        needs: [native-client-tests]
+        condition: "${{ inputs.include_stress }}"
+        steps:
+          - scripts/stress/run-concurrent-uploads.sh 100
+        timeout: 15m
+
+      failure-tests:
+        description: "Run failure injection scenarios"
+        runs-on: ubuntu-latest
+        needs: [native-client-tests]
+        condition: "${{ inputs.include_failure }}"
+        steps:
+          - scripts/failure/test-server-crash.sh
+          - scripts/failure/test-db-disconnect.sh
+          - scripts/failure/test-storage-failure.sh
+        timeout: 15m
+
+    success_criteria:
+      - "All native client tests pass with --profile all"
+      - "Stress tests complete with zero data corruption"
+      - "Failure tests verify atomic rollback"
+      - "Full suite completes within 30 minutes"
+
+# ============================================================================
+# RELEASE WORKFLOW (E2E Gate)
+# ============================================================================
+
+  release:
+    name: "Release"
+    description: "Release workflow with E2E gate"
+
+    triggers:
+      push:
+        tags: ["v*"]
+
+    jobs:
+      e2e-gate:
+        description: "Run full E2E suite before release"
+        uses: ./.github/workflows/e2e.yml
+        with:
+          profile: all
+          include_stress: true
+          include_failure: true
+
+      publish:
+        description: "Publish release artifacts"
+        runs-on: ubuntu-latest
+        needs: [e2e-gate]
+        condition: "needs.e2e-gate.result == 'success'"
+        steps:
+          - Create GitHub release
+          - Upload artifacts
+          - Push Docker images
+
+    success_criteria:
+      - "Release blocked if E2E tests fail"
+      - "E2E tests run for 100% of releases"
+      - "No release without passing E2E gate"
+
+# ============================================================================
+# DOCKER COMPOSE PROFILES CONTRACT
+# ============================================================================
+
+docker_compose_profiles:
+  description: "Profile definitions for docker-compose.test.yml"
+
+  profiles:
+    smoke:
+      description: "Quick validation (default when no profile specified)"
+      services: [backend, postgres, pki, pypi-test, npm-test, cargo-test]
+      estimated_duration: 10m
+
+    all:
+      description: "Complete native client test suite"
+      services: [backend, postgres, pki, gpg, registry,
+                 pypi-test, npm-test, cargo-test, maven-test, go-test,
+                 rpm-test, deb-test, helm-test, conda-test, docker-test]
+      estimated_duration: 30m
+
+    pypi:
+      services: [backend, postgres, pki, pypi-test]
+    npm:
+      services: [backend, postgres, pki, npm-test]
+    cargo:
+      services: [backend, postgres, pki, cargo-test]
+    maven:
+      services: [backend, postgres, pki, maven-test]
+    go:
+      services: [backend, postgres, pki, go-test]
+    rpm:
+      services: [backend, postgres, pki, gpg, rpm-test]
+    deb:
+      services: [backend, postgres, pki, gpg, deb-test]
+    helm:
+      services: [backend, postgres, pki, helm-test]
+    conda:
+      services: [backend, postgres, pki, conda-test]
+    docker:
+      services: [backend, postgres, pki, registry, docker-test]
+
+  usage_examples:
+    - "docker compose -f docker-compose.test.yml up"  # runs smoke profile
+    - "docker compose -f docker-compose.test.yml --profile rpm up"
+    - "docker compose -f docker-compose.test.yml --profile all up"

@@ -10,13 +10,13 @@ test.describe('Repository Management', () => {
     await expect(page.getByText('Dashboard')).toBeVisible()
   })
 
-  test('should navigate to repositories page', async ({ page }) => {
+  test('@smoke should navigate to repositories page', async ({ page }) => {
     await page.getByRole('link', { name: 'Repositories' }).click()
     await expect(page).toHaveURL('/repositories')
     await expect(page.getByRole('heading', { name: 'Repositories' })).toBeVisible()
   })
 
-  test('should display repository list', async ({ page }) => {
+  test('@smoke should display repository list', async ({ page }) => {
     await page.goto('/repositories')
 
     // Should show table headers
@@ -26,7 +26,7 @@ test.describe('Repository Management', () => {
     await expect(page.getByRole('columnheader', { name: 'Type' })).toBeVisible()
   })
 
-  test('should open create repository modal', async ({ page }) => {
+  test('@full should open create repository modal', async ({ page }) => {
     await page.goto('/repositories')
 
     await page.getByRole('button', { name: 'Create Repository' }).click()
@@ -37,7 +37,7 @@ test.describe('Repository Management', () => {
     await expect(page.getByLabel('Format')).toBeVisible()
   })
 
-  test('should create new repository', async ({ page }) => {
+  test('@smoke should create new repository', async ({ page }) => {
     await page.goto('/repositories')
 
     await page.getByRole('button', { name: 'Create Repository' }).click()

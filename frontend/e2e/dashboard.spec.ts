@@ -10,55 +10,55 @@ test.describe('Dashboard', () => {
     await expect(page.getByText('Dashboard')).toBeVisible()
   })
 
-  test('should display dashboard heading', async ({ page }) => {
+  test('@smoke should display dashboard heading', async ({ page }) => {
     await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
   })
 
-  test('should show system health section', async ({ page }) => {
+  test('@smoke should show system health section', async ({ page }) => {
     await expect(page.getByText('System Health')).toBeVisible()
     await expect(page.getByText('Status')).toBeVisible()
     await expect(page.getByText('Database')).toBeVisible()
     await expect(page.getByText('Storage')).toBeVisible()
   })
 
-  test('should display admin statistics', async ({ page }) => {
+  test('@full should display admin statistics', async ({ page }) => {
     await expect(page.getByText('Repositories')).toBeVisible()
     await expect(page.getByText('Artifacts')).toBeVisible()
     await expect(page.getByText('Users')).toBeVisible()
     await expect(page.getByText('Total Storage')).toBeVisible()
   })
 
-  test('should display recent repositories table', async ({ page }) => {
+  test('@full should display recent repositories table', async ({ page }) => {
     await expect(page.getByText('Recent Repositories')).toBeVisible()
     await expect(page.getByText('View All')).toBeVisible()
   })
 
-  test('should navigate to repositories from View All link', async ({ page }) => {
+  test('@full should navigate to repositories from View All link', async ({ page }) => {
     await page.getByText('View All').click()
     await expect(page).toHaveURL('/repositories')
   })
 
-  test('should have refresh button', async ({ page }) => {
+  test('@full should have refresh button', async ({ page }) => {
     await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible()
   })
 
-  test('should refresh data when clicking refresh', async ({ page }) => {
+  test('@full should refresh data when clicking refresh', async ({ page }) => {
     await page.getByRole('button', { name: 'Refresh' }).click()
     // Button should show loading state briefly
     await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible()
   })
 
-  test('should navigate from stat card clicks', async ({ page }) => {
+  test('@full should navigate from stat card clicks', async ({ page }) => {
     // Click on Repositories stat card
     await page.locator('.ant-card').filter({ hasText: 'Repositories' }).first().click()
     await expect(page).toHaveURL('/repositories')
   })
 
-  test('should display healthy status with green color', async ({ page }) => {
+  test('@full should display healthy status with green color', async ({ page }) => {
     await expect(page.getByText('healthy')).toBeVisible()
   })
 
-  test('should show help modal from header', async ({ page }) => {
+  test('@full should show help modal from header', async ({ page }) => {
     // Click help button in header
     await page.locator('button').filter({ has: page.locator('[aria-label="question-circle"]') }).click()
 
@@ -67,7 +67,7 @@ test.describe('Dashboard', () => {
     await expect(page.getByText('Supported Formats')).toBeVisible()
   })
 
-  test('should close help modal', async ({ page }) => {
+  test('@full should close help modal', async ({ page }) => {
     // Open help modal
     await page.locator('button').filter({ has: page.locator('[aria-label="question-circle"]') }).click()
     await expect(page.getByText('About Artifact Keeper')).toBeVisible()
@@ -88,28 +88,28 @@ test.describe('Sidebar Navigation', () => {
     await expect(page.getByText('Dashboard')).toBeVisible()
   })
 
-  test('should display sidebar with all menu items', async ({ page }) => {
+  test('@smoke should display sidebar with all menu items', async ({ page }) => {
     await expect(page.getByRole('link', { name: 'Dashboard' })).toBeVisible()
     await expect(page.getByRole('link', { name: 'Repositories' })).toBeVisible()
     await expect(page.getByRole('link', { name: 'Users' })).toBeVisible()
     await expect(page.getByRole('link', { name: 'Settings' })).toBeVisible()
   })
 
-  test('should display version in sidebar footer', async ({ page }) => {
+  test('@full should display version in sidebar footer', async ({ page }) => {
     await expect(page.getByText('v1.0.0')).toBeVisible()
   })
 
-  test('should navigate to Users page', async ({ page }) => {
+  test('@full should navigate to Users page', async ({ page }) => {
     await page.getByRole('link', { name: 'Users' }).click()
     await expect(page).toHaveURL('/users')
   })
 
-  test('should navigate to Settings page', async ({ page }) => {
+  test('@full should navigate to Settings page', async ({ page }) => {
     await page.getByRole('link', { name: 'Settings' }).click()
     await expect(page).toHaveURL('/settings')
   })
 
-  test('should highlight active menu item', async ({ page }) => {
+  test('@full should highlight active menu item', async ({ page }) => {
     // Dashboard should be highlighted by default
     const dashboardLink = page.getByRole('link', { name: 'Dashboard' })
     await expect(dashboardLink).toHaveClass(/ant-menu-item-selected/)

@@ -8,14 +8,16 @@ test.describe('Authentication', () => {
     })
   })
 
-  test('should show login page when not authenticated', async ({ page }) => {
+  // @smoke - Core authentication flows
+  test('@smoke should show login page when not authenticated', async ({ page }) => {
     await page.goto('/')
     await expect(page).toHaveURL(/.*login/)
     await expect(page.getByText('Artifact Keeper')).toBeVisible()
     await expect(page.getByText('Artifact Registry')).toBeVisible()
   })
 
-  test('should login successfully with valid credentials', async ({ page }) => {
+  // @smoke - Core authentication flows
+  test('@smoke should login successfully with valid credentials', async ({ page }) => {
     await page.goto('/login')
 
     await page.getByPlaceholder('Username').fill('admin')
@@ -27,7 +29,8 @@ test.describe('Authentication', () => {
     await expect(page.getByText('Dashboard')).toBeVisible()
   })
 
-  test('should show error for invalid credentials', async ({ page }) => {
+  // @full - Extended authentication tests
+  test('@full should show error for invalid credentials', async ({ page }) => {
     await page.goto('/login')
 
     await page.getByPlaceholder('Username').fill('invalid')
@@ -38,7 +41,8 @@ test.describe('Authentication', () => {
     await expect(page.getByRole('alert')).toBeVisible()
   })
 
-  test('should show validation errors for empty fields', async ({ page }) => {
+  // @full - Extended authentication tests
+  test('@full should show validation errors for empty fields', async ({ page }) => {
     await page.goto('/login')
 
     await page.getByRole('button', { name: /log in/i }).click()
@@ -47,7 +51,8 @@ test.describe('Authentication', () => {
     await expect(page.getByText('Please input your password!')).toBeVisible()
   })
 
-  test('should logout successfully', async ({ page }) => {
+  // @smoke - Core authentication flows
+  test('@smoke should logout successfully', async ({ page }) => {
     // First login
     await page.goto('/login')
     await page.getByPlaceholder('Username').fill('admin')
@@ -65,7 +70,8 @@ test.describe('Authentication', () => {
     await expect(page).toHaveURL(/.*login/)
   })
 
-  test('should persist login across page refresh', async ({ page }) => {
+  // @full - Extended authentication tests
+  test('@full should persist login across page refresh', async ({ page }) => {
     // Login
     await page.goto('/login')
     await page.getByPlaceholder('Username').fill('admin')

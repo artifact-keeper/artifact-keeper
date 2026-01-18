@@ -1,0 +1,5 @@
+test-package (VERSION_PLACEHOLDER-1) unstable; urgency=low
+
+  * Initial test package release
+
+ -- Test Author <test@artifact-keeper.local>  Mon, 01 Jan 2024 00:00:00 +0000

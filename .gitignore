@@ -73,3 +73,10 @@ credentials/
 # Claude Code local config
 .claude/
 ARTIFACTORY_UI_UX_DEEP_DIVE.md
+
+# Test asset generation output (generated packages)
+.assets/generated/
+
+# PKI keys (generated for testing)
+.pki/*.key
+.pki/gpg-signing.key

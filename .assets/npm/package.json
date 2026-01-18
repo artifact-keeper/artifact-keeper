@@ -1,0 +1,16 @@
+{
+  "name": "@test/package",
+  "version": "VERSION_PLACEHOLDER",
+  "description": "Test package for E2E native client testing",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Test passed\" && exit 0"
+  },
+  "keywords": ["test", "e2e", "artifact-keeper"],
+  "author": "Test Author <test@artifact-keeper.local>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/artifact-keeper/test-package"
+  }
+}

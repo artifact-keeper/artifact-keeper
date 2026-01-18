@@ -1,0 +1,13 @@
+Source: test-package
+Section: misc
+Priority: optional
+Maintainer: Test Author <test@artifact-keeper.local>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+Homepage: https://github.com/artifact-keeper/test-package
+
+Package: test-package
+Architecture: all
+Depends: ${misc:Depends}
+Description: Test package for E2E native client testing
+ A test package for E2E native client testing of the Artifact Keeper registry.

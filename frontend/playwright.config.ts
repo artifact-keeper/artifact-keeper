@@ -3,6 +3,11 @@ import { defineConfig, devices } from '@playwright/test'
 // Use BASE_URL from environment (for Docker) or default to localhost
 const baseURL = process.env.BASE_URL || 'http://localhost:5173'
 
+// Support for @smoke and @full test tags via environment variable
+// Usage: TEST_TAG=@smoke npx playwright test
+// Usage: TEST_TAG=@full npx playwright test
+const testTag = process.env.TEST_TAG
+
 export default defineConfig({
   testDir: './e2e',
   globalSetup: './e2e/global-setup.ts',
@@ -12,6 +17,8 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: process.env.CI ? [['html', { open: 'never' }], ['list']] : 'html',
   outputDir: 'test-results',
+  // Filter tests by tag if TEST_TAG environment variable is set
+  grep: testTag ? new RegExp(testTag) : undefined,
   use: {
     baseURL,
     trace: 'on-first-retry',

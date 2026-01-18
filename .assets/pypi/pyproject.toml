@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "test-package"
+version = "VERSION_PLACEHOLDER"
+description = "Test package for E2E native client testing"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Test Author", email = "test@artifact-keeper.local"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+
+[project.urls]
+"Homepage" = "https://github.com/artifact-keeper/test-package"
+
+[tool.setuptools.packages.find]
+where = ["src"]

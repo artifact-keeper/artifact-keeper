@@ -1,0 +1,232 @@
+# Test Asset Templates Contract
+# Defines the structure and generation scripts for test packages
+#
+# All templates live in .assets/ directory at repository root
+
+version: "1.0"
+description: "Test package generation templates for native client testing"
+
+# ============================================================================
+# COMMON CONFIGURATION
+# ============================================================================
+
+common:
+  base_dir: ".assets"
+  output_dir: ".assets/generated"  # gitignored
+
+  size_tiers:
+    small:
+      max_bytes: 1048576  # 1MB
+      data_file: null
+    medium:
+      max_bytes: 10485760  # 10MB
+      data_file:
+        name: "data.bin"
+        size: 10485760
+        source: "/dev/urandom"
+    large:
+      max_bytes: 104857600  # 100MB
+      data_file:
+        name: "data.bin"
+        size: 104857600
+        source: "/dev/urandom"
+
+# ============================================================================
+# PACKAGE TEMPLATES
+# ============================================================================
+
+templates:
+  pypi:
+    directory: ".assets/pypi"
+    files:
+      - pyproject.toml
+      - src/test_package/__init__.py
+      - README.md
+    generate_script: "generate.sh"
+    build_command: "python -m build"
+    output_pattern: "dist/*.whl"
+    client:
+      push: "twine upload --repository-url $REGISTRY_URL dist/*"
+      pull: "pip install --index-url $REGISTRY_URL test-package"
+
+  npm:
+    directory: ".assets/npm"
+    files:
+      - package.json
+      - index.js
+      - README.md
+    generate_script: "generate.sh"
+    build_command: "npm pack"
+    output_pattern: "*.tgz"
+    client:
+      push: "npm publish --registry $REGISTRY_URL"
+      pull: "npm install --registry $REGISTRY_URL test-package"
+
+  cargo:
+    directory: ".assets/cargo"
+    files:
+      - Cargo.toml
+      - src/lib.rs
+    generate_script: "generate.sh"
+    build_command: "cargo package"
+    output_pattern: "target/package/*.crate"
+    client:
+      push: "cargo publish --registry $REGISTRY_NAME"
+      pull: "cargo install --registry $REGISTRY_NAME test-package"
+
+  maven:
+    directory: ".assets/maven"
+    files:
+      - pom.xml
+      - src/main/java/com/test/TestClass.java
+    generate_script: "generate.sh"
+    build_command: "mvn package"
+    output_pattern: "target/*.jar"
+    client:
+      push: "mvn deploy -DaltDeploymentRepository=test::default::$REGISTRY_URL"
+      pull: "mvn dependency:get -DremoteRepositories=$REGISTRY_URL -Dartifact=com.test:test-package:1.0.0"
+
+  go:
+    directory: ".assets/go"
+    files:
+      - go.mod
+      - main.go
+    generate_script: "generate.sh"
+    build_command: "go mod tidy && zip -r module.zip ."
+    output_pattern: "*.zip"
+    client:
+      push: "curl -X PUT $REGISTRY_URL/test-package/@v/v1.0.0.zip -T module.zip"
+      pull: "GOPROXY=$REGISTRY_URL go get test-package@v1.0.0"
+
+  rpm:
+    directory: ".assets/rpm"
+    files:
+      - test-package.spec
+      - SOURCES/test-file.txt
+    generate_script: "generate.sh"
+    build_command: "rpmbuild -bb test-package.spec"
+    output_pattern: "RPMS/**/*.rpm"
+    signing: "rpmsign --addsign --key-id='$GPG_KEY_ID'"
+    client:
+      push: "curl -X PUT $REGISTRY_URL/test-package-1.0.0.rpm -T package.rpm"
+      pull: "dnf install -y --repo=test-repo test-package"
+    container:
+      image: "rockylinux/rockylinux:9-ubi"
+      setup:
+        - "dnf install -y rpm-build rpm-sign"
+
+  deb:
+    directory: ".assets/debian"
+    files:
+      - debian/control
+      - debian/changelog
+      - debian/rules
+      - debian/compat
+      - src/test-file.txt
+    generate_script: "generate.sh"
+    build_command: "dpkg-buildpackage -us -uc"
+    output_pattern: "../*.deb"
+    signing: "dpkg-sig --sign builder -k '$GPG_KEY_ID'"
+    client:
+      push: "curl -X PUT $REGISTRY_URL/test-package_1.0.0_amd64.deb -T package.deb"
+      pull: "apt install -y test-package"
+    container:
+      image: "debian:bookworm-slim"
+      setup:
+        - "apt update && apt install -y build-essential dpkg-sig"
+
+  helm:
+    directory: ".assets/helm"
+    files:
+      - Chart.yaml
+      - values.yaml
+      - templates/deployment.yaml
+    generate_script: "generate.sh"
+    build_command: "helm package ."
+    output_pattern: "*.tgz"
+    client:
+      push: "helm push test-chart-1.0.0.tgz oci://$REGISTRY_URL"
+      pull: "helm pull oci://$REGISTRY_URL/test-chart --version 1.0.0"
+
+  conda:
+    directory: ".assets/conda"
+    files:
+      - meta.yaml
+      - build.sh
+    generate_script: "generate.sh"
+    build_command: "conda build ."
+    output_pattern: "output/**/*.tar.bz2"
+    client:
+      push: "anaconda upload -u test-channel output/*.tar.bz2"
+      pull: "conda install -c $REGISTRY_URL test-package"
+    container:
+      image: "continuumio/miniconda3"
+      setup:
+        - "conda install -y conda-build anaconda-client"
+
+  docker:
+    directory: ".assets/docker"
+    files:
+      - Dockerfile
+      - entrypoint.sh
+    generate_script: "generate.sh"
+    build_command: "docker build -t test-image:$VERSION ."
+    output_pattern: null  # Docker images aren't files
+    client:
+      push: "docker push $REGISTRY_URL/test-image:$VERSION"
+      pull: "docker pull $REGISTRY_URL/test-image:$VERSION"
+
+# ============================================================================
+# GENERATION SCRIPT CONTRACT
+# ============================================================================
+
+generate_script_contract:
+  description: "All generate.sh scripts must follow this interface"
+
+  arguments:
+    - name: "size_tier"
+      type: "string"
+      values: ["small", "medium", "large"]
+      default: "small"
+    - name: "version"
+      type: "string"
+      default: "1.0.0"
+    - name: "output_dir"
+      type: "string"
+      default: "../generated"
+
+  environment:
+    GPG_KEY_ID: "Test GPG key ID for signing (RPM/Debian)"
+    REGISTRY_URL: "Target registry URL for push commands"
+
+  exit_codes:
+    0: "Success"
+    1: "Build failure"
+    2: "Invalid arguments"
+
+  example: |
+    #!/bin/bash
+    set -euo pipefail
+
+    SIZE_TIER=${1:-small}
+    VERSION=${2:-1.0.0}
+    OUTPUT_DIR=${3:-../generated}
+
+    # Create data file based on size tier
+    case $SIZE_TIER in
+      small)  DATA_SIZE=0 ;;
+      medium) dd if=/dev/urandom of=data.bin bs=1M count=10 2>/dev/null ;;
+      large)  dd if=/dev/urandom of=data.bin bs=1M count=100 2>/dev/null ;;
+    esac
+
+    # Update version in manifest
+    sed -i "s/VERSION_PLACEHOLDER/$VERSION/" pyproject.toml
+
+    # Build package
+    python -m build
+
+    # Move to output
+    mkdir -p "$OUTPUT_DIR/pypi"
+    mv dist/* "$OUTPUT_DIR/pypi/"
+
+    echo "Generated PyPI package: $OUTPUT_DIR/pypi/"
