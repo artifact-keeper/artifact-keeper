@@ -35,13 +35,13 @@ pub async fn heartbeat_loop(state: Arc<EdgeState>) {
             Err(e) => {
                 tracing::warn!("Heartbeat failed: {}", e);
                 // Check if this is a connectivity error
-                if is_heartbeat_connectivity_error(&e) {
-                    if !state.is_offline.load(Ordering::SeqCst) {
-                        state.is_offline.store(true, Ordering::SeqCst);
-                        tracing::warn!(
-                            "Heartbeat connectivity failure - transitioning to offline mode"
-                        );
-                    }
+                if is_heartbeat_connectivity_error(&e)
+                    && !state.is_offline.load(Ordering::SeqCst)
+                {
+                    state.is_offline.store(true, Ordering::SeqCst);
+                    tracing::warn!(
+                        "Heartbeat connectivity failure - transitioning to offline mode"
+                    );
                 }
             }
         }
