@@ -148,7 +148,7 @@ export const MigrationItemsList: React.FC<MigrationItemsListProps> = ({
     return () => clearInterval(interval);
   }, [autoRefresh, refreshInterval, pagination.current, pagination.pageSize]);
 
-  const handleTableChange = (newPagination: any) => {
+  const handleTableChange = (newPagination: { current?: number; pageSize?: number }) => {
     loadItems(newPagination.current, newPagination.pageSize);
   };
 
