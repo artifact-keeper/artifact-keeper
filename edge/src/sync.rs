@@ -51,9 +51,7 @@ pub async fn heartbeat_loop(state: Arc<EdgeState>) {
 /// Check if a heartbeat error indicates a connectivity problem.
 fn is_heartbeat_connectivity_error(err: &anyhow::Error) -> bool {
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
-        return reqwest_err.is_connect()
-            || reqwest_err.is_timeout()
-            || reqwest_err.is_request();
+        return reqwest_err.is_connect() || reqwest_err.is_timeout() || reqwest_err.is_request();
     }
     let msg = err.to_string().to_lowercase();
     msg.contains("connection refused")
@@ -63,10 +61,7 @@ fn is_heartbeat_connectivity_error(err: &anyhow::Error) -> bool {
         || msg.contains("dns")
 }
 
-async fn send_heartbeat(
-    client: &reqwest::Client,
-    state: &EdgeState,
-) -> anyhow::Result<()> {
+async fn send_heartbeat(client: &reqwest::Client, state: &EdgeState) -> anyhow::Result<()> {
     let url = format!("{}/api/v1/edge-nodes/heartbeat", state.primary_url);
 
     let is_offline = state.is_offline.load(Ordering::SeqCst);

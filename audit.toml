@@ -1,0 +1,15 @@
+# Configuration for cargo-audit
+# See https://github.com/rustsec/rustsec/tree/main/cargo-audit
+
+[advisories]
+# List of advisory IDs to ignore
+ignore = [
+    # rsa 0.9.10 - Marvin Attack timing sidechannel
+    # No fix available upstream. This is a transitive dependency from sqlx-mysql
+    # which we don't use (we use postgres). The vulnerability requires:
+    # 1. An attacker to have network access to the server
+    # 2. Ability to measure timing differences with high precision
+    # 3. The server to be using RSA for authentication
+    # Risk is low for our use case as we don't use MySQL or RSA authentication.
+    "RUSTSEC-2023-0071",
+]
