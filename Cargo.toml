@@ -66,7 +66,11 @@ serde_urlencoded = "0.7"
 # Async streams
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
 bytes = "1.5"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
 wasmtime = { version = "21", features = ["component-model", "async"] }

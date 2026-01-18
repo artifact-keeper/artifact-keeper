@@ -66,10 +66,15 @@ serde_urlencoded.workspace = true
 # Async streams
 futures.workspace = true
 tokio-util.workspace = true
+tokio-stream.workspace = true
 bytes.workspace = true
+
+# CLI
+clap.workspace = true
 
 # Additional
 async-trait = "0.1"
+async-stream = "0.3"
 hex = "0.4"
 rand = "0.9"
 
@@ -95,6 +100,9 @@ base64 = "0.22"
 
 # Temp files
 tempfile = "3.16"
+
+# Directory walking
+walkdir = "2.5"
 
 [dev-dependencies]
 tokio-test = "0.4"

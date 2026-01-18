@@ -14,6 +14,7 @@ import {
   LockOutlined,
   SettingOutlined,
   ApiOutlined,
+  SwapOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
 } from '@ant-design/icons'
@@ -99,6 +100,11 @@ const AppSidebar = () => {
         key: '/permissions',
         icon: <LockOutlined />,
         label: <Link to="/permissions">Permissions</Link>,
+      },
+      {
+        key: '/migration',
+        icon: <SwapOutlined />,
+        label: <Link to="/migration">Migration</Link>,
       },
       {
         key: '/settings',

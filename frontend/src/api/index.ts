@@ -4,6 +4,7 @@ export { default as repositoriesApi } from './repositories';
 export { default as artifactsApi } from './artifacts';
 export { default as adminApi } from './admin';
 export { default as groupsApi } from './groups';
+export { default as migrationApi } from './migration';
 export { default as permissionsApi } from './permissions';
 export { default as packagesApi } from './packages';
 export { default as buildsApi } from './builds';

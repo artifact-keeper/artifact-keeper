@@ -21,6 +21,7 @@ import Profile from './pages/Profile'
 import Search from './pages/Search'
 import Groups from './pages/admin/Groups'
 import Permissions from './pages/admin/Permissions'
+import Migration from './pages/admin/Migration'
 import Packages from './pages/Packages'
 import Builds from './pages/Builds'
 import SetupWizards from './pages/SetupWizards'
@@ -78,6 +79,7 @@ function AppContent() {
             <Route path="/users" element={<Users />} />
             <Route path="/groups" element={<Groups />} />
             <Route path="/permissions" element={<Permissions />} />
+            <Route path="/migration" element={<Migration />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/profile" element={<Profile />} />
             <Route path="/search" element={<Search />} />

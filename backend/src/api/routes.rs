@@ -150,6 +150,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
             "/webhooks",
             handlers::webhooks::router()
                 .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                ))
+        )
+        // Migration routes with auth middleware
+        .nest(
+            "/migrations",
+            handlers::migration::router()
+                .layer(middleware::from_fn_with_state(
                     auth_service,
                     auth_middleware,
                 ))

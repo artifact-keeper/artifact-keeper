@@ -3,6 +3,7 @@
 //! Open-source artifact registry supporting 13+ package formats.
 
 pub mod api;
+pub mod cli;
 pub mod config;
 pub mod db;
 pub mod error;

@@ -7,6 +7,7 @@ pub mod builds;
 pub mod edge;
 pub mod groups;
 pub mod health;
+pub mod migration;
 pub mod packages;
 pub mod permissions;
 pub mod plugins;

@@ -2,6 +2,7 @@
 
 // Re-export all type modules
 export * from './groups';
+export * from './migration';
 export * from './permissions';
 export * from './packages';
 export * from './builds';
