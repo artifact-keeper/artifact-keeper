@@ -9,6 +9,8 @@
 //! cargo test --test integration_tests
 //! ```
 
+#![allow(dead_code)]
+
 use std::env;
 use std::sync::Once;
 
