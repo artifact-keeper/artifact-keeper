@@ -598,7 +598,8 @@ impl MigrationService {
         .fetch_one(&self.db)
         .await?;
 
-        let (_total_items, _completed, _failed, _skipped, transferred, started_at, finished_at) = job;
+        let (_total_items, _completed, _failed, _skipped, transferred, started_at, finished_at) =
+            job;
 
         let duration = match (started_at, finished_at) {
             (Some(start), Some(end)) => end.signed_duration_since(start).num_seconds(),
