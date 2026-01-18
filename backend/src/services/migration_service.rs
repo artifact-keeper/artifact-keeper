@@ -6,7 +6,7 @@
 
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::{debug, error, info, instrument, warn, Span};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::models::migration::{MigrationItemType, MigrationJobStatus};
