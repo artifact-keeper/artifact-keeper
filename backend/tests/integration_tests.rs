@@ -1,13 +1,16 @@
 //! Integration tests for artifact registry backend.
 //!
-//! These tests require a running PostgreSQL database.
-//! Set the TEST_DATABASE_URL environment variable to run them.
+//! These tests require a running backend HTTP server.
+//! Set the TEST_BASE_URL environment variable to specify the server URL.
 //!
 //! Example:
 //! ```sh
-//! export TEST_DATABASE_URL="postgresql://registry:registry@localhost:5432/artifact_registry_test"
-//! cargo test --test integration_tests
+//! export TEST_BASE_URL="http://127.0.0.1:9080"
+//! cargo test --test integration_tests -- --ignored
 //! ```
+//!
+//! Note: These tests are marked with #[ignore] because they require
+//! a running HTTP server. In CI, run them separately with a service container.
 
 #![allow(dead_code)]
 
@@ -343,6 +346,7 @@ mod tests {
     // ============= Health Check Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_health_check() {
         let server = TestServer::new();
         let client = Client::new();
@@ -360,6 +364,7 @@ mod tests {
     // ============= Authentication Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_login() {
         let mut server = TestServer::new();
         let result = server.login().await;
@@ -371,6 +376,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_login_invalid_credentials() {
         let server = TestServer::new();
         let client = Client::new();
@@ -390,6 +396,7 @@ mod tests {
     // ============= Maven Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_maven_artifact_lifecycle() {
         let server = get_server().await;
         let repo_key = "maven-test";
@@ -433,6 +440,7 @@ mod tests {
     // ============= PyPI Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_pypi_artifact_lifecycle() {
         let server = get_server().await;
         let repo_key = "pypi-test";
@@ -469,6 +477,7 @@ mod tests {
     // ============= NPM Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_npm_artifact_lifecycle() {
         let server = get_server().await;
         let repo_key = "npm-test";
@@ -501,6 +510,7 @@ mod tests {
     // ============= Docker Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_docker_manifest_lifecycle() {
         let server = get_server().await;
         let repo_key = "docker-test";
@@ -537,6 +547,7 @@ mod tests {
     // ============= Helm Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_helm_chart_lifecycle() {
         let server = get_server().await;
         let repo_key = "helm-test";
@@ -569,6 +580,7 @@ mod tests {
     // ============= RPM Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_rpm_package_lifecycle() {
         let server = get_server().await;
         let repo_key = "rpm-test";
@@ -605,6 +617,7 @@ mod tests {
     // ============= Debian Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_deb_package_lifecycle() {
         let server = get_server().await;
         let repo_key = "deb-test";
@@ -641,6 +654,7 @@ mod tests {
     // ============= Go Module Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_go_module_lifecycle() {
         let server = get_server().await;
         let repo_key = "go-test";
@@ -672,6 +686,7 @@ mod tests {
     // ============= NuGet Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_nuget_package_lifecycle() {
         let server = get_server().await;
         let repo_key = "nuget-test";
@@ -708,6 +723,7 @@ mod tests {
     // ============= RubyGems Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_rubygems_lifecycle() {
         let server = get_server().await;
         let repo_key = "rubygems-test";
@@ -740,6 +756,7 @@ mod tests {
     // ============= Conan Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_conan_package_lifecycle() {
         let server = get_server().await;
         let repo_key = "conan-test";
@@ -771,6 +788,7 @@ mod tests {
     // ============= Cargo Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_cargo_crate_lifecycle() {
         let server = get_server().await;
         let repo_key = "cargo-test";
@@ -807,6 +825,7 @@ mod tests {
     // ============= Generic Repository Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_generic_artifact_lifecycle() {
         let server = get_server().await;
         let repo_key = "generic-test";
@@ -851,6 +870,7 @@ mod tests {
     // ============= Search Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_search_artifacts() {
         let server = get_server().await;
         let client = Client::new();
@@ -871,6 +891,7 @@ mod tests {
     // ============= Repository List Tests =============
 
     #[tokio::test]
+    #[ignore = "requires running HTTP server"]
     async fn test_list_repositories() {
         let server = get_server().await;
         let client = Client::new();
