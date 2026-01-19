@@ -40,8 +40,8 @@ RUN useradd -r -s /bin/false artifact
 # Copy binary from builder
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
 
-# Create data directories
-RUN mkdir -p /data/storage /data/backups && chown -R artifact:artifact /data
+# Create data directories (storage, backups, plugins)
+RUN mkdir -p /data/storage /data/backups /data/plugins && chown -R artifact:artifact /data
 
 # Switch to non-root user
 USER artifact

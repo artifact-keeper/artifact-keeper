@@ -11,6 +11,8 @@ Auto-generated from all feature plans. Last updated: 2026-01-14
 - PostgreSQL (migration job state), existing Artifact Keeper storage (migrated artifacts) (004-artifactory-migration)
 - Rust 1.75+ (backend), TypeScript 5.3 (frontend), Bash/YAML (CI workflows) + GitHub Actions, Docker Compose, Playwright, Vitest, Cargo test, axum-test (005-staged-testing-ci)
 - PostgreSQL (test database), local filesystem (test artifacts) (005-staged-testing-ci)
+- TypeScript 5.3 + Playwright 1.41+, React 19.x, Ant Design 6.x (006-ui-e2e-coverage)
+- N/A (E2E tests interact with running backend via HTTP) (006-ui-e2e-coverage)
 
 - Rust 1.75+ (backend), TypeScript 5.x (frontend) (001-artifact-registry)
 
@@ -94,9 +96,9 @@ gh workflow run e2e.yml -f profile=all -f include_stress=true
 Rust 1.75+ (backend), TypeScript 5.x (frontend): Follow standard conventions
 
 ## Recent Changes
+- 006-ui-e2e-coverage: Added TypeScript 5.3 + Playwright 1.41+, React 19.x, Ant Design 6.x
 - 005-staged-testing-ci: Added Rust 1.75+ (backend), TypeScript 5.3 (frontend), Bash/YAML (CI workflows) + GitHub Actions, Docker Compose, Playwright, Vitest, Cargo test, axum-test
 - 004-artifactory-migration: Added Rust 1.75+ (backend), TypeScript 5.x (frontend) + axum, sqlx, tokio, reqwest (backend); React 19, Ant Design 6, TanStack Query 5 (frontend)
-- 003-frontend-ui-parity: Added TypeScript 5.3, React 19.x + Ant Design 6.x, React Router 7.x, TanStack Query 5.x, Axios
 
 
 <!-- MANUAL ADDITIONS START -->
