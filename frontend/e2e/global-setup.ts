@@ -1,15 +1,106 @@
 /**
  * Global setup for E2E tests
  * Seeds the database with test data via API calls
+ * Cleans up stale E2E test data before seeding
  */
 
+import { TEST_PATTERNS } from './fixtures/test-data';
+
 const BASE_URL = process.env.BASE_URL || 'http://localhost:5173';
+const API_URL = process.env.API_URL || 'http://localhost:8080';
+
+/**
+ * Clean up stale E2E test resources before running tests
+ */
+async function cleanupStaleTestData(authHeaders: Record<string, string>): Promise<void> {
+  console.log('🧹 Cleaning up stale E2E test data...');
+
+  // Clean up repositories with E2E prefix
+  try {
+    const reposResponse = await fetch(`${API_URL}/api/v1/repositories`, {
+      headers: authHeaders,
+    });
+
+    if (reposResponse.ok) {
+      const data = await reposResponse.json();
+      const repos = data.items || data || [];
+
+      for (const repo of repos) {
+        if (repo.key?.startsWith(TEST_PATTERNS.repoKeyPrefix)) {
+          const deleteResponse = await fetch(
+            `${API_URL}/api/v1/repositories/${repo.key}`,
+            { method: 'DELETE', headers: authHeaders }
+          );
+          if (deleteResponse.ok) {
+            console.log(`  🗑️  Deleted stale repo: ${repo.key}`);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('  ⚠️  Failed to clean up repositories:', error);
+  }
+
+  // Clean up users with E2E prefix
+  try {
+    const usersResponse = await fetch(`${API_URL}/api/v1/users`, {
+      headers: authHeaders,
+    });
+
+    if (usersResponse.ok) {
+      const data = await usersResponse.json();
+      const users = data.items || data || [];
+
+      for (const user of users) {
+        if (user.username?.startsWith(TEST_PATTERNS.userPrefix)) {
+          const deleteResponse = await fetch(
+            `${API_URL}/api/v1/users/${user.username}`,
+            { method: 'DELETE', headers: authHeaders }
+          );
+          if (deleteResponse.ok) {
+            console.log(`  🗑️  Deleted stale user: ${user.username}`);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('  ⚠️  Failed to clean up users:', error);
+  }
+
+  // Clean up groups with E2E prefix
+  try {
+    const groupsResponse = await fetch(`${API_URL}/api/v1/groups`, {
+      headers: authHeaders,
+    });
+
+    if (groupsResponse.ok) {
+      const data = await groupsResponse.json();
+      const groups = data.items || data || [];
+
+      for (const group of groups) {
+        if (group.name?.startsWith(TEST_PATTERNS.groupPrefix)) {
+          const deleteResponse = await fetch(
+            `${API_URL}/api/v1/groups/${group.name}`,
+            { method: 'DELETE', headers: authHeaders }
+          );
+          if (deleteResponse.ok) {
+            console.log(`  🗑️  Deleted stale group: ${group.name}`);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('  ⚠️  Failed to clean up groups:', error);
+  }
+
+  console.log('🧹 Cleanup complete!');
+}
 
 async function globalSetup() {
-  console.log('🌱 Seeding test data...');
+  console.log('🌱 Starting E2E test setup...');
 
-  // Login to get auth token
-  const loginResponse = await fetch(`${BASE_URL}/api/v1/auth/login`, {
+  // Login to get auth token (use API_URL for direct backend calls)
+  const loginResponse = await fetch(`${API_URL}/api/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username: 'admin', password: 'admin123' }),
@@ -26,6 +117,11 @@ async function globalSetup() {
     'Authorization': `Bearer ${access_token}`,
   };
 
+  // Clean up stale test data first
+  await cleanupStaleTestData(authHeaders);
+
+  console.log('🌱 Seeding test data...');
+
   // Create test repositories
   const repositories = [
     { key: 'maven-releases', name: 'Maven Releases', description: 'Maven release artifacts', format: 'maven', repo_type: 'local', is_public: false },
@@ -36,7 +132,7 @@ async function globalSetup() {
   ];
 
   for (const repo of repositories) {
-    const response = await fetch(`${BASE_URL}/api/v1/repositories`, {
+    const response = await fetch(`${API_URL}/api/v1/repositories`, {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify(repo),
@@ -60,7 +156,7 @@ async function globalSetup() {
   ];
 
   for (const artifact of testArtifacts) {
-    const response = await fetch(`${BASE_URL}/api/v1/repositories/${artifact.repo}/artifacts/${artifact.path}`, {
+    const response = await fetch(`${API_URL}/api/v1/repositories/${artifact.repo}/artifacts/${artifact.path}`, {
       method: 'PUT',
       headers: {
         ...authHeaders,

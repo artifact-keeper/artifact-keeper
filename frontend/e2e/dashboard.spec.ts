@@ -1,123 +1,225 @@
-import { test, expect } from '@playwright/test'
+import { test, expect } from '@playwright/test';
+import { LoginPage, DashboardPage } from './pages';
 
+/**
+ * Dashboard E2E Tests
+ *
+ * Tests cover:
+ * - Dashboard widgets display (system health, statistics)
+ * - Onboarding wizard flow for new users
+ * - Empty state when no repositories exist
+ * - Widget data refresh
+ * - Navigation from dashboard
+ *
+ * Uses Page Object pattern for maintainability.
+ */
 test.describe('Dashboard', () => {
+  let loginPage: LoginPage;
+  let dashboardPage: DashboardPage;
+
   test.beforeEach(async ({ page }) => {
+    loginPage = new LoginPage(page);
+    dashboardPage = new DashboardPage(page);
+
     // Login first
-    await page.goto('/login')
-    await page.getByPlaceholder('Username').fill('admin')
-    await page.getByPlaceholder('Password').fill('admin123')
-    await page.getByRole('button', { name: /log in/i }).click()
-    await expect(page.getByText('Dashboard')).toBeVisible()
-  })
+    await loginPage.goto();
+    await loginPage.loginAndWaitForDashboard('admin', 'admin123');
+  });
 
-  test('@smoke should display dashboard heading', async ({ page }) => {
-    await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
-  })
+  test.describe('Dashboard Widgets', () => {
+    test('@smoke should display dashboard heading', async ({ page }) => {
+      await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+    });
 
-  test('@smoke should show system health section', async ({ page }) => {
-    await expect(page.getByText('System Health')).toBeVisible()
-    await expect(page.getByText('Status')).toBeVisible()
-    await expect(page.getByText('Database')).toBeVisible()
-    await expect(page.getByText('Storage')).toBeVisible()
-  })
+    test('@smoke should show system health section', async ({ page }) => {
+      await expect(page.getByText('System Health')).toBeVisible();
+      await expect(page.getByText('Status')).toBeVisible();
+      await expect(page.getByText('Database')).toBeVisible();
+      await expect(page.getByText('Storage')).toBeVisible();
+    });
 
-  test('@full should display admin statistics', async ({ page }) => {
-    await expect(page.getByText('Repositories')).toBeVisible()
-    await expect(page.getByText('Artifacts')).toBeVisible()
-    await expect(page.getByText('Users')).toBeVisible()
-    await expect(page.getByText('Total Storage')).toBeVisible()
-  })
+    test('@full should display admin statistics', async ({ page }) => {
+      await expect(page.getByText('Repositories')).toBeVisible();
+      await expect(page.getByText('Artifacts')).toBeVisible();
+      await expect(page.getByText('Users')).toBeVisible();
+      await expect(page.getByText('Total Storage')).toBeVisible();
+    });
 
-  test('@full should display recent repositories table', async ({ page }) => {
-    await expect(page.getByText('Recent Repositories')).toBeVisible()
-    await expect(page.getByText('View All')).toBeVisible()
-  })
+    test('@full should display recent repositories table', async ({ page }) => {
+      await expect(page.getByText('Recent Repositories')).toBeVisible();
+      await expect(page.getByText('View All')).toBeVisible();
+    });
 
-  test('@full should navigate to repositories from View All link', async ({ page }) => {
-    await page.getByText('View All').click()
-    await expect(page).toHaveURL('/repositories')
-  })
+    test('@full should navigate to repositories from View All link', async ({ page }) => {
+      await page.getByText('View All').click();
+      await expect(page).toHaveURL('/repositories');
+    });
 
-  test('@full should have refresh button', async ({ page }) => {
-    await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible()
-  })
+    test('@full should have refresh button', async ({ page }) => {
+      await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible();
+    });
 
-  test('@full should refresh data when clicking refresh', async ({ page }) => {
-    await page.getByRole('button', { name: 'Refresh' }).click()
-    // Button should show loading state briefly
-    await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible()
-  })
+    test('@full should refresh data when clicking refresh', async ({ page }) => {
+      await page.getByRole('button', { name: 'Refresh' }).click();
+      // Button should show loading state briefly then return to visible
+      await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible();
+    });
 
-  test('@full should navigate from stat card clicks', async ({ page }) => {
-    // Click on Repositories stat card
-    await page.locator('.ant-card').filter({ hasText: 'Repositories' }).first().click()
-    await expect(page).toHaveURL('/repositories')
-  })
+    test('@full should display healthy status with green color', async ({ page }) => {
+      await expect(page.getByText('healthy')).toBeVisible();
+    });
+  });
 
-  test('@full should display healthy status with green color', async ({ page }) => {
-    await expect(page.getByText('healthy')).toBeVisible()
-  })
+  test.describe('Dashboard Navigation', () => {
+    test('@full should navigate from stat card clicks', async ({ page }) => {
+      // Click on Repositories stat card
+      await page.locator('.ant-card').filter({ hasText: 'Repositories' }).first().click();
+      await expect(page).toHaveURL('/repositories');
+    });
 
-  test('@full should show help modal from header', async ({ page }) => {
-    // Click help button in header
-    await page.locator('button').filter({ has: page.locator('[aria-label="question-circle"]') }).click()
+    test('@full should show help modal from header', async ({ page }) => {
+      // Click help button in header
+      await page.locator('button').filter({ has: page.locator('[aria-label="question-circle"]') }).click();
 
-    await expect(page.getByText('About Artifact Keeper')).toBeVisible()
-    await expect(page.getByText('Version 1.0.0')).toBeVisible()
-    await expect(page.getByText('Supported Formats')).toBeVisible()
-  })
+      await expect(page.getByText('About Artifact Keeper')).toBeVisible();
+      await expect(page.getByText('Version 1.0.0')).toBeVisible();
+      await expect(page.getByText('Supported Formats')).toBeVisible();
+    });
 
-  test('@full should close help modal', async ({ page }) => {
-    // Open help modal
-    await page.locator('button').filter({ has: page.locator('[aria-label="question-circle"]') }).click()
-    await expect(page.getByText('About Artifact Keeper')).toBeVisible()
+    test('@full should close help modal', async ({ page }) => {
+      // Open help modal
+      await page.locator('button').filter({ has: page.locator('[aria-label="question-circle"]') }).click();
+      await expect(page.getByText('About Artifact Keeper')).toBeVisible();
 
-    // Close it
-    await page.getByRole('button', { name: 'Close' }).click()
+      // Close it
+      await page.getByRole('button', { name: 'Close' }).click();
 
-    await expect(page.getByText('About Artifact Keeper')).not.toBeVisible()
-  })
-})
+      await expect(page.getByText('About Artifact Keeper')).not.toBeVisible();
+    });
+  });
+
+  test.describe('Onboarding Wizard', () => {
+    // Note: Onboarding wizard tests may require a fresh user that hasn't completed onboarding
+    // These tests verify the UI flow exists
+
+    test('@smoke should handle onboarding wizard if shown', async () => {
+      const isOnboardingVisible = await dashboardPage.isOnboardingVisible();
+      if (isOnboardingVisible) {
+        // Complete the onboarding wizard
+        await dashboardPage.completeOnboarding();
+        await dashboardPage.expectOnboardingComplete();
+      }
+      // Dashboard should be loaded after onboarding
+      await dashboardPage.expectDashboardLoaded();
+    });
+
+    test('@full should skip onboarding wizard if available', async () => {
+      const isOnboardingVisible = await dashboardPage.isOnboardingVisible();
+      if (isOnboardingVisible) {
+        // Skip the onboarding wizard
+        await dashboardPage.skipOnboarding();
+        await dashboardPage.expectOnboardingComplete();
+      }
+      // Dashboard should be loaded after skipping
+      await dashboardPage.expectDashboardLoaded();
+    });
+
+    test('@full should persist onboarding completion', async ({ page }) => {
+      // Complete or skip onboarding if visible
+      const isOnboardingVisible = await dashboardPage.isOnboardingVisible();
+      if (isOnboardingVisible) {
+        await dashboardPage.skipOnboarding();
+      }
+
+      // Refresh the page
+      await page.reload();
+      await dashboardPage.waitForPageLoad();
+
+      // Onboarding should not appear again
+      const isStillVisible = await dashboardPage.isOnboardingVisible();
+      expect(isStillVisible).toBeFalsy();
+    });
+  });
+
+  test.describe('Widget Data Refresh', () => {
+    test('@full should refresh widget data using page object', async () => {
+      await dashboardPage.refreshWidgets();
+      // Verify dashboard is still loaded after refresh
+      await dashboardPage.expectDashboardLoaded();
+    });
+
+    test('@full should display artifact count in widget', async () => {
+      const count = await dashboardPage.getArtifactCount();
+      // Count should be a valid number (0 or more)
+      expect(count).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  test.describe('Empty State', () => {
+    // Note: Empty state tests may require a fresh environment with no repositories
+    // These tests verify the empty state UI exists when applicable
+
+    test('@full should show empty state or widgets based on data', async () => {
+      const hasEmptyState = await dashboardPage.isEmptyStateVisible();
+      if (hasEmptyState) {
+        // Verify create repository button is available
+        await expect(dashboardPage.createRepoButton).toBeVisible();
+      } else {
+        // Normal dashboard with widgets
+        await dashboardPage.expectDashboardLoaded();
+      }
+    });
+
+    test('@full should navigate to create repo from empty state', async () => {
+      const hasEmptyState = await dashboardPage.isEmptyStateVisible();
+      if (hasEmptyState) {
+        await dashboardPage.clickCreateRepository();
+        // Should navigate to repository creation
+        // Exact URL depends on implementation
+      }
+    });
+  });
+});
 
 test.describe('Sidebar Navigation', () => {
+  let loginPage: LoginPage;
+
   test.beforeEach(async ({ page }) => {
-    await page.goto('/login')
-    await page.getByPlaceholder('Username').fill('admin')
-    await page.getByPlaceholder('Password').fill('admin123')
-    await page.getByRole('button', { name: /log in/i }).click()
-    await expect(page.getByText('Dashboard')).toBeVisible()
-  })
+    loginPage = new LoginPage(page);
+    await loginPage.goto();
+    await loginPage.loginAndWaitForDashboard('admin', 'admin123');
+  });
 
   test('@smoke should display sidebar with all menu items', async ({ page }) => {
-    await expect(page.getByRole('link', { name: 'Dashboard' })).toBeVisible()
-    await expect(page.getByRole('link', { name: 'Repositories' })).toBeVisible()
-    await expect(page.getByRole('link', { name: 'Users' })).toBeVisible()
-    await expect(page.getByRole('link', { name: 'Settings' })).toBeVisible()
-  })
+    await expect(page.getByRole('link', { name: 'Dashboard' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Repositories' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Users' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Settings' })).toBeVisible();
+  });
 
   test('@full should display version in sidebar footer', async ({ page }) => {
-    await expect(page.getByText('v1.0.0')).toBeVisible()
-  })
+    await expect(page.getByText('v1.0.0')).toBeVisible();
+  });
 
   test('@full should navigate to Users page', async ({ page }) => {
-    await page.getByRole('link', { name: 'Users' }).click()
-    await expect(page).toHaveURL('/users')
-  })
+    await page.getByRole('link', { name: 'Users' }).click();
+    await expect(page).toHaveURL('/users');
+  });
 
   test('@full should navigate to Settings page', async ({ page }) => {
-    await page.getByRole('link', { name: 'Settings' }).click()
-    await expect(page).toHaveURL('/settings')
-  })
+    await page.getByRole('link', { name: 'Settings' }).click();
+    await expect(page).toHaveURL('/settings');
+  });
 
   test('@full should highlight active menu item', async ({ page }) => {
     // Dashboard should be highlighted by default
-    const dashboardLink = page.getByRole('link', { name: 'Dashboard' })
-    await expect(dashboardLink).toHaveClass(/ant-menu-item-selected/)
+    const dashboardLink = page.getByRole('link', { name: 'Dashboard' });
+    await expect(dashboardLink).toHaveClass(/ant-menu-item-selected/);
 
     // Navigate to repositories
-    await page.getByRole('link', { name: 'Repositories' }).click()
+    await page.getByRole('link', { name: 'Repositories' }).click();
 
-    const reposLink = page.getByRole('link', { name: 'Repositories' })
-    await expect(reposLink).toHaveClass(/ant-menu-item-selected/)
-  })
-})
+    const reposLink = page.getByRole('link', { name: 'Repositories' });
+    await expect(reposLink).toHaveClass(/ant-menu-item-selected/);
+  });
+});

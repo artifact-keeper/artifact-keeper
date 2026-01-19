@@ -1,0 +1,1 @@
+# Contracts\n\nNo new API contracts needed for this feature.\n\nE2E tests interact with existing APIs defined in:\n- specs/001-artifact-registry/contracts/\n- specs/004-artifactory-migration/contracts/

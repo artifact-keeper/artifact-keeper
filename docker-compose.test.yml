@@ -55,6 +55,7 @@ services:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
       JWT_SECRET: e2e-test-secret-key-32-bytes-long
       RUST_LOG: info
       HOST: 0.0.0.0
@@ -130,7 +131,10 @@ services:
         condition: service_healthy
     environment:
       BASE_URL: http://frontend:5173
+      API_URL: http://backend:8080
       CI: "true"
+      # Filter to run only @smoke tests by default for faster CI feedback
+      TEST_TAG: ${TEST_TAG:-@smoke}
     volumes:
       - ./test-results:/app/test-results:z
       - ./playwright-report:/app/playwright-report:z

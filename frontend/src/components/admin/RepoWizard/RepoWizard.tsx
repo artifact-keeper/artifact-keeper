@@ -63,15 +63,24 @@ export const RepoWizard: React.FC<RepoWizardProps> = ({
   const availableRepos = repositoriesData?.items || [];
 
   const createMutation = useMutation({
-    mutationFn: (data: CreateRepositoryRequest) => repositoriesApi.create(data),
+    mutationFn: (data: CreateRepositoryRequest) => {
+      console.log('Creating repository with data:', JSON.stringify(data, null, 2));
+      return repositoriesApi.create(data);
+    },
     onSuccess: (repository) => {
       message.success(`Repository "${repository.name}" created successfully`);
       queryClient.invalidateQueries({ queryKey: ['repositories'] });
       onSuccess?.(repository);
       handleClose();
     },
-    onError: (error: Error) => {
-      message.error(`Failed to create repository: ${error.message}`);
+    onError: (error: unknown) => {
+      // Extract error details from axios error response
+      const axiosError = error as { response?: { data?: { message?: string; code?: string } } };
+      const errorMessage = axiosError.response?.data?.message
+        || (error instanceof Error ? error.message : 'Unknown error');
+      const errorCode = axiosError.response?.data?.code;
+      console.error('Repository creation failed:', { error, errorCode, errorMessage });
+      message.error(`Failed to create repository: ${errorMessage}`);
     },
   });
 
@@ -308,7 +317,12 @@ export const RepoWizard: React.FC<RepoWizardProps> = ({
           overflow: 'auto',
         }}
       >
-        {steps[currentStep]?.component}
+        {/* Render all steps but only show current one to preserve form state */}
+        {steps.map((step, index) => (
+          <div key={step.key} style={{ display: index === currentStep ? 'block' : 'none' }}>
+            {step.component}
+          </div>
+        ))}
       </div>
 
       <div
