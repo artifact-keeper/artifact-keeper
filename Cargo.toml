@@ -25,7 +25,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Authentication
-jsonwebtoken = "10.2"
+jsonwebtoken = "9.3"
 bcrypt = "0.18"
 
 # Checksums
@@ -34,7 +34,7 @@ md-5 = "0.10"
 sha1 = "0.10"
 
 # S3 storage using rust-s3 crate (works with Rust 1.75+)
-rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
+rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 
 # Logging/Tracing
 tracing = "0.1"
@@ -73,8 +73,8 @@ bytes = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # WASM runtime
-wasmtime = { version = "40.0.2", features = ["component-model", "async"] }
-wasmtime-wasi = "40.0.2"
+wasmtime = { version = "24.0", features = ["component-model", "async"] }
+wasmtime-wasi = "24.0"
 
 # Git operations
-git2 = "0.20"
+git2 = "0.19"

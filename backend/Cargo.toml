@@ -84,7 +84,7 @@ flate2 = "1.0"
 tar = "0.4"
 mime_guess = "2.0"
 zip = "2.2"
-toml = "0.9"
+toml = "0.8"
 serde_yaml = "0.9"
 regex = "1.11"
 
