@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::api::dto::Pagination;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 
@@ -77,14 +78,6 @@ impl From<PermissionRow> for PermissionResponse {
             updated_at: row.updated_at,
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-pub struct Pagination {
-    pub page: u32,
-    pub per_page: u32,
-    pub total: i64,
-    pub total_pages: u32,
 }
 
 #[derive(Debug, Serialize)]

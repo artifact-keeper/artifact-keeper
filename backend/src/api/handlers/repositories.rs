@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -93,14 +94,6 @@ pub struct RepositoryResponse {
 pub struct RepositoryListResponse {
     pub items: Vec<RepositoryResponse>,
     pub pagination: Pagination,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Pagination {
-    pub page: u32,
-    pub per_page: u32,
-    pub total: i64,
-    pub total_pages: u32,
 }
 
 /// Convert a Repository model to a RepositoryResponse with optional storage usage.

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::api::dto::Pagination;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 
@@ -93,14 +94,6 @@ impl From<BuildRow> for BuildResponse {
             modules: None,
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-pub struct Pagination {
-    pub page: u32,
-    pub per_page: u32,
-    pub total: i64,
-    pub total_pages: u32,
 }
 
 #[derive(Debug, Serialize)]
