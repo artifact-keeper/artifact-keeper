@@ -190,11 +190,29 @@ test.describe('Sidebar Navigation', () => {
     await loginPage.loginAndWaitForDashboard('admin', 'admin123');
   });
 
-  test('@smoke should display sidebar with all menu items', async ({ page }) => {
+  test('@smoke should display sidebar with grouped menu items', async ({ page }) => {
+    // Overview group
     await expect(page.getByRole('link', { name: 'Dashboard' })).toBeVisible();
+
+    // Artifacts group
     await expect(page.getByRole('link', { name: 'Repositories' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Artifacts' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Packages' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Builds' })).toBeVisible();
+
+    // Admin group (admin user)
     await expect(page.getByRole('link', { name: 'Users' })).toBeVisible();
     await expect(page.getByRole('link', { name: 'Settings' })).toBeVisible();
+  });
+
+  test('@smoke should display nav group headers', async ({ page }) => {
+    const sidebar = page.locator('.ant-layout-sider, .ant-drawer-body');
+    await expect(sidebar.getByText('Overview')).toBeVisible();
+    await expect(sidebar.getByText('Artifacts')).toBeVisible();
+    await expect(sidebar.getByText('Security')).toBeVisible();
+    await expect(sidebar.getByText('Integration')).toBeVisible();
+    await expect(sidebar.getByText('AI / ML')).toBeVisible();
+    await expect(sidebar.getByText('Administration')).toBeVisible();
   });
 
   test('@full should display version in sidebar footer', async ({ page }) => {
@@ -211,15 +229,54 @@ test.describe('Sidebar Navigation', () => {
     await expect(page).toHaveURL('/settings');
   });
 
+  test('@full should navigate to Webhooks page', async ({ page }) => {
+    await page.getByRole('link', { name: 'Webhooks' }).click();
+    await expect(page).toHaveURL('/webhooks');
+    await expect(page.getByRole('heading', { name: 'Webhooks' })).toBeVisible();
+  });
+
   test('@full should highlight active menu item', async ({ page }) => {
-    // Dashboard should be highlighted by default
-    const dashboardLink = page.getByRole('link', { name: 'Dashboard' });
-    await expect(dashboardLink).toHaveClass(/ant-menu-item-selected/);
+    // Dashboard menu item should be selected by default
+    const dashboardItem = page.locator('.ant-menu-item-selected').filter({
+      has: page.getByRole('link', { name: 'Dashboard' }),
+    });
+    await expect(dashboardItem).toBeVisible();
 
     // Navigate to repositories
     await page.getByRole('link', { name: 'Repositories' }).click();
 
-    const reposLink = page.getByRole('link', { name: 'Repositories' });
-    await expect(reposLink).toHaveClass(/ant-menu-item-selected/);
+    const reposItem = page.locator('.ant-menu-item-selected').filter({
+      has: page.getByRole('link', { name: 'Repositories' }),
+    });
+    await expect(reposItem).toBeVisible();
+  });
+
+  test('@full should show Coming Soon tooltip for unbuilt items', async ({ page }) => {
+    // AI/ML items should be disabled
+    const modelConfigItem = page.locator('.ant-menu-item-disabled').filter({
+      hasText: 'Model Config',
+    });
+    await expect(modelConfigItem).toBeVisible();
+
+    const analysisItem = page.locator('.ant-menu-item-disabled').filter({
+      hasText: 'Artifact Analysis',
+    });
+    await expect(analysisItem).toBeVisible();
+  });
+
+  test('@full should show Integration group items', async ({ page }) => {
+    await expect(page.getByRole('link', { name: 'Edge Nodes' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Plugins' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Webhooks' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Migration' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Set Me Up' })).toBeVisible();
+  });
+
+  test('@full should show Security group items', async ({ page }) => {
+    await expect(page.getByRole('link', { name: 'Permissions' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Scan Results' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Policies' })).toBeVisible();
+    const sidebar = page.locator('.ant-layout-sider, .ant-drawer-body');
+    await expect(sidebar.getByText('Dashboard')).toBeVisible();
   });
 });

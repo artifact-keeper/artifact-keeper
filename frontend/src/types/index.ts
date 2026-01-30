@@ -8,6 +8,7 @@ export * from './packages';
 export * from './builds';
 export * from './search';
 export * from './tree';
+export * from './security';
 
 export interface User {
   id: string;

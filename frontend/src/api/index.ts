@@ -11,6 +11,8 @@ export { default as buildsApi } from './builds';
 export { default as searchApi } from './search';
 export { default as treeApi } from './tree';
 export { default as profileApi } from './profile';
+export { default as webhooksApi } from './webhooks';
+export { default as securityApi } from './security';
 
 export type { LoginCredentials } from './auth';
 export type { ListRepositoriesParams } from './repositories';
@@ -50,3 +52,18 @@ export type {
   CreateAccessTokenRequest,
   CreateAccessTokenResponse,
 } from './profile';
+export type {
+  Webhook,
+  WebhookDelivery,
+  WebhookEvent,
+  CreateWebhookRequest,
+  WebhookTestResult,
+  ListWebhooksParams,
+  ListDeliveriesParams,
+} from './webhooks';
+export type {
+  ScanListResponse,
+  FindingListResponse,
+  ListScansParams,
+  ListFindingsParams,
+} from './security';

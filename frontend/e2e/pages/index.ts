@@ -13,3 +13,4 @@ export { ProfilePage } from './ProfilePage';
 export { AdminUsersPage } from './AdminUsersPage';
 export { AdminGroupsPage } from './AdminGroupsPage';
 export { SearchPage } from './SearchPage';
+export { NavigationPage } from './NavigationPage';

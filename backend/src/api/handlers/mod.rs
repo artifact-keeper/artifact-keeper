@@ -14,4 +14,5 @@ pub mod plugins;
 pub mod repositories;
 pub mod search;
 pub mod users;
+pub mod security;
 pub mod webhooks;

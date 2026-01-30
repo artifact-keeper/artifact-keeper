@@ -25,6 +25,11 @@ import Migration from './pages/admin/Migration'
 import Packages from './pages/Packages'
 import Builds from './pages/Builds'
 import SetupWizards from './pages/SetupWizards'
+import Webhooks from './pages/Webhooks'
+import SecurityDashboard from './pages/SecurityDashboard'
+import SecurityScans from './pages/SecurityScans'
+import SecurityScanDetail from './pages/SecurityScanDetail'
+import SecurityPolicies from './pages/SecurityPolicies'
 import NotFound from './pages/NotFound'
 import { ServerError, Forbidden } from './pages/errors'
 
@@ -80,6 +85,11 @@ function AppContent() {
             <Route path="/groups" element={<Groups />} />
             <Route path="/permissions" element={<Permissions />} />
             <Route path="/migration" element={<Migration />} />
+            <Route path="/webhooks" element={<Webhooks />} />
+            <Route path="/security" element={<SecurityDashboard />} />
+            <Route path="/security/scans" element={<SecurityScans />} />
+            <Route path="/security/scans/:id" element={<SecurityScanDetail />} />
+            <Route path="/security/policies" element={<SecurityPolicies />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/profile" element={<Profile />} />
             <Route path="/search" element={<Search />} />

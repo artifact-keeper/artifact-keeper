@@ -143,6 +143,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Security routes with auth middleware
+        .nest(
+            "/security",
+            handlers::security::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Migration routes with auth middleware
         .nest(
             "/migrations",
