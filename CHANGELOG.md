@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Failure test runner (`scripts/failure/run-all.sh`)
 
 ### Changed
+
+#### Shared DTO Module Refactor (007-shared-dto)
+- **Consolidated duplicate Pagination structs** into shared `backend/src/api/dto.rs` module
+  - Removed duplicate `Pagination` struct definitions from 6 handler files
+  - All handlers now import from `crate::api::dto::Pagination`
+  - Added `PaginationQuery` struct for standardized query parameter handling
+  - Added `Pagination::from_query_and_total()` helper method
+  - Zero breaking changes - API response structure unchanged
+
 - Updated `CLAUDE.md` with comprehensive testing commands documentation
 - Extended `docker-compose.test.yml` with native client test services and profiles
 - Added `axum-test` dev dependency to backend `Cargo.toml`

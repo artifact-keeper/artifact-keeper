@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -85,14 +86,6 @@ pub struct UserResponse {
 pub struct CreateUserResponse {
     pub user: UserResponse,
     pub generated_password: Option<String>, // Only returned if password was auto-generated
-}
-
-#[derive(Debug, Serialize)]
-pub struct Pagination {
-    pub page: u32,
-    pub per_page: u32,
-    pub total: i64,
-    pub total_pages: u32,
 }
 
 #[derive(Debug, Serialize)]
