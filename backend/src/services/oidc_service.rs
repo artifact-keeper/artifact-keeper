@@ -736,6 +736,7 @@ mod tests {
             oidc_client_secret: Some("secret-456".into()),
             ldap_url: None,
             ldap_base_dn: None,
+            trivy_url: None,
         };
 
         let oidc_config = OidcConfig::from_config(&config);

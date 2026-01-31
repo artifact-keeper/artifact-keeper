@@ -32,6 +32,7 @@ services:
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
+      TRIVY_URL: http://trivy:8090
       HOST: 0.0.0.0
       PORT: 8080
     volumes:
@@ -46,6 +47,16 @@ services:
       timeout: 10s
       start_period: 10s
       retries: 3
+    restart: unless-stopped
+
+  trivy:
+    image: aquasec/trivy:latest
+    container_name: artifact-keeper-trivy
+    command: ["server", "--listen", "0.0.0.0:8090"]
+    ports:
+      - "8090:8090"
+    volumes:
+      - trivy_cache:/root/.cache/trivy
     restart: unless-stopped
 
   frontend:
@@ -71,6 +82,8 @@ volumes:
   backup_storage:
     driver: local
   plugins_storage:
+    driver: local
+  trivy_cache:
     driver: local
 
 networks:

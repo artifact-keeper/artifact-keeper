@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
+use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
 use crate::services::scan_result_service::ScanResultService;
 
@@ -797,12 +798,19 @@ impl ScannerService {
         advisory_client: Arc<AdvisoryClient>,
         scan_result_service: Arc<ScanResultService>,
         scan_config_service: Arc<ScanConfigService>,
+        trivy_url: Option<String>,
     ) -> Self {
-        let dep_scanner = Arc::new(DependencyScanner::new(advisory_client));
+        let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
+        let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
+
+        if let Some(url) = trivy_url {
+            info!("Trivy image scanner enabled at {}", url);
+            scanners.push(Arc::new(ImageScanner::new(url)));
+        }
 
         Self {
             db,
-            scanners: vec![dep_scanner],
+            scanners,
             scan_result_service,
             scan_config_service,
         }

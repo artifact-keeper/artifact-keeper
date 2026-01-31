@@ -7,6 +7,7 @@ pub mod routes;
 
 use crate::config::Config;
 use crate::services::plugin_registry::PluginRegistry;
+use crate::services::scanner_service::ScannerService;
 use crate::services::wasm_plugin_service::WasmPluginService;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub struct AppState {
     pub db: PgPool,
     pub plugin_registry: Option<Arc<PluginRegistry>>,
     pub wasm_plugin_service: Option<Arc<WasmPluginService>>,
+    pub scanner_service: Option<Arc<ScannerService>>,
 }
 
 impl AppState {
@@ -27,6 +29,7 @@ impl AppState {
             db,
             plugin_registry: None,
             wasm_plugin_service: None,
+            scanner_service: None,
         }
     }
 
@@ -42,7 +45,13 @@ impl AppState {
             db,
             plugin_registry: Some(plugin_registry),
             wasm_plugin_service: Some(wasm_plugin_service),
+            scanner_service: None,
         }
+    }
+
+    /// Set the scanner service for security scanning.
+    pub fn set_scanner_service(&mut self, scanner_service: Arc<ScannerService>) {
+        self.scanner_service = Some(scanner_service);
     }
 }
 

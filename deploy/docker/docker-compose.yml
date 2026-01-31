@@ -61,6 +61,7 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       JWT_SECRET: change-this-in-production-use-32-bytes
+      TRIVY_URL: http://trivy:8090
       LOG_LEVEL: debug
     ports:
       - "8080:8080"
@@ -69,6 +70,14 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+
+  trivy:
+    image: aquasec/trivy:latest
+    command: ["server", "--listen", "0.0.0.0:8090"]
+    ports:
+      - "8090:8090"
+    volumes:
+      - trivy_cache:/root/.cache/trivy
 
   frontend:
     build:
@@ -82,3 +91,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  trivy_cache:

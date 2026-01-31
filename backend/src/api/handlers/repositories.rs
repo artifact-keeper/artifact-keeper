@@ -461,7 +461,10 @@ pub async fn upload_artifact(
     let repo = repo_service.get_by_key(&key).await?;
 
     let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let mut artifact_service = ArtifactService::new(state.db.clone(), storage);
+    if let Some(ref scanner) = state.scanner_service {
+        artifact_service.set_scanner_service(scanner.clone());
+    }
 
     // Extract name from path
     let name = path.split('/').next_back().unwrap_or(&path).to_string();

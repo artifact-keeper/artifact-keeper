@@ -14,7 +14,13 @@ use artifact_keeper_backend::{
     config::Config,
     db,
     error::Result,
-    services::{plugin_registry::PluginRegistry, wasm_plugin_service::WasmPluginService},
+    services::{
+        plugin_registry::PluginRegistry,
+        scan_config_service::ScanConfigService,
+        scan_result_service::ScanResultService,
+        scanner_service::{AdvisoryClient, ScannerService},
+        wasm_plugin_service::WasmPluginService,
+    },
 };
 
 #[tokio::main]
@@ -49,13 +55,29 @@ async fn main() -> Result<()> {
     let (plugin_registry, wasm_plugin_service) =
         initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
 
+    // Initialize security scanner service
+    let advisory_client = Arc::new(AdvisoryClient::new(
+        std::env::var("GITHUB_TOKEN").ok(),
+    ));
+    let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
+    let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
+    let scanner_service = Arc::new(ScannerService::new(
+        db_pool.clone(),
+        advisory_client,
+        scan_result_service,
+        scan_config_service,
+        config.trivy_url.clone(),
+    ));
+
     // Create application state with WASM plugin support
-    let state = Arc::new(api::AppState::with_wasm_plugins(
+    let mut app_state = api::AppState::with_wasm_plugins(
         config.clone(),
         db_pool,
         plugin_registry,
         wasm_plugin_service,
-    ));
+    );
+    app_state.set_scanner_service(scanner_service);
+    let state = Arc::new(app_state);
 
     // Build router
     let app = Router::new()

@@ -56,6 +56,9 @@ pub struct Config {
 
     /// LDAP base DN (optional)
     pub ldap_base_dn: Option<String>,
+
+    /// Trivy server URL for container image scanning (optional)
+    pub trivy_url: Option<String>,
 }
 
 impl Config {
@@ -91,6 +94,7 @@ impl Config {
             oidc_client_secret: env::var("OIDC_CLIENT_SECRET").ok(),
             ldap_url: env::var("LDAP_URL").ok(),
             ldap_base_dn: env::var("LDAP_BASE_DN").ok(),
+            trivy_url: env::var("TRIVY_URL").ok(),
         })
     }
 }

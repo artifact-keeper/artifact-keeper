@@ -58,6 +58,7 @@ services:
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: e2e-test-secret-key-32-bytes-long
       RUST_LOG: info
+      TRIVY_URL: http://trivy:8090
       HOST: 0.0.0.0
       PORT: 8080
     healthcheck:
@@ -66,6 +67,15 @@ services:
       timeout: 10s
       start_period: 30s
       retries: 10
+    networks:
+      - e2e-test-network
+
+  trivy:
+    image: aquasec/trivy:latest
+    container_name: e2e-test-trivy
+    command: ["server", "--listen", "0.0.0.0:8090"]
+    volumes:
+      - trivy-cache:/root/.cache/trivy
     networks:
       - e2e-test-network
 
@@ -368,3 +378,4 @@ volumes:
   pki-data:
   maven-cache:
   go-cache:
+  trivy-cache:

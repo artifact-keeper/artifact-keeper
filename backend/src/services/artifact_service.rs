@@ -14,6 +14,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::repository_service::RepositoryService;
+use crate::services::scanner_service::ScannerService;
 use crate::storage::StorageBackend;
 
 /// Artifact service
@@ -22,6 +23,7 @@ pub struct ArtifactService {
     storage: Arc<dyn StorageBackend>,
     repo_service: RepositoryService,
     plugin_service: Option<Arc<PluginService>>,
+    scanner_service: Option<Arc<ScannerService>>,
 }
 
 impl ArtifactService {
@@ -33,6 +35,7 @@ impl ArtifactService {
             storage,
             repo_service,
             plugin_service: None,
+            scanner_service: None,
         }
     }
 
@@ -48,12 +51,18 @@ impl ArtifactService {
             storage,
             repo_service,
             plugin_service: Some(plugin_service),
+            scanner_service: None,
         }
     }
 
     /// Set the plugin service for hook triggering.
     pub fn set_plugin_service(&mut self, plugin_service: Arc<PluginService>) {
         self.plugin_service = Some(plugin_service);
+    }
+
+    /// Set the scanner service for scan-on-upload.
+    pub fn set_scanner_service(&mut self, scanner_service: Arc<ScannerService>) {
+        self.scanner_service = Some(scanner_service);
     }
 
     /// Trigger a plugin hook, logging but not failing if plugin service is unavailable.
@@ -210,6 +219,32 @@ impl ArtifactService {
         let artifact_info = ArtifactInfo::from(&artifact);
         self.trigger_hook_non_blocking(PluginEventType::AfterUpload, &artifact_info)
             .await;
+
+        // Trigger scan-on-upload if scanner service is configured
+        if let Some(ref scanner) = self.scanner_service {
+            let scanner = scanner.clone();
+            let artifact_id = artifact.id;
+            let repo_id = artifact.repository_id;
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                // Check if scan_on_upload is enabled for this repository
+                let should_scan = sqlx::query_scalar!(
+                    "SELECT scan_on_upload FROM scan_configs WHERE repository_id = $1 AND scan_enabled = true",
+                    repo_id
+                )
+                .fetch_optional(&db)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+
+                if should_scan {
+                    if let Err(e) = scanner.scan_artifact(artifact_id).await {
+                        tracing::warn!("Auto-scan failed for artifact {}: {}", artifact_id, e);
+                    }
+                }
+            });
+        }
 
         Ok(artifact)
     }

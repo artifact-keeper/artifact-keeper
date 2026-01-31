@@ -443,6 +443,7 @@ mod tests {
             oidc_client_secret: None,
             ldap_url: Some("ldap://localhost:389".into()),
             ldap_base_dn: Some("dc=example,dc=com".into()),
+            trivy_url: None,
         };
 
         let ldap_config = LdapConfig::from_config(&config);
