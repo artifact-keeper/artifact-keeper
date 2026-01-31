@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) FROM download_statistics\n        WHERE artifact_id = ANY(\n            SELECT id FROM artifacts\n            WHERE repository_id = $1 AND LOWER(name) = LOWER($2) AND is_deleted = false\n        )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "300cb27dcfad2955c8997909576fb6e38434f925cd6074edac165ab89b8205d0"
+}

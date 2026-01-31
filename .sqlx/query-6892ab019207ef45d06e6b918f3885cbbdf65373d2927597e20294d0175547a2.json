@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT a.name, a.version, am.metadata as \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n        ORDER BY a.name, a.created_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "metadata?",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "6892ab019207ef45d06e6b918f3885cbbdf65373d2927597e20294d0175547a2"
+}

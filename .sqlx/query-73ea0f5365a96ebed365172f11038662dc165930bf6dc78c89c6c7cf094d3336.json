@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT size_bytes, content_type\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path = $2\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "content_type",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "73ea0f5365a96ebed365172f11038662dc165930bf6dc78c89c6c7cf094d3336"
+}

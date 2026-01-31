@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id FROM artifacts WHERE repository_id = $1 AND LOWER(name) = LOWER($2) AND version = $3 AND is_deleted = false",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e8ad345903aa7759da76f703d11b67e00e70a97b897e2591bfdbac2641ce5452"
+}

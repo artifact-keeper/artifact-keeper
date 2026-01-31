@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT path, size_bytes, checksum_sha256\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path LIKE $2 || '%'\n        ORDER BY path\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "path",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "checksum_sha256",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "636bac27e0687737d587d78e095732708f015e4d0aeb67b14aef0bb6ff2938e1"
+}

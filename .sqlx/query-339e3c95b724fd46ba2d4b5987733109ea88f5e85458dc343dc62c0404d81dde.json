@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO artifacts (\n            repository_id, path, name, version, size_bytes,\n            checksum_sha256, content_type, storage_key, uploaded_by\n        )\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Bpchar",
+        "Varchar",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "339e3c95b724fd46ba2d4b5987733109ea88f5e85458dc343dc62c0404d81dde"
+}

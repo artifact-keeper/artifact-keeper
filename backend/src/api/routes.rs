@@ -35,6 +35,10 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/cargo", handlers::cargo::router())
         // RubyGems API
         .nest("/gems", handlers::rubygems::router())
+        // Git LFS API
+        .nest("/lfs", handlers::gitlfs::router())
+        // Pub (Dart/Flutter) Repository API
+        .nest("/pub", handlers::pub_registry::router())
         // Go Proxy API (GOPROXY protocol)
         .nest("/go", handlers::goproxy::router())
         // Helm Chart Repository API
@@ -47,8 +51,30 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/alpine", handlers::alpine::router())
         // Conda Channel API
         .nest("/conda", handlers::conda::router())
+        // Swift Package Registry (SE-0292)
+        .nest("/swift", handlers::swift::router())
         // Terraform Registry Protocol
         .nest("/terraform", handlers::terraform::router())
+        // CocoaPods Spec Repo API
+        .nest("/cocoapods", handlers::cocoapods::router())
+        // Hex.pm Repository API (Elixir/Erlang packages)
+        .nest("/hex", handlers::hex::router())
+        // HuggingFace Hub API
+        .nest("/huggingface", handlers::huggingface::router())
+        // JetBrains Plugin Repository API
+        .nest("/jetbrains", handlers::jetbrains::router())
+        // Chef Supermarket API
+        .nest("/chef", handlers::chef::router())
+        // Puppet Forge API
+        .nest("/puppet", handlers::puppet::router())
+        // Ansible Galaxy API
+        .nest("/ansible", handlers::ansible::router())
+        // CRAN Repository API (R packages)
+        .nest("/cran", handlers::cran::router())
+        // SBT/Ivy Repository API (Scala/Java packages)
+        .nest("/ivy", handlers::sbt::router())
+        // VS Code Extension Marketplace API
+        .nest("/vscode", handlers::vscode::router())
         .with_state(state)
 }
 
