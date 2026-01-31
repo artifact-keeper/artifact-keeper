@@ -166,7 +166,7 @@ const Dashboard = () => {
       {/* System Health */}
       <Card title="System Health" style={{ marginBottom: 16 }}>
         <Row gutter={16}>
-          <Col span={8}>
+          <Col span={health?.checks?.security_scanner ? 6 : 8}>
             <Statistic
               title="Status"
               value={health?.status || 'Unknown'}
@@ -174,7 +174,7 @@ const Dashboard = () => {
               prefix={health?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
             />
           </Col>
-          <Col span={8}>
+          <Col span={health?.checks?.security_scanner ? 6 : 8}>
             <Statistic
               title="Database"
               value={health?.checks?.database?.status || 'Unknown'}
@@ -182,7 +182,7 @@ const Dashboard = () => {
               prefix={health?.checks?.database?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
             />
           </Col>
-          <Col span={8}>
+          <Col span={health?.checks?.security_scanner ? 6 : 8}>
             <Statistic
               title="Storage"
               value={health?.checks?.storage?.status || 'Unknown'}
@@ -190,6 +190,16 @@ const Dashboard = () => {
               prefix={health?.checks?.storage?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
             />
           </Col>
+          {health?.checks?.security_scanner && (
+            <Col span={6}>
+              <Statistic
+                title="Security Scanner"
+                value={health.checks.security_scanner.status}
+                styles={{ content: { color: health.checks.security_scanner.status === 'healthy' ? '#3f8600' : health.checks.security_scanner.status === 'unavailable' ? '#faad14' : '#cf1322' } }}
+                prefix={health.checks.security_scanner.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
+              />
+            </Col>
+          )}
         </Row>
       </Card>
 

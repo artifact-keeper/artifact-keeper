@@ -1,7 +1,9 @@
 //! Health check endpoints.
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use reqwest::Client;
 use serde::Serialize;
+use std::time::Duration;
 
 use crate::api::SharedState;
 
@@ -16,6 +18,8 @@ pub struct HealthResponse {
 pub struct HealthChecks {
     pub database: CheckStatus,
     pub storage: CheckStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_scanner: Option<CheckStatus>,
 }
 
 #[derive(Serialize)]
@@ -39,6 +43,31 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         },
     };
 
+    // Check security scanner (Trivy) if configured
+    let scanner_check = if let Some(trivy_url) = &state.config.trivy_url {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let health_url = format!("{}/healthz", trivy_url.trim_end_matches('/'));
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => Some(CheckStatus {
+                status: "healthy".to_string(),
+                message: None,
+            }),
+            Ok(resp) => Some(CheckStatus {
+                status: "unhealthy".to_string(),
+                message: Some(format!("Trivy returned status {}", resp.status())),
+            }),
+            Err(e) => Some(CheckStatus {
+                status: "unavailable".to_string(),
+                message: Some(format!("Trivy unreachable: {}", e)),
+            }),
+        }
+    } else {
+        None
+    };
+
     let overall_status = if db_check.status == "healthy" {
         "healthy"
     } else {
@@ -54,6 +83,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
                 status: "healthy".to_string(),
                 message: None,
             },
+            security_scanner: scanner_check,
         },
     };
 
@@ -147,6 +177,7 @@ mod tests {
                     status: "healthy".to_string(),
                     message: Some("Connected".to_string()),
                 },
+                security_scanner: None,
             },
         };
 
@@ -155,6 +186,34 @@ mod tests {
         assert!(json.contains("\"version\":\"1.0.0\""));
         assert!(json.contains("\"database\""));
         assert!(json.contains("\"storage\""));
+        // security_scanner is None, should be skipped
+        assert!(!json.contains("\"security_scanner\""));
+    }
+
+    /// Test HealthResponse with security scanner
+    #[test]
+    fn test_health_response_with_scanner() {
+        let response = HealthResponse {
+            status: "healthy".to_string(),
+            version: "1.0.0".to_string(),
+            checks: HealthChecks {
+                database: CheckStatus {
+                    status: "healthy".to_string(),
+                    message: None,
+                },
+                storage: CheckStatus {
+                    status: "healthy".to_string(),
+                    message: None,
+                },
+                security_scanner: Some(CheckStatus {
+                    status: "healthy".to_string(),
+                    message: None,
+                }),
+            },
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"security_scanner\""));
     }
 
     /// Test CheckStatus without message skips serialization
@@ -196,6 +255,7 @@ mod tests {
                     status: "healthy".to_string(),
                     message: None,
                 },
+                security_scanner: None,
             },
         };
 

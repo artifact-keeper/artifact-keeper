@@ -138,8 +138,9 @@ export interface HealthResponse {
   status: string;
   version: string;
   checks: {
-    database: { status: string };
-    storage: { status: string };
+    database: { status: string; message?: string };
+    storage: { status: string; message?: string };
+    security_scanner?: { status: string; message?: string };
   };
 }
 
