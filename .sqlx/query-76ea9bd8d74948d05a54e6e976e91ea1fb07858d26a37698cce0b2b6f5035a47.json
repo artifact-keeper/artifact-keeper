@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true) as \"repos_with_scanning!\",\n                (SELECT COUNT(*) FROM scan_results) as \"total_scans!\",\n                (SELECT COUNT(*) FROM scan_findings WHERE NOT is_acknowledged) as \"total_findings!\",\n                (SELECT COUNT(*) FROM scan_findings WHERE severity = 'critical' AND NOT is_acknowledged) as \"critical_findings!\",\n                (SELECT COUNT(*) FROM scan_findings WHERE severity = 'high' AND NOT is_acknowledged) as \"high_findings!\",\n                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A') as \"repos_grade_a!\",\n                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F') as \"repos_grade_f!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repos_with_scanning!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_scans!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_findings!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "critical_findings!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "high_findings!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "repos_grade_a!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "repos_grade_f!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "76ea9bd8d74948d05a54e6e976e91ea1fb07858d26a37698cce0b2b6f5035a47"
+}

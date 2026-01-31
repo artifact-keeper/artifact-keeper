@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE scan_results\n            SET status = 'completed', findings_count = $2,\n                critical_count = $3, high_count = $4, medium_count = $5,\n                low_count = $6, info_count = $7, completed_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2ff4253dc543645240d30cb9513e81bee04ec0f1fd5442e95a5c1fc7d6a8c513"
+}

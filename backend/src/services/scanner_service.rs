@@ -166,7 +166,7 @@ impl AdvisoryClient {
                         let matches = Self::parse_osv_response(&body, chunk);
                         // Update cache
                         let mut cache = self.cache.write().await;
-                        for (i, dep) in chunk.iter().enumerate() {
+                        for (_i, dep) in chunk.iter().enumerate() {
                             let key = format!(
                                 "{}:{}:{}",
                                 dep.ecosystem,
@@ -175,7 +175,7 @@ impl AdvisoryClient {
                             );
                             let dep_matches: Vec<_> = matches
                                 .iter()
-                                .filter(|m| {
+                                .filter(|_m| {
                                     // Match by position in batch response
                                     true // OSV returns results indexed by query order
                                 })
@@ -975,7 +975,7 @@ impl ScannerService {
         // In a real implementation this would use the injected StorageBackend.
         // For now, we return an empty buffer if storage is not available,
         // letting the scanner handle manifests from metadata instead.
-        let content = sqlx::query_scalar!(
+        let _content = sqlx::query_scalar!(
             "SELECT encode(E''::bytea, 'hex') as \"hex!\" FROM artifacts WHERE id = $1",
             artifact.id,
         )

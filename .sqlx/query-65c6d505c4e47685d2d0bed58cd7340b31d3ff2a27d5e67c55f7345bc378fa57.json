@@ -1,0 +1,75 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE scan_policies\n            SET name = $2, max_severity = $3, block_unscanned = $4,\n                block_on_fail = $5, is_enabled = $6, updated_at = NOW()\n            WHERE id = $1\n            RETURNING id, name, repository_id, max_severity, block_unscanned,\n                      block_on_fail, is_enabled, created_at, updated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "max_severity",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "block_unscanned",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "block_on_fail",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "65c6d505c4e47685d2d0bed58cd7340b31d3ff2a27d5e67c55f7345bc378fa57"
+}

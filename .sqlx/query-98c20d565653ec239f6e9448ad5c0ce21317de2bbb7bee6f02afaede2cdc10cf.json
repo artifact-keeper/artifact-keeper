@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, repository_id, score, grade, total_findings,\n                   critical_count, high_count, medium_count, low_count,\n                   acknowledged_count, last_scan_at, calculated_at\n            FROM repo_security_scores\n            ORDER BY score ASC, critical_count DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "score",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "grade",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "total_findings",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "critical_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "high_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "medium_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "low_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "acknowledged_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "last_scan_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "calculated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "98c20d565653ec239f6e9448ad5c0ce21317de2bbb7bee6f02afaede2cdc10cf"
+}

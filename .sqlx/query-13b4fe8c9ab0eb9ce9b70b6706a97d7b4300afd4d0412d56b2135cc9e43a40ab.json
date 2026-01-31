@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "DELETE FROM backups WHERE id = $1",
+  "query": "UPDATE artifacts SET quarantine_status = 'flagged' WHERE id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "66c17723115ded02d4e232e60bfc354b5725649b31f76c4778f8f02a795c025e"
+  "hash": "13b4fe8c9ab0eb9ce9b70b6706a97d7b4300afd4d0412d56b2135cc9e43a40ab"
 }

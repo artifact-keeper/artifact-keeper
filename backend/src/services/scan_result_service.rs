@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
-    DashboardSummary, Grade, RawFinding, RepoSecurityScore, ScanConfig, ScanFinding, ScanResult,
+    DashboardSummary, Grade, RawFinding, RepoSecurityScore, ScanFinding, ScanResult,
     Severity,
 };
 
