@@ -15,6 +15,18 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     proxy: {
+      '/health': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/ready': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/metrics': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
       '/api': {
         target: process.env.VITE_API_URL || 'http://localhost:9080',
         changeOrigin: true,
