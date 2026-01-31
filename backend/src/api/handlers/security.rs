@@ -276,7 +276,7 @@ async fn get_all_scores(
 // ---------------------------------------------------------------------------
 
 async fn trigger_scan(
-    State(_state): State<SharedState>,
+    State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
@@ -286,20 +286,46 @@ async fn trigger_scan(
         ));
     }
 
-    // For now, return a queued response. The actual scanning runs async.
-    // In a full implementation, we'd spawn the scanner task here.
-    let msg = if let Some(artifact_id) = body.artifact_id {
-        format!("Scan queued for artifact {}", artifact_id)
-    } else if let Some(repo_id) = body.repository_id {
-        format!("Repository scan queued for {}", repo_id)
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Scanner service not configured".to_string()))?
+        .clone();
+
+    if let Some(artifact_id) = body.artifact_id {
+        let scanner = scanner.clone();
+        tokio::spawn(async move {
+            if let Err(e) = scanner.scan_artifact(artifact_id).await {
+                tracing::error!("Scan failed for artifact {}: {}", artifact_id, e);
+            }
+        });
+        Ok(Json(TriggerScanResponse {
+            message: format!("Scan queued for artifact {}", artifact_id),
+            artifacts_queued: 1,
+        }))
+    } else if let Some(repository_id) = body.repository_id {
+        let scanner = scanner.clone();
+        // Count artifacts first so we can return the count immediately
+        let count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as \"count!\" FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+            repository_id
+        )
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = scanner.scan_repository(repository_id).await {
+                tracing::error!("Repository scan failed for {}: {}", repository_id, e);
+            }
+        });
+        Ok(Json(TriggerScanResponse {
+            message: format!("Repository scan queued for {} ({} artifacts)", repository_id, count),
+            artifacts_queued: count as u32,
+        }))
     } else {
         unreachable!()
-    };
-
-    Ok(Json(TriggerScanResponse {
-        message: msg,
-        artifacts_queued: 1,
-    }))
+    }
 }
 
 async fn list_scans(
