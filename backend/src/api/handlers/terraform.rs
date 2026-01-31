@@ -100,11 +100,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -216,9 +212,7 @@ async fn resolve_terraform_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo,
 // GET /{repo_key}/.well-known/terraform.json — Service Discovery
 // ---------------------------------------------------------------------------
 
-async fn service_discovery(
-    Path(repo_key): Path<String>,
-) -> Result<Response, Response> {
+async fn service_discovery(Path(repo_key): Path<String>) -> Result<Response, Response> {
     let json = serde_json::json!({
         "modules.v1": format!("/terraform/{}/v1/modules/", repo_key),
         "providers.v1": format!("/terraform/{}/v1/providers/", repo_key),

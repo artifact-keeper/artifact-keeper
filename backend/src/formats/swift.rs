@@ -99,9 +99,10 @@ impl SwiftHandler {
                 if manifest_file == "Package.swift" {
                     is_manifest = true;
                 } else {
-                    return Err(AppError::Validation(
-                        format!("Invalid manifest file: {}", manifest_file),
-                    ));
+                    return Err(AppError::Validation(format!(
+                        "Invalid manifest file: {}",
+                        manifest_file
+                    )));
                 }
             }
             _ => {

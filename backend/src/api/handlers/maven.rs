@@ -47,11 +47,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -199,8 +195,7 @@ async fn download(
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
         if let Some((group_id, artifact_id)) = parse_metadata_path(base_path) {
             let xml =
-                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id)
-                    .await?;
+                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await?;
             let checksum = compute_checksum(xml.as_bytes(), checksum_type);
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -521,16 +516,13 @@ async fn upload(
     }
 
     // Store file
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    storage.put(&storage_key, body.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
 
     // Build metadata JSON
     let handler = MavenHandler::new();

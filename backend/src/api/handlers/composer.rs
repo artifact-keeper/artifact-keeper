@@ -66,11 +66,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -217,12 +213,10 @@ async fn packages_json(
         if let Some(metadata) = &row.metadata {
             if let Some(composer) = metadata.get("composer") {
                 if let Some(desc) = composer.get("description").and_then(|v| v.as_str()) {
-                    version_entry["description"] =
-                        serde_json::Value::String(desc.to_string());
+                    version_entry["description"] = serde_json::Value::String(desc.to_string());
                 }
                 if let Some(pkg_type) = composer.get("type").and_then(|v| v.as_str()) {
-                    version_entry["type"] =
-                        serde_json::Value::String(pkg_type.to_string());
+                    version_entry["type"] = serde_json::Value::String(pkg_type.to_string());
                 }
                 if let Some(license) = composer.get("license") {
                     version_entry["license"] = license.clone();
@@ -248,10 +242,7 @@ async fn packages_json(
             }
         }
 
-        by_name
-            .entry(name.clone())
-            .or_default()
-            .push(version_entry);
+        by_name.entry(name.clone()).or_default().push(version_entry);
     }
 
     for (name, versions) in &by_name {
@@ -462,10 +453,7 @@ async fn metadata_v1(
     }
 
     let mut packages_map = serde_json::Map::new();
-    packages_map.insert(
-        full_name,
-        serde_json::Value::Object(version_map),
-    );
+    packages_map.insert(full_name, serde_json::Value::Object(version_map));
 
     let response = serde_json::json!({
         "packages": packages_map,
@@ -641,10 +629,7 @@ async fn search(
                 .and_then(|d| d.as_str())
                 .unwrap_or("");
 
-            let url = format!(
-                "/composer/{}/p2/{}.json",
-                repo_key, r.name
-            );
+            let url = format!("/composer/{}/p2/{}.json", repo_key, r.name);
 
             serde_json::json!({
                 "name": r.name,
@@ -717,9 +702,7 @@ async fn upload(
 
     // The body should be a zip archive containing composer.json
     if body.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Empty request body").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "Empty request body").into_response());
     }
 
     // Parse composer.json from the archive to extract metadata
@@ -778,10 +761,7 @@ async fn upload(
     if existing.is_some() {
         return Err((
             StatusCode::CONFLICT,
-            format!(
-                "Version {} of {} already exists",
-                version, full_name
-            ),
+            format!("Version {} of {} already exists", version, full_name),
         )
             .into_response());
     }
@@ -789,16 +769,13 @@ async fn upload(
     // Store the archive
     let storage_key = format!("composer/{}/{}/{}.zip", full_name, version, sha256);
     let storage = FilesystemStorage::new(&repo.storage_path);
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    storage.put(&storage_key, body.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
 
     let size_bytes = body.len() as i64;
 

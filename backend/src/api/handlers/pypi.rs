@@ -62,11 +62,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -135,7 +131,10 @@ async fn resolve_pypi_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Resp
     if fmt != "pypi" && fmt != "poetry" && fmt != "conda" {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("Repository '{}' is not a PyPI repository (format: {})", repo_key, fmt),
+            format!(
+                "Repository '{}' is not a PyPI repository (format: {})",
+                repo_key, fmt
+            ),
         )
             .into_response());
     }
@@ -480,16 +479,13 @@ async fn serve_metadata(
 
     // Try to extract METADATA from the package file
     let storage = FilesystemStorage::new(storage_path);
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
 
     let metadata_text = if filename.ends_with(".whl") {
         extract_metadata_from_wheel(&content)
@@ -619,8 +615,7 @@ async fn upload(
                         if let Some(arr) = existing.as_array() {
                             let mut arr = arr.clone();
                             arr.push(serde_json::Value::String(text));
-                            metadata_fields
-                                .insert(name, serde_json::Value::Array(arr));
+                            metadata_fields.insert(name, serde_json::Value::Array(arr));
                         } else {
                             metadata_fields.insert(
                                 name,
@@ -631,8 +626,7 @@ async fn upload(
                             );
                         }
                     } else {
-                        metadata_fields
-                            .insert(name, serde_json::Value::String(text));
+                        metadata_fields.insert(name, serde_json::Value::String(text));
                     }
                 }
             }
@@ -655,8 +649,9 @@ async fn upload(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'version' field").into_response())?;
     let content = file_content
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'content' field").into_response())?;
-    let filename = file_name
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing filename in content field").into_response())?;
+    let filename = file_name.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "Missing filename in content field").into_response()
+    })?;
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
 

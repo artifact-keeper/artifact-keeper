@@ -68,11 +68,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -122,8 +118,7 @@ async fn authenticate(
                 .status(StatusCode::UNAUTHORIZED)
                 .header("WWW-Authenticate", "Basic realm=\"cargo\"")
                 .body(Body::from(
-                    serde_json::json!({"errors": [{"detail": "Invalid credentials"}]})
-                        .to_string(),
+                    serde_json::json!({"errors": [{"detail": "Invalid credentials"}]}).to_string(),
                 ))
                 .unwrap()
         })?;
@@ -265,7 +260,11 @@ async fn search_crates(
                 .metadata_text
                 .as_ref()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
-                .and_then(|m| m.get("description").and_then(|v| v.as_str()).map(String::from))
+                .and_then(|m| {
+                    m.get("description")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
                 .unwrap_or_default();
 
             serde_json::json!({
@@ -355,11 +354,7 @@ async fn publish(
 
     let crate_data_offset = crate_len_offset + 4;
     if body.len() < crate_data_offset + crate_len {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Payload too short for .crate data",
-        )
-            .into_response());
+        return Err((StatusCode::BAD_REQUEST, "Payload too short for .crate data").into_response());
     }
 
     let crate_bytes =

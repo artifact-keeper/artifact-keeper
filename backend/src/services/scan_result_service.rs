@@ -5,8 +5,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
-    DashboardSummary, Grade, RawFinding, RepoSecurityScore, ScanFinding, ScanResult,
-    Severity,
+    DashboardSummary, Grade, RawFinding, RepoSecurityScore, ScanFinding, ScanResult, Severity,
 };
 
 pub struct ScanResultService {

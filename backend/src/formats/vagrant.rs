@@ -37,7 +37,9 @@ impl VagrantHandler {
 
         let org = parts[0].to_string();
         if org.is_empty() {
-            return Err(AppError::Validation("Organization name cannot be empty".to_string()));
+            return Err(AppError::Validation(
+                "Organization name cannot be empty".to_string(),
+            ));
         }
 
         if parts.len() < 2 {

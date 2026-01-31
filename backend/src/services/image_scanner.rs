@@ -67,10 +67,10 @@ impl ImageScanner {
     /// Check if this artifact is an OCI/Docker image manifest.
     fn is_container_image(artifact: &Artifact) -> bool {
         let ct = &artifact.content_type;
-        ct.contains("vnd.oci.image") ||
-        ct.contains("vnd.docker.distribution") ||
-        ct.contains("vnd.docker.container") ||
-        artifact.path.contains("/manifests/")
+        ct.contains("vnd.oci.image")
+            || ct.contains("vnd.docker.distribution")
+            || ct.contains("vnd.docker.container")
+            || artifact.path.contains("/manifests/")
     }
 
     /// Extract an image reference from the artifact path.
@@ -92,7 +92,12 @@ impl ImageScanner {
 
     /// Check if the Trivy server is available.
     async fn check_trivy_health(&self) -> bool {
-        match self.http.get(format!("{}/healthz", self.trivy_url)).send().await {
+        match self
+            .http
+            .get(format!("{}/healthz", self.trivy_url))
+            .send()
+            .await
+        {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }
@@ -104,10 +109,13 @@ impl ImageScanner {
         let output = tokio::process::Command::new("trivy")
             .args([
                 "image",
-                "--server", &self.trivy_url,
-                "--format", "json",
+                "--server",
+                &self.trivy_url,
+                "--format",
+                "json",
                 "--quiet",
-                "--timeout", "5m",
+                "--timeout",
+                "5m",
                 image_ref,
             ])
             .output()
@@ -146,7 +154,9 @@ impl ImageScanner {
             }
         });
 
-        let resp = self.http.post(&url)
+        let resp = self
+            .http
+            .post(&url)
             .json(&body)
             .send()
             .await
@@ -173,11 +183,12 @@ impl ImageScanner {
         for result in &report.results {
             if let Some(ref vulns) = result.vulnerabilities {
                 for vuln in vulns {
-                    let severity = Severity::from_str_loose(&vuln.severity)
-                        .unwrap_or(Severity::Info);
+                    let severity =
+                        Severity::from_str_loose(&vuln.severity).unwrap_or(Severity::Info);
 
-                    let title = vuln.title.clone()
-                        .unwrap_or_else(|| format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name));
+                    let title = vuln.title.clone().unwrap_or_else(|| {
+                        format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
+                    });
 
                     findings.push(RawFinding {
                         severity,
@@ -394,7 +405,11 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::Critical);
         assert_eq!(findings[0].cve_id, Some("CVE-2021-36159".to_string()));
         assert_eq!(findings[0].title, "apk-tools: heap overflow in libfetch");
-        assert!(findings[0].affected_component.as_ref().unwrap().contains("apk-tools"));
+        assert!(findings[0]
+            .affected_component
+            .as_ref()
+            .unwrap()
+            .contains("apk-tools"));
         assert_eq!(findings[0].fixed_version, Some("2.12.6-r0".to_string()));
         assert_eq!(findings[0].source, Some("trivy".to_string()));
 

@@ -113,9 +113,8 @@ impl ComposerHandler {
                     AppError::Validation(format!("Failed to read composer.json: {}", e))
                 })?;
 
-                return serde_json::from_str(&content).map_err(|e| {
-                    AppError::Validation(format!("Invalid composer.json: {}", e))
-                });
+                return serde_json::from_str(&content)
+                    .map_err(|e| AppError::Validation(format!("Invalid composer.json: {}", e)));
             }
         }
 
@@ -267,16 +266,14 @@ mod tests {
 
     #[test]
     fn test_parse_v1_metadata() {
-        let info =
-            ComposerHandler::parse_path("p/laravel/framework$abc123def.json").unwrap();
+        let info = ComposerHandler::parse_path("p/laravel/framework$abc123def.json").unwrap();
         assert!(matches!(info.kind, ComposerPathKind::MetadataV1));
         assert_eq!(info.vendor, Some("laravel".to_string()));
     }
 
     #[test]
     fn test_parse_dist_archive() {
-        let info =
-            ComposerHandler::parse_path("dist/laravel/framework/11.0.0/abc123.zip").unwrap();
+        let info = ComposerHandler::parse_path("dist/laravel/framework/11.0.0/abc123.zip").unwrap();
         assert!(matches!(info.kind, ComposerPathKind::Archive));
         assert_eq!(info.vendor, Some("laravel".to_string()));
         assert_eq!(info.package, Some("framework".to_string()));

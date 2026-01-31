@@ -15,6 +15,7 @@ pub mod generic;
 pub mod gitlfs;
 pub mod go;
 pub mod helm;
+pub mod hex;
 pub mod huggingface;
 pub mod jetbrains_plugins;
 pub mod maven;
@@ -24,9 +25,9 @@ pub mod nuget;
 pub mod oci;
 pub mod opkg;
 pub mod p2;
+pub mod r#pub;
 pub mod puppet;
 pub mod pypi;
-pub mod r#pub;
 pub mod rpm;
 pub mod rubygems;
 pub mod sbt;
@@ -35,7 +36,6 @@ pub mod terraform;
 pub mod vagrant;
 pub mod vscode_extensions;
 pub mod wasm;
-pub mod hex;
 
 #[cfg(test)]
 mod format_tests;
@@ -187,9 +187,10 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
 pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandler> {
     match format {
         RepositoryFormat::Maven | RepositoryFormat::Gradle => Box::new(maven::MavenHandler::new()),
-        RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Bower | RepositoryFormat::Pnpm => {
-            Box::new(npm::NpmHandler::new())
-        }
+        RepositoryFormat::Npm
+        | RepositoryFormat::Yarn
+        | RepositoryFormat::Bower
+        | RepositoryFormat::Pnpm => Box::new(npm::NpmHandler::new()),
         RepositoryFormat::Pypi | RepositoryFormat::Poetry | RepositoryFormat::Conda => {
             Box::new(pypi::PypiHandler::new())
         }
@@ -240,12 +241,53 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
 /// List all supported core format keys.
 pub fn list_core_formats() -> Vec<&'static str> {
     vec![
-        "maven", "npm", "pypi", "nuget", "go", "rubygems", "docker", "helm", "rpm", "debian",
-        "conan", "cargo", "generic", "podman", "buildx", "oras", "wasm_oci", "helm_oci",
-        "poetry", "conda", "yarn", "bower", "pnpm", "chocolatey", "powershell",
-        "terraform", "opentofu", "alpine", "conda_native", "composer",
-        "hex", "cocoapods", "swift", "pub", "sbt", "chef", "puppet", "ansible",
-        "gitlfs", "vscode", "jetbrains", "huggingface", "mlmodel",
-        "cran", "vagrant", "opkg", "p2", "bazel",
+        "maven",
+        "npm",
+        "pypi",
+        "nuget",
+        "go",
+        "rubygems",
+        "docker",
+        "helm",
+        "rpm",
+        "debian",
+        "conan",
+        "cargo",
+        "generic",
+        "podman",
+        "buildx",
+        "oras",
+        "wasm_oci",
+        "helm_oci",
+        "poetry",
+        "conda",
+        "yarn",
+        "bower",
+        "pnpm",
+        "chocolatey",
+        "powershell",
+        "terraform",
+        "opentofu",
+        "alpine",
+        "conda_native",
+        "composer",
+        "hex",
+        "cocoapods",
+        "swift",
+        "pub",
+        "sbt",
+        "chef",
+        "puppet",
+        "ansible",
+        "gitlfs",
+        "vscode",
+        "jetbrains",
+        "huggingface",
+        "mlmodel",
+        "cran",
+        "vagrant",
+        "opkg",
+        "p2",
+        "bazel",
     ]
 }

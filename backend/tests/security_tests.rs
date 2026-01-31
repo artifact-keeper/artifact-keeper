@@ -40,9 +40,18 @@ mod security_model_tests {
     #[test]
     fn test_severity_from_str_loose() {
         // Critical
-        assert_eq!(Severity::from_str_loose("critical"), Some(Severity::Critical));
-        assert_eq!(Severity::from_str_loose("CRITICAL"), Some(Severity::Critical));
-        assert_eq!(Severity::from_str_loose("Critical"), Some(Severity::Critical));
+        assert_eq!(
+            Severity::from_str_loose("critical"),
+            Some(Severity::Critical)
+        );
+        assert_eq!(
+            Severity::from_str_loose("CRITICAL"),
+            Some(Severity::Critical)
+        );
+        assert_eq!(
+            Severity::from_str_loose("Critical"),
+            Some(Severity::Critical)
+        );
 
         // High
         assert_eq!(Severity::from_str_loose("high"), Some(Severity::High));
@@ -64,8 +73,14 @@ mod security_model_tests {
         // Info (including aliases)
         assert_eq!(Severity::from_str_loose("info"), Some(Severity::Info));
         assert_eq!(Severity::from_str_loose("INFO"), Some(Severity::Info));
-        assert_eq!(Severity::from_str_loose("informational"), Some(Severity::Info));
-        assert_eq!(Severity::from_str_loose("INFORMATIONAL"), Some(Severity::Info));
+        assert_eq!(
+            Severity::from_str_loose("informational"),
+            Some(Severity::Info)
+        );
+        assert_eq!(
+            Severity::from_str_loose("INFORMATIONAL"),
+            Some(Severity::Info)
+        );
         assert_eq!(Severity::from_str_loose("none"), Some(Severity::Info));
         assert_eq!(Severity::from_str_loose("NONE"), Some(Severity::Info));
 
@@ -175,7 +190,7 @@ mod security_model_tests {
             + 1 * Severity::High.penalty_weight()              // 10
             + 2 * Severity::Medium.penalty_weight()            // 6
             + 3 * Severity::Low.penalty_weight()               // 3
-            + 5 * Severity::Info.penalty_weight();             // 0
+            + 5 * Severity::Info.penalty_weight(); // 0
         let score = (100 - penalty).max(0);
         assert_eq!(penalty, 69);
         assert_eq!(score, 31);
@@ -221,7 +236,7 @@ mod security_model_tests {
     fn test_only_low_and_info_findings() {
         // Many low severity findings should still allow decent score
         let penalty = 20 * Severity::Low.penalty_weight()   // 20
-            + 50 * Severity::Info.penalty_weight();         // 0
+            + 50 * Severity::Info.penalty_weight(); // 0
         let score = (100 - penalty).max(0);
         assert_eq!(penalty, 20);
         assert_eq!(score, 80);

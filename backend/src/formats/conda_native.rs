@@ -202,8 +202,7 @@ mod tests {
     #[test]
     fn test_parse_conda_v2_package() {
         let info =
-            CondaNativeHandler::parse_path("linux-64/numpy-1.26.4-py312h02b7e37_0.conda")
-                .unwrap();
+            CondaNativeHandler::parse_path("linux-64/numpy-1.26.4-py312h02b7e37_0.conda").unwrap();
         assert_eq!(info.subdir, Some("linux-64".to_string()));
         assert_eq!(info.name, Some("numpy".to_string()));
         assert_eq!(info.version, Some("1.26.4".to_string()));
@@ -214,8 +213,7 @@ mod tests {
     #[test]
     fn test_parse_conda_v1_package() {
         let info =
-            CondaNativeHandler::parse_path("noarch/requests-2.31.0-pyhd8ed1ab_0.tar.bz2")
-                .unwrap();
+            CondaNativeHandler::parse_path("noarch/requests-2.31.0-pyhd8ed1ab_0.tar.bz2").unwrap();
         assert_eq!(info.subdir, Some("noarch".to_string()));
         assert_eq!(info.name, Some("requests".to_string()));
         assert_eq!(info.version, Some("2.31.0".to_string()));

@@ -76,10 +76,7 @@ impl PolicyService {
             if let Some(ref scan) = latest_scan {
                 // Check: block_on_fail
                 if policy.block_on_fail && scan.status == "failed" {
-                    violations.push(format!(
-                        "Policy '{}': latest scan failed",
-                        policy.name
-                    ));
+                    violations.push(format!("Policy '{}': latest scan failed", policy.name));
                     continue;
                 }
 

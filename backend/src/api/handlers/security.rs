@@ -30,10 +30,7 @@ pub fn router() -> Router<SharedState> {
         .route("/artifacts/:artifact_id/scans", get(list_artifact_scans))
         // Finding acknowledgment
         .route("/findings/:id/acknowledge", post(acknowledge_finding))
-        .route(
-            "/findings/:id/acknowledge",
-            delete(revoke_acknowledgment),
-        )
+        .route("/findings/:id/acknowledge", delete(revoke_acknowledgment))
         // Policy CRUD
         .route("/policies", get(list_policies).post(create_policy))
         .route(
@@ -45,7 +42,10 @@ pub fn router() -> Router<SharedState> {
 /// Repository-scoped security routes (nested under /repositories/:key)
 pub fn repo_security_router() -> Router<SharedState> {
     Router::new()
-        .route("/security", get(get_repo_security).put(update_repo_security))
+        .route(
+            "/security",
+            get(get_repo_security).put(update_repo_security),
+        )
         .route("/security/scans", get(list_repo_scans))
 }
 
@@ -611,14 +611,11 @@ async fn get_repo_security(
     Path(key): Path<String>,
 ) -> Result<Json<RepoSecurityResponse>> {
     // Resolve repository by key
-    let repo = sqlx::query_scalar!(
-        "SELECT id FROM repositories WHERE key = $1",
-        key,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+    let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
 
     let config_svc = ScanConfigService::new(state.db.clone());
     let result_svc = ScanResultService::new(state.db.clone());
@@ -661,14 +658,11 @@ async fn update_repo_security(
     Path(key): Path<String>,
     Json(body): Json<UpsertScanConfigRequest>,
 ) -> Result<Json<ScanConfigResponse>> {
-    let repo = sqlx::query_scalar!(
-        "SELECT id FROM repositories WHERE key = $1",
-        key,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+    let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
 
     let svc = ScanConfigService::new(state.db.clone());
     let c = svc.upsert_config(repo, &body).await?;
@@ -698,28 +692,37 @@ async fn list_artifact_scans(
     let offset = (page - 1) * per_page;
 
     let (scans, total) = svc
-        .list_scans(None, Some(artifact_id), query.status.as_deref(), offset, per_page)
+        .list_scans(
+            None,
+            Some(artifact_id),
+            query.status.as_deref(),
+            offset,
+            per_page,
+        )
         .await?;
 
     Ok(Json(ScanListResponse {
-        items: scans.into_iter().map(|s| ScanResponse {
-            id: s.id,
-            artifact_id: s.artifact_id,
-            repository_id: s.repository_id,
-            scan_type: s.scan_type,
-            status: s.status,
-            findings_count: s.findings_count,
-            critical_count: s.critical_count,
-            high_count: s.high_count,
-            medium_count: s.medium_count,
-            low_count: s.low_count,
-            info_count: s.info_count,
-            scanner_version: s.scanner_version,
-            error_message: s.error_message,
-            started_at: s.started_at,
-            completed_at: s.completed_at,
-            created_at: s.created_at,
-        }).collect(),
+        items: scans
+            .into_iter()
+            .map(|s| ScanResponse {
+                id: s.id,
+                artifact_id: s.artifact_id,
+                repository_id: s.repository_id,
+                scan_type: s.scan_type,
+                status: s.status,
+                findings_count: s.findings_count,
+                critical_count: s.critical_count,
+                high_count: s.high_count,
+                medium_count: s.medium_count,
+                low_count: s.low_count,
+                info_count: s.info_count,
+                scanner_version: s.scanner_version,
+                error_message: s.error_message,
+                started_at: s.started_at,
+                completed_at: s.completed_at,
+                created_at: s.created_at,
+            })
+            .collect(),
         total,
     }))
 }
@@ -730,14 +733,11 @@ async fn list_repo_scans(
     Path(key): Path<String>,
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
-    let repo = sqlx::query_scalar!(
-        "SELECT id FROM repositories WHERE key = $1",
-        key,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
+    let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
 
     let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);

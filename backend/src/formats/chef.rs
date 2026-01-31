@@ -28,9 +28,9 @@ impl ChefHandler {
     pub fn parse_path(path: &str) -> Result<ChefPathInfo> {
         // Try API path first: api/v1/cookbooks/<name>/versions/<version>
         if path.starts_with("api/v1/cookbooks/") {
-            let remainder = path.strip_prefix("api/v1/cookbooks/").ok_or_else(|| {
-                AppError::Validation(format!("Invalid Chef API path: {}", path))
-            })?;
+            let remainder = path
+                .strip_prefix("api/v1/cookbooks/")
+                .ok_or_else(|| AppError::Validation(format!("Invalid Chef API path: {}", path)))?;
 
             let parts: Vec<&str> = remainder.split('/').collect();
 
@@ -63,9 +63,9 @@ impl ChefHandler {
 
         // Try archive path: cookbooks/<name>-<version>.tar.gz
         if path.starts_with("cookbooks/") {
-            let filename = path
-                .strip_prefix("cookbooks/")
-                .ok_or_else(|| AppError::Validation(format!("Invalid Chef archive path: {}", path)))?;
+            let filename = path.strip_prefix("cookbooks/").ok_or_else(|| {
+                AppError::Validation(format!("Invalid Chef archive path: {}", path))
+            })?;
 
             if !filename.ends_with(".tar.gz") {
                 return Err(AppError::Validation(format!(
@@ -74,9 +74,9 @@ impl ChefHandler {
                 )));
             }
 
-            let name_version = filename
-                .strip_suffix(".tar.gz")
-                .ok_or_else(|| AppError::Validation(format!("Invalid Chef archive path: {}", path)))?;
+            let name_version = filename.strip_suffix(".tar.gz").ok_or_else(|| {
+                AppError::Validation(format!("Invalid Chef archive path: {}", path))
+            })?;
 
             // Split on the last hyphen to separate name from version
             if let Some(last_hyphen) = name_version.rfind('-') {
@@ -171,7 +171,8 @@ mod tests {
     #[test]
     fn test_parse_archive_path_with_hyphenated_name() {
         let path = "cookbooks/chef-client-5.2.1.tar.gz";
-        let info = ChefHandler::parse_path(path).expect("Should parse archive path with hyphenated name");
+        let info =
+            ChefHandler::parse_path(path).expect("Should parse archive path with hyphenated name");
 
         assert_eq!(info.name, "chef-client");
         assert_eq!(info.version, Some("5.2.1".to_string()));

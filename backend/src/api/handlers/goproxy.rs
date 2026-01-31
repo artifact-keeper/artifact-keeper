@@ -166,11 +166,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -394,10 +390,7 @@ async fn version_info(
             .into_response()
     })?;
 
-    let time_str = artifact
-        .created_at
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let time_str = artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let info = serde_json::json!({
         "Version": version,
@@ -594,10 +587,7 @@ async fn latest_version(
     })?;
 
     let version = artifact.version.unwrap_or_default();
-    let time_str = artifact
-        .created_at
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+    let time_str = artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     let info = serde_json::json!({
         "Version": version,

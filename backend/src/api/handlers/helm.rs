@@ -43,10 +43,7 @@ pub fn router() -> Router<SharedState> {
         // ChartMuseum-compatible upload
         .route("/:repo_key/api/charts", post(upload_chart))
         // ChartMuseum-compatible delete
-        .route(
-            "/:repo_key/api/charts/:name/:version",
-            delete(delete_chart),
-        )
+        .route("/:repo_key/api/charts/:name/:version", delete(delete_chart))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
@@ -59,11 +56,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -199,9 +192,7 @@ async fn index_yaml(
         let chart_yaml = metadata
             .as_ref()
             .and_then(|m| m.get("chart"))
-            .and_then(|chart_value| {
-                serde_json::from_value::<ChartYaml>(chart_value.clone()).ok()
-            });
+            .and_then(|chart_value| serde_json::from_value::<ChartYaml>(chart_value.clone()).ok());
 
         // Fall back to a minimal ChartYaml if metadata is missing
         let chart_yaml = chart_yaml.unwrap_or_else(|| ChartYaml {

@@ -98,11 +98,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -164,10 +160,7 @@ fn compute_sha256(data: &[u8]) -> String {
 
 /// Resolve the first path segment as a repository key and the rest as the
 /// image name within the repository.
-async fn resolve_repo(
-    db: &PgPool,
-    image_name: &str,
-) -> Result<(Uuid, String, String), Response> {
+async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<(Uuid, String, String), Response> {
     // Split: "test/python" → repo_key="test", image="python"
     // Or:    "myrepo/org/image" → repo_key="myrepo", image="org/image"
     let (repo_key, image) = match image_name.find('/') {
@@ -181,8 +174,20 @@ async fn resolve_repo(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string()))?
-    .ok_or_else(|| oci_error(StatusCode::NOT_FOUND, "NAME_UNKNOWN", &format!("repository not found: {}", repo_key)))?;
+    .map_err(|e| {
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        )
+    })?
+    .ok_or_else(|| {
+        oci_error(
+            StatusCode::NOT_FOUND,
+            "NAME_UNKNOWN",
+            &format!("repository not found: {}", repo_key),
+        )
+    })?;
 
     Ok((repo.id, repo.storage_path, image.to_string()))
 }
@@ -219,7 +224,8 @@ async fn token(
         None => {
             // Also try Bearer token (docker may send existing token)
             if let Ok(claims) = validate_token(&state.db, &state.config, &headers) {
-                let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+                let auth_service =
+                    AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
                 let user = match sqlx::query_as!(
                     crate::models::user::User,
                     r#"SELECT id, username, email, password_hash, display_name,
@@ -233,12 +239,24 @@ async fn token(
                 .await
                 {
                     Ok(Some(u)) => u,
-                    _ => return oci_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "invalid credentials"),
+                    _ => {
+                        return oci_error(
+                            StatusCode::UNAUTHORIZED,
+                            "UNAUTHORIZED",
+                            "invalid credentials",
+                        )
+                    }
                 };
 
                 let tokens = match auth_service.generate_tokens(&user) {
                     Ok(t) => t,
-                    Err(_) => return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "token generation failed"),
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL_ERROR",
+                            "token generation failed",
+                        )
+                    }
                 };
 
                 let resp = TokenResponse {
@@ -254,12 +272,19 @@ async fn token(
                     .body(Body::from(serde_json::to_string(&resp).unwrap()))
                     .unwrap();
             }
-            return oci_error(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", "credentials required");
+            return oci_error(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "credentials required",
+            );
         }
     };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = match auth_service.authenticate(&credentials.0, &credentials.1).await {
+    let (_user, tokens) = match auth_service
+        .authenticate(&credentials.0, &credentials.1)
+        .await
+    {
         Ok(result) => result,
         Err(_) => {
             return oci_error(
@@ -318,7 +343,9 @@ fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
     let parts: Vec<&str> = path.split('/').collect();
 
     // Find "manifests" or "blobs" in the parts
-    let op_idx = parts.iter().position(|&p| p == "manifests" || p == "blobs" || p == "tags")?;
+    let op_idx = parts
+        .iter()
+        .position(|&p| p == "manifests" || p == "blobs" || p == "tags")?;
     let name = parts[..op_idx].join("/");
     let operation = parts[op_idx];
 
@@ -464,14 +491,21 @@ async fn handle_start_upload(
                 return oci_error(
                     StatusCode::BAD_REQUEST,
                     "DIGEST_INVALID",
-                    &format!("digest mismatch: computed {} != provided {}", computed, digest),
+                    &format!(
+                        "digest mismatch: computed {} != provided {}",
+                        computed, digest
+                    ),
                 );
             }
 
             let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
             let key = blob_storage_key(digest);
             if let Err(e) = storage.put(&key, body.clone()).await {
-                return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "BLOB_UPLOAD_UNKNOWN", &e.to_string());
+                return oci_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "BLOB_UPLOAD_UNKNOWN",
+                    &e.to_string(),
+                );
             }
 
             // Record in oci_blobs
@@ -500,7 +534,11 @@ async fn handle_start_upload(
     if !body.is_empty() {
         let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
         if let Err(e) = storage.put(&temp_key, body.clone()).await {
-            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "BLOB_UPLOAD_UNKNOWN", &e.to_string());
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_UPLOAD_UNKNOWN",
+                &e.to_string(),
+            );
         }
     }
 
@@ -516,11 +554,17 @@ async fn handle_start_upload(
         return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
     }
 
-    info!("Started blob upload session {} for {}", session_id, image_name);
+    info!(
+        "Started blob upload session {} for {}",
+        session_id, image_name
+    );
 
     Response::builder()
         .status(StatusCode::ACCEPTED)
-        .header(LOCATION, format!("/v2/{}/blobs/uploads/{}", image_name, session_id))
+        .header(
+            LOCATION,
+            format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
+        )
         .header("Docker-Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", bytes_received.max(0)))
         .header(CONTENT_LENGTH, "0")
@@ -544,7 +588,13 @@ async fn handle_patch_upload(
 
     let session_id: Uuid = match uuid_str.parse() {
         Ok(id) => id,
-        Err(_) => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "invalid upload UUID"),
+        Err(_) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "invalid upload UUID",
+            )
+        }
     };
 
     // Look up session
@@ -575,21 +625,32 @@ async fn handle_patch_upload(
     existing.extend_from_slice(&body);
 
     let new_bytes = existing.len() as i64;
-    if let Err(e) = storage.put(&session.storage_temp_key, Bytes::from(existing)).await {
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "BLOB_UPLOAD_UNKNOWN", &e.to_string());
+    if let Err(e) = storage
+        .put(&session.storage_temp_key, Bytes::from(existing))
+        .await
+    {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UPLOAD_UNKNOWN",
+            &e.to_string(),
+        );
     }
 
     // Update session
     let _ = sqlx::query!(
         "UPDATE oci_upload_sessions SET bytes_received = $2, updated_at = NOW() WHERE id = $1",
-        session_id, new_bytes
+        session_id,
+        new_bytes
     )
     .execute(&state.db)
     .await;
 
     Response::builder()
         .status(StatusCode::ACCEPTED)
-        .header(LOCATION, format!("/v2/{}/blobs/uploads/{}", image_name, session_id))
+        .header(
+            LOCATION,
+            format!("/v2/{}/blobs/uploads/{}", image_name, session_id),
+        )
         .header("Docker-Upload-UUID", session_id.to_string())
         .header("Range", format!("0-{}", new_bytes))
         .header(CONTENT_LENGTH, "0")
@@ -614,12 +675,24 @@ async fn handle_complete_upload(
 
     let digest = match digest_query {
         Some(d) => d.to_string(),
-        None => return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "digest query parameter required"),
+        None => {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                "digest query parameter required",
+            )
+        }
     };
 
     let session_id: Uuid = match uuid_str.parse() {
         Ok(id) => id,
-        Err(_) => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "invalid upload UUID"),
+        Err(_) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "invalid upload UUID",
+            )
+        }
     };
 
     let session = match sqlx::query!(
@@ -630,8 +703,20 @@ async fn handle_complete_upload(
     .await
     {
         Ok(Some(s)) => s,
-        Ok(None) => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "upload session not found"),
-        Err(e) => return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string()),
+        Ok(None) => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "BLOB_UPLOAD_UNKNOWN",
+                "upload session not found",
+            )
+        }
+        Err(e) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                &e.to_string(),
+            )
+        }
     };
 
     let (_repo_id, storage_path, _image) = match resolve_repo(&state.db, image_name).await {
@@ -656,7 +741,10 @@ async fn handle_complete_upload(
         return oci_error(
             StatusCode::BAD_REQUEST,
             "DIGEST_INVALID",
-            &format!("digest mismatch: computed {} != provided {}", computed, digest),
+            &format!(
+                "digest mismatch: computed {} != provided {}",
+                computed, digest
+            ),
         );
     }
 
@@ -664,7 +752,11 @@ async fn handle_complete_upload(
     let blob_key = blob_storage_key(&digest);
     let size_bytes = data.len() as i64;
     if let Err(e) = storage.put(&blob_key, Bytes::from(data)).await {
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "BLOB_UPLOAD_UNKNOWN", &e.to_string());
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UPLOAD_UNKNOWN",
+            &e.to_string(),
+        );
     }
 
     // Record in oci_blobs
@@ -681,7 +773,10 @@ async fn handle_complete_upload(
         .execute(&state.db)
         .await;
 
-    info!("Completed blob upload {}: {} ({} bytes)", session_id, digest, size_bytes);
+    info!(
+        "Completed blob upload {}: {} ({} bytes)",
+        session_id, digest, size_bytes
+    );
 
     Response::builder()
         .status(StatusCode::CREATED)
@@ -752,7 +847,11 @@ async fn handle_head_manifest(
             .header(CONTENT_TYPE, &content_type)
             .body(Body::empty())
             .unwrap(),
-        Err(_) => oci_error(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", "manifest not found"),
+        Err(_) => oci_error(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_UNKNOWN",
+            "manifest not found",
+        ),
     }
 }
 
@@ -809,7 +908,11 @@ async fn handle_get_manifest(
             .header(CONTENT_TYPE, &content_type)
             .body(Body::from(data))
             .unwrap(),
-        Err(_) => oci_error(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", "manifest data not found"),
+        Err(_) => oci_error(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_UNKNOWN",
+            "manifest data not found",
+        ),
     }
 }
 
@@ -844,7 +947,11 @@ async fn handle_put_manifest(
     // Store manifest
     let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
     if let Err(e) = storage.put(&manifest_key, body.clone()).await {
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "MANIFEST_INVALID", &e.to_string());
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "MANIFEST_INVALID",
+            &e.to_string(),
+        );
     }
 
     // Upsert tag mapping
@@ -855,30 +962,44 @@ async fn handle_put_manifest(
              manifest_digest = EXCLUDED.manifest_digest,
              manifest_content_type = EXCLUDED.manifest_content_type,
              updated_at = NOW()"#,
-        repo_id, image, reference, digest, content_type
+        repo_id,
+        image,
+        reference,
+        digest,
+        content_type
     )
     .execute(&state.db)
     .await
     {
-        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string());
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
     }
 
     // Calculate total image size from manifest (config + layers)
-    let total_size: i64 = if let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(&body) {
-        let config_size = manifest_json.get("config")
-            .and_then(|c| c.get("size"))
-            .and_then(|s| s.as_i64())
-            .unwrap_or(0);
-        let layers_size: i64 = manifest_json.get("layers")
-            .and_then(|l| l.as_array())
-            .map(|layers| layers.iter()
-                .filter_map(|l| l.get("size").and_then(|s| s.as_i64()))
-                .sum())
-            .unwrap_or(0);
-        config_size + layers_size
-    } else {
-        body.len() as i64
-    };
+    let total_size: i64 =
+        if let Ok(manifest_json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            let config_size = manifest_json
+                .get("config")
+                .and_then(|c| c.get("size"))
+                .and_then(|s| s.as_i64())
+                .unwrap_or(0);
+            let layers_size: i64 = manifest_json
+                .get("layers")
+                .and_then(|l| l.as_array())
+                .map(|layers| {
+                    layers
+                        .iter()
+                        .filter_map(|l| l.get("size").and_then(|s| s.as_i64()))
+                        .sum()
+                })
+                .unwrap_or(0);
+            config_size + layers_size
+        } else {
+            body.len() as i64
+        };
 
     // Also create an artifact record so it appears in the UI
     let artifact_path = format!("v2/{}/manifests/{}", image, reference);
@@ -949,14 +1070,18 @@ async fn catch_all(
         ("HEAD", "blobs") => {
             let digest = match reference {
                 Some(d) => d,
-                None => return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "digest required"),
+                None => {
+                    return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "digest required")
+                }
             };
             handle_head_blob(&state, &headers, &image_name, &digest).await
         }
         ("GET", "blobs") => {
             let digest = match reference {
                 Some(d) => d,
-                None => return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "digest required"),
+                None => {
+                    return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "digest required")
+                }
             };
             handle_get_blob(&state, &headers, &image_name, &digest).await
         }
@@ -969,14 +1094,26 @@ async fn catch_all(
         ("PATCH", "uploads") => {
             let uuid = match reference {
                 Some(u) => u,
-                None => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "upload UUID required"),
+                None => {
+                    return oci_error(
+                        StatusCode::NOT_FOUND,
+                        "BLOB_UPLOAD_UNKNOWN",
+                        "upload UUID required",
+                    )
+                }
             };
             handle_patch_upload(&state, &headers, &image_name, &uuid, body).await
         }
         ("PUT", "uploads") => {
             let uuid = match reference {
                 Some(u) => u,
-                None => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "upload UUID required"),
+                None => {
+                    return oci_error(
+                        StatusCode::NOT_FOUND,
+                        "BLOB_UPLOAD_UNKNOWN",
+                        "upload UUID required",
+                    )
+                }
             };
             let digest = query.get("digest").map(|s| s.as_str());
             handle_complete_upload(&state, &headers, &image_name, &uuid, digest, body).await
@@ -986,21 +1123,39 @@ async fn catch_all(
         ("HEAD", "manifests") => {
             let reference = match reference {
                 Some(r) => r,
-                None => return oci_error(StatusCode::BAD_REQUEST, "NAME_INVALID", "reference required"),
+                None => {
+                    return oci_error(
+                        StatusCode::BAD_REQUEST,
+                        "NAME_INVALID",
+                        "reference required",
+                    )
+                }
             };
             handle_head_manifest(&state, &headers, &image_name, &reference).await
         }
         ("GET", "manifests") => {
             let reference = match reference {
                 Some(r) => r,
-                None => return oci_error(StatusCode::BAD_REQUEST, "NAME_INVALID", "reference required"),
+                None => {
+                    return oci_error(
+                        StatusCode::BAD_REQUEST,
+                        "NAME_INVALID",
+                        "reference required",
+                    )
+                }
             };
             handle_get_manifest(&state, &headers, &image_name, &reference).await
         }
         ("PUT", "manifests") => {
             let reference = match reference {
                 Some(r) => r,
-                None => return oci_error(StatusCode::BAD_REQUEST, "NAME_INVALID", "reference required"),
+                None => {
+                    return oci_error(
+                        StatusCode::BAD_REQUEST,
+                        "NAME_INVALID",
+                        "reference required",
+                    )
+                }
             };
             handle_put_manifest(&state, &headers, &image_name, &reference, body).await
         }

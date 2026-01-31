@@ -107,9 +107,9 @@ impl PuppetHandler {
 
         // Try archive path: modules/<author>-<name>-<version>.tar.gz
         if path.starts_with("modules/") {
-            let filename = path
-                .strip_prefix("modules/")
-                .ok_or_else(|| AppError::Validation(format!("Invalid Puppet archive path: {}", path)))?;
+            let filename = path.strip_prefix("modules/").ok_or_else(|| {
+                AppError::Validation(format!("Invalid Puppet archive path: {}", path))
+            })?;
 
             if !filename.ends_with(".tar.gz") {
                 return Err(AppError::Validation(format!(
@@ -118,9 +118,9 @@ impl PuppetHandler {
                 )));
             }
 
-            let author_name_version = filename
-                .strip_suffix(".tar.gz")
-                .ok_or_else(|| AppError::Validation(format!("Invalid Puppet archive path: {}", path)))?;
+            let author_name_version = filename.strip_suffix(".tar.gz").ok_or_else(|| {
+                AppError::Validation(format!("Invalid Puppet archive path: {}", path))
+            })?;
 
             // Split on the first hyphen for author
             if let Some(first_hyphen) = author_name_version.find('-') {
@@ -225,7 +225,8 @@ mod tests {
     #[test]
     fn test_parse_archive_path_with_hyphenated_name() {
         let path = "modules/puppetlabs-linux-base-2.1.0.tar.gz";
-        let info = PuppetHandler::parse_path(path).expect("Should parse archive path with hyphenated name");
+        let info = PuppetHandler::parse_path(path)
+            .expect("Should parse archive path with hyphenated name");
 
         assert_eq!(info.author, "puppetlabs");
         assert_eq!(info.name, "linux-base");

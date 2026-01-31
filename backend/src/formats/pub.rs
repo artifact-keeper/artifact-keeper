@@ -50,7 +50,9 @@ impl PubHandler {
         if let Some(api_path) = path.strip_prefix("api/packages/") {
             let parts: Vec<&str> = api_path.split('/').collect();
             if parts.is_empty() {
-                return Err(AppError::Validation("Empty package name in Pub path".to_string()));
+                return Err(AppError::Validation(
+                    "Empty package name in Pub path".to_string(),
+                ));
             }
 
             let name = parts[0].to_string();
@@ -78,7 +80,8 @@ impl PubHandler {
             let parts: Vec<&str> = pkg_path.split('/').collect();
             if parts.len() < 3 {
                 return Err(AppError::Validation(
-                    "Invalid Pub archive path: expected packages/<name>/versions/<version>.tar.gz".to_string(),
+                    "Invalid Pub archive path: expected packages/<name>/versions/<version>.tar.gz"
+                        .to_string(),
                 ));
             }
 

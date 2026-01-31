@@ -244,8 +244,7 @@ mod tests {
 
     #[test]
     fn test_parse_module_download() {
-        let info =
-            TerraformHandler::parse_path("hashicorp/consul/aws/0.1.0/download").unwrap();
+        let info = TerraformHandler::parse_path("hashicorp/consul/aws/0.1.0/download").unwrap();
         assert!(matches!(info.kind, TerraformArtifactKind::Module));
         assert_eq!(info.version, Some("0.1.0".to_string()));
     }

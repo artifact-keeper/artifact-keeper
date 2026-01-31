@@ -78,11 +78,7 @@ fn extract_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -403,22 +399,14 @@ async fn push_gem(
 
     // Extract gemspec from the .gem file
     let gemspec = RubygemsHandler::extract_gemspec(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid gem file: {}", e),
-        )
-            .into_response()
+        (StatusCode::BAD_REQUEST, format!("Invalid gem file: {}", e)).into_response()
     })?;
 
     let gem_name = &gemspec.name;
     let gem_version = &gemspec.version;
 
     if gem_name.is_empty() || gem_version.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Gem name and version are required",
-        )
-            .into_response());
+        return Err((StatusCode::BAD_REQUEST, "Gem name and version are required").into_response());
     }
 
     // Build filename
@@ -459,16 +447,13 @@ async fn push_gem(
     // Store the file
     let storage_key = format!("rubygems/{}/{}/{}", gem_name, gem_version, filename);
     let storage = FilesystemStorage::new(&repo.storage_path);
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    storage.put(&storage_key, body.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
 
     // Build metadata JSON
     let gem_metadata = serde_json::json!({
@@ -572,13 +557,7 @@ async fn specs_index(
 
     let specs: Vec<serde_json::Value> = artifacts
         .iter()
-        .map(|a| {
-            serde_json::json!([
-                a.name,
-                a.version.clone().unwrap_or_default(),
-                "ruby"
-            ])
-        })
+        .map(|a| serde_json::json!([a.name, a.version.clone().unwrap_or_default(), "ruby"]))
         .collect();
 
     let json_bytes = serde_json::to_vec(&specs).map_err(|e| {
@@ -638,13 +617,7 @@ async fn latest_specs_index(
 
     let specs: Vec<serde_json::Value> = artifacts
         .iter()
-        .map(|a| {
-            serde_json::json!([
-                a.name,
-                a.version.clone().unwrap_or_default(),
-                "ruby"
-            ])
-        })
+        .map(|a| serde_json::json!([a.name, a.version.clone().unwrap_or_default(), "ruby"]))
         .collect();
 
     let json_bytes = serde_json::to_vec(&specs).map_err(|e| {
@@ -742,7 +715,9 @@ async fn dependencies(
                         .map(|dep| {
                             serde_json::json!([
                                 dep.get("name").and_then(|n| n.as_str()).unwrap_or(""),
-                                dep.get("requirements").and_then(|r| r.as_str()).unwrap_or(">= 0"),
+                                dep.get("requirements")
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or(">= 0"),
                             ])
                         })
                         .collect::<Vec<_>>()

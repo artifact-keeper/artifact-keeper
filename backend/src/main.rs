@@ -56,9 +56,7 @@ async fn main() -> Result<()> {
         initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
 
     // Initialize security scanner service
-    let advisory_client = Arc::new(AdvisoryClient::new(
-        std::env::var("GITHUB_TOKEN").ok(),
-    ));
+    let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
     let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
     let scanner_service = Arc::new(ScannerService::new(

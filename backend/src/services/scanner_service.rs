@@ -131,7 +131,12 @@ impl AdvisoryClient {
         {
             let cache = self.cache.read().await;
             for dep in deps {
-                let key = format!("{}:{}:{}", dep.ecosystem, dep.name, dep.version.as_deref().unwrap_or("*"));
+                let key = format!(
+                    "{}:{}:{}",
+                    dep.ecosystem,
+                    dep.name,
+                    dep.version.as_deref().unwrap_or("*")
+                );
                 if let Some(cached) = cache.get(&key) {
                     if cached.fetched_at.elapsed() < CACHE_TTL {
                         results.extend(cached.findings.clone());
@@ -351,12 +356,12 @@ impl AdvisoryClient {
         matches
     }
 
-    fn parse_github_advisory(
-        adv: &serde_json::Value,
-        dep: &Dependency,
-    ) -> Option<AdvisoryMatch> {
+    fn parse_github_advisory(adv: &serde_json::Value, dep: &Dependency) -> Option<AdvisoryMatch> {
         let ghsa_id = adv.get("ghsa_id")?.as_str()?.to_string();
-        let summary = adv.get("summary").and_then(|v| v.as_str()).map(String::from);
+        let summary = adv
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let description = adv
             .get("description")
             .and_then(|v| v.as_str())
@@ -366,10 +371,7 @@ impl AdvisoryClient {
             .and_then(|v| v.as_str())
             .unwrap_or("medium")
             .to_lowercase();
-        let cve_id = adv
-            .get("cve_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let cve_id = adv.get("cve_id").and_then(|v| v.as_str()).map(String::from);
         let html_url = adv
             .get("html_url")
             .and_then(|v| v.as_str())
@@ -442,7 +444,10 @@ impl DependencyScanner {
             Self::parse_go(content_str)
         } else if name == "pom.xml" || name.ends_with("/pom.xml") {
             Self::parse_maven(content_str)
-        } else if name.ends_with(".gemspec") || name == "gemfile.lock" || name.ends_with("/gemfile.lock") {
+        } else if name.ends_with(".gemspec")
+            || name == "gemfile.lock"
+            || name.ends_with("/gemfile.lock")
+        {
             Self::parse_rubygems(content_str)
         } else if name.ends_with(".nuspec") || name == "packages.config" {
             Self::parse_nuget(content_str)
@@ -458,9 +463,11 @@ impl DependencyScanner {
             for section in ["dependencies", "devDependencies", "peerDependencies"] {
                 if let Some(obj) = pkg.get(section).and_then(|v| v.as_object()) {
                     for (name, version) in obj {
-                        let ver = version
-                            .as_str()
-                            .map(|v| v.trim_start_matches('^').trim_start_matches('~').to_string());
+                        let ver = version.as_str().map(|v| {
+                            v.trim_start_matches('^')
+                                .trim_start_matches('~')
+                                .to_string()
+                        });
                         deps.push(Dependency {
                             name: name.clone(),
                             version: ver,
@@ -740,8 +747,8 @@ impl Scanner for DependencyScanner {
                 seen_ids.insert(alias.clone());
             }
 
-            let severity = Severity::from_str_loose(&advisory_match.severity)
-                .unwrap_or(Severity::Medium);
+            let severity =
+                Severity::from_str_loose(&advisory_match.severity).unwrap_or(Severity::Medium);
 
             let cve_id = advisory_match
                 .aliases
@@ -765,11 +772,7 @@ impl Scanner for DependencyScanner {
                 title,
                 description: advisory_match.details,
                 cve_id,
-                affected_component: Some(
-                    deps.first()
-                        .map(|d| d.name.clone())
-                        .unwrap_or_default(),
-                ),
+                affected_component: Some(deps.first().map(|d| d.name.clone()).unwrap_or_default()),
                 affected_version: advisory_match.affected_version,
                 fixed_version: advisory_match.fixed_version,
                 source: Some(advisory_match.source),
@@ -998,12 +1001,12 @@ impl ScannerService {
     }
 
     /// Update artifact quarantine_status based on scan findings.
-    async fn update_quarantine_status(
-        &self,
-        artifact_id: Uuid,
-        findings_count: i32,
-    ) -> Result<()> {
-        let status = if findings_count > 0 { "flagged" } else { "clean" };
+    async fn update_quarantine_status(&self, artifact_id: Uuid, findings_count: i32) -> Result<()> {
+        let status = if findings_count > 0 {
+            "flagged"
+        } else {
+            "clean"
+        };
         sqlx::query!(
             "UPDATE artifacts SET quarantine_status = $2 WHERE id = $1",
             artifact_id,

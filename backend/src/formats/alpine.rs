@@ -50,10 +50,7 @@ impl AlpineHandler {
                     is_index: false,
                 })
             }
-            _ => Err(AppError::Validation(format!(
-                "Invalid APK path: {}",
-                path
-            ))),
+            _ => Err(AppError::Validation(format!("Invalid APK path: {}", path))),
         }
     }
 
@@ -101,9 +98,9 @@ impl AlpineHandler {
 
             if path.to_string_lossy() == ".PKGINFO" {
                 let mut content = String::new();
-                entry.read_to_string(&mut content).map_err(|e| {
-                    AppError::Validation(format!("Failed to read .PKGINFO: {}", e))
-                })?;
+                entry
+                    .read_to_string(&mut content)
+                    .map_err(|e| AppError::Validation(format!("Failed to read .PKGINFO: {}", e)))?;
                 return Self::parse_pkginfo(&content);
             }
         }
@@ -140,9 +137,7 @@ impl AlpineHandler {
         }
 
         if info.pkgname.is_empty() {
-            return Err(AppError::Validation(
-                "PKGINFO missing pkgname".to_string(),
-            ));
+            return Err(AppError::Validation("PKGINFO missing pkgname".to_string()));
         }
 
         Ok(info)

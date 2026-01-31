@@ -69,9 +69,9 @@ impl AnsibleHandler {
 
         // Try archive path: collections/<namespace>-<name>-<version>.tar.gz
         if path.starts_with("collections/") {
-            let filename = path
-                .strip_prefix("collections/")
-                .ok_or_else(|| AppError::Validation(format!("Invalid Ansible archive path: {}", path)))?;
+            let filename = path.strip_prefix("collections/").ok_or_else(|| {
+                AppError::Validation(format!("Invalid Ansible archive path: {}", path))
+            })?;
 
             if !filename.ends_with(".tar.gz") {
                 return Err(AppError::Validation(format!(
@@ -80,9 +80,9 @@ impl AnsibleHandler {
                 )));
             }
 
-            let namespace_name_version = filename
-                .strip_suffix(".tar.gz")
-                .ok_or_else(|| AppError::Validation(format!("Invalid Ansible archive path: {}", path)))?;
+            let namespace_name_version = filename.strip_suffix(".tar.gz").ok_or_else(|| {
+                AppError::Validation(format!("Invalid Ansible archive path: {}", path))
+            })?;
 
             // Split on the first hyphen for namespace
             if let Some(first_hyphen) = namespace_name_version.find('-') {
@@ -187,7 +187,8 @@ mod tests {
     #[test]
     fn test_parse_archive_path_with_hyphenated_name() {
         let path = "collections/community-aws-network-1.2.3.tar.gz";
-        let info = AnsibleHandler::parse_path(path).expect("Should parse archive path with hyphenated name");
+        let info = AnsibleHandler::parse_path(path)
+            .expect("Should parse archive path with hyphenated name");
 
         assert_eq!(info.namespace, "community");
         assert_eq!(info.name, "aws-network");

@@ -76,10 +76,7 @@ impl HexHandler {
 
                 let basename = &filename[..filename.len() - 4]; // Remove .tar
                 let last_dash = basename.rfind('-').ok_or_else(|| {
-                    AppError::Validation(format!(
-                        "Invalid tarball filename format: {}",
-                        filename
-                    ))
+                    AppError::Validation(format!("Invalid tarball filename format: {}", filename))
                 })?;
 
                 let name = basename[..last_dash].to_string();

@@ -68,10 +68,7 @@ impl SbtHandler {
 
         // Need at least: org/module/revision/<type>s/artifact.ext
         if parts.len() < 5 {
-            return Err(AppError::Validation(format!(
-                "Invalid SBT path: {}",
-                path
-            )));
+            return Err(AppError::Validation(format!("Invalid SBT path: {}", path)));
         }
 
         let org = parts[0].to_string();
@@ -81,10 +78,7 @@ impl SbtHandler {
         // Fourth part should be <type>s (e.g., jars, sources, docs)
         let type_part = parts[3];
         if !type_part.ends_with('s') {
-            return Err(AppError::Validation(format!(
-                "Invalid SBT path: {}",
-                path
-            )));
+            return Err(AppError::Validation(format!("Invalid SBT path: {}", path)));
         }
 
         // Last part is the filename: artifact-revision.ext
@@ -96,10 +90,7 @@ impl SbtHandler {
             let extension = &filename[dot_pos + 1..];
             (name.to_string(), extension.to_string())
         } else {
-            return Err(AppError::Validation(format!(
-                "Invalid SBT path: {}",
-                path
-            )));
+            return Err(AppError::Validation(format!("Invalid SBT path: {}", path)));
         };
 
         Ok(SbtPathInfo {

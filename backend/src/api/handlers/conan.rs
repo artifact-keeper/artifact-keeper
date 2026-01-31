@@ -97,11 +97,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -437,7 +433,13 @@ async fn search(
 
 async fn recipe_latest(
     State(state): State<SharedState>,
-    Path((repo_key, name, version, _user, _channel)): Path<(String, String, String, String, String)>,
+    Path((repo_key, name, version, _user, _channel)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
 
@@ -574,8 +576,7 @@ async fn recipe_file_download(
 
     let artifact_path =
         recipe_artifact_path(&name, &version, &user, &channel, &revision, &file_path);
-    let _storage_key =
-        recipe_storage_key(&name, &version, &user, &channel, &revision, &file_path);
+    let _storage_key = recipe_storage_key(&name, &version, &user, &channel, &revision, &file_path);
 
     // Look up artifact
     let artifact = sqlx::query!(
@@ -653,8 +654,7 @@ async fn recipe_file_upload(
 
     let artifact_path =
         recipe_artifact_path(&name, &version, &user, &channel, &revision, &file_path);
-    let storage_key =
-        recipe_storage_key(&name, &version, &user, &channel, &revision, &file_path);
+    let storage_key = recipe_storage_key(&name, &version, &user, &channel, &revision, &file_path);
 
     // Compute SHA-256
     let mut hasher = Sha256::new();
@@ -692,16 +692,13 @@ async fn recipe_file_upload(
 
     // Store the file
     let storage = FilesystemStorage::new(&repo.storage_path);
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    storage.put(&storage_key, body.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
 
     // Build metadata JSON
     let metadata = serde_json::json!({
@@ -1084,16 +1081,13 @@ async fn package_file_upload(
 
     // Store the file
     let storage = FilesystemStorage::new(&repo.storage_path);
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    storage.put(&storage_key, body.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
 
     // Build metadata JSON
     let metadata = serde_json::json!({
