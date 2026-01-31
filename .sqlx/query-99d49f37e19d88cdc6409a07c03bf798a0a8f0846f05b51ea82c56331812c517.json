@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by)\n           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n           ON CONFLICT (repository_id, path) DO UPDATE SET\n             version = EXCLUDED.version,\n             size_bytes = EXCLUDED.size_bytes,\n             checksum_sha256 = EXCLUDED.checksum_sha256,\n             content_type = EXCLUDED.content_type,\n             storage_key = EXCLUDED.storage_key,\n             uploaded_by = EXCLUDED.uploaded_by,\n             updated_at = NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Bpchar",
+        "Varchar",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "99d49f37e19d88cdc6409a07c03bf798a0a8f0846f05b51ea82c56331812c517"
+}

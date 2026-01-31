@@ -14,5 +14,6 @@ pub mod plugins;
 pub mod repositories;
 pub mod search;
 pub mod users;
+pub mod oci_v2;
 pub mod security;
 pub mod webhooks;

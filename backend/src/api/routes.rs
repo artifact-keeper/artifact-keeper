@@ -17,6 +17,9 @@ pub fn create_router(state: SharedState) -> Router {
         .route("/metrics", get(handlers::health::metrics))
         // API v1 routes
         .nest("/api/v1", api_v1_routes(state.clone()))
+        // Docker Registry V2 API (OCI Distribution Spec)
+        .route("/v2/", handlers::oci_v2::version_check_handler())
+        .nest("/v2", handlers::oci_v2::router())
         .with_state(state)
 }
 

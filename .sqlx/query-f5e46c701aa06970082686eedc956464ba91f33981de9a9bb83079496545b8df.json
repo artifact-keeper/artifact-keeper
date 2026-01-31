@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)\n           VALUES ($1, $2, $3, $4, $5)\n           ON CONFLICT (repository_id, name, tag) DO UPDATE SET\n             manifest_digest = EXCLUDED.manifest_digest,\n             manifest_content_type = EXCLUDED.manifest_content_type,\n             updated_at = NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f5e46c701aa06970082686eedc956464ba91f33981de9a9bb83079496545b8df"
+}
