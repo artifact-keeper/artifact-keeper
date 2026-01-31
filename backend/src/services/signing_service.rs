@@ -25,8 +25,8 @@ pub struct SigningService {
 pub struct CreateKeyRequest {
     pub repository_id: Option<Uuid>,
     pub name: String,
-    pub key_type: String,        // "gpg", "rsa", "ed25519"
-    pub algorithm: String,       // "rsa2048", "rsa4096"
+    pub key_type: String,  // "gpg", "rsa", "ed25519"
+    pub algorithm: String, // "rsa2048", "rsa4096"
     pub uid_name: Option<String>,
     pub uid_email: Option<String>,
     pub created_by: Option<Uuid>,
@@ -55,9 +55,8 @@ impl SigningService {
 
         // Generate RSA key pair (use OsRng from rsa's rand_core to avoid version mismatch)
         let mut rng = rsa::rand_core::OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, bits).map_err(|e| {
-            AppError::Internal(format!("Failed to generate RSA key: {}", e))
-        })?;
+        let private_key = RsaPrivateKey::new(&mut rng, bits)
+            .map_err(|e| AppError::Internal(format!("Failed to generate RSA key: {}", e)))?;
         let public_key = RsaPublicKey::from(&private_key);
 
         // Serialize keys

@@ -4,8 +4,11 @@
 //!
 //! Routes are mounted at `/conda/{repo_key}/...`:
 //!   GET  /conda/{repo_key}/channeldata.json                  - Channel metadata
+//!   GET  /conda/{repo_key}/keys/repo.pub                     - Repository public key (PEM)
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json            - Repository data for subdir
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.bz2        - Compressed repodata
+//!   GET  /conda/{repo_key}/{subdir}/repodata.json.sig        - Repodata signature (raw bytes)
+//!   GET  /conda/{repo_key}/{subdir}/repodata.json.zst        - Compressed repodata (zstd) [stub]
 //!   GET  /conda/{repo_key}/{subdir}/current_repodata.json    - Current (latest) repodata
 //!   GET  /conda/{repo_key}/{subdir}/{filename}               - Download package
 //!   PUT  /conda/{repo_key}/{subdir}/{filename}               - Upload package
@@ -30,6 +33,7 @@ use tracing::info;
 use crate::api::SharedState;
 use crate::formats::conda_native::CondaNativeHandler;
 use crate::services::auth_service::AuthService;
+use crate::services::signing_service::SigningService;
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::StorageBackend;
 
@@ -54,16 +58,23 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Channel metadata
         .route("/:repo_key/channeldata.json", get(channeldata_json))
+        // Public key endpoint
+        .route("/:repo_key/keys/repo.pub", get(repo_public_key))
         // Upload (alternative POST)
         .route("/:repo_key/upload", post(upload_post))
         // Subdir repodata endpoints
-        .route(
-            "/:repo_key/:subdir/repodata.json",
-            get(repodata_json),
-        )
+        .route("/:repo_key/:subdir/repodata.json", get(repodata_json))
         .route(
             "/:repo_key/:subdir/repodata.json.bz2",
             get(repodata_json_bz2),
+        )
+        .route(
+            "/:repo_key/:subdir/repodata.json.sig",
+            get(repodata_json_sig),
+        )
+        .route(
+            "/:repo_key/:subdir/repodata.json.zst",
+            get(repodata_json_zst),
         )
         .route(
             "/:repo_key/:subdir/current_repodata.json",
@@ -86,11 +97,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -267,6 +274,33 @@ async fn channeldata_json(
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     let artifacts = list_conda_artifacts(&state.db, repo.id).await?;
 
+    // Query for the latest version of each package (ordered by created_at DESC,
+    // so the first row per name is the latest).
+    let latest_versions: BTreeMap<String, String> = {
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT ON (a.name) a.name, a.version
+            FROM artifacts a
+            WHERE a.repository_id = $1 AND a.is_deleted = false
+            ORDER BY a.name, a.created_at DESC
+            "#,
+            repo.id
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+
+        rows.into_iter()
+            .filter_map(|r| r.version.map(|v| (r.name, v)))
+            .collect()
+    };
+
     // Collect all packages with their subdirs
     let mut packages: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
@@ -281,13 +315,7 @@ async fn channeldata_json(
             .as_ref()
             .and_then(|m| m.get("subdir").and_then(|v| v.as_str()))
             .map(|s| s.to_string())
-            .or_else(|| {
-                artifact
-                    .path
-                    .split('/')
-                    .next()
-                    .map(|s| s.to_string())
-            })
+            .or_else(|| artifact.path.split('/').next().map(|s| s.to_string()))
             .unwrap_or_else(|| "noarch".to_string());
 
         let pkg_name = artifact
@@ -297,18 +325,16 @@ async fn channeldata_json(
             .map(|s| s.to_string())
             .unwrap_or_else(|| artifact.name.clone());
 
-        packages
-            .entry(pkg_name)
-            .or_default()
-            .insert(subdir);
+        packages.entry(pkg_name).or_default().insert(subdir);
     }
 
     let packages_json: serde_json::Map<String, serde_json::Value> = packages
         .into_iter()
         .map(|(name, subdirs)| {
+            let version = latest_versions.get(&name).cloned().unwrap_or_default();
             let val = serde_json::json!({
                 "subdirs": subdirs.into_iter().collect::<Vec<_>>(),
-                "version": "",
+                "version": version,
             });
             (name, val)
         })
@@ -323,7 +349,9 @@ async fn channeldata_json(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string_pretty(&channeldata).unwrap()))
+        .body(Body::from(
+            serde_json::to_string_pretty(&channeldata).unwrap(),
+        ))
         .unwrap())
 }
 
@@ -368,6 +396,121 @@ async fn repodata_json_bz2(
         .header(CONTENT_LENGTH, compressed.len().to_string())
         .body(Body::from(compressed))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /conda/{repo_key}/{subdir}/repodata.json.sig
+// ---------------------------------------------------------------------------
+
+/// Return the raw RSA signature of repodata.json for the given subdir.
+///
+/// Conda uses raw (non-PGP-armored) signatures. Returns 404 if the repository
+/// has no active signing key configured.
+async fn repodata_json_sig(
+    State(state): State<SharedState>,
+    Path((repo_key, subdir)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
+
+    let json_bytes = serde_json::to_vec(&repodata).unwrap();
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signature = signing_svc
+        .sign_data(repo.id, &json_bytes)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Signing error: {}", e),
+            )
+                .into_response()
+        })?;
+
+    match signature {
+        Some(sig_bytes) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(CONTENT_LENGTH, sig_bytes.len().to_string())
+            .body(Body::from(sig_bytes))
+            .unwrap()),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /conda/{repo_key}/{subdir}/repodata.json.zst
+// ---------------------------------------------------------------------------
+
+/// Return repodata.json compressed with zstd.
+///
+/// Modern conda/mamba clients prefer zstd over bz2 for faster decompression.
+/// TODO: Add zstd crate dependency to enable this endpoint. For now returns 404.
+async fn repodata_json_zst(
+    State(_state): State<SharedState>,
+    Path((_repo_key, _subdir)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    // TODO: Enable once the `zstd` crate is added to Cargo.toml:
+    //
+    //   let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    //   let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
+    //   let json_bytes = serde_json::to_vec(&repodata).unwrap();
+    //   let compressed = zstd::encode_all(std::io::Cursor::new(&json_bytes), 3)
+    //       .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("zstd error: {}", e)).into_response())?;
+    //   Ok(Response::builder()
+    //       .status(StatusCode::OK)
+    //       .header(CONTENT_TYPE, "application/zstd")
+    //       .header(CONTENT_LENGTH, compressed.len().to_string())
+    //       .body(Body::from(compressed))
+    //       .unwrap())
+
+    Err((
+        StatusCode::NOT_FOUND,
+        "repodata.json.zst not yet supported; use repodata.json or repodata.json.bz2",
+    )
+        .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET /conda/{repo_key}/keys/repo.pub
+// ---------------------------------------------------------------------------
+
+/// Return the repository's RSA public key in PEM format.
+async fn repo_public_key(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let public_key = signing_svc
+        .get_repo_public_key(repo.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Signing service error: {}", e),
+            )
+                .into_response()
+        })?;
+
+    match public_key {
+        Some(pem) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/x-pem-file")
+            .header(CONTENT_LENGTH, pem.len().to_string())
+            .body(Body::from(pem))
+            .unwrap()),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -673,9 +816,9 @@ async fn store_conda_package(
             .into_response()
     })?;
 
-    let pkg_name = path_info.name.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Could not parse package name").into_response()
-    })?;
+    let pkg_name = path_info
+        .name
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Could not parse package name").into_response())?;
     let pkg_version = path_info.version.ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "Could not parse package version").into_response()
     })?;

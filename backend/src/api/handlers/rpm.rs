@@ -7,6 +7,9 @@
 //!   GET  /rpm/{repo_key}/repodata/primary.xml.gz    - Primary package metadata
 //!   GET  /rpm/{repo_key}/repodata/filelists.xml.gz  - File lists (stub)
 //!   GET  /rpm/{repo_key}/repodata/other.xml.gz      - Other metadata (stub)
+//!   GET  /rpm/{repo_key}/repodata/updateinfo.xml.gz - Update advisories (stub)
+//!   GET  /rpm/{repo_key}/repodata/repomd.xml.asc    - Detached GPG signature
+//!   GET  /rpm/{repo_key}/repodata/repomd.xml.key    - Public key (PEM)
 //!   GET  /rpm/{repo_key}/packages/*path              - Download RPM package
 //!   PUT  /rpm/{repo_key}/packages/*path              - Upload RPM package
 //!   POST /rpm/{repo_key}/upload                      - Upload RPM (alternative)
@@ -30,6 +33,7 @@ use tracing::info;
 
 use crate::api::SharedState;
 use crate::services::auth_service::AuthService;
+use crate::services::signing_service::SigningService;
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::StorageBackend;
 
@@ -47,6 +51,13 @@ pub fn router() -> Router<SharedState> {
             get(filelists_xml_gz),
         )
         .route("/:repo_key/repodata/other.xml.gz", get(other_xml_gz))
+        .route(
+            "/:repo_key/repodata/updateinfo.xml.gz",
+            get(updateinfo_xml_gz),
+        )
+        // Signing endpoints
+        .route("/:repo_key/repodata/repomd.xml.asc", get(repomd_xml_asc))
+        .route("/:repo_key/repodata/repomd.xml.key", get(repomd_xml_key))
         // Package download and upload
         .route("/:repo_key/packages/*path", get(download_package))
         .route("/:repo_key/packages/*path", put(upload_package_put))
@@ -64,11 +75,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -240,35 +247,33 @@ async fn list_rpm_artifacts(
 }
 
 // ---------------------------------------------------------------------------
-// GET /rpm/{repo_key}/repodata/repomd.xml
+// Shared repomd.xml generation
 // ---------------------------------------------------------------------------
 
-async fn repomd_xml(
-    State(state): State<SharedState>,
-    Path(repo_key): Path<String>,
-) -> Result<Response, Response> {
-    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
-    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
-
+fn generate_repomd_xml_content(artifacts: &[RpmArtifact]) -> String {
     // Generate primary.xml content and compute its gzipped checksum
-    let primary_xml = generate_primary_xml(&artifacts);
+    let primary_xml = generate_primary_xml(artifacts);
     let primary_gz = gzip_bytes(primary_xml.as_bytes());
     let primary_sha256 = sha256_hex(&primary_gz);
 
-    let filelists_xml = generate_filelists_xml(&artifacts);
+    let filelists_xml = generate_filelists_xml(artifacts);
     let filelists_gz = gzip_bytes(filelists_xml.as_bytes());
     let filelists_sha256 = sha256_hex(&filelists_gz);
 
-    let other_xml = generate_other_xml(&artifacts);
+    let other_xml = generate_other_xml(artifacts);
     let other_gz = gzip_bytes(other_xml.as_bytes());
     let other_sha256 = sha256_hex(&other_gz);
+
+    let updateinfo_xml = generate_updateinfo_xml();
+    let updateinfo_gz = gzip_bytes(updateinfo_xml.as_bytes());
+    let updateinfo_sha256 = sha256_hex(&updateinfo_gz);
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    let xml = format!(
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <repomd xmlns="http://linux.duke.edu/metadata/repo">
   <data type="primary">
@@ -289,21 +294,141 @@ async fn repomd_xml(
     <timestamp>{timestamp}</timestamp>
     <size>{other_size}</size>
   </data>
+  <data type="updateinfo">
+    <location href="repodata/updateinfo.xml.gz"/>
+    <checksum type="sha256">{updateinfo_sha256}</checksum>
+    <timestamp>{timestamp}</timestamp>
+    <size>{updateinfo_size}</size>
+  </data>
 </repomd>
 "#,
         primary_sha256 = primary_sha256,
         filelists_sha256 = filelists_sha256,
         other_sha256 = other_sha256,
+        updateinfo_sha256 = updateinfo_sha256,
         timestamp = timestamp,
         primary_size = primary_gz.len(),
         filelists_size = filelists_gz.len(),
         other_size = other_gz.len(),
-    );
+        updateinfo_size = updateinfo_gz.len(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// GET /rpm/{repo_key}/repodata/repomd.xml
+// ---------------------------------------------------------------------------
+
+async fn repomd_xml(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
+
+    let xml = generate_repomd_xml_content(&artifacts);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/xml")
         .body(Body::from(xml))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /rpm/{repo_key}/repodata/repomd.xml.asc — Detached PGP signature
+// ---------------------------------------------------------------------------
+
+async fn repomd_xml_asc(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+    let artifacts = list_rpm_artifacts(&state.db, repo.id).await?;
+
+    let repomd_content = generate_repomd_xml_content(&artifacts);
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signature = signing_svc
+        .sign_data(repo.id, repomd_content.as_bytes())
+        .await
+        .unwrap_or(None);
+
+    match signature {
+        Some(sig_bytes) => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&sig_bytes);
+            // Wrap base64 at 76 characters per line (PGP armor convention)
+            let wrapped: Vec<&str> = b64
+                .as_bytes()
+                .chunks(76)
+                .map(|c| std::str::from_utf8(c).unwrap_or(""))
+                .collect();
+            let armored = format!(
+                "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
+                wrapped.join("\n"),
+            );
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/pgp-signature")
+                .body(Body::from(armored))
+                .unwrap())
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /rpm/{repo_key}/repodata/repomd.xml.key — Public key for rpm --import
+// ---------------------------------------------------------------------------
+
+async fn repomd_xml_key(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let public_key = signing_svc
+        .get_repo_public_key(repo.id)
+        .await
+        .unwrap_or(None);
+
+    match public_key {
+        Some(pem) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/x-pem-file")
+            .body(Body::from(pem))
+            .unwrap()),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /rpm/{repo_key}/repodata/updateinfo.xml.gz — Update advisories (stub)
+// ---------------------------------------------------------------------------
+
+async fn updateinfo_xml_gz(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let _repo = resolve_rpm_repo(&state.db, &repo_key).await?;
+
+    let updateinfo_xml = generate_updateinfo_xml();
+    let gz = gzip_bytes(updateinfo_xml.as_bytes());
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/gzip")
+        .header(CONTENT_LENGTH, gz.len().to_string())
+        .body(Body::from(gz))
         .unwrap())
 }
 
@@ -383,10 +508,7 @@ async fn download_package(
 ) -> Result<Response, Response> {
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
-    let filename = pkg_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&pkg_path);
+    let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path);
 
     let artifact = sqlx::query!(
         r#"
@@ -454,16 +576,10 @@ async fn upload_package_put(
     let user_id = authenticate(&state.db, &state.config, &headers).await?;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
-    let filename = pkg_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&pkg_path)
-        .to_string();
+    let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path).to_string();
 
     if !filename.ends_with(".rpm") {
-        return Err(
-            (StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
     }
 
     store_rpm(&state, &repo, &filename, body, user_id).await
@@ -503,9 +619,7 @@ async fn upload_package_post(
         });
 
     if !filename.ends_with(".rpm") {
-        return Err(
-            (StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
     }
 
     store_rpm(&state, &repo, &filename, body, user_id).await
@@ -672,41 +786,40 @@ fn generate_primary_xml(artifacts: &[RpmArtifact]) -> String {
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
 
         // Extract metadata from artifact_metadata if available, else parse filename
-        let (name, version, release, arch, summary) =
-            if let Some(ref meta) = artifact.metadata {
-                (
-                    meta.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&artifact.name)
-                        .to_string(),
-                    meta.get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0")
-                        .to_string(),
-                    meta.get("release")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("1")
-                        .to_string(),
-                    meta.get("arch")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("noarch")
-                        .to_string(),
-                    meta.get("summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                )
-            } else if let Some((n, v, r, a)) = parse_rpm_filename(filename) {
-                (n, v, r, a, String::new())
-            } else {
-                (
-                    artifact.name.clone(),
-                    artifact.version.clone().unwrap_or_else(|| "0".to_string()),
-                    "1".to_string(),
-                    "noarch".to_string(),
-                    String::new(),
-                )
-            };
+        let (name, version, release, arch, summary) = if let Some(ref meta) = artifact.metadata {
+            (
+                meta.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&artifact.name)
+                    .to_string(),
+                meta.get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0")
+                    .to_string(),
+                meta.get("release")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("1")
+                    .to_string(),
+                meta.get("arch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("noarch")
+                    .to_string(),
+                meta.get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        } else if let Some((n, v, r, a)) = parse_rpm_filename(filename) {
+            (n, v, r, a, String::new())
+        } else {
+            (
+                artifact.name.clone(),
+                artifact.version.clone().unwrap_or_else(|| "0".to_string()),
+                "1".to_string(),
+                "noarch".to_string(),
+                String::new(),
+            )
+        };
 
         xml.push_str(&format!(
             r#"  <package type="rpm">
@@ -743,37 +856,36 @@ fn generate_filelists_xml(artifacts: &[RpmArtifact]) -> String {
     );
 
     for artifact in artifacts {
-        let (name, version, release, _arch) =
-            if let Some(ref meta) = artifact.metadata {
+        let (name, version, release, _arch) = if let Some(ref meta) = artifact.metadata {
+            (
+                meta.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&artifact.name)
+                    .to_string(),
+                meta.get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0")
+                    .to_string(),
+                meta.get("release")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("1")
+                    .to_string(),
+                meta.get("arch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("noarch")
+                    .to_string(),
+            )
+        } else {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            parse_rpm_filename(filename).unwrap_or_else(|| {
                 (
-                    meta.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&artifact.name)
-                        .to_string(),
-                    meta.get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0")
-                        .to_string(),
-                    meta.get("release")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("1")
-                        .to_string(),
-                    meta.get("arch")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("noarch")
-                        .to_string(),
+                    artifact.name.clone(),
+                    artifact.version.clone().unwrap_or_else(|| "0".to_string()),
+                    "1".to_string(),
+                    "noarch".to_string(),
                 )
-            } else {
-                let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-                parse_rpm_filename(filename).unwrap_or_else(|| {
-                    (
-                        artifact.name.clone(),
-                        artifact.version.clone().unwrap_or_else(|| "0".to_string()),
-                        "1".to_string(),
-                        "noarch".to_string(),
-                    )
-                })
-            };
+            })
+        };
 
         xml.push_str(&format!(
             r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
@@ -808,42 +920,39 @@ fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
     );
 
     for artifact in artifacts {
-        let (name, version, release) =
-            if let Some(ref meta) = artifact.metadata {
-                (
-                    meta.get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&artifact.name)
-                        .to_string(),
-                    meta.get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0")
-                        .to_string(),
-                    meta.get("release")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("1")
-                        .to_string(),
-                )
-            } else {
-                let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-                let parsed = parse_rpm_filename(filename);
-                (
-                    parsed
-                        .as_ref()
-                        .map(|p| p.0.clone())
-                        .unwrap_or_else(|| artifact.name.clone()),
-                    parsed
-                        .as_ref()
-                        .map(|p| p.1.clone())
-                        .unwrap_or_else(|| {
-                            artifact.version.clone().unwrap_or_else(|| "0".to_string())
-                        }),
-                    parsed
-                        .as_ref()
-                        .map(|p| p.2.clone())
-                        .unwrap_or_else(|| "1".to_string()),
-                )
-            };
+        let (name, version, release) = if let Some(ref meta) = artifact.metadata {
+            (
+                meta.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&artifact.name)
+                    .to_string(),
+                meta.get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0")
+                    .to_string(),
+                meta.get("release")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("1")
+                    .to_string(),
+            )
+        } else {
+            let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+            let parsed = parse_rpm_filename(filename);
+            (
+                parsed
+                    .as_ref()
+                    .map(|p| p.0.clone())
+                    .unwrap_or_else(|| artifact.name.clone()),
+                parsed
+                    .as_ref()
+                    .map(|p| p.1.clone())
+                    .unwrap_or_else(|| artifact.version.clone().unwrap_or_else(|| "0".to_string())),
+                parsed
+                    .as_ref()
+                    .map(|p| p.2.clone())
+                    .unwrap_or_else(|| "1".to_string()),
+            )
+        };
 
         xml.push_str(&format!(
             r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
@@ -867,6 +976,13 @@ fn generate_other_xml(artifacts: &[RpmArtifact]) -> String {
 
     xml.push_str("</otherdata>\n");
     xml
+}
+
+fn generate_updateinfo_xml() -> String {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<updates></updates>
+"#
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -952,7 +1068,10 @@ mod tests {
 
     #[test]
     fn test_xml_escape() {
-        assert_eq!(xml_escape("a<b>c&d\"e'f"), "a&lt;b&gt;c&amp;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a<b>c&d\"e'f"),
+            "a&lt;b&gt;c&amp;d&quot;e&apos;f"
+        );
     }
 
     #[test]

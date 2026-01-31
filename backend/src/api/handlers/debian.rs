@@ -6,6 +6,8 @@
 //! Routes are mounted at `/debian/{repo_key}/...`:
 //!   GET  /debian/{repo_key}/dists/{distribution}/Release                            - Release file
 //!   GET  /debian/{repo_key}/dists/{distribution}/InRelease                          - Inline signed release
+//!   GET  /debian/{repo_key}/dists/{distribution}/Release.gpg                        - Detached GPG signature
+//!   GET  /debian/{repo_key}/dists/{distribution}/gpg-key.asc                        - Repository public key
 //!   GET  /debian/{repo_key}/dists/{distribution}/{component}/binary-{arch}/Packages - Packages index
 //!   GET  /debian/{repo_key}/dists/{distribution}/{component}/binary-{arch}/Packages.gz - Compressed Packages index
 //!   GET  /debian/{repo_key}/pool/{component}/*path                                  - Download .deb
@@ -32,6 +34,7 @@ use tracing::info;
 
 use crate::api::SharedState;
 use crate::services::auth_service::AuthService;
+use crate::services::signing_service::SigningService;
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::StorageBackend;
 
@@ -42,13 +45,19 @@ use crate::storage::StorageBackend;
 pub fn router() -> Router<SharedState> {
     Router::new()
         // Release files
-        .route(
-            "/:repo_key/dists/:distribution/Release",
-            get(release_file),
-        )
+        .route("/:repo_key/dists/:distribution/Release", get(release_file))
         .route(
             "/:repo_key/dists/:distribution/InRelease",
             get(in_release_file),
+        )
+        .route(
+            "/:repo_key/dists/:distribution/Release.gpg",
+            get(release_gpg),
+        )
+        // Public key endpoint
+        .route(
+            "/:repo_key/dists/:distribution/gpg-key.asc",
+            get(gpg_key_asc),
         )
         // Packages index
         .route(
@@ -59,6 +68,11 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/dists/:distribution/:component/:binary_arch/Packages.gz",
             get(packages_index_gz),
         )
+        // TODO: Add Packages.xz support once xz2/lzma crate is available
+        // .route(
+        //     "/:repo_key/dists/:distribution/:component/:binary_arch/Packages.xz",
+        //     get(packages_index_xz),
+        // )
         // Pool: download and upload
         .route(
             "/:repo_key/pool/:component/*path",
@@ -78,11 +92,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -289,15 +299,14 @@ async fn fetch_package_entries(
 }
 
 // ---------------------------------------------------------------------------
-// GET /debian/{repo_key}/dists/{distribution}/Release
+// Release content generation (shared by Release, InRelease, Release.gpg)
 // ---------------------------------------------------------------------------
 
-async fn release_file(
-    State(state): State<SharedState>,
-    Path((repo_key, distribution)): Path<(String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
-
+async fn generate_release_content(
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    distribution: &str,
+) -> Result<String, Response> {
     // Gather all architectures from uploaded packages
     let mut architectures = std::collections::BTreeSet::new();
     let artifacts = sqlx::query_scalar!(
@@ -306,7 +315,7 @@ async fn release_file(
         FROM artifacts
         WHERE repository_id = $1 AND is_deleted = false AND path LIKE 'pool/%'
         "#,
-        repo.id,
+        repo_id,
     )
     .fetch_all(&state.db)
     .await
@@ -339,8 +348,7 @@ async fn release_file(
     let packages_text = {
         let mut all_entries = Vec::new();
         for arch in &architectures {
-            let entries =
-                fetch_package_entries(&state.db, repo.id, component, arch).await?;
+            let entries = fetch_package_entries(&state.db, repo_id, component, arch).await?;
             all_entries.extend(entries);
         }
         build_packages_text(&all_entries)
@@ -395,6 +403,64 @@ async fn release_file(
         gz_size = gz_bytes.len(),
     );
 
+    Ok(release)
+}
+
+// ---------------------------------------------------------------------------
+// PGP armor helpers
+// ---------------------------------------------------------------------------
+
+/// Wrap a raw signature in PGP detached signature armor format.
+fn pgp_armor_signature(signature: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    // Wrap base64 at 76 characters per line (PGP convention)
+    let wrapped: Vec<&str> = b64
+        .as_bytes()
+        .chunks(76)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect();
+    format!(
+        "-----BEGIN PGP SIGNATURE-----\n\
+         \n\
+         {}\n\
+         -----END PGP SIGNATURE-----\n",
+        wrapped.join("\n"),
+    )
+}
+
+/// Produce a GPG-style clearsigned document from content and signature.
+fn pgp_clearsign(content: &str, signature: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    let wrapped: Vec<&str> = b64
+        .as_bytes()
+        .chunks(76)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect();
+    format!(
+        "-----BEGIN PGP SIGNED MESSAGE-----\n\
+         Hash: SHA256\n\
+         \n\
+         {content}\
+         -----BEGIN PGP SIGNATURE-----\n\
+         \n\
+         {sig}\n\
+         -----END PGP SIGNATURE-----\n",
+        content = content,
+        sig = wrapped.join("\n"),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// GET /debian/{repo_key}/dists/{distribution}/Release
+// ---------------------------------------------------------------------------
+
+async fn release_file(
+    State(state): State<SharedState>,
+    Path((repo_key, distribution)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    let release = generate_release_content(&state, repo.id, &distribution).await?;
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -407,11 +473,99 @@ async fn release_file(
 // ---------------------------------------------------------------------------
 
 async fn in_release_file(
-    state: State<SharedState>,
-    path: Path<(String, String)>,
+    State(state): State<SharedState>,
+    Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    // For now, serve the same content as Release (unsigned)
-    release_file(state, path).await
+    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    let release = generate_release_content(&state, repo.id, &distribution).await?;
+
+    // Attempt to sign the release content
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signature = signing_svc
+        .sign_data(repo.id, release.as_bytes())
+        .await
+        .unwrap_or(None);
+
+    let body = match signature {
+        Some(sig) => pgp_clearsign(&release, &sig),
+        None => release,
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /debian/{repo_key}/dists/{distribution}/Release.gpg
+// ---------------------------------------------------------------------------
+
+async fn release_gpg(
+    State(state): State<SharedState>,
+    Path((repo_key, distribution)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    let release = generate_release_content(&state, repo.id, &distribution).await?;
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signature = signing_svc
+        .sign_data(repo.id, release.as_bytes())
+        .await
+        .unwrap_or(None);
+
+    match signature {
+        Some(sig) => {
+            let armored = pgp_armor_signature(&sig);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/pgp-signature")
+                .body(Body::from(armored))
+                .unwrap())
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GET /debian/{repo_key}/dists/{distribution}/gpg-key.asc
+// ---------------------------------------------------------------------------
+
+async fn gpg_key_asc(
+    State(state): State<SharedState>,
+    Path((repo_key, _distribution)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let public_key = signing_svc
+        .get_repo_public_key(repo.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to retrieve public key: {}", e),
+            )
+                .into_response()
+        })?;
+
+    match public_key {
+        Some(pem) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/pgp-keys")
+            .body(Body::from(pem))
+            .unwrap()),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "No signing key configured for this repository",
+        )
+            .into_response()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,19 +574,12 @@ async fn in_release_file(
 
 async fn packages_index(
     State(state): State<SharedState>,
-    Path((repo_key, _distribution, component, binary_arch)): Path<(
-        String,
-        String,
-        String,
-        String,
-    )>,
+    Path((repo_key, _distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
     // binary_arch is like "binary-amd64", strip the "binary-" prefix
-    let arch = binary_arch
-        .strip_prefix("binary-")
-        .unwrap_or(&binary_arch);
+    let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
 
     let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
     let text = build_packages_text(&entries);
@@ -451,18 +598,11 @@ async fn packages_index(
 
 async fn packages_index_gz(
     State(state): State<SharedState>,
-    Path((repo_key, _distribution, component, binary_arch)): Path<(
-        String,
-        String,
-        String,
-        String,
-    )>,
+    Path((repo_key, _distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    let arch = binary_arch
-        .strip_prefix("binary-")
-        .unwrap_or(&binary_arch);
+    let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
 
     let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
     let text = build_packages_text(&entries);
@@ -741,10 +881,7 @@ async fn upload_raw(
         .next()
         .unwrap_or('_')
         .to_ascii_lowercase();
-    let pool_path = format!(
-        "{}/{}/{}",
-        first_char, deb_info.name, filename
-    );
+    let pool_path = format!("{}/{}/{}", first_char, deb_info.name, filename);
     let artifact_path = format!("pool/{}/{}", component, pool_path);
 
     // Check for duplicate

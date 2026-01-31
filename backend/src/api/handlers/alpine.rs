@@ -27,6 +27,7 @@ use tracing::info;
 
 use crate::api::SharedState;
 use crate::services::auth_service::AuthService;
+use crate::services::signing_service::SigningService;
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::StorageBackend;
 
@@ -48,6 +49,11 @@ pub fn router() -> Router<SharedState> {
         )
         // Alternative upload endpoint
         .route("/:repo_key/upload", post(upload_package_post))
+        // Public key endpoint for signature verification
+        .route(
+            "/:repo_key/:branch/keys/artifact-keeper.rsa.pub",
+            get(public_key),
+        )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
@@ -60,11 +66,7 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| {
-            base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-        })
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -343,11 +345,51 @@ fn generate_apkindex_text(artifacts: &[AlpineArtifact], arch: &str) -> String {
     text
 }
 
-/// Create an APKINDEX.tar.gz from the text content.
-fn create_apkindex_tar_gz(apkindex_text: &str) -> Result<Vec<u8>, Response> {
+/// Create an APKINDEX.tar.gz from the text content with an optional RSA signature.
+///
+/// When `signature` is `Some`, the archive contains:
+///   1. `.SIGN.RSA.artifact-keeper.rsa.pub` — raw RSA signature bytes
+///   2. `APKINDEX` — the package index
+///
+/// When `signature` is `None`, only the `APKINDEX` entry is included.
+fn create_apkindex_tar_gz(
+    apkindex_text: &str,
+    signature: Option<&[u8]>,
+) -> Result<Vec<u8>, Response> {
     let gz_buf = Vec::new();
     let gz_encoder = GzEncoder::new(gz_buf, Compression::default());
     let mut tar_builder = tar::Builder::new(gz_encoder);
+
+    let mtime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // If a signature is available, add .SIGN file FIRST (apk verifies order)
+    if let Some(sig_bytes) = signature {
+        let mut sig_header = tar::Header::new_gnu();
+        sig_header
+            .set_path(".SIGN.RSA.artifact-keeper.rsa.pub")
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to set tar path for signature: {}", e),
+                )
+                    .into_response()
+            })?;
+        sig_header.set_size(sig_bytes.len() as u64);
+        sig_header.set_mode(0o644);
+        sig_header.set_mtime(mtime);
+        sig_header.set_cksum();
+
+        tar_builder.append(&sig_header, sig_bytes).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to append signature to tar: {}", e),
+            )
+                .into_response()
+        })?;
+    }
 
     let content_bytes = apkindex_text.as_bytes();
     let mut header = tar::Header::new_gnu();
@@ -360,23 +402,16 @@ fn create_apkindex_tar_gz(apkindex_text: &str) -> Result<Vec<u8>, Response> {
     })?;
     header.set_size(content_bytes.len() as u64);
     header.set_mode(0o644);
-    header.set_mtime(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    );
+    header.set_mtime(mtime);
     header.set_cksum();
 
-    tar_builder
-        .append(&header, content_bytes)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to append to tar: {}", e),
-            )
-                .into_response()
-        })?;
+    tar_builder.append(&header, content_bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to append to tar: {}", e),
+        )
+            .into_response()
+    })?;
 
     let gz_encoder = tar_builder.into_inner().map_err(|e| {
         (
@@ -404,17 +439,65 @@ async fn apk_index(
     Path((repo_key, branch, repository, arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
-    let artifacts =
-        list_alpine_artifacts(&state.db, repo.id, &branch, &repository, &arch).await?;
+    let artifacts = list_alpine_artifacts(&state.db, repo.id, &branch, &repository, &arch).await?;
 
     let apkindex_text = generate_apkindex_text(&artifacts, &arch);
-    let tar_gz = create_apkindex_tar_gz(&apkindex_text)?;
+
+    // Sign the APKINDEX content if signing is configured for this repository
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let signature = signing_svc
+        .sign_data(repo.id, apkindex_text.as_bytes())
+        .await
+        .unwrap_or(None);
+
+    let tar_gz = create_apkindex_tar_gz(&apkindex_text, signature.as_deref())?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/gzip")
         .header(CONTENT_LENGTH, tar_gz.len().to_string())
         .body(Body::from(tar_gz))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /alpine/{repo_key}/{branch}/keys/artifact-keeper.rsa.pub - Public key
+// ---------------------------------------------------------------------------
+
+async fn public_key(
+    State(state): State<SharedState>,
+    Path((repo_key, _branch)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
+
+    let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
+    let public_pem = signing_svc
+        .get_repo_public_key(repo.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to retrieve public key: {}", e),
+            )
+                .into_response()
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "No signing key configured for this repository",
+            )
+                .into_response()
+        })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-pem-file")
+        .header(
+            "Content-Disposition",
+            "attachment; filename=\"artifact-keeper.rsa.pub\"",
+        )
+        .header(CONTENT_LENGTH, public_pem.len().to_string())
+        .body(Body::from(public_pem))
         .unwrap())
 }
 
@@ -513,12 +596,20 @@ async fn upload_package_put(
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
 
     if !filename.ends_with(".apk") {
-        return Err(
-            (StatusCode::BAD_REQUEST, "File must have .apk extension").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
     }
 
-    store_apk(&state, &repo, &branch, &repository, &arch, &filename, body, user_id).await
+    store_apk(
+        &state,
+        &repo,
+        &branch,
+        &repository,
+        &arch,
+        &filename,
+        body,
+        user_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -555,9 +646,7 @@ async fn upload_package_post(
         });
 
     if !filename.ends_with(".apk") {
-        return Err(
-            (StatusCode::BAD_REQUEST, "File must have .apk extension").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
     }
 
     // Extract branch/repository/arch from headers or use defaults
@@ -580,7 +669,14 @@ async fn upload_package_post(
         .to_string();
 
     store_apk(
-        &state, &repo, &branch, &repository, &arch, &filename, body, user_id,
+        &state,
+        &repo,
+        &branch,
+        &repository,
+        &arch,
+        &filename,
+        body,
+        user_id,
     )
     .await
 }
@@ -756,19 +852,13 @@ mod tests {
     #[test]
     fn test_parse_apk_filename_simple() {
         let result = parse_apk_filename("curl-8.5.0-r0.apk");
-        assert_eq!(
-            result,
-            Some(("curl".to_string(), "8.5.0-r0".to_string()))
-        );
+        assert_eq!(result, Some(("curl".to_string(), "8.5.0-r0".to_string())));
     }
 
     #[test]
     fn test_parse_apk_filename_hyphenated_name() {
         let result = parse_apk_filename("my-app-1.2.3-r1.apk");
-        assert_eq!(
-            result,
-            Some(("my-app".to_string(), "1.2.3-r1".to_string()))
-        );
+        assert_eq!(result, Some(("my-app".to_string(), "1.2.3-r1".to_string())));
     }
 
     #[test]
@@ -804,7 +894,7 @@ mod tests {
 
     #[test]
     fn test_create_apkindex_tar_gz_empty() {
-        let result = create_apkindex_tar_gz("");
+        let result = create_apkindex_tar_gz("", None);
         assert!(result.is_ok());
         let tar_gz = result.unwrap();
         assert!(!tar_gz.is_empty());
@@ -813,7 +903,7 @@ mod tests {
     #[test]
     fn test_create_apkindex_tar_gz_with_content() {
         let content = "C:abc123\nP:curl\nV:8.5.0-r0\nA:x86_64\nS:1234\nI:5678\nT:URL retrieval utility\nU:https://curl.se\nL:MIT\n\n";
-        let result = create_apkindex_tar_gz(content);
+        let result = create_apkindex_tar_gz(content, None);
         assert!(result.is_ok());
 
         // Verify it's a valid tar.gz by decompressing
@@ -822,5 +912,29 @@ mod tests {
         let mut archive = tar::Archive::new(gz);
         let entries: Vec<_> = archive.entries().unwrap().collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_create_apkindex_tar_gz_with_signature() {
+        let content = "C:abc123\nP:curl\nV:8.5.0-r0\nA:x86_64\nS:1234\nI:5678\nT:URL retrieval utility\nU:https://curl.se\nL:MIT\n\n";
+        let fake_signature = b"fake-rsa-signature-bytes";
+        let result = create_apkindex_tar_gz(content, Some(fake_signature));
+        assert!(result.is_ok());
+
+        // Verify both entries exist in the correct order
+        let tar_gz = result.unwrap();
+        let gz = flate2::read::GzDecoder::new(&tar_gz[..]);
+        let mut archive = tar::Archive::new(gz);
+        let entry_names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                e.path().ok().map(|p| p.to_string_lossy().to_string())
+            })
+            .collect();
+        assert_eq!(entry_names.len(), 2);
+        assert_eq!(entry_names[0], ".SIGN.RSA.artifact-keeper.rsa.pub");
+        assert_eq!(entry_names[1], "APKINDEX");
     }
 }

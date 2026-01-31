@@ -28,7 +28,10 @@ pub fn router() -> Router<SharedState> {
             "/repositories/:repo_id/config",
             get(get_repo_signing_config).post(update_repo_signing_config),
         )
-        .route("/repositories/:repo_id/public-key", get(get_repo_public_key))
+        .route(
+            "/repositories/:repo_id/public-key",
+            get(get_repo_public_key),
+        )
 }
 
 // --- Request/Response DTOs ---
