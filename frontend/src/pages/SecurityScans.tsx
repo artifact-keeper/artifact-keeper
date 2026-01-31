@@ -39,7 +39,7 @@ export default function SecurityScans() {
     queryKey: ['repositories'],
     queryFn: async () => {
       const { data } = await apiClient.get('/api/v1/repositories');
-      return data;
+      return data?.items || data || [];
     },
   });
 
