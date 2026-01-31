@@ -6,40 +6,14 @@ import { DashboardWidget } from '../DashboardWidget';
 import { adminApi, repositoriesApi } from '../../../api';
 import { useAuth } from '../../../contexts';
 import { colors, spacing } from '../../../styles/tokens';
+import { packageTypeLabels } from '../../../constants/packages';
+import { formatBrandColors } from '../../../constants/formatIcons';
 import type { RepositoryFormat } from '../../../types';
 
 interface FormatCount {
   format: RepositoryFormat;
   count: number;
 }
-
-const formatColors: Record<RepositoryFormat, string> = {
-  maven: '#C71A36',
-  docker: '#2496ED',
-  npm: '#CB3837',
-  pypi: '#3776AB',
-  helm: '#0F1689',
-  rpm: '#EE0000',
-  debian: '#A80030',
-  go: '#00ADD8',
-  nuget: '#004880',
-  cargo: '#DEA584',
-  generic: colors.textSecondary,
-};
-
-const formatLabels: Record<RepositoryFormat, string> = {
-  maven: 'Maven',
-  docker: 'Docker',
-  npm: 'NPM',
-  pypi: 'PyPI',
-  helm: 'Helm',
-  rpm: 'RPM',
-  debian: 'Debian',
-  go: 'Go',
-  nuget: 'NuGet',
-  cargo: 'Cargo',
-  generic: 'Generic',
-};
 
 export const ArtifactCountWidget: React.FC = () => {
   const { user } = useAuth();
@@ -130,10 +104,10 @@ export const ArtifactCountWidget: React.FC = () => {
             {formatCounts.map(({ format, count }) => (
               <Tag
                 key={format}
-                color={formatColors[format]}
+                color={formatBrandColors[format] || colors.textSecondary}
                 style={{ margin: 0 }}
               >
-                {formatLabels[format]}: {count}
+                {packageTypeLabels[format] || format.toUpperCase()}: {count}
               </Tag>
             ))}
           </div>
