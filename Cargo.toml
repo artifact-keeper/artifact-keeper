@@ -78,3 +78,4 @@ wasmtime-wasi = "24.0"
 
 # Git operations
 git2 = "0.19"
+meilisearch-sdk = "0.27"

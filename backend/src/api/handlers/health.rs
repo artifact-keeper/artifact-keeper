@@ -20,6 +20,8 @@ pub struct HealthChecks {
     pub storage: CheckStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_scanner: Option<CheckStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meilisearch: Option<CheckStatus>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +70,31 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         None
     };
 
+    // Check Meilisearch if configured
+    let meili_check = if let Some(meili_url) = &state.config.meilisearch_url {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let health_url = format!("{}/health", meili_url.trim_end_matches('/'));
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => Some(CheckStatus {
+                status: "healthy".to_string(),
+                message: None,
+            }),
+            Ok(resp) => Some(CheckStatus {
+                status: "unhealthy".to_string(),
+                message: Some(format!("Meilisearch returned status {}", resp.status())),
+            }),
+            Err(e) => Some(CheckStatus {
+                status: "unavailable".to_string(),
+                message: Some(format!("Meilisearch unreachable: {}", e)),
+            }),
+        }
+    } else {
+        None
+    };
+
     let overall_status = if db_check.status == "healthy" {
         "healthy"
     } else {
@@ -84,6 +111,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
                 message: None,
             },
             security_scanner: scanner_check,
+            meilisearch: meili_check,
         },
     };
 
@@ -178,6 +206,7 @@ mod tests {
                     message: Some("Connected".to_string()),
                 },
                 security_scanner: None,
+                meilisearch: None,
             },
         };
 
@@ -209,6 +238,7 @@ mod tests {
                     status: "healthy".to_string(),
                     message: None,
                 }),
+                meilisearch: None,
             },
         };
 
@@ -256,6 +286,7 @@ mod tests {
                     message: None,
                 },
                 security_scanner: None,
+                meilisearch: None,
             },
         };
 

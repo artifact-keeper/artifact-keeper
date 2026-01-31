@@ -41,65 +41,86 @@ const Search = () => {
 
   // Search query
   const { data: searchResults, isLoading, isFetching } = useQuery({
-    queryKey: ['advanced-search', searchValues, page, pageSize, sortField, sortOrder],
+    queryKey: ['advanced-search', searchValues, activeTab, page, pageSize, sortField, sortOrder],
     queryFn: async () => {
       if (!searchValues) return null
 
-      // Build search request based on active tab
-      const request: Parameters<typeof searchApi.advanced>[0] = {
+      // Handle checksum search separately via dedicated endpoint
+      if (activeTab === 'checksum') {
+        const checksumValue = searchValues.checksum?.value
+        if (!checksumValue) return null
+
+        const algorithmMap = {
+          md5: 'md5' as const,
+          sha1: 'sha1' as const,
+          sha256: 'sha256' as const,
+          sha512: 'sha256' as const, // fallback: API only supports sha256/sha1/md5
+        }
+        const algorithm = algorithmMap[searchValues.checksum?.type ?? 'sha256'] ?? 'sha256'
+
+        const artifacts = await searchApi.checksumSearch({
+          checksum: checksumValue,
+          algorithm,
+        })
+
+        // Wrap in paginated response shape for consistent handling
+        return {
+          items: artifacts,
+          pagination: { page: 1, per_page: artifacts.length, total: artifacts.length, total_pages: 1 },
+        }
+      }
+
+      // Build search request for all other tabs
+      const request: Parameters<typeof searchApi.advancedSearch>[0] = {
         page,
         per_page: pageSize,
       }
 
-      switch (searchValues.searchType) {
+      switch (activeTab) {
         case 'package':
-          if (searchValues.packageName) request.query = searchValues.packageName
-          if (searchValues.repository) request.repository_key = searchValues.repository
-          if (searchValues.format) request.format = searchValues.format
+          if (searchValues.package?.name) request.query = searchValues.package.name
+          if (searchValues.package?.version) request.version = searchValues.package.version
+          if (searchValues.package?.repository) request.repository_key = searchValues.package.repository
+          if (searchValues.package?.format) request.format = searchValues.package.format
           break
         case 'property':
-          if (searchValues.properties?.length) {
-            request.properties = searchValues.properties.reduce((acc, prop) => {
-              if (prop.key && prop.value) {
-                acc[prop.key] = prop.value
-              }
-              return acc
-            }, {} as Record<string, string>)
-          }
-          break
-        case 'checksum':
-          if (searchValues.checksum) {
-            request.checksum = searchValues.checksum
-            request.checksum_type = searchValues.checksumType
+          // Property search: use query param with filter key:value pairs
+          if (searchValues.property?.filters?.length) {
+            const queryParts = searchValues.property.filters
+              .filter((f) => f.key && f.value)
+              .map((f) => `${f.key}:${f.value}`)
+            if (queryParts.length > 0) {
+              request.query = queryParts.join(' ')
+            }
           }
           break
         case 'gavc':
-          if (searchValues.groupId) request.group_id = searchValues.groupId
-          if (searchValues.artifactId) request.artifact_id = searchValues.artifactId
-          if (searchValues.version) request.version = searchValues.version
-          if (searchValues.classifier) request.classifier = searchValues.classifier
+          if (searchValues.gavc?.groupId) request.path = searchValues.gavc.groupId
+          if (searchValues.gavc?.artifactId) request.name = searchValues.gavc.artifactId
+          if (searchValues.gavc?.version) request.version = searchValues.gavc.version
           break
       }
 
-      return searchApi.advanced(request)
+      return searchApi.advancedSearch(request)
     },
     enabled: !!searchValues,
   })
 
   // Handle search form submit
-  const handleSearch = useCallback((values: AdvancedSearchValues) => {
+  const handleSearch = useCallback((values: AdvancedSearchValues, tab: SearchTabType) => {
     setSearchValues(values)
+    setActiveTab(tab)
     setPage(1)
 
     // Update URL with search query
     const params = new URLSearchParams()
-    if (values.packageName) params.set('q', values.packageName)
-    if (values.searchType) params.set('tab', values.searchType)
+    if (values.package?.name) params.set('q', values.package.name)
+    params.set('tab', tab)
     setSearchParams(params)
   }, [setSearchParams])
 
   // Handle result selection
-  const handleSelect = useCallback((result: ArtifactSearchHit) => {
+  const handleSelect = useCallback((_result: ArtifactSearchHit) => {
     // Navigate to artifact detail - handled by SearchResults component
   }, [])
 
@@ -123,7 +144,9 @@ const Search = () => {
   }, [])
 
   // Transform search results to expected format
-  const results: ArtifactSearchHit[] = searchResults?.items ?? []
+  // Note: SearchResult and Artifact types are structurally compatible with ArtifactSearchHit
+  // for the fields used by the SearchResults component (name, path, repository_key, etc.)
+  const results = (searchResults?.items ?? []) as unknown as ArtifactSearchHit[]
 
   return (
     <div>

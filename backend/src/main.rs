@@ -15,6 +15,7 @@ use artifact_keeper_backend::{
     db,
     error::Result,
     services::{
+        meili_service::MeiliService,
         plugin_registry::PluginRegistry,
         scan_config_service::ScanConfigService,
         scan_result_service::ScanResultService,
@@ -67,6 +68,47 @@ async fn main() -> Result<()> {
         config.trivy_url.clone(),
     ));
 
+    // Initialize Meilisearch (optional, graceful fallback)
+    let meili_service = match (&config.meilisearch_url, &config.meilisearch_api_key) {
+        (Some(url), Some(api_key)) => {
+            tracing::info!("Initializing Meilisearch at {}", url);
+            let service = Arc::new(MeiliService::new(url, api_key));
+            match service.configure_indexes().await {
+                Ok(()) => {
+                    tracing::info!("Meilisearch indexes configured");
+                    // Spawn background reindex if the index is empty
+                    let svc = service.clone();
+                    let pool = db_pool.clone();
+                    tokio::spawn(async move {
+                        match svc.is_index_empty().await {
+                            Ok(true) => {
+                                tracing::info!("Meilisearch index is empty, starting background reindex");
+                                if let Err(e) = svc.full_reindex(&pool).await {
+                                    tracing::warn!("Background reindex failed: {}", e);
+                                }
+                            }
+                            Ok(false) => {
+                                tracing::info!("Meilisearch index already populated, skipping reindex");
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to check Meilisearch index status: {}", e);
+                            }
+                        }
+                    });
+                    Some(service)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to configure Meilisearch indexes, continuing without search: {}", e);
+                    None
+                }
+            }
+        }
+        _ => {
+            tracing::info!("Meilisearch not configured, search indexing disabled");
+            None
+        }
+    };
+
     // Create application state with WASM plugin support
     let mut app_state = api::AppState::with_wasm_plugins(
         config.clone(),
@@ -75,6 +117,9 @@ async fn main() -> Result<()> {
         wasm_plugin_service,
     );
     app_state.set_scanner_service(scanner_service);
+    if let Some(meili) = meili_service {
+        app_state.set_meili_service(meili);
+    }
     let state = Arc::new(app_state);
 
     // Build router

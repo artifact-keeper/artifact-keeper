@@ -10,6 +10,7 @@ pub mod edge_service;
 pub mod encryption;
 pub mod image_scanner;
 pub mod ldap_service;
+pub mod meili_service;
 pub mod migration_service;
 pub mod migration_worker;
 pub mod oidc_service;

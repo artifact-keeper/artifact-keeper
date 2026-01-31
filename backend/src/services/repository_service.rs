@@ -2,11 +2,14 @@
 //!
 //! Handles repository CRUD operations, virtual repository management, and quota enforcement.
 
+use std::sync::Arc;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat, RepositoryType};
+use crate::services::meili_service::{MeiliService, RepositoryDocument};
 
 /// Request to create a new repository
 #[derive(Debug)]
@@ -36,12 +39,29 @@ pub struct UpdateRepositoryRequest {
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
+    meili_service: Option<Arc<MeiliService>>,
 }
 
 impl RepositoryService {
     /// Create a new repository service
     pub fn new(db: PgPool) -> Self {
-        Self { db }
+        Self {
+            db,
+            meili_service: None,
+        }
+    }
+
+    /// Create a new repository service with Meilisearch indexing support.
+    pub fn new_with_meili(db: PgPool, meili_service: Option<Arc<MeiliService>>) -> Self {
+        Self {
+            db,
+            meili_service,
+        }
+    }
+
+    /// Set the Meilisearch service for search indexing.
+    pub fn set_meili_service(&mut self, meili_service: Arc<MeiliService>) {
+        self.meili_service = Some(meili_service);
     }
 
     /// Create a new repository
@@ -108,6 +128,21 @@ impl RepositoryService {
                 AppError::Database(e.to_string())
             }
         })?;
+
+        // Index repository in Meilisearch (non-blocking)
+        if let Some(ref meili) = self.meili_service {
+            let meili = meili.clone();
+            let doc = Self::repo_to_meili_doc(&repo);
+            tokio::spawn(async move {
+                if let Err(e) = meili.index_repository(&doc).await {
+                    tracing::warn!(
+                        "Failed to index repository {} in Meilisearch: {}",
+                        doc.id,
+                        e
+                    );
+                }
+            });
+        }
 
         Ok(repo)
     }
@@ -264,6 +299,21 @@ impl RepositoryService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
 
+        // Index updated repository in Meilisearch (non-blocking)
+        if let Some(ref meili) = self.meili_service {
+            let meili = meili.clone();
+            let doc = Self::repo_to_meili_doc(&repo);
+            tokio::spawn(async move {
+                if let Err(e) = meili.index_repository(&doc).await {
+                    tracing::warn!(
+                        "Failed to index updated repository {} in Meilisearch: {}",
+                        doc.id,
+                        e
+                    );
+                }
+            });
+        }
+
         Ok(repo)
     }
 
@@ -276,6 +326,21 @@ impl RepositoryService {
 
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound("Repository not found".to_string()));
+        }
+
+        // Remove repository from Meilisearch index (non-blocking)
+        if let Some(ref meili) = self.meili_service {
+            let meili = meili.clone();
+            let repo_id_str = id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = meili.remove_repository(&repo_id_str).await {
+                    tracing::warn!(
+                        "Failed to remove repository {} from Meilisearch: {}",
+                        repo_id_str,
+                        e
+                    );
+                }
+            });
         }
 
         Ok(())
@@ -406,6 +471,20 @@ impl RepositoryService {
                 Ok(current_usage + additional_bytes <= quota)
             }
             None => Ok(true), // No quota set
+        }
+    }
+
+    /// Convert a Repository model to a Meilisearch RepositoryDocument.
+    fn repo_to_meili_doc(repo: &Repository) -> RepositoryDocument {
+        RepositoryDocument {
+            id: repo.id.to_string(),
+            name: repo.name.clone(),
+            key: repo.key.clone(),
+            description: repo.description.clone(),
+            format: format!("{:?}", repo.format).to_lowercase(),
+            repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
+            is_public: repo.is_public,
+            created_at: repo.created_at.timestamp(),
         }
     }
 }

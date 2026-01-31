@@ -59,6 +59,12 @@ pub struct Config {
 
     /// Trivy server URL for container image scanning (optional)
     pub trivy_url: Option<String>,
+
+    /// Meilisearch URL for search indexing (optional)
+    pub meilisearch_url: Option<String>,
+
+    /// Meilisearch API key
+    pub meilisearch_api_key: Option<String>,
 }
 
 impl Config {
@@ -95,6 +101,8 @@ impl Config {
             ldap_url: env::var("LDAP_URL").ok(),
             ldap_base_dn: env::var("LDAP_BASE_DN").ok(),
             trivy_url: env::var("TRIVY_URL").ok(),
+            meilisearch_url: env::var("MEILISEARCH_URL").ok(),
+            meilisearch_api_key: env::var("MEILISEARCH_API_KEY").ok(),
         })
     }
 }

@@ -141,6 +141,7 @@ export interface HealthResponse {
     database: { status: string; message?: string };
     storage: { status: string; message?: string };
     security_scanner?: { status: string; message?: string };
+    meilisearch?: { status: string; message?: string };
   };
 }
 

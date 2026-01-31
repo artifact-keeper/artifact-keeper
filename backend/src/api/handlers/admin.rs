@@ -29,6 +29,7 @@ pub fn router() -> Router<SharedState> {
         .route("/settings", get(get_settings).post(update_settings))
         .route("/stats", get(get_system_stats))
         .route("/cleanup", post(run_cleanup))
+        .route("/reindex", post(trigger_reindex))
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,4 +540,56 @@ pub async fn run_cleanup(
     }
 
     Ok(Json(result))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReindexResponse {
+    pub message: String,
+    pub artifacts_indexed: i64,
+    pub repositories_indexed: i64,
+}
+
+/// Trigger a full Meilisearch reindex of all artifacts and repositories.
+///
+/// Requires admin privileges and Meilisearch to be configured.
+pub async fn trigger_reindex(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<ReindexResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Unauthorized(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
+    let meili = state.meili_service.as_ref().ok_or_else(|| {
+        AppError::Internal("Meilisearch is not configured".to_string())
+    })?;
+
+    // Count artifacts and repositories before reindex so we can report counts
+    let artifact_stats = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) as "count!",
+            COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
+        FROM artifacts
+        WHERE is_deleted = false
+        "#
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let repo_count = sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM repositories")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    meili.full_reindex(&state.db).await?;
+
+    Ok(Json(ReindexResponse {
+        message: "Full reindex completed successfully".to_string(),
+        artifacts_indexed: artifact_stats.count,
+        repositories_indexed: repo_count,
+    }))
 }

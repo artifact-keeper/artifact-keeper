@@ -235,7 +235,7 @@ pub async fn create_repository(
     // Generate storage path using the configured storage directory
     let storage_path = format!("{}/{}", state.config.storage_path, payload.key);
 
-    let service = RepositoryService::new(state.db.clone());
+    let service = state.create_repository_service();
     let repo = service
         .create(ServiceCreateRepoReq {
             key: payload.key,
@@ -276,7 +276,7 @@ pub async fn update_repository(
     // Require authentication
     let _auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
-    let service = RepositoryService::new(state.db.clone());
+    let service = state.create_repository_service();
 
     // Get existing repo by key
     let existing = service.get_by_key(&key).await?;
@@ -308,7 +308,7 @@ pub async fn delete_repository(
     // Require authentication
     let _auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
-    let service = RepositoryService::new(state.db.clone());
+    let service = state.create_repository_service();
     let repo = service.get_by_key(&key).await?;
     service.delete(repo.id).await?;
     Ok(())
@@ -462,10 +462,7 @@ pub async fn upload_artifact(
     let repo = repo_service.get_by_key(&key).await?;
 
     let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
-    let mut artifact_service = ArtifactService::new(state.db.clone(), storage);
-    if let Some(ref scanner) = state.scanner_service {
-        artifact_service.set_scanner_service(scanner.clone());
-    }
+    let artifact_service = state.create_artifact_service(storage);
 
     // Extract name from path
     let name = path.split('/').next_back().unwrap_or(&path).to_string();
@@ -573,7 +570,7 @@ pub async fn delete_artifact(
     let repo = repo_service.get_by_key(&key).await?;
 
     let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let artifact_service = state.create_artifact_service(storage);
 
     // Find the artifact
     let artifact = sqlx::query_scalar!(

@@ -165,42 +165,62 @@ const Dashboard = () => {
 
       {/* System Health */}
       <Card title="System Health" style={{ marginBottom: 16 }}>
-        <Row gutter={16}>
-          <Col span={health?.checks?.security_scanner ? 6 : 8}>
-            <Statistic
-              title="Status"
-              value={health?.status || 'Unknown'}
-              styles={{ content: { color: health?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
-              prefix={health?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
-            />
-          </Col>
-          <Col span={health?.checks?.security_scanner ? 6 : 8}>
-            <Statistic
-              title="Database"
-              value={health?.checks?.database?.status || 'Unknown'}
-              styles={{ content: { color: health?.checks?.database?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
-              prefix={health?.checks?.database?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
-            />
-          </Col>
-          <Col span={health?.checks?.security_scanner ? 6 : 8}>
-            <Statistic
-              title="Storage"
-              value={health?.checks?.storage?.status || 'Unknown'}
-              styles={{ content: { color: health?.checks?.storage?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
-              prefix={health?.checks?.storage?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
-            />
-          </Col>
-          {health?.checks?.security_scanner && (
-            <Col span={6}>
-              <Statistic
-                title="Security Scanner"
-                value={health.checks.security_scanner.status}
-                styles={{ content: { color: health.checks.security_scanner.status === 'healthy' ? '#3f8600' : health.checks.security_scanner.status === 'unavailable' ? '#faad14' : '#cf1322' } }}
-                prefix={health.checks.security_scanner.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
-              />
-            </Col>
-          )}
-        </Row>
+        {(() => {
+          const baseCount = 3 // Status, Database, Storage
+          const optionalCount =
+            (health?.checks?.security_scanner ? 1 : 0) +
+            (health?.checks?.meilisearch ? 1 : 0)
+          const colSpan = Math.floor(24 / (baseCount + optionalCount))
+
+          return (
+            <Row gutter={16}>
+              <Col span={colSpan}>
+                <Statistic
+                  title="Status"
+                  value={health?.status || 'Unknown'}
+                  styles={{ content: { color: health?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
+                  prefix={health?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
+                />
+              </Col>
+              <Col span={colSpan}>
+                <Statistic
+                  title="Database"
+                  value={health?.checks?.database?.status || 'Unknown'}
+                  styles={{ content: { color: health?.checks?.database?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
+                  prefix={health?.checks?.database?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
+                />
+              </Col>
+              <Col span={colSpan}>
+                <Statistic
+                  title="Storage"
+                  value={health?.checks?.storage?.status || 'Unknown'}
+                  styles={{ content: { color: health?.checks?.storage?.status === 'healthy' ? '#3f8600' : '#cf1322' } }}
+                  prefix={health?.checks?.storage?.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
+                />
+              </Col>
+              {health?.checks?.security_scanner && (
+                <Col span={colSpan}>
+                  <Statistic
+                    title="Security Scanner"
+                    value={health.checks.security_scanner.status}
+                    styles={{ content: { color: health.checks.security_scanner.status === 'healthy' ? '#3f8600' : health.checks.security_scanner.status === 'unavailable' ? '#faad14' : '#cf1322' } }}
+                    prefix={health.checks.security_scanner.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
+                  />
+                </Col>
+              )}
+              {health?.checks?.meilisearch && (
+                <Col span={colSpan}>
+                  <Statistic
+                    title="Search Engine"
+                    value={health.checks.meilisearch.status}
+                    styles={{ content: { color: health.checks.meilisearch.status === 'healthy' ? '#3f8600' : health.checks.meilisearch.status === 'unavailable' ? '#faad14' : '#cf1322' } }}
+                    prefix={health.checks.meilisearch.status === 'healthy' ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
+                  />
+                </Col>
+              )}
+            </Row>
+          )
+        })()}
       </Card>
 
       {/* Storage and Activity Widgets */}

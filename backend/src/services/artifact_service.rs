@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
+use crate::services::meili_service::{ArtifactDocument, MeiliService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
@@ -24,6 +25,7 @@ pub struct ArtifactService {
     repo_service: RepositoryService,
     plugin_service: Option<Arc<PluginService>>,
     scanner_service: Option<Arc<ScannerService>>,
+    meili_service: Option<Arc<MeiliService>>,
 }
 
 impl ArtifactService {
@@ -36,6 +38,24 @@ impl ArtifactService {
             repo_service,
             plugin_service: None,
             scanner_service: None,
+            meili_service: None,
+        }
+    }
+
+    /// Create a new artifact service with Meilisearch indexing support.
+    pub fn new_with_meili(
+        db: PgPool,
+        storage: Arc<dyn StorageBackend>,
+        meili_service: Option<Arc<MeiliService>>,
+    ) -> Self {
+        let repo_service = RepositoryService::new(db.clone());
+        Self {
+            db,
+            storage,
+            repo_service,
+            plugin_service: None,
+            scanner_service: None,
+            meili_service,
         }
     }
 
@@ -52,6 +72,7 @@ impl ArtifactService {
             repo_service,
             plugin_service: Some(plugin_service),
             scanner_service: None,
+            meili_service: None,
         }
     }
 
@@ -63,6 +84,11 @@ impl ArtifactService {
     /// Set the scanner service for scan-on-upload.
     pub fn set_scanner_service(&mut self, scanner_service: Arc<ScannerService>) {
         self.scanner_service = Some(scanner_service);
+    }
+
+    /// Set the Meilisearch service for search indexing.
+    pub fn set_meili_service(&mut self, meili_service: Arc<MeiliService>) {
+        self.meili_service = Some(meili_service);
     }
 
     /// Trigger a plugin hook, logging but not failing if plugin service is unavailable.
@@ -246,6 +272,68 @@ impl ArtifactService {
             });
         }
 
+        // Index artifact in Meilisearch (non-blocking)
+        if let Some(ref meili) = self.meili_service {
+            let meili = meili.clone();
+            let db = self.db.clone();
+            let artifact_id = artifact.id;
+            let artifact_name = artifact.name.clone();
+            let artifact_path = artifact.path.clone();
+            let artifact_version = artifact.version.clone();
+            let artifact_content_type = artifact.content_type.clone();
+            let artifact_size = artifact.size_bytes;
+            let artifact_created = artifact.created_at;
+            let repo_id = artifact.repository_id;
+            tokio::spawn(async move {
+                // Fetch repository info for the document
+                let repo_info = sqlx::query_as::<_, (String, String, String)>(
+                    "SELECT key, name, format::text FROM repositories WHERE id = $1",
+                )
+                .bind(repo_id)
+                .fetch_optional(&db)
+                .await;
+
+                match repo_info {
+                    Ok(Some((repo_key, repo_name, format))) => {
+                        let doc = ArtifactDocument {
+                            id: artifact_id.to_string(),
+                            name: artifact_name,
+                            path: artifact_path,
+                            version: artifact_version,
+                            format,
+                            repository_id: repo_id.to_string(),
+                            repository_key: repo_key,
+                            repository_name: repo_name,
+                            content_type: artifact_content_type,
+                            size_bytes: artifact_size,
+                            download_count: 0,
+                            created_at: artifact_created.timestamp(),
+                        };
+                        if let Err(e) = meili.index_artifact(&doc).await {
+                            tracing::warn!(
+                                "Failed to index artifact {} in Meilisearch: {}",
+                                artifact_id,
+                                e
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "Repository {} not found when indexing artifact {}",
+                            repo_id,
+                            artifact_id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to fetch repository for Meilisearch indexing: {}",
+                            e
+                        );
+                    }
+                }
+            });
+        }
+
         Ok(artifact)
     }
 
@@ -409,6 +497,21 @@ impl ArtifactService {
         // Trigger AfterDelete hooks (non-blocking)
         self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
             .await;
+
+        // Remove artifact from Meilisearch index (non-blocking)
+        if let Some(ref meili) = self.meili_service {
+            let meili = meili.clone();
+            let artifact_id_str = id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = meili.remove_artifact(&artifact_id_str).await {
+                    tracing::warn!(
+                        "Failed to remove artifact {} from Meilisearch: {}",
+                        artifact_id_str,
+                        e
+                    );
+                }
+            });
+        }
 
         Ok(())
     }

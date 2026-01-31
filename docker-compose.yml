@@ -25,6 +25,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      meilisearch:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
       STORAGE_PATH: /data/storage
@@ -33,6 +35,8 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
       TRIVY_URL: http://trivy:8090
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-artifact-keeper-dev-key}
       HOST: 0.0.0.0
       PORT: 8080
     volumes:
@@ -47,6 +51,23 @@ services:
       timeout: 10s
       start_period: 10s
       retries: 3
+    restart: unless-stopped
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    container_name: artifact-keeper-meilisearch
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-artifact-keeper-dev-key}
+      MEILI_ENV: development
+    volumes:
+      - meilisearch_data:/meili_data
+    ports:
+      - "7700:7700"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   trivy:
@@ -84,6 +105,8 @@ volumes:
   plugins_storage:
     driver: local
   trivy_cache:
+    driver: local
+  meilisearch_data:
     driver: local
 
 networks:
