@@ -3,12 +3,15 @@
 # Tests push (npm publish) and pull (npm install) operations
 set -euo pipefail
 
-REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080/api/v1/repositories/test-npm}"
+REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
+REPO_KEY="${REPO_KEY:-test-npm}"
 CA_CERT="${CA_CERT:-}"
 TEST_VERSION="1.0.$(date +%s)"
 
+NPM_REGISTRY="${REGISTRY_URL}/npm/${REPO_KEY}/"
+
 echo "==> NPM Native Client Test"
-echo "Registry: $REGISTRY_URL"
+echo "Registry: $NPM_REGISTRY"
 echo "Version: $TEST_VERSION"
 
 # Generate test package
@@ -40,8 +43,8 @@ EOF
 
 # Configure npm registry
 echo "==> Configuring npm registry..."
-npm config set registry "$REGISTRY_URL"
-npm config set //${REGISTRY_URL#http*://}:_authToken "$(echo -n 'admin:admin123' | base64)"
+npm config set registry "$NPM_REGISTRY"
+npm config set //${NPM_REGISTRY#http*://}:_authToken "$(echo -n 'admin:admin123' | base64)"
 
 if [ -n "$CA_CERT" ] && [ -f "$CA_CERT" ]; then
     npm config set cafile "$CA_CERT"
@@ -67,4 +70,4 @@ echo "==> Verifying installed package..."
 node -e "const pkg = require('@test/native-package'); console.log(pkg.hello());"
 
 echo ""
-echo "✅ NPM native client test PASSED"
+echo "==> NPM native client test PASSED"

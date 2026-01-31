@@ -23,7 +23,39 @@ export default defineConfig({
         target: process.env.VITE_API_URL || 'http://localhost:9080',
         changeOrigin: true,
       },
+      '/npm': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/maven': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/cargo': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/gems': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/debian': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
       '/pypi': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/nuget': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/rpm': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
+      '/go': {
         target: process.env.VITE_API_URL || 'http://localhost:9080',
         changeOrigin: true,
       },

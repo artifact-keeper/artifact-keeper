@@ -1,9 +1,12 @@
 #!/bin/bash
 # Maven native client test script
 # Tests push (mvn deploy) and pull (mvn dependency:get) operations
+# against the Maven 2 repository layout at /maven/{repo_key}/
 set -euo pipefail
 
-REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080/api/v1/repositories/test-maven}"
+REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080/maven/test-maven}"
+REGISTRY_USER="${REGISTRY_USER:-admin}"
+REGISTRY_PASS="${REGISTRY_PASS:-admin123}"
 CA_CERT="${CA_CERT:-}"
 TEST_VERSION="1.0.$(date +%s)"
 
@@ -63,8 +66,8 @@ cat > ~/.m2/settings.xml << EOF
   <servers>
     <server>
       <id>test-registry</id>
-      <username>admin</username>
-      <password>admin123</password>
+      <username>$REGISTRY_USER</username>
+      <password>$REGISTRY_PASS</password>
     </server>
   </servers>
 </settings>
@@ -75,9 +78,41 @@ echo "==> Building and deploying artifact..."
 mvn clean package -q
 mvn deploy -q -DaltDeploymentRepository=test-registry::default::$REGISTRY_URL
 
-# Verify push
+# Verify push via curl
 echo "==> Verifying artifact was deployed..."
 sleep 2
+
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+  "$REGISTRY_URL/com/test/test-artifact-native/$TEST_VERSION/test-artifact-native-$TEST_VERSION.jar")
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "FAIL: Expected HTTP 200 for artifact download, got $HTTP_CODE"
+  exit 1
+fi
+
+echo "==> Artifact download returned HTTP $HTTP_CODE"
+
+# Verify maven-metadata.xml
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+  "$REGISTRY_URL/com/test/test-artifact-native/maven-metadata.xml")
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "FAIL: Expected HTTP 200 for maven-metadata.xml, got $HTTP_CODE"
+  exit 1
+fi
+
+echo "==> maven-metadata.xml returned HTTP $HTTP_CODE"
+
+# Verify checksum
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+  "$REGISTRY_URL/com/test/test-artifact-native/$TEST_VERSION/test-artifact-native-$TEST_VERSION.jar.sha1")
+
+if [ "$HTTP_CODE" != "200" ]; then
+  echo "FAIL: Expected HTTP 200 for .sha1 checksum, got $HTTP_CODE"
+  exit 1
+fi
+
+echo "==> SHA1 checksum returned HTTP $HTTP_CODE"
 
 # Pull with mvn dependency:get
 echo "==> Fetching artifact with Maven..."
@@ -115,4 +150,4 @@ EOF
 mvn dependency:resolve -q
 
 echo ""
-echo "✅ Maven native client test PASSED"
+echo "Maven native client test PASSED"

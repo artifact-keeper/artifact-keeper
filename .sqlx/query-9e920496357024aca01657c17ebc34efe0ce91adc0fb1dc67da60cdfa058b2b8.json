@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO artifact_metadata (artifact_id, format, metadata)\n        VALUES ($1, 'debian', $2)\n        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9e920496357024aca01657c17ebc34efe0ce91adc0fb1dc67da60cdfa058b2b8"
+}

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT a.version as \"version?\"\n        FROM artifacts a\n        JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND am.format = 'maven'\n          AND am.metadata->>'groupId' = $2\n          AND am.metadata->>'artifactId' = $3\n          AND a.version IS NOT NULL\n        ORDER BY a.version\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version?",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "5800ffbe73ed75f849c90643ca273ce3babb1e717f4bb4836bdd77b2322422bd"
+}

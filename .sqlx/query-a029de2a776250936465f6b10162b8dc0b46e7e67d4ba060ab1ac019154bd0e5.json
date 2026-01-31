@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT path\n        FROM artifacts\n        WHERE repository_id = $1 AND is_deleted = false AND path LIKE 'pool/%'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "path",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a029de2a776250936465f6b10162b8dc0b46e7e67d4ba060ab1ac019154bd0e5"
+}
