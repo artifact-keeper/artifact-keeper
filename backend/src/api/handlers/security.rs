@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -274,7 +274,7 @@ async fn get_all_scores(
 // ---------------------------------------------------------------------------
 
 async fn trigger_scan(
-    State(state): State<SharedState>,
+    State(_state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
@@ -609,7 +609,7 @@ async fn get_repo_security(
 ) -> Result<Json<RepoSecurityResponse>> {
     // Resolve repository by key
     let repo = sqlx::query_scalar!(
-        "SELECT id FROM repositories WHERE key = $1 AND is_deleted = false",
+        "SELECT id FROM repositories WHERE key = $1",
         key,
     )
     .fetch_optional(&state.db)
@@ -659,7 +659,7 @@ async fn update_repo_security(
     Json(body): Json<UpsertScanConfigRequest>,
 ) -> Result<Json<ScanConfigResponse>> {
     let repo = sqlx::query_scalar!(
-        "SELECT id FROM repositories WHERE key = $1 AND is_deleted = false",
+        "SELECT id FROM repositories WHERE key = $1",
         key,
     )
     .fetch_optional(&state.db)
@@ -690,7 +690,7 @@ async fn list_repo_scans(
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
     let repo = sqlx::query_scalar!(
-        "SELECT id FROM repositories WHERE key = $1 AND is_deleted = false",
+        "SELECT id FROM repositories WHERE key = $1",
         key,
     )
     .fetch_optional(&state.db)

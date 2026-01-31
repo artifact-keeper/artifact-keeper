@@ -1,0 +1,43 @@
+# Local development stack
+#
+# Runs only infrastructure (Postgres) in Docker.
+# Backend and frontend run natively on the host for fast iteration.
+#
+# Usage:
+#   docker compose -f docker-compose.local-dev.yml up -d
+#
+# Then in separate terminals:
+#   DATABASE_URL=postgresql://registry:registry@localhost:30432/artifact_registry cargo run -p artifact-keeper-backend
+#   cd frontend && npm run dev
+#
+# Ports:
+#   Postgres: 30432  (host) -> 5432 (container)
+#   Backend:  8080   (run natively)
+#   Frontend: 5173   (run natively via vite)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: artifact-keeper-dev-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    volumes:
+      - dev_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "30432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  dev_postgres_data:
+    driver: local
+
+networks:
+  default:
+    name: artifact-keeper-dev-network

@@ -85,7 +85,7 @@ impl PolicyService {
 
                 // Check: max_severity threshold (non-acknowledged findings only)
                 if scan.status == "completed" {
-                    let threshold = Severity::from_str_loose(&policy.max_severity)
+                    let _threshold = Severity::from_str_loose(&policy.max_severity)
                         .unwrap_or(Severity::Critical);
 
                     // Count non-acknowledged findings at or above the threshold

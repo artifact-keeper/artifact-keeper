@@ -1,0 +1,97 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO repo_security_scores (repository_id, score, grade, total_findings,\n                critical_count, high_count, medium_count, low_count,\n                acknowledged_count, last_scan_at, calculated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())\n            ON CONFLICT (repository_id)\n            DO UPDATE SET\n                score = EXCLUDED.score,\n                grade = EXCLUDED.grade,\n                total_findings = EXCLUDED.total_findings,\n                critical_count = EXCLUDED.critical_count,\n                high_count = EXCLUDED.high_count,\n                medium_count = EXCLUDED.medium_count,\n                low_count = EXCLUDED.low_count,\n                acknowledged_count = EXCLUDED.acknowledged_count,\n                last_scan_at = EXCLUDED.last_scan_at,\n                calculated_at = NOW()\n            RETURNING id, repository_id, score, grade, total_findings,\n                      critical_count, high_count, medium_count, low_count,\n                      acknowledged_count, last_scan_at, calculated_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "score",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "grade",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "total_findings",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "critical_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "high_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "medium_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "low_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "acknowledged_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "last_scan_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "calculated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Bpchar",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "a30caddd4dfdf12e17baceffc245d4a0d2ce86f041da4d7f47c4fff160225c41"
+}

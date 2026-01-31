@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        SELECT COUNT(*) as \"count!\"\n                        FROM scan_findings\n                        WHERE artifact_id = $1\n                          AND NOT is_acknowledged\n                          AND severity IN (\n                              SELECT unnest(CASE $2\n                                  WHEN 'critical' THEN ARRAY['critical']\n                                  WHEN 'high' THEN ARRAY['critical', 'high']\n                                  WHEN 'medium' THEN ARRAY['critical', 'high', 'medium']\n                                  WHEN 'low' THEN ARRAY['critical', 'high', 'medium', 'low']\n                              END)\n                          )\n                        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9bab745eec3721d3512d21d99c9c179300a320116d7853e89bea24a8277e8347"
+}

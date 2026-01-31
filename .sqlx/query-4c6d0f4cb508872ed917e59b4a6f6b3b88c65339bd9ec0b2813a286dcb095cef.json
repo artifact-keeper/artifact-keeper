@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                COUNT(*) FILTER (WHERE severity = 'critical' AND NOT is_acknowledged) as \"critical!\",\n                COUNT(*) FILTER (WHERE severity = 'high' AND NOT is_acknowledged) as \"high!\",\n                COUNT(*) FILTER (WHERE severity = 'medium' AND NOT is_acknowledged) as \"medium!\",\n                COUNT(*) FILTER (WHERE severity = 'low' AND NOT is_acknowledged) as \"low!\",\n                COUNT(*) FILTER (WHERE is_acknowledged) as \"acknowledged!\",\n                COUNT(*) as \"total!\"\n            FROM scan_findings\n            WHERE artifact_id IN (\n                SELECT id FROM artifacts WHERE repository_id = $1 AND NOT is_deleted\n            )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "critical!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "high!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "medium!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "low!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "acknowledged!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "total!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "4c6d0f4cb508872ed917e59b4a6f6b3b88c65339bd9ec0b2813a286dcb095cef"
+}
