@@ -2,7 +2,7 @@
 -- Part of Borg Replication: Resumable Chunked Transfer Protocol
 
 -- Transfer session: tracks an artifact being transferred to a requesting node
-CREATE TABLE transfer_sessions (
+CREATE TABLE IF NOT EXISTS transfer_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     artifact_id UUID NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
     requesting_node_id UUID NOT NULL REFERENCES edge_nodes(id) ON DELETE CASCADE,
@@ -22,7 +22,7 @@ CREATE TABLE transfer_sessions (
 
 -- Individual chunks within a transfer session
 -- Each chunk tracks which peer served it (swarm distribution)
-CREATE TABLE transfer_chunks (
+CREATE TABLE IF NOT EXISTS transfer_chunks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id UUID NOT NULL REFERENCES transfer_sessions(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
@@ -40,7 +40,7 @@ CREATE TABLE transfer_chunks (
 -- Chunk availability: which edge nodes have which chunks of which artifacts
 -- Uses a compact bitfield representation for efficiency
 -- For a 500MB artifact with 1MB chunks: 500 bits = 63 bytes
-CREATE TABLE chunk_availability (
+CREATE TABLE IF NOT EXISTS chunk_availability (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     edge_node_id UUID NOT NULL REFERENCES edge_nodes(id) ON DELETE CASCADE,
     artifact_id UUID NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
@@ -52,11 +52,11 @@ CREATE TABLE chunk_availability (
 );
 
 -- Indexes for efficient chunk transfer queries
-CREATE INDEX idx_transfer_sessions_requesting ON transfer_sessions (requesting_node_id, status);
-CREATE INDEX idx_transfer_sessions_artifact ON transfer_sessions (artifact_id);
-CREATE INDEX idx_transfer_chunks_session_status ON transfer_chunks (session_id, status);
-CREATE INDEX idx_transfer_chunks_pending ON transfer_chunks (session_id, chunk_index)
+CREATE INDEX IF NOT EXISTS idx_transfer_sessions_requesting ON transfer_sessions (requesting_node_id, status);
+CREATE INDEX IF NOT EXISTS idx_transfer_sessions_artifact ON transfer_sessions (artifact_id);
+CREATE INDEX IF NOT EXISTS idx_transfer_chunks_session_status ON transfer_chunks (session_id, status);
+CREATE INDEX IF NOT EXISTS idx_transfer_chunks_pending ON transfer_chunks (session_id, chunk_index)
     WHERE status = 'pending';
-CREATE INDEX idx_chunk_availability_artifact ON chunk_availability (artifact_id)
+CREATE INDEX IF NOT EXISTS idx_chunk_availability_artifact ON chunk_availability (artifact_id)
     WHERE available_chunks > 0;
-CREATE INDEX idx_chunk_availability_node ON chunk_availability (edge_node_id);
+CREATE INDEX IF NOT EXISTS idx_chunk_availability_node ON chunk_availability (edge_node_id);

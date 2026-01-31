@@ -2,9 +2,12 @@
 -- Part of Borg Replication: Mesh Peer Discovery
 -- Unidirectional links: each row represents source → target with measured network metrics
 
-CREATE TYPE peer_status AS ENUM ('active', 'probing', 'unreachable', 'disabled');
+DO $$ BEGIN
+    CREATE TYPE peer_status AS ENUM ('active', 'probing', 'unreachable', 'disabled');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
-CREATE TABLE peer_connections (
+CREATE TABLE IF NOT EXISTS peer_connections (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     source_node_id UUID NOT NULL REFERENCES edge_nodes(id) ON DELETE CASCADE,
     target_node_id UUID NOT NULL REFERENCES edge_nodes(id) ON DELETE CASCADE,
@@ -25,11 +28,11 @@ CREATE TABLE peer_connections (
 );
 
 -- Indexes for peer lookups
-CREATE INDEX idx_peer_connections_source ON peer_connections (source_node_id, status)
+CREATE INDEX IF NOT EXISTS idx_peer_connections_source ON peer_connections (source_node_id, status)
     WHERE status = 'active';
-CREATE INDEX idx_peer_connections_target ON peer_connections (target_node_id, status)
+CREATE INDEX IF NOT EXISTS idx_peer_connections_target ON peer_connections (target_node_id, status)
     WHERE status = 'active';
 -- For finding best peers: order by latency, filter by bandwidth
-CREATE INDEX idx_peer_connections_quality
+CREATE INDEX IF NOT EXISTS idx_peer_connections_quality
     ON peer_connections (source_node_id, latency_ms, bandwidth_estimate_bps DESC)
     WHERE status = 'active';
