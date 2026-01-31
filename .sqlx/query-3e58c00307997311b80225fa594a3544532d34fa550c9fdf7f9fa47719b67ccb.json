@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes, r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
+  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
   "describe": {
     "columns": [
       {
@@ -128,11 +128,28 @@
       },
       {
         "ordinal": 11,
+        "name": "replication_priority: ReplicationPriority",
+        "type_info": {
+          "Custom": {
+            "name": "replication_priority",
+            "kind": {
+              "Enum": [
+                "immediate",
+                "scheduled",
+                "on_demand",
+                "local_only"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 12,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -155,8 +172,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "1b05fdd4326d5f6097ea45a00d9e54ae57f7c0f5fe894599613a00dd3dfcc32c"
+  "hash": "3e58c00307997311b80225fa594a3544532d34fa550c9fdf7f9fa47719b67ccb"
 }

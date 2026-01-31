@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE transfer_sessions\n            SET status = 'completed', completed_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3f794ad66ba162d9c00181d42ad8882be17091e1d71567dfc012ff3fdcb8c4b1"
+}

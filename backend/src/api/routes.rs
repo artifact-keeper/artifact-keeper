@@ -138,10 +138,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         // Edge node routes with auth middleware
         .nest(
             "/edge-nodes",
-            handlers::edge::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::edge::router()
+                .nest("/:id/transfer", handlers::transfer::router())
+                .nest("/:id/peers", handlers::peer::peer_router())
+                .nest("/:id/chunks", handlers::peer::chunk_router())
+                .merge(handlers::peer::network_profile_router())
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Admin routes with auth middleware
         .nest(

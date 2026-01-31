@@ -30,6 +30,7 @@ import SecurityDashboard from './pages/SecurityDashboard'
 import SecurityScans from './pages/SecurityScans'
 import SecurityScanDetail from './pages/SecurityScanDetail'
 import SecurityPolicies from './pages/SecurityPolicies'
+import ReplicationDashboard from './pages/ReplicationDashboard'
 import NotFound from './pages/NotFound'
 import { ServerError, Forbidden } from './pages/errors'
 
@@ -79,6 +80,7 @@ function AppContent() {
             <Route path="/builds" element={<Builds />} />
             <Route path="/setup" element={<SetupWizards />} />
             <Route path="/edge-nodes" element={<EdgeNodes />} />
+            <Route path="/replication" element={<ReplicationDashboard />} />
             <Route path="/backups" element={<Backups />} />
             <Route path="/plugins" element={<Plugins />} />
             <Route path="/users" element={<Users />} />

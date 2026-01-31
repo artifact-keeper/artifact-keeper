@@ -83,6 +83,16 @@ pub enum RepositoryType {
     Virtual,
 }
 
+/// Replication priority for Borg replication policies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "replication_priority", rename_all = "snake_case")]
+pub enum ReplicationPriority {
+    Immediate,
+    Scheduled,
+    OnDemand,
+    LocalOnly,
+}
+
 /// Repository entity
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct Repository {
@@ -97,6 +107,7 @@ pub struct Repository {
     pub upstream_url: Option<String>,
     pub is_public: bool,
     pub quota_bytes: Option<i64>,
+    pub replication_priority: ReplicationPriority,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

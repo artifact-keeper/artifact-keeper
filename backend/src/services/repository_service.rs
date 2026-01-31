@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
+use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat, RepositoryType};
 
 /// Request to create a new repository
 #[derive(Debug)]
@@ -84,7 +84,9 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, created_at, updated_at
+                is_public, quota_bytes,
+                replication_priority as "replication_priority: ReplicationPriority",
+                created_at, updated_at
             "#,
             req.key,
             req.name,
@@ -120,7 +122,9 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, created_at, updated_at
+                is_public, quota_bytes,
+                replication_priority as "replication_priority: ReplicationPriority",
+                created_at, updated_at
             FROM repositories
             WHERE id = $1
             "#,
@@ -144,7 +148,9 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, created_at, updated_at
+                is_public, quota_bytes,
+                replication_priority as "replication_priority: ReplicationPriority",
+                created_at, updated_at
             FROM repositories
             WHERE key = $1
             "#,
@@ -175,7 +181,9 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, created_at, updated_at
+                is_public, quota_bytes,
+                replication_priority as "replication_priority: ReplicationPriority",
+                created_at, updated_at
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
@@ -233,7 +241,9 @@ impl RepositoryService {
                 format as "format: RepositoryFormat",
                 repo_type as "repo_type: RepositoryType",
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, created_at, updated_at
+                is_public, quota_bytes,
+                replication_priority as "replication_priority: ReplicationPriority",
+                created_at, updated_at
             "#,
             id,
             req.name,
@@ -345,7 +355,9 @@ impl RepositoryService {
                 r.format as "format: RepositoryFormat",
                 r.repo_type as "repo_type: RepositoryType",
                 r.storage_backend, r.storage_path, r.upstream_url,
-                r.is_public, r.quota_bytes, r.created_at, r.updated_at
+                r.is_public, r.quota_bytes,
+                r.replication_priority as "replication_priority: ReplicationPriority",
+                r.created_at, r.updated_at
             FROM repositories r
             INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
             WHERE vrm.virtual_repo_id = $1

@@ -1,7 +1,7 @@
-//! Artifact Keeper Edge Node - Distributed caching node.
+//! Artifact Keeper Edge Node - Distributed caching node with swarm-based transfer.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,19 +13,59 @@ use axum::Router;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 mod cache;
+mod peers;
+mod replication;
+mod scheduler;
 mod sync;
+mod transfer;
+
+/// Default chunk size for chunked transfers (1 MB).
+const DEFAULT_CHUNK_SIZE: i32 = 1_048_576;
+
+/// Minimum artifact size to use chunked transfer (anything smaller is fetched whole).
+const CHUNKED_TRANSFER_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
 
 /// Edge node application state with offline mode tracking.
 pub struct EdgeState {
     pub primary_url: String,
     pub api_key: String,
     pub cache: Arc<cache::ArtifactCache>,
+    /// The edge node's ID from the primary registry (set after registration/heartbeat).
+    pub edge_node_id: RwLock<Option<Uuid>>,
+    /// Configurable chunk size for chunked transfers.
+    pub transfer_chunk_size: i32,
+    /// Whether chunked transfer is enabled.
+    pub chunked_transfer_enabled: bool,
     /// Tracks whether the edge node is currently offline (cannot reach primary).
     pub is_offline: AtomicBool,
     /// Timestamp of last successful contact with the primary server.
     pub last_primary_contact: RwLock<Option<Instant>>,
+    /// Number of currently active sync transfers.
+    pub active_transfers: Arc<AtomicI32>,
+    /// Total bytes transferred by the sync scheduler.
+    pub bytes_transferred: Arc<AtomicI64>,
+    /// Consecutive sync task fetch failures (used for backoff).
+    pub consecutive_failures: Arc<AtomicU32>,
+}
+
+impl EdgeState {
+    /// Get the edge node ID, returning a zeroed UUID if not yet registered.
+    pub fn node_id(&self) -> Uuid {
+        // Use try_read to avoid blocking; fall back to nil UUID
+        self.edge_node_id
+            .try_read()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(Uuid::nil())
+    }
+
+    /// Get the configured chunk size.
+    pub fn chunk_size(&self) -> i32 {
+        self.transfer_chunk_size
+    }
 }
 
 impl Clone for EdgeState {
@@ -34,8 +74,14 @@ impl Clone for EdgeState {
             primary_url: self.primary_url.clone(),
             api_key: self.api_key.clone(),
             cache: self.cache.clone(),
+            edge_node_id: RwLock::new(None),
+            transfer_chunk_size: self.transfer_chunk_size,
+            chunked_transfer_enabled: self.chunked_transfer_enabled,
             is_offline: AtomicBool::new(self.is_offline.load(Ordering::SeqCst)),
-            last_primary_contact: RwLock::new(None), // Clone starts fresh
+            last_primary_contact: RwLock::new(None),
+            active_transfers: self.active_transfers.clone(),
+            bytes_transferred: self.bytes_transferred.clone(),
+            consecutive_failures: self.consecutive_failures.clone(),
         }
     }
 }
@@ -94,9 +140,22 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "1024".to_string())
         .parse()
         .unwrap_or(1024);
+    let chunk_size: i32 = std::env::var("CHUNK_SIZE_BYTES")
+        .unwrap_or_else(|_| DEFAULT_CHUNK_SIZE.to_string())
+        .parse()
+        .unwrap_or(DEFAULT_CHUNK_SIZE);
+    let chunked_enabled: bool = std::env::var("CHUNKED_TRANSFER_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .parse()
+        .unwrap_or(true);
+    let edge_node_id: Option<Uuid> = std::env::var("EDGE_NODE_ID")
+        .ok()
+        .and_then(|s| s.parse().ok());
 
     tracing::info!("Starting Artifact Keeper Edge Node");
     tracing::info!("Primary registry: {}", primary_url);
+    tracing::info!("Chunked transfer: {}", if chunked_enabled { "enabled" } else { "disabled" });
+    tracing::info!("Chunk size: {} bytes", chunk_size);
 
     // Create cache
     let cache = Arc::new(cache::ArtifactCache::new(cache_size));
@@ -106,8 +165,14 @@ async fn main() -> anyhow::Result<()> {
         primary_url,
         api_key,
         cache,
+        edge_node_id: RwLock::new(edge_node_id),
+        transfer_chunk_size: chunk_size,
+        chunked_transfer_enabled: chunked_enabled,
         is_offline: AtomicBool::new(false),
         last_primary_contact: RwLock::new(None),
+        active_transfers: Arc::new(AtomicI32::new(0)),
+        bytes_transferred: Arc::new(AtomicI64::new(0)),
+        consecutive_failures: Arc::new(AtomicU32::new(0)),
     });
 
     // Start heartbeat task
@@ -122,12 +187,32 @@ async fn main() -> anyhow::Result<()> {
         connectivity_check_loop(connectivity_state).await;
     });
 
+    // Start peer discovery loop
+    let peer_state = state.clone();
+    tokio::spawn(async move {
+        peers::peer_discovery_loop(peer_state).await;
+    });
+
+    // Start sync scheduler loop
+    let scheduler_state = state.clone();
+    tokio::spawn(async move {
+        scheduler::sync_scheduler_loop(scheduler_state).await;
+    });
+
     // Build router with artifact proxy and health routes
     let app = Router::new()
         .route("/health", get(health_check))
         .route(
             "/api/v1/repositories/:repo_key/artifacts/*path",
             get(serve_artifact),
+        )
+        .route(
+            "/api/v1/artifacts/:artifact_id",
+            get(serve_artifact_by_id),
+        )
+        .route(
+            "/peer/v1/artifacts/:artifact_id/download",
+            get(serve_artifact_to_peer),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -144,11 +229,9 @@ async fn main() -> anyhow::Result<()> {
 
 /// Check if an error indicates a connectivity problem.
 fn is_connectivity_error(err: &anyhow::Error) -> bool {
-    // Check for reqwest errors that indicate network issues
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         return reqwest_err.is_connect() || reqwest_err.is_timeout() || reqwest_err.is_request();
     }
-    // Check error message for common connectivity indicators
     let msg = err.to_string().to_lowercase();
     msg.contains("connection refused")
         || msg.contains("network unreachable")
@@ -175,11 +258,12 @@ fn mark_offline(state: &EdgeState) {
 
 /// Serve an artifact from cache or fetch from primary.
 ///
-/// This handler implements offline mode:
+/// This handler implements the swarm-based transfer protocol:
 /// 1. First checks the local cache
-/// 2. If online, tries to fetch from primary (caching on success)
-/// 3. If primary is unreachable, transitions to offline mode
-/// 4. In offline mode, returns 503 if artifact not in cache
+/// 2. If online, tries to fetch from primary (using chunked transfer for large artifacts)
+/// 3. Falls back to simple whole-file fetch for small artifacts
+/// 4. If primary is unreachable, transitions to offline mode
+/// 5. In offline mode, returns 503 if artifact not in cache
 async fn serve_artifact(
     State(state): State<Arc<EdgeState>>,
     Path((repo_key, artifact_path)): Path<(String, String)>,
@@ -276,11 +360,123 @@ async fn serve_artifact(
     }
 }
 
+/// Serve an artifact to a peer from local cache.
+///
+/// This is the peer-to-peer endpoint used for edge-to-edge replication.
+/// Returns 200 with raw bytes if the artifact is cached, or 404 otherwise.
+/// No authentication is required (peers are on the same internal network).
+async fn serve_artifact_to_peer(
+    State(state): State<Arc<EdgeState>>,
+    Path(artifact_id): Path<Uuid>,
+) -> Result<Response, AppError> {
+    let cache_key = format!("artifact:{}", artifact_id);
+
+    if let Some(cached_content) = state.cache.get(&cache_key) {
+        tracing::debug!(artifact_id = %artifact_id, "Serving artifact to peer from cache");
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            cached_content,
+        )
+            .into_response());
+    }
+
+    Err(AppError::NotFound(format!(
+        "Artifact {} not in local cache",
+        artifact_id
+    )))
+}
+
+/// Serve an artifact by ID using peer-first replication strategy.
+///
+/// Tries peers first for faster delivery, then falls back to primary.
+/// Accepts an optional `size` query parameter to enable chunked transfer
+/// for large artifacts when falling back to primary.
+async fn serve_artifact_by_id(
+    State(state): State<Arc<EdgeState>>,
+    Path(artifact_id): Path<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<ArtifactByIdParams>,
+) -> Result<Response, AppError> {
+    let cache_key = format!("artifact:{}", artifact_id);
+    let artifact_size = params.size.unwrap_or(0);
+
+    tracing::debug!(
+        artifact_id = %artifact_id,
+        size = artifact_size,
+        "Serving artifact by ID with peer-first strategy"
+    );
+
+    // Check offline mode early
+    if state.is_offline.load(Ordering::SeqCst) {
+        if let Some(cached) = state.cache.get(&cache_key) {
+            return Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                cached,
+            )
+                .into_response());
+        }
+        return Err(AppError::ServiceUnavailable(
+            "Primary server unreachable, artifact not in cache".to_string(),
+        ));
+    }
+
+    let client = reqwest::Client::new();
+
+    match replication::fetch_with_peer_fallback(
+        &client,
+        &state,
+        artifact_id,
+        artifact_size,
+        &cache_key,
+    )
+    .await
+    {
+        Ok(data) => {
+            mark_online(&state).await;
+            Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                data,
+            )
+                .into_response())
+        }
+        Err(e) if is_connectivity_error(&e) => {
+            mark_offline(&state);
+            Err(AppError::ServiceUnavailable(
+                "Primary server unreachable, artifact not in cache".to_string(),
+            ))
+        }
+        Err(e) => {
+            if let Some(reqwest_err) = e.downcast_ref::<reqwest::Error>() {
+                if reqwest_err.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                    return Err(AppError::NotFound(format!(
+                        "Artifact not found: {}",
+                        artifact_id
+                    )));
+                }
+            }
+            Err(AppError::Internal(format!(
+                "Failed to fetch artifact: {}",
+                e
+            )))
+        }
+    }
+}
+
+/// Query parameters for the artifact-by-ID endpoint.
+#[derive(Debug, serde::Deserialize)]
+struct ArtifactByIdParams {
+    /// Optional artifact size hint to enable chunked transfer for large files.
+    size: Option<i64>,
+}
+
 /// Health check endpoint that reports offline status.
 async fn health_check(State(state): State<Arc<EdgeState>>) -> impl IntoResponse {
     let is_offline = state.is_offline.load(Ordering::SeqCst);
     let cache_size = state.cache.size();
     let cache_entries = state.cache.len();
+    let node_id = state.edge_node_id.read().await.map(|id| id.to_string());
 
     let last_contact = state.last_primary_contact.read().await;
     let seconds_since_contact = last_contact
@@ -289,11 +485,18 @@ async fn health_check(State(state): State<Arc<EdgeState>>) -> impl IntoResponse 
 
     let status = if is_offline { "offline" } else { "online" };
 
+    let active_transfers = state.active_transfers.load(Ordering::Relaxed);
+    let bytes_transferred_total = state.bytes_transferred.load(Ordering::Relaxed);
+
     let body = serde_json::json!({
         "status": status,
         "is_offline": is_offline,
+        "node_id": node_id,
         "cache_size_bytes": cache_size,
         "cache_entries": cache_entries,
+        "chunked_transfer_enabled": state.chunked_transfer_enabled,
+        "active_transfers": active_transfers,
+        "bytes_transferred_total": bytes_transferred_total,
         "seconds_since_primary_contact": if seconds_since_contact == u64::MAX {
             None
         } else {
@@ -301,18 +504,12 @@ async fn health_check(State(state): State<Arc<EdgeState>>) -> impl IntoResponse 
         },
     });
 
-    // Return 200 even when offline - the edge is still serving from cache
-    // Use a header or body field to indicate degraded mode
     let status_code = StatusCode::OK;
 
     (status_code, axum::Json(body))
 }
 
 /// Periodically check connectivity to the primary server.
-///
-/// This loop runs every 30 seconds and attempts to contact the primary
-/// if the edge node is currently in offline mode. On success, it
-/// transitions back to online mode.
 async fn connectivity_check_loop(state: Arc<EdgeState>) {
     use std::time::Duration;
 
@@ -333,7 +530,6 @@ async fn connectivity_check_loop(state: Arc<EdgeState>) {
 
         tracing::debug!("Checking connectivity to primary server");
 
-        // Try a simple health check to the primary
         let health_url = format!("{}/health", state.primary_url);
 
         match client.get(&health_url).send().await {

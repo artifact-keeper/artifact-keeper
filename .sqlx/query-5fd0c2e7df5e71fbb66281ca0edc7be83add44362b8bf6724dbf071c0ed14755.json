@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, created_at, updated_at\n            ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                created_at, updated_at\n            FROM repositories\n            WHERE ($1::repository_format IS NULL OR format = $1)\n              AND ($2::repository_type IS NULL OR repo_type = $2)\n              AND ($3 = false OR is_public = true)\n            ORDER BY name\n            OFFSET $4\n            LIMIT $5\n            ",
   "describe": {
     "columns": [
       {
@@ -128,20 +128,34 @@
       },
       {
         "ordinal": 11,
+        "name": "replication_priority: ReplicationPriority",
+        "type_info": {
+          "Custom": {
+            "name": "replication_priority",
+            "kind": {
+              "Enum": [
+                "immediate",
+                "scheduled",
+                "on_demand",
+                "local_only"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 12,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Varchar",
-        "Varchar",
-        "Text",
         {
           "Custom": {
             "name": "repository_format",
@@ -212,10 +226,8 @@
             }
           }
         },
-        "Varchar",
-        "Varchar",
-        "Varchar",
         "Bool",
+        "Int8",
         "Int8"
       ]
     },
@@ -232,8 +244,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "2df605c01ac1ec9f732d5f71d822ae81d5a0fdd48eb6be6f031d3e01df318cf4"
+  "hash": "5fd0c2e7df5e71fbb66281ca0edc7be83add44362b8bf6724dbf071c0ed14755"
 }

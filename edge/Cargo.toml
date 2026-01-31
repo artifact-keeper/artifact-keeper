@@ -47,3 +47,6 @@ bytes.workspace = true
 
 # LRU cache
 lru = "0.16"
+
+# Cryptographic hashing for chunk verification
+sha2.workspace = true

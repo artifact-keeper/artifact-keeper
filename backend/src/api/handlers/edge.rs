@@ -12,7 +12,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::Result;
 use crate::services::edge_service::{
-    EdgeService, EdgeStatus, RegisterEdgeNodeRequest as ServiceRegisterReq,
+    EdgeService, EdgeStatus, ReplicationPriority, RegisterEdgeNodeRequest as ServiceRegisterReq,
 };
 
 /// Create edge node routes
@@ -78,6 +78,8 @@ pub struct HeartbeatRequest {
 pub struct AssignRepoRequest {
     pub repository_id: Uuid,
     pub sync_enabled: Option<bool>,
+    pub priority_override: Option<String>,
+    pub replication_schedule: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -292,12 +294,24 @@ pub async fn assign_repo(
     Path(id): Path<Uuid>,
     Json(payload): Json<AssignRepoRequest>,
 ) -> Result<()> {
+    let priority_override = payload.priority_override.as_ref().and_then(|s| {
+        match s.to_lowercase().as_str() {
+            "immediate" => Some(ReplicationPriority::Immediate),
+            "scheduled" => Some(ReplicationPriority::Scheduled),
+            "on_demand" => Some(ReplicationPriority::OnDemand),
+            "local_only" => Some(ReplicationPriority::LocalOnly),
+            _ => None,
+        }
+    });
+
     let service = EdgeService::new(state.db.clone());
     service
         .assign_repository(
             id,
             payload.repository_id,
             payload.sync_enabled.unwrap_or(true),
+            priority_override,
+            payload.replication_schedule,
         )
         .await?;
     Ok(())

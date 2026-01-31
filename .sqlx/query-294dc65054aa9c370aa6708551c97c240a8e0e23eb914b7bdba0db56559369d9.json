@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes, created_at, updated_at\n            FROM repositories\n            WHERE key = $1\n            ",
+  "query": "\n            UPDATE repositories\n            SET\n                name = COALESCE($2, name),\n                description = COALESCE($3, description),\n                is_public = COALESCE($4, is_public),\n                quota_bytes = COALESCE($5, quota_bytes),\n                upstream_url = COALESCE($6, upstream_url),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -128,18 +128,40 @@
       },
       {
         "ordinal": 11,
+        "name": "replication_priority: ReplicationPriority",
+        "type_info": {
+          "Custom": {
+            "name": "replication_priority",
+            "kind": {
+              "Enum": [
+                "immediate",
+                "scheduled",
+                "on_demand",
+                "local_only"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 12,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid",
+        "Varchar",
+        "Text",
+        "Bool",
+        "Int8",
+        "Varchar"
       ]
     },
     "nullable": [
@@ -155,8 +177,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "c8885be5c660228869158f008e5d103a8d16ebc8a6d8352362f4e0b34448b6d1"
+  "hash": "294dc65054aa9c370aa6708551c97c240a8e0e23eb914b7bdba0db56559369d9"
 }
