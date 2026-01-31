@@ -1,124 +1,125 @@
 #!/bin/bash
-# Alpine/APK E2E test — build APK with abuild, upload, configure apk, install
+# Alpine/APK E2E test — fetch real package from upstream, upload to registry, install from registry
 set -euo pipefail
 source /scripts/lib.sh
 
 REPO_KEY="e2e-alpine-$(date +%s)"
-TEST_VERSION="1.0.$(date +%s)"
-PKG_NAME="e2e-test-pkg"
 ARCH=$(apk --print-arch)
-INSTALL_DIR="/usr/share/$PKG_NAME"
+# Use a small, real Alpine package with no dependencies
+TEST_PKG="fortune"
 
 log "Alpine/APK E2E Test"
-log "Repo: $REPO_KEY | Version: $TEST_VERSION | Arch: $ARCH"
+log "Repo: $REPO_KEY | Arch: $ARCH | Test package: $TEST_PKG"
 
-# --- Install build deps ---
-log "Installing build dependencies..."
-apk add --no-cache curl python3 alpine-sdk sudo openssl > /dev/null 2>&1
+# --- Install deps ---
+log "Installing dependencies..."
+apk add --no-cache curl python3 > /dev/null 2>&1
 
 # --- Setup repo + signing ---
 setup_signed_repo "$REPO_KEY" "alpine"
 
-# --- Generate abuild signing key for builder user ---
-log "Setting up abuild signing key..."
-adduser -D builder 2>/dev/null || true
-addgroup builder abuild 2>/dev/null || true
+# --- Fetch a real package + deps from upstream ---
+log "Updating package index from upstream..."
+# Ensure repos are clean (default Alpine repos only)
+grep -v "artifact-keeper" /etc/apk/repositories > /tmp/clean-repos || true
+cp /tmp/clean-repos /etc/apk/repositories
+apk update 2>&1 | tail -3 || true
 
-BUILDER_HOME="/home/builder"
-mkdir -p "$BUILDER_HOME/.abuild"
-# Generate RSA key in traditional format (required by abuild-sign)
-openssl genrsa -traditional -out "$BUILDER_HOME/.abuild/builder.rsa" 2048 2>/dev/null
-openssl rsa -in "$BUILDER_HOME/.abuild/builder.rsa" -pubout \
-    -out "$BUILDER_HOME/.abuild/builder.rsa.pub" 2>/dev/null
-echo "PACKAGER_PRIVKEY=$BUILDER_HOME/.abuild/builder.rsa" > "$BUILDER_HOME/.abuild/abuild.conf"
-cp "$BUILDER_HOME/.abuild/builder.rsa.pub" /etc/apk/keys/
-chown -R builder:builder "$BUILDER_HOME/.abuild"
-
-# --- Build APK with abuild ---
-log "Building APK package..."
-WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
-cd "$WORK_DIR"
-
-# Use /usr/share instead of /opt (Alpine policy forbids /opt)
-cat > APKBUILD << EOF
-# Maintainer: E2E Test <e2e@test.local>
-pkgname=$PKG_NAME
-pkgver=$(echo "$TEST_VERSION" | tr '-' '_')
-pkgrel=0
-pkgdesc="E2E test package for Alpine native client testing"
-url="https://test.local"
-arch="noarch"
-license="MIT"
-options="!check"
-
-package() {
-    mkdir -p "\$pkgdir$INSTALL_DIR"
-    echo "Hello from $PKG_NAME!" > "\$pkgdir$INSTALL_DIR/test-file.txt"
-    echo "Version: $TEST_VERSION" >> "\$pkgdir$INSTALL_DIR/test-file.txt"
-    echo "Format: alpine" >> "\$pkgdir$INSTALL_DIR/test-file.txt"
+log "Fetching $TEST_PKG (with dependencies) from upstream Alpine repos..."
+mkdir -p /tmp/apk-cache
+apk fetch -R -o /tmp/apk-cache "$TEST_PKG" 2>&1 || {
+    # fortune might not exist, try another small package
+    TEST_PKG="pv"
+    log "fortune not available, trying $TEST_PKG..."
+    rm -f /tmp/apk-cache/*.apk
+    apk fetch -R -o /tmp/apk-cache "$TEST_PKG" 2>&1 || {
+        TEST_PKG="tree"
+        log "pv not available, trying $TEST_PKG..."
+        rm -f /tmp/apk-cache/*.apk
+        apk fetch -R -o /tmp/apk-cache "$TEST_PKG" 2>&1 || fail "Cannot fetch any test package"
+    }
 }
-EOF
 
-chown -R builder:builder "$WORK_DIR"
+APK_FILES=$(find /tmp/apk-cache -name "*.apk")
+APK_COUNT=$(echo "$APK_FILES" | wc -l)
+APK_FILE=$(echo "$APK_FILES" | head -1)
+[ -f "$APK_FILE" ] || fail "No APK file fetched"
+log "Fetched $APK_COUNT package(s) for $TEST_PKG"
+echo "$APK_FILES" | while read f; do log "  $(basename "$f") ($(du -h "$f" | cut -f1))"; done
 
-log "Running abuild..."
-su builder -c "cd $WORK_DIR && abuild -F -d -P $WORK_DIR/packages" 2>&1 || fail "abuild failed"
-
-APK_FILE=$(find "$WORK_DIR/packages" -name "*.apk" | head -1)
-[ -f "$APK_FILE" ] || fail "No .apk file produced by abuild"
-log "Built: $(basename "$APK_FILE")"
-
-# --- Upload APK ---
-log "Uploading APK to registry (arch=$ARCH)..."
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
-    -u "$AUTH_USER:$AUTH_PASS" \
-    -H "Content-Type: application/vnd.alpine.package" \
-    --data-binary "@$APK_FILE" \
-    "$BACKEND_URL/alpine/$REPO_KEY/v3/main/$ARCH/$(basename "$APK_FILE")")
-[ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || fail "Upload failed (HTTP $HTTP_CODE)"
-log "Upload OK ($HTTP_CODE)"
+# --- Upload all packages to our registry ---
+log "Uploading $APK_COUNT package(s) to registry..."
+for pkg in $APK_FILES; do
+    PKG_NAME_FILE=$(basename "$pkg")
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+        -u "$AUTH_USER:$AUTH_PASS" \
+        -H "Content-Type: application/vnd.alpine.package" \
+        --data-binary "@$pkg" \
+        "$BACKEND_URL/alpine/$REPO_KEY/v3/main/$ARCH/$PKG_NAME_FILE")
+    [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || fail "Upload of $PKG_NAME_FILE failed (HTTP $HTTP_CODE)"
+    log "  Uploaded $PKG_NAME_FILE ($HTTP_CODE)"
+done
+log "All packages uploaded"
 
 sleep 1
 
-# --- Verify signed APKINDEX ---
-log "Verifying APKINDEX.tar.gz has .SIGN.RSA entry..."
+# --- Verify registry metadata ---
+log "Verifying APKINDEX.tar.gz..."
 curl -sf "$BACKEND_URL/alpine/$REPO_KEY/v3/main/$ARCH/APKINDEX.tar.gz" -o /tmp/apkindex.tar.gz
 ENTRIES=$(tar tzf /tmp/apkindex.tar.gz 2>/dev/null)
 echo "$ENTRIES" | grep -q ".SIGN.RSA" || fail "APKINDEX.tar.gz missing .SIGN.RSA entry"
-log "APKINDEX.tar.gz is signed"
+echo "$ENTRIES" | grep -q "APKINDEX" || fail "APKINDEX.tar.gz missing APKINDEX entry"
+log "APKINDEX.tar.gz is signed and contains index"
 
 log "Verifying public key endpoint..."
-PUB_KEY=$(curl -sf "$BACKEND_URL/alpine/$REPO_KEY/v3/keys/artifact-keeper.rsa.pub")
-echo "$PUB_KEY" | grep -q "BEGIN PUBLIC KEY" || fail "Public key endpoint invalid"
+curl -sf "$BACKEND_URL/alpine/$REPO_KEY/v3/keys/artifact-keeper.rsa.pub" | \
+    grep -q "BEGIN PUBLIC KEY" || fail "Public key endpoint invalid"
 log "Public key endpoint OK"
 
-# --- Configure apk ---
-log "Installing registry public key..."
-curl -sf "$BACKEND_URL/alpine/$REPO_KEY/v3/keys/artifact-keeper.rsa.pub" \
-    > /etc/apk/keys/artifact-keeper.rsa.pub
+log "Verifying direct package download..."
+curl -sf "$BACKEND_URL/alpine/$REPO_KEY/v3/main/$ARCH/$(basename "$APK_FILE")" -o /tmp/dl.apk
+[ -s /tmp/dl.apk ] || fail "Download empty"
+ORIG_SIZE=$(stat -c%s "$APK_FILE" 2>/dev/null || stat -f%z "$APK_FILE")
+DL_SIZE=$(stat -c%s /tmp/dl.apk 2>/dev/null || stat -f%z /tmp/dl.apk)
+[ "$ORIG_SIZE" = "$DL_SIZE" ] || fail "Size mismatch: uploaded=$ORIG_SIZE downloaded=$DL_SIZE"
+log "Downloaded package matches uploaded ($DL_SIZE bytes)"
 
-log "Adding APK repository..."
-echo "$BACKEND_URL/alpine/$REPO_KEY/v3/main" >> /etc/apk/repositories
+# --- Remove the package if installed, configure repo, install from registry ---
+apk del "$TEST_PKG" 2>/dev/null || true
 
-# --- apk update + install ---
-log "Running apk update..."
+log "Configuring APK to use our registry..."
+# Replace repos to force install from our registry (all deps were uploaded)
+cp /etc/apk/repositories /etc/apk/repositories.bak
+echo "$BACKEND_URL/alpine/$REPO_KEY/v3/main" > /etc/apk/repositories
+
+log "Running apk update (registry only)..."
 apk update --allow-untrusted 2>&1 | tail -5 || log "apk update had warnings"
 
-log "Installing $PKG_NAME..."
-apk add --allow-untrusted "$PKG_NAME" 2>&1 || {
-    log "apk add by name failed, trying direct install..."
-    curl -sf "$BACKEND_URL/alpine/$REPO_KEY/v3/main/$ARCH/$(basename "$APK_FILE")" -o /tmp/e2e.apk
-    [ -s /tmp/e2e.apk ] || fail "Cannot download package"
-    apk add --allow-untrusted /tmp/e2e.apk 2>&1 || fail "Cannot install downloaded APK"
+log "Installing $TEST_PKG from registry..."
+apk add --allow-untrusted "$TEST_PKG" 2>&1 || {
+    log "apk add by name failed, trying direct install of all downloaded packages..."
+    # Download all packages from registry and install locally
+    mkdir -p /tmp/dl-pkgs
+    for pkg in $APK_FILES; do
+        PKG_NAME_FILE=$(basename "$pkg")
+        curl -sf "$BACKEND_URL/alpine/$REPO_KEY/v3/main/$ARCH/$PKG_NAME_FILE" -o "/tmp/dl-pkgs/$PKG_NAME_FILE"
+    done
+    apk add --allow-untrusted /tmp/dl-pkgs/*.apk 2>&1 || fail "Cannot install APK packages"
 }
 
+# Restore original repos
+cp /etc/apk/repositories.bak /etc/apk/repositories
+
 # --- Verify ---
-log "Verifying installed package..."
-[ -f "$INSTALL_DIR/test-file.txt" ] || fail "Installed file not found at $INSTALL_DIR/test-file.txt"
-INSTALLED_CONTENT=$(cat "$INSTALL_DIR/test-file.txt")
-echo "$INSTALLED_CONTENT" | grep -q "$TEST_VERSION" || fail "Version mismatch in installed file"
-log "Installed file content verified"
+log "Verifying $TEST_PKG is installed..."
+apk info -e "$TEST_PKG" 2>/dev/null || fail "$TEST_PKG not in installed packages"
+log "$TEST_PKG is installed"
+
+# Try to run it
+if which "$TEST_PKG" > /dev/null 2>&1; then
+    log "Running $TEST_PKG..."
+    "$TEST_PKG" --version 2>&1 | head -1 || "$TEST_PKG" --help 2>&1 | head -1 || true
+fi
 
 echo ""
 echo "=== Alpine/APK E2E test PASSED ==="
