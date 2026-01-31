@@ -104,6 +104,7 @@ tempfile = "3.16"
 
 # Directory walking
 walkdir = "2.5"
+rsa = { version = "0.9", features = ["sha2"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

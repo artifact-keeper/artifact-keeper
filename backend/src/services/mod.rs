@@ -18,6 +18,7 @@ pub mod proxy_service;
 pub mod repository_service;
 pub mod saml_service;
 pub mod search_service;
+pub mod signing_service;
 pub mod storage_service;
 pub mod token_service;
 pub mod scan_config_service;

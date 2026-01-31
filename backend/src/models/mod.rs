@@ -13,4 +13,5 @@ pub mod repository;
 pub mod role;
 pub mod security;
 pub mod sync_task;
+pub mod signing_key;
 pub mod user;

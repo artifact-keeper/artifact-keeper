@@ -32,3 +32,4 @@ pub mod debian;
 pub mod helm;
 pub mod alpine;
 pub mod terraform;
+pub mod signing;

@@ -175,6 +175,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Signing key management routes with auth middleware
+        .nest(
+            "/signing",
+            handlers::signing::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Security routes with auth middleware
         .nest(
             "/security",
