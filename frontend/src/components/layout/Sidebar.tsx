@@ -20,6 +20,7 @@ import {
   SafetyCertificateOutlined,
   BugOutlined,
   SendOutlined,
+  SyncOutlined,
   RobotOutlined,
   ExperimentOutlined,
   NodeIndexOutlined,
@@ -119,6 +120,11 @@ const AppSidebar = () => {
       key: '/edge-nodes',
       icon: <CloudServerOutlined />,
       label: <Link to="/edge-nodes">Edge Nodes</Link>,
+    },
+    {
+      key: '/replication',
+      icon: <SyncOutlined />,
+      label: <Link to="/replication">Replication</Link>,
     },
     {
       key: '/plugins',

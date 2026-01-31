@@ -12,6 +12,8 @@ pub mod conda;
 pub mod debian;
 pub mod edge;
 pub mod goproxy;
+pub mod peer;
+pub mod transfer;
 pub mod groups;
 pub mod health;
 pub mod helm;

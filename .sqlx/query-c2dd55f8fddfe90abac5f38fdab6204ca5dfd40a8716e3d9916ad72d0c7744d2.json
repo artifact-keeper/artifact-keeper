@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE transfer_sessions\n            SET status = 'failed', error_message = $2, completed_at = NOW()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c2dd55f8fddfe90abac5f38fdab6204ca5dfd40a8716e3d9916ad72d0c7744d2"
+}

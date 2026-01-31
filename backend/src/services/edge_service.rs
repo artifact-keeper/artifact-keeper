@@ -18,6 +18,24 @@ pub enum EdgeStatus {
     Degraded,
 }
 
+/// Replication priority for Borg replication policies.
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
+#[sqlx(type_name = "replication_priority", rename_all = "snake_case")]
+pub enum ReplicationPriority {
+    Immediate,
+    Scheduled,
+    OnDemand,
+    LocalOnly,
+}
+
+/// A repository with a scheduled replication policy.
+#[derive(Debug)]
+pub struct ScheduledRepo {
+    pub repo_id: Uuid,
+    pub schedule: Option<String>,
+    pub last_replicated_at: Option<DateTime<Utc>>,
+}
+
 impl std::fmt::Display for EdgeStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -42,6 +60,16 @@ pub struct EdgeNode {
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub sync_filter: Option<serde_json::Value>,
+    pub max_bandwidth_bps: Option<i64>,
+    pub sync_window_start: Option<chrono::NaiveTime>,
+    pub sync_window_end: Option<chrono::NaiveTime>,
+    pub sync_window_timezone: Option<String>,
+    pub concurrent_transfers_limit: Option<i32>,
+    pub active_transfers: i32,
+    pub backoff_until: Option<DateTime<Utc>>,
+    pub consecutive_failures: i32,
+    pub bytes_transferred_total: i64,
+    pub transfer_failures_total: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -78,6 +106,10 @@ impl EdgeService {
                 status as "status: EdgeStatus",
                 region, cache_size_bytes, cache_used_bytes,
                 last_heartbeat_at, last_sync_at, sync_filter,
+                max_bandwidth_bps, sync_window_start, sync_window_end,
+                sync_window_timezone, concurrent_transfers_limit,
+                active_transfers, backoff_until, consecutive_failures,
+                bytes_transferred_total, transfer_failures_total,
                 created_at, updated_at
             "#,
             req.name,
@@ -109,6 +141,10 @@ impl EdgeService {
                 status as "status: EdgeStatus",
                 region, cache_size_bytes, cache_used_bytes,
                 last_heartbeat_at, last_sync_at, sync_filter,
+                max_bandwidth_bps, sync_window_start, sync_window_end,
+                sync_window_timezone, concurrent_transfers_limit,
+                active_transfers, backoff_until, consecutive_failures,
+                bytes_transferred_total, transfer_failures_total,
                 created_at, updated_at
             FROM edge_nodes
             WHERE id = $1
@@ -133,6 +169,10 @@ impl EdgeService {
                 status as "status: EdgeStatus",
                 region, cache_size_bytes, cache_used_bytes,
                 last_heartbeat_at, last_sync_at, sync_filter,
+                max_bandwidth_bps, sync_window_start, sync_window_end,
+                sync_window_timezone, concurrent_transfers_limit,
+                active_transfers, backoff_until, consecutive_failures,
+                bytes_transferred_total, transfer_failures_total,
                 created_at, updated_at
             FROM edge_nodes
             WHERE name = $1
@@ -163,6 +203,10 @@ impl EdgeService {
                 status as "status: EdgeStatus",
                 region, cache_size_bytes, cache_used_bytes,
                 last_heartbeat_at, last_sync_at, sync_filter,
+                max_bandwidth_bps, sync_window_start, sync_window_end,
+                sync_window_timezone, concurrent_transfers_limit,
+                active_transfers, backoff_until, consecutive_failures,
+                bytes_transferred_total, transfer_failures_total,
                 created_at, updated_at
             FROM edge_nodes
             WHERE ($1::edge_status IS NULL OR status = $1)
@@ -285,16 +329,24 @@ impl EdgeService {
         edge_node_id: Uuid,
         repository_id: Uuid,
         sync_enabled: bool,
+        priority_override: Option<ReplicationPriority>,
+        replication_schedule: Option<String>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
-            INSERT INTO edge_repo_assignments (edge_node_id, repository_id, sync_enabled)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (edge_node_id, repository_id) DO UPDATE SET sync_enabled = $3
+            INSERT INTO edge_repo_assignments
+                (edge_node_id, repository_id, sync_enabled, priority_override, replication_schedule)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (edge_node_id, repository_id) DO UPDATE SET
+                sync_enabled = $3,
+                priority_override = $4,
+                replication_schedule = $5
             "#,
             edge_node_id,
             repository_id,
-            sync_enabled
+            sync_enabled,
+            priority_override as Option<ReplicationPriority>,
+            replication_schedule
         )
         .execute(&self.db)
         .await
@@ -394,7 +446,10 @@ impl EdgeService {
                 a.storage_key, a.size_bytes as artifact_size
             FROM sync_tasks st
             JOIN artifacts a ON a.id = st.artifact_id
-            WHERE st.edge_node_id = $1 AND st.status = 'pending'
+            JOIN repositories r ON r.id = a.repository_id
+            WHERE st.edge_node_id = $1
+              AND st.status = 'pending'
+              AND r.replication_priority != 'local_only'
             ORDER BY st.priority DESC, st.created_at
             LIMIT $2
             "#,
@@ -454,6 +509,88 @@ impl EdgeService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Update the replication priority for a repository.
+    pub async fn update_replication_priority(
+        &self,
+        repo_id: Uuid,
+        priority: ReplicationPriority,
+    ) -> Result<()> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE repositories
+            SET replication_priority = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+            repo_id,
+            priority as ReplicationPriority
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound("Repository not found".to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Get repositories that require immediate sync for a given edge node.
+    ///
+    /// Returns repo IDs where the effective priority (assignment override or
+    /// repository default) is `immediate` and sync is enabled.
+    pub async fn get_repos_for_immediate_sync(
+        &self,
+        edge_node_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        let repos = sqlx::query_scalar!(
+            r#"
+            SELECT era.repository_id
+            FROM edge_repo_assignments era
+            JOIN repositories r ON r.id = era.repository_id
+            WHERE era.edge_node_id = $1
+              AND era.sync_enabled = true
+              AND COALESCE(era.priority_override, r.replication_priority) = 'immediate'
+            "#,
+            edge_node_id
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(repos)
+    }
+
+    /// Get repositories with scheduled replication for a given edge node.
+    ///
+    /// Returns repo metadata including the cron schedule and last replication
+    /// timestamp so callers can determine which repos are due for sync.
+    pub async fn get_repos_for_scheduled_sync(
+        &self,
+        edge_node_id: Uuid,
+    ) -> Result<Vec<ScheduledRepo>> {
+        let repos = sqlx::query_as!(
+            ScheduledRepo,
+            r#"
+            SELECT
+                era.repository_id as repo_id,
+                era.replication_schedule as schedule,
+                era.last_replicated_at
+            FROM edge_repo_assignments era
+            JOIN repositories r ON r.id = era.repository_id
+            WHERE era.edge_node_id = $1
+              AND era.sync_enabled = true
+              AND COALESCE(era.priority_override, r.replication_priority) = 'scheduled'
+            "#,
+            edge_node_id
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(repos)
     }
 }
 

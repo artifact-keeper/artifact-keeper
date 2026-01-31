@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use super::repository::ReplicationPriority;
+
 /// Edge node status enum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "edge_status", rename_all = "lowercase")]
@@ -31,6 +33,16 @@ pub struct EdgeNode {
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub last_sync_at: Option<DateTime<Utc>>,
     pub sync_filter: Option<serde_json::Value>,
+    pub max_bandwidth_bps: Option<i64>,
+    pub sync_window_start: Option<chrono::NaiveTime>,
+    pub sync_window_end: Option<chrono::NaiveTime>,
+    pub sync_window_timezone: Option<String>,
+    pub concurrent_transfers_limit: Option<i32>,
+    pub active_transfers: i32,
+    pub backoff_until: Option<DateTime<Utc>>,
+    pub consecutive_failures: i32,
+    pub bytes_transferred_total: i64,
+    pub transfer_failures_total: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -44,5 +56,8 @@ pub struct EdgeRepoAssignment {
     pub edge_node_id: Uuid,
     pub repository_id: Uuid,
     pub sync_enabled: bool,
+    pub priority_override: Option<ReplicationPriority>,
+    pub replication_schedule: Option<String>,
+    pub last_replicated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

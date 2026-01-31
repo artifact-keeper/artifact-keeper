@@ -26,5 +26,7 @@ pub mod search_service;
 pub mod signing_service;
 pub mod storage_service;
 pub mod token_service;
+pub mod transfer_service;
+pub mod peer_service;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
