@@ -23,6 +23,10 @@ export default defineConfig({
         target: process.env.VITE_API_URL || 'http://localhost:9080',
         changeOrigin: true,
       },
+      '/pypi': {
+        target: process.env.VITE_API_URL || 'http://localhost:9080',
+        changeOrigin: true,
+      },
     },
   },
   test: {

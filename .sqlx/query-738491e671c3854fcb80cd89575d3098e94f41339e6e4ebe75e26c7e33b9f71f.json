@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT a.id, a.storage_key\n        FROM artifacts a\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND a.path LIKE '%/' || $2\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "storage_key",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "738491e671c3854fcb80cd89575d3098e94f41339e6e4ebe75e26c7e33b9f71f"
+}

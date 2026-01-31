@@ -20,6 +20,8 @@ pub fn create_router(state: SharedState) -> Router {
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
         .nest("/v2", handlers::oci_v2::router())
+        // PyPI Simple Repository API (PEP 503)
+        .nest("/pypi", handlers::pypi::router())
         .with_state(state)
 }
 

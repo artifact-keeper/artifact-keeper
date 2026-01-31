@@ -15,5 +15,6 @@ pub mod repositories;
 pub mod search;
 pub mod users;
 pub mod oci_v2;
+pub mod pypi;
 pub mod security;
 pub mod webhooks;
