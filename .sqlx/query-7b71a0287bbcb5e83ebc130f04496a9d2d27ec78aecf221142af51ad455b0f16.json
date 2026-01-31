@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, path, storage_key, size_bytes, content_type\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path LIKE $2 || '/' || $3 || '/' || $4 || '/%/' || $5\n        LIMIT 1\n        ",
+  "query": "\n        SELECT id, path, storage_key, size_bytes, content_type\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path = $2\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -32,9 +32,6 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Text",
-        "Text",
-        "Text",
         "Text"
       ]
     },
@@ -46,5 +43,5 @@
       false
     ]
   },
-  "hash": "37aadc925d7bb846876ce7398f2c8d3aee56d393fc541fb853b754063f1b4931"
+  "hash": "7b71a0287bbcb5e83ebc130f04496a9d2d27ec78aecf221142af51ad455b0f16"
 }

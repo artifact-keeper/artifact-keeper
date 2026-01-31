@@ -36,28 +36,14 @@ use crate::storage::StorageBackend;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        // Ivy descriptor
+        // Single wildcard handles all Ivy layout paths:
+        //   GET  — download artifact (ivy.xml, jars, srcs, docs, etc.)
+        //   PUT  — upload artifact (auth required)
+        //   HEAD — check artifact existence
         .route(
-            "/:repo_key/:org/:name/:version/ivys/ivy.xml",
-            get(get_ivy_descriptor),
+            "/:repo_key/*path",
+            get(download_by_path).put(upload_artifact).head(check_exists),
         )
-        // JAR download
-        .route(
-            "/:repo_key/:org/:name/:version/jars/*jar_file",
-            get(download_artifact),
-        )
-        // Sources download
-        .route(
-            "/:repo_key/:org/:name/:version/srcs/*src_file",
-            get(download_artifact),
-        )
-        // Javadoc download
-        .route(
-            "/:repo_key/:org/:name/:version/docs/*doc_file",
-            get(download_artifact),
-        )
-        // Upload and existence check via wildcard
-        .route("/:repo_key/*path", put(upload_artifact).head(check_exists))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
@@ -160,20 +146,20 @@ async fn resolve_sbt_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 }
 
 // ---------------------------------------------------------------------------
-// GET /ivy/{repo_key}/{org}/{name}/{version}/ivys/ivy.xml — Ivy descriptor
+// GET /ivy/{repo_key}/*path — Download artifact by path
 // ---------------------------------------------------------------------------
 
-async fn get_ivy_descriptor(
+async fn download_by_path(
     State(state): State<SharedState>,
-    Path((repo_key, org, name, version)): Path<(String, String, String, String)>,
+    Path((repo_key, artifact_path)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
-    let ivy_path = format!("{}/{}/{}/ivys/ivy.xml", org, name, version);
+    let artifact_path = artifact_path.trim_start_matches('/');
 
     let artifact = sqlx::query!(
         r#"
-        SELECT id, storage_key, size_bytes
+        SELECT id, path, storage_key, size_bytes, content_type
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
@@ -181,70 +167,7 @@ async fn get_ivy_descriptor(
         LIMIT 1
         "#,
         repo.id,
-        ivy_path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Ivy descriptor not found").into_response())?;
-
-    let storage = FilesystemStorage::new(&repo.storage_path);
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/xml")
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
-}
-
-// ---------------------------------------------------------------------------
-// GET /ivy/{repo_key}/{org}/{name}/{version}/{type}s/* — Download artifact
-// ---------------------------------------------------------------------------
-
-async fn download_artifact(
-    State(state): State<SharedState>,
-    Path((repo_key, org, name, version, file)): Path<(String, String, String, String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
-
-    let file = file.trim_start_matches('/');
-
-    // Reconstruct the full artifact path by matching against stored paths
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, storage_key, size_bytes, content_type
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path LIKE $2 || '/' || $3 || '/' || $4 || '/%/' || $5
-        LIMIT 1
-        "#,
-        repo.id,
-        org,
-        name,
-        version,
-        file
+        artifact_path
     )
     .fetch_optional(&state.db)
     .await
@@ -284,7 +207,10 @@ async fn download_artifact(
         .header(CONTENT_TYPE, content_type)
         .header(
             "Content-Disposition",
-            format!("attachment; filename=\"{}\"", file),
+            format!(
+                "attachment; filename=\"{}\"",
+                artifact_path.rsplit('/').next().unwrap_or(artifact_path)
+            ),
         )
         .header(CONTENT_LENGTH, content.len().to_string())
         .body(Body::from(content))

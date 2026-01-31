@@ -41,10 +41,11 @@ pub fn router() -> Router<SharedState> {
         .route("/:repo_key/identifiers", get(lookup_identifiers))
         // List package releases
         .route("/:repo_key/:scope/:name", get(list_releases))
-        // Download source archive (must come before /:version to match .zip suffix)
-        .route("/:repo_key/:scope/:name/*version_path", get(version_path_handler))
-        // Publish release
-        .route("/:repo_key/:scope/:name/:version", put(publish_release))
+        // Version path: GET dispatches to metadata/archive/manifest, PUT publishes
+        .route(
+            "/:repo_key/:scope/:name/*version_path",
+            get(version_path_handler).put(publish_release_from_wildcard),
+        )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
@@ -476,12 +477,29 @@ async fn fetch_manifest(
 }
 
 // ---------------------------------------------------------------------------
-// PUT /swift/:repo_key/:scope/:name/:version -- Publish release
+// PUT /swift/:repo_key/:scope/:name/*version_path -- Publish release (wildcard wrapper)
+// ---------------------------------------------------------------------------
+
+async fn publish_release_from_wildcard(
+    State(state): State<SharedState>,
+    Path((repo_key, scope, name, version_path)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let version = version_path.trim_start_matches('/').to_string();
+    publish_release(state, repo_key, scope, name, version, headers, body).await
+}
+
+// ---------------------------------------------------------------------------
+// Publish release implementation
 // ---------------------------------------------------------------------------
 
 async fn publish_release(
-    State(state): State<SharedState>,
-    Path((repo_key, scope, name, version)): Path<(String, String, String, String)>,
+    state: SharedState,
+    repo_key: String,
+    scope: String,
+    name: String,
+    version: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
