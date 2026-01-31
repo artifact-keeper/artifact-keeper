@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT LOWER(name) as \"name!\", MAX(version) as \"latest_version?\",\n               COUNT(DISTINCT version)::bigint as \"version_count!\",\n               SUM(size_bytes)::bigint as \"total_size?\"\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND LOWER(name) LIKE $2\n        GROUP BY LOWER(name)\n        ORDER BY LOWER(name)\n        LIMIT $3 OFFSET $4\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "latest_version?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "version_count!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "total_size?",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "a708bca86743e6d309169a6cb31b1c9385b4b418d634af43a1d54832fbe9a6ed"
+}

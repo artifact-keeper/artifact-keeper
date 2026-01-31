@@ -20,8 +20,23 @@ pub fn create_router(state: SharedState) -> Router {
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
         .nest("/v2", handlers::oci_v2::router())
+        // npm Registry API
+        .nest("/npm", handlers::npm::router())
         // PyPI Simple Repository API (PEP 503)
+        .nest("/maven", handlers::maven::router())
         .nest("/pypi", handlers::pypi::router())
+        // Debian/APT Repository API
+        .nest("/debian", handlers::debian::router())
+        // NuGet v3 API
+        .nest("/nuget", handlers::nuget::router())
+        // RPM/YUM Repository API
+        .nest("/rpm", handlers::rpm::router())
+        // Cargo sparse registry API
+        .nest("/cargo", handlers::cargo::router())
+        // RubyGems API
+        .nest("/gems", handlers::rubygems::router())
+        // Go Proxy API (GOPROXY protocol)
+        .nest("/go", handlers::goproxy::router())
         .with_state(state)
 }
 

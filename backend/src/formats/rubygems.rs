@@ -268,56 +268,56 @@ impl RubygemsHandler {
 
     /// Parse gemspec YAML content
     pub fn parse_gemspec_yaml(content: &str) -> Result<GemSpec> {
-        // Ruby's gemspec format uses YAML with custom tags
-        // We'll parse what we can and ignore unknown fields
+        // Ruby's gemspec format uses YAML with custom tags like !ruby/object:Gem::Version.
+        // The version field is structured as:
+        //   version: !ruby/object:Gem::Version
+        //     version: 1.0.0
+        // We use indentation level to distinguish top-level fields from nested ones.
         let mut gemspec = GemSpec::default();
+        let mut expect_nested_version = false;
 
-        for line in content.lines() {
-            let line = line.trim();
+        for raw_line in content.lines() {
+            let indent = raw_line.len() - raw_line.trim_start().len();
+            let line = raw_line.trim();
 
-            if let Some(rest) = line.strip_prefix("name:") {
-                gemspec.name = rest.trim().trim_matches('"').to_string();
-            } else if let Some(rest) = line.strip_prefix("version:") {
-                // Handle !ruby/object:Gem::Version format
-                if rest.contains("version:") {
-                    // Multi-line version
-                    continue;
-                }
-                gemspec.version = rest.trim().trim_matches('"').to_string();
-            } else if line.starts_with("version:") && gemspec.version.is_empty() {
-                // Handle inline version
-                if let Some(ver) = line.split("version:").last() {
-                    gemspec.version = ver.trim().trim_matches('"').to_string();
-                }
-            } else if let Some(rest) = line.strip_prefix("platform:") {
-                let platform = rest.trim().trim_matches('"');
-                if platform != "ruby" && !platform.is_empty() {
-                    gemspec.platform = Some(platform.to_string());
-                }
-            } else if let Some(rest) = line.strip_prefix("summary:") {
-                gemspec.summary = Some(rest.trim().trim_matches('"').to_string());
-            } else if let Some(rest) = line.strip_prefix("description:") {
-                gemspec.description = Some(rest.trim().trim_matches('"').to_string());
-            } else if let Some(rest) = line.strip_prefix("homepage:") {
-                gemspec.homepage = Some(rest.trim().trim_matches('"').to_string());
-            } else if let Some(rest) = line.strip_prefix("license:") {
-                gemspec.license = Some(rest.trim().trim_matches('"').to_string());
+            if line.is_empty() || line.starts_with("---") || line.starts_with('#') {
+                continue;
             }
-        }
 
-        // Try to extract version from nested structure if still empty
-        if gemspec.version.is_empty() {
-            for line in content.lines() {
-                if line.trim().starts_with("- ")
-                    && line
-                        .trim_start_matches("- ")
-                        .chars()
-                        .next()
-                        .map(|c| c.is_ascii_digit())
-                        .unwrap_or(false)
-                {
-                    gemspec.version = line.trim().trim_start_matches("- ").to_string();
-                    break;
+            // Top-level fields have 0 indent in gemspec YAML
+            if indent == 0 {
+                expect_nested_version = false;
+                if let Some(rest) = line.strip_prefix("name:") {
+                    gemspec.name = rest.trim().trim_matches('"').to_string();
+                } else if let Some(rest) = line.strip_prefix("version:") {
+                    let trimmed = rest.trim().trim_matches('"').trim_matches('\'');
+                    if trimmed.starts_with("!ruby/") {
+                        expect_nested_version = true;
+                    } else if !trimmed.is_empty() {
+                        gemspec.version = trimmed.to_string();
+                    }
+                } else if let Some(rest) = line.strip_prefix("platform:") {
+                    let platform = rest.trim().trim_matches('"');
+                    if platform != "ruby" && !platform.is_empty() {
+                        gemspec.platform = Some(platform.to_string());
+                    }
+                } else if let Some(rest) = line.strip_prefix("summary:") {
+                    gemspec.summary = Some(rest.trim().trim_matches('"').to_string());
+                } else if let Some(rest) = line.strip_prefix("description:") {
+                    gemspec.description = Some(rest.trim().trim_matches('"').to_string());
+                } else if let Some(rest) = line.strip_prefix("homepage:") {
+                    gemspec.homepage = Some(rest.trim().trim_matches('"').to_string());
+                } else if let Some(rest) = line.strip_prefix("license:") {
+                    gemspec.license = Some(rest.trim().trim_matches('"').to_string());
+                }
+            } else if expect_nested_version && gemspec.version.is_empty() {
+                // Indented line right after "version: !ruby/object:Gem::Version"
+                if let Some(rest) = line.strip_prefix("version:") {
+                    let ver = rest.trim().trim_matches('"').trim_matches('\'');
+                    if !ver.is_empty() {
+                        gemspec.version = ver.to_string();
+                        expect_nested_version = false;
+                    }
                 }
             }
         }
