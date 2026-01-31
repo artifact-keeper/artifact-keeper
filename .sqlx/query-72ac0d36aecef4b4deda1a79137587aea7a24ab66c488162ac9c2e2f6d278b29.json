@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT a.name, a.version,\n               a.checksum_sha256,\n               am.metadata as \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1 AND a.is_deleted = false\n        ORDER BY a.name, a.version\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "checksum_sha256",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "metadata?",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "72ac0d36aecef4b4deda1a79137587aea7a24ab66c488162ac9c2e2f6d278b29"
+}

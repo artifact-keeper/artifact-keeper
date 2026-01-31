@@ -156,6 +156,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "bytes",
+ "bzip2",
  "chrono",
  "clap",
  "dotenvy",

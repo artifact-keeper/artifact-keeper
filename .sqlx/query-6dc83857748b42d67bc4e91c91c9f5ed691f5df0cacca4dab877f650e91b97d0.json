@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(DISTINCT name)\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND name ILIKE $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6dc83857748b42d67bc4e91c91c9f5ed691f5df0cacca4dab877f650e91b97d0"
+}

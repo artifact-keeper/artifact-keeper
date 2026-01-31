@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE artifacts SET is_deleted = true WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "10f371840323b0f1120b9bcd9af47a92a04bc1c8d817e13db9d69bb83204c4b2"
+}

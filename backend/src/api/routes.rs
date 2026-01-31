@@ -37,6 +37,18 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/gems", handlers::rubygems::router())
         // Go Proxy API (GOPROXY protocol)
         .nest("/go", handlers::goproxy::router())
+        // Helm Chart Repository API
+        .nest("/helm", handlers::helm::router())
+        // Composer (PHP) Repository API
+        .nest("/composer", handlers::composer::router())
+        // Conan v2 Repository API (C/C++ packages)
+        .nest("/conan", handlers::conan::router())
+        // Alpine/APK Repository API
+        .nest("/alpine", handlers::alpine::router())
+        // Conda Channel API
+        .nest("/conda", handlers::conda::router())
+        // Terraform Registry Protocol
+        .nest("/terraform", handlers::terraform::router())
         .with_state(state)
 }
 

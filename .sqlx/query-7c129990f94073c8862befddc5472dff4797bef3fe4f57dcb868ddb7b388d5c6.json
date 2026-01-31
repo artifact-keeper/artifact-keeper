@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO artifact_metadata (artifact_id, format, metadata)\n        VALUES ($1, 'conda', $2)\n        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7c129990f94073c8862befddc5472dff4797bef3fe4f57dcb868ddb7b388d5c6"
+}

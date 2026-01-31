@@ -87,6 +87,7 @@ zip = "2.2"
 toml = "0.8"
 serde_yaml = "0.9"
 regex = "1.11"
+bzip2 = "0.5"
 
 # WASM runtime
 wasmtime.workspace = true
