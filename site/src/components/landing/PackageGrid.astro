@@ -1,5 +1,5 @@
 ---
-import { packages } from "../data/packages";
+import { packages } from "../../data/packages";
 
 const grouped = packages.reduce<Record<string, string[]>>((acc, pkg) => {
   if (!acc[pkg.category]) acc[pkg.category] = [];
