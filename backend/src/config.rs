@@ -65,6 +65,9 @@ pub struct Config {
 
     /// Meilisearch API key
     pub meilisearch_api_key: Option<String>,
+
+    /// Path for scan workspace shared with Trivy
+    pub scan_workspace_path: String,
 }
 
 impl Config {
@@ -103,6 +106,8 @@ impl Config {
             trivy_url: env::var("TRIVY_URL").ok(),
             meilisearch_url: env::var("MEILISEARCH_URL").ok(),
             meilisearch_api_key: env::var("MEILISEARCH_API_KEY").ok(),
+            scan_workspace_path: env::var("SCAN_WORKSPACE_PATH")
+                .unwrap_or_else(|_| "/scan-workspace".into()),
         })
     }
 }

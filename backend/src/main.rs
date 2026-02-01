@@ -66,6 +66,8 @@ async fn main() -> Result<()> {
         scan_result_service,
         scan_config_service,
         config.trivy_url.clone(),
+        config.storage_path.clone(),
+        config.scan_workspace_path.clone(),
     ));
 
     // Initialize Meilisearch (optional, graceful fallback)

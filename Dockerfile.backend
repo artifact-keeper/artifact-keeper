@@ -27,12 +27,19 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies and scanner CLIs
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     curl \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Trivy CLI
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+# Install Grype CLI
+RUN curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
 # Create non-root user
 RUN useradd -r -s /bin/false artifact
@@ -40,8 +47,10 @@ RUN useradd -r -s /bin/false artifact
 # Copy binary from builder
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
 
-# Create data directories (storage, backups, plugins)
-RUN mkdir -p /data/storage /data/backups /data/plugins && chown -R artifact:artifact /data
+# Create data directories (storage, backups, plugins, scan workspace, caches)
+RUN mkdir -p /data/storage /data/backups /data/plugins /scan-workspace \
+    /home/artifact/.cache/grype /home/artifact/.cache/trivy && \
+    chown -R artifact:artifact /data /scan-workspace /home/artifact
 
 # Switch to non-root user
 USER artifact

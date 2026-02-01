@@ -5,6 +5,7 @@
 //! security score recalculation.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,9 +21,13 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
+use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
 use crate::services::scan_result_service::ScanResultService;
+use crate::services::trivy_fs_scanner::TrivyFsScanner;
+use crate::storage::filesystem::FilesystemStorage;
+use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Scanner trait
@@ -793,6 +798,9 @@ pub struct ScannerService {
     scanners: Vec<Arc<dyn Scanner>>,
     scan_result_service: Arc<ScanResultService>,
     scan_config_service: Arc<ScanConfigService>,
+    #[allow(dead_code)]
+    storage_base_path: String,
+    scan_workspace_path: String,
 }
 
 impl ScannerService {
@@ -802,20 +810,34 @@ impl ScannerService {
         scan_result_service: Arc<ScanResultService>,
         scan_config_service: Arc<ScanConfigService>,
         trivy_url: Option<String>,
+        storage_base_path: String,
+        scan_workspace_path: String,
     ) -> Self {
         let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
         let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
 
         if let Some(url) = trivy_url {
             info!("Trivy image scanner enabled at {}", url);
-            scanners.push(Arc::new(ImageScanner::new(url)));
+            scanners.push(Arc::new(ImageScanner::new(url.clone())));
+            // Trivy filesystem scanner for non-container artifacts
+            info!("Trivy filesystem scanner enabled");
+            scanners.push(Arc::new(TrivyFsScanner::new(
+                url,
+                scan_workspace_path.clone(),
+            )));
         }
+
+        // Grype scanner (CLI-based, degrades gracefully if binary not available)
+        info!("Grype scanner enabled");
+        scanners.push(Arc::new(GrypeScanner::new(scan_workspace_path.clone())));
 
         Self {
             db,
             scanners,
             scan_result_service,
             scan_config_service,
+            storage_base_path,
+            scan_workspace_path,
         }
     }
 
@@ -980,24 +1002,165 @@ impl ScannerService {
         Ok(count)
     }
 
-    /// Fetch artifact content from storage.
+    /// Fetch artifact content from filesystem storage.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
-        // Use the storage_key to read from the storage backend.
-        // In a real implementation this would use the injected StorageBackend.
-        // For now, we return an empty buffer if storage is not available,
-        // letting the scanner handle manifests from metadata instead.
-        let _content = sqlx::query_scalar!(
-            "SELECT encode(E''::bytea, 'hex') as \"hex!\" FROM artifacts WHERE id = $1",
-            artifact.id,
+        // Look up the repository's storage_path
+        let storage_path: String = sqlx::query_scalar(
+            "SELECT storage_path FROM repositories WHERE id = $1",
         )
-        .fetch_optional(&self.db)
+        .bind(artifact.repository_id)
+        .fetch_one(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(format!(
+            "Failed to fetch storage_path for repository {}: {}",
+            artifact.repository_id, e
+        )))?;
 
-        // The actual content lives in object storage, not the DB.
-        // Return empty bytes — the scanner will attempt manifest parsing
-        // from metadata or skip gracefully.
-        Ok(Bytes::new())
+        // Create a FilesystemStorage for this repository and read the artifact
+        let storage = FilesystemStorage::new(&storage_path);
+        let content = storage.get(&artifact.storage_key).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to read artifact {} (key={}): {}",
+                artifact.id, artifact.storage_key, e
+            ))
+        })?;
+
+        Ok(content)
+    }
+
+    /// Prepare a scan workspace directory with the artifact content.
+    ///
+    /// Creates a temporary directory under the shared scan workspace path,
+    /// writes the artifact content, and extracts archives when applicable.
+    /// Returns the path to the workspace directory.
+    pub async fn prepare_scan_workspace(
+        &self,
+        artifact: &Artifact,
+        content: &Bytes,
+    ) -> Result<PathBuf> {
+        let workspace_dir = PathBuf::from(&self.scan_workspace_path)
+            .join(artifact.id.to_string());
+
+        tokio::fs::create_dir_all(&workspace_dir).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to create scan workspace {}: {}",
+                workspace_dir.display(),
+                e
+            ))
+        })?;
+
+        let artifact_path = workspace_dir.join(&artifact.name);
+
+        // Write the artifact content to the workspace
+        tokio::fs::write(&artifact_path, content).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to write artifact to scan workspace: {}",
+                e
+            ))
+        })?;
+
+        // Extract archives if applicable
+        let name_lower = artifact.name.to_lowercase();
+        if name_lower.ends_with(".tar.gz")
+            || name_lower.ends_with(".tgz")
+            || name_lower.ends_with(".crate")
+            || name_lower.ends_with(".gem")
+        {
+            self.extract_tar_gz(content, &workspace_dir).await?;
+        } else if name_lower.ends_with(".zip")
+            || name_lower.ends_with(".whl")
+            || name_lower.ends_with(".jar")
+            || name_lower.ends_with(".nupkg")
+        {
+            self.extract_zip(content, &workspace_dir).await?;
+        }
+
+        Ok(workspace_dir)
+    }
+
+    /// Extract a tar.gz archive into the target directory.
+    async fn extract_tar_gz(&self, content: &Bytes, target_dir: &Path) -> Result<()> {
+        let content = content.clone();
+        let target = target_dir.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            use flate2::read::GzDecoder;
+            use tar::Archive;
+
+            let decoder = GzDecoder::new(content.as_ref());
+            let mut archive = Archive::new(decoder);
+            archive.unpack(&target).map_err(|e| {
+                AppError::Storage(format!("Failed to extract tar.gz archive: {}", e))
+            })
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Archive extraction task failed: {}", e)))?
+    }
+
+    /// Extract a zip archive into the target directory.
+    async fn extract_zip(&self, content: &Bytes, target_dir: &Path) -> Result<()> {
+        let content = content.clone();
+        let target = target_dir.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::Cursor;
+
+            let reader = Cursor::new(content.as_ref());
+            let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
+                AppError::Storage(format!("Failed to open zip archive: {}", e))
+            })?;
+
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| {
+                    AppError::Storage(format!("Failed to read zip entry {}: {}", i, e))
+                })?;
+
+                let out_path = match file.enclosed_name() {
+                    Some(path) => target.join(path),
+                    None => continue, // Skip entries with unsafe paths
+                };
+
+                if file.is_dir() {
+                    std::fs::create_dir_all(&out_path).map_err(|e| {
+                        AppError::Storage(format!("Failed to create directory: {}", e))
+                    })?;
+                } else {
+                    if let Some(parent) = out_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            AppError::Storage(format!("Failed to create parent directory: {}", e))
+                        })?;
+                    }
+                    let mut out_file = std::fs::File::create(&out_path).map_err(|e| {
+                        AppError::Storage(format!("Failed to create file: {}", e))
+                    })?;
+                    std::io::copy(&mut file, &mut out_file).map_err(|e| {
+                        AppError::Storage(format!("Failed to write extracted file: {}", e))
+                    })?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Zip extraction task failed: {}", e)))?
+    }
+
+    /// Clean up a scan workspace directory.
+    pub async fn cleanup_scan_workspace(&self, path: &Path) -> Result<()> {
+        if path.starts_with(&self.scan_workspace_path) {
+            tokio::fs::remove_dir_all(path).await.map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to clean up scan workspace {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        } else {
+            warn!(
+                "Refusing to clean up path outside scan workspace: {}",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     /// Update artifact quarantine_status based on scan findings.
