@@ -1,0 +1,371 @@
+---
+title: "AWS Deployment"
+description: "Deploy Artifact Keeper on AWS using a pre-built AMI or Packer + Terraform"
+---
+
+Deploy Artifact Keeper on a single EC2 instance with PostgreSQL, Meilisearch, Trivy, and Grype pre-installed. Choose between a pre-built AMI for one-click launches or build your own with Packer.
+
+## Architecture
+
+```text
+┌──────────────────────────────────────────────────┐
+│                  EC2 Instance                     │
+│                                                   │
+│  ┌───────────┐   ┌──────────────────────────┐    │
+│  │   Nginx   │──▶│   Artifact Keeper (8080)  │    │
+│  │  (80/443) │   └────────┬─────────────────┘    │
+│  └───────────┘            │                       │
+│                    ┌──────┴──────┐                │
+│              ┌─────▼────┐ ┌─────▼──────┐         │
+│              │ PostgreSQL│ │ Meilisearch│         │
+│              │  (5432)   │ │   (7700)   │         │
+│              └───────────┘ └────────────┘         │
+│                                                   │
+│  ┌────────────┐  ┌────────────┐                  │
+│  │   Trivy    │  │   Grype    │                  │
+│  │   (8090)   │  │  (CLI)     │                  │
+│  └────────────┘  └────────────┘                  │
+│                                                   │
+│  /var/lib/artifact-keeper/  (EBS gp3 volume)     │
+└──────────────────────────────────────────────────┘
+```
+
+All services run on a single instance and communicate over localhost. Nginx terminates HTTP/HTTPS and proxies to the backend. Artifacts are stored on a dedicated EBS volume.
+
+## Prerequisites
+
+- AWS account with permissions to launch EC2 instances
+- An EC2 key pair for SSH access
+- AWS CLI configured (`aws configure`)
+
+## Option 1: Pre-Built AMI (Quickest)
+
+Launch the official Artifact Keeper AMI directly from the AWS console or CLI.
+
+### Find the AMI
+
+Check the [latest release](https://github.com/artifact-keeper/artifact-keeper/releases) for the AMI ID, or search in the EC2 console:
+
+```bash
+aws ec2 describe-images \
+  --owners self \
+  --filters "Name=name,Values=artifact-keeper-*" \
+  --query 'Images | sort_by(@, &CreationDate) | [-1].[ImageId,Name]' \
+  --output table
+```
+
+### Launch an Instance
+
+```bash
+aws ec2 run-instances \
+  --image-id ami-0123456789abcdef0 \
+  --instance-type t3.medium \
+  --key-name my-key-pair \
+  --security-group-ids sg-abc123 \
+  --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=artifact-keeper}]' \
+  --query 'Instances[0].InstanceId' \
+  --output text
+```
+
+### Retrieve Credentials
+
+On first boot, the instance generates random credentials for all services. SSH in to retrieve them:
+
+```bash
+ssh -i ~/.ssh/my-key-pair.pem ubuntu@<PUBLIC_IP>
+sudo cat /opt/artifact-keeper/.credentials
+```
+
+Output:
+
+```text
+=====================================
+  Artifact Keeper Credentials
+=====================================
+Admin Username: admin
+Admin Password: <generated>
+
+Database User:  artifact_keeper
+Database Pass:  <generated>
+
+Meilisearch Key: <generated>
+JWT Secret:      <generated>
+=====================================
+
+Access your instance at:
+  http://<PUBLIC_IP>
+```
+
+Open `http://<PUBLIC_IP>` in your browser to access the UI.
+
+---
+
+## Option 2: Terraform (Recommended for Production)
+
+The Terraform module provisions the full infrastructure: VPC, security groups, IAM roles, EC2 instance, and a dedicated EBS data volume.
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/artifact-keeper/artifact-keeper.git
+cd artifact-keeper/deploy/aws/terraform
+```
+
+### 2. Configure Variables
+
+```bash
+cp terraform.tfvars.example terraform.tfvars
+```
+
+Edit `terraform.tfvars`:
+
+```hcl
+ami_id        = "ami-0123456789abcdef0"  # From latest release
+aws_region    = "us-east-1"
+instance_type = "t3.medium"
+key_name      = "my-key-pair"
+
+# Restrict SSH to your IP
+allowed_ssh_cidrs = ["203.0.113.0/32"]
+
+# Optional: auto-SSL with Let's Encrypt
+# domain      = "artifacts.example.com"
+# admin_email = "admin@example.com"
+
+# Artifact storage volume (GB)
+data_volume_size = 100
+```
+
+### 3. Deploy
+
+```bash
+terraform init
+terraform plan
+terraform apply
+```
+
+### 4. Access Your Instance
+
+Terraform outputs everything you need:
+
+```bash
+terraform output url
+# http://54.123.45.67
+
+terraform output ssh_command
+# ssh -i ~/.ssh/my-key-pair.pem ubuntu@54.123.45.67
+
+terraform output credentials_command
+# ssh -i ~/.ssh/my-key-pair.pem ubuntu@54.123.45.67 'sudo cat /opt/artifact-keeper/.credentials'
+```
+
+### 5. Tear Down
+
+```bash
+terraform destroy
+```
+
+---
+
+## Option 3: Build Your Own AMI with Packer
+
+Use the Packer template to build a custom AMI with your own modifications.
+
+### 1. Install Packer
+
+```bash
+# macOS
+brew install hashicorp/tap/packer
+
+# Ubuntu/Debian
+curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt-get update && sudo apt-get install packer
+```
+
+### 2. Configure the Build
+
+```bash
+cd deploy/aws/packer
+cp variables.auto.pkrvars.hcl.example variables.auto.pkrvars.hcl
+```
+
+Edit `variables.auto.pkrvars.hcl`:
+
+```hcl
+artifact_keeper_version = "0.2.0"
+aws_region              = "us-east-1"
+instance_type           = "t3.medium"
+
+# Copy to additional regions
+# ami_regions = ["us-west-2", "eu-west-1"]
+```
+
+### 3. Build
+
+```bash
+packer init .
+packer validate .
+packer build .
+```
+
+Packer will:
+1. Launch a temporary EC2 instance from Ubuntu 24.04
+2. Install PostgreSQL, Meilisearch, Trivy, Grype, and Artifact Keeper
+3. Configure systemd services and Nginx
+4. Snapshot the instance as a new AMI
+5. Terminate the temporary instance
+
+The AMI ID is printed at the end of the build. Use it with the Terraform module or launch directly.
+
+### Customizing the Build
+
+The provisioning scripts are in `deploy/aws/scripts/`:
+
+| Script | Purpose |
+|--------|---------|
+| `01-system.sh` | Base packages, firewall, fail2ban |
+| `02-postgresql.sh` | PostgreSQL 16 |
+| `03-meilisearch.sh` | Meilisearch search engine |
+| `04-scanners.sh` | Trivy and Grype vulnerability scanners |
+| `05-artifact-keeper.sh` | Backend binary + frontend from GitHub Releases |
+| `06-nginx.sh` | Nginx reverse proxy for all package format endpoints |
+| `07-first-boot.sh` | One-time setup: secrets, database init, optional SSL |
+| `99-cleanup.sh` | Remove caches and SSH keys for clean AMI |
+
+Modify any script before building to customize the installation.
+
+---
+
+## Post-Deployment
+
+### Configure SSL with Let's Encrypt
+
+If you didn't set a domain during launch, you can configure SSL manually:
+
+```bash
+ssh -i ~/.ssh/my-key-pair.pem ubuntu@<PUBLIC_IP>
+
+# Update Nginx server_name
+sudo sed -i 's/server_name _;/server_name artifacts.example.com;/' \
+  /etc/nginx/sites-available/artifact-keeper
+sudo nginx -t && sudo systemctl reload nginx
+
+# Request certificate
+sudo certbot --nginx -d artifacts.example.com \
+  --non-interactive --agree-tos -m admin@example.com --redirect
+```
+
+Certbot automatically renews certificates via a systemd timer.
+
+### Configure Package Managers
+
+Once running, configure your package managers to point at the instance. See the [Package Formats Overview](/docs/package-formats/) for client configuration guides.
+
+Example — configure npm:
+
+```bash
+npm config set registry http://<YOUR_IP_OR_DOMAIN>/npm/my-npm-repo/
+npm login --registry http://<YOUR_IP_OR_DOMAIN>/npm/my-npm-repo/
+```
+
+### Check Service Status
+
+```bash
+ssh -i ~/.ssh/my-key-pair.pem ubuntu@<PUBLIC_IP>
+
+# All services
+sudo systemctl status artifact-keeper meilisearch postgresql trivy-server nginx
+
+# Artifact Keeper logs
+sudo journalctl -u artifact-keeper -f
+
+# Health check
+curl http://localhost/health
+```
+
+### Backup
+
+Artifacts are stored on the EBS data volume at `/var/lib/artifact-keeper/storage`. Create EBS snapshots for point-in-time backups:
+
+```bash
+# Find the volume ID
+INSTANCE_ID=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=artifact-keeper" \
+  --query 'Reservations[0].Instances[0].InstanceId' --output text)
+
+VOLUME_ID=$(aws ec2 describe-volumes \
+  --filters "Name=attachment.instance-id,Values=${INSTANCE_ID}" \
+            "Name=tag:Name,Values=*data*" \
+  --query 'Volumes[0].VolumeId' --output text)
+
+# Create snapshot
+aws ec2 create-snapshot \
+  --volume-id "$VOLUME_ID" \
+  --description "artifact-keeper-backup-$(date +%Y%m%d)" \
+  --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=artifact-keeper-backup}]"
+```
+
+---
+
+## Instance Sizing
+
+| Workload | Instance Type | vCPU | RAM | Artifacts |
+|----------|--------------|------|-----|-----------|
+| Small team (< 20 devs) | `t3.medium` | 2 | 4 GB | Up to 100 GB |
+| Medium team (20–100 devs) | `t3.large` | 2 | 8 GB | Up to 500 GB |
+| Large team (100+ devs) | `m6i.xlarge` | 4 | 16 GB | 1 TB+ |
+
+All instances use gp3 EBS volumes. Increase the `data_volume_size` Terraform variable for more artifact storage.
+
+---
+
+## Troubleshooting
+
+### First-boot didn't complete
+
+```bash
+# Check first-boot log
+sudo journalctl -u artifact-keeper-first-boot
+
+# Re-run manually
+sudo /opt/artifact-keeper/first-boot.sh
+```
+
+### Artifact Keeper won't start
+
+```bash
+# Check the service
+sudo systemctl status artifact-keeper
+sudo journalctl -u artifact-keeper --no-pager -n 50
+
+# Verify database connection
+sudo -u postgres psql -c "SELECT 1" artifact_keeper
+```
+
+### Can't connect to the instance
+
+1. Verify the security group allows inbound HTTP (port 80) and HTTPS (port 443)
+2. Check that the instance has a public IP or Elastic IP
+3. Confirm UFW is allowing traffic: `sudo ufw status`
+
+### SSL certificate issues
+
+```bash
+# Test renewal
+sudo certbot renew --dry-run
+
+# Force renewal
+sudo certbot renew --force-renewal
+```
+
+---
+
+## See Also
+
+- [Docker Compose Deployment](/docs/deployment/docker/) — Containerized deployment
+- [Kubernetes Deployment](/docs/deployment/kubernetes/) — Cluster deployment
+- [Configuration](/docs/getting-started/configuration/) — Environment variables reference
+- [Backup & Recovery](/docs/advanced/backup/) — Backup strategies

@@ -80,6 +80,7 @@ export default defineConfig({
         {
           label: 'Deployment',
           items: [
+            { label: 'AWS', slug: 'docs/deployment/aws' },
             { label: 'Docker Compose', slug: 'docs/deployment/docker' },
             { label: 'Kubernetes', slug: 'docs/deployment/kubernetes' },
           ],
