@@ -411,7 +411,6 @@ impl FormatHandler for PypiHandler {
 
         // Validate package files
         if let Some(filename) = info.filename.as_ref().filter(|_| !content.is_empty()) {
-
             // Validate wheel files
             if filename.ends_with(".whl") {
                 let pkg_info = Self::extract_wheel_metadata(content)?;
