@@ -3,7 +3,7 @@ title: "AWS Deployment"
 description: "Deploy Artifact Keeper on AWS using a pre-built AMI or Packer + Terraform"
 ---
 
-Deploy Artifact Keeper on a single EC2 instance with PostgreSQL, Meilisearch, Trivy, and Grype pre-installed. Choose between a pre-built AMI for one-click launches or build your own with Packer.
+Deploy Artifact Keeper on a single EC2 instance using Docker Compose. The AMI comes with Docker pre-installed, all images pre-pulled, and a first-boot service that generates secrets and starts everything automatically.
 
 ## Architecture
 
@@ -11,26 +11,29 @@ Deploy Artifact Keeper on a single EC2 instance with PostgreSQL, Meilisearch, Tr
 ┌──────────────────────────────────────────────────┐
 │                  EC2 Instance                     │
 │                                                   │
-│  ┌───────────┐   ┌──────────────────────────┐    │
-│  │   Nginx   │──▶│   Artifact Keeper (8080)  │    │
-│  │  (80/443) │   └────────┬─────────────────┘    │
-│  └───────────┘            │                       │
-│                    ┌──────┴──────┐                │
-│              ┌─────▼────┐ ┌─────▼──────┐         │
-│              │ PostgreSQL│ │ Meilisearch│         │
-│              │  (5432)   │ │   (7700)   │         │
-│              └───────────┘ └────────────┘         │
+│  ┌───────────┐                                   │
+│  │   Nginx   │  (host — handles SSL/TLS)         │
+│  │  (80/443) │                                   │
+│  └─────┬─────┘                                   │
+│        │                                          │
+│  ┌─────▼──────────── Docker Compose ───────────┐ │
+│  │                                              │ │
+│  │  ┌──────────┐  ┌──────────────────────────┐ │ │
+│  │  │ Frontend │  │   Backend (8080)          │ │ │
+│  │  │  (3000)  │  └────────┬─────────────────┘ │ │
+│  │  └──────────┘           │                    │ │
+│  │               ┌─────────┼──────────┐         │ │
+│  │         ┌─────▼───┐ ┌───▼─────┐ ┌─▼──────┐ │ │
+│  │         │Postgres │ │Meili-   │ │ Trivy  │ │ │
+│  │         │  (5432) │ │search   │ │ (8090) │ │ │
+│  │         └─────────┘ └─────────┘ └────────┘ │ │
+│  └──────────────────────────────────────────────┘ │
 │                                                   │
-│  ┌────────────┐  ┌────────────┐                  │
-│  │   Trivy    │  │   Grype    │                  │
-│  │   (8090)   │  │  (CLI)     │                  │
-│  └────────────┘  └────────────┘                  │
-│                                                   │
-│  /var/lib/artifact-keeper/  (EBS gp3 volume)     │
+│  /data/  (EBS gp3 volume)                        │
 └──────────────────────────────────────────────────┘
 ```
 
-All services run on a single instance and communicate over localhost. Nginx terminates HTTP/HTTPS and proxies to the backend. Artifacts are stored on a dedicated EBS volume.
+Nginx runs on the host for SSL termination. All application services run as Docker containers managed by Docker Compose. Data is persisted to `/data/` on a dedicated EBS volume.
 
 ## Prerequisites
 
@@ -83,18 +86,22 @@ Output:
 =====================================
   Artifact Keeper Credentials
 =====================================
-Admin Username: admin
-Admin Password: <generated>
 
-Database User:  artifact_keeper
-Database Pass:  <generated>
+Access URL: http://<PUBLIC_IP>
 
-Meilisearch Key: <generated>
-JWT Secret:      <generated>
+Database Password:  <generated>
+Meilisearch Key:    <generated>
+JWT Secret:         <generated>
+
+Docker Compose Dir: /opt/artifact-keeper
+
+Manage services:
+  cd /opt/artifact-keeper
+  docker compose ps
+  docker compose logs -f backend
+  docker compose restart
+
 =====================================
-
-Access your instance at:
-  http://<PUBLIC_IP>
 ```
 
 Open `http://<PUBLIC_IP>` in your browser to access the UI.
@@ -213,10 +220,11 @@ packer build .
 
 Packer will:
 1. Launch a temporary EC2 instance from Ubuntu 24.04
-2. Install PostgreSQL, Meilisearch, Trivy, Grype, and Artifact Keeper
-3. Configure systemd services and Nginx
-4. Snapshot the instance as a new AMI
-5. Terminate the temporary instance
+2. Install Docker, Nginx, and certbot
+3. Copy the Docker Compose file and pull all container images
+4. Configure systemd services for first-boot and compose
+5. Snapshot the instance as a new AMI
+6. Terminate the temporary instance
 
 The AMI ID is printed at the end of the build. Use it with the Terraform module or launch directly.
 
@@ -226,16 +234,19 @@ The provisioning scripts are in `deploy/aws/scripts/`:
 
 | Script | Purpose |
 |--------|---------|
-| `01-system.sh` | Base packages, firewall, fail2ban |
-| `02-postgresql.sh` | PostgreSQL 16 |
-| `03-meilisearch.sh` | Meilisearch search engine |
-| `04-scanners.sh` | Trivy and Grype vulnerability scanners |
-| `05-artifact-keeper.sh` | Backend binary + frontend from GitHub Releases |
-| `06-nginx.sh` | Nginx reverse proxy for all package format endpoints |
-| `07-first-boot.sh` | One-time setup: secrets, database init, optional SSL |
+| `01-docker.sh` | Install Docker, Nginx, certbot, firewall |
+| `02-artifact-keeper.sh` | Copy compose file, pull images, configure systemd |
 | `99-cleanup.sh` | Remove caches and SSH keys for clean AMI |
 
-Modify any script before building to customize the installation.
+Supporting files:
+
+| File | Purpose |
+|------|---------|
+| `docker-compose.yml` | Production compose with GHCR images |
+| `nginx-host.conf` | Host Nginx config for SSL termination |
+| `first-boot.sh` | Generate secrets, configure Nginx, optional SSL |
+
+Modify any file before building to customize the installation.
 
 ---
 
@@ -276,11 +287,15 @@ npm login --registry http://<YOUR_IP_OR_DOMAIN>/npm/my-npm-repo/
 ```bash
 ssh -i ~/.ssh/my-key-pair.pem ubuntu@<PUBLIC_IP>
 
-# All services
-sudo systemctl status artifact-keeper meilisearch postgresql trivy-server nginx
+# Container status
+cd /opt/artifact-keeper
+docker compose ps
 
 # Artifact Keeper logs
-sudo journalctl -u artifact-keeper -f
+docker compose logs -f backend
+
+# All logs
+docker compose logs -f
 
 # Health check
 curl http://localhost/health
@@ -288,7 +303,7 @@ curl http://localhost/health
 
 ### Backup
 
-Artifacts are stored on the EBS data volume at `/var/lib/artifact-keeper/storage`. Create EBS snapshots for point-in-time backups:
+Artifacts are stored on the EBS data volume at `/data/storage`. Create EBS snapshots for point-in-time backups:
 
 ```bash
 # Find the volume ID
@@ -337,12 +352,19 @@ sudo /opt/artifact-keeper/first-boot.sh
 ### Artifact Keeper won't start
 
 ```bash
-# Check the service
-sudo systemctl status artifact-keeper
-sudo journalctl -u artifact-keeper --no-pager -n 50
+cd /opt/artifact-keeper
 
-# Verify database connection
-sudo -u postgres psql -c "SELECT 1" artifact_keeper
+# Check container status
+docker compose ps
+
+# Check backend logs
+docker compose logs backend
+
+# Check if database is healthy
+docker compose logs postgres
+
+# Restart everything
+docker compose down && docker compose up -d
 ```
 
 ### Can't connect to the instance

@@ -1,12 +1,6 @@
-artifact_keeper_version = "0.2.0"
+artifact_keeper_version = "latest"
 aws_region              = "us-east-1"
 instance_type           = "t3.medium"
 
 # Copy AMI to additional regions (optional)
 # ami_regions = ["us-west-2", "eu-west-1", "ap-southeast-1"]
-
-# Component versions (defaults are usually fine)
-# postgresql_version  = "16"
-# meilisearch_version = "1.12.3"
-# trivy_version       = "0.58.2"
-# grype_version       = "0.86.1"

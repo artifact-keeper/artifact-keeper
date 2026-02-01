@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: artifact_keeper
+      POSTGRES_USER: artifact_keeper
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - /data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U artifact_keeper -d artifact_keeper"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    restart: always
+    environment:
+      MEILI_ENV: production
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_HTTP_ADDR: 0.0.0.0:7700
+    volumes:
+      - /data/meilisearch:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  trivy:
+    image: aquasec/trivy:latest
+    restart: always
+    command: ["server", "--listen", "0.0.0.0:8090"]
+    volumes:
+      - /data/trivy-cache:/root/.cache/trivy
+
+  backend:
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://artifact_keeper:${DB_PASSWORD}@postgres:5432/artifact_keeper
+      BIND_ADDRESS: 0.0.0.0:8080
+      STORAGE_BACKEND: filesystem
+      STORAGE_PATH: /data/storage
+      JWT_SECRET: ${JWT_SECRET}
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY}
+      TRIVY_URL: http://trivy:8090
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /data/storage:/data/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+
+  frontend:
+    image: ghcr.io/artifact-keeper/artifact-keeper-frontend:${ARTIFACT_KEEPER_VERSION:-latest}
+    restart: always
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - backend
