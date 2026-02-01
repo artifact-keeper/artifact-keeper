@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Demo deployment for demo.artifactkeeper.com
 # All write operations are blocked via DEMO_MODE.
 # Reset daily with: ./reset-demo.sh

@@ -24,16 +24,14 @@ pub async fn demo_guard(
         return next.run(request).await;
     }
 
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let is_read_only = matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    let is_auth_endpoint = request.uri().path().starts_with("/api/v1/auth");
 
-    // Allow all read operations
-    if method == Method::GET || method == Method::HEAD || method == Method::OPTIONS {
-        return next.run(request).await;
-    }
-
-    // Allow auth endpoints (login, refresh, etc.)
-    if path.starts_with("/api/v1/auth") {
+    // Allow read operations and auth endpoints (login, refresh, etc.)
+    if is_read_only || is_auth_endpoint {
         return next.run(request).await;
     }
 
