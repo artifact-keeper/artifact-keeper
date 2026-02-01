@@ -1,238 +1,464 @@
 ---
 title: "Package Formats"
-description: "All 30+ package formats supported by Artifact Keeper"
+description: "All 45+ package formats supported by Artifact Keeper, grouped by ecosystem"
 ---
 
 # Package Formats
 
-Artifact Keeper supports 30+ package formats out of the box. All formats are included at no extra cost with no feature gates or limitations.
+Artifact Keeper supports **45+ package formats** out of the box. Every format is included at no extra cost — no feature gates, no tier restrictions. Each speaks the native wire protocol that your package manager already expects.
 
-## Language Package Managers
+Custom formats can be added via the [WASM plugin system](/docs/advanced/plugins/).
 
-Full support for language-specific package ecosystems with native client compatibility.
+---
 
-| Format | API Endpoint | Description |
-|--------|--------------|-------------|
-| **Maven** | `/maven/{repo}` | Java and JVM language artifacts (JAR, WAR, POM) |
-| **npm** | `/npm/{repo}` | Node.js and JavaScript packages |
-| **PyPI** | `/pypi/{repo}` | Python packages (wheels, sdists) |
-| **NuGet** | `/nuget/{repo}` | .NET packages and libraries |
-| **Cargo** | `/cargo/{repo}` | Rust crates and dependencies |
-| **Go** | `/go/{repo}` | Go modules (proxy protocol) |
-| **RubyGems** | `/rubygems/{repo}` | Ruby gems and bundler support |
-| **Composer** | `/composer/{repo}` | PHP packages via Packagist protocol |
-| **Hex** | `/hex/{repo}` | Erlang and Elixir packages |
-| **Pub** | `/pub/{repo}` | Dart and Flutter packages |
-| **CRAN** | `/cran/{repo}` | R language packages |
-| **sbt** | `/sbt/{repo}` | Scala build tool artifacts |
+## Languages & Runtimes
 
-### Example Usage
+### Java / JVM
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Maven** | `maven` | `/maven/{repo}` | Maven, Gradle, Ant+Ivy |
+| **SBT** | `sbt` | `/ivy/{repo}` | sbt, Ivy |
 
 **Maven** (`pom.xml`):
 ```xml
 <repositories>
   <repository>
     <id>artifact-keeper</id>
-    <url>https://artifacts.example.com/maven/my-repo</url>
+    <url>https://registry.example.com/maven/my-repo</url>
   </repository>
 </repositories>
 ```
 
-**npm** (`.npmrc`):
-```
-registry=https://artifacts.example.com/npm/my-repo/
-//artifacts.example.com/npm/my-repo/:_authToken=${NPM_TOKEN}
+**SBT** (`build.sbt`):
+```scala
+resolvers += "Artifact Keeper" at "https://registry.example.com/ivy/my-repo"
 ```
 
-**PyPI** (`pip.conf`):
+### JavaScript / TypeScript
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **npm** | `npm` | `/npm/{repo}` | npm, Yarn, pnpm, Bower |
+
+Aliases: `yarn`, `bower`, `pnpm` all route through the npm handler.
+
+**npm** (`.npmrc`):
+```
+registry=https://registry.example.com/npm/my-repo/
+//registry.example.com/npm/my-repo/:_authToken=${NPM_TOKEN}
+```
+
+### Python
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **PyPI** | `pypi` | `/pypi/{repo}` | pip, Poetry, pipenv, twine |
+| **Conda** | `conda_native` | `/conda/{repo}` | conda, mamba, micromamba |
+
+Aliases: `poetry`, `conda` also route through the PyPI handler for simple repository API.
+
+**pip** (`pip.conf`):
 ```ini
 [global]
-index-url = https://artifacts.example.com/pypi/my-repo/simple
+index-url = https://registry.example.com/pypi/my-repo/simple
 ```
+
+**Conda** (`.condarc`):
+```yaml
+channels:
+  - https://registry.example.com/conda/my-repo
+```
+
+### .NET
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **NuGet** | `nuget` | `/nuget/{repo}` | dotnet, NuGet CLI, Visual Studio |
+
+Aliases: `chocolatey`, `powershell` route through the NuGet handler.
+
+**NuGet** (`nuget.config`):
+```xml
+<packageSources>
+  <add key="artifact-keeper" value="https://registry.example.com/nuget/my-repo/v3/index.json" />
+</packageSources>
+```
+
+### Rust
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Cargo** | `cargo` | `/cargo/{repo}` | cargo |
 
 **Cargo** (`~/.cargo/config.toml`):
 ```toml
 [registries.artifact-keeper]
-index = "https://artifacts.example.com/cargo/my-repo/index"
+index = "sparse+https://registry.example.com/cargo/my-repo/index/"
 ```
 
-## Containers & Cloud Infrastructure
+### Go
 
-Container images and infrastructure-as-code packages.
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Go** | `go` | `/go/{repo}` | go mod |
 
-| Format | API Endpoint | Description |
-|--------|--------------|-------------|
-| **Docker/OCI** | `/v2/{repo}` | Docker images and OCI containers (fully OCI-compliant) |
-| **Helm** | `/helm/{repo}` | Kubernetes Helm charts |
-| **Terraform** | `/terraform/{repo}` | Terraform modules and providers |
-| **Vagrant** | `/vagrant/{repo}` | Vagrant boxes |
-
-### Example Usage
-
-**Docker**:
+**Go**:
 ```bash
-docker tag myimage:latest artifacts.example.com/docker/my-repo/myimage:latest
-docker push artifacts.example.com/docker/my-repo/myimage:latest
+GOPROXY=https://registry.example.com/go/my-repo,direct go mod download
 ```
 
-**Helm**:
-```bash
-helm repo add my-repo https://artifacts.example.com/helm/my-repo
-helm install myapp my-repo/mychart
+### Ruby
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **RubyGems** | `rubygems` | `/gems/{repo}` | gem, Bundler |
+
+**Bundler** (`Gemfile`):
+```ruby
+source "https://registry.example.com/gems/my-repo"
 ```
 
-**Terraform**:
-```hcl
-module "example" {
-  source = "artifacts.example.com/terraform/my-repo/example"
-  version = "1.0.0"
-}
-```
+### PHP
 
-## Machine Learning & AI
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Composer** | `composer` | `/composer/{repo}` | Composer |
 
-Specialized formats for ML/AI workflows.
-
-| Format | API Endpoint | Description |
-|--------|--------------|-------------|
-| **HuggingFace** | `/huggingface/{repo}` | ML models, datasets, and tokenizers |
-| **Conda** | `/conda/{repo}` | Python data science packages |
-
-### Example Usage
-
-**HuggingFace** (using `huggingface_hub`):
-```python
-from huggingface_hub import HfApi
-
-api = HfApi(endpoint="https://artifacts.example.com/huggingface/my-repo")
-api.upload_file(path_or_fileobj="model.bin", repo_id="my-model")
-```
-
-**Conda**:
-```bash
-conda config --add channels https://artifacts.example.com/conda/my-repo
-conda install mypackage
-```
-
-## System Packages
-
-Native operating system package formats.
-
-| Format | API Endpoint | Description |
-|--------|--------------|-------------|
-| **Debian/APT** | `/debian/{repo}` | Debian and Ubuntu .deb packages |
-| **RPM/YUM** | `/rpm/{repo}` | RedHat, CentOS, Fedora .rpm packages |
-| **Alpine/APK** | `/alpine/{repo}` | Alpine Linux .apk packages |
-| **Conan** | `/conan/{repo}` | C/C++ package manager |
-
-### Example Usage
-
-**Debian/APT** (`/etc/apt/sources.list.d/artifact-keeper.list`):
-```
-deb https://artifacts.example.com/debian/my-repo stable main
-```
-
-**RPM/YUM** (`/etc/yum.repos.d/artifact-keeper.repo`):
-```ini
-[artifact-keeper]
-name=Artifact Keeper Repository
-baseurl=https://artifacts.example.com/rpm/my-repo
-enabled=1
-gpgcheck=0
-```
-
-**Conan** (`~/.conan/remotes.json`):
+**Composer** (`composer.json`):
 ```json
 {
-  "remotes": [
-    {
-      "name": "artifact-keeper",
-      "url": "https://artifacts.example.com/conan/my-repo",
-      "verify_ssl": true
-    }
+  "repositories": [
+    { "type": "composer", "url": "https://registry.example.com/composer/my-repo" }
   ]
 }
 ```
 
-## Other Formats
+### Elixir / Erlang
 
-Additional specialized formats for various tools and ecosystems.
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Hex** | `hex` | `/hex/{repo}` | mix, rebar3 |
 
-| Format | API Endpoint | Description |
-|--------|--------------|-------------|
-| **Generic** | `/generic/{repo}` | Generic file storage for any artifact type |
-| **Git LFS** | `/lfs/{repo}` | Git Large File Storage objects |
-| **VS Code Extensions** | `/vscode/{repo}` | Visual Studio Code extensions (.vsix) |
-| **JetBrains Plugins** | `/jetbrains/{repo}` | IntelliJ IDEA and other JetBrains IDE plugins |
-| **CocoaPods** | `/cocoapods/{repo}` | iOS and macOS dependency manager |
-| **Swift** | `/swift/{repo}` | Swift Package Manager packages |
-| **Chef** | `/chef/{repo}` | Chef cookbooks and recipes |
-| **Puppet** | `/puppet/{repo}` | Puppet modules |
-
-### Example Usage
-
-**Generic** (upload any file):
+**Mix**:
 ```bash
-curl -X PUT \
-  -H "Authorization: Bearer $TOKEN" \
-  --data-binary @myfile.zip \
-  https://artifacts.example.com/generic/my-repo/myfile.zip
+HEX_MIRROR=https://registry.example.com/hex/my-repo mix deps.get
 ```
 
-**Git LFS** (`.lfsconfig`):
-```
-[lfs]
-url = https://artifacts.example.com/lfs/my-repo
+### Dart / Flutter
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Pub** | `pub` | `/pub/{repo}` | dart pub, flutter pub |
+
+**Dart**:
+```bash
+PUB_HOSTED_URL=https://registry.example.com/pub/my-repo dart pub get
 ```
 
-**CocoaPods** (`Podfile`):
+### Swift
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Swift** | `swift` | `/swift/{repo}` | Swift Package Manager |
+
+**Package.swift**:
+```swift
+dependencies: [
+    .package(url: "https://registry.example.com/swift/my-repo/scope/package", from: "1.0.0")
+]
+```
+
+### iOS / macOS
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **CocoaPods** | `cocoapods` | `/cocoapods/{repo}` | pod |
+
+**Podfile**:
 ```ruby
-source 'https://artifacts.example.com/cocoapods/my-repo'
-
+source 'https://registry.example.com/cocoapods/my-repo'
 pod 'MyFramework', '~> 1.0'
 ```
 
-## Format Support Status
+### R
 
-All formats listed above are fully supported and production-ready. Each format:
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **CRAN** | `cran` | `/cran/{repo}` | R, install.packages |
 
-- Works with native package managers and clients
-- Supports authentication via API tokens
-- Includes metadata indexing and search
-- Can be scanned for vulnerabilities (where applicable)
-- Has no storage or feature limitations
+**R**:
+```r
+install.packages("mypackage", repos = "https://registry.example.com/cran/my-repo")
+```
 
-## Feature Matrix
+---
 
-| Feature | All Formats |
-|---------|-------------|
-| Upload/Download | ✓ |
-| Versioning | ✓ |
-| Metadata Storage | ✓ |
-| Full-Text Search | ✓ |
-| Access Control (RBAC) | ✓ |
-| Vulnerability Scanning | ✓ (containers, language packages) |
-| Replication | ✓ |
-| Virtual Repositories | ✓ |
-| Retention Policies | ✓ |
-| Webhooks | ✓ |
+## Containers & OCI
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Docker / OCI** | `docker` | `/v2/{repo}` | Docker, Podman, Buildx, ORAS, Helm OCI, WASM OCI |
+
+Full OCI Distribution Spec implementation. Aliases: `oci`, `podman`, `buildx`, `oras`, `wasm_oci`, `helm_oci` all route through the unified OCI handler.
+
+**Docker**:
+```bash
+docker login registry.example.com
+docker push registry.example.com/my-repo/myimage:latest
+```
+
+**Podman**:
+```bash
+podman push registry.example.com/my-repo/myimage:latest
+```
+
+**ORAS** (generic OCI artifacts):
+```bash
+oras push registry.example.com/my-repo/myartifact:v1 ./artifact.tar.gz
+```
+
+---
+
+## Infrastructure & DevOps
+
+### Kubernetes
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Helm** | `helm` | `/helm/{repo}` | helm |
+
+**Helm**:
+```bash
+helm repo add my-repo https://registry.example.com/helm/my-repo
+helm install myapp my-repo/mychart
+```
+
+### Infrastructure as Code
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Terraform** | `terraform` | `/terraform/{repo}` | terraform, tofu |
+| **Vagrant** | `vagrant` | `/vagrant/{repo}` | vagrant |
+
+Alias: `opentofu` routes through the Terraform handler.
+
+**Terraform**:
+```hcl
+module "example" {
+  source  = "registry.example.com/terraform/my-repo/example"
+  version = "1.0.0"
+}
+```
+
+### Configuration Management
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Chef** | `chef` | `/chef/{repo}` | knife, Berkshelf |
+| **Puppet** | `puppet` | `/puppet/{repo}` | puppet module |
+| **Ansible** | `ansible` | `/ansible/{repo}` | ansible-galaxy |
+
+**Ansible Galaxy**:
+```bash
+ansible-galaxy collection install my_namespace.my_collection \
+  -s https://registry.example.com/ansible/my-repo
+```
+
+**Puppet**:
+```bash
+puppet module install author-module \
+  --module_repository https://registry.example.com/puppet/my-repo
+```
+
+**Chef**:
+```bash
+knife cookbook upload mybook \
+  --supermarket-site https://registry.example.com/chef/my-repo
+```
+
+---
+
+## System Packages
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Debian / APT** | `debian` | `/debian/{repo}` | apt, dpkg |
+| **RPM / YUM** | `rpm` | `/rpm/{repo}` | yum, dnf, zypper |
+| **Alpine / APK** | `alpine` | `/alpine/{repo}` | apk |
+| **OPKG** | `opkg` | `/opkg/{repo}` | opkg (OpenWrt) |
+
+**Debian** (`/etc/apt/sources.list.d/artifact-keeper.list`):
+```
+deb https://registry.example.com/debian/my-repo stable main
+```
+
+**RPM** (`/etc/yum.repos.d/artifact-keeper.repo`):
+```ini
+[artifact-keeper]
+name=Artifact Keeper
+baseurl=https://registry.example.com/rpm/my-repo
+enabled=1
+gpgcheck=1
+```
+
+**Alpine** (`/etc/apk/repositories`):
+```
+https://registry.example.com/alpine/my-repo/v3.19/main
+```
+
+**OPKG** (`/etc/opkg/customfeeds.conf`):
+```
+src/gz artifact-keeper https://registry.example.com/opkg/my-repo
+```
+
+:::note[Package signing]
+Debian, RPM, Alpine, and Conda repositories support GPG/RSA signing for repository metadata. See [Artifact Signing](/docs/security/signing/) for setup.
+:::
+
+---
+
+## C / C++
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Conan** | `conan` | `/conan/{repo}` | conan (v2) |
+| **Bazel** | `bazel` | `/bazel/{repo}` | bazel, bazelisk |
+
+**Conan** (`conan remote`):
+```bash
+conan remote add artifact-keeper https://registry.example.com/conan/my-repo
+```
+
+**Bazel** (`MODULE.bazel`):
+```starlark
+bazel_dep(name = "my_module", version = "1.0.0")
+```
+
+---
+
+## ML / AI
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **HuggingFace** | `huggingface` | `/huggingface/{repo}` | huggingface_hub, transformers |
+| **ML Model** | `mlmodel` | `/mlmodel/{repo}` | Generic model storage |
+
+**HuggingFace**:
+```python
+from huggingface_hub import HfApi
+
+api = HfApi(endpoint="https://registry.example.com/huggingface/my-repo")
+api.upload_file(path_or_fileobj="model.bin", repo_id="my-model")
+```
+
+---
+
+## Editor Extensions
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **VS Code** | `vscode` | `/vscode/{repo}` | VS Code, Cursor, Windsurf, Kiro |
+| **JetBrains** | `jetbrains` | `/jetbrains/{repo}` | IntelliJ, PyCharm, WebStorm, etc. |
+
+Aliases: `cursor`, `windsurf`, `kiro` route through the VS Code handler.
+
+---
+
+## Version Control
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Git LFS** | `gitlfs` | `/lfs/{repo}` | git lfs |
+
+**Git LFS** (`.lfsconfig`):
+```ini
+[lfs]
+url = https://registry.example.com/lfs/my-repo
+```
+
+---
+
+## Eclipse
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **P2** | `p2` | `/p2/{repo}` | Eclipse IDE |
+
+---
+
+## Generic
+
+| Format | Key | API Endpoint | Native Clients |
+|--------|-----|--------------|----------------|
+| **Generic** | `generic` | `/generic/{repo}` | curl, wget, any HTTP client |
+
+Store any file type with custom metadata. Useful for build outputs, documentation bundles, or proprietary formats.
+
+```bash
+# Upload
+curl -X PUT \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @myfile.zip \
+  https://registry.example.com/generic/my-repo/path/to/myfile.zip
+
+# Download
+curl -O https://registry.example.com/generic/my-repo/path/to/myfile.zip
+```
+
+---
+
+## Format Feature Matrix
+
+Every format supports the full Artifact Keeper feature set:
+
+| Feature | Status |
+|---------|--------|
+| Upload / Download | All formats |
+| Versioning | All formats |
+| Metadata Indexing | All formats |
+| Full-Text Search | All formats (via Meilisearch) |
+| Access Control (RBAC) | All formats |
+| Vulnerability Scanning | Language packages, containers, archives |
+| Repository Metadata Signing | Debian, RPM, Alpine, Conda |
+| Replication to Edge Nodes | All formats |
+| Virtual Repositories | All formats |
+| Webhooks | All formats |
+
+## Quick Reference: All Format Keys
+
+For use in API calls and configuration:
+
+```
+alpine, ansible, bazel, cargo, chef, cocoapods, composer, conan,
+conda_native, cran, debian, docker, generic, gitlfs, go, helm,
+hex, huggingface, jetbrains, maven, mlmodel, npm, nuget, oci,
+opkg, p2, pub, puppet, rpm, rubygems, sbt, swift, terraform,
+vagrant, vscode
+```
+
+**Aliases** (automatically resolved):
+```
+bower → npm        buildx → docker      chocolatey → nuget
+conda → pypi       cursor → vscode      helm_oci → docker
+kiro → vscode      opentofu → terraform  oras → docker
+pnpm → npm         podman → docker       poetry → pypi
+powershell → nuget  wasm_oci → docker    windsurf → vscode
+yarn → npm
+```
 
 ## Adding Custom Formats
 
-While Artifact Keeper supports 30+ formats out of the box, you can extend it with custom formats using:
+Artifact Keeper can be extended with custom format handlers using the WASM plugin system:
 
-- **Generic repositories**: Store any file type with custom metadata
-- **WASM plugins**: Implement custom repository protocols
-- **REST API**: Build custom upload/download workflows
+1. Write a handler in any language that compiles to WASM (Rust, Go, C, AssemblyScript)
+2. Implement the `FormatHandler` WIT interface (`parse_metadata`, `validate`, `generate_index`)
+3. Install via Git URL, ZIP upload, or local path
 
-See the Plugins documentation for details on extending format support.
-
-## Migration Support
-
-All package formats can be migrated from Artifactory using the built-in migration API. See [Migrate from Artifactory](/docs/migration/from-artifactory/) for details.
+See [WASM Plugins](/docs/advanced/plugins/) for details.
 
 ## Next Steps
 
-- [Quickstart Guide](/getting-started/quickstart) - Create your first repository
-- [Configuration Reference](/getting-started/configuration) - Configure repository settings
-- [Migration Guide](/docs/migration/from-artifactory/) - Migrate existing artifacts
+- [Quickstart Guide](/docs/getting-started/quickstart/) — Create your first repository
+- [Architecture](/docs/getting-started/architecture/) — How the backend handles each format
+- [Migrate from Artifactory](/docs/migration/from-artifactory/) — Import existing artifacts
