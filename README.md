@@ -1,39 +1,248 @@
 # Artifact Keeper
 
-[![CI](https://github.com/YOUR_USERNAME/artifact-keeper/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/artifact-keeper/actions/workflows/ci.yml)
-[![Docker Publish](https://github.com/YOUR_USERNAME/artifact-keeper/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/YOUR_USERNAME/artifact-keeper/actions/workflows/docker-publish.yml)
+[![CI](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml/badge.svg)](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io/artifact-keeper/artifact-keeper-backend)
 
-An enterprise-grade artifact registry supporting 11+ package formats, built with Rust and React.
+An enterprise-grade, open-source artifact registry supporting **45+ package formats**. Built with Rust and React.
 
-## Features
+[Documentation](https://artifactkeeper.com/docs/) | [Demo](https://demo.artifactkeeper.com) | [Website](https://artifactkeeper.com)
 
-- **Multi-Format Support** - Maven, PyPI, NPM, Docker, Helm, RPM, Debian, Go, NuGet, Cargo, Generic
-- **Repository Types** - Local, Remote (proxy), and Virtual (aggregation)
-- **Authentication** - JWT-based auth with role-based access control
-- **Modern UI** - React TypeScript frontend with Ant Design
-- **API-First** - Complete REST API with OpenAPI documentation
-- **Containerized** - Docker and Docker Compose support
+## Highlights
+
+- **45+ Package Formats** - Native protocol support for Maven, PyPI, NPM, Docker/OCI, Cargo, Go, Helm, and 38 more
+- **WASM Plugin System** - Extend with custom format handlers via WebAssembly (WIT-based, Wasmtime runtime)
+- **Security Scanning** - Automated vulnerability detection with Trivy and Grype, policy engine, quarantine workflow
+- **Borg Replication** - Mesh edge sync with swarm-based artifact distribution and P2P transfers
+- **Full-Text Search** - Meilisearch-powered search across all repositories and artifacts
+- **Multi-Auth** - JWT, OpenID Connect, LDAP, SAML 2.0, and API token support
+- **Artifactory Migration** - Built-in tooling to migrate repositories, artifacts, and permissions from JFrog Artifactory
+- **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, and Conda handlers
+
+## System Architecture
+
+```mermaid
+graph LR
+    Client["Browser / CLI / Package Manager"]
+    Frontend["Frontend\nReact 19 · Ant Design 6\nTanStack Query 5"]
+    Backend["Backend\nRust · Axum\n45+ format handlers"]
+    DB[(PostgreSQL 16)]
+    Storage["Storage\nFilesystem / S3"]
+    Meili["Meilisearch\nFull-text search"]
+    Trivy["Trivy\nContainer & FS scanning"]
+    Grype["Grype\nDependency scanning"]
+    Edge1["Edge Node"]
+    Edge2["Edge Node"]
+
+    Client --> Frontend
+    Client --> Backend
+    Frontend --> Backend
+    Backend --> DB
+    Backend --> Storage
+    Backend --> Meili
+    Backend --> Trivy
+    Backend --> Grype
+    Backend <-->|Borg Replication| Edge1
+    Backend <-->|Borg Replication| Edge2
+    Edge1 <-->|P2P Mesh| Edge2
+```
+
+## Backend Architecture
+
+The backend follows a layered architecture with a middleware pipeline processing every request.
+
+```mermaid
+flowchart TD
+    REQ["HTTP Request"] --> MW["Middleware Pipeline"]
+
+    subgraph MW["Middleware"]
+        direction LR
+        CORS["CORS"] --> AUTH["Auth\nJWT · OIDC · LDAP\nSAML · API Key"]
+        AUTH --> RL["Rate Limiter"]
+        RL --> TRACE["Tracing\n+ Metrics"]
+        TRACE --> DEMO["Demo Mode\nGuard"]
+    end
+
+    MW --> ROUTER["Router\n50+ route groups"]
+
+    subgraph HANDLERS["Handler Layer"]
+        FMT["Format Handlers\nMaven · PyPI · NPM\nDocker · 41 more"]
+        CORE["Core Handlers\nRepos · Artifacts\nUsers · Auth"]
+        ADV["Advanced Handlers\nSecurity · Plugins\nEdge · Migration"]
+    end
+
+    ROUTER --> HANDLERS
+
+    subgraph SERVICES["Service Layer"]
+        direction LR
+        ART["Artifact\nService"]
+        REPO["Repository\nService"]
+        SCAN["Scanner\nService"]
+        PLUG["Plugin\nService"]
+        SEARCH["Search\nService"]
+    end
+
+    HANDLERS --> SERVICES
+
+    subgraph DATA["Data Layer"]
+        direction LR
+        PG[(PostgreSQL)]
+        FS["Storage\nFS / S3"]
+        MS["Meilisearch"]
+        SC["Trivy / Grype"]
+    end
+
+    SERVICES --> DATA
+```
+
+## Supported Package Formats
+
+45+ formats organized by ecosystem. Each has a native protocol handler that speaks the package manager's wire protocol.
+
+### Languages & Runtimes
+
+| Format | Aliases | Ecosystem |
+|--------|---------|-----------|
+| **Maven** | Gradle | Java, Kotlin, Scala |
+| **NPM** | Yarn, Bower, pnpm | JavaScript, TypeScript |
+| **PyPI** | Poetry, Conda | Python |
+| **NuGet** | Chocolatey, PowerShell | .NET, C# |
+| **Cargo** | | Rust |
+| **Go** | | Go modules |
+| **RubyGems** | | Ruby |
+| **Hex** | | Elixir, Erlang |
+| **Composer** | | PHP |
+| **Pub** | | Dart, Flutter |
+| **CocoaPods** | | iOS, macOS |
+| **Swift** | | Swift Package Manager |
+| **CRAN** | | R |
+| **SBT** | Ivy | Scala, Java |
+
+### Containers & Infrastructure
+
+| Format | Aliases | Ecosystem |
+|--------|---------|-----------|
+| **Docker / OCI** | Podman, Buildx, ORAS, WASM OCI, Helm OCI | Container images |
+| **Helm** | | Kubernetes charts |
+| **Terraform** | OpenTofu | Infrastructure modules |
+| **Vagrant** | | VM boxes |
+
+### System Packages
+
+| Format | Ecosystem |
+|--------|-----------|
+| **RPM** | RHEL, Fedora, CentOS |
+| **Debian** | Ubuntu, Debian |
+| **Alpine** | Alpine Linux (APK) |
+| **Conda** | Conda channels |
+| **OPKG** | OpenWrt, embedded Linux |
+
+### Configuration Management
+
+| Format | Ecosystem |
+|--------|-----------|
+| **Chef** | Chef Supermarket |
+| **Puppet** | Puppet Forge |
+| **Ansible** | Ansible Galaxy |
+
+### ML / AI
+
+| Format | Ecosystem |
+|--------|-----------|
+| **HuggingFace** | Models, datasets |
+| **ML Model** | Generic ML artifacts |
+
+### Editor Extensions
+
+| Format | Aliases | Ecosystem |
+|--------|---------|-----------|
+| **VS Code** | Cursor, Windsurf, Kiro | Extension marketplace |
+| **JetBrains** | | Plugin repository |
+
+### Other
+
+| Format | Ecosystem |
+|--------|-----------|
+| **Conan** | C, C++ |
+| **Git LFS** | Large file storage |
+| **Bazel** | Bazel modules |
+| **P2** | Eclipse plugins |
+| **Generic** | Any file type |
+
+> Custom formats can be added via the [WASM plugin system](#wasm-plugin-system).
+
+## Security Scanning Pipeline
+
+Every artifact upload is automatically scanned for known vulnerabilities.
+
+```mermaid
+flowchart LR
+    UP["Artifact\nUpload"] --> HASH{"SHA-256\nDedup"}
+    HASH -->|New artifact| T["Trivy\nFS Scanner"]
+    HASH -->|New artifact| G["Grype\nDependency Scanner"]
+    HASH -->|Already scanned| CACHE["Cached\nResults"]
+    T --> SCORE["Vulnerability\nScore (A-F)"]
+    G --> SCORE
+    CACHE --> SCORE
+    SCORE --> POL{"Policy\nEngine"}
+    POL -->|Pass| OK["Stored"]
+    POL -->|Fail| Q["Quarantined"]
+```
+
+- **Dual scanner** - Trivy for filesystem/container analysis, Grype for dependency trees
+- **Scoring** - A through F grades based on finding severity and count
+- **Policies** - Configurable rules that block or quarantine artifacts
+- **Signing** - GPG/RSA signing for Debian, RPM, Alpine, and Conda packages
+
+## Borg Replication
+
+Distributed artifact caching with a hub-and-spoke topology that supports peer-to-peer transfers.
+
+```mermaid
+graph TD
+    HUB["Hub Node\n(Primary Registry)"]
+    E1["Edge Node\nUS-West"]
+    E2["Edge Node\nEU-Central"]
+    E3["Edge Node\nAP-Southeast"]
+
+    HUB <-->|"Chunked Transfer\n+ Scheduling"| E1
+    HUB <-->|"Chunked Transfer\n+ Scheduling"| E2
+    HUB <-->|"Chunked Transfer\n+ Scheduling"| E3
+    E1 <-->|"P2P Mesh"| E2
+    E2 <-->|"P2P Mesh"| E3
+    E1 <-->|"P2P Mesh"| E3
+```
+
+- **Swarm-based distribution** - Artifacts replicate across the mesh based on demand
+- **Chunked transfers** - Large artifacts split for reliable delivery over unstable links
+- **Cache management** - TTL and LRU eviction per edge node
+- **Network-aware scheduling** - Bandwidth and latency profiling for optimal routing
+
+## WASM Plugin System
+
+Extend Artifact Keeper with custom format handlers compiled to WebAssembly.
+
+- **WIT-based interface** - Plugins implement a well-defined `FormatHandler` contract
+- **Wasmtime runtime** - Sandboxed execution with fuel-based CPU limits and memory caps
+- **Hot reload** - Install, enable, disable, and reload plugins without restart
+- **Sources** - Load from Git repositories, ZIP uploads, or local paths
 
 ## Quick Start
 
-### Using Docker Compose
+### Docker Compose
 
 ```bash
-# Clone the repository
-git clone https://github.com/YOUR_USERNAME/artifact-keeper.git
+git clone https://github.com/artifact-keeper/artifact-keeper.git
 cd artifact-keeper
-
-# Start all services
 docker compose up -d
-
-# Access the UI
-open http://localhost:3000
 ```
+
+The UI is available at [http://localhost:30173](http://localhost:30173) and the API at [http://localhost:30080](http://localhost:30080).
 
 Default credentials: `admin` / `admin`
 
-### Manual Installation
+### Manual Build
 
 ```bash
 # Backend
@@ -46,147 +255,83 @@ npm install
 npm run dev
 ```
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Artifact Keeper                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐       │
-│   │   Frontend  │────▶│   Backend   │────▶│  PostgreSQL │       │
-│   │   (React)   │     │   (Rust)    │     │             │       │
-│   └─────────────┘     └──────┬──────┘     └─────────────┘       │
-│                              │                                   │
-│                              ▼                                   │
-│                       ┌─────────────┐                            │
-│                       │   Storage   │                            │
-│                       │ (S3/Local)  │                            │
-│                       └─────────────┘                            │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## Supported Package Formats
-
-| Format | Type | Description |
-|--------|------|-------------|
-| Maven | Java | Java/Kotlin/Scala packages |
-| PyPI | Python | Python packages |
-| NPM | Node.js | JavaScript/TypeScript packages |
-| Docker | Containers | OCI container images |
-| Helm | Kubernetes | Helm charts |
-| RPM | Red Hat | RPM packages |
-| Debian | Ubuntu/Debian | DEB packages |
-| Go | Go | Go modules |
-| NuGet | .NET | .NET packages |
-| Cargo | Rust | Rust crates |
-| Generic | Any | Any file type |
-
-## CI/CD Pipeline
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        GitHub Actions                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐    │
-│   │   Lint   │──▶│   Test   │──▶│  Build   │──▶│   E2E    │    │
-│   │          │   │          │   │          │   │  Tests   │    │
-│   └──────────┘   └──────────┘   └──────────┘   └──────────┘    │
-│                                                      │          │
-│                                                      ▼          │
-│   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐    │
-│   │ Security │   │  Docker  │   │ Release  │   │ Publish  │    │
-│   │  Audit   │   │  Build   │   │          │   │          │    │
-│   └──────────┘   └──────────┘   └──────────┘   └──────────┘    │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Workflows
-
-| Workflow | Trigger | Description |
-|----------|---------|-------------|
-| `ci.yml` | Push/PR | Lint, test, build, E2E tests |
-| `docker-publish.yml` | Push to main/tags | Build and push Docker images |
-| `release.yml` | Version tags | Create GitHub releases |
-| `scheduled-tests.yml` | Daily | Nightly E2E and security scans |
-
-## Testing
-
-### Local Testing
-
-```bash
-# Backend tests
-cargo test --workspace
-
-# Frontend unit tests
-cd frontend && npm run test:run
-
-# E2E tests (Docker)
-./scripts/run-e2e-tests.sh
-```
-
-### Test Coverage
-
-| Type | Framework | Location |
-|------|-----------|----------|
-| Backend Unit | Cargo | `backend/src/**/*.rs` |
-| Backend Integration | Cargo | `backend/tests/` |
-| Frontend Unit | Vitest | `frontend/src/**/*.test.ts` |
-| Frontend Component | RTL | `frontend/src/**/*.test.tsx` |
-| E2E | Playwright | `frontend/e2e/` |
-
-See [TESTING.md](TESTING.md) for detailed testing documentation.
-
-## API Documentation
-
-- **OpenAPI Spec**: `specs/001-artifact-registry/contracts/openapi.yaml`
-- **Swagger UI**: Available at `/api/docs` when running
+Requires Rust 1.75+, Node.js 20+, and PostgreSQL 16+.
 
 ## Configuration
 
-### Environment Variables
+Key environment variables (see [full reference](https://artifactkeeper.com/docs/reference/environment/)):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | Required |
-| `JWT_SECRET` | Secret for JWT tokens | Required |
-| `STORAGE_PATH` | Local storage path | `/data/storage` |
+| `DATABASE_URL` | PostgreSQL connection string | **Required** |
+| `JWT_SECRET` | Secret for signing JWT tokens | **Required** |
+| `STORAGE_BACKEND` | `filesystem` or `s3` | `filesystem` |
+| `STORAGE_PATH` | Local storage directory | `/var/lib/artifact-keeper/artifacts` |
 | `S3_BUCKET` | S3 bucket name | - |
-| `S3_ENDPOINT` | S3 endpoint URL | - |
-| `RUST_LOG` | Log level | `info` |
+| `S3_ENDPOINT` | S3-compatible endpoint URL | - |
+| `TRIVY_URL` | Trivy server for security scanning | - |
+| `MEILISEARCH_URL` | Meilisearch for full-text search | - |
+| `DEMO_MODE` | Block all write operations | `false` |
 
-### Docker Compose Files
+## Testing
 
-| File | Purpose |
-|------|---------|
-| `docker-compose.yml` | Production deployment |
-| `docker-compose.test.yml` | Automated E2E testing |
-| `deploy/docker/docker-compose.yml` | Full stack with MinIO |
+Three-tier testing strategy:
 
-## Development
+| Tier | Trigger | What runs |
+|------|---------|-----------|
+| **1** | Every push/PR | `cargo fmt`, `cargo clippy`, `cargo test --lib`, frontend lint + Vitest |
+| **2** | Main branch | Integration tests with PostgreSQL |
+| **3** | Release/manual | Full E2E with Playwright, native client tests for 10 formats, stress + failure injection |
 
-### Prerequisites
+```bash
+# Tier 1 - Fast checks
+cargo test --workspace --lib
+cd frontend && npm run test:run
 
-- Rust 1.75+
-- Node.js 20+
-- PostgreSQL 16+
-- Docker (optional)
+# Tier 3 - Full E2E
+./scripts/run-e2e-tests.sh --profile all
+```
 
-### Project Structure
+## Project Structure
 
 ```
 artifact-keeper/
-├── backend/           # Rust backend
-├── frontend/          # React frontend
-├── edge/              # Edge node service
-├── specs/             # OpenAPI specifications
-├── scripts/           # Utility scripts
-├── deploy/            # Deployment configs
-└── .github/           # CI/CD workflows
+├── backend/          # Rust backend (Axum, SQLx, 429 unit tests)
+│   ├── src/
+│   │   ├── api/      # Handlers, middleware, routes
+│   │   ├── formats/  # 45+ format handler implementations
+│   │   ├── services/ # Business logic (35+ services)
+│   │   ├── models/   # Data models (18 types)
+│   │   └── storage/  # FS and S3 backends
+│   └── migrations/   # 33 PostgreSQL migrations
+├── frontend/         # React 19 + TypeScript + Ant Design 6
+│   ├── src/
+│   │   ├── pages/    # 29 page components
+│   │   ├── components/
+│   │   ├── api/      # API client modules
+│   │   └── contexts/ # Auth, Theme
+│   └── e2e/          # Playwright E2E tests
+├── edge/             # Edge node service (Rust)
+├── site/             # Documentation site (Astro + Starlight)
+├── specs/            # Feature specifications
+├── scripts/          # Test runners, native client tests, stress tests
+├── deploy/           # Docker, Kubernetes, demo configs
+└── .github/          # CI/CD workflows
 ```
+
+## Technology Choices
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Backend language | **Rust** | Memory safety, performance, strong type system |
+| Web framework | **Axum** | Tower middleware ecosystem, async-first |
+| Database | **PostgreSQL 16** | JSONB for metadata, mature ecosystem |
+| Frontend | **React 19 + TypeScript** | Component model, type safety |
+| UI library | **Ant Design 6** | Enterprise-grade components out of the box |
+| Search | **Meilisearch** | Fast full-text search, easy to operate |
+| Security scanning | **Trivy + Grype** | Complementary coverage, industry standard |
+| Plugin runtime | **Wasmtime** | Sandboxed, portable, WIT contract system |
+| Storage | **Filesystem / S3** | Simple default, cloud-ready upgrade path |
 
 ## Contributing
 
@@ -202,4 +347,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-Built with ❤️ using Rust, React, and TypeScript
+Built with Rust and TypeScript. "JFrog" and "Artifactory" are trademarks of JFrog Ltd. Artifact Keeper is not affiliated with or endorsed by JFrog.
