@@ -1,6 +1,10 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  content: ['./src/**/*.{astro,html,js,ts}'],
+  content: [
+    './src/pages/index.astro',
+    './src/components/landing/**/*.astro',
+    './src/layouts/LandingLayout.astro',
+  ],
   theme: {
     extend: {
       colors: {

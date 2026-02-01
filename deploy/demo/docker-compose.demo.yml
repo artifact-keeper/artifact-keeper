@@ -70,13 +70,6 @@ services:
         echo 'Demo data seeded successfully'
       "
 
-  # Landing page (static marketing site)
-  landing:
-    build:
-      context: ../..
-      dockerfile: landing/Dockerfile
-    ports:
-      - "80:80"
 
 volumes:
   postgres_data:
