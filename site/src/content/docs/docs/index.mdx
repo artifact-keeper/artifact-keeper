@@ -1,6 +1,6 @@
 ---
 title: "Welcome to Artifact Keeper"
-description: "Open-source artifact registry supporting 30+ package formats. A free, MIT-licensed alternative to Artifactory."
+description: "Open-source artifact registry supporting 45+ package formats. A free, MIT-licensed alternative to Artifactory."
 ---
 
 # Welcome to Artifact Keeper
@@ -10,31 +10,33 @@ Artifact Keeper is an open-source artifact registry built to be a powerful, cost
 ## Why Artifact Keeper?
 
 - **Free and Open Source**: MIT licensed, no hidden costs or feature gates
-- **30+ Package Formats**: Support for Maven, npm, Docker, PyPI, NuGet, Cargo, and 25+ more formats
-- **Built for Scale**: Handles 50,000+ artifacts with efficient storage and caching
+- **45+ Package Formats**: Native protocol support for Maven, npm, Docker, PyPI, NuGet, Cargo, Helm, and 38+ more
+- **Built for Scale**: Handles 50,000+ artifacts with efficient content-addressed storage
 - **Modern Architecture**: Rust backend for performance, React frontend for usability
-- **Security First**: Integrated vulnerability scanning with Trivy
-- **Extensible**: WASM plugin system for custom workflows
-- **Edge Nodes**: Distributed caching for global teams
+- **Security First**: Dual vulnerability scanning with Trivy and Grype, policy engine, artifact signing
+- **Extensible**: WASM plugin system for custom format handlers
+- **Edge Nodes**: Distributed caching with P2P mesh replication for global teams
 - **Migration Tooling**: Built-in migration from Artifactory
 
 ## Key Features
 
-- **Multi-Format Support**: Single registry for all your package types - languages, containers, cloud infrastructure, ML models, and system packages
-- **Security Scanning**: Automatic vulnerability detection with Trivy integration
-- **Advanced Search**: Fast, full-text search powered by MeiliSearch
-- **RBAC & Auth**: Fine-grained permissions with OIDC and LDAP support
-- **Edge Nodes**: Deploy caching nodes closer to your teams worldwide
-- **WASM Plugins**: Extend functionality with custom plugins written in any WASM-compatible language
+- **Multi-Format Support**: Single registry for all your package types — languages, containers, cloud infrastructure, ML models, and system packages
+- **Security Scanning**: Automatic vulnerability detection with Trivy and Grype, A-F scoring, quarantine policies
+- **Advanced Search**: Fast, full-text search powered by Meilisearch
+- **Multi-Auth**: JWT, OIDC, LDAP, SAML 2.0, and API tokens with fine-grained RBAC
+- **Edge Nodes**: Deploy caching nodes closer to your teams with Borg Replication
+- **WASM Plugins**: Extend with custom format handlers written in any WASM-compatible language
+- **Artifact Signing**: GPG and RSA signing for Debian, RPM, Alpine, and Conda packages
 - **Migration API**: Seamless migration from Artifactory with zero downtime
-- **Modern UI**: Clean, intuitive interface built with React and Ant Design
+- **Modern UI**: Clean, intuitive interface built with React 19 and Ant Design 6
 
 ## Quick Links
 
-- [Quickstart Guide](/getting-started/quickstart) - Get up and running in 5 minutes
-- [Package Formats](/package-formats) - See all 30+ supported formats
-- [Migrate from Artifactory](/migration/from-artifactory) - Switch and save thousands per year
-- [Configuration Reference](/getting-started/configuration) - Complete environment variable guide
+- [Architecture](/docs/getting-started/architecture/) - How the system is built and why
+- [Quickstart Guide](/docs/getting-started/quickstart/) - Get up and running in 5 minutes
+- [Package Formats](/docs/package-formats/) - See all 45+ supported formats
+- [Migrate from Artifactory](/docs/migration/from-artifactory/) - Switch and save thousands per year
+- [Configuration Reference](/docs/getting-started/configuration/) - Complete environment variable guide
 
 ## License
 
@@ -43,6 +45,7 @@ Artifact Keeper is released under the MIT License. Use it freely in your project
 ## Technology Stack
 
 - **Backend**: Rust 1.75+ with Axum, SQLx, and Tokio
-- **Frontend**: React 19.x with TypeScript, Ant Design 6.x, and TanStack Query
-- **Storage**: PostgreSQL 15+ for metadata, filesystem or S3 for artifacts
-- **Optional**: Trivy for scanning, MeiliSearch for search, MinIO for S3-compatible storage
+- **Frontend**: React 19 with TypeScript 5.3, Ant Design 6, and TanStack Query 5
+- **Database**: PostgreSQL 16 with compile-time checked queries
+- **Storage**: Filesystem or S3 for artifacts (content-addressed by SHA-256)
+- **Optional**: Trivy + Grype for scanning, Meilisearch for search, MinIO for S3-compatible storage

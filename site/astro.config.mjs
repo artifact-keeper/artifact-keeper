@@ -1,5 +1,6 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import starlightClientMermaid from '@pasqal-io/starlight-client-mermaid';
 import tailwind from '@astrojs/tailwind';
 
 export default defineConfig({
@@ -8,13 +9,14 @@ export default defineConfig({
     starlight({
       title: 'Artifact Keeper',
       description: 'The open-source artifact registry. Documentation, guides, and API reference.',
+      plugins: [starlightClientMermaid()],
       logo: {
         light: './src/assets/logo-light.svg',
         dark: './src/assets/logo-dark.svg',
         replacesTitle: false,
       },
       social: {
-        github: 'https://github.com/brandonrc/artifact-keeper',
+        github: 'https://github.com/artifact-keeper/artifact-keeper',
       },
       customCss: ['./src/styles/custom.css'],
       disable404Route: true,
@@ -23,6 +25,7 @@ export default defineConfig({
           label: 'Getting Started',
           items: [
             { label: 'Welcome', slug: 'docs' },
+            { label: 'Architecture', slug: 'docs/getting-started/architecture' },
             { label: 'Quickstart', slug: 'docs/getting-started/quickstart' },
             { label: 'Installation', slug: 'docs/getting-started/installation' },
             { label: 'Configuration', slug: 'docs/getting-started/configuration' },

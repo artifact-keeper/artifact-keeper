@@ -9,11 +9,12 @@
     "preview": "astro preview"
   },
   "dependencies": {
-    "astro": "^5.1.5",
+    "@astrojs/sitemap": "^3.2.0",
     "@astrojs/starlight": "^0.32.0",
     "@astrojs/tailwind": "^6.0.0",
-    "@astrojs/sitemap": "^3.2.0",
-    "tailwindcss": "^3.4.0",
-    "sharp": "^0.33.0"
+    "@pasqal-io/starlight-client-mermaid": "^0.1.0",
+    "astro": "^5.1.5",
+    "sharp": "^0.33.0",
+    "tailwindcss": "^3.4.0"
   }
 }
