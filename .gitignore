@@ -74,6 +74,13 @@ credentials/
 .claude/
 ARTIFACTORY_UI_UX_DEEP_DIVE.md
 
+# Agent tooling (internal, not for public repo)
+.beads/
+.specify/
+AGENTS.md
+CLAUDE.md
+.gitattributes
+
 # Test asset generation output (generated packages)
 .assets/generated/
 
