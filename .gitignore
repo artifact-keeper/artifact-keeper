@@ -55,6 +55,7 @@ playwright/.cache/
 
 # Local artifact storage (test data)
 backend/data/
+data/repositories/
 
 # Secrets (never commit these)
 *.pem
