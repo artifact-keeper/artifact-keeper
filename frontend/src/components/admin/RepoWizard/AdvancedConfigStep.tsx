@@ -94,11 +94,11 @@ export const AdvancedConfigStep: React.FC<AdvancedConfigStepProps> = ({
                     style={{ width: '100%' }}
                     placeholder="Enter quota in bytes"
                     min={1048576}
-                    formatter={(value) =>
-                      value ? `${Math.round(Number(value) / 1073741824 * 100) / 100} GB` : ''
+                    formatter={((value: string | undefined) =>
+                      value ? `${Math.round(Number(value) / 1073741824 * 100) / 100} GB` : '') as never
                     }
-                    parser={(value) =>
-                      value ? Number(value?.replace(/[^\d.]/g, '')) * 1073741824 : 0
+                    parser={((value: string | undefined) =>
+                      value ? Number(value?.replace(/[^\d.]/g, '')) * 1073741824 : 0) as never
                     }
                   />
                 </Form.Item>

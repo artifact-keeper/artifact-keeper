@@ -1,27 +1,9 @@
 import apiClient from './client';
 import type { PaginatedResponse } from '../types';
 
-export interface Group {
-  id: string;
-  name: string;
-  description?: string;
-  created_at: string;
-  updated_at: string;
-  member_count?: number;
-}
-
-export interface CreateGroupRequest {
-  name: string;
-  description?: string;
-}
-
-export interface GroupMember {
-  user_id: string;
-  username: string;
-  email: string;
-  display_name?: string;
-  joined_at: string;
-}
+// Re-export types from the canonical types/ module
+export type { Group, GroupMember, CreateGroupRequest } from '../types/groups';
+import type { Group, CreateGroupRequest } from '../types/groups';
 
 export interface ListGroupsParams {
   page?: number;

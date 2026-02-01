@@ -32,7 +32,7 @@ export interface PackageListProps {
   onSort?: (field: string, order: 'ascend' | 'descend' | null) => void;
 }
 
-const packageTypeLabels: Record<PackageType, string> = {
+const packageTypeLabels: Partial<Record<PackageType, string>> = {
   maven: 'Maven',
   gradle: 'Gradle',
   npm: 'npm',
@@ -47,6 +47,41 @@ const packageTypeLabels: Record<PackageType, string> = {
   conan: 'Conan',
   cargo: 'Cargo',
   generic: 'Generic',
+  podman: 'Podman',
+  buildx: 'Buildx',
+  oras: 'ORAS',
+  wasm_oci: 'WASM OCI',
+  helm_oci: 'Helm OCI',
+  poetry: 'Poetry',
+  conda: 'Conda',
+  yarn: 'Yarn',
+  bower: 'Bower',
+  pnpm: 'pnpm',
+  chocolatey: 'Chocolatey',
+  powershell: 'PowerShell',
+  terraform: 'Terraform',
+  opentofu: 'OpenTofu',
+  alpine: 'Alpine',
+  conda_native: 'Conda Native',
+  composer: 'Composer',
+  hex: 'Hex',
+  cocoapods: 'CocoaPods',
+  swift: 'Swift',
+  pub: 'Pub',
+  sbt: 'sbt',
+  chef: 'Chef',
+  puppet: 'Puppet',
+  ansible: 'Ansible',
+  gitlfs: 'Git LFS',
+  vscode: 'VS Code',
+  jetbrains: 'JetBrains',
+  huggingface: 'Hugging Face',
+  mlmodel: 'ML Model',
+  cran: 'CRAN',
+  vagrant: 'Vagrant',
+  opkg: 'Opkg',
+  p2: 'P2',
+  bazel: 'Bazel',
 };
 
 export const PackageList: React.FC<PackageListProps> = ({
@@ -70,7 +105,7 @@ export const PackageList: React.FC<PackageListProps> = ({
   const handleTableChange = useCallback(
     (
       _pagination: TablePaginationConfig,
-      _filters: Record<string, (string | number | boolean)[] | null>,
+      _filters: Record<string, unknown>,
       sorter: SorterResult<Package> | SorterResult<Package>[]
     ) => {
       if (onSort && !Array.isArray(sorter) && sorter.field) {

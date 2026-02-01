@@ -59,7 +59,7 @@ const MigrationPage: React.FC = () => {
         migrationApi.listConnections(),
       ]);
       setJobs(jobsData.items);
-      setConnections(connectionsData.items);
+      setConnections(connectionsData);
     } catch (error) {
       console.error('Failed to load migration data:', error);
     } finally {
@@ -136,7 +136,7 @@ const MigrationPage: React.FC = () => {
       width: 150,
       render: (_: unknown, record: MigrationJob) => (
         <Space direction="vertical" size={0}>
-          <Text>{record.progress_percent.toFixed(1)}%</Text>
+          <Text>{(record.progress_percent ?? 0).toFixed(1)}%</Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
             {record.completed_items}/{record.total_items} items
           </Text>

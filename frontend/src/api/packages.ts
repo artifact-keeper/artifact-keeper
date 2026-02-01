@@ -1,27 +1,9 @@
 import apiClient from './client';
 import type { PaginatedResponse } from '../types';
 
-export interface Package {
-  id: string;
-  repository_key: string;
-  name: string;
-  version: string;
-  format: string;
-  description?: string;
-  size_bytes: number;
-  download_count: number;
-  created_at: string;
-  updated_at: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface PackageVersion {
-  version: string;
-  size_bytes: number;
-  download_count: number;
-  created_at: string;
-  checksum_sha256: string;
-}
+// Re-export types from the canonical types/ module
+export type { Package, PackageVersion } from '../types/packages';
+import type { Package, PackageVersion } from '../types/packages';
 
 export interface ListPackagesParams {
   page?: number;

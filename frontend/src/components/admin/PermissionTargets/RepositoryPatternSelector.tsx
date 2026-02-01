@@ -314,7 +314,7 @@ export const RepositoryPatternSelector: React.FC<RepositoryPatternSelectorProps>
         </Card>
       )}
 
-      <Divider orientation="left">
+      <Divider titlePlacement="left">
         <Space>
           <FilterOutlined />
           <Text>Preview: Matching Repositories ({matchingRepositories.length})</Text>
@@ -360,7 +360,7 @@ export const RepositoryPatternSelector: React.FC<RepositoryPatternSelectorProps>
 
       {excludedRepositories.length > 0 && (
         <>
-          <Divider orientation="left">
+          <Divider titlePlacement="left">
             <Space>
               <CloseCircleOutlined style={{ color: colors.error }} />
               <Text type="secondary">

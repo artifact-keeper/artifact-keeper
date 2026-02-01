@@ -16,6 +16,14 @@ import type {
 } from '../../types/migration';
 import { migrationApi } from '../../api/migration';
 
+/** Extended config for wizard UI state (includes fields not in API MigrationConfig) */
+type WizardConfig = Partial<MigrationConfig> & {
+  include_repositories?: string[];
+  include_artifacts?: boolean;
+  include_metadata?: boolean;
+  verify_checksums?: boolean;
+};
+
 const { Title, Text, Paragraph } = Typography;
 
 interface MigrationWizardProps {
@@ -40,7 +48,7 @@ export const MigrationWizard: React.FC<MigrationWizardProps> = ({
   const [currentStep, setCurrentStep] = useState(0);
   const [connection, setConnection] = useState<SourceConnection | null>(null);
   const [selectedRepos, setSelectedRepos] = useState<string[]>([]);
-  const [config, setConfig] = useState<Partial<MigrationConfig>>({
+  const [config, setConfig] = useState<WizardConfig>({
     include_repositories: [],
     include_artifacts: true,
     include_metadata: true,
@@ -66,7 +74,7 @@ export const MigrationWizard: React.FC<MigrationWizardProps> = ({
     }));
   }, []);
 
-  const handleConfigChange = useCallback((updates: Partial<MigrationConfig>) => {
+  const handleConfigChange = useCallback((updates: WizardConfig) => {
     setConfig((prev) => ({ ...prev, ...updates }));
   }, []);
 
@@ -250,8 +258,8 @@ export const MigrationWizard: React.FC<MigrationWizardProps> = ({
 };
 
 interface ConfigurationFormProps {
-  config: Partial<MigrationConfig>;
-  onChange: (updates: Partial<MigrationConfig>) => void;
+  config: WizardConfig;
+  onChange: (updates: WizardConfig) => void;
 }
 
 const ConfigurationForm: React.FC<ConfigurationFormProps> = ({ config, onChange }) => {
@@ -340,7 +348,7 @@ const ConfigurationForm: React.FC<ConfigurationFormProps> = ({ config, onChange 
 interface ReviewSummaryProps {
   connection: SourceConnection | null;
   selectedRepos: string[];
-  config: Partial<MigrationConfig>;
+  config: WizardConfig;
 }
 
 const ReviewSummary: React.FC<ReviewSummaryProps> = ({

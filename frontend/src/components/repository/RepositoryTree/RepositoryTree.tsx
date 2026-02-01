@@ -247,7 +247,7 @@ export const RepositoryTree: React.FC<RepositoryTreeProps> = ({
    * Handle tree node expansion
    */
   const handleExpand: TreeProps['onExpand'] = useCallback(
-    (expandedKeys, { node, expanded }) => {
+    (expandedKeys: React.Key[], { node, expanded }: { node: { key: React.Key }; expanded: boolean }) => {
       const nodeId = node.key as string;
       if (expanded) {
         expandNode(nodeId);
@@ -262,7 +262,7 @@ export const RepositoryTree: React.FC<RepositoryTreeProps> = ({
    * Handle tree node selection
    */
   const handleSelect: TreeProps['onSelect'] = useCallback(
-    (selectedKeys, info) => {
+    (selectedKeys: React.Key[], info: unknown) => {
       if (onSelect && selectedKeys.length > 0) {
         const nodeId = selectedKeys[0] as string;
 

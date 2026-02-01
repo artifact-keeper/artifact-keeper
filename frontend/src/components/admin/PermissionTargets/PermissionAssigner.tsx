@@ -128,7 +128,7 @@ export const PermissionAssigner: React.FC<PermissionAssignerProps> = ({
   );
 
   const handleSelectAllActions: CheckboxProps['onChange'] = useCallback(
-    (e) => {
+    (e: Parameters<NonNullable<CheckboxProps['onChange']>>[0]) => {
       if (e.target.checked) {
         handleChange({ actions: ACTIONS.map((a) => a.key) });
       } else {

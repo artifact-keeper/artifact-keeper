@@ -159,7 +159,7 @@ export function useApiError<TData = unknown, TError = Error>(
   // Get error from query/mutation or manual error
   const error = useMemo(() => {
     if (manualError) return manualError;
-    if (queryOrMutation?.error) return queryOrMutation.error as Error;
+    if (queryOrMutation?.error) return queryOrMutation.error as unknown as Error;
     return null;
   }, [manualError, queryOrMutation?.error]);
 

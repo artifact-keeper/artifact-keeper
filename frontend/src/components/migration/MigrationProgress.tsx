@@ -92,7 +92,7 @@ const formatBytes = (bytes: number): string => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 };
 
-const formatDuration = (startTime: string | null): string => {
+const formatDuration = (startTime: string | null | undefined): string => {
   if (!startTime) return '-';
   const start = new Date(startTime);
   const now = new Date();
@@ -115,7 +115,7 @@ export const MigrationProgress: React.FC<MigrationProgressProps> = ({
   const eventSourceRef = useRef<EventSource | null>(null);
 
   const connectSSE = useCallback(() => {
-    const eventSource = migrationApi.streamProgress(jobId);
+    const eventSource = migrationApi.createProgressStream(jobId);
     eventSourceRef.current = eventSource;
 
     eventSource.onopen = () => {

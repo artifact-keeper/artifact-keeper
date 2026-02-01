@@ -50,7 +50,7 @@ export const ArtifactList: React.FC<ArtifactListProps> = ({
   const handleTableChange = useCallback(
     (
       _pagination: TablePaginationConfig,
-      _filters: Record<string, (string | number | boolean)[] | null>,
+      _filters: Record<string, unknown>,
       sorter: SorterResult<Artifact> | SorterResult<Artifact>[]
     ) => {
       if (onSort && !Array.isArray(sorter) && sorter.field) {

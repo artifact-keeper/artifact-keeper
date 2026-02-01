@@ -386,8 +386,8 @@ const EdgeNodes = () => {
               max={10240}
               placeholder="100"
               style={{ width: '100%' }}
-              formatter={(value) => `${value} GB`}
-              parser={(value) => value?.replace(' GB', '') as unknown as number}
+              formatter={((value: string | undefined) => `${value} GB`) as never}
+              parser={((value: string | undefined) => Number(value?.replace(' GB', '') || 1)) as never}
             />
           </Form.Item>
           <Form.Item>

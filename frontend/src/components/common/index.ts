@@ -126,7 +126,7 @@ export type {
   CascaderProps,
   AutoCompleteProps,
   RateProps,
-  SliderProps,
+  SiderProps,
   InputNumberProps,
   SegmentedProps,
   FlexProps,

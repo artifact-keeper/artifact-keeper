@@ -93,7 +93,7 @@ export const MigrationReport: React.FC<MigrationReportProps> = ({ jobId }) => {
         migrationApi.getMigrationReport(jobId),
         migrationApi.getMigration(jobId),
       ]);
-      setReport(reportData);
+      setReport(typeof reportData === 'string' ? null : reportData);
       setJob(jobData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load report');

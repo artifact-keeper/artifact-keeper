@@ -142,7 +142,7 @@ export const SearchResults: React.FC<SearchResultsProps> = ({
   const handleTableChange = useCallback(
     (
       _pagination: TablePaginationConfig,
-      _filters: Record<string, (string | number | boolean)[] | null>,
+      _filters: Record<string, unknown>,
       sorter: SorterResult<ArtifactSearchHit> | SorterResult<ArtifactSearchHit>[]
     ) => {
       if (!Array.isArray(sorter) && sorter.field && sorter.order) {
@@ -172,7 +172,7 @@ export const SearchResults: React.FC<SearchResultsProps> = ({
                 }}
               />
               {result.version && (
-                <Tag size="small" style={{ marginLeft: spacing.xs }}>
+                <Tag style={{ marginLeft: spacing.xs }}>
                   v{result.version}
                 </Tag>
               )}
@@ -339,7 +339,7 @@ export const SearchResults: React.FC<SearchResultsProps> = ({
                   }}
                 />
                 {result.version && (
-                  <Tag size="small">v{result.version}</Tag>
+                  <Tag>v{result.version}</Tag>
                 )}
               </Space>
             }

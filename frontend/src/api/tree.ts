@@ -1,19 +1,8 @@
 import apiClient from './client';
 
-export type TreeNodeType = 'folder' | 'file' | 'repository';
-
-export interface TreeNode {
-  id: string;
-  name: string;
-  path: string;
-  type: TreeNodeType;
-  size_bytes?: number;
-  children_count?: number;
-  has_children: boolean;
-  repository_key?: string;
-  created_at?: string;
-  updated_at?: string;
-}
+// Re-export types from the canonical types/ module
+export type { TreeNodeType, TreeNode } from '../types/tree';
+import type { TreeNode } from '../types/tree';
 
 export interface GetChildrenParams {
   repository_key?: string;

@@ -17,7 +17,7 @@ import { colors } from '../styles/tokens'
 const Artifacts = () => {
   useDocumentTitle('Artifacts')
   const queryClient = useQueryClient()
-  const { showConfirm } = useConfirmDialog()
+  const { confirm: showConfirm } = useConfirmDialog()
 
   // State for selection
   const [selectedPath, setSelectedPath] = useState<string | undefined>()
@@ -119,21 +119,20 @@ const Artifacts = () => {
 
   // Handle artifact delete with confirmation
   const handleDelete = useCallback(
-    async (artifact: Artifact) => {
-      const confirmed = await showConfirm({
+    (artifact: Artifact) => {
+      showConfirm({
         title: 'Delete Artifact',
         content: `Are you sure you want to delete "${artifact.name}"? This action cannot be undone.`,
         type: 'danger',
-        confirmText: 'Delete',
+        okText: 'Delete',
         cancelText: 'Cancel',
+        onOk: () => {
+          deleteMutation.mutate({
+            repoKey: artifact.repository_key,
+            path: artifact.path,
+          })
+        },
       })
-
-      if (confirmed) {
-        deleteMutation.mutate({
-          repoKey: artifact.repository_key,
-          path: artifact.path,
-        })
-      }
     },
     [showConfirm, deleteMutation]
   )

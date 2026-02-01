@@ -28,7 +28,7 @@ import type { UploadFile, UploadProps } from 'antd/es/upload/interface';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title, Text, Paragraph } = Typography;
-const { Step } = Steps;
+// Steps.Step was removed in Ant Design 6; use `items` prop instead
 
 interface ExportMetadata {
   version: string;
@@ -356,7 +356,7 @@ export const ImportFromExport: React.FC<ImportFromExportProps> = ({
                   </Descriptions.Item>
                 </Descriptions>
 
-                <Divider orientation="left">Select Repositories</Divider>
+                <Divider titlePlacement="left">Select Repositories</Divider>
 
                 <Space>
                   <Button onClick={() => handleSelectAllRepos(true)}>
@@ -622,13 +622,13 @@ export const ImportFromExport: React.FC<ImportFromExportProps> = ({
 
   return (
     <Space direction="vertical" style={{ width: '100%' }} size="large">
-      <Steps current={currentStep}>
-        <Step title="Select Source" />
-        <Step title="Review Contents" />
-        <Step title="Configure" />
-        <Step title="Import" />
-        <Step title="Complete" />
-      </Steps>
+      <Steps current={currentStep} items={[
+        { title: 'Select Source' },
+        { title: 'Review Contents' },
+        { title: 'Configure' },
+        { title: 'Import' },
+        { title: 'Complete' },
+      ]} />
 
       {renderStepContent()}
 

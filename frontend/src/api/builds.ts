@@ -1,52 +1,11 @@
 import apiClient from './client';
 import type { PaginatedResponse } from '../types';
 
-export type BuildStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled';
-
-export interface Build {
-  id: string;
-  name: string;
-  number: number;
-  status: BuildStatus;
-  started_at?: string;
-  finished_at?: string;
-  duration_ms?: number;
-  agent?: string;
-  created_at: string;
-  updated_at: string;
-  artifact_count?: number;
-  modules?: BuildModule[];
-}
-
-export interface BuildModule {
-  id: string;
-  name: string;
-  artifacts: BuildArtifact[];
-}
-
-export interface BuildArtifact {
-  name: string;
-  path: string;
-  checksum_sha256: string;
-  size_bytes: number;
-}
-
-export interface BuildDiff {
-  build_a: string;
-  build_b: string;
-  added: BuildArtifact[];
-  removed: BuildArtifact[];
-  modified: BuildArtifactDiff[];
-}
-
-export interface BuildArtifactDiff {
-  name: string;
-  path: string;
-  old_checksum: string;
-  new_checksum: string;
-  old_size_bytes: number;
-  new_size_bytes: number;
-}
+// Re-export types from the canonical types/ module
+export type { BuildStatus, Build, BuildModule, BuildDiff, BuildDetail, BuildModuleArtifact, ArtifactChange } from '../types/builds';
+// Re-export for backward compat
+export type { BuildModuleArtifact as BuildArtifact, ArtifactChange as BuildArtifactDiff } from '../types/builds';
+import type { Build, BuildDetail, BuildStatus, BuildDiff } from '../types/builds';
 
 export interface ListBuildsParams {
   page?: number;
@@ -65,8 +24,8 @@ export const buildsApi = {
     return response.data;
   },
 
-  get: async (buildId: string): Promise<Build> => {
-    const response = await apiClient.get<Build>(`/api/v1/builds/${buildId}`);
+  get: async (buildId: string): Promise<BuildDetail> => {
+    const response = await apiClient.get<BuildDetail>(`/api/v1/builds/${buildId}`);
     return response.data;
   },
 
