@@ -7,6 +7,7 @@ import type { ColumnsType, TableProps } from 'antd/es/table'
 import { repositoriesApi } from '../api'
 import type { Repository, CreateRepositoryRequest, RepositoryFormat, RepositoryType } from '../types'
 import { useDocumentTitle } from '../hooks'
+import { useAuth } from '../contexts'
 import { RepoWizard } from '../components/admin'
 
 const { Text } = Typography
@@ -41,6 +42,7 @@ const formatBytes = (bytes: number): string => {
 
 const Repositories = () => {
   useDocumentTitle('Repositories')
+  const { isAuthenticated } = useAuth()
 
   // Modal states
   const [wizardOpen, setWizardOpen] = useState(false)
@@ -199,21 +201,25 @@ const Repositories = () => {
           >
             View
           </Button>
-          <Button
-            type="link"
-            icon={<EditOutlined />}
-            onClick={() => handleEdit(record)}
-          >
-            Edit
-          </Button>
-          <Button
-            type="link"
-            danger
-            icon={<DeleteOutlined />}
-            onClick={() => handleDeleteClick(record)}
-          >
-            Delete
-          </Button>
+          {isAuthenticated && (
+            <Button
+              type="link"
+              icon={<EditOutlined />}
+              onClick={() => handleEdit(record)}
+            >
+              Edit
+            </Button>
+          )}
+          {isAuthenticated && (
+            <Button
+              type="link"
+              danger
+              icon={<DeleteOutlined />}
+              onClick={() => handleDeleteClick(record)}
+            >
+              Delete
+            </Button>
+          )}
         </Space>
       ),
     },
@@ -234,9 +240,11 @@ const Repositories = () => {
               onClick={handleRefresh}
             />
           </Tooltip>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setWizardOpen(true)}>
-            Create Repository
-          </Button>
+          {isAuthenticated && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => setWizardOpen(true)}>
+              Create Repository
+            </Button>
+          )}
         </Space>
       </div>
 

@@ -60,7 +60,7 @@ function DemoBanner() {
       top: 0,
       zIndex: 1100,
     }}>
-      This is a read-only demo.{' '}
+      This is a read-only demo — logged in as admin.{' '}
       <a href="https://artifactkeeper.com" style={{ fontWeight: 600 }}>
         Deploy your own instance &rarr;
       </a>

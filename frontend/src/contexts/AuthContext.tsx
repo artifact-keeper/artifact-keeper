@@ -83,13 +83,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setMustChangePassword(false);
   }, []);
 
-  // Check for existing token on mount
+  // Check for existing token on mount, auto-login in demo mode
   useEffect(() => {
     const initAuth = async () => {
       const token = localStorage.getItem('access_token');
       if (token) {
         await refreshUser();
+        setIsLoading(false);
+        return;
       }
+
+      // In demo mode, auto-login as admin so visitors see the full UI
+      try {
+        const healthRes = await fetch('/health');
+        const health = await healthRes.json();
+        if (health.demo_mode === true) {
+          try {
+            const loginRes = await authApi.login({ username: 'admin', password: 'demo' });
+            storeTokens(loginRes);
+            await refreshUser();
+          } catch {
+            // Demo auto-login failed, continue as anonymous
+          }
+        }
+      } catch {
+        // Health check failed, continue as anonymous
+      }
+
       setIsLoading(false);
     };
     initAuth();
