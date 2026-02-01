@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useEffect } from 'react';
+import React, { useCallback, useMemo, useEffect, useRef } from 'react';
 import { Tree, Spin, Typography, Tooltip } from 'antd';
 import type { TreeProps, TreeDataNode } from 'antd';
 import { LoadingOutlined } from '@ant-design/icons';
@@ -157,10 +157,26 @@ export const RepositoryTree: React.FC<RepositoryTreeProps> = ({
     loadChildren,
   });
 
-  // Update root nodes when repositories change
+  // Keep a ref to current nodes so the effect can read them without re-triggering
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+
+  // Update root nodes when repositories change, preserving loaded children
   useEffect(() => {
-    const rootNodes = repositories.map(repositoryToTreeNode);
-    setNodes(rootNodes);
+    const prev = nodesRef.current;
+    const prevMap = new Map<string, HookTreeNode<TreeNode>>();
+    prev.forEach((n) => prevMap.set(n.id, n));
+
+    const newRoots = repositories.map((repo) => {
+      const newNode = repositoryToTreeNode(repo);
+      const existing = prevMap.get(newNode.id);
+      if (existing?.children) {
+        return { ...newNode, children: existing.children };
+      }
+      return newNode;
+    });
+
+    setNodes(newRoots);
   }, [repositories, setNodes]);
 
   /**
