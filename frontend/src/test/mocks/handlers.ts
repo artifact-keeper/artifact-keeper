@@ -232,6 +232,7 @@ export const handlers = [
     return HttpResponse.json({
       status: 'healthy',
       version: '1.0.0',
+      demo_mode: false,
       checks: {
         database: { status: 'healthy', message: 'Connected' },
         storage: { status: 'healthy', message: 'Available' },

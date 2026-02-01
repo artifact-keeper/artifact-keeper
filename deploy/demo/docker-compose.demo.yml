@@ -1,4 +1,5 @@
 # Demo deployment for demo.artifactkeeper.com
+# Uses pre-built images from ghcr.io (pushed by CI on every main branch commit).
 # All write operations are blocked via DEMO_MODE.
 # Reset daily with: ./reset-demo.sh
 
@@ -18,9 +19,7 @@ services:
       retries: 5
 
   backend:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.backend
+    image: ghcr.io/brandonrc/artifact-keeper-backend:latest
     environment:
       DATABASE_URL: postgres://registry:registry-demo@postgres:5432/artifact_registry
       BIND_ADDRESS: 0.0.0.0:8080
@@ -45,11 +44,7 @@ services:
       - trivy_cache:/root/.cache/trivy
 
   frontend:
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile.frontend
-      args:
-        VITE_DEMO_MODE: "true"
+    image: ghcr.io/brandonrc/artifact-keeper-frontend:latest
     ports:
       - "3000:80"
     depends_on:
@@ -69,7 +64,6 @@ services:
         PGPASSWORD=registry-demo psql -h postgres -U registry -d artifact_registry -f /seed.sql &&
         echo 'Demo data seeded successfully'
       "
-
 
 volumes:
   postgres_data:

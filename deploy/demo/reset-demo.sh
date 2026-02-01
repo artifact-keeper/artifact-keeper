@@ -15,8 +15,8 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Starting demo reset..."
 # Bring everything down and remove volumes
 docker compose -f docker-compose.demo.yml down -v
 
-# Rebuild (pick up any code changes)
-docker compose -f docker-compose.demo.yml build
+# Pull latest images
+docker compose -f docker-compose.demo.yml pull
 
 # Start fresh
 docker compose -f docker-compose.demo.yml up -d
