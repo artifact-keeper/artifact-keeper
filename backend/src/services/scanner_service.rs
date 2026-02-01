@@ -895,10 +895,63 @@ impl ScannerService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        let checksum = &artifact.checksum_sha256;
+        const DEDUP_TTL_DAYS: i32 = 30;
+
         for scanner in &self.scanners {
+            // Check for reusable scan results (same hash + scan type within TTL)
+            if let Ok(Some(source_scan)) = self
+                .scan_result_service
+                .find_reusable_scan(checksum, scanner.scan_type(), DEDUP_TTL_DAYS)
+                .await
+            {
+                // Skip if the source scan is for the same artifact (already scanned)
+                if source_scan.artifact_id != artifact_id {
+                    match self
+                        .scan_result_service
+                        .copy_scan_results(
+                            source_scan.id,
+                            artifact_id,
+                            artifact.repository_id,
+                            scanner.scan_type(),
+                            checksum,
+                        )
+                        .await
+                    {
+                        Ok(reused) => {
+                            info!(
+                                "Reusing scan results from {} for artifact {} (scanner={}, hash={}..)",
+                                source_scan.id,
+                                artifact_id,
+                                scanner.name(),
+                                &checksum[..8.min(checksum.len())],
+                            );
+                            // Update quarantine status based on copied findings
+                            self.update_quarantine_status(
+                                artifact_id,
+                                reused.findings_count,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to copy scan results from {}: {}. Running fresh scan.",
+                                source_scan.id, e
+                            );
+                        }
+                    }
+                }
+            }
+
             let scan_result = self
                 .scan_result_service
-                .create_scan_result(artifact_id, artifact.repository_id, scanner.scan_type())
+                .create_scan_result_with_checksum(
+                    artifact_id,
+                    artifact.repository_id,
+                    scanner.scan_type(),
+                    Some(checksum),
+                )
                 .await?;
 
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {

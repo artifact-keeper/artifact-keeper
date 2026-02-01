@@ -28,11 +28,23 @@ impl ScanResultService {
         repository_id: Uuid,
         scan_type: &str,
     ) -> Result<ScanResult> {
+        self.create_scan_result_with_checksum(artifact_id, repository_id, scan_type, None)
+            .await
+    }
+
+    /// Create a new pending scan result with an optional checksum for dedup.
+    pub async fn create_scan_result_with_checksum(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        scan_type: &str,
+        checksum_sha256: Option<&str>,
+    ) -> Result<ScanResult> {
         let result = sqlx::query_as!(
             ScanResult,
             r#"
-            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at)
-            VALUES ($1, $2, $3, 'running', NOW())
+            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)
+            VALUES ($1, $2, $3, 'running', NOW(), $4)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at
@@ -40,12 +52,114 @@ impl ScanResultService {
             artifact_id,
             repository_id,
             scan_type,
+            checksum_sha256,
         )
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
+    }
+
+    /// Find a completed scan result for the same checksum + scan_type within a TTL window.
+    /// Returns None if no reusable scan exists.
+    pub async fn find_reusable_scan(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        ttl_days: i32,
+    ) -> Result<Option<ScanResult>> {
+        let result = sqlx::query_as!(
+            ScanResult,
+            r#"
+            SELECT id, artifact_id, repository_id, scan_type, status,
+                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                   scanner_version, error_message, started_at, completed_at, created_at
+            FROM scan_results
+            WHERE checksum_sha256 = $1
+              AND scan_type = $2
+              AND status = 'completed'
+              AND completed_at > NOW() - ($3 || ' days')::interval
+            ORDER BY completed_at DESC
+            LIMIT 1
+            "#,
+            checksum_sha256,
+            scan_type,
+            ttl_days.to_string(),
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(result)
+    }
+
+    /// Copy scan results from a source scan to a new artifact.
+    /// Creates a new completed scan_result and duplicates all findings.
+    pub async fn copy_scan_results(
+        &self,
+        source_scan_id: Uuid,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        scan_type: &str,
+        checksum_sha256: &str,
+    ) -> Result<ScanResult> {
+        // Get source scan counts
+        let source = self.get_scan(source_scan_id).await?;
+
+        // Create new scan result marked as reused
+        let new_scan = sqlx::query_as!(
+            ScanResult,
+            r#"
+            INSERT INTO scan_results (
+                artifact_id, repository_id, scan_type, status, started_at, completed_at,
+                findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                checksum_sha256, source_scan_id, is_reused
+            )
+            VALUES ($1, $2, $3, 'completed', NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, true)
+            RETURNING id, artifact_id, repository_id, scan_type, status,
+                      findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                      scanner_version, error_message, started_at, completed_at, created_at
+            "#,
+            artifact_id,
+            repository_id,
+            scan_type,
+            source.findings_count,
+            source.critical_count,
+            source.high_count,
+            source.medium_count,
+            source.low_count,
+            source.info_count,
+            checksum_sha256,
+            source_scan_id,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Copy all findings from source scan to new scan
+        sqlx::query!(
+            r#"
+            INSERT INTO scan_findings (
+                scan_result_id, artifact_id, severity, title, description,
+                cve_id, affected_component, affected_version, fixed_version,
+                source, source_url
+            )
+            SELECT $1, $2, severity, title, description,
+                   cve_id, affected_component, affected_version, fixed_version,
+                   source, source_url
+            FROM scan_findings
+            WHERE scan_result_id = $3
+            "#,
+            new_scan.id,
+            artifact_id,
+            source_scan_id,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(new_scan)
     }
 
     /// Mark a scan as completed with severity counts.

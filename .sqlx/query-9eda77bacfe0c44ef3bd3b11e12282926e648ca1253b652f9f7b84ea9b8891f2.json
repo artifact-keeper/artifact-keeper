@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at)\n            VALUES ($1, $2, $3, 'running', NOW())\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at\n            ",
+  "query": "\n            INSERT INTO scan_results (\n                artifact_id, repository_id, scan_type, status, started_at, completed_at,\n                findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                checksum_sha256, source_scan_id, is_reused\n            )\n            VALUES ($1, $2, $3, 'completed', NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, true)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at\n            ",
   "describe": {
     "columns": [
       {
@@ -88,7 +88,15 @@
       "Left": [
         "Uuid",
         "Uuid",
-        "Varchar"
+        "Varchar",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Bpchar",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -110,5 +118,5 @@
       false
     ]
   },
-  "hash": "c06d584bd6e07b5bf1857552b30812d3dc8ffe42f94809e36e6e1b1b97fcaa6d"
+  "hash": "9eda77bacfe0c44ef3bd3b11e12282926e648ca1253b652f9f7b84ea9b8891f2"
 }

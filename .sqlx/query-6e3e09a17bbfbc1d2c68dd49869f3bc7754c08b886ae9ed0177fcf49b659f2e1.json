@@ -1,0 +1,115 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)\n            VALUES ($1, $2, $3, 'running', NOW(), $4)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "artifact_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "scan_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "findings_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "critical_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "high_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "medium_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "low_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "info_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "scanner_version",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "6e3e09a17bbfbc1d2c68dd49869f3bc7754c08b886ae9ed0177fcf49b659f2e1"
+}
