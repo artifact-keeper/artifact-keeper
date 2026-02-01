@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use super::handlers;
 use super::middleware::auth::{auth_middleware, optional_auth_middleware};
+use super::middleware::demo::demo_guard;
 use super::SharedState;
 use crate::services::auth_service::AuthService;
 
 /// Create the main API router
 pub fn create_router(state: SharedState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         // Health endpoints (no auth required)
         .route("/health", get(handlers::health::health_check))
         .route("/ready", get(handlers::health::readiness_check))
@@ -74,8 +75,15 @@ pub fn create_router(state: SharedState) -> Router {
         // SBT/Ivy Repository API (Scala/Java packages)
         .nest("/ivy", handlers::sbt::router())
         // VS Code Extension Marketplace API
-        .nest("/vscode", handlers::vscode::router())
-        .with_state(state)
+        .nest("/vscode", handlers::vscode::router());
+
+    // Apply demo mode guard if enabled
+    if state.config.demo_mode {
+        tracing::info!("Demo mode enabled — write operations will be blocked");
+        router = router.layer(middleware::from_fn_with_state(state.clone(), demo_guard));
+    }
+
+    router.with_state(state)
 }
 
 /// API v1 routes

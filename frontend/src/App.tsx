@@ -36,6 +36,30 @@ import { ServerError, Forbidden } from './pages/errors'
 
 const { Content } = Layout
 
+const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === 'true'
+
+function DemoBanner() {
+  if (!DEMO_MODE) return null
+  return (
+    <div style={{
+      background: '#fffbe6',
+      borderBottom: '1px solid #ffe58f',
+      padding: '8px 16px',
+      textAlign: 'center',
+      fontSize: 14,
+      color: '#614700',
+      position: 'sticky',
+      top: 0,
+      zIndex: 1100,
+    }}>
+      This is a read-only demo.{' '}
+      <a href="https://artifactkeeper.com" style={{ fontWeight: 600 }}>
+        Deploy your own instance &rarr;
+      </a>
+    </div>
+  )
+}
+
 function AppContent() {
   const { isAuthenticated, isLoading, mustChangePassword } = useAuth()
 
@@ -113,6 +137,7 @@ function ThemedApp() {
   return (
     <ConfigProvider theme={theme}>
       <BrowserRouter>
+        <DemoBanner />
         <AppContent />
       </BrowserRouter>
     </ConfigProvider>

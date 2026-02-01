@@ -68,6 +68,9 @@ pub struct Config {
 
     /// Path for scan workspace shared with Trivy
     pub scan_workspace_path: String,
+
+    /// Demo mode: blocks all write operations (POST/PUT/DELETE/PATCH) except auth
+    pub demo_mode: bool,
 }
 
 impl Config {
@@ -108,6 +111,9 @@ impl Config {
             meilisearch_api_key: env::var("MEILISEARCH_API_KEY").ok(),
             scan_workspace_path: env::var("SCAN_WORKSPACE_PATH")
                 .unwrap_or_else(|_| "/scan-workspace".into()),
+            demo_mode: env::var("DEMO_MODE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         })
     }
 }
