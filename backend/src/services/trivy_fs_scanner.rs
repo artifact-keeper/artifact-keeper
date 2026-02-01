@@ -42,7 +42,13 @@ impl TrivyFsScanner {
             return false;
         }
 
-        let name_lower = artifact.name.to_lowercase();
+        // Use the original filename from the path for extension detection
+        let original_filename = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.name);
+        let name_lower = original_filename.to_lowercase();
         let scannable_extensions = [
             ".tar.gz", ".tgz", ".whl", ".jar", ".war", ".ear", ".gem", ".crate", ".nupkg",
             ".zip", ".deb", ".rpm", ".apk", ".egg", ".pex",
@@ -71,7 +77,13 @@ impl TrivyFsScanner {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
-        let artifact_path = workspace.join(&artifact.name);
+        // Use the original filename from the path (last segment) for correct extension detection
+        let original_filename = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.name);
+        let artifact_path = workspace.join(original_filename);
 
         tokio::fs::write(&artifact_path, content)
             .await
@@ -80,7 +92,7 @@ impl TrivyFsScanner {
             })?;
 
         // Extract archives into the workspace directory
-        if Self::is_archive(&artifact.name) {
+        if Self::is_archive(original_filename) {
             if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
                 warn!(
                     "Failed to extract archive {}: {}. Scanning raw file instead.",

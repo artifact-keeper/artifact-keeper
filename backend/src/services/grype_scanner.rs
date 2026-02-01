@@ -89,7 +89,13 @@ impl GrypeScanner {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
-        let artifact_path = workspace.join(&artifact.name);
+        // Use the original filename from the path (last segment) for correct extension detection
+        let original_filename = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.name);
+        let artifact_path = workspace.join(original_filename);
 
         tokio::fs::write(&artifact_path, content)
             .await
@@ -98,7 +104,7 @@ impl GrypeScanner {
             })?;
 
         // Extract archives into the workspace directory
-        if Self::is_archive(&artifact.name) {
+        if Self::is_archive(original_filename) {
             if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
                 warn!(
                     "Failed to extract archive {}: {}. Scanning raw file instead.",
