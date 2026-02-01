@@ -1,27 +1,21 @@
+/* Brand color palette — Starlight handles light/dark switching via bg mappings.
+   "white" = lightest color, "black" = darkest color, grays in between. */
 :root {
-  --sl-color-accent-low: #f0fff4;
+  --sl-color-accent-low: #122a1a;
   --sl-color-accent: #3eb065;
-  --sl-color-accent-high: #152033;
+  --sl-color-accent-high: #a8e6b4;
   --sl-color-white: #ffffff;
-  --sl-color-gray-1: #eeeeee;
-  --sl-color-gray-2: #c2c2c2;
-  --sl-color-gray-3: #8b8b8b;
-  --sl-color-gray-4: #585858;
-  --sl-color-gray-5: #383838;
-  --sl-color-gray-6: #272727;
-  --sl-color-black: #152033;
+  --sl-color-gray-1: #eef1f5;
+  --sl-color-gray-2: #b8c1cc;
+  --sl-color-gray-3: #6e7d8f;
+  --sl-color-gray-4: #445060;
+  --sl-color-gray-5: #1e2836;
+  --sl-color-gray-6: #141c28;
+  --sl-color-black: #0e1520;
 }
 
-:root[data-theme='dark'] {
-  --sl-color-accent-low: #1a3a24;
-  --sl-color-accent: #3eb065;
-  --sl-color-accent-high: #c8f0d0;
-  --sl-color-white: #ffffff;
-  --sl-color-gray-1: #272727;
-  --sl-color-gray-2: #383838;
-  --sl-color-gray-3: #585858;
-  --sl-color-gray-4: #8b8b8b;
-  --sl-color-gray-5: #c2c2c2;
-  --sl-color-gray-6: #eeeeee;
-  --sl-color-black: #f6f6f6;
+:root[data-theme='light'] {
+  --sl-color-accent-low: #e8f5ec;
+  --sl-color-accent: #2d9050;
+  --sl-color-accent-high: #1a5c32;
 }
