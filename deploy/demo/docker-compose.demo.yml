@@ -20,7 +20,7 @@ services:
   backend:
     build:
       context: ../..
-      dockerfile: deploy/docker/Dockerfile.backend
+      dockerfile: Dockerfile.backend
     environment:
       DATABASE_URL: postgres://registry:registry-demo@postgres:5432/artifact_registry
       BIND_ADDRESS: 0.0.0.0:8080
