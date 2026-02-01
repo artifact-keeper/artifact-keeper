@@ -29,6 +29,8 @@ export interface RepoSecurityScore {
 export interface ScanResult {
   id: string;
   artifact_id: string;
+  artifact_name: string | null;
+  artifact_version: string | null;
   repository_id: string;
   scan_type: string;
   status: string;

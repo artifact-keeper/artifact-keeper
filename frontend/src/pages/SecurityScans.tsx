@@ -124,9 +124,19 @@ export default function SecurityScans() {
     },
     {
       title: 'Artifact',
-      dataIndex: 'artifact_id',
-      key: 'artifact_id',
-      render: (id: string) => <code>{id.slice(0, 8)}...</code>,
+      dataIndex: 'artifact_name',
+      key: 'artifact',
+      render: (_: string | null, record: ScanResult) =>
+        record.artifact_name ? (
+          <span>
+            <strong>{record.artifact_name}</strong>
+            {record.artifact_version && (
+              <span style={{ color: '#888', marginLeft: 4 }}>{record.artifact_version}</span>
+            )}
+          </span>
+        ) : (
+          <code>{record.artifact_id.slice(0, 8)}...</code>
+        ),
     },
     {
       title: 'Started',
