@@ -79,7 +79,6 @@ ARTIFACTORY_UI_UX_DEEP_DIVE.md
 .beads/
 .specify/
 AGENTS.md
-CLAUDE.md
 .gitattributes
 
 # Test asset generation output (generated packages)
