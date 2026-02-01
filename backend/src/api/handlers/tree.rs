@@ -72,14 +72,11 @@ pub async fn get_tree(
     };
 
     // Verify repository exists
-    let repo = sqlx::query!(
-        "SELECT id FROM repositories WHERE key = $1",
-        repo_key
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound(format!("Repository '{}' not found", repo_key)))?;
+    let repo = sqlx::query!("SELECT id FROM repositories WHERE key = $1", repo_key)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("Repository '{}' not found", repo_key)))?;
 
     let prefix = params.path.unwrap_or_default();
     let prefix_depth = if prefix.is_empty() {

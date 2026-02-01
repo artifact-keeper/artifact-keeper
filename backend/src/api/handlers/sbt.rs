@@ -42,7 +42,9 @@ pub fn router() -> Router<SharedState> {
         //   HEAD — check artifact existence
         .route(
             "/:repo_key/*path",
-            get(download_by_path).put(upload_artifact).head(check_exists),
+            get(download_by_path)
+                .put(upload_artifact)
+                .head(check_exists),
         )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
@@ -64,7 +66,9 @@ fn extract_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok())
+        .and_then(|b64| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+        })
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');

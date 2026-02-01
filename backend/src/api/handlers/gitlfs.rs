@@ -219,23 +219,14 @@ async fn authenticate(
     config: &crate::config::Config,
     headers: &HeaderMap,
 ) -> Result<uuid::Uuid, Response> {
-    let (username, password) = extract_credentials(headers).ok_or_else(|| {
-        lfs_error_response(
-            StatusCode::UNAUTHORIZED,
-            "Authentication required",
-        )
-    })?;
+    let (username, password) = extract_credentials(headers)
+        .ok_or_else(|| lfs_error_response(StatusCode::UNAUTHORIZED, "Authentication required"))?;
 
     let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
     let (user, _tokens) = auth_service
         .authenticate(&username, &password)
         .await
-        .map_err(|_| {
-            lfs_error_response(
-                StatusCode::UNAUTHORIZED,
-                "Invalid credentials",
-            )
-        })?;
+        .map_err(|_| lfs_error_response(StatusCode::UNAUTHORIZED, "Invalid credentials"))?;
 
     Ok(user.id)
 }
@@ -262,9 +253,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
             &format!("Database error: {}", e),
         )
     })?
-    .ok_or_else(|| {
-        lfs_error_response(StatusCode::NOT_FOUND, "Repository not found")
-    })?;
+    .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Repository not found"))?;
 
     let fmt = repo.format.to_lowercase();
     if fmt != "gitlfs" {
@@ -330,10 +319,7 @@ async fn batch(
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let request: BatchRequest = serde_json::from_slice(&body).map_err(|e| {
-        lfs_error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("Invalid JSON: {}", e),
-        )
+        lfs_error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e))
     })?;
 
     if request.operation != "download" && request.operation != "upload" {
@@ -506,10 +492,7 @@ async fn upload_object(
     validate_oid(&oid)?;
 
     if body.is_empty() {
-        return Err(lfs_error_response(
-            StatusCode::BAD_REQUEST,
-            "Empty body",
-        ));
+        return Err(lfs_error_response(StatusCode::BAD_REQUEST, "Empty body"));
     }
 
     // Verify SHA-256 matches the OID
@@ -598,7 +581,10 @@ async fn upload_object(
     .execute(&state.db)
     .await;
 
-    info!("Git LFS upload: {} ({} bytes) to repo {}", oid, size_bytes, repo_key);
+    info!(
+        "Git LFS upload: {} ({} bytes) to repo {}",
+        oid, size_bytes, repo_key
+    );
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -675,10 +661,7 @@ async fn verify_object(
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let request: VerifyRequest = serde_json::from_slice(&body).map_err(|e| {
-        lfs_error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("Invalid JSON: {}", e),
-        )
+        lfs_error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e))
     })?;
 
     validate_oid(&request.oid)?;
@@ -735,10 +718,7 @@ async fn create_lock(
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let request: CreateLockRequest = serde_json::from_slice(&body).map_err(|e| {
-        lfs_error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("Invalid JSON: {}", e),
-        )
+        lfs_error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e))
     })?;
 
     if request.path.is_empty() {
@@ -776,18 +756,15 @@ async fn create_lock(
     }
 
     // Look up username
-    let username = sqlx::query_scalar!(
-        "SELECT username FROM users WHERE id = $1",
-        user_id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {}", e),
-        )
-    })?;
+    let username = sqlx::query_scalar!("SELECT username FROM users WHERE id = $1", user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Database error: {}", e),
+            )
+        })?;
 
     let lock_id = uuid::Uuid::new_v4();
     let locked_at = chrono::Utc::now();
@@ -900,25 +877,19 @@ async fn verify_locks(
         None
     } else {
         Some(serde_json::from_slice(&body).map_err(|e| {
-            lfs_error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid JSON: {}", e),
-            )
+            lfs_error_response(StatusCode::BAD_REQUEST, &format!("Invalid JSON: {}", e))
         })?)
     };
 
-    let username = sqlx::query_scalar!(
-        "SELECT username FROM users WHERE id = $1",
-        user_id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {}", e),
-        )
-    })?;
+    let username = sqlx::query_scalar!("SELECT username FROM users WHERE id = $1", user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Database error: {}", e),
+            )
+        })?;
 
     let rows = sqlx::query!(
         r#"
@@ -999,18 +970,15 @@ async fn delete_lock(
     };
 
     // Look up the user
-    let username = sqlx::query_scalar!(
-        "SELECT username FROM users WHERE id = $1",
-        user_id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {}", e),
-        )
-    })?;
+    let username = sqlx::query_scalar!("SELECT username FROM users WHERE id = $1", user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Database error: {}", e),
+            )
+        })?;
 
     // Find the lock
     let row = sqlx::query!(
@@ -1035,10 +1003,7 @@ async fn delete_lock(
     .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Lock not found"))?;
 
     let m = &row.metadata;
-    let lock_owner = m
-        .get("owner")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let lock_owner = m.get("owner").and_then(|v| v.as_str()).unwrap_or("");
 
     // Only the lock owner or force can unlock
     if lock_owner != username && !force {
@@ -1050,28 +1015,36 @@ async fn delete_lock(
 
     let lock_info = LockInfo {
         id: lock_id.clone(),
-        path: m.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        locked_at: m.get("locked_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        path: m
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        locked_at: m
+            .get("locked_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         owner: LockOwner {
             name: lock_owner.to_string(),
         },
     };
 
     // Delete the lock
-    sqlx::query!(
-        "DELETE FROM artifact_metadata WHERE id = $1",
-        row.row_id
-    )
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {}", e),
-        )
-    })?;
+    sqlx::query!("DELETE FROM artifact_metadata WHERE id = $1", row.row_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Database error: {}", e),
+            )
+        })?;
 
-    info!("Git LFS unlock: {} by {} (force: {})", lock_id, username, force);
+    info!(
+        "Git LFS unlock: {} by {} (force: {})",
+        lock_id, username, force
+    );
 
     let response = UnlockResponse { lock: lock_info };
     Ok(lfs_json_response(StatusCode::OK, &response))

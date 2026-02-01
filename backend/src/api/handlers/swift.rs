@@ -188,9 +188,8 @@ async fn list_releases(
     Path((repo_key, scope, name)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     // Validate the path via SwiftHandler
-    let _info = SwiftHandler::parse_path(&format!("{}/{}", scope, name)).map_err(|e| {
-        swift_error_response(StatusCode::BAD_REQUEST, &e.to_string())
-    })?;
+    let _info = SwiftHandler::parse_path(&format!("{}/{}", scope, name))
+        .map_err(|e| swift_error_response(StatusCode::BAD_REQUEST, &e.to_string()))?;
 
     let repo = resolve_swift_repo(&state.db, &repo_key).await?;
 
@@ -221,10 +220,7 @@ async fn list_releases(
     let mut releases = serde_json::Map::new();
     for artifact in &artifacts {
         let version = artifact.version.clone().unwrap_or_default();
-        let url = format!(
-            "/swift/{}/{}/{}/{}",
-            repo_key, scope, name, version
-        );
+        let url = format!("/swift/{}/{}/{}/{}", repo_key, scope, name, version);
         releases.insert(
             version,
             serde_json::json!({
@@ -306,10 +302,7 @@ async fn get_release_metadata(
     })?
     .ok_or_else(|| swift_error_response(StatusCode::NOT_FOUND, "Release not found"))?;
 
-    let archive_url = format!(
-        "/swift/{}/{}/{}/{}.zip",
-        repo_key, scope, name, version
-    );
+    let archive_url = format!("/swift/{}/{}/{}/{}.zip", repo_key, scope, name, version);
 
     let mut resources = vec![serde_json::json!({
         "name": "source-archive",
@@ -508,9 +501,8 @@ async fn publish_release(
     let repo = resolve_swift_repo(&state.db, &repo_key).await?;
 
     // Validate path
-    let _info = SwiftHandler::parse_path(&format!("{}/{}/{}", scope, name, version)).map_err(
-        |e| swift_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
-    )?;
+    let _info = SwiftHandler::parse_path(&format!("{}/{}/{}", scope, name, version))
+        .map_err(|e| swift_error_response(StatusCode::BAD_REQUEST, &e.to_string()))?;
 
     if body.is_empty() {
         return Err(swift_error_response(
@@ -633,7 +625,10 @@ async fn publish_release(
         scope, name, version, repo_key
     );
 
-    Ok(swift_json_response(StatusCode::CREATED, serde_json::json!({})))
+    Ok(swift_json_response(
+        StatusCode::CREATED,
+        serde_json::json!({}),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -682,10 +677,7 @@ async fn lookup_identifiers(
         )
     })?;
 
-    let identifiers: Vec<&str> = artifacts
-        .iter()
-        .map(|a| a.name.as_str())
-        .collect();
+    let identifiers: Vec<&str> = artifacts.iter().map(|a| a.name.as_str()).collect();
 
     let body = serde_json::json!({
         "identifiers": identifiers,

@@ -38,10 +38,7 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Upload flow (must be registered before the parameterized routes
         // so that literal segments match before `:name` captures them)
-        .route(
-            "/:repo_key/api/packages/versions/new",
-            post(new_upload_url),
-        )
+        .route("/:repo_key/api/packages/versions/new", post(new_upload_url))
         .route(
             "/:repo_key/api/packages/versions/newUpload",
             post(upload_package),
@@ -444,11 +441,7 @@ async fn upload_package(
     // Extract the tar.gz file from multipart form data
     let mut file_bytes: Option<bytes::Bytes> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid multipart: {}", e),
-        )
-            .into_response()
+        (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
@@ -463,8 +456,9 @@ async fn upload_package(
         }
     }
 
-    let body = file_bytes
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'file' field in upload").into_response())?;
+    let body = file_bytes.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "Missing 'file' field in upload").into_response()
+    })?;
 
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty package archive").into_response());
@@ -483,9 +477,11 @@ async fn upload_package(
     let pkg_version = &pubspec.version;
 
     if pkg_name.is_empty() || pkg_version.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Package name and version are required").into_response(),
-        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Package name and version are required",
+        )
+            .into_response());
     }
 
     // Compute SHA256
@@ -592,10 +588,7 @@ async fn upload_package(
     );
 
     // Redirect to finalize endpoint per the Pub spec
-    let finish_url = format!(
-        "/pub/{}/api/packages/versions/newUploadFinish",
-        repo_key
-    );
+    let finish_url = format!("/pub/{}/api/packages/versions/newUploadFinish", repo_key);
 
     Ok(Response::builder()
         .status(StatusCode::FOUND)
@@ -630,9 +623,7 @@ async fn finalize_upload(
 // ---------------------------------------------------------------------------
 
 /// Extract pubspec.yaml from a Pub package tar.gz archive.
-fn extract_pubspec_from_archive(
-    data: &[u8],
-) -> Result<crate::formats::r#pub::PubSpec, String> {
+fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::PubSpec, String> {
     use flate2::read::GzDecoder;
     use std::io::Read;
     use tar::Archive;
@@ -640,7 +631,9 @@ fn extract_pubspec_from_archive(
     let decoder = GzDecoder::new(data);
     let mut archive = Archive::new(decoder);
 
-    let entries = archive.entries().map_err(|e| format!("Failed to read archive: {}", e))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to read archive: {}", e))?;
 
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("Failed to read archive entry: {}", e))?;

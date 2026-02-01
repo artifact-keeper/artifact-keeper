@@ -76,7 +76,9 @@ fn extract_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok())
+        .and_then(|b64| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+        })
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -300,8 +302,16 @@ async fn binary_index(
     let mut index = String::new();
     for a in &artifacts {
         index.push_str(&format!("Package: {}\n", a.name));
-        index.push_str(&format!("Version: {}\n", a.version.clone().unwrap_or_default()));
-        if let Some(deps) = a.metadata.as_ref().and_then(|m| m.get("depends")).and_then(|v| v.as_str()) {
+        index.push_str(&format!(
+            "Version: {}\n",
+            a.version.clone().unwrap_or_default()
+        ));
+        if let Some(deps) = a
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("depends"))
+            .and_then(|v| v.as_str())
+        {
             index.push_str(&format!("Depends: {}\n", deps));
         }
         index.push('\n');
@@ -338,12 +348,12 @@ async fn upload_package(
         (StatusCode::BAD_REQUEST, format!("Invalid CRAN path: {}", e)).into_response()
     })?;
 
-    let pkg_name = path_info
-        .name
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Could not extract package name").into_response())?;
-    let pkg_version = path_info
-        .version
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Could not extract package version").into_response())?;
+    let pkg_name = path_info.name.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "Could not extract package name").into_response()
+    })?;
+    let pkg_version = path_info.version.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "Could not extract package version").into_response()
+    })?;
 
     // Compute SHA256
     let mut hasher = Sha256::new();
@@ -481,8 +491,16 @@ async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, 
     let mut index = String::new();
     for a in &artifacts {
         index.push_str(&format!("Package: {}\n", a.name));
-        index.push_str(&format!("Version: {}\n", a.version.clone().unwrap_or_default()));
-        if let Some(deps) = a.metadata.as_ref().and_then(|m| m.get("depends")).and_then(|v| v.as_str()) {
+        index.push_str(&format!(
+            "Version: {}\n",
+            a.version.clone().unwrap_or_default()
+        ));
+        if let Some(deps) = a
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("depends"))
+            .and_then(|v| v.as_str())
+        {
             index.push_str(&format!("Depends: {}\n", deps));
         }
         index.push('\n');

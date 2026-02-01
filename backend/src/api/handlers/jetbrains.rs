@@ -341,8 +341,7 @@ async fn plugin_updates(
             .into_response()
     })?;
 
-    let mut xml =
-        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plugin-updates>\n");
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plugin-updates>\n");
 
     for a in &artifacts {
         let version = a.version.clone().unwrap_or_default();
@@ -406,23 +405,23 @@ async fn upload_plugin(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let (file_bytes, plugin_name, plugin_version) =
-        if content_type.contains("multipart/form-data") {
-            extract_plugin_from_multipart(content_type, &body)?
-        } else {
-            // Raw upload - extract name/version from headers
-            let name = headers
-                .get("x-plugin-name")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string();
-            let version = headers
-                .get("x-plugin-version")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("0.0.0")
-                .to_string();
-            (body.clone(), name, version)
-        };
+    let (file_bytes, plugin_name, plugin_version) = if content_type.contains("multipart/form-data")
+    {
+        extract_plugin_from_multipart(content_type, &body)?
+    } else {
+        // Raw upload - extract name/version from headers
+        let name = headers
+            .get("x-plugin-name")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let version = headers
+            .get("x-plugin-version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0.0.0")
+            .to_string();
+        (body.clone(), name, version)
+    };
 
     if plugin_name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Plugin name is required").into_response());
@@ -453,16 +452,11 @@ async fn upload_plugin(
     })?;
 
     if existing.is_some() {
-        return Err(
-            (StatusCode::CONFLICT, "Plugin version already exists").into_response()
-        );
+        return Err((StatusCode::CONFLICT, "Plugin version already exists").into_response());
     }
 
     // Store the file
-    let storage_key = format!(
-        "jetbrains/{}/{}/{}",
-        plugin_name, plugin_version, filename
-    );
+    let storage_key = format!("jetbrains/{}/{}/{}", plugin_name, plugin_version, filename);
     let storage = FilesystemStorage::new(&repo.storage_path);
     storage
         .put(&storage_key, file_bytes.clone())
@@ -670,9 +664,7 @@ fn extract_plugin_from_multipart(
         .split("boundary=")
         .nth(1)
         .map(|b| b.trim().trim_matches('"'))
-        .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response()
-        })?;
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response())?;
 
     let boundary_marker = format!("--{}", boundary);
     let body_str = String::from_utf8_lossy(body);

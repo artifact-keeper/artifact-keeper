@@ -927,11 +927,8 @@ impl ScannerService {
                                 &checksum[..8.min(checksum.len())],
                             );
                             // Update quarantine status based on copied findings
-                            self.update_quarantine_status(
-                                artifact_id,
-                                reused.findings_count,
-                            )
-                            .await?;
+                            self.update_quarantine_status(artifact_id, reused.findings_count)
+                                .await?;
                             continue;
                         }
                         Err(e) => {
@@ -1058,16 +1055,17 @@ impl ScannerService {
     /// Fetch artifact content from filesystem storage.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
         // Look up the repository's storage_path
-        let storage_path: String = sqlx::query_scalar(
-            "SELECT storage_path FROM repositories WHERE id = $1",
-        )
-        .bind(artifact.repository_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(format!(
-            "Failed to fetch storage_path for repository {}: {}",
-            artifact.repository_id, e
-        )))?;
+        let storage_path: String =
+            sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
+                .bind(artifact.repository_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| {
+                    AppError::Database(format!(
+                        "Failed to fetch storage_path for repository {}: {}",
+                        artifact.repository_id, e
+                    ))
+                })?;
 
         // Create a FilesystemStorage for this repository and read the artifact
         let storage = FilesystemStorage::new(&storage_path);
@@ -1091,26 +1089,26 @@ impl ScannerService {
         artifact: &Artifact,
         content: &Bytes,
     ) -> Result<PathBuf> {
-        let workspace_dir = PathBuf::from(&self.scan_workspace_path)
-            .join(artifact.id.to_string());
+        let workspace_dir = PathBuf::from(&self.scan_workspace_path).join(artifact.id.to_string());
 
-        tokio::fs::create_dir_all(&workspace_dir).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to create scan workspace {}: {}",
-                workspace_dir.display(),
-                e
-            ))
-        })?;
+        tokio::fs::create_dir_all(&workspace_dir)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to create scan workspace {}: {}",
+                    workspace_dir.display(),
+                    e
+                ))
+            })?;
 
         let artifact_path = workspace_dir.join(&artifact.name);
 
         // Write the artifact content to the workspace
-        tokio::fs::write(&artifact_path, content).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to write artifact to scan workspace: {}",
-                e
-            ))
-        })?;
+        tokio::fs::write(&artifact_path, content)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!("Failed to write artifact to scan workspace: {}", e))
+            })?;
 
         // Extract archives if applicable
         let name_lower = artifact.name.to_lowercase();
@@ -1142,9 +1140,9 @@ impl ScannerService {
 
             let decoder = GzDecoder::new(content.as_ref());
             let mut archive = Archive::new(decoder);
-            archive.unpack(&target).map_err(|e| {
-                AppError::Storage(format!("Failed to extract tar.gz archive: {}", e))
-            })
+            archive
+                .unpack(&target)
+                .map_err(|e| AppError::Storage(format!("Failed to extract tar.gz archive: {}", e)))
         })
         .await
         .map_err(|e| AppError::Internal(format!("Archive extraction task failed: {}", e)))?
@@ -1159,9 +1157,8 @@ impl ScannerService {
             use std::io::Cursor;
 
             let reader = Cursor::new(content.as_ref());
-            let mut archive = zip::ZipArchive::new(reader).map_err(|e| {
-                AppError::Storage(format!("Failed to open zip archive: {}", e))
-            })?;
+            let mut archive = zip::ZipArchive::new(reader)
+                .map_err(|e| AppError::Storage(format!("Failed to open zip archive: {}", e)))?;
 
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i).map_err(|e| {
@@ -1183,9 +1180,8 @@ impl ScannerService {
                             AppError::Storage(format!("Failed to create parent directory: {}", e))
                         })?;
                     }
-                    let mut out_file = std::fs::File::create(&out_path).map_err(|e| {
-                        AppError::Storage(format!("Failed to create file: {}", e))
-                    })?;
+                    let mut out_file = std::fs::File::create(&out_path)
+                        .map_err(|e| AppError::Storage(format!("Failed to create file: {}", e)))?;
                     std::io::copy(&mut file, &mut out_file).map_err(|e| {
                         AppError::Storage(format!("Failed to write extracted file: {}", e))
                     })?;

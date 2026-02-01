@@ -68,11 +68,8 @@ impl AppState {
 
     /// Create an ArtifactService with the shared Meilisearch and scanner services.
     pub fn create_artifact_service(&self, storage: Arc<dyn StorageBackend>) -> ArtifactService {
-        let mut svc = ArtifactService::new_with_meili(
-            self.db.clone(),
-            storage,
-            self.meili_service.clone(),
-        );
+        let mut svc =
+            ArtifactService::new_with_meili(self.db.clone(), storage, self.meili_service.clone());
         if let Some(ref scanner) = self.scanner_service {
             svc.set_scanner_service(scanner.clone());
         }

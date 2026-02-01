@@ -78,7 +78,12 @@ impl MeiliService {
                 "content_type",
             ])
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to set artifacts searchable attributes: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to set artifacts searchable attributes: {}",
+                    e
+                ))
+            })?;
 
         artifacts_index
             .set_filterable_attributes([
@@ -90,39 +95,45 @@ impl MeiliService {
                 "created_at",
             ])
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to set artifacts filterable attributes: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to set artifacts filterable attributes: {}",
+                    e
+                ))
+            })?;
 
         artifacts_index
-            .set_sortable_attributes([
-                "created_at",
-                "size_bytes",
-                "name",
-                "download_count",
-            ])
+            .set_sortable_attributes(["created_at", "size_bytes", "name", "download_count"])
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to set artifacts sortable attributes: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to set artifacts sortable attributes: {}",
+                    e
+                ))
+            })?;
 
         // Configure repositories index
         let repos_index = self.client.index(REPOSITORIES_INDEX);
 
         repos_index
-            .set_searchable_attributes([
-                "name",
-                "key",
-                "description",
-                "format",
-            ])
+            .set_searchable_attributes(["name", "key", "description", "format"])
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to set repositories searchable attributes: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to set repositories searchable attributes: {}",
+                    e
+                ))
+            })?;
 
         repos_index
-            .set_filterable_attributes([
-                "format",
-                "repo_type",
-                "is_public",
-            ])
+            .set_filterable_attributes(["format", "repo_type", "is_public"])
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to set repositories filterable attributes: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to set repositories filterable attributes: {}",
+                    e
+                ))
+            })?;
 
         tracing::info!("Meilisearch indexes configured successfully");
         Ok(())
@@ -154,7 +165,9 @@ impl MeiliService {
             .index(ARTIFACTS_INDEX)
             .delete_document(artifact_id)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to remove artifact from index: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to remove artifact from index: {}", e))
+            })?;
         Ok(())
     }
 
@@ -164,7 +177,9 @@ impl MeiliService {
             .index(REPOSITORIES_INDEX)
             .delete_document(repository_id)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to remove repository from index: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to remove repository from index: {}", e))
+            })?;
         Ok(())
     }
 
@@ -195,11 +210,7 @@ impl MeiliService {
             .await
             .map_err(|e| AppError::Internal(format!("Artifact search failed: {}", e)))?;
 
-        let hits: Vec<ArtifactDocument> = results
-            .hits
-            .into_iter()
-            .map(|hit| hit.result)
-            .collect();
+        let hits: Vec<ArtifactDocument> = results.hits.into_iter().map(|hit| hit.result).collect();
 
         Ok(SearchResults {
             total_hits: results.estimated_total_hits.unwrap_or(hits.len()),
@@ -232,11 +243,8 @@ impl MeiliService {
             .await
             .map_err(|e| AppError::Internal(format!("Repository search failed: {}", e)))?;
 
-        let hits: Vec<RepositoryDocument> = results
-            .hits
-            .into_iter()
-            .map(|hit| hit.result)
-            .collect();
+        let hits: Vec<RepositoryDocument> =
+            results.hits.into_iter().map(|hit| hit.result).collect();
 
         Ok(SearchResults {
             total_hits: results.estimated_total_hits.unwrap_or(hits.len()),
@@ -319,10 +327,9 @@ impl MeiliService {
         let index = self.client.index(ARTIFACTS_INDEX);
 
         for chunk in documents.chunks(BATCH_SIZE) {
-            index
-                .add_documents(chunk, Some("id"))
-                .await
-                .map_err(|e| AppError::Internal(format!("Failed to batch index artifacts: {}", e)))?;
+            index.add_documents(chunk, Some("id")).await.map_err(|e| {
+                AppError::Internal(format!("Failed to batch index artifacts: {}", e))
+            })?;
         }
 
         tracing::info!("Artifact reindex complete: {} documents indexed", total);
@@ -352,7 +359,9 @@ impl MeiliService {
         )
         .fetch_all(db)
         .await
-        .map_err(|e| AppError::Database(format!("Failed to fetch repositories for reindex: {}", e)))?;
+        .map_err(|e| {
+            AppError::Database(format!("Failed to fetch repositories for reindex: {}", e))
+        })?;
 
         let total = rows.len();
         tracing::info!("Reindexing {} repositories", total);
@@ -374,10 +383,9 @@ impl MeiliService {
         let index = self.client.index(REPOSITORIES_INDEX);
 
         for chunk in documents.chunks(BATCH_SIZE) {
-            index
-                .add_documents(chunk, Some("id"))
-                .await
-                .map_err(|e| AppError::Internal(format!("Failed to batch index repositories: {}", e)))?;
+            index.add_documents(chunk, Some("id")).await.map_err(|e| {
+                AppError::Internal(format!("Failed to batch index repositories: {}", e))
+            })?;
         }
 
         tracing::info!("Repository reindex complete: {} documents indexed", total);

@@ -8,7 +8,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat, RepositoryType};
+use crate::models::repository::{
+    ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+};
 use crate::services::meili_service::{MeiliService, RepositoryDocument};
 
 /// Request to create a new repository
@@ -53,10 +55,7 @@ impl RepositoryService {
 
     /// Create a new repository service with Meilisearch indexing support.
     pub fn new_with_meili(db: PgPool, meili_service: Option<Arc<MeiliService>>) -> Self {
-        Self {
-            db,
-            meili_service,
-        }
+        Self { db, meili_service }
     }
 
     /// Set the Meilisearch service for search indexing.

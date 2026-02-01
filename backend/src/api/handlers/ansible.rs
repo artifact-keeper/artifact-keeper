@@ -36,10 +36,7 @@ use crate::storage::StorageBackend;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        .route(
-            "/:repo_key/api/v3/collections/",
-            get(list_collections),
-        )
+        .route("/:repo_key/api/v3/collections/", get(list_collections))
         .route(
             "/:repo_key/api/v3/collections/:namespace/:name/",
             get(collection_info),
@@ -52,10 +49,7 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/api/v3/collections/:namespace/:name/versions/:version/",
             get(version_info),
         )
-        .route(
-            "/:repo_key/download/*file_path",
-            get(download_collection),
-        )
+        .route("/:repo_key/download/*file_path", get(download_collection))
         .route(
             "/:repo_key/api/v3/artifacts/collections/",
             post(upload_collection),
@@ -251,9 +245,8 @@ async fn collection_info(
 
     // Validate via format handler
     let validate_path = format!("api/v3/collections/{}/{}", namespace, name);
-    let _ = AnsibleHandler::parse_path(&validate_path).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response()
-    })?;
+    let _ = AnsibleHandler::parse_path(&validate_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let collection_name = format!("{}-{}", namespace, name);
     let artifact = sqlx::query!(
@@ -403,9 +396,8 @@ async fn version_info(
         "api/v3/collections/{}/{}/versions/{}",
         namespace, name, version
     );
-    let _ = AnsibleHandler::parse_path(&validate_path).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response()
-    })?;
+    let _ = AnsibleHandler::parse_path(&validate_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let collection_name = format!("{}-{}", namespace, name);
     let artifact = sqlx::query!(
@@ -553,13 +545,11 @@ async fn upload_collection(
     let mut tarball: Option<bytes::Bytes> = None;
     let mut collection_json: Option<serde_json::Value> = None;
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Multipart error: {}", e),
-        )
-            .into_response()
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
+    {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "file" => {
@@ -591,9 +581,8 @@ async fn upload_collection(
         }
     }
 
-    let tarball = tarball.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing file field").into_response()
-    })?;
+    let tarball =
+        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
 
     if tarball.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
@@ -617,15 +606,15 @@ async fn upload_collection(
             .to_string();
         (namespace, name, version)
     } else {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Missing collection metadata JSON").into_response(),
-        );
+        return Err((StatusCode::BAD_REQUEST, "Missing collection metadata JSON").into_response());
     };
 
     if namespace.is_empty() || collection_name.is_empty() || collection_version.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Namespace, name, and version are required").into_response(),
-        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Namespace, name, and version are required",
+        )
+            .into_response());
     }
 
     // Validate via format handler
@@ -671,16 +660,11 @@ async fn upload_collection(
     })?;
 
     if existing.is_some() {
-        return Err(
-            (StatusCode::CONFLICT, "Collection version already exists").into_response(),
-        );
+        return Err((StatusCode::CONFLICT, "Collection version already exists").into_response());
     }
 
     // Store the file
-    let storage_key = format!(
-        "ansible/{}/{}/{}",
-        full_name, collection_version, filename
-    );
+    let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
     let storage = FilesystemStorage::new(&repo.storage_path);
     storage
         .put(&storage_key, tarball.clone())

@@ -541,10 +541,7 @@ impl EdgeService {
     ///
     /// Returns repo IDs where the effective priority (assignment override or
     /// repository default) is `immediate` and sync is enabled.
-    pub async fn get_repos_for_immediate_sync(
-        &self,
-        edge_node_id: Uuid,
-    ) -> Result<Vec<Uuid>> {
+    pub async fn get_repos_for_immediate_sync(&self, edge_node_id: Uuid) -> Result<Vec<Uuid>> {
         let repos = sqlx::query_scalar!(
             r#"
             SELECT era.repository_id

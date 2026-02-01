@@ -18,7 +18,10 @@ pub fn router() -> Router<SharedState> {
         .route("/init", post(init_transfer))
         .route("/:session_id/chunks", get(get_chunk_manifest))
         .route("/:session_id", get(get_session))
-        .route("/:session_id/chunk/:chunk_index/complete", post(complete_chunk))
+        .route(
+            "/:session_id/chunk/:chunk_index/complete",
+            post(complete_chunk),
+        )
         .route("/:session_id/chunk/:chunk_index/fail", post(fail_chunk))
         .route("/:session_id/chunk/:chunk_index/retry", post(retry_chunk))
         .route("/:session_id/complete", post(complete_session))
@@ -167,7 +170,9 @@ async fn fail_chunk(
     Json(body): Json<FailBody>,
 ) -> Result<()> {
     let service = TransferService::new(state.db.clone());
-    service.fail_chunk(session_id, chunk_index, &body.error).await
+    service
+        .fail_chunk(session_id, chunk_index, &body.error)
+        .await
 }
 
 /// POST /api/v1/edge-nodes/:id/transfer/:session_id/chunk/:chunk_index/retry

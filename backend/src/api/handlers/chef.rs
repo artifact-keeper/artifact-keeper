@@ -430,13 +430,11 @@ async fn upload_cookbook(
     let mut tarball: Option<bytes::Bytes> = None;
     let mut cookbook_json: Option<serde_json::Value> = None;
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Multipart error: {}", e),
-        )
-            .into_response()
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
+    {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "tarball" => {
@@ -468,9 +466,8 @@ async fn upload_cookbook(
         }
     }
 
-    let tarball = tarball.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing tarball field").into_response()
-    })?;
+    let tarball = tarball
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing tarball field").into_response())?;
 
     if tarball.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
@@ -495,15 +492,15 @@ async fn upload_cookbook(
         // Validate via format handler as fallback
         let path = "api/v1/cookbooks/unknown/versions/0.0.0";
         let _ = ChefHandler::parse_path(path);
-        return Err(
-            (StatusCode::BAD_REQUEST, "Missing cookbook metadata JSON").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "Missing cookbook metadata JSON").into_response());
     };
 
     if cookbook_name.is_empty() || cookbook_version.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Cookbook name and version are required").into_response(),
-        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Cookbook name and version are required",
+        )
+            .into_response());
     }
 
     // Validate via format handler
@@ -512,11 +509,7 @@ async fn upload_cookbook(
         cookbook_name, cookbook_version
     );
     let _ = ChefHandler::parse_path(&validate_path).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid cookbook: {}", e),
-        )
-            .into_response()
+        (StatusCode::BAD_REQUEST, format!("Invalid cookbook: {}", e)).into_response()
     })?;
 
     let filename = format!("{}-{}.tar.gz", cookbook_name, cookbook_version);
@@ -545,16 +538,11 @@ async fn upload_cookbook(
     })?;
 
     if existing.is_some() {
-        return Err(
-            (StatusCode::CONFLICT, "Cookbook version already exists").into_response()
-        );
+        return Err((StatusCode::CONFLICT, "Cookbook version already exists").into_response());
     }
 
     // Store the file
-    let storage_key = format!(
-        "chef/{}/{}/{}",
-        cookbook_name, cookbook_version, filename
-    );
+    let storage_key = format!("chef/{}/{}/{}", cookbook_name, cookbook_version, filename);
     let storage = FilesystemStorage::new(&repo.storage_path);
     storage
         .put(&storage_key, tarball.clone())

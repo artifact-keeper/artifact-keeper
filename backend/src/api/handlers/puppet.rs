@@ -35,10 +35,7 @@ use crate::storage::StorageBackend;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        .route(
-            "/:repo_key/v3/modules/:owner_name",
-            get(module_info),
-        )
+        .route("/:repo_key/v3/modules/:owner_name", get(module_info))
         .route(
             "/:repo_key/v3/modules/:owner_name/releases",
             get(release_list),
@@ -47,10 +44,7 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v3/releases/:owner_name_version",
             get(release_info),
         )
-        .route(
-            "/:repo_key/v3/files/*file_path",
-            get(download_module),
-        )
+        .route("/:repo_key/v3/files/*file_path", get(download_module))
         .route("/:repo_key/v3/releases", post(publish_module))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
@@ -167,9 +161,7 @@ fn parse_owner_name(s: &str) -> Result<(String, String), Response> {
     let name = s[first_hyphen + 1..].to_string();
 
     if owner.is_empty() || name.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Owner and name must not be empty").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "Owner and name must not be empty").into_response());
     }
 
     Ok((owner, name))
@@ -206,9 +198,11 @@ fn parse_owner_name_version(s: &str) -> Result<(String, String, String), Respons
     let version = remainder[last_hyphen + 1..].to_string();
 
     if owner.is_empty() || name.is_empty() || version.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Owner, name, and version must not be empty").into_response(),
-        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Owner, name, and version must not be empty",
+        )
+            .into_response());
     }
 
     Ok((owner, name, version))
@@ -227,9 +221,8 @@ async fn module_info(
 
     // Validate via format handler
     let validate_path = format!("v3/modules/{}-{}", owner, name);
-    let _ = PuppetHandler::parse_path(&validate_path).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response()
-    })?;
+    let _ = PuppetHandler::parse_path(&validate_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let artifact = sqlx::query!(
         r#"
@@ -363,9 +356,8 @@ async fn release_info(
 
     // Validate via format handler
     let validate_path = format!("v3/releases/{}-{}-{}", owner, name, version);
-    let _ = PuppetHandler::parse_path(&validate_path).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response()
-    })?;
+    let _ = PuppetHandler::parse_path(&validate_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let module_name = format!("{}-{}", owner, name);
     let artifact = sqlx::query!(
@@ -508,13 +500,11 @@ async fn publish_module(
     let mut tarball: Option<bytes::Bytes> = None;
     let mut module_json: Option<serde_json::Value> = None;
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Multipart error: {}", e),
-        )
-            .into_response()
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
+    {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "file" => {
@@ -546,9 +536,8 @@ async fn publish_module(
         }
     }
 
-    let tarball = tarball.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing file field").into_response()
-    })?;
+    let tarball =
+        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
 
     if tarball.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
@@ -573,26 +562,21 @@ async fn publish_module(
             .to_string();
         (owner, name, version)
     } else {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Missing module metadata JSON").into_response()
-        );
+        return Err((StatusCode::BAD_REQUEST, "Missing module metadata JSON").into_response());
     };
 
     if owner.is_empty() || module_name.is_empty() || module_version.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Owner, name, and version are required").into_response(),
-        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Owner, name, and version are required",
+        )
+            .into_response());
     }
 
     // Validate via format handler
     let validate_path = format!("v3/releases/{}-{}-{}", owner, module_name, module_version);
-    let _ = PuppetHandler::parse_path(&validate_path).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid module: {}", e),
-        )
-            .into_response()
-    })?;
+    let _ = PuppetHandler::parse_path(&validate_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid module: {}", e)).into_response())?;
 
     let full_name = format!("{}-{}", owner, module_name);
     let filename = format!("{}-{}-{}.tar.gz", owner, module_name, module_version);
@@ -621,16 +605,11 @@ async fn publish_module(
     })?;
 
     if existing.is_some() {
-        return Err(
-            (StatusCode::CONFLICT, "Module version already exists").into_response()
-        );
+        return Err((StatusCode::CONFLICT, "Module version already exists").into_response());
     }
 
     // Store the file
-    let storage_key = format!(
-        "puppet/{}/{}/{}",
-        full_name, module_version, filename
-    );
+    let storage_key = format!("puppet/{}/{}/{}", full_name, module_version, filename);
     let storage = FilesystemStorage::new(&repo.storage_path);
     storage
         .put(&storage_key, tarball.clone())

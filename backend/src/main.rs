@@ -84,13 +84,17 @@ async fn main() -> Result<()> {
                     tokio::spawn(async move {
                         match svc.is_index_empty().await {
                             Ok(true) => {
-                                tracing::info!("Meilisearch index is empty, starting background reindex");
+                                tracing::info!(
+                                    "Meilisearch index is empty, starting background reindex"
+                                );
                                 if let Err(e) = svc.full_reindex(&pool).await {
                                     tracing::warn!("Background reindex failed: {}", e);
                                 }
                             }
                             Ok(false) => {
-                                tracing::info!("Meilisearch index already populated, skipping reindex");
+                                tracing::info!(
+                                    "Meilisearch index already populated, skipping reindex"
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to check Meilisearch index status: {}", e);
@@ -100,7 +104,10 @@ async fn main() -> Result<()> {
                     Some(service)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to configure Meilisearch indexes, continuing without search: {}", e);
+                    tracing::warn!(
+                        "Failed to configure Meilisearch indexes, continuing without search: {}",
+                        e
+                    );
                     None
                 }
             }

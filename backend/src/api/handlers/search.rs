@@ -291,10 +291,9 @@ pub async fn checksum_search(
     }
 
     let artifacts = match algorithm {
-        "sha256" => {
-            sqlx::query_as!(
-                ChecksumRow,
-                r#"
+        "sha256" => sqlx::query_as!(
+            ChecksumRow,
+            r#"
                 SELECT
                     a.id,
                     r.key AS repository_key,
@@ -315,16 +314,14 @@ pub async fn checksum_search(
                   AND a.checksum_sha256 = $1
                 ORDER BY a.created_at DESC
                 "#,
-                checksum
-            )
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-        }
-        "sha1" => {
-            sqlx::query_as!(
-                ChecksumRow,
-                r#"
+            checksum
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?,
+        "sha1" => sqlx::query_as!(
+            ChecksumRow,
+            r#"
                 SELECT
                     a.id,
                     r.key AS repository_key,
@@ -345,16 +342,14 @@ pub async fn checksum_search(
                   AND a.checksum_sha1 = $1
                 ORDER BY a.created_at DESC
                 "#,
-                checksum
-            )
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-        }
-        "md5" => {
-            sqlx::query_as!(
-                ChecksumRow,
-                r#"
+            checksum
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?,
+        "md5" => sqlx::query_as!(
+            ChecksumRow,
+            r#"
                 SELECT
                     a.id,
                     r.key AS repository_key,
@@ -375,12 +370,11 @@ pub async fn checksum_search(
                   AND a.checksum_md5 = $1
                 ORDER BY a.created_at DESC
                 "#,
-                checksum
-            )
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-        }
+            checksum
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?,
         other => {
             return Err(AppError::Validation(format!(
                 "Unsupported checksum algorithm: {other}. Use sha256, sha1, or md5."

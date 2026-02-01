@@ -164,9 +164,8 @@ async fn get_podspec(
 
     // Validate via the format handler
     let full_path = format!("Specs/{}/{}/{}", name, version, podspec_file);
-    let path_info = CocoaPodsHandler::parse_path(&full_path).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response()
-    })?;
+    let path_info = CocoaPodsHandler::parse_path(&full_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     // Find the artifact
     let artifact = sqlx::query!(
@@ -246,9 +245,8 @@ async fn download_pod(
 
     // Parse the pod path to extract name and version
     let full_path = format!("pods/{}", filename);
-    let path_info = CocoaPodsHandler::parse_path(&full_path).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response()
-    })?;
+    let path_info = CocoaPodsHandler::parse_path(&full_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     // Find artifact by name and version
     let artifact = sqlx::query!(
@@ -337,9 +335,7 @@ async fn push_pod(
     let pod_version = &podspec.version;
 
     if pod_name.is_empty() || pod_version.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Pod name and version are required").into_response(),
-        );
+        return Err((StatusCode::BAD_REQUEST, "Pod name and version are required").into_response());
     }
 
     let filename = format!("{}-{}.tar.gz", pod_name, pod_version);
@@ -373,16 +369,13 @@ async fn push_pod(
     // Store the pod archive
     let storage_key = format!("cocoapods/{}/{}/{}", pod_name, pod_version, filename);
     let storage = FilesystemStorage::new(&repo.storage_path);
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    storage.put(&storage_key, body.clone()).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
 
     // Also store the podspec JSON separately for direct retrieval
     let podspec_key = format!(
@@ -552,7 +545,9 @@ fn extract_podspec_from_archive(data: &[u8]) -> Result<PodSpec, String> {
     let gz = GzDecoder::new(data);
     let mut archive = Archive::new(gz);
 
-    let entries = archive.entries().map_err(|e| format!("Failed to read archive: {}", e))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to read archive: {}", e))?;
 
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;

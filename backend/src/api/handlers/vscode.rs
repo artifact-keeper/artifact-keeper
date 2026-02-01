@@ -67,7 +67,9 @@ fn extract_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Basic ").or(v.strip_prefix("basic ")))
-        .and_then(|b64| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok())
+        .and_then(|b64| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+        })
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|s| {
             let mut parts = s.splitn(2, ':');
@@ -317,24 +319,14 @@ async fn publish_extension(
         .get("x-publisher")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Missing x-publisher header",
-            )
-                .into_response()
-        })?;
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing x-publisher header").into_response())?;
 
     let ext_name = headers
         .get("x-extension-name")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
         .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Missing x-extension-name header",
-            )
-                .into_response()
+            (StatusCode::BAD_REQUEST, "Missing x-extension-name header").into_response()
         })?;
 
     let ext_version = headers

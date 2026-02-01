@@ -29,8 +29,7 @@ struct ReplicationTestServer {
 
 impl ReplicationTestServer {
     fn new() -> Self {
-        let base_url =
-            env::var("TEST_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:9080".into());
+        let base_url = env::var("TEST_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:9080".into());
         Self {
             base_url,
             access_token: String::new(),
@@ -140,7 +139,10 @@ impl ReplicationTestServer {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await?;
-            eprintln!("Warning: failed to delete edge node {}: {} - {}", id, status, text);
+            eprintln!(
+                "Warning: failed to delete edge node {}: {} - {}",
+                id, status, text
+            );
         }
         Ok(())
     }
@@ -335,7 +337,11 @@ impl ReplicationTestServer {
         } else {
             let status = resp.status();
             let text = resp.text().await?;
-            Err(format!("Complete chunk {} failed: {} - {}", chunk_index, status, text).into())
+            Err(format!(
+                "Complete chunk {} failed: {} - {}",
+                chunk_index, status, text
+            )
+            .into())
         }
     }
 
@@ -690,7 +696,9 @@ mod tests {
 
         // If tasks were auto-queued, verify the priority level
         for task in &tasks {
-            let priority = task["priority"].as_i64().expect("priority should be a number");
+            let priority = task["priority"]
+                .as_i64()
+                .expect("priority should be a number");
             // P0 = immediate (highest priority)
             assert!(
                 priority >= 0,
@@ -754,9 +762,7 @@ mod tests {
             .expect("Failed to init transfer session");
 
         let session_id = session["id"].as_str().expect("No session id");
-        let total_chunks = session["total_chunks"]
-            .as_i64()
-            .expect("No total_chunks") as i32;
+        let total_chunks = session["total_chunks"].as_i64().expect("No total_chunks") as i32;
 
         assert!(total_chunks > 0, "Should have at least 1 chunk");
         assert_eq!(
@@ -783,9 +789,7 @@ mod tests {
         // Complete each chunk
         for chunk in chunks {
             let chunk_index = chunk["chunk_index"].as_i64().expect("No chunk_index") as i32;
-            let checksum = chunk["checksum"]
-                .as_str()
-                .unwrap_or("placeholder-checksum");
+            let checksum = chunk["checksum"].as_str().unwrap_or("placeholder-checksum");
 
             server
                 .complete_chunk(node_id, session_id, chunk_index, checksum)
@@ -892,10 +896,7 @@ mod tests {
             .await
             .expect("Failed to discover peers from node 1");
 
-        let peer_ids: Vec<&str> = peers
-            .iter()
-            .filter_map(|p| p["node_id"].as_str())
-            .collect();
+        let peer_ids: Vec<&str> = peers.iter().filter_map(|p| p["node_id"].as_str()).collect();
 
         assert!(
             peer_ids.contains(&node2_id),
@@ -937,10 +938,7 @@ mod tests {
             .await
             .expect("Failed to get scored peers");
 
-        assert!(
-            !scored.is_empty(),
-            "Should have at least one scored peer"
-        );
+        assert!(!scored.is_empty(), "Should have at least one scored peer");
 
         // If both peers are scored, node 2 (10ms latency) should score >= node 3 (50ms)
         if scored.len() >= 2 {
@@ -1006,10 +1004,7 @@ mod tests {
         // but the request should succeed without error).
         let resp = server
             .client
-            .get(format!(
-                "{}/api/v1/edge-nodes/{}",
-                server.base_url, node_id
-            ))
+            .get(format!("{}/api/v1/edge-nodes/{}", server.base_url, node_id))
             .header("Authorization", server.auth_header())
             .send()
             .await
@@ -1063,10 +1058,7 @@ mod tests {
         // Verify node is still accessible after heartbeat
         let resp = server
             .client
-            .get(format!(
-                "{}/api/v1/edge-nodes/{}",
-                server.base_url, node_id
-            ))
+            .get(format!("{}/api/v1/edge-nodes/{}", server.base_url, node_id))
             .header("Authorization", server.auth_header())
             .send()
             .await

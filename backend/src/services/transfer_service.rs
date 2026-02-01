@@ -247,12 +247,7 @@ impl TransferService {
     }
 
     /// Mark a chunk as failed.
-    pub async fn fail_chunk(
-        &self,
-        session_id: Uuid,
-        chunk_index: i32,
-        error: &str,
-    ) -> Result<()> {
+    pub async fn fail_chunk(&self, session_id: Uuid, chunk_index: i32, error: &str) -> Result<()> {
         sqlx::query!(
             r#"
             UPDATE transfer_chunks
@@ -352,7 +347,10 @@ impl TransferService {
         total_chunks: i32,
     ) -> Result<()> {
         // Count set bits
-        let available_chunks = chunk_bitmap.iter().map(|b| b.count_ones() as i32).sum::<i32>();
+        let available_chunks = chunk_bitmap
+            .iter()
+            .map(|b| b.count_ones() as i32)
+            .sum::<i32>();
 
         sqlx::query!(
             r#"

@@ -192,10 +192,7 @@ async fn package_info(
         .iter()
         .map(|a| {
             let version = a.version.clone().unwrap_or_default();
-            let tarball_url = format!(
-                "/hex/{}/tarballs/{}-{}.tar",
-                repo_key, name, version
-            );
+            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
 
             serde_json::json!({
                 "version": version,
@@ -315,7 +312,11 @@ async fn publish_package(
     // Validate the tarball path using the HexHandler
     let tarball_path = format!("tarballs/package-0.0.0.tar");
     HexHandler::parse_path(&tarball_path).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid hex package: {}", e)).into_response()
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid hex package: {}", e),
+        )
+            .into_response()
     })?;
 
     // Extract package name and version from the tarball metadata.
@@ -327,13 +328,19 @@ async fn publish_package(
     //   - contents.tar.gz (the actual package files)
     //   - CHECKSUM (SHA-256 of the above)
     let (pkg_name, pkg_version) = extract_name_version_from_tarball(&body).map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid hex tarball: {}", e)).into_response()
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid hex tarball: {}", e),
+        )
+            .into_response()
     })?;
 
     if pkg_name.is_empty() || pkg_version.is_empty() {
-        return Err(
-            (StatusCode::BAD_REQUEST, "Package name and version are required").into_response(),
-        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Package name and version are required",
+        )
+            .into_response());
     }
 
     let filename = format!("{}-{}.tar", pkg_name, pkg_version);

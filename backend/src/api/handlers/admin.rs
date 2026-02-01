@@ -562,9 +562,10 @@ pub async fn trigger_reindex(
         ));
     }
 
-    let meili = state.meili_service.as_ref().ok_or_else(|| {
-        AppError::Internal("Meilisearch is not configured".to_string())
-    })?;
+    let meili = state
+        .meili_service
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Meilisearch is not configured".to_string()))?;
 
     // Count artifacts and repositories before reindex so we can report counts
     let artifact_stats = sqlx::query!(

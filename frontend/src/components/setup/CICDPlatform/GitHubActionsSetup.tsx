@@ -1,4 +1,3 @@
-/* eslint-disable no-useless-escape */
 import React from 'react';
 import { Typography, Space, Divider, Alert, Collapse } from 'antd';
 import { SettingOutlined, KeyOutlined, FileTextOutlined } from '@ant-design/icons';

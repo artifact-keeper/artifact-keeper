@@ -43,15 +43,11 @@ impl TrivyFsScanner {
         }
 
         // Use the original filename from the path for extension detection
-        let original_filename = artifact
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&artifact.name);
+        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let name_lower = original_filename.to_lowercase();
         let scannable_extensions = [
-            ".tar.gz", ".tgz", ".whl", ".jar", ".war", ".ear", ".gem", ".crate", ".nupkg",
-            ".zip", ".deb", ".rpm", ".apk", ".egg", ".pex",
+            ".tar.gz", ".tgz", ".whl", ".jar", ".war", ".ear", ".gem", ".crate", ".nupkg", ".zip",
+            ".deb", ".rpm", ".apk", ".egg", ".pex",
             // Lock files and manifests that Trivy can parse directly
             ".lock", ".toml", ".json", ".xml", ".txt", ".cfg", ".ini",
         ];
@@ -67,22 +63,14 @@ impl TrivyFsScanner {
     }
 
     /// Prepare the scan workspace: write artifact content and extract archives.
-    async fn prepare_workspace(
-        &self,
-        artifact: &Artifact,
-        content: &Bytes,
-    ) -> Result<PathBuf> {
+    async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
         let workspace = self.workspace_dir(artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
         // Use the original filename from the path (last segment) for correct extension detection
-        let original_filename = artifact
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&artifact.name);
+        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let artifact_path = workspace.join(original_filename);
 
         tokio::fs::write(&artifact_path, content)
@@ -128,38 +116,49 @@ impl TrivyFsScanner {
             .to_string_lossy()
             .to_lowercase();
 
-        let output = if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
-            tokio::process::Command::new("tar")
-                .args(["xzf", &archive_path.to_string_lossy(), "-C", &dest.to_string_lossy()])
-                .output()
-                .await
-        } else if name.ends_with(".zip")
-            || name.ends_with(".whl")
-            || name.ends_with(".jar")
-            || name.ends_with(".war")
-            || name.ends_with(".ear")
-            || name.ends_with(".nupkg")
-            || name.ends_with(".egg")
-        {
-            tokio::process::Command::new("unzip")
-                .args([
-                    "-o",
-                    "-q",
-                    &archive_path.to_string_lossy(),
-                    "-d",
-                    &dest.to_string_lossy(),
-                ])
-                .output()
-                .await
-        } else if name.ends_with(".gem") {
-            // Ruby gems are tar archives with a data.tar.gz inside
-            tokio::process::Command::new("tar")
-                .args(["xf", &archive_path.to_string_lossy(), "-C", &dest.to_string_lossy()])
-                .output()
-                .await
-        } else {
-            return Ok(());
-        };
+        let output =
+            if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
+                tokio::process::Command::new("tar")
+                    .args([
+                        "xzf",
+                        &archive_path.to_string_lossy(),
+                        "-C",
+                        &dest.to_string_lossy(),
+                    ])
+                    .output()
+                    .await
+            } else if name.ends_with(".zip")
+                || name.ends_with(".whl")
+                || name.ends_with(".jar")
+                || name.ends_with(".war")
+                || name.ends_with(".ear")
+                || name.ends_with(".nupkg")
+                || name.ends_with(".egg")
+            {
+                tokio::process::Command::new("unzip")
+                    .args([
+                        "-o",
+                        "-q",
+                        &archive_path.to_string_lossy(),
+                        "-d",
+                        &dest.to_string_lossy(),
+                    ])
+                    .output()
+                    .await
+            } else if name.ends_with(".gem") {
+                // Ruby gems are tar archives with a data.tar.gz inside
+                tokio::process::Command::new("tar")
+                    .args([
+                        "xf",
+                        &archive_path.to_string_lossy(),
+                        "-C",
+                        &dest.to_string_lossy(),
+                    ])
+                    .output()
+                    .await
+            } else {
+                return Ok(());
+            };
 
         match output {
             Ok(o) if o.status.success() => Ok(()),
@@ -210,9 +209,7 @@ impl TrivyFsScanner {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("not found") || stderr.contains("No such file") {
-                return Err(AppError::Internal(
-                    "Trivy CLI not available".to_string(),
-                ));
+                return Err(AppError::Internal("Trivy CLI not available".to_string()));
             }
             return Err(AppError::Internal(format!(
                 "Trivy filesystem scan failed (exit {}): {}",
@@ -273,10 +270,7 @@ impl TrivyFsScanner {
                         title,
                         description: vuln.description.clone(),
                         cve_id: Some(vuln.vulnerability_id.clone()),
-                        affected_component: Some(format!(
-                            "{} ({})",
-                            vuln.pkg_name, result.target
-                        )),
+                        affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
                         affected_version: Some(vuln.installed_version.clone()),
                         fixed_version: vuln.fixed_version.clone(),
                         source: Some("trivy-filesystem".to_string()),
@@ -381,25 +375,41 @@ mod tests {
 
     #[test]
     fn test_is_applicable_tar_gz() {
-        let artifact = make_artifact("my-lib-1.0.0.tar.gz", "application/gzip", "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz");
+        let artifact = make_artifact(
+            "my-lib-1.0.0.tar.gz",
+            "application/gzip",
+            "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
+        );
         assert!(TrivyFsScanner::is_applicable(&artifact));
     }
 
     #[test]
     fn test_is_applicable_wheel() {
-        let artifact = make_artifact("my_lib-1.0.0-py3-none-any.whl", "application/zip", "pypi/my-lib/1.0.0/my_lib-1.0.0-py3-none-any.whl");
+        let artifact = make_artifact(
+            "my_lib-1.0.0-py3-none-any.whl",
+            "application/zip",
+            "pypi/my-lib/1.0.0/my_lib-1.0.0-py3-none-any.whl",
+        );
         assert!(TrivyFsScanner::is_applicable(&artifact));
     }
 
     #[test]
     fn test_is_applicable_jar() {
-        let artifact = make_artifact("myapp-1.0.0.jar", "application/java-archive", "maven/com/example/myapp/1.0.0/myapp-1.0.0.jar");
+        let artifact = make_artifact(
+            "myapp-1.0.0.jar",
+            "application/java-archive",
+            "maven/com/example/myapp/1.0.0/myapp-1.0.0.jar",
+        );
         assert!(TrivyFsScanner::is_applicable(&artifact));
     }
 
     #[test]
     fn test_is_applicable_crate() {
-        let artifact = make_artifact("my-crate-1.0.0.crate", "application/gzip", "crates/my-crate/1.0.0/my-crate-1.0.0.crate");
+        let artifact = make_artifact(
+            "my-crate-1.0.0.crate",
+            "application/gzip",
+            "crates/my-crate/1.0.0/my-crate-1.0.0.crate",
+        );
         assert!(TrivyFsScanner::is_applicable(&artifact));
     }
 
@@ -444,18 +454,16 @@ mod tests {
                 target: "requirements.txt".to_string(),
                 class: "lang-pkgs".to_string(),
                 result_type: "pip".to_string(),
-                vulnerabilities: Some(vec![
-                    crate::services::image_scanner::TrivyVulnerability {
-                        vulnerability_id: "CVE-2023-12345".to_string(),
-                        pkg_name: "requests".to_string(),
-                        installed_version: "2.28.0".to_string(),
-                        fixed_version: Some("2.31.0".to_string()),
-                        severity: "HIGH".to_string(),
-                        title: Some("SSRF in requests".to_string()),
-                        description: Some("A vulnerability in requests allows SSRF".to_string()),
-                        primary_url: Some("https://avd.aquasec.com/nvd/cve-2023-12345".to_string()),
-                    },
-                ]),
+                vulnerabilities: Some(vec![crate::services::image_scanner::TrivyVulnerability {
+                    vulnerability_id: "CVE-2023-12345".to_string(),
+                    pkg_name: "requests".to_string(),
+                    installed_version: "2.28.0".to_string(),
+                    fixed_version: Some("2.31.0".to_string()),
+                    severity: "HIGH".to_string(),
+                    title: Some("SSRF in requests".to_string()),
+                    description: Some("A vulnerability in requests allows SSRF".to_string()),
+                    primary_url: Some("https://avd.aquasec.com/nvd/cve-2023-12345".to_string()),
+                }]),
             }],
         };
 
@@ -464,6 +472,10 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::High);
         assert_eq!(findings[0].cve_id, Some("CVE-2023-12345".to_string()));
         assert_eq!(findings[0].source, Some("trivy-filesystem".to_string()));
-        assert!(findings[0].affected_component.as_ref().unwrap().contains("requests"));
+        assert!(findings[0]
+            .affected_component
+            .as_ref()
+            .unwrap()
+            .contains("requests"));
     }
 }

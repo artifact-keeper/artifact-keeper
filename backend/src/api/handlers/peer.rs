@@ -25,7 +25,10 @@ pub fn peer_router() -> Router<SharedState> {
 /// Create chunk availability routes (nested under /api/v1/edge-nodes/:id/chunks)
 pub fn chunk_router() -> Router<SharedState> {
     Router::new()
-        .route("/:artifact_id", get(get_chunk_availability).put(update_chunk_availability))
+        .route(
+            "/:artifact_id",
+            get(get_chunk_availability).put(update_chunk_availability),
+        )
         .route("/:artifact_id/peers", get(get_peers_with_chunks))
         .route("/:artifact_id/scored-peers", get(get_scored_peers))
 }
@@ -315,14 +318,18 @@ async fn update_network_profile(
         .as_ref()
         .map(|s| s.parse::<chrono::NaiveTime>())
         .transpose()
-        .map_err(|e| crate::error::AppError::Validation(format!("Invalid sync_window_start: {}", e)))?;
+        .map_err(|e| {
+            crate::error::AppError::Validation(format!("Invalid sync_window_start: {}", e))
+        })?;
 
     let window_end = body
         .sync_window_end
         .as_ref()
         .map(|s| s.parse::<chrono::NaiveTime>())
         .transpose()
-        .map_err(|e| crate::error::AppError::Validation(format!("Invalid sync_window_end: {}", e)))?;
+        .map_err(|e| {
+            crate::error::AppError::Validation(format!("Invalid sync_window_end: {}", e))
+        })?;
 
     sqlx::query!(
         r#"

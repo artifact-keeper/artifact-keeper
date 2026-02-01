@@ -133,10 +133,7 @@ pub struct ScanResponse {
 }
 
 /// Batch-lookup artifact name/version and enrich scan results into responses.
-async fn enrich_scans(
-    db: &PgPool,
-    scans: Vec<ScanResult>,
-) -> Result<Vec<ScanResponse>> {
+async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanResponse>> {
     let artifact_ids: Vec<Uuid> = scans.iter().map(|s| s.artifact_id).collect();
     let artifact_info: std::collections::HashMap<Uuid, (String, Option<String>)> =
         if !artifact_ids.is_empty() {
@@ -377,7 +374,10 @@ async fn trigger_scan(
             }
         });
         Ok(Json(TriggerScanResponse {
-            message: format!("Repository scan queued for {} ({} artifacts)", repository_id, count),
+            message: format!(
+                "Repository scan queued for {} ({} artifacts)",
+                repository_id, count
+            ),
             artifacts_queued: count as u32,
         }))
     } else {

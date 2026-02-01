@@ -79,22 +79,14 @@ impl GrypeScanner {
     }
 
     /// Prepare the scan workspace: write artifact content and extract archives.
-    async fn prepare_workspace(
-        &self,
-        artifact: &Artifact,
-        content: &Bytes,
-    ) -> Result<PathBuf> {
+    async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
         let workspace = self.workspace_dir(artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
         // Use the original filename from the path (last segment) for correct extension detection
-        let original_filename = artifact
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&artifact.name);
+        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let artifact_path = workspace.join(original_filename);
 
         tokio::fs::write(&artifact_path, content)
@@ -140,37 +132,48 @@ impl GrypeScanner {
             .to_string_lossy()
             .to_lowercase();
 
-        let output = if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
-            tokio::process::Command::new("tar")
-                .args(["xzf", &archive_path.to_string_lossy(), "-C", &dest.to_string_lossy()])
-                .output()
-                .await
-        } else if name.ends_with(".zip")
-            || name.ends_with(".whl")
-            || name.ends_with(".jar")
-            || name.ends_with(".war")
-            || name.ends_with(".ear")
-            || name.ends_with(".nupkg")
-            || name.ends_with(".egg")
-        {
-            tokio::process::Command::new("unzip")
-                .args([
-                    "-o",
-                    "-q",
-                    &archive_path.to_string_lossy(),
-                    "-d",
-                    &dest.to_string_lossy(),
-                ])
-                .output()
-                .await
-        } else if name.ends_with(".gem") {
-            tokio::process::Command::new("tar")
-                .args(["xf", &archive_path.to_string_lossy(), "-C", &dest.to_string_lossy()])
-                .output()
-                .await
-        } else {
-            return Ok(());
-        };
+        let output =
+            if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
+                tokio::process::Command::new("tar")
+                    .args([
+                        "xzf",
+                        &archive_path.to_string_lossy(),
+                        "-C",
+                        &dest.to_string_lossy(),
+                    ])
+                    .output()
+                    .await
+            } else if name.ends_with(".zip")
+                || name.ends_with(".whl")
+                || name.ends_with(".jar")
+                || name.ends_with(".war")
+                || name.ends_with(".ear")
+                || name.ends_with(".nupkg")
+                || name.ends_with(".egg")
+            {
+                tokio::process::Command::new("unzip")
+                    .args([
+                        "-o",
+                        "-q",
+                        &archive_path.to_string_lossy(),
+                        "-d",
+                        &dest.to_string_lossy(),
+                    ])
+                    .output()
+                    .await
+            } else if name.ends_with(".gem") {
+                tokio::process::Command::new("tar")
+                    .args([
+                        "xf",
+                        &archive_path.to_string_lossy(),
+                        "-C",
+                        &dest.to_string_lossy(),
+                    ])
+                    .output()
+                    .await
+            } else {
+                return Ok(());
+            };
 
         match output {
             Ok(o) if o.status.success() => Ok(()),
@@ -372,7 +375,9 @@ mod tests {
                         versions: vec!["2.0.0".to_string()],
                         state: Some("fixed".to_string()),
                     }),
-                    urls: Some(vec!["https://nvd.nist.gov/vuln/detail/CVE-2023-99999".to_string()]),
+                    urls: Some(vec![
+                        "https://nvd.nist.gov/vuln/detail/CVE-2023-99999".to_string()
+                    ]),
                 },
                 artifact: GrypeArtifact {
                     name: "vulnerable-pkg".to_string(),
@@ -388,10 +393,22 @@ mod tests {
         assert_eq!(findings[0].cve_id, Some("CVE-2023-99999".to_string()));
         assert_eq!(findings[0].fixed_version, Some("2.0.0".to_string()));
         assert_eq!(findings[0].source, Some("grype".to_string()));
-        assert!(findings[0].affected_component.as_ref().unwrap().contains("vulnerable-pkg"));
-        assert!(findings[0].affected_component.as_ref().unwrap().contains("python"));
+        assert!(findings[0]
+            .affected_component
+            .as_ref()
+            .unwrap()
+            .contains("vulnerable-pkg"));
+        assert!(findings[0]
+            .affected_component
+            .as_ref()
+            .unwrap()
+            .contains("python"));
         assert_eq!(findings[0].affected_version, Some("1.0.0".to_string()));
-        assert!(findings[0].source_url.as_ref().unwrap().contains("nvd.nist.gov"));
+        assert!(findings[0]
+            .source_url
+            .as_ref()
+            .unwrap()
+            .contains("nvd.nist.gov"));
     }
 
     #[test]
