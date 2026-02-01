@@ -1,0 +1,107 @@
+---
+title: "Quickstart"
+description: "Get Artifact Keeper running in 5 minutes with Docker Compose"
+---
+
+# Quickstart
+
+Get Artifact Keeper up and running in minutes using Docker Compose.
+
+## Prerequisites
+
+- Docker and Docker Compose installed
+- Git (to clone the repository)
+
+## Quick Start
+
+1. **Clone the repository**:
+
+```bash
+git clone https://github.com/yourusername/artifact-keeper.git
+cd artifact-keeper
+```
+
+2. **Start the services**:
+
+```bash
+docker compose up -d
+```
+
+This starts the full stack:
+- Artifact Keeper backend and frontend
+- PostgreSQL database
+- MinIO (S3-compatible storage)
+- Trivy (vulnerability scanner)
+
+3. **Access the UI**:
+
+Open your browser to [http://localhost:3000](http://localhost:3000)
+
+4. **Login**:
+
+Use the default credentials:
+- **Username**: `admin`
+- **Password**: `admin`
+
+**Important**: Change the default password immediately in production environments.
+
+## First Steps
+
+### Create Your First Repository
+
+1. Navigate to **Repositories** in the sidebar
+2. Click **Create Repository**
+3. Choose a package format (e.g., Maven, npm, Docker)
+4. Enter a repository name and description
+5. Click **Create**
+
+### Push Your First Artifact
+
+Depending on your package format:
+
+**Maven** (in your `pom.xml`):
+```xml
+<distributionManagement>
+  <repository>
+    <id>artifact-keeper</id>
+    <url>http://localhost:8080/maven/my-repo</url>
+  </repository>
+</distributionManagement>
+```
+
+**npm** (using `.npmrc`):
+```
+registry=http://localhost:8080/npm/my-repo/
+//localhost:8080/npm/my-repo/:_authToken=YOUR_TOKEN
+```
+
+**Docker**:
+```bash
+docker tag myimage:latest localhost:8080/docker/my-repo/myimage:latest
+docker push localhost:8080/docker/my-repo/myimage:latest
+```
+
+### Browse Artifacts
+
+1. Navigate to **Repositories** and select your repository
+2. Browse uploaded artifacts
+3. View metadata, dependencies, and security scan results
+4. Search across all artifacts using the search bar
+
+## Next Steps
+
+- [Installation Guide](/getting-started/installation) - Deploy from source or customize your Docker setup
+- [Configuration Reference](/getting-started/configuration) - Configure storage, authentication, and integrations
+- [Package Formats](/package-formats) - See all supported package formats and their endpoints
+
+## Stopping the Services
+
+```bash
+docker compose down
+```
+
+To remove all data (databases, artifacts):
+
+```bash
+docker compose down -v
+```

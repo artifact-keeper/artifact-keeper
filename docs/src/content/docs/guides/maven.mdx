@@ -1,0 +1,461 @@
+---
+title: "Maven Repository Guide"
+description: "Using Artifact Keeper as a Maven repository for Java artifacts"
+---
+
+Artifact Keeper serves as a Maven-compatible repository for Java artifacts, supporting both Maven and Gradle build tools.
+
+## Endpoint
+
+Maven operations use the `/maven` endpoint:
+
+```
+http://localhost:8080/maven
+```
+
+## Maven Configuration
+
+### settings.xml
+
+Configure Maven to use Artifact Keeper by editing `~/.m2/settings.xml`:
+
+```xml
+<settings>
+  <servers>
+    <server>
+      <id>artifact-keeper</id>
+      <username>your-username</username>
+      <password>your-password</password>
+    </server>
+  </servers>
+
+  <mirrors>
+    <mirror>
+      <id>artifact-keeper</id>
+      <name>Artifact Keeper</name>
+      <url>http://localhost:8080/maven</url>
+      <mirrorOf>*</mirrorOf>
+    </mirror>
+  </mirrors>
+
+  <profiles>
+    <profile>
+      <id>artifact-keeper</id>
+      <repositories>
+        <repository>
+          <id>artifact-keeper</id>
+          <url>http://localhost:8080/maven</url>
+          <releases>
+            <enabled>true</enabled>
+          </releases>
+          <snapshots>
+            <enabled>true</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+    </profile>
+  </profiles>
+
+  <activeProfiles>
+    <activeProfile>artifact-keeper</activeProfile>
+  </activeProfiles>
+</settings>
+```
+
+### Project pom.xml
+
+Add distribution management to your project's `pom.xml`:
+
+```xml
+<project>
+  <!-- ... -->
+
+  <distributionManagement>
+    <repository>
+      <id>artifact-keeper</id>
+      <name>Artifact Keeper Releases</name>
+      <url>http://localhost:8080/maven/releases</url>
+    </repository>
+    <snapshotRepository>
+      <id>artifact-keeper</id>
+      <name>Artifact Keeper Snapshots</name>
+      <url>http://localhost:8080/maven/snapshots</url>
+    </snapshotRepository>
+  </distributionManagement>
+</project>
+```
+
+## Publishing Artifacts
+
+### Deploy Release Versions
+
+Deploy a release version to Artifact Keeper:
+
+```bash
+mvn clean deploy
+```
+
+This builds your project and uploads it to the releases repository.
+
+### Deploy Snapshot Versions
+
+Ensure your version ends with `-SNAPSHOT`:
+
+```xml
+<version>1.0.0-SNAPSHOT</version>
+```
+
+Then deploy:
+
+```bash
+mvn clean deploy
+```
+
+Snapshots are uploaded to the snapshots repository and can be overwritten.
+
+### Deploy Specific File
+
+Deploy a JAR file directly without building:
+
+```bash
+mvn deploy:deploy-file \
+  -DgroupId=com.example \
+  -DartifactId=myapp \
+  -Dversion=1.0.0 \
+  -Dpackaging=jar \
+  -Dfile=target/myapp-1.0.0.jar \
+  -DrepositoryId=artifact-keeper \
+  -Durl=http://localhost:8080/maven/releases
+```
+
+## Resolving Dependencies
+
+### Download Dependencies
+
+Maven automatically downloads dependencies from Artifact Keeper:
+
+```bash
+mvn clean install
+```
+
+### Force Update
+
+Force Maven to check for updated snapshots:
+
+```bash
+mvn clean install -U
+```
+
+### Resolve Specific Dependency
+
+```bash
+mvn dependency:get \
+  -DgroupId=com.example \
+  -DartifactId=myapp \
+  -Dversion=1.0.0
+```
+
+## Snapshot vs Release Repositories
+
+### Release Repositories
+
+- Immutable versions (1.0.0, 2.1.3, etc.)
+- Cannot be overwritten once deployed
+- Used for stable, production-ready artifacts
+- URL: `http://localhost:8080/maven/releases`
+
+### Snapshot Repositories
+
+- Mutable versions (1.0.0-SNAPSHOT)
+- Can be overwritten with newer builds
+- Used for development and testing
+- Maven checks for updates based on update policy
+- URL: `http://localhost:8080/maven/snapshots`
+
+### Update Policy
+
+Configure how often Maven checks for snapshot updates:
+
+```xml
+<repository>
+  <id>artifact-keeper</id>
+  <url>http://localhost:8080/maven/snapshots</url>
+  <snapshots>
+    <enabled>true</enabled>
+    <updatePolicy>always</updatePolicy>
+    <!-- Options: always, daily, interval:X, never -->
+  </snapshots>
+</repository>
+```
+
+## Gradle Configuration
+
+### build.gradle (Groovy)
+
+```groovy
+plugins {
+    id 'java'
+    id 'maven-publish'
+}
+
+repositories {
+    maven {
+        url = 'http://localhost:8080/maven'
+        credentials {
+            username = project.findProperty('artifactKeeperUser') ?: 'username'
+            password = project.findProperty('artifactKeeperPassword') ?: 'password'
+        }
+    }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            groupId = 'com.example'
+            artifactId = 'myapp'
+            version = '1.0.0'
+
+            from components.java
+        }
+    }
+
+    repositories {
+        maven {
+            name = 'artifactKeeper'
+            url = version.endsWith('SNAPSHOT')
+                ? 'http://localhost:8080/maven/snapshots'
+                : 'http://localhost:8080/maven/releases'
+            credentials {
+                username = project.findProperty('artifactKeeperUser')
+                password = project.findProperty('artifactKeeperPassword')
+            }
+        }
+    }
+}
+```
+
+### build.gradle.kts (Kotlin DSL)
+
+```kotlin
+plugins {
+    java
+    `maven-publish`
+}
+
+repositories {
+    maven {
+        url = uri("http://localhost:8080/maven")
+        credentials {
+            username = project.findProperty("artifactKeeperUser") as String? ?: "username"
+            password = project.findProperty("artifactKeeperPassword") as String? ?: "password"
+        }
+    }
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            groupId = "com.example"
+            artifactId = "myapp"
+            version = "1.0.0"
+
+            from(components["java"])
+        }
+    }
+
+    repositories {
+        maven {
+            name = "artifactKeeper"
+            url = uri(
+                if (version.toString().endsWith("SNAPSHOT"))
+                    "http://localhost:8080/maven/snapshots"
+                else
+                    "http://localhost:8080/maven/releases"
+            )
+            credentials {
+                username = project.findProperty("artifactKeeperUser") as String?
+                password = project.findProperty("artifactKeeperPassword") as String?
+            }
+        }
+    }
+}
+```
+
+### gradle.properties
+
+Store credentials securely:
+
+```properties
+artifactKeeperUser=your-username
+artifactKeeperPassword=your-password
+```
+
+### Publish with Gradle
+
+```bash
+./gradlew publish
+```
+
+## Advanced Features
+
+### Checksums
+
+Maven automatically generates and verifies MD5 and SHA1 checksums for all artifacts. Artifact Keeper stores and validates these checksums.
+
+### POM Metadata
+
+Include complete POM metadata for better dependency resolution:
+
+```xml
+<project>
+  <name>My Application</name>
+  <description>A sample application</description>
+  <url>https://github.com/example/myapp</url>
+
+  <licenses>
+    <license>
+      <name>Apache License 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <name>Your Name</name>
+      <email>you@example.com</email>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:git://github.com/example/myapp.git</connection>
+    <url>https://github.com/example/myapp</url>
+  </scm>
+</project>
+```
+
+### Classifiers
+
+Deploy artifacts with classifiers (sources, javadoc):
+
+```xml
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-source-plugin</artifactId>
+  <executions>
+    <execution>
+      <id>attach-sources</id>
+      <goals>
+        <goal>jar</goal>
+      </goals>
+    </execution>
+  </executions>
+</plugin>
+
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-javadoc-plugin</artifactId>
+  <executions>
+    <execution>
+      <id>attach-javadocs</id>
+      <goals>
+        <goal>jar</goal>
+      </goals>
+    </execution>
+  </executions>
+</plugin>
+```
+
+## Integration with CI/CD
+
+### GitHub Actions
+
+```yaml
+name: Deploy to Artifact Keeper
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Deploy with Maven
+        env:
+          MAVEN_USERNAME: ${{ secrets.ARTIFACT_KEEPER_USER }}
+          MAVEN_PASSWORD: ${{ secrets.ARTIFACT_KEEPER_PASSWORD }}
+        run: |
+          mvn clean deploy -s .github/settings.xml
+```
+
+### Jenkins Pipeline
+
+```groovy
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven 3.9'
+        jdk 'JDK 17'
+    }
+
+    stages {
+        stage('Build and Deploy') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'artifact-keeper',
+                        usernameVariable: 'MAVEN_USER',
+                        passwordVariable: 'MAVEN_PASS'
+                    )
+                ]) {
+                    sh 'mvn clean deploy'
+                }
+            }
+        }
+    }
+}
+```
+
+## Troubleshooting
+
+### Authentication Failures
+
+Verify credentials in `settings.xml` match your Artifact Keeper account:
+
+```bash
+curl -u username:password http://localhost:8080/maven
+```
+
+### Deployment Failures
+
+Check that the repository ID in `pom.xml` matches `settings.xml`:
+
+```bash
+mvn deploy -X  # Enable debug output
+```
+
+### Snapshot Update Issues
+
+Force update snapshots:
+
+```bash
+mvn clean install -U
+```
+
+Or clear local cache:
+
+```bash
+rm -rf ~/.m2/repository/com/example/myapp
+```
+
+## See Also
+
+- [Security Scanning](/security/scanning) - Automatic vulnerability scanning for Java dependencies
+- [Security Policies](/security/policies) - Configure policies to block vulnerable artifacts

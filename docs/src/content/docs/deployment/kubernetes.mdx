@@ -1,0 +1,728 @@
+---
+title: "Kubernetes Deployment"
+description: "Production-ready Kubernetes deployment with StatefulSets, PVCs, and Ingress"
+---
+
+Deploy Artifact Keeper on Kubernetes for high availability, scalability, and cloud-native infrastructure.
+
+## Prerequisites
+
+- Kubernetes 1.24+ cluster
+- kubectl configured
+- 100 GB storage for artifacts
+- 50 GB storage for backups
+- Ingress controller (nginx, traefik, etc.)
+- cert-manager (optional, for TLS certificates)
+
+## Architecture Overview
+
+```text
+┌─────────────────────────────────────────────┐
+│              Ingress (HTTPS)                │
+└──────────────┬──────────────────────────────┘
+               │
+       ┌───────┴────────┐
+       │                │
+┌──────▼──────┐  ┌──────▼──────┐
+│  Frontend   │  │   Backend   │
+│  Deployment │  │  Deployment │
+│  (2 pods)   │  │  (2 pods)   │
+└─────────────┘  └──────┬──────┘
+                        │
+                 ┌──────▼──────┐
+                 │  PostgreSQL │
+                 │ StatefulSet │
+                 │   (1 pod)   │
+                 └─────────────┘
+```
+
+## Quick Start
+
+### 1. Clone Repository
+
+```bash
+git clone https://github.com/artifact-keeper/artifact-keeper.git
+cd artifact-keeper/deploy/k8s
+```
+
+### 2. Create Namespace
+
+```bash
+kubectl create namespace artifact-keeper
+```
+
+### 3. Configure Secrets
+
+Create `secrets.yaml`:
+
+```bash
+kubectl create secret generic artifact-keeper-secrets \
+  --from-literal=db-password=$(openssl rand -base64 32) \
+  --from-literal=jwt-secret=$(openssl rand -base64 64) \
+  --namespace artifact-keeper
+```
+
+### 4. Deploy Resources
+
+```bash
+# Using Kustomize
+kubectl apply -k overlays/production
+
+# Or manually
+kubectl apply -f namespace.yaml
+kubectl apply -f configmap.yaml
+kubectl apply -f secrets.yaml
+kubectl apply -f postgres-statefulset.yaml
+kubectl apply -f backend-deployment.yaml
+kubectl apply -f frontend-deployment.yaml
+kubectl apply -f ingress.yaml
+```
+
+### 5. Verify Deployment
+
+```bash
+kubectl get pods -n artifact-keeper
+kubectl get svc -n artifact-keeper
+kubectl get ingress -n artifact-keeper
+```
+
+## Kubernetes Manifests
+
+### Namespace
+
+`namespace.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: artifact-keeper
+  labels:
+    name: artifact-keeper
+```
+
+### ConfigMap
+
+`configmap.yaml`:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifact-keeper-config
+  namespace: artifact-keeper
+data:
+  STORAGE_BACKEND: "filesystem"
+  STORAGE_PATH: "/data/artifacts"
+  RUST_LOG: "info"
+  PORT: "8080"
+  BACKUP_ENABLED: "true"
+  BACKUP_SCHEDULE: "0 2 * * *"
+  BACKUP_PATH: "/data/backups"
+```
+
+### Secrets
+
+`secrets.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: artifact-keeper-secrets
+  namespace: artifact-keeper
+type: Opaque
+stringData:
+  db-password: "CHANGE-ME"
+  jwt-secret: "CHANGE-ME"
+  # For S3 storage (optional)
+  s3-access-key: ""
+  s3-secret-key: ""
+```
+
+### PostgreSQL StatefulSet
+
+`postgres-statefulset.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: artifact-keeper
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: artifact-keeper
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: artifact_registry
+            - name: POSTGRES_USER
+              value: registry
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: artifact-keeper-secrets
+                  key: db-password
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - registry
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - registry
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+### Backend Deployment
+
+`backend-deployment.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: artifact-keeper
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: artifact-keeper
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: artifact-keeper/backend:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              value: postgres://registry:$(DB_PASSWORD)@postgres:5432/artifact_registry
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: artifact-keeper-secrets
+                  key: db-password
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: artifact-keeper-secrets
+                  key: jwt-secret
+          envFrom:
+            - configMapRef:
+                name: artifact-keeper-config
+          volumeMounts:
+            - name: artifact-storage
+              mountPath: /data/artifacts
+            - name: backup-storage
+              mountPath: /data/backups
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: artifact-storage
+          persistentVolumeClaim:
+            claimName: artifact-storage-pvc
+        - name: backup-storage
+          persistentVolumeClaim:
+            claimName: backup-storage-pvc
+```
+
+### Frontend Deployment
+
+`frontend-deployment.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: artifact-keeper
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: artifact-keeper
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: artifact-keeper/frontend:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: REACT_APP_API_URL
+              value: /api
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+```
+
+### Persistent Volume Claims
+
+`pvc.yaml`:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: artifact-storage-pvc
+  namespace: artifact-keeper
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-storage-pvc
+  namespace: artifact-keeper
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 50Gi
+```
+
+### Ingress
+
+`ingress.yaml`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: artifact-keeper
+  namespace: artifact-keeper
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "10g"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - registry.example.com
+      secretName: artifact-keeper-tls
+  rules:
+    - host: registry.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+```
+
+## Kustomize Structure
+
+Use Kustomize for environment-specific configurations:
+
+```text
+deploy/k8s/
+├── base/
+│   ├── kustomization.yaml
+│   ├── namespace.yaml
+│   ├── configmap.yaml
+│   ├── postgres-statefulset.yaml
+│   ├── backend-deployment.yaml
+│   ├── frontend-deployment.yaml
+│   └── pvc.yaml
+└── overlays/
+    ├── development/
+    │   ├── kustomization.yaml
+    │   └── patches/
+    ├── staging/
+    │   ├── kustomization.yaml
+    │   └── patches/
+    └── production/
+        ├── kustomization.yaml
+        ├── ingress.yaml
+        └── patches/
+            ├── replica-count.yaml
+            └── resource-limits.yaml
+```
+
+`overlays/production/kustomization.yaml`:
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: artifact-keeper
+
+resources:
+  - ../../base
+  - ingress.yaml
+
+patches:
+  - path: patches/replica-count.yaml
+  - path: patches/resource-limits.yaml
+
+configMapGenerator:
+  - name: artifact-keeper-config
+    behavior: merge
+    literals:
+      - RUST_LOG=info
+      - BACKUP_ENABLED=true
+
+secretGenerator:
+  - name: artifact-keeper-secrets
+    files:
+      - db-password=secrets/db-password.txt
+      - jwt-secret=secrets/jwt-secret.txt
+```
+
+## High Availability
+
+### Multi-Zone Deployment
+
+Distribute pods across availability zones:
+
+```yaml
+spec:
+  template:
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - backend
+                topologyKey: topology.kubernetes.io/zone
+```
+
+### Horizontal Pod Autoscaler
+
+Auto-scale based on CPU/memory:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  namespace: artifact-keeper
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+```
+
+## Storage Options
+
+### AWS EBS
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+volumeBindingMode: WaitForFirstConsumer
+```
+
+### GCP Persistent Disk
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: pd-ssd
+  replication-type: regional-pd
+volumeBindingMode: WaitForFirstConsumer
+```
+
+### Azure Disk
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: disk.csi.azure.com
+parameters:
+  skuName: Premium_LRS
+volumeBindingMode: WaitForFirstConsumer
+```
+
+## Monitoring
+
+### Prometheus ServiceMonitor
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: artifact-keeper
+  namespace: artifact-keeper
+spec:
+  selector:
+    matchLabels:
+      app: backend
+  endpoints:
+    - port: metrics
+      interval: 30s
+```
+
+## Backup Strategy
+
+### CronJob for Database Backup
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: artifact-keeper
+spec:
+  schedule: "0 2 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: postgres:15-alpine
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  pg_dump -h postgres -U registry artifact_registry | \
+                  gzip > /backup/backup-$(date +%Y%m%d-%H%M%S).sql.gz
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: artifact-keeper-secrets
+                      key: db-password
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: backup-storage-pvc
+          restartPolicy: OnFailure
+```
+
+## Troubleshooting
+
+### Check Pod Status
+
+```bash
+kubectl get pods -n artifact-keeper
+kubectl describe pod <pod-name> -n artifact-keeper
+kubectl logs <pod-name> -n artifact-keeper
+```
+
+### Database Connection Issues
+
+```bash
+kubectl exec -it postgres-0 -n artifact-keeper -- psql -U registry -d artifact_registry
+```
+
+### Storage Issues
+
+```bash
+kubectl get pvc -n artifact-keeper
+kubectl describe pvc artifact-storage-pvc -n artifact-keeper
+```
+
+### Scaling Issues
+
+```bash
+kubectl get hpa -n artifact-keeper
+kubectl describe hpa backend-hpa -n artifact-keeper
+```
+
+## Upgrading
+
+```bash
+# Update image tags
+kubectl set image deployment/backend backend=artifact-keeper/backend:v2.0.0 -n artifact-keeper
+
+# Or apply updated manifests
+kubectl apply -k overlays/production
+
+# Watch rollout
+kubectl rollout status deployment/backend -n artifact-keeper
+```
+
+## Production Checklist
+
+- [ ] Configure resource limits
+- [ ] Set up horizontal autoscaling
+- [ ] Configure pod anti-affinity
+- [ ] Enable ingress TLS
+- [ ] Set up monitoring
+- [ ] Configure backup CronJobs
+- [ ] Test disaster recovery
+- [ ] Configure network policies
+- [ ] Set up log aggregation
+- [ ] Enable pod security policies

@@ -1,0 +1,207 @@
+---
+title: "Configuration"
+description: "Complete environment variable reference for Artifact Keeper"
+---
+
+# Configuration
+
+Artifact Keeper is configured using environment variables. All configuration options are documented below.
+
+## Core Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DATABASE_URL` | **Yes** | - | PostgreSQL connection string (e.g., `postgresql://user:pass@localhost/artifact_keeper`) |
+| `BIND_ADDRESS` | No | `0.0.0.0:8080` | Server bind address and port |
+| `LOG_LEVEL` | No | `info` | Logging level: `trace`, `debug`, `info`, `warn`, `error` |
+| `DEMO_MODE` | No | `false` | Enable read-only demo mode (disables writes) |
+
+## Storage Configuration
+
+### Filesystem Storage
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `STORAGE_BACKEND` | No | `filesystem` | Storage backend: `filesystem` or `s3` |
+| `STORAGE_PATH` | No | `/var/lib/artifact-keeper/artifacts` | Local filesystem path for artifact storage |
+
+### S3-Compatible Storage
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `STORAGE_BACKEND` | No | `filesystem` | Set to `s3` to use S3-compatible storage |
+| `S3_BUCKET` | No | - | S3 bucket name for artifact storage |
+| `S3_REGION` | No | - | AWS region (e.g., `us-east-1`) |
+| `S3_ENDPOINT` | No | - | Custom S3 endpoint URL (for MinIO, DigitalOcean Spaces, etc.) |
+| `AWS_ACCESS_KEY_ID` | No | - | AWS access key ID (can also be set via AWS SDK defaults) |
+| `AWS_SECRET_ACCESS_KEY` | No | - | AWS secret access key (can also be set via AWS SDK defaults) |
+
+## Authentication & Security
+
+### JWT Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `JWT_SECRET` | **Yes** | - | Secret key for signing JWT tokens (use a secure random string) |
+| `JWT_EXPIRATION_SECS` | No | `86400` | JWT token expiration in seconds (default: 24 hours) |
+| `JWT_ACCESS_TOKEN_EXPIRY_MINUTES` | No | `30` | Access token expiration in minutes |
+| `JWT_REFRESH_TOKEN_EXPIRY_DAYS` | No | `7` | Refresh token expiration in days |
+
+**Generate a secure JWT secret**:
+```bash
+openssl rand -hex 32
+```
+
+### OIDC Authentication
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OIDC_ISSUER` | No | - | OIDC issuer URL (e.g., `https://accounts.google.com`) |
+| `OIDC_CLIENT_ID` | No | - | OIDC client ID from your identity provider |
+| `OIDC_CLIENT_SECRET` | No | - | OIDC client secret from your identity provider |
+
+Supported OIDC providers: Google, Okta, Auth0, Keycloak, Azure AD, and any OpenID Connect compliant provider.
+
+### LDAP Authentication
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LDAP_URL` | No | - | LDAP server URL (e.g., `ldap://ldap.example.com:389`) |
+| `LDAP_BASE_DN` | No | - | LDAP base DN for user searches (e.g., `dc=example,dc=com`) |
+
+## Security Scanning
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TRIVY_URL` | No | - | Trivy server URL for vulnerability scanning (e.g., `http://trivy:8080`) |
+| `SCAN_WORKSPACE_PATH` | No | `/scan-workspace` | Temporary workspace directory for scanning artifacts |
+
+When `TRIVY_URL` is set, Artifact Keeper automatically scans artifacts for vulnerabilities. Requires a running Trivy server.
+
+**Docker Compose includes Trivy by default**:
+```yaml
+services:
+  trivy:
+    image: aquasec/trivy:latest
+    command: server --listen 0.0.0.0:8080
+```
+
+## Search Integration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `MEILISEARCH_URL` | No | - | MeiliSearch server URL for full-text search (e.g., `http://meilisearch:7700`) |
+| `MEILISEARCH_API_KEY` | No | - | MeiliSearch API key (optional, for protected instances) |
+
+When configured, enables fast full-text search across all artifacts, repositories, and metadata.
+
+## Example Configurations
+
+### Minimal Configuration (Development)
+
+```bash
+# .env file
+DATABASE_URL=postgresql://postgres:postgres@localhost/artifact_keeper
+JWT_SECRET=dev-secret-change-in-production
+STORAGE_BACKEND=filesystem
+STORAGE_PATH=/tmp/artifacts
+LOG_LEVEL=debug
+```
+
+### Production Configuration (AWS)
+
+```bash
+# .env file
+DATABASE_URL=postgresql://artifact_keeper:secure_password@db.example.com/artifact_keeper
+JWT_SECRET=generated-with-openssl-rand-hex-32
+BIND_ADDRESS=0.0.0.0:8080
+LOG_LEVEL=info
+
+# S3 storage
+STORAGE_BACKEND=s3
+S3_BUCKET=my-artifact-keeper-bucket
+S3_REGION=us-west-2
+
+# Authentication
+OIDC_ISSUER=https://accounts.google.com
+OIDC_CLIENT_ID=your-client-id.apps.googleusercontent.com
+OIDC_CLIENT_SECRET=your-client-secret
+
+# Security scanning
+TRIVY_URL=http://trivy.internal:8080
+SCAN_WORKSPACE_PATH=/var/lib/artifact-keeper/scan-workspace
+
+# Search
+MEILISEARCH_URL=http://meilisearch.internal:7700
+MEILISEARCH_API_KEY=your-meilisearch-master-key
+```
+
+### Production Configuration (Self-Hosted)
+
+```bash
+# .env file
+DATABASE_URL=postgresql://artifact_keeper:secure_password@postgres:5432/artifact_keeper
+JWT_SECRET=generated-with-openssl-rand-hex-32
+BIND_ADDRESS=0.0.0.0:8080
+LOG_LEVEL=info
+
+# Filesystem storage
+STORAGE_BACKEND=filesystem
+STORAGE_PATH=/var/lib/artifact-keeper/artifacts
+
+# LDAP authentication
+LDAP_URL=ldap://ldap.corp.example.com:389
+LDAP_BASE_DN=dc=corp,dc=example,dc=com
+
+# Security scanning
+TRIVY_URL=http://trivy:8080
+SCAN_WORKSPACE_PATH=/var/lib/artifact-keeper/scan-workspace
+```
+
+### Docker Compose Configuration
+
+```yaml
+# docker-compose.override.yml
+services:
+  backend:
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/artifact_keeper
+      - JWT_SECRET=${JWT_SECRET:-change-this-in-production}
+      - LOG_LEVEL=info
+      - STORAGE_BACKEND=s3
+      - S3_BUCKET=artifacts
+      - S3_REGION=us-east-1
+      - S3_ENDPOINT=http://minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - TRIVY_URL=http://trivy:8080
+      - MEILISEARCH_URL=http://meilisearch:7700
+```
+
+## Configuration Validation
+
+On startup, Artifact Keeper validates all required configuration and provides helpful error messages:
+
+```
+ERROR: DATABASE_URL is required but not set
+ERROR: JWT_SECRET is required but not set
+ERROR: S3_BUCKET is required when STORAGE_BACKEND=s3
+```
+
+Check logs after starting to ensure configuration is correct.
+
+## Security Best Practices
+
+1. **Never use default secrets in production**: Generate secure random values for `JWT_SECRET`
+2. **Use environment-specific `.env` files**: Keep production secrets separate from development
+3. **Restrict database access**: Use dedicated database users with minimal required permissions
+4. **Enable HTTPS**: Always use TLS in production (configure via reverse proxy)
+5. **Rotate secrets regularly**: Update `JWT_SECRET` and API keys periodically
+6. **Limit token expiration**: Keep `JWT_ACCESS_TOKEN_EXPIRY_MINUTES` short (15-30 minutes)
+7. **Enable scanning**: Configure `TRIVY_URL` to scan all artifacts for vulnerabilities
+
+## Next Steps
+
+- [Quickstart Guide](/getting-started/quickstart) - Create your first repository
+- [Package Formats](/package-formats) - See all supported formats
+- [Installation Guide](/getting-started/installation) - Deployment options

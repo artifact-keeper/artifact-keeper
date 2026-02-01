@@ -1,0 +1,728 @@
+---
+title: "Client Configuration"
+description: "Configure native package managers to work with Artifact Keeper"
+---
+
+Configure your package managers and build tools to use Artifact Keeper as your artifact registry.
+
+## Docker
+
+### Login
+
+```bash
+docker login registry.example.com
+Username: alice
+Password: [your-password-or-token]
+```
+
+### Pull Image
+
+```bash
+docker pull registry.example.com/my-docker-repo/my-app:1.2.3
+```
+
+### Push Image
+
+```bash
+# Tag image
+docker tag my-app:1.2.3 registry.example.com/my-docker-repo/my-app:1.2.3
+
+# Push
+docker push registry.example.com/my-docker-repo/my-app:1.2.3
+```
+
+### Configuration File
+
+`~/.docker/config.json`:
+
+```json
+{
+  "auths": {
+    "registry.example.com": {
+      "auth": "base64-encoded-username:password"
+    }
+  }
+}
+```
+
+---
+
+## Maven
+
+### settings.xml
+
+Add to `~/.m2/settings.xml`:
+
+```xml
+<settings>
+  <servers>
+    <server>
+      <id>artifact-keeper</id>
+      <username>alice</username>
+      <password>your-password-or-token</password>
+    </server>
+  </servers>
+
+  <mirrors>
+    <mirror>
+      <id>artifact-keeper</id>
+      <name>Artifact Keeper</name>
+      <url>https://registry.example.com/maven2/my-maven-repo</url>
+      <mirrorOf>central</mirrorOf>
+    </mirror>
+  </mirrors>
+
+  <profiles>
+    <profile>
+      <id>artifact-keeper</id>
+      <repositories>
+        <repository>
+          <id>artifact-keeper</id>
+          <url>https://registry.example.com/maven2/my-maven-repo</url>
+          <releases>
+            <enabled>true</enabled>
+          </releases>
+          <snapshots>
+            <enabled>true</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+    </profile>
+  </profiles>
+
+  <activeProfiles>
+    <activeProfile>artifact-keeper</activeProfile>
+  </activeProfiles>
+</settings>
+```
+
+### pom.xml
+
+For publishing:
+
+```xml
+<distributionManagement>
+  <repository>
+    <id>artifact-keeper</id>
+    <url>https://registry.example.com/maven2/my-maven-repo</url>
+  </repository>
+  <snapshotRepository>
+    <id>artifact-keeper</id>
+    <url>https://registry.example.com/maven2/my-maven-snapshots</url>
+  </snapshotRepository>
+</distributionManagement>
+```
+
+### Deploy
+
+```bash
+mvn clean deploy
+```
+
+---
+
+## npm
+
+### Login
+
+```bash
+npm login --registry=https://registry.example.com/npm/my-npm-repo
+```
+
+### .npmrc
+
+Project-level (`.npmrc` in project root):
+
+```ini
+registry=https://registry.example.com/npm/my-npm-repo/
+//registry.example.com/npm/my-npm-repo/:_authToken=your-api-token
+```
+
+User-level (`~/.npmrc`):
+
+```ini
+registry=https://registry.example.com/npm/my-npm-repo/
+//registry.example.com/npm/my-npm-repo/:_authToken=your-api-token
+```
+
+### Scope-specific Registry
+
+For scoped packages:
+
+```ini
+@mycompany:registry=https://registry.example.com/npm/my-npm-repo/
+//registry.example.com/npm/my-npm-repo/:_authToken=your-api-token
+```
+
+### Install Package
+
+```bash
+npm install my-package@1.2.3
+```
+
+### Publish Package
+
+```bash
+npm publish
+```
+
+---
+
+## pip (Python)
+
+### pip.conf
+
+Linux/macOS (`~/.pip/pip.conf`):
+
+```ini
+[global]
+index-url = https://alice:your-token@registry.example.com/pypi/my-pypi-repo/simple
+```
+
+Windows (`%APPDATA%\pip\pip.ini`):
+
+```ini
+[global]
+index-url = https://alice:your-token@registry.example.com/pypi/my-pypi-repo/simple
+```
+
+### Command Line
+
+```bash
+pip install --index-url https://alice:your-token@registry.example.com/pypi/my-pypi-repo/simple my-package
+```
+
+### requirements.txt
+
+```txt
+--index-url https://alice:your-token@registry.example.com/pypi/my-pypi-repo/simple
+my-package==1.2.3
+```
+
+### Publish with twine
+
+```bash
+twine upload --repository-url https://registry.example.com/pypi/my-pypi-repo/ \
+  --username alice \
+  --password your-token \
+  dist/*
+```
+
+---
+
+## Cargo (Rust)
+
+### .cargo/config.toml
+
+Project-level or user-level (`~/.cargo/config.toml`):
+
+```toml
+[registries.artifact-keeper]
+index = "https://registry.example.com/crates/my-crates-repo/index"
+
+[net]
+git-fetch-with-cli = true
+
+[source.artifact-keeper]
+registry = "https://registry.example.com/crates/my-crates-repo"
+
+[source.crates-io]
+replace-with = "artifact-keeper"
+```
+
+### Cargo.toml
+
+For publishing:
+
+```toml
+[package]
+name = "my-package"
+version = "1.2.3"
+publish = ["artifact-keeper"]
+```
+
+### Login
+
+```bash
+cargo login --registry=artifact-keeper your-api-token
+```
+
+### Publish
+
+```bash
+cargo publish --registry=artifact-keeper
+```
+
+---
+
+## Helm
+
+### Add Repository
+
+```bash
+helm repo add my-helm-repo https://registry.example.com/helm/my-helm-repo \
+  --username alice \
+  --password your-token
+```
+
+### Update Repositories
+
+```bash
+helm repo update
+```
+
+### Install Chart
+
+```bash
+helm install my-release my-helm-repo/my-chart
+```
+
+### Push Chart
+
+Using helm-push plugin:
+
+```bash
+# Install plugin
+helm plugin install https://github.com/chartmuseum/helm-push
+
+# Push chart
+helm cm-push my-chart-1.2.3.tgz my-helm-repo
+```
+
+---
+
+## Go
+
+### GOPROXY
+
+Set environment variable:
+
+```bash
+export GOPROXY=https://alice:your-token@registry.example.com/go/my-go-repo,direct
+```
+
+Or in `~/.bashrc` / `~/.zshrc`:
+
+```bash
+export GOPROXY="https://alice:your-token@registry.example.com/go/my-go-repo,direct"
+```
+
+### .netrc for Authentication
+
+`~/.netrc`:
+
+```
+machine registry.example.com
+login alice
+password your-token
+```
+
+Set permissions:
+
+```bash
+chmod 600 ~/.netrc
+```
+
+### go.mod
+
+```go
+module github.com/mycompany/my-module
+
+go 1.21
+
+require (
+    github.com/mycompany/my-package v1.2.3
+)
+```
+
+### Install Dependencies
+
+```bash
+go mod download
+```
+
+---
+
+## NuGet (.NET)
+
+### nuget.config
+
+Project-level or user-level:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="artifact-keeper" value="https://registry.example.com/nuget/my-nuget-repo/v3/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <artifact-keeper>
+      <add key="Username" value="alice" />
+      <add key="ClearTextPassword" value="your-token" />
+    </artifact-keeper>
+  </packageSourceCredentials>
+</configuration>
+```
+
+### Add Source
+
+```bash
+dotnet nuget add source https://registry.example.com/nuget/my-nuget-repo/v3/index.json \
+  --name artifact-keeper \
+  --username alice \
+  --password your-token \
+  --store-password-in-clear-text
+```
+
+### Install Package
+
+```bash
+dotnet add package MyPackage --version 1.2.3
+```
+
+### Publish Package
+
+```bash
+dotnet nuget push MyPackage.1.2.3.nupkg \
+  --source https://registry.example.com/nuget/my-nuget-repo \
+  --api-key your-token
+```
+
+---
+
+## RubyGems
+
+### Add Source
+
+```bash
+gem sources --add https://registry.example.com/rubygems/my-gems-repo/
+```
+
+### List Sources
+
+```bash
+gem sources --list
+```
+
+### .gemrc
+
+`~/.gemrc`:
+
+```yaml
+---
+:sources:
+  - https://registry.example.com/rubygems/my-gems-repo/
+:backtrace: false
+:bulk_threshold: 1000
+:update_sources: true
+:verbose: true
+```
+
+### Bundler
+
+`Gemfile`:
+
+```ruby
+source 'https://registry.example.com/rubygems/my-gems-repo/'
+
+gem 'my-gem', '~> 1.2.3'
+```
+
+### Authentication
+
+Add credentials to `~/.gem/credentials`:
+
+```yaml
+---
+:artifact_keeper: your-api-token
+```
+
+Or use environment variable:
+
+```bash
+export GEM_HOST_API_KEY=your-api-token
+```
+
+### Publish Gem
+
+```bash
+gem push my-gem-1.2.3.gem --host https://registry.example.com/rubygems/my-gems-repo/
+```
+
+---
+
+## Composer (PHP)
+
+### composer.json
+
+```json
+{
+  "repositories": [
+    {
+      "type": "composer",
+      "url": "https://registry.example.com/composer/my-composer-repo"
+    }
+  ],
+  "require": {
+    "myvendor/my-package": "1.2.3"
+  },
+  "config": {
+    "secure-http": true
+  }
+}
+```
+
+### Authentication
+
+Using auth.json:
+
+```json
+{
+  "http-basic": {
+    "registry.example.com": {
+      "username": "alice",
+      "password": "your-token"
+    }
+  }
+}
+```
+
+Or via command:
+
+```bash
+composer config http-basic.registry.example.com alice your-token
+```
+
+### Install Dependencies
+
+```bash
+composer install
+```
+
+---
+
+## Gradle
+
+### build.gradle (Groovy)
+
+```groovy
+repositories {
+    maven {
+        url "https://registry.example.com/maven2/my-maven-repo"
+        credentials {
+            username = "alice"
+            password = "your-token"
+        }
+    }
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+        }
+    }
+    repositories {
+        maven {
+            url = "https://registry.example.com/maven2/my-maven-repo"
+            credentials {
+                username = "alice"
+                password = "your-token"
+            }
+        }
+    }
+}
+```
+
+### build.gradle.kts (Kotlin)
+
+```kotlin
+repositories {
+    maven {
+        url = uri("https://registry.example.com/maven2/my-maven-repo")
+        credentials {
+            username = "alice"
+            password = "your-token"
+        }
+    }
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            from(components["java"])
+        }
+    }
+    repositories {
+        maven {
+            url = uri("https://registry.example.com/maven2/my-maven-repo")
+            credentials {
+                username = "alice"
+                password = "your-token"
+            }
+        }
+    }
+}
+```
+
+### gradle.properties
+
+Store credentials securely:
+
+```properties
+artifactKeeperUsername=alice
+artifactKeeperPassword=your-token
+```
+
+Reference in build.gradle:
+
+```groovy
+credentials {
+    username = project.findProperty("artifactKeeperUsername") ?: ""
+    password = project.findProperty("artifactKeeperPassword") ?: ""
+}
+```
+
+---
+
+## Conda
+
+### .condarc
+
+`~/.condarc`:
+
+```yaml
+channels:
+  - https://alice:your-token@registry.example.com/conda/my-conda-repo
+  - defaults
+
+ssl_verify: true
+```
+
+### Install Package
+
+```bash
+conda install -c https://alice:your-token@registry.example.com/conda/my-conda-repo my-package
+```
+
+---
+
+## API Token Management
+
+For all package managers, use API tokens instead of passwords:
+
+### Generate Token
+
+```bash
+curl -X POST https://registry.example.com/api/v1/users/me/tokens \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "CI Pipeline Token",
+    "scopes": ["repository:read", "repository:write"],
+    "expires_at": "2027-12-31T23:59:59Z"
+  }'
+```
+
+### List Tokens
+
+```bash
+curl https://registry.example.com/api/v1/users/me/tokens \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+### Revoke Token
+
+```bash
+curl -X DELETE https://registry.example.com/api/v1/users/me/tokens/token-123 \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+---
+
+## CI/CD Integration
+
+### GitHub Actions
+
+```yaml
+- name: Configure npm
+  run: |
+    echo "//registry.example.com/npm/my-npm-repo/:_authToken=${{ secrets.ARTIFACT_KEEPER_TOKEN }}" > ~/.npmrc
+
+- name: Publish package
+  run: npm publish
+```
+
+### GitLab CI
+
+```yaml
+before_script:
+  - echo "//registry.example.com/npm/my-npm-repo/:_authToken=${ARTIFACT_KEEPER_TOKEN}" > ~/.npmrc
+
+publish:
+  script:
+    - npm publish
+```
+
+### Jenkins
+
+```groovy
+withCredentials([string(credentialsId: 'artifact-keeper-token', variable: 'TOKEN')]) {
+    sh 'echo "//registry.example.com/npm/my-npm-repo/:_authToken=${TOKEN}" > ~/.npmrc'
+    sh 'npm publish'
+}
+```
+
+---
+
+## Troubleshooting
+
+### Authentication Failures
+
+Verify credentials:
+
+```bash
+curl -u alice:your-token https://registry.example.com/api/v1/health
+```
+
+Check token hasn't expired:
+
+```bash
+curl https://registry.example.com/api/v1/users/me/tokens \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+### SSL Certificate Issues
+
+Trust custom CA certificate:
+
+```bash
+# Download CA cert
+curl https://registry.example.com/ca.crt -o /usr/local/share/ca-certificates/artifact-keeper.crt
+
+# Update CA bundle
+sudo update-ca-certificates
+```
+
+For npm:
+
+```bash
+npm config set cafile /path/to/ca.crt
+```
+
+### Network/Proxy Issues
+
+Configure HTTP proxy:
+
+```bash
+export HTTP_PROXY=http://proxy.example.com:8080
+export HTTPS_PROXY=http://proxy.example.com:8080
+```
+
+For npm:
+
+```bash
+npm config set proxy http://proxy.example.com:8080
+npm config set https-proxy http://proxy.example.com:8080
+```

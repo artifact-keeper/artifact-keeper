@@ -1,0 +1,238 @@
+---
+title: "Package Formats"
+description: "All 30+ package formats supported by Artifact Keeper"
+---
+
+# Package Formats
+
+Artifact Keeper supports 30+ package formats out of the box. All formats are included at no extra cost with no feature gates or limitations.
+
+## Language Package Managers
+
+Full support for language-specific package ecosystems with native client compatibility.
+
+| Format | API Endpoint | Description |
+|--------|--------------|-------------|
+| **Maven** | `/maven/{repo}` | Java and JVM language artifacts (JAR, WAR, POM) |
+| **npm** | `/npm/{repo}` | Node.js and JavaScript packages |
+| **PyPI** | `/pypi/{repo}` | Python packages (wheels, sdists) |
+| **NuGet** | `/nuget/{repo}` | .NET packages and libraries |
+| **Cargo** | `/cargo/{repo}` | Rust crates and dependencies |
+| **Go** | `/go/{repo}` | Go modules (proxy protocol) |
+| **RubyGems** | `/rubygems/{repo}` | Ruby gems and bundler support |
+| **Composer** | `/composer/{repo}` | PHP packages via Packagist protocol |
+| **Hex** | `/hex/{repo}` | Erlang and Elixir packages |
+| **Pub** | `/pub/{repo}` | Dart and Flutter packages |
+| **CRAN** | `/cran/{repo}` | R language packages |
+| **sbt** | `/sbt/{repo}` | Scala build tool artifacts |
+
+### Example Usage
+
+**Maven** (`pom.xml`):
+```xml
+<repositories>
+  <repository>
+    <id>artifact-keeper</id>
+    <url>https://artifacts.example.com/maven/my-repo</url>
+  </repository>
+</repositories>
+```
+
+**npm** (`.npmrc`):
+```
+registry=https://artifacts.example.com/npm/my-repo/
+//artifacts.example.com/npm/my-repo/:_authToken=${NPM_TOKEN}
+```
+
+**PyPI** (`pip.conf`):
+```ini
+[global]
+index-url = https://artifacts.example.com/pypi/my-repo/simple
+```
+
+**Cargo** (`~/.cargo/config.toml`):
+```toml
+[registries.artifact-keeper]
+index = "https://artifacts.example.com/cargo/my-repo/index"
+```
+
+## Containers & Cloud Infrastructure
+
+Container images and infrastructure-as-code packages.
+
+| Format | API Endpoint | Description |
+|--------|--------------|-------------|
+| **Docker/OCI** | `/v2/{repo}` | Docker images and OCI containers (fully OCI-compliant) |
+| **Helm** | `/helm/{repo}` | Kubernetes Helm charts |
+| **Terraform** | `/terraform/{repo}` | Terraform modules and providers |
+| **Vagrant** | `/vagrant/{repo}` | Vagrant boxes |
+
+### Example Usage
+
+**Docker**:
+```bash
+docker tag myimage:latest artifacts.example.com/docker/my-repo/myimage:latest
+docker push artifacts.example.com/docker/my-repo/myimage:latest
+```
+
+**Helm**:
+```bash
+helm repo add my-repo https://artifacts.example.com/helm/my-repo
+helm install myapp my-repo/mychart
+```
+
+**Terraform**:
+```hcl
+module "example" {
+  source = "artifacts.example.com/terraform/my-repo/example"
+  version = "1.0.0"
+}
+```
+
+## Machine Learning & AI
+
+Specialized formats for ML/AI workflows.
+
+| Format | API Endpoint | Description |
+|--------|--------------|-------------|
+| **HuggingFace** | `/huggingface/{repo}` | ML models, datasets, and tokenizers |
+| **Conda** | `/conda/{repo}` | Python data science packages |
+
+### Example Usage
+
+**HuggingFace** (using `huggingface_hub`):
+```python
+from huggingface_hub import HfApi
+
+api = HfApi(endpoint="https://artifacts.example.com/huggingface/my-repo")
+api.upload_file(path_or_fileobj="model.bin", repo_id="my-model")
+```
+
+**Conda**:
+```bash
+conda config --add channels https://artifacts.example.com/conda/my-repo
+conda install mypackage
+```
+
+## System Packages
+
+Native operating system package formats.
+
+| Format | API Endpoint | Description |
+|--------|--------------|-------------|
+| **Debian/APT** | `/debian/{repo}` | Debian and Ubuntu .deb packages |
+| **RPM/YUM** | `/rpm/{repo}` | RedHat, CentOS, Fedora .rpm packages |
+| **Alpine/APK** | `/alpine/{repo}` | Alpine Linux .apk packages |
+| **Conan** | `/conan/{repo}` | C/C++ package manager |
+
+### Example Usage
+
+**Debian/APT** (`/etc/apt/sources.list.d/artifact-keeper.list`):
+```
+deb https://artifacts.example.com/debian/my-repo stable main
+```
+
+**RPM/YUM** (`/etc/yum.repos.d/artifact-keeper.repo`):
+```ini
+[artifact-keeper]
+name=Artifact Keeper Repository
+baseurl=https://artifacts.example.com/rpm/my-repo
+enabled=1
+gpgcheck=0
+```
+
+**Conan** (`~/.conan/remotes.json`):
+```json
+{
+  "remotes": [
+    {
+      "name": "artifact-keeper",
+      "url": "https://artifacts.example.com/conan/my-repo",
+      "verify_ssl": true
+    }
+  ]
+}
+```
+
+## Other Formats
+
+Additional specialized formats for various tools and ecosystems.
+
+| Format | API Endpoint | Description |
+|--------|--------------|-------------|
+| **Generic** | `/generic/{repo}` | Generic file storage for any artifact type |
+| **Git LFS** | `/lfs/{repo}` | Git Large File Storage objects |
+| **VS Code Extensions** | `/vscode/{repo}` | Visual Studio Code extensions (.vsix) |
+| **JetBrains Plugins** | `/jetbrains/{repo}` | IntelliJ IDEA and other JetBrains IDE plugins |
+| **CocoaPods** | `/cocoapods/{repo}` | iOS and macOS dependency manager |
+| **Swift** | `/swift/{repo}` | Swift Package Manager packages |
+| **Chef** | `/chef/{repo}` | Chef cookbooks and recipes |
+| **Puppet** | `/puppet/{repo}` | Puppet modules |
+
+### Example Usage
+
+**Generic** (upload any file):
+```bash
+curl -X PUT \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-binary @myfile.zip \
+  https://artifacts.example.com/generic/my-repo/myfile.zip
+```
+
+**Git LFS** (`.lfsconfig`):
+```
+[lfs]
+url = https://artifacts.example.com/lfs/my-repo
+```
+
+**CocoaPods** (`Podfile`):
+```ruby
+source 'https://artifacts.example.com/cocoapods/my-repo'
+
+pod 'MyFramework', '~> 1.0'
+```
+
+## Format Support Status
+
+All formats listed above are fully supported and production-ready. Each format:
+
+- Works with native package managers and clients
+- Supports authentication via API tokens
+- Includes metadata indexing and search
+- Can be scanned for vulnerabilities (where applicable)
+- Has no storage or feature limitations
+
+## Feature Matrix
+
+| Feature | All Formats |
+|---------|-------------|
+| Upload/Download | ✓ |
+| Versioning | ✓ |
+| Metadata Storage | ✓ |
+| Full-Text Search | ✓ |
+| Access Control (RBAC) | ✓ |
+| Vulnerability Scanning | ✓ (containers, language packages) |
+| Replication | ✓ |
+| Virtual Repositories | ✓ |
+| Retention Policies | ✓ |
+| Webhooks | ✓ |
+
+## Adding Custom Formats
+
+While Artifact Keeper supports 30+ formats out of the box, you can extend it with custom formats using:
+
+- **Generic repositories**: Store any file type with custom metadata
+- **WASM plugins**: Implement custom repository protocols
+- **REST API**: Build custom upload/download workflows
+
+See the Plugins documentation for details on extending format support.
+
+## Migration Support
+
+All package formats can be migrated from Artifactory using the built-in migration API. See [Migrate from Artifactory](/migration/from-artifactory) for details.
+
+## Next Steps
+
+- [Quickstart Guide](/getting-started/quickstart) - Create your first repository
+- [Configuration Reference](/getting-started/configuration) - Configure repository settings
+- [Migration Guide](/migration/from-artifactory) - Migrate existing artifacts

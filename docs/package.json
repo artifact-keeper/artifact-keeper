@@ -1,0 +1,15 @@
+{
+  "name": "artifact-keeper-docs",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.32.0",
+    "astro": "^5.1.5",
+    "sharp": "^0.33.0"
+  }
+}

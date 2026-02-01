@@ -1,0 +1,255 @@
+---
+title: "Installation"
+description: "Install Artifact Keeper using Docker Compose or build from source"
+---
+
+# Installation
+
+Artifact Keeper can be deployed using Docker Compose for quick setup, or built from source for customization.
+
+## Docker Compose (Recommended)
+
+The easiest way to run Artifact Keeper with all dependencies.
+
+### Full Stack Setup
+
+The included `docker-compose.yml` provides a complete setup with:
+- Artifact Keeper backend (Rust API server)
+- Frontend (React UI)
+- PostgreSQL 15 (metadata storage)
+- MinIO (S3-compatible artifact storage)
+- Trivy (vulnerability scanning)
+
+```bash
+git clone https://github.com/yourusername/artifact-keeper.git
+cd artifact-keeper
+docker compose up -d
+```
+
+**Default Ports**:
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8080`
+- MinIO Console: `http://localhost:9001`
+
+### Customizing Docker Compose
+
+Edit `docker-compose.yml` or create a `docker-compose.override.yml`:
+
+```yaml
+services:
+  backend:
+    environment:
+      - LOG_LEVEL=debug
+      - JWT_SECRET=your-secret-key-change-this
+    volumes:
+      - ./local-storage:/var/lib/artifact-keeper/artifacts
+```
+
+## From Source
+
+Build Artifact Keeper from source for development or custom deployments.
+
+### Prerequisites
+
+- **Rust**: 1.75 or later ([install rustup](https://rustup.rs/))
+- **Node.js**: 20.x or later ([install node](https://nodejs.org/))
+- **PostgreSQL**: 15 or later
+- **Git**: For cloning the repository
+
+### Build Backend
+
+```bash
+# Clone repository
+git clone https://github.com/yourusername/artifact-keeper.git
+cd artifact-keeper
+
+# Build backend (release mode)
+cargo build --release
+
+# Binary will be at: target/release/artifact-keeper
+```
+
+### Build Frontend
+
+```bash
+cd frontend
+
+# Install dependencies
+npm install
+
+# Build for production
+npm run build
+
+# Production build will be in: dist/
+```
+
+### Setup Database
+
+1. **Create PostgreSQL database**:
+
+```sql
+CREATE DATABASE artifact_keeper;
+CREATE USER artifact_keeper WITH PASSWORD 'your-password';
+GRANT ALL PRIVILEGES ON DATABASE artifact_keeper TO artifact_keeper;
+```
+
+2. **Run migrations**:
+
+```bash
+# Set database URL
+export DATABASE_URL=postgresql://artifact_keeper:your-password@localhost/artifact_keeper
+
+# Run migrations (handled automatically on first start)
+./target/release/artifact-keeper migrate
+```
+
+### Configure Environment
+
+Create a `.env` file or set environment variables:
+
+```bash
+# Required
+export DATABASE_URL=postgresql://artifact_keeper:your-password@localhost/artifact_keeper
+export JWT_SECRET=generate-a-secure-random-string-here
+
+# Optional
+export BIND_ADDRESS=0.0.0.0:8080
+export LOG_LEVEL=info
+export STORAGE_BACKEND=filesystem
+export STORAGE_PATH=/var/lib/artifact-keeper/artifacts
+```
+
+See the [Configuration Reference](/getting-started/configuration) for all available options.
+
+### Run the Application
+
+```bash
+# Start backend
+./target/release/artifact-keeper
+
+# In another terminal, serve frontend (for development)
+cd frontend
+npm run dev
+
+# Or serve the production build with a static file server
+npx serve -s dist -l 3000
+```
+
+## Production Deployment
+
+### Systemd Service (Linux)
+
+Create `/etc/systemd/system/artifact-keeper.service`:
+
+```ini
+[Unit]
+Description=Artifact Keeper
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=artifact-keeper
+WorkingDirectory=/opt/artifact-keeper
+EnvironmentFile=/opt/artifact-keeper/.env
+ExecStart=/opt/artifact-keeper/artifact-keeper
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable artifact-keeper
+sudo systemctl start artifact-keeper
+sudo systemctl status artifact-keeper
+```
+
+### Reverse Proxy (Nginx)
+
+```nginx
+server {
+    listen 80;
+    server_name artifacts.example.com;
+
+    # Frontend
+    location / {
+        root /var/www/artifact-keeper/frontend;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Backend API
+    location /api {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Package repositories
+    location ~ ^/(maven|npm|docker|pypi) {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        client_max_body_size 1G;
+    }
+}
+```
+
+## Storage Options
+
+### Filesystem Storage (Default)
+
+Simple and performant for single-node deployments:
+
+```bash
+export STORAGE_BACKEND=filesystem
+export STORAGE_PATH=/var/lib/artifact-keeper/artifacts
+```
+
+Ensure the directory exists and is writable:
+
+```bash
+sudo mkdir -p /var/lib/artifact-keeper/artifacts
+sudo chown artifact-keeper:artifact-keeper /var/lib/artifact-keeper/artifacts
+```
+
+### S3-Compatible Storage
+
+For distributed deployments or cloud environments:
+
+```bash
+export STORAGE_BACKEND=s3
+export S3_BUCKET=artifact-keeper
+export S3_REGION=us-east-1
+export S3_ENDPOINT=https://s3.amazonaws.com  # Optional, for MinIO/custom endpoints
+export AWS_ACCESS_KEY_ID=your-access-key
+export AWS_SECRET_ACCESS_KEY=your-secret-key
+```
+
+Works with AWS S3, MinIO, DigitalOcean Spaces, and other S3-compatible services.
+
+## Verification
+
+Check that everything is running:
+
+```bash
+# Backend health check
+curl http://localhost:8080/health
+
+# Expected response:
+# {"status":"healthy"}
+
+# Frontend
+curl http://localhost:3000
+
+# Should return the HTML of the React app
+```
+
+## Next Steps
+
+- [Configuration Reference](/getting-started/configuration) - Configure authentication, scanning, and integrations
+- [Quickstart Guide](/getting-started/quickstart) - Create your first repository and push artifacts
+- [Package Formats](/package-formats) - See all supported formats and endpoints

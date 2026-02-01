@@ -1,0 +1,48 @@
+---
+title: "Welcome to Artifact Keeper"
+description: "Open-source artifact registry supporting 30+ package formats. A free, MIT-licensed alternative to Artifactory."
+---
+
+# Welcome to Artifact Keeper
+
+Artifact Keeper is an open-source artifact registry built to be a powerful, cost-effective alternative to JFrog Artifactory. Built with Rust and React, it provides enterprise-grade artifact management without the enterprise price tag.
+
+## Why Artifact Keeper?
+
+- **Free and Open Source**: MIT licensed, no hidden costs or feature gates
+- **30+ Package Formats**: Support for Maven, npm, Docker, PyPI, NuGet, Cargo, and 25+ more formats
+- **Built for Scale**: Handles 50,000+ artifacts with efficient storage and caching
+- **Modern Architecture**: Rust backend for performance, React frontend for usability
+- **Security First**: Integrated vulnerability scanning with Trivy
+- **Extensible**: WASM plugin system for custom workflows
+- **Edge Nodes**: Distributed caching for global teams
+- **Migration Tooling**: Built-in migration from Artifactory
+
+## Key Features
+
+- **Multi-Format Support**: Single registry for all your package types - languages, containers, cloud infrastructure, ML models, and system packages
+- **Security Scanning**: Automatic vulnerability detection with Trivy integration
+- **Advanced Search**: Fast, full-text search powered by MeiliSearch
+- **RBAC & Auth**: Fine-grained permissions with OIDC and LDAP support
+- **Edge Nodes**: Deploy caching nodes closer to your teams worldwide
+- **WASM Plugins**: Extend functionality with custom plugins written in any WASM-compatible language
+- **Migration API**: Seamless migration from Artifactory with zero downtime
+- **Modern UI**: Clean, intuitive interface built with React and Ant Design
+
+## Quick Links
+
+- [Quickstart Guide](/getting-started/quickstart) - Get up and running in 5 minutes
+- [Package Formats](/package-formats) - See all 30+ supported formats
+- [Migrate from Artifactory](/migration/from-artifactory) - Switch and save thousands per year
+- [Configuration Reference](/getting-started/configuration) - Complete environment variable guide
+
+## License
+
+Artifact Keeper is released under the MIT License. Use it freely in your projects, commercial or otherwise.
+
+## Technology Stack
+
+- **Backend**: Rust 1.75+ with Axum, SQLx, and Tokio
+- **Frontend**: React 19.x with TypeScript, Ant Design 6.x, and TanStack Query
+- **Storage**: PostgreSQL 15+ for metadata, filesystem or S3 for artifacts
+- **Optional**: Trivy for scanning, MeiliSearch for search, MinIO for S3-compatible storage

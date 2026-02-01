@@ -1,0 +1,536 @@
+---
+title: "npm Registry Guide"
+description: "Using Artifact Keeper as an npm registry for JavaScript and TypeScript packages"
+---
+
+Artifact Keeper provides a fully compatible npm registry for publishing and installing JavaScript and TypeScript packages.
+
+## Endpoint
+
+All npm operations use the `/npm` endpoint:
+
+```
+http://localhost:8080/npm/
+```
+
+## Configuration
+
+### .npmrc Configuration
+
+Create or edit `.npmrc` in your project root or home directory (`~/.npmrc`):
+
+```ini
+registry=http://localhost:8080/npm/
+```
+
+### Authentication
+
+#### Option 1: npm login
+
+Interactive login:
+
+```bash
+npm login --registry=http://localhost:8080/npm/
+```
+
+Enter your Artifact Keeper username and password when prompted.
+
+#### Option 2: Auth Token
+
+Add authentication token directly to `.npmrc`:
+
+```ini
+registry=http://localhost:8080/npm/
+//localhost:8080/npm/:_authToken=your-auth-token
+```
+
+#### Option 3: Basic Auth
+
+Use base64-encoded credentials:
+
+```ini
+registry=http://localhost:8080/npm/
+//localhost:8080/npm/:_auth=base64(username:password)
+//localhost:8080/npm/:always-auth=true
+```
+
+## Publishing Packages
+
+### Prepare Your Package
+
+Ensure `package.json` is properly configured:
+
+```json
+{
+  "name": "my-package",
+  "version": "1.0.0",
+  "description": "My awesome package",
+  "main": "index.js",
+  "author": "Your Name",
+  "license": "MIT"
+}
+```
+
+### Publish to Registry
+
+```bash
+npm publish
+```
+
+### Publish Scoped Package
+
+For organization or user-scoped packages:
+
+```json
+{
+  "name": "@mycompany/my-package",
+  "version": "1.0.0"
+}
+```
+
+Configure scope registry:
+
+```ini
+@mycompany:registry=http://localhost:8080/npm/
+//localhost:8080/npm/:_authToken=your-auth-token
+```
+
+Publish:
+
+```bash
+npm publish --access public
+```
+
+Or for private packages:
+
+```bash
+npm publish --access restricted
+```
+
+### Publish Specific Tag
+
+Publish with a custom tag (default is `latest`):
+
+```bash
+npm publish --tag beta
+npm publish --tag next
+```
+
+## Installing Packages
+
+### Install from Registry
+
+```bash
+npm install my-package
+```
+
+### Install Scoped Package
+
+```bash
+npm install @mycompany/my-package
+```
+
+### Install Specific Version
+
+```bash
+npm install my-package@1.0.0
+npm install my-package@^1.0.0
+npm install my-package@~1.2.3
+```
+
+### Install from Specific Tag
+
+```bash
+npm install my-package@beta
+npm install my-package@next
+```
+
+## Scoped Packages
+
+Scoped packages allow you to group related packages under a namespace.
+
+### Configure Scope
+
+For organization scope `@mycompany`:
+
+```ini
+@mycompany:registry=http://localhost:8080/npm/
+//localhost:8080/npm/:_authToken=your-auth-token
+```
+
+### Create Scoped Package
+
+```json
+{
+  "name": "@mycompany/utils",
+  "version": "1.0.0"
+}
+```
+
+### Publish Scoped Package
+
+```bash
+npm publish --access public
+```
+
+### Install Scoped Package
+
+```bash
+npm install @mycompany/utils
+```
+
+### Use Scoped Package
+
+```javascript
+import { helper } from '@mycompany/utils';
+```
+
+## Version Management
+
+### Semantic Versioning
+
+Follow semantic versioning for your packages:
+
+```bash
+# Increment patch version (1.0.0 -> 1.0.1)
+npm version patch
+
+# Increment minor version (1.0.0 -> 1.1.0)
+npm version minor
+
+# Increment major version (1.0.0 -> 2.0.0)
+npm version major
+```
+
+Then publish:
+
+```bash
+npm publish
+```
+
+### Pre-release Versions
+
+```bash
+npm version prerelease --preid=beta
+# 1.0.0 -> 1.0.1-beta.0
+
+npm publish --tag beta
+```
+
+### List Versions
+
+View all published versions:
+
+```bash
+npm view my-package versions
+```
+
+### Deprecate Version
+
+Mark a version as deprecated:
+
+```bash
+npm deprecate my-package@1.0.0 "Use version 2.0.0 instead"
+```
+
+## Tag Management
+
+### Add Tag
+
+```bash
+npm dist-tag add my-package@1.0.0 stable
+```
+
+### Remove Tag
+
+```bash
+npm dist-tag rm my-package stable
+```
+
+### List Tags
+
+```bash
+npm dist-tag ls my-package
+```
+
+## Yarn Support
+
+Artifact Keeper's npm registry is fully compatible with Yarn.
+
+### Configure Yarn v1
+
+```bash
+yarn config set registry http://localhost:8080/npm/
+```
+
+### Configure Yarn v2+
+
+Edit `.yarnrc.yml`:
+
+```yaml
+npmRegistryServer: "http://localhost:8080/npm/"
+
+npmAuthToken: your-auth-token
+```
+
+### Install with Yarn
+
+```bash
+yarn add my-package
+```
+
+### Publish with Yarn
+
+```bash
+yarn publish
+```
+
+## pnpm Support
+
+Artifact Keeper's npm registry is fully compatible with pnpm.
+
+### Configure pnpm
+
+```bash
+pnpm config set registry http://localhost:8080/npm/
+```
+
+Or in `.npmrc`:
+
+```ini
+registry=http://localhost:8080/npm/
+```
+
+### Install with pnpm
+
+```bash
+pnpm add my-package
+```
+
+### Publish with pnpm
+
+```bash
+pnpm publish
+```
+
+## Integration with CI/CD
+
+### GitHub Actions
+
+```yaml
+name: Publish Package
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'http://localhost:8080/npm/'
+
+      - run: npm ci
+
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+```
+
+### GitLab CI
+
+```yaml
+publish:
+  image: node:20
+  script:
+    - echo "//localhost:8080/npm/:_authToken=${NPM_TOKEN}" > .npmrc
+    - npm publish
+  only:
+    - tags
+```
+
+### Jenkins Pipeline
+
+```groovy
+pipeline {
+    agent any
+
+    tools {
+        nodejs 'NodeJS 20'
+    }
+
+    stages {
+        stage('Publish') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'npm-token', variable: 'NPM_TOKEN')
+                ]) {
+                    sh '''
+                        echo "//localhost:8080/npm/:_authToken=${NPM_TOKEN}" > .npmrc
+                        npm publish
+                    '''
+                }
+            }
+        }
+    }
+}
+```
+
+## Advanced Configuration
+
+### Multiple Registries
+
+Use different registries for different scopes:
+
+```ini
+# Default registry
+registry=https://registry.npmjs.org/
+
+# Company packages
+@mycompany:registry=http://localhost:8080/npm/
+//localhost:8080/npm/:_authToken=token1
+
+# Team packages
+@myteam:registry=http://team-registry:8080/npm/
+//team-registry:8080/npm/:_authToken=token2
+```
+
+### Proxy Configuration
+
+```ini
+proxy=http://proxy.example.com:8080
+https-proxy=http://proxy.example.com:8080
+```
+
+### SSL/TLS Configuration
+
+For self-signed certificates:
+
+```ini
+strict-ssl=false
+```
+
+Or add CA certificate:
+
+```ini
+cafile=/path/to/ca-certificate.crt
+```
+
+## Package Scripts
+
+Automate publishing with package scripts:
+
+```json
+{
+  "scripts": {
+    "prepublishOnly": "npm test && npm run build",
+    "preversion": "npm test",
+    "version": "npm run build && git add -A",
+    "postversion": "git push && git push --tags && npm publish"
+  }
+}
+```
+
+## Troubleshooting
+
+### Authentication Errors
+
+Verify your token is valid:
+
+```bash
+npm whoami --registry=http://localhost:8080/npm/
+```
+
+### Publishing Failures
+
+Check package name availability:
+
+```bash
+npm view my-package
+```
+
+Enable verbose logging:
+
+```bash
+npm publish --loglevel verbose
+```
+
+### Installation Issues
+
+Clear npm cache:
+
+```bash
+npm cache clean --force
+```
+
+Verify registry configuration:
+
+```bash
+npm config get registry
+npm config list
+```
+
+### Version Conflicts
+
+Ensure version in `package.json` is incremented:
+
+```bash
+npm version patch  # Auto-increment
+npm publish
+```
+
+## Best Practices
+
+### Semantic Versioning
+
+- **Major** (1.0.0 -> 2.0.0): Breaking changes
+- **Minor** (1.0.0 -> 1.1.0): New features, backward compatible
+- **Patch** (1.0.0 -> 1.0.1): Bug fixes
+
+### Package.json Fields
+
+Include essential metadata:
+
+```json
+{
+  "name": "@mycompany/my-package",
+  "version": "1.0.0",
+  "description": "Clear, concise description",
+  "keywords": ["keyword1", "keyword2"],
+  "author": "Your Name <you@example.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mycompany/my-package"
+  },
+  "bugs": {
+    "url": "https://github.com/mycompany/my-package/issues"
+  },
+  "homepage": "https://github.com/mycompany/my-package#readme"
+}
+```
+
+### .npmignore
+
+Exclude unnecessary files from published package:
+
+```
+.git
+.github
+tests
+coverage
+*.test.js
+.env
+.DS_Store
+node_modules
+```
+
+## See Also
+
+- [Security Scanning](/security/scanning) - Automatic vulnerability scanning for npm packages
+- [Security Policies](/security/policies) - Configure policies to block vulnerable packages

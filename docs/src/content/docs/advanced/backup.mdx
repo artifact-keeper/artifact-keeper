@@ -1,0 +1,537 @@
+---
+title: "Backup & Recovery"
+description: "Built-in backup system for database and artifacts with scheduled backups and restore capabilities"
+---
+
+Artifact Keeper includes a comprehensive backup and recovery system to protect your registry data and artifacts.
+
+## Backup Components
+
+A complete backup includes:
+
+1. **Database backup**: PostgreSQL dump of all metadata, users, permissions, and configuration
+2. **Artifact storage**: All artifact files from the storage backend
+3. **System configuration**: Environment settings and plugin configurations
+
+## Creating Backups
+
+### Manual Backup via API
+
+```bash
+curl -X POST https://registry.example.com/api/v1/admin/backups \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "Pre-upgrade backup",
+    "include_artifacts": true,
+    "compression": "gzip"
+  }'
+```
+
+Response:
+
+```json
+{
+  "backup_id": "backup-123",
+  "status": "in_progress",
+  "started_at": "2026-02-01T12:00:00Z",
+  "description": "Pre-upgrade backup"
+}
+```
+
+### Manual Backup via CLI
+
+```bash
+# Full backup
+artifact-keeper backup create \
+  --output /backups/full-backup-2026-02-01.tar.gz \
+  --compression gzip
+
+# Database only
+artifact-keeper backup create \
+  --database-only \
+  --output /backups/db-backup-2026-02-01.sql.gz
+
+# Artifacts only
+artifact-keeper backup create \
+  --artifacts-only \
+  --output /backups/artifacts-backup-2026-02-01.tar.gz
+```
+
+## Scheduled Backups
+
+### Configuration
+
+Enable automatic scheduled backups:
+
+```bash
+# Enable scheduled backups
+BACKUP_ENABLED=true
+
+# Backup schedule (cron format)
+BACKUP_SCHEDULE="0 2 * * *"  # Daily at 2 AM
+
+# Backup retention
+BACKUP_RETENTION_DAYS=30
+
+# Backup destination
+BACKUP_PATH=/var/backups/artifact-keeper
+
+# Include artifacts in scheduled backups
+BACKUP_INCLUDE_ARTIFACTS=true
+
+# Compression method
+BACKUP_COMPRESSION=gzip  # or 'zstd', 'none'
+```
+
+### Backup Retention Policy
+
+```bash
+# Keep daily backups for 7 days
+BACKUP_RETENTION_DAILY=7
+
+# Keep weekly backups for 4 weeks
+BACKUP_RETENTION_WEEKLY=4
+
+# Keep monthly backups for 12 months
+BACKUP_RETENTION_MONTHLY=12
+```
+
+Artifact Keeper automatically manages backup rotation based on these policies.
+
+## Backup Storage
+
+### Local Filesystem
+
+Default storage location:
+
+```bash
+BACKUP_PATH=/var/backups/artifact-keeper
+```
+
+Ensure sufficient disk space:
+
+```bash
+df -h /var/backups
+```
+
+### Remote Storage (S3)
+
+Store backups in S3-compatible storage:
+
+```bash
+BACKUP_STORAGE=s3
+BACKUP_S3_BUCKET=artifact-keeper-backups
+BACKUP_S3_REGION=us-east-1
+BACKUP_S3_PREFIX=backups/
+BACKUP_S3_ACCESS_KEY_ID=your-access-key
+BACKUP_S3_SECRET_ACCESS_KEY=your-secret-key
+```
+
+### Network Storage
+
+Use NFS or other network-attached storage:
+
+```bash
+# Mount NFS share
+sudo mount -t nfs backup-server:/backups /mnt/backups
+
+# Configure backup path
+BACKUP_PATH=/mnt/backups/artifact-keeper
+```
+
+## Backup Structure
+
+### Backup Archive Contents
+
+```text
+backup-2026-02-01-120000/
+├── metadata.json          # Backup metadata
+├── database/
+│   └── dump.sql.gz       # PostgreSQL dump
+├── artifacts/
+│   └── storage.tar.gz    # Artifact files
+├── config/
+│   ├── environment.env   # Environment variables
+│   └── plugins/          # Plugin configurations
+└── checksum.sha256       # Integrity verification
+```
+
+### Metadata File
+
+```json
+{
+  "backup_id": "backup-123",
+  "created_at": "2026-02-01T12:00:00Z",
+  "version": "1.0.0",
+  "components": {
+    "database": true,
+    "artifacts": true,
+    "config": true
+  },
+  "statistics": {
+    "database_size_mb": 245,
+    "artifacts_count": 15234,
+    "artifacts_size_mb": 125678,
+    "total_size_mb": 125923
+  },
+  "compression": "gzip",
+  "encryption": false
+}
+```
+
+## Restoring from Backup
+
+### Via API
+
+```bash
+curl -X POST https://registry.example.com/api/v1/admin/backups/backup-123/restore \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "restore_database": true,
+    "restore_artifacts": true,
+    "restore_config": true
+  }'
+```
+
+### Via CLI
+
+```bash
+# Full restore
+artifact-keeper backup restore \
+  --backup-file /backups/full-backup-2026-02-01.tar.gz \
+  --confirm
+
+# Database only
+artifact-keeper backup restore \
+  --backup-file /backups/db-backup-2026-02-01.sql.gz \
+  --database-only \
+  --confirm
+
+# Artifacts only
+artifact-keeper backup restore \
+  --backup-file /backups/artifacts-backup-2026-02-01.tar.gz \
+  --artifacts-only \
+  --confirm
+```
+
+### Restore Process
+
+1. **Pre-restore validation**: Verify backup integrity and compatibility
+2. **Service shutdown**: Stop all backend services
+3. **Database restore**: Import PostgreSQL dump
+4. **Artifact restore**: Extract artifact files to storage backend
+5. **Configuration restore**: Apply system configuration
+6. **Post-restore verification**: Verify data integrity
+7. **Service restart**: Start backend services
+
+### Restore Warnings
+
+- Existing data will be overwritten
+- Restore requires downtime
+- Ensure backup version matches current version (or use migration tools)
+- Test restores on staging environment first
+
+## Point-in-Time Recovery (PITR)
+
+Enable PostgreSQL continuous archiving for point-in-time recovery:
+
+### Configuration
+
+```bash
+# Enable WAL archiving
+POSTGRES_WAL_ARCHIVING=true
+POSTGRES_WAL_ARCHIVE_PATH=/var/lib/postgres/wal_archive
+
+# Archive retention
+POSTGRES_WAL_RETENTION_DAYS=7
+```
+
+### PostgreSQL Configuration
+
+In `postgresql.conf`:
+
+```ini
+wal_level = replica
+archive_mode = on
+archive_command = 'cp %p /var/lib/postgres/wal_archive/%f'
+archive_timeout = 300
+```
+
+### Restore to Point in Time
+
+```bash
+artifact-keeper backup restore \
+  --backup-file /backups/base-backup.tar.gz \
+  --recovery-target-time "2026-02-01 11:30:00" \
+  --confirm
+```
+
+## Backup Verification
+
+### Integrity Check
+
+Verify backup integrity without restoring:
+
+```bash
+curl https://registry.example.com/api/v1/admin/backups/backup-123/verify \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Or via CLI:
+
+```bash
+artifact-keeper backup verify \
+  --backup-file /backups/full-backup-2026-02-01.tar.gz
+```
+
+Checks:
+- Archive can be extracted
+- Checksums match
+- Database dump is valid SQL
+- All referenced artifacts are present
+
+### Test Restore
+
+Perform test restore to temporary location:
+
+```bash
+artifact-keeper backup test-restore \
+  --backup-file /backups/full-backup-2026-02-01.tar.gz \
+  --temp-dir /tmp/restore-test
+```
+
+## Incremental Backups
+
+Reduce backup size and time with incremental backups:
+
+### Configuration
+
+```bash
+BACKUP_TYPE=incremental
+BACKUP_FULL_SCHEDULE="0 2 * * 0"  # Full backup weekly on Sunday
+BACKUP_INCREMENTAL_SCHEDULE="0 2 * * 1-6"  # Incremental daily Mon-Sat
+```
+
+### How It Works
+
+1. **Full backup**: Complete copy of database and artifacts
+2. **Incremental backup**: Only changes since last backup (full or incremental)
+3. **Restore**: Requires full backup + all incremental backups since then
+
+### Restore from Incremental
+
+```bash
+artifact-keeper backup restore \
+  --full-backup /backups/full-2026-01-25.tar.gz \
+  --incremental /backups/incr-2026-01-26.tar.gz \
+  --incremental /backups/incr-2026-01-27.tar.gz \
+  --incremental /backups/incr-2026-02-01.tar.gz \
+  --confirm
+```
+
+## Backup Encryption
+
+Protect backups with encryption:
+
+### Configuration
+
+```bash
+BACKUP_ENCRYPTION=true
+BACKUP_ENCRYPTION_KEY=/etc/artifact-keeper/backup.key
+```
+
+### Generate Encryption Key
+
+```bash
+# Generate 256-bit AES key
+openssl rand -base64 32 > /etc/artifact-keeper/backup.key
+chmod 600 /etc/artifact-keeper/backup.key
+```
+
+### Encrypted Backup
+
+Backups are encrypted using AES-256-GCM:
+
+```bash
+artifact-keeper backup create \
+  --output /backups/encrypted-backup.tar.gz.enc \
+  --encryption-key /etc/artifact-keeper/backup.key
+```
+
+### Restore Encrypted Backup
+
+```bash
+artifact-keeper backup restore \
+  --backup-file /backups/encrypted-backup.tar.gz.enc \
+  --decryption-key /etc/artifact-keeper/backup.key \
+  --confirm
+```
+
+## Managing Backups
+
+### List Backups
+
+```bash
+curl https://registry.example.com/api/v1/admin/backups \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Response:
+
+```json
+{
+  "backups": [
+    {
+      "id": "backup-123",
+      "created_at": "2026-02-01T12:00:00Z",
+      "description": "Scheduled daily backup",
+      "size_mb": 125923,
+      "type": "full",
+      "status": "completed",
+      "location": "s3://artifact-keeper-backups/backups/backup-123.tar.gz"
+    }
+  ]
+}
+```
+
+### Delete Backup
+
+```bash
+curl -X DELETE https://registry.example.com/api/v1/admin/backups/backup-123 \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+### Download Backup
+
+```bash
+curl https://registry.example.com/api/v1/admin/backups/backup-123/download \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -o backup-123.tar.gz
+```
+
+## Disaster Recovery
+
+### Recovery Plan
+
+1. **Prepare new environment**: Install Artifact Keeper with same version
+2. **Restore configuration**: Copy environment variables and config files
+3. **Restore database**: Import PostgreSQL dump
+4. **Restore artifacts**: Extract to storage backend
+5. **Verify integrity**: Run health checks
+6. **Update DNS**: Point domain to new instance
+7. **Test**: Verify uploads and downloads work
+
+### Automated DR Setup
+
+Use infrastructure-as-code to automate disaster recovery:
+
+```bash
+# Terraform/Ansible scripts for provisioning
+terraform apply -var-file=dr.tfvars
+
+# Restore from backup
+artifact-keeper backup restore \
+  --backup-file s3://backups/latest.tar.gz \
+  --confirm
+
+# Verify health
+artifact-keeper health check
+```
+
+## Monitoring
+
+### Backup Metrics
+
+```text
+artifact_keeper_backup_last_success_timestamp
+artifact_keeper_backup_duration_seconds
+artifact_keeper_backup_size_bytes
+artifact_keeper_backup_failures_total
+```
+
+### Alerts
+
+Configure alerts for backup failures:
+
+```yaml
+groups:
+  - name: backup
+    rules:
+      - alert: BackupFailed
+        expr: time() - artifact_keeper_backup_last_success_timestamp > 86400
+        annotations:
+          summary: "Backup has not succeeded in 24 hours"
+
+      - alert: BackupTooLarge
+        expr: artifact_keeper_backup_size_bytes > 1e12
+        annotations:
+          summary: "Backup size exceeds 1TB"
+```
+
+## Best Practices
+
+### Regular Testing
+
+- Test restores monthly
+- Verify backup integrity weekly
+- Document restore procedures
+- Train team on recovery process
+
+### 3-2-1 Rule
+
+- **3** copies of data (production + 2 backups)
+- **2** different media types (disk + cloud)
+- **1** offsite copy (different geographic location)
+
+### Automation
+
+- Automate scheduled backups
+- Automate retention policies
+- Automate backup verification
+- Alert on failures
+
+### Security
+
+- Encrypt backups at rest
+- Encrypt backups in transit
+- Restrict access to backup files
+- Rotate encryption keys periodically
+
+## Troubleshooting
+
+### Backup Failures
+
+Check logs:
+
+```bash
+tail -f /var/log/artifact-keeper/backup.log
+```
+
+Common issues:
+- Insufficient disk space
+- Database connection errors
+- Storage backend unavailable
+- Permission issues
+
+### Restore Failures
+
+Verify backup integrity:
+
+```bash
+artifact-keeper backup verify --backup-file backup.tar.gz
+```
+
+Check version compatibility:
+
+```bash
+artifact-keeper backup info --backup-file backup.tar.gz
+```
+
+### Performance Issues
+
+- Use compression to reduce backup size
+- Run backups during off-peak hours
+- Use incremental backups for large registries
+- Store backups on fast storage

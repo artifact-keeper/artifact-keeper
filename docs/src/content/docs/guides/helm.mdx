@@ -1,0 +1,673 @@
+---
+title: "Helm Chart Repository Guide"
+description: "Using Artifact Keeper as a Helm chart repository for Kubernetes applications"
+---
+
+Artifact Keeper provides a Helm chart repository for hosting and distributing Kubernetes application packages.
+
+## Endpoint
+
+Helm operations use the `/helm` endpoint:
+
+```
+http://localhost:8080/helm
+```
+
+## Configuration
+
+### Add Helm Repository
+
+Add Artifact Keeper as a Helm chart repository:
+
+```bash
+helm repo add artifact-keeper http://localhost:8080/helm
+```
+
+With authentication:
+
+```bash
+helm repo add artifact-keeper http://localhost:8080/helm \
+  --username your-username \
+  --password your-password
+```
+
+### Update Repository Index
+
+Fetch the latest chart information:
+
+```bash
+helm repo update
+```
+
+### List Repositories
+
+View configured repositories:
+
+```bash
+helm repo list
+```
+
+## Publishing Charts
+
+### Create a Helm Chart
+
+Generate a new chart:
+
+```bash
+helm create my-chart
+```
+
+This creates a chart structure:
+
+```
+my-chart/
+├── Chart.yaml
+├── values.yaml
+├── templates/
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── _helpers.tpl
+└── charts/
+```
+
+### Chart.yaml
+
+Define chart metadata in `Chart.yaml`:
+
+```yaml
+apiVersion: v2
+name: my-chart
+description: A Helm chart for Kubernetes
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+keywords:
+  - application
+  - kubernetes
+
+maintainers:
+  - name: Your Name
+    email: you@example.com
+
+home: https://github.com/yourusername/my-chart
+sources:
+  - https://github.com/yourusername/my-chart
+
+dependencies:
+  - name: postgresql
+    version: "12.1.0"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+```
+
+### Package Chart
+
+Create a chart archive:
+
+```bash
+helm package my-chart
+```
+
+This creates `my-chart-0.1.0.tgz`.
+
+### Publish Chart
+
+Push the chart to Artifact Keeper using the Helm OCI or HTTP protocol:
+
+#### Option 1: Using helm-push Plugin
+
+Install the helm-push plugin:
+
+```bash
+helm plugin install https://github.com/chartmuseum/helm-push
+```
+
+Push the chart:
+
+```bash
+helm cm-push my-chart-0.1.0.tgz artifact-keeper
+```
+
+Or push directly from directory:
+
+```bash
+helm cm-push my-chart/ artifact-keeper
+```
+
+#### Option 2: Using curl
+
+```bash
+curl -u username:password \
+  --data-binary "@my-chart-0.1.0.tgz" \
+  http://localhost:8080/helm/api/charts
+```
+
+#### Option 3: OCI Registry (if supported)
+
+```bash
+# Login to OCI registry
+helm registry login localhost:8080 -u username
+
+# Package and push
+helm push my-chart-0.1.0.tgz oci://localhost:8080/helm
+```
+
+## Installing Charts
+
+### Search for Charts
+
+Search the repository:
+
+```bash
+helm search repo artifact-keeper
+helm search repo artifact-keeper/my-chart
+```
+
+Show chart details:
+
+```bash
+helm show chart artifact-keeper/my-chart
+helm show values artifact-keeper/my-chart
+helm show all artifact-keeper/my-chart
+```
+
+### Install Chart
+
+Install a chart from Artifact Keeper:
+
+```bash
+helm install my-release artifact-keeper/my-chart
+```
+
+Install specific version:
+
+```bash
+helm install my-release artifact-keeper/my-chart --version 0.1.0
+```
+
+Install with custom values:
+
+```bash
+helm install my-release artifact-keeper/my-chart \
+  --set service.type=LoadBalancer \
+  --set replicaCount=3
+```
+
+Or use a values file:
+
+```bash
+helm install my-release artifact-keeper/my-chart -f custom-values.yaml
+```
+
+### Install to Specific Namespace
+
+```bash
+helm install my-release artifact-keeper/my-chart \
+  --namespace my-namespace \
+  --create-namespace
+```
+
+## Managing Releases
+
+### List Installed Charts
+
+```bash
+helm list
+helm list --namespace my-namespace
+helm list --all-namespaces
+```
+
+### Upgrade Release
+
+```bash
+helm upgrade my-release artifact-keeper/my-chart
+```
+
+Upgrade to specific version:
+
+```bash
+helm upgrade my-release artifact-keeper/my-chart --version 0.2.0
+```
+
+### Rollback Release
+
+```bash
+helm rollback my-release
+helm rollback my-release 1  # Rollback to specific revision
+```
+
+### Uninstall Release
+
+```bash
+helm uninstall my-release
+helm uninstall my-release --namespace my-namespace
+```
+
+## Chart Versioning
+
+### Semantic Versioning
+
+Follow semantic versioning in `Chart.yaml`:
+
+```yaml
+version: 1.2.3
+# Major.Minor.Patch
+```
+
+### Version Constraints
+
+In chart dependencies:
+
+```yaml
+dependencies:
+  - name: redis
+    version: "~6.2.0"  # >= 6.2.0, < 6.3.0
+    repository: http://localhost:8080/helm
+
+  - name: postgresql
+    version: "^12.0.0"  # >= 12.0.0, < 13.0.0
+    repository: http://localhost:8080/helm
+```
+
+### App Version
+
+Track application version separately:
+
+```yaml
+version: 1.0.0      # Chart version
+appVersion: "2.5.1" # Application version
+```
+
+## Chart Dependencies
+
+### Define Dependencies
+
+In `Chart.yaml`:
+
+```yaml
+dependencies:
+  - name: redis
+    version: "17.0.0"
+    repository: http://localhost:8080/helm
+    condition: redis.enabled
+
+  - name: postgresql
+    version: "12.1.0"
+    repository: http://localhost:8080/helm
+    condition: postgresql.enabled
+    tags:
+      - database
+```
+
+### Download Dependencies
+
+```bash
+helm dependency update my-chart
+```
+
+This downloads dependencies to `charts/` directory.
+
+### List Dependencies
+
+```bash
+helm dependency list my-chart
+```
+
+## Chart Repository Index
+
+The repository index is automatically maintained at `/helm/index.yaml`.
+
+### View Index
+
+```bash
+curl http://localhost:8080/helm/index.yaml
+```
+
+Example index.yaml:
+
+```yaml
+apiVersion: v1
+entries:
+  my-chart:
+    - name: my-chart
+      version: 0.1.0
+      description: A Helm chart for Kubernetes
+      created: "2024-01-15T10:00:00Z"
+      digest: sha256:abc123...
+      urls:
+        - http://localhost:8080/helm/charts/my-chart-0.1.0.tgz
+    - name: my-chart
+      version: 0.2.0
+      description: A Helm chart for Kubernetes
+      created: "2024-01-20T10:00:00Z"
+      digest: sha256:def456...
+      urls:
+        - http://localhost:8080/helm/charts/my-chart-0.2.0.tgz
+```
+
+## Integration with CI/CD
+
+### GitHub Actions
+
+```yaml
+name: Package and Publish Helm Chart
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: '3.13.0'
+
+      - name: Package chart
+        run: |
+          helm package charts/my-chart --version ${{ github.ref_name }}
+
+      - name: Install helm-push plugin
+        run: |
+          helm plugin install https://github.com/chartmuseum/helm-push
+
+      - name: Add Helm repository
+        run: |
+          helm repo add artifact-keeper http://registry.example.com/helm \
+            --username ${{ secrets.HELM_USER }} \
+            --password ${{ secrets.HELM_PASSWORD }}
+
+      - name: Push chart
+        run: |
+          helm cm-push my-chart-*.tgz artifact-keeper
+```
+
+### GitLab CI
+
+```yaml
+publish-chart:
+  image: alpine/helm:latest
+  stage: deploy
+  script:
+    - helm plugin install https://github.com/chartmuseum/helm-push
+    - helm repo add artifact-keeper $HELM_REPO_URL --username $HELM_USER --password $HELM_PASSWORD
+    - helm package charts/my-chart
+    - helm cm-push my-chart-*.tgz artifact-keeper
+  only:
+    - tags
+```
+
+### Jenkins Pipeline
+
+```groovy
+pipeline {
+    agent any
+
+    tools {
+        helm 'Helm 3.13'
+    }
+
+    stages {
+        stage('Package and Publish') {
+            steps {
+                sh '''
+                    helm plugin install https://github.com/chartmuseum/helm-push
+                    helm repo add artifact-keeper ${HELM_REPO_URL} \
+                        --username ${HELM_USER} \
+                        --password ${HELM_PASSWORD}
+                    helm package charts/my-chart
+                    helm cm-push my-chart-*.tgz artifact-keeper
+                '''
+            }
+        }
+    }
+}
+```
+
+## Testing Charts
+
+### Lint Chart
+
+Validate chart syntax and structure:
+
+```bash
+helm lint my-chart
+```
+
+### Template Rendering
+
+Preview rendered Kubernetes manifests:
+
+```bash
+helm template my-release my-chart
+```
+
+With custom values:
+
+```bash
+helm template my-release my-chart -f custom-values.yaml
+```
+
+### Dry Run Installation
+
+Test installation without deploying:
+
+```bash
+helm install my-release artifact-keeper/my-chart --dry-run --debug
+```
+
+### Chart Testing
+
+Use chart-testing tool:
+
+```bash
+# Install ct
+brew install chart-testing
+
+# Lint and test
+ct lint --charts charts/my-chart
+ct install --charts charts/my-chart
+```
+
+## Advanced Features
+
+### Provenance and Integrity
+
+Sign charts with GPG:
+
+```bash
+# Package and sign
+helm package my-chart --sign --key 'Your Name' --keyring ~/.gnupg/secring.gpg
+
+# Verify signature
+helm verify my-chart-0.1.0.tgz
+```
+
+### Chart Hooks
+
+Define lifecycle hooks in templates:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "{{ .Release.Name }}-setup"
+  annotations:
+    "helm.sh/hook": pre-install
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  template:
+    spec:
+      containers:
+        - name: setup
+          image: busybox
+          command: ["sh", "-c", "echo Setting up..."]
+      restartPolicy: Never
+```
+
+### Chart Library
+
+Create reusable chart libraries:
+
+```yaml
+# Chart.yaml
+apiVersion: v2
+name: common
+type: library
+version: 1.0.0
+```
+
+Use in other charts:
+
+```yaml
+dependencies:
+  - name: common
+    version: "1.0.0"
+    repository: http://localhost:8080/helm
+```
+
+## Troubleshooting
+
+### Repository Not Found
+
+Update repository index:
+
+```bash
+helm repo update
+```
+
+Verify repository URL:
+
+```bash
+helm repo list
+```
+
+### Authentication Errors
+
+Re-add repository with credentials:
+
+```bash
+helm repo remove artifact-keeper
+helm repo add artifact-keeper http://localhost:8080/helm \
+  --username your-username \
+  --password your-password
+```
+
+### Chart Installation Failures
+
+Enable debug output:
+
+```bash
+helm install my-release artifact-keeper/my-chart --debug
+```
+
+Check Kubernetes events:
+
+```bash
+kubectl get events --namespace my-namespace
+```
+
+### Version Conflicts
+
+List available versions:
+
+```bash
+helm search repo artifact-keeper/my-chart --versions
+```
+
+Install specific version:
+
+```bash
+helm install my-release artifact-keeper/my-chart --version 0.1.0
+```
+
+## Best Practices
+
+### Chart Structure
+
+```
+my-chart/
+├── Chart.yaml           # Chart metadata
+├── values.yaml          # Default values
+├── values.schema.json   # JSON schema for validation
+├── README.md           # Chart documentation
+├── templates/
+│   ├── NOTES.txt       # Post-install notes
+│   ├── _helpers.tpl    # Template helpers
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   ├── ingress.yaml
+│   └── tests/
+│       └── test-connection.yaml
+└── .helmignore         # Ignore patterns
+```
+
+### Values.yaml
+
+Provide sensible defaults:
+
+```yaml
+replicaCount: 1
+
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: "1.21"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+```
+
+### Documentation
+
+Include NOTES.txt for post-install instructions:
+
+```
+Thank you for installing {{ .Chart.Name }}.
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }}
+  $ helm get all {{ .Release.Name }}
+
+To access the application:
+
+{{- if .Values.ingress.enabled }}
+  http://{{ index .Values.ingress.hosts 0 "host" }}
+{{- else }}
+  kubectl port-forward service/{{ include "my-chart.fullname" . }} 8080:{{ .Values.service.port }}
+{{- end }}
+```
+
+## See Also
+
+- [Security Scanning](/security/scanning) - Automatic vulnerability scanning for container images in Helm charts
+- [Security Policies](/security/policies) - Configure policies to block vulnerable charts
+- [Docker Guide](/guides/docker) - Container image management for Helm chart dependencies

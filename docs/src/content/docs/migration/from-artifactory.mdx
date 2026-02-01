@@ -1,0 +1,373 @@
+---
+title: "Migrate from Artifactory"
+description: "Migrate your artifacts from JFrog Artifactory to Artifact Keeper with zero downtime"
+---
+
+# Migrate from Artifactory
+
+Switch from JFrog Artifactory to Artifact Keeper and save thousands of dollars per year while gaining access to all features with no restrictions.
+
+## Why Migrate?
+
+### Cost Savings
+
+| | Artifactory Pro | Artifactory Enterprise | Artifact Keeper |
+|---|---|---|---|
+| **Annual Cost** | $6,000 - $12,000 | $24,000 - $48,000+ | **$0** |
+| **Per-User Pricing** | Yes | Yes | **No** |
+| **Feature Gates** | Yes (HA, Edge, etc.) | Yes (Xray, etc.) | **None** |
+| **Support Contracts** | Required | Required | **Optional** |
+
+**Real-world savings**: Teams typically save $400-1,400 per month by switching to Artifact Keeper.
+
+### Feature Comparison
+
+| Feature | Artifactory | Artifact Keeper |
+|---------|-------------|-----------------|
+| Package Formats | 30+ | **30+** |
+| High Availability | Enterprise only ($$$) | **Included** |
+| Edge Nodes | Pro+ ($$$) | **Included** |
+| Security Scanning | Xray add-on ($$$) | **Included** |
+| Advanced Search | Enterprise only | **Included** |
+| RBAC | All tiers | **Included** |
+| OIDC/LDAP | Pro+ | **Included** |
+| API Access | All tiers | **Included** |
+| Plugin System | Limited | **WASM Plugins** |
+| License | Proprietary | **MIT (Open Source)** |
+
+## Migration Overview
+
+Artifact Keeper includes a built-in migration API that handles:
+
+- Repository structure and configuration
+- All artifacts with metadata
+- Version history and checksums
+- User permissions and access control
+- Repository-level settings
+
+The migration process is designed for zero-downtime transitions using a parallel-run approach.
+
+## Prerequisites
+
+Before starting migration:
+
+1. **Artifactory Access**:
+   - Admin credentials or API token
+   - Network access to Artifactory server
+   - Read access to all repositories you want to migrate
+
+2. **Artifact Keeper Setup**:
+   - Running Artifact Keeper instance (see [Installation](/getting-started/installation))
+   - Sufficient storage for migrated artifacts
+   - Database with adequate capacity
+
+3. **Network Requirements**:
+   - Artifact Keeper can reach Artifactory server
+   - Sufficient bandwidth (plan for artifact transfer size)
+
+## Migration Methods
+
+### Method 1: Built-in Migration API (Recommended)
+
+Use Artifact Keeper's migration API for automated, reliable migrations.
+
+#### Step 1: Configure Source
+
+Create a migration configuration:
+
+```bash
+curl -X POST https://artifacts.example.com/api/v1/migrations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source": {
+      "type": "artifactory",
+      "url": "https://artifactory.corp.example.com",
+      "username": "admin",
+      "password": "admin-password-or-token"
+    },
+    "repositories": [
+      "libs-release-local",
+      "libs-snapshot-local",
+      "docker-local"
+    ],
+    "options": {
+      "include_metadata": true,
+      "include_permissions": true,
+      "validate_checksums": true,
+      "parallel_transfers": 4
+    }
+  }'
+```
+
+Response:
+```json
+{
+  "migration_id": "mig_abc123",
+  "status": "pending",
+  "created_at": "2026-02-01T12:00:00Z"
+}
+```
+
+#### Step 2: Start Migration
+
+```bash
+curl -X POST https://artifacts.example.com/api/v1/migrations/mig_abc123/start \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### Step 3: Monitor Progress
+
+```bash
+curl https://artifacts.example.com/api/v1/migrations/mig_abc123 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Response:
+```json
+{
+  "migration_id": "mig_abc123",
+  "status": "in_progress",
+  "progress": {
+    "total_artifacts": 50000,
+    "migrated_artifacts": 12500,
+    "failed_artifacts": 0,
+    "current_repository": "libs-release-local",
+    "percentage_complete": 25.0
+  },
+  "started_at": "2026-02-01T12:05:00Z",
+  "estimated_completion": "2026-02-01T16:30:00Z"
+}
+```
+
+#### Step 4: Verify Migration
+
+After migration completes, verify the results:
+
+```bash
+curl https://artifacts.example.com/api/v1/migrations/mig_abc123/report \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Response includes:
+- Total artifacts migrated
+- Checksum verification results
+- Failed artifacts (if any)
+- Metadata migration status
+- Permission migration status
+
+### Method 2: Manual Migration
+
+For smaller repositories or specific use cases, migrate manually using native clients.
+
+#### Maven Example
+
+```bash
+# Download from Artifactory
+mvn dependency:get \
+  -DremoteRepositories=https://artifactory.corp.example.com/libs-release \
+  -DgroupId=com.example \
+  -DartifactId=myapp \
+  -Dversion=1.0.0
+
+# Deploy to Artifact Keeper
+mvn deploy:deploy-file \
+  -Durl=https://artifacts.example.com/maven/libs-release \
+  -DrepositoryId=artifact-keeper \
+  -Dfile=target/myapp-1.0.0.jar \
+  -DpomFile=pom.xml
+```
+
+#### Docker Example
+
+```bash
+# Pull from Artifactory
+docker pull artifactory.corp.example.com/docker-local/myimage:latest
+
+# Tag for Artifact Keeper
+docker tag artifactory.corp.example.com/docker-local/myimage:latest \
+  artifacts.example.com/docker/docker-local/myimage:latest
+
+# Push to Artifact Keeper
+docker push artifacts.example.com/docker/docker-local/myimage:latest
+```
+
+## Zero-Downtime Migration Strategy
+
+Recommended approach for production environments with no service interruption.
+
+### Phase 1: Parallel Run (Weeks 1-2)
+
+1. **Set up Artifact Keeper** alongside existing Artifactory
+2. **Configure read-only access** to Artifactory (no new writes)
+3. **Start migration** using the Migration API
+4. **Verify data integrity** by comparing checksums
+
+### Phase 2: Hybrid Mode (Weeks 2-3)
+
+1. **Configure clients** to read from Artifact Keeper, fall back to Artifactory
+2. **Direct new uploads** to Artifact Keeper
+3. **Continue background migration** of remaining artifacts
+4. **Monitor both systems** for any discrepancies
+
+Example hybrid configuration (Maven `settings.xml`):
+```xml
+<mirrors>
+  <mirror>
+    <id>artifact-keeper</id>
+    <mirrorOf>*</mirrorOf>
+    <url>https://artifacts.example.com/maven/libs-release</url>
+  </mirror>
+</mirrors>
+
+<servers>
+  <server>
+    <id>artifact-keeper</id>
+    <username>${env.ARTIFACT_TOKEN}</username>
+    <password></password>
+  </server>
+</servers>
+```
+
+### Phase 3: Cutover (Week 3-4)
+
+1. **Complete migration** of all artifacts
+2. **Update DNS** or reverse proxy to point to Artifact Keeper
+3. **Update CI/CD pipelines** with new repository URLs
+4. **Set Artifactory to read-only** as backup
+5. **Monitor for 1-2 weeks** before decommissioning Artifactory
+
+### Phase 4: Decommission (Week 4+)
+
+1. **Verify all clients** are using Artifact Keeper
+2. **Archive Artifactory data** for compliance/backup
+3. **Shut down Artifactory** servers
+4. **Celebrate cost savings**
+
+## Large-Scale Migrations
+
+For repositories with 50,000+ artifacts:
+
+### Performance Tuning
+
+Increase parallel transfers in migration config:
+
+```json
+{
+  "options": {
+    "parallel_transfers": 8,
+    "batch_size": 100,
+    "retry_attempts": 3,
+    "timeout_seconds": 300
+  }
+}
+```
+
+### Incremental Migration
+
+Migrate in stages by repository priority:
+
+1. **Critical repositories** (production dependencies)
+2. **Active repositories** (current development)
+3. **Archive repositories** (older versions)
+4. **Deprecated repositories** (consider not migrating)
+
+### Resume Failed Migrations
+
+If migration is interrupted, resume from where it left off:
+
+```bash
+curl -X POST https://artifacts.example.com/api/v1/migrations/mig_abc123/resume \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+The migration API tracks progress and skips already-migrated artifacts.
+
+## Permission Migration
+
+Artifactory permissions can be mapped to Artifact Keeper RBAC:
+
+| Artifactory Permission | Artifact Keeper Role |
+|------------------------|----------------------|
+| Admin | Admin (full access) |
+| Deploy/Cache | Write (upload artifacts) |
+| Read | Read (download artifacts) |
+| Annotate | Write (modify metadata) |
+| Delete | Write (delete artifacts) |
+
+The Migration API automatically creates corresponding roles and assignments.
+
+## Troubleshooting
+
+### Common Issues
+
+**Checksum Mismatch**:
+```
+Error: Checksum verification failed for artifact xyz
+```
+Solution: Re-download and verify Artifactory source, or skip checksum validation:
+```json
+{"options": {"validate_checksums": false}}
+```
+
+**Authentication Failure**:
+```
+Error: Failed to authenticate with Artifactory: 401 Unauthorized
+```
+Solution: Verify credentials, ensure API token has read access to all repositories.
+
+**Storage Full**:
+```
+Error: Insufficient storage space
+```
+Solution: Increase storage capacity or migrate in smaller batches.
+
+**Timeout**:
+```
+Error: Transfer timeout after 300 seconds
+```
+Solution: Increase timeout or reduce batch size:
+```json
+{"options": {"timeout_seconds": 600, "batch_size": 50}}
+```
+
+### Getting Help
+
+- Check migration logs: `GET /api/v1/migrations/{id}/logs`
+- Review failed artifacts: `GET /api/v1/migrations/{id}/failures`
+- Community support: [GitHub Discussions](https://github.com/yourusername/artifact-keeper/discussions)
+- Commercial support: Available for enterprise migrations
+
+## Post-Migration Checklist
+
+After migration completes:
+
+- [ ] Verify artifact counts match between Artifactory and Artifact Keeper
+- [ ] Test downloading artifacts from all migrated repositories
+- [ ] Validate permissions and access control
+- [ ] Update CI/CD pipeline configurations
+- [ ] Update developer documentation with new URLs
+- [ ] Configure backup and disaster recovery
+- [ ] Set up monitoring and alerting
+- [ ] Archive or decommission Artifactory
+
+## Cost Savings Calculator
+
+Estimate your savings from migrating:
+
+**Artifactory Pro**: $6,000 - $12,000/year
+**Artifactory Enterprise**: $24,000 - $48,000/year
+**Artifact Keeper**: $0 (MIT licensed)
+
+**Deployment costs** (one-time):
+- Self-hosted: Server costs only (~$100-500/month for infrastructure)
+- Managed cloud: Variable based on usage
+
+**Break-even**: Typically 1-2 months after migration
+
+## Next Steps
+
+- [Installation Guide](/getting-started/installation) - Set up Artifact Keeper
+- [Configuration Reference](/getting-started/configuration) - Configure authentication and storage
+- [Package Formats](/package-formats) - See all supported formats
+- [Quickstart Guide](/getting-started/quickstart) - Get started with your first repository

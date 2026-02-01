@@ -1,0 +1,495 @@
+---
+title: "Vulnerability Scanning"
+description: "Automatic security vulnerability scanning for artifacts in Artifact Keeper"
+---
+
+Artifact Keeper provides integrated vulnerability scanning for artifacts using multiple scanning engines to detect security issues before they reach production.
+
+## Overview
+
+Artifact Keeper automatically scans uploaded artifacts for known vulnerabilities and security issues using industry-standard scanning tools.
+
+### Integrated Scanners
+
+- **Trivy FS Scanner**: Filesystem and package vulnerability scanning
+- **Grype**: Vulnerability scanner for container images and filesystems
+- **Dependency Scanner**: Language-specific dependency vulnerability detection
+- **Image Scanner**: Container image layer scanning
+
+## Features
+
+### Automatic Scanning
+
+All artifacts are automatically scanned upon upload:
+
+- **On-Upload Scanning**: Triggers immediately when artifacts are published
+- **Scheduled Scanning**: Periodic rescans to catch newly disclosed vulnerabilities
+- **Manual Scanning**: Trigger scans via API or UI
+
+### Hash-Based Deduplication
+
+Scanning results are cached based on content hash:
+
+- Same content = reuse existing scan results
+- Eliminates duplicate work across repositories
+- Significantly reduces scanning time for identical artifacts
+- Automatic cache invalidation when vulnerability databases update
+
+### Scan Coverage
+
+Supported artifact types:
+
+- **Container Images**: Docker, OCI images
+- **Language Packages**: npm, PyPI, Maven, Cargo, Gems
+- **System Packages**: Alpine APK, Debian/Ubuntu DEB, RedHat RPM
+- **Archives**: tar, zip containing dependencies
+- **Helm Charts**: Scans embedded container images
+
+## Configuration
+
+### Environment Variables
+
+Configure Trivy integration:
+
+```bash
+# Required: Trivy server URL
+TRIVY_URL=http://trivy:8080
+
+# Optional: Trivy authentication
+TRIVY_TOKEN=your-trivy-token
+
+# Optional: Scanner configuration
+SCAN_ON_UPLOAD=true
+SCAN_TIMEOUT=300
+SCAN_CACHE_TTL=3600
+```
+
+### Database Configuration
+
+Scanning results are stored in PostgreSQL:
+
+```sql
+-- Scan results table
+CREATE TABLE scan_results (
+    id SERIAL PRIMARY KEY,
+    artifact_hash VARCHAR(64) NOT NULL,
+    scanner_name VARCHAR(50) NOT NULL,
+    scan_date TIMESTAMP NOT NULL,
+    vulnerabilities JSONB,
+    summary JSONB,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_artifact_hash ON scan_results(artifact_hash);
+CREATE INDEX idx_scan_date ON scan_results(scan_date);
+```
+
+## Using the API
+
+### Get Scan Results
+
+Retrieve scan results for an artifact:
+
+```bash
+GET /api/v1/security/scans?artifact=my-image&version=1.0.0
+```
+
+Response:
+
+```json
+{
+  "artifact": {
+    "name": "my-image",
+    "version": "1.0.0",
+    "type": "docker",
+    "hash": "sha256:abc123..."
+  },
+  "scan": {
+    "status": "completed",
+    "scanner": "trivy",
+    "scanned_at": "2024-01-15T10:30:00Z",
+    "duration_ms": 1234
+  },
+  "summary": {
+    "total": 15,
+    "critical": 2,
+    "high": 5,
+    "medium": 6,
+    "low": 2,
+    "negligible": 0
+  },
+  "vulnerabilities": [
+    {
+      "id": "CVE-2024-1234",
+      "severity": "CRITICAL",
+      "package": "openssl",
+      "version": "1.1.1k",
+      "fixed_version": "1.1.1w",
+      "title": "OpenSSL vulnerability",
+      "description": "Critical vulnerability in OpenSSL",
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2024-1234"
+      ]
+    }
+  ]
+}
+```
+
+### Trigger Manual Scan
+
+Initiate a scan manually:
+
+```bash
+POST /api/v1/security/scans
+Content-Type: application/json
+
+{
+  "artifact": "my-image",
+  "version": "1.0.0",
+  "scanner": "trivy"
+}
+```
+
+### Get Scan History
+
+View scan history for an artifact:
+
+```bash
+GET /api/v1/security/scans/history?artifact=my-image&version=1.0.0
+```
+
+### Bulk Scan
+
+Trigger scans for multiple artifacts:
+
+```bash
+POST /api/v1/security/scans/bulk
+Content-Type: application/json
+
+{
+  "artifacts": [
+    {"name": "image-a", "version": "1.0.0"},
+    {"name": "image-b", "version": "2.1.0"},
+    {"name": "image-c", "version": "1.5.0"}
+  ],
+  "scanner": "trivy"
+}
+```
+
+## UI Integration
+
+### Viewing Scan Results
+
+The Artifact Keeper UI displays scan results for each artifact:
+
+1. Navigate to the artifact details page
+2. View the "Security" tab
+3. See vulnerability summary and detailed results
+4. Filter by severity level
+5. View CVE details and remediation guidance
+
+### Scan Status Indicators
+
+Artifacts show visual indicators:
+
+- **Green**: No vulnerabilities or only low severity
+- **Yellow**: Medium severity vulnerabilities found
+- **Orange**: High severity vulnerabilities found
+- **Red**: Critical vulnerabilities found
+- **Gray**: Scan in progress or not yet scanned
+
+### Artifact Details
+
+For each vulnerability:
+
+- CVE identifier and title
+- Severity level with color coding
+- Affected package name and version
+- Fixed version (if available)
+- CVSS score and vector
+- Description and impact
+- Links to external references (NVD, vendor advisories)
+- Remediation recommendations
+
+## Scanning Workflows
+
+### Container Image Scanning
+
+When a Docker image is pushed:
+
+```bash
+docker push localhost:8080/my-app:1.0.0
+```
+
+Artifact Keeper automatically:
+
+1. Calculates image layer hashes
+2. Checks cache for existing scan results
+3. If not cached, triggers Trivy scan
+4. Stores vulnerability results
+5. Applies security policies
+6. Updates UI with scan status
+
+### Package Scanning
+
+When a package is published:
+
+```bash
+npm publish  # or cargo publish, mvn deploy, etc.
+```
+
+Artifact Keeper:
+
+1. Extracts package metadata
+2. Identifies dependencies
+3. Scans for known vulnerabilities
+4. Checks dependency licenses
+5. Reports security findings
+
+### Helm Chart Scanning
+
+When a Helm chart is pushed:
+
+```bash
+helm cm-push my-chart-1.0.0.tgz artifact-keeper
+```
+
+Artifact Keeper:
+
+1. Extracts chart metadata
+2. Identifies referenced container images
+3. Scans each container image
+4. Aggregates vulnerabilities
+5. Reports chart-level security status
+
+## Scanner Details
+
+### Trivy Scanner
+
+Trivy integration provides comprehensive scanning:
+
+- **OS Packages**: Detects vulnerabilities in Alpine, Debian, Ubuntu, RHEL, etc.
+- **Language Dependencies**: Scans npm, PyPI, Maven, Cargo, Bundler, etc.
+- **Container Images**: Full image layer analysis
+- **Filesystem Scanning**: Direct filesystem vulnerability detection
+
+Configuration:
+
+```yaml
+# config/trivy.yaml
+scanner:
+  trivy:
+    enabled: true
+    url: "${TRIVY_URL}"
+    timeout: 300
+    cache_ttl: 3600
+    severity:
+      - CRITICAL
+      - HIGH
+      - MEDIUM
+      - LOW
+    security_checks:
+      - vuln
+      - config
+      - secret
+```
+
+### Grype Scanner
+
+Alternative scanner with different vulnerability database:
+
+```yaml
+# config/grype.yaml
+scanner:
+  grype:
+    enabled: true
+    db_auto_update: true
+    severity_threshold: medium
+```
+
+### Dependency Scanner
+
+Language-specific vulnerability scanning:
+
+```yaml
+# config/dependency-scanner.yaml
+scanner:
+  dependencies:
+    enabled: true
+    languages:
+      - javascript
+      - python
+      - java
+      - rust
+    check_licenses: true
+    allow_licenses:
+      - MIT
+      - Apache-2.0
+      - BSD-3-Clause
+```
+
+## Performance Optimization
+
+### Scan Caching
+
+Hash-based caching eliminates redundant scans:
+
+```rust
+// Pseudocode example
+async fn scan_artifact(artifact: &Artifact) -> ScanResult {
+    let hash = artifact.content_hash();
+
+    // Check cache
+    if let Some(cached) = cache.get(hash).await {
+        if !cached.is_expired() {
+            return cached.results;
+        }
+    }
+
+    // Perform scan
+    let results = trivy_scan(artifact).await?;
+
+    // Cache results
+    cache.set(hash, results.clone()).await;
+
+    results
+}
+```
+
+### Parallel Scanning
+
+Multiple artifacts scanned concurrently:
+
+- Configurable worker pool
+- Queue-based processing
+- Priority scanning for critical artifacts
+
+### Incremental Scanning
+
+For container images:
+
+- Only scan new layers
+- Reuse results for unchanged base layers
+- Significantly faster for layered builds
+
+## Monitoring and Metrics
+
+### Scan Metrics
+
+Track scanning performance:
+
+- Total scans performed
+- Average scan duration
+- Cache hit rate
+- Vulnerabilities found by severity
+- Scanner availability
+
+### API Metrics
+
+```bash
+GET /api/v1/security/scans/metrics
+```
+
+Response:
+
+```json
+{
+  "scans": {
+    "total": 1500,
+    "today": 45,
+    "in_progress": 3,
+    "failed": 2
+  },
+  "cache": {
+    "hit_rate": 0.78,
+    "size_mb": 150
+  },
+  "vulnerabilities": {
+    "critical": 12,
+    "high": 45,
+    "medium": 120,
+    "low": 78
+  },
+  "performance": {
+    "avg_scan_time_ms": 2500,
+    "p95_scan_time_ms": 4500,
+    "p99_scan_time_ms": 8000
+  }
+}
+```
+
+## Troubleshooting
+
+### Scan Failures
+
+Check scanner connectivity:
+
+```bash
+curl http://trivy:8080/healthz
+```
+
+View scan logs:
+
+```bash
+GET /api/v1/security/scans/{scan_id}/logs
+```
+
+### Slow Scans
+
+Enable debug logging:
+
+```bash
+SCAN_LOG_LEVEL=debug
+SCAN_TRACE=true
+```
+
+Monitor scanner resources:
+
+```bash
+docker stats trivy
+```
+
+### Database Issues
+
+Update vulnerability database:
+
+```bash
+# Trivy
+trivy image --download-db-only
+
+# Grype
+grype db update
+```
+
+## Best Practices
+
+### Regular Updates
+
+- Keep scanner databases updated
+- Run periodic rescans for old artifacts
+- Monitor for new CVE disclosures
+
+### Severity Handling
+
+- Set appropriate severity thresholds
+- Automate critical vulnerability alerts
+- Define remediation SLAs by severity
+
+### Integration
+
+- Integrate with CI/CD pipelines
+- Block deployments based on scan results
+- Automate security reporting
+
+### Performance
+
+- Use hash-based caching
+- Enable parallel scanning
+- Monitor cache hit rates
+- Tune scanner timeouts
+
+## See Also
+
+- [Security Policies](/security/policies) - Configure policies to block vulnerable artifacts
+- [Artifact Signing](/security/signing) - Verify artifact integrity and authenticity
+- [Docker Guide](/guides/docker) - Container image management

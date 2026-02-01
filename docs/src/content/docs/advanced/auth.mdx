@@ -1,0 +1,311 @@
+---
+title: "Authentication & RBAC"
+description: "JWT-based authentication, role-based access control, and SSO integration"
+---
+
+Artifact Keeper provides comprehensive authentication and authorization features to secure your artifact registry.
+
+## Authentication Methods
+
+### JWT-Based Authentication
+
+Artifact Keeper uses JSON Web Tokens (JWT) for stateless authentication:
+
+- **Access tokens**: Short-lived tokens (default 15 minutes) for API requests
+- **Refresh tokens**: Long-lived tokens (default 7 days) to obtain new access tokens
+- Tokens are signed with HS256 using the `JWT_SECRET` environment variable
+
+#### Login Flow
+
+```bash
+# Login to get tokens
+curl -X POST https://registry.example.com/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin"}'
+
+# Response includes access_token and refresh_token
+{
+  "access_token": "eyJhbGc...",
+  "refresh_token": "eyJhbGc...",
+  "expires_in": 900
+}
+
+# Use access token in subsequent requests
+curl -H "Authorization: Bearer eyJhbGc..." \
+  https://registry.example.com/api/v1/repositories
+```
+
+#### Token Refresh
+
+```bash
+# Refresh access token before expiration
+curl -X POST https://registry.example.com/api/v1/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token": "eyJhbGc..."}'
+```
+
+### API Tokens
+
+API tokens provide programmatic access without username/password:
+
+- Scoped to specific repositories or operations
+- Support expiration dates
+- Can be revoked individually
+- Ideal for CI/CD pipelines
+
+```bash
+# Create API token
+curl -X POST https://registry.example.com/api/v1/users/me/tokens \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "CI Pipeline Token",
+    "scopes": ["repository:read", "repository:write"],
+    "expires_at": "2027-12-31T23:59:59Z"
+  }'
+
+# Use API token
+curl -H "Authorization: Bearer $API_TOKEN" \
+  https://registry.example.com/api/v1/packages
+```
+
+### Default Credentials
+
+The system ships with default administrator credentials:
+
+- **Username**: `admin`
+- **Password**: `admin`
+
+**Important**: You must change the default password on first login. The system will enforce this requirement.
+
+## Role-Based Access Control (RBAC)
+
+Artifact Keeper implements three built-in roles:
+
+### Admin Role
+
+Full system access including:
+- User and group management
+- Repository creation and deletion
+- Security policy configuration
+- System settings and backups
+- Plugin management
+
+### User Role
+
+Standard user permissions:
+- Upload and download artifacts (where granted)
+- Create repositories (if enabled)
+- View security scan results
+- Manage own API tokens
+
+### Viewer Role
+
+Read-only access:
+- Browse and download artifacts (where granted)
+- View repository metadata
+- View security scan results
+- Cannot upload or modify data
+
+## Repository-Level Permissions
+
+Fine-grained permissions can be assigned at the repository level:
+
+### Permission Types
+
+- **Read**: Download artifacts, view metadata
+- **Write**: Upload artifacts, update metadata
+- **Delete**: Remove artifacts
+- **Admin**: Full repository control including permissions
+
+### Assigning Permissions
+
+```bash
+# Grant user write access to repository
+curl -X POST https://registry.example.com/api/v1/permissions \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repository_id": "repo-123",
+    "user_id": "user-456",
+    "permissions": ["read", "write"]
+  }'
+
+# Grant group permissions
+curl -X POST https://registry.example.com/api/v1/permissions \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repository_id": "repo-123",
+    "group_id": "group-789",
+    "permissions": ["read"]
+  }'
+```
+
+## Groups
+
+Organize users into groups for easier permission management:
+
+```bash
+# Create group
+curl -X POST https://registry.example.com/api/v1/groups \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "developers",
+    "description": "Development team"
+  }'
+
+# Add users to group
+curl -X POST https://registry.example.com/api/v1/groups/group-789/members \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_ids": ["user-456", "user-890"]
+  }'
+```
+
+## LDAP Integration
+
+Integrate with your existing LDAP directory for centralized authentication:
+
+### Configuration
+
+Set these environment variables:
+
+```bash
+LDAP_URL=ldap://ldap.example.com:389
+LDAP_BASE_DN=dc=example,dc=com
+LDAP_BIND_DN=cn=admin,dc=example,dc=com
+LDAP_BIND_PASSWORD=secret
+LDAP_USER_FILTER=(uid={username})
+LDAP_SYNC_INTERVAL=3600  # Sync every hour
+```
+
+### How It Works
+
+1. User attempts login with LDAP credentials
+2. Artifact Keeper binds to LDAP server
+3. User DN is resolved using `LDAP_USER_FILTER`
+4. Authentication is verified against LDAP
+5. User is created locally if first login
+6. JWT tokens are issued for API access
+
+### Group Synchronization
+
+LDAP groups can be mapped to Artifact Keeper groups:
+
+```bash
+LDAP_GROUP_FILTER=(memberUid={username})
+LDAP_GROUP_BASE_DN=ou=groups,dc=example,dc=com
+LDAP_GROUP_ATTRIBUTE=cn
+```
+
+## OIDC/SSO Integration
+
+Support for OpenID Connect (OIDC) enables SSO with providers like:
+- Okta
+- Auth0
+- Keycloak
+- Azure AD
+- Google Workspace
+
+### Configuration
+
+```bash
+OIDC_ISSUER=https://accounts.google.com
+OIDC_CLIENT_ID=your-client-id.apps.googleusercontent.com
+OIDC_CLIENT_SECRET=your-client-secret
+OIDC_REDIRECT_URI=https://registry.example.com/api/v1/auth/oidc/callback
+OIDC_SCOPES=openid,email,profile
+```
+
+### Authorization Code Flow
+
+1. User clicks "Login with SSO" in web UI
+2. Redirected to OIDC provider
+3. User authenticates with provider
+4. Provider redirects back with authorization code
+5. Artifact Keeper exchanges code for ID token
+6. User is created/updated locally
+7. JWT access and refresh tokens issued
+
+### Claims Mapping
+
+Map OIDC claims to user attributes:
+
+```bash
+OIDC_USERNAME_CLAIM=preferred_username
+OIDC_EMAIL_CLAIM=email
+OIDC_NAME_CLAIM=name
+OIDC_GROUPS_CLAIM=groups
+```
+
+## Security Best Practices
+
+### Strong JWT Secrets
+
+Generate a cryptographically secure secret:
+
+```bash
+openssl rand -base64 64
+```
+
+Set in environment:
+
+```bash
+JWT_SECRET=your-generated-secret
+```
+
+### Token Expiration
+
+Configure appropriate token lifetimes:
+
+```bash
+JWT_ACCESS_TOKEN_EXPIRY=900      # 15 minutes
+JWT_REFRESH_TOKEN_EXPIRY=604800  # 7 days
+```
+
+### HTTPS Only
+
+Always use HTTPS in production:
+
+```bash
+REQUIRE_HTTPS=true
+```
+
+### Rate Limiting
+
+Protect against brute force attacks:
+
+```bash
+RATE_LIMIT_LOGIN=5       # Max 5 login attempts
+RATE_LIMIT_WINDOW=300    # Per 5 minutes
+```
+
+### Audit Logging
+
+Enable comprehensive audit logs:
+
+```bash
+AUDIT_LOG_ENABLED=true
+AUDIT_LOG_PATH=/var/log/artifact-keeper/audit.log
+```
+
+## Troubleshooting
+
+### Token Validation Failures
+
+Check that `JWT_SECRET` matches across all backend instances.
+
+### LDAP Connection Issues
+
+Test LDAP connectivity:
+
+```bash
+ldapsearch -x -H $LDAP_URL -b $LDAP_BASE_DN -D $LDAP_BIND_DN -w $LDAP_BIND_PASSWORD
+```
+
+### OIDC Configuration
+
+Verify redirect URI is registered with your OIDC provider and matches `OIDC_REDIRECT_URI` exactly.
