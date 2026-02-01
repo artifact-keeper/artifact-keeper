@@ -6,11 +6,13 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::security::ScanResult;
 use crate::services::policy_service::PolicyService;
 use crate::services::scan_config_service::{ScanConfigService, UpsertScanConfigRequest};
 use crate::services::scan_result_service::ScanResultService;
@@ -112,6 +114,8 @@ pub struct ScanListResponse {
 pub struct ScanResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
+    pub artifact_name: Option<String>,
+    pub artifact_version: Option<String>,
     pub repository_id: Uuid,
     pub scan_type: String,
     pub status: String,
@@ -126,6 +130,59 @@ pub struct ScanResponse {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Batch-lookup artifact name/version and enrich scan results into responses.
+async fn enrich_scans(
+    db: &PgPool,
+    scans: Vec<ScanResult>,
+) -> Result<Vec<ScanResponse>> {
+    let artifact_ids: Vec<Uuid> = scans.iter().map(|s| s.artifact_id).collect();
+    let artifact_info: std::collections::HashMap<Uuid, (String, Option<String>)> =
+        if !artifact_ids.is_empty() {
+            sqlx::query!(
+                r#"SELECT id, name, version FROM artifacts WHERE id = ANY($1)"#,
+                &artifact_ids,
+            )
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .into_iter()
+            .map(|r| (r.id, (r.name, r.version)))
+            .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    Ok(scans
+        .into_iter()
+        .map(|s| {
+            let (artifact_name, artifact_version) = artifact_info
+                .get(&s.artifact_id)
+                .map(|(n, v)| (Some(n.clone()), v.clone()))
+                .unwrap_or((None, None));
+            ScanResponse {
+                id: s.id,
+                artifact_id: s.artifact_id,
+                artifact_name,
+                artifact_version,
+                repository_id: s.repository_id,
+                scan_type: s.scan_type,
+                status: s.status,
+                findings_count: s.findings_count,
+                critical_count: s.critical_count,
+                high_count: s.high_count,
+                medium_count: s.medium_count,
+                low_count: s.low_count,
+                info_count: s.info_count,
+                scanner_version: s.scanner_version,
+                error_message: s.error_message,
+                started_at: s.started_at,
+                completed_at: s.completed_at,
+                created_at: s.created_at,
+            }
+        })
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,28 +405,7 @@ async fn list_scans(
         )
         .await?;
 
-    let items: Vec<ScanResponse> = scans
-        .into_iter()
-        .map(|s| ScanResponse {
-            id: s.id,
-            artifact_id: s.artifact_id,
-            repository_id: s.repository_id,
-            scan_type: s.scan_type,
-            status: s.status,
-            findings_count: s.findings_count,
-            critical_count: s.critical_count,
-            high_count: s.high_count,
-            medium_count: s.medium_count,
-            low_count: s.low_count,
-            info_count: s.info_count,
-            scanner_version: s.scanner_version,
-            error_message: s.error_message,
-            started_at: s.started_at,
-            completed_at: s.completed_at,
-            created_at: s.created_at,
-        })
-        .collect();
-
+    let items = enrich_scans(&state.db, scans).await?;
     Ok(Json(ScanListResponse { items, total }))
 }
 
@@ -381,24 +417,8 @@ async fn get_scan(
     let svc = ScanResultService::new(state.db.clone());
     let s = svc.get_scan(id).await?;
 
-    Ok(Json(ScanResponse {
-        id: s.id,
-        artifact_id: s.artifact_id,
-        repository_id: s.repository_id,
-        scan_type: s.scan_type,
-        status: s.status,
-        findings_count: s.findings_count,
-        critical_count: s.critical_count,
-        high_count: s.high_count,
-        medium_count: s.medium_count,
-        low_count: s.low_count,
-        info_count: s.info_count,
-        scanner_version: s.scanner_version,
-        error_message: s.error_message,
-        started_at: s.started_at,
-        completed_at: s.completed_at,
-        created_at: s.created_at,
-    }))
+    let mut items = enrich_scans(&state.db, vec![s]).await?;
+    Ok(Json(items.remove(0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -727,30 +747,8 @@ async fn list_artifact_scans(
         )
         .await?;
 
-    Ok(Json(ScanListResponse {
-        items: scans
-            .into_iter()
-            .map(|s| ScanResponse {
-                id: s.id,
-                artifact_id: s.artifact_id,
-                repository_id: s.repository_id,
-                scan_type: s.scan_type,
-                status: s.status,
-                findings_count: s.findings_count,
-                critical_count: s.critical_count,
-                high_count: s.high_count,
-                medium_count: s.medium_count,
-                low_count: s.low_count,
-                info_count: s.info_count,
-                scanner_version: s.scanner_version,
-                error_message: s.error_message,
-                started_at: s.started_at,
-                completed_at: s.completed_at,
-                created_at: s.created_at,
-            })
-            .collect(),
-        total,
-    }))
+    let items = enrich_scans(&state.db, scans).await?;
+    Ok(Json(ScanListResponse { items, total }))
 }
 
 async fn list_repo_scans(
@@ -774,27 +772,6 @@ async fn list_repo_scans(
         .list_scans(Some(repo), None, query.status.as_deref(), offset, per_page)
         .await?;
 
-    let items: Vec<ScanResponse> = scans
-        .into_iter()
-        .map(|s| ScanResponse {
-            id: s.id,
-            artifact_id: s.artifact_id,
-            repository_id: s.repository_id,
-            scan_type: s.scan_type,
-            status: s.status,
-            findings_count: s.findings_count,
-            critical_count: s.critical_count,
-            high_count: s.high_count,
-            medium_count: s.medium_count,
-            low_count: s.low_count,
-            info_count: s.info_count,
-            scanner_version: s.scanner_version,
-            error_message: s.error_message,
-            started_at: s.started_at,
-            completed_at: s.completed_at,
-            created_at: s.created_at,
-        })
-        .collect();
-
+    let items = enrich_scans(&state.db, scans).await?;
     Ok(Json(ScanListResponse { items, total }))
 }
