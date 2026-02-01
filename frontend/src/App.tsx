@@ -68,6 +68,21 @@ function DemoBanner() {
   )
 }
 
+/** Wrapper that redirects to /login when the user is not authenticated */
+function RequireAuth({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated } = useAuth()
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  return <>{children}</>
+}
+
+/** Wrapper that redirects to /login when the user is not an admin */
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const { isAuthenticated, user } = useAuth()
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  if (!user?.is_admin) return <Navigate to="/error/403" replace />
+  return <>{children}</>
+}
+
 function AppContent() {
   const { isAuthenticated, isLoading, mustChangePassword } = useAuth()
 
@@ -79,17 +94,8 @@ function AppContent() {
     )
   }
 
-  if (!isAuthenticated) {
-    return (
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route path="*" element={<Navigate to="/login" replace />} />
-      </Routes>
-    )
-  }
-
   // If user must change password, show only the password change screen
-  if (mustChangePassword) {
+  if (isAuthenticated && mustChangePassword) {
     return (
       <Routes>
         <Route path="*" element={<ChangePassword />} />
@@ -104,30 +110,36 @@ function AppContent() {
         <AppHeader />
         <Content style={{ margin: '24px 16px', padding: 24, background: '#fff' }}>
           <Routes>
+            {/* Public routes — anyone can browse */}
             <Route path="/" element={<Dashboard />} />
             <Route path="/repositories" element={<Repositories />} />
             <Route path="/repositories/:key" element={<RepositoryDetail />} />
             <Route path="/artifacts" element={<Artifacts />} />
             <Route path="/packages" element={<Packages />} />
             <Route path="/builds" element={<Builds />} />
-            <Route path="/setup" element={<SetupWizards />} />
-            <Route path="/edge-nodes" element={<EdgeNodes />} />
-            <Route path="/replication" element={<ReplicationDashboard />} />
-            <Route path="/backups" element={<Backups />} />
-            <Route path="/plugins" element={<Plugins />} />
-            <Route path="/users" element={<Users />} />
-            <Route path="/groups" element={<Groups />} />
-            <Route path="/permissions" element={<Permissions />} />
-            <Route path="/migration" element={<Migration />} />
-            <Route path="/webhooks" element={<Webhooks />} />
-            <Route path="/security" element={<SecurityDashboard />} />
-            <Route path="/security/scans" element={<SecurityScans />} />
-            <Route path="/security/scans/:id" element={<SecurityScanDetail />} />
-            <Route path="/security/policies" element={<SecurityPolicies />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/profile" element={<Profile />} />
             <Route path="/search" element={<Search />} />
-            <Route path="/login" element={<Navigate to="/" replace />} />
+            <Route path="/login" element={isAuthenticated ? <Navigate to="/" replace /> : <Login />} />
+
+            {/* Authenticated user routes */}
+            <Route path="/setup" element={<RequireAuth><SetupWizards /></RequireAuth>} />
+            <Route path="/profile" element={<RequireAuth><Profile /></RequireAuth>} />
+            <Route path="/edge-nodes" element={<RequireAuth><EdgeNodes /></RequireAuth>} />
+            <Route path="/replication" element={<RequireAuth><ReplicationDashboard /></RequireAuth>} />
+            <Route path="/plugins" element={<RequireAuth><Plugins /></RequireAuth>} />
+            <Route path="/webhooks" element={<RequireAuth><Webhooks /></RequireAuth>} />
+
+            {/* Admin-only routes */}
+            <Route path="/security" element={<RequireAdmin><SecurityDashboard /></RequireAdmin>} />
+            <Route path="/security/scans" element={<RequireAdmin><SecurityScans /></RequireAdmin>} />
+            <Route path="/security/scans/:id" element={<RequireAdmin><SecurityScanDetail /></RequireAdmin>} />
+            <Route path="/security/policies" element={<RequireAdmin><SecurityPolicies /></RequireAdmin>} />
+            <Route path="/backups" element={<RequireAdmin><Backups /></RequireAdmin>} />
+            <Route path="/users" element={<RequireAdmin><Users /></RequireAdmin>} />
+            <Route path="/groups" element={<RequireAdmin><Groups /></RequireAdmin>} />
+            <Route path="/permissions" element={<RequireAdmin><Permissions /></RequireAdmin>} />
+            <Route path="/migration" element={<RequireAdmin><Migration /></RequireAdmin>} />
+            <Route path="/settings" element={<RequireAdmin><Settings /></RequireAdmin>} />
+
             <Route path="/error/500" element={<ServerError />} />
             <Route path="/error/403" element={<Forbidden />} />
             <Route path="*" element={<NotFound />} />

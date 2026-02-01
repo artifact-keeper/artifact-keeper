@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { Layout, Avatar, Dropdown, Space, message, Button, Modal, Typography, Divider } from 'antd'
 import {
   UserOutlined,
+  LoginOutlined,
   LogoutOutlined,
   QuestionCircleOutlined,
   GithubOutlined,
@@ -19,7 +20,7 @@ const { Title, Text, Paragraph } = Typography
 const APP_VERSION = '1.0.0'
 
 const AppHeader = () => {
-  const { user, logout } = useAuth()
+  const { user, logout, isAuthenticated } = useAuth()
   const navigate = useNavigate()
   const [helpModalOpen, setHelpModalOpen] = useState(false)
   const { isMobile, toggleSidebarVisible } = useAppShell()
@@ -95,12 +96,22 @@ const AppHeader = () => {
             onClick={() => setHelpModalOpen(true)}
             aria-label="Help"
           />
-          <Dropdown menu={{ items, onClick: handleMenuClick }} placement="bottomRight">
-            <Space style={{ cursor: 'pointer' }}>
-              <Avatar icon={<UserOutlined />} />
-              {!isMobile && <span>{user?.display_name || user?.username || 'User'}</span>}
-            </Space>
-          </Dropdown>
+          {isAuthenticated ? (
+            <Dropdown menu={{ items, onClick: handleMenuClick }} placement="bottomRight">
+              <Space style={{ cursor: 'pointer' }}>
+                <Avatar icon={<UserOutlined />} />
+                {!isMobile && <span>{user?.display_name || user?.username || 'User'}</span>}
+              </Space>
+            </Dropdown>
+          ) : (
+            <Button
+              type="primary"
+              icon={<LoginOutlined />}
+              onClick={() => navigate('/login')}
+            >
+              {!isMobile && 'Sign In'}
+            </Button>
+          )}
         </Space>
       </Header>
 

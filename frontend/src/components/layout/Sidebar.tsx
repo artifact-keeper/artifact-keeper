@@ -55,6 +55,7 @@ const AppSidebar = () => {
     isMobile
   } = useAppShell()
 
+  const { isAuthenticated } = useAuth()
   const isAdmin = user?.is_admin ?? false
 
   // -- Overview group (always visible) --
@@ -188,7 +189,7 @@ const AppSidebar = () => {
     },
   ]
 
-  // Build the full menu with group headers
+  // Build the full menu with group headers based on access level
   const items: MenuItem[] = [
     {
       key: 'grp-overview',
@@ -202,18 +203,24 @@ const AppSidebar = () => {
       label: 'Artifacts',
       children: artifactsItems,
     },
+    // Authenticated users see Integration section
+    ...(isAuthenticated ? [
+      {
+        key: 'grp-integration',
+        type: 'group' as const,
+        label: 'Integration',
+        children: isAdmin
+          ? integrationItems
+          : integrationItems.filter(i => i && 'key' in i && !['/migration'].includes(String(i.key))),
+      } satisfies MenuItem,
+    ] : []),
+    // Admin-only sections
     ...(isAdmin ? [
       {
         key: 'grp-security',
         type: 'group' as const,
         label: 'Security',
         children: securityItems,
-      } satisfies MenuItem,
-      {
-        key: 'grp-integration',
-        type: 'group' as const,
-        label: 'Integration',
-        children: integrationItems,
       } satisfies MenuItem,
       {
         key: 'grp-ai',
