@@ -3,7 +3,7 @@ import { adminApi } from './admin'
 import { server } from '../test/mocks/server'
 import { http, HttpResponse } from 'msw'
 
-const API_URL = 'http://localhost:9080/api/v1'
+const API_URL = '/api/v1'
 
 describe('adminApi', () => {
   beforeEach(() => {
@@ -102,7 +102,7 @@ describe('adminApi', () => {
 
     it('should handle degraded status', async () => {
       server.use(
-        http.get(`${API_URL}/health`, () => {
+        http.get(`/health`, () => {
           return HttpResponse.json({
             status: 'degraded',
             version: '1.0.0',
@@ -122,7 +122,7 @@ describe('adminApi', () => {
 
     it('should handle unhealthy status', async () => {
       server.use(
-        http.get(`${API_URL}/health`, () => {
+        http.get(`/health`, () => {
           return HttpResponse.json({
             status: 'unhealthy',
             version: '1.0.0',

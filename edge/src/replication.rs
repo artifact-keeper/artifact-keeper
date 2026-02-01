@@ -63,26 +63,24 @@ pub async fn fetch_with_peer_fallback(
         );
 
         match client.get(&peer_url).send().await {
-            Ok(response) if response.status().is_success() => {
-                match response.bytes().await {
-                    Ok(data) => {
-                        tracing::info!(
-                            peer_node_id = %peer.node_id,
-                            size = data.len(),
-                            "Fetched artifact from peer"
-                        );
-                        state.cache.put(cache_key.to_owned(), data.clone());
-                        return Ok(data);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            peer_node_id = %peer.node_id,
-                            error = %e,
-                            "Failed to read peer response body"
-                        );
-                    }
+            Ok(response) if response.status().is_success() => match response.bytes().await {
+                Ok(data) => {
+                    tracing::info!(
+                        peer_node_id = %peer.node_id,
+                        size = data.len(),
+                        "Fetched artifact from peer"
+                    );
+                    state.cache.put(cache_key.to_owned(), data.clone());
+                    return Ok(data);
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(
+                        peer_node_id = %peer.node_id,
+                        error = %e,
+                        "Failed to read peer response body"
+                    );
+                }
+            },
             Ok(response) => {
                 tracing::debug!(
                     peer_node_id = %peer.node_id,
@@ -102,8 +100,7 @@ pub async fn fetch_with_peer_fallback(
 
     // 4. Fall back to primary (chunked transfer for large artifacts)
     tracing::info!("All peers exhausted, falling back to primary");
-    let data =
-        crate::sync::fetch_artifact_by_id(client, state, artifact_id, artifact_size).await?;
+    let data = crate::sync::fetch_artifact_by_id(client, state, artifact_id, artifact_size).await?;
     state.cache.put(cache_key.to_owned(), data.clone());
     Ok(data)
 }

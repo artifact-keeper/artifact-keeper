@@ -154,7 +154,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Artifact Keeper Edge Node");
     tracing::info!("Primary registry: {}", primary_url);
-    tracing::info!("Chunked transfer: {}", if chunked_enabled { "enabled" } else { "disabled" });
+    tracing::info!(
+        "Chunked transfer: {}",
+        if chunked_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     tracing::info!("Chunk size: {} bytes", chunk_size);
 
     // Create cache
@@ -206,10 +213,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/repositories/:repo_key/artifacts/*path",
             get(serve_artifact),
         )
-        .route(
-            "/api/v1/artifacts/:artifact_id",
-            get(serve_artifact_by_id),
-        )
+        .route("/api/v1/artifacts/:artifact_id", get(serve_artifact_by_id))
         .route(
             "/peer/v1/artifacts/:artifact_id/download",
             get(serve_artifact_to_peer),

@@ -431,15 +431,18 @@ pub async fn chunked_fetch(
     }
 
     // Sort peers by score descending (primary stays at top via MAX score)
-    sources.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    sources.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Step 4: Download chunks with concurrency control
     let mut assembled = BytesMut::with_capacity(session.total_size as usize);
     assembled.resize(session.total_size as usize, 0);
 
     // Apply chunk ordering strategy
-    let completion_ratio =
-        completed_indices.len() as f64 / session.total_chunks as f64;
+    let completion_ratio = completed_indices.len() as f64 / session.total_chunks as f64;
 
     if completion_ratio >= RAREST_FIRST_THRESHOLD && !peers.is_empty() {
         // Rarest-chunk-first: sort by how many peers have each chunk
@@ -642,5 +645,7 @@ async fn download_chunk_with_retry(
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All sources exhausted for chunk {}", chunk.chunk_index)))
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("All sources exhausted for chunk {}", chunk.chunk_index)
+    }))
 }

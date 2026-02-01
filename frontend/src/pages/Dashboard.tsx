@@ -121,7 +121,9 @@ const Dashboard = () => {
   if (statsLoading || healthLoading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', padding: 50 }}>
-        <Spin size="large" tip="Loading dashboard..." />
+        <Spin size="large" tip="Loading dashboard...">
+          <div style={{ padding: 50 }} />
+        </Spin>
       </div>
     )
   }

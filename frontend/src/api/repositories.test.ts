@@ -4,7 +4,7 @@ import { server } from '../test/mocks/server'
 import { http, HttpResponse } from 'msw'
 import { mockRepositories } from '../test/mocks/handlers'
 
-const API_URL = 'http://localhost:9080/api/v1'
+const API_URL = '/api/v1'
 
 describe('repositoriesApi', () => {
   beforeEach(() => {

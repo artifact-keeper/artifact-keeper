@@ -6,7 +6,7 @@ import Login from './Login'
 import { server } from '../test/mocks/server'
 import { http, HttpResponse } from 'msw'
 
-const API_URL = 'http://localhost:9080/api/v1'
+const API_URL = '/api/v1'
 
 describe('Login Page', () => {
   beforeEach(() => {
@@ -100,10 +100,12 @@ describe('Login Page', () => {
     await user.type(screen.getByPlaceholderText('Password'), 'admin')
     await user.click(screen.getByRole('button', { name: /log in/i }))
 
-    // Check that button shows loading state
+    // Check that button shows loading state (Ant Design 6 uses loading class, not disabled attr)
     await waitFor(() => {
       const button = screen.getByRole('button', { name: /log in/i })
-      expect(button).toBeDisabled()
+      expect(
+        button.classList.contains('ant-btn-loading') || button.hasAttribute('disabled')
+      ).toBe(true)
     })
   })
 

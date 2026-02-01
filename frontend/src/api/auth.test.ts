@@ -3,7 +3,7 @@ import { authApi } from './auth'
 import { server } from '../test/mocks/server'
 import { http, HttpResponse } from 'msw'
 
-const API_URL = 'http://localhost:9080/api/v1'
+const API_URL = '/api/v1'
 
 describe('authApi', () => {
   beforeEach(() => {

@@ -198,13 +198,9 @@ async fn execute_sync_task(
     rate_limiter.wait_for(task.artifact_size as usize).await;
 
     state.active_transfers.fetch_add(1, Ordering::Relaxed);
-    let result = crate::sync::fetch_artifact_by_id(
-        client,
-        state,
-        task.artifact_id,
-        task.artifact_size,
-    )
-    .await;
+    let result =
+        crate::sync::fetch_artifact_by_id(client, state, task.artifact_id, task.artifact_size)
+            .await;
     state.active_transfers.fetch_sub(1, Ordering::Relaxed);
 
     let artifact_bytes = result?;
@@ -359,10 +355,7 @@ pub async fn sync_scheduler_loop(state: Arc<EdgeState>) {
 
         let batch: Vec<_> = tasks_to_run.into_iter().take(available_slots).collect();
 
-        tracing::info!(
-            count = batch.len(),
-            "Executing sync task batch"
-        );
+        tracing::info!(count = batch.len(), "Executing sync task batch");
 
         // Execute tasks concurrently
         let mut handles = Vec::new();
@@ -404,8 +397,14 @@ mod tests {
     #[test]
     fn test_sync_window_no_bounds() {
         assert!(is_within_sync_window(None, None));
-        assert!(is_within_sync_window(Some(NaiveTime::from_hms_opt(2, 0, 0).unwrap()), None));
-        assert!(is_within_sync_window(None, Some(NaiveTime::from_hms_opt(6, 0, 0).unwrap())));
+        assert!(is_within_sync_window(
+            Some(NaiveTime::from_hms_opt(2, 0, 0).unwrap()),
+            None
+        ));
+        assert!(is_within_sync_window(
+            None,
+            Some(NaiveTime::from_hms_opt(6, 0, 0).unwrap())
+        ));
     }
 
     #[test]

@@ -160,10 +160,7 @@ pub async fn peer_discovery_loop(state: Arc<EdgeState>) {
 }
 
 /// Run a single discovery and probe cycle.
-async fn run_discovery_cycle(
-    client: &reqwest::Client,
-    state: &EdgeState,
-) -> anyhow::Result<()> {
+async fn run_discovery_cycle(client: &reqwest::Client, state: &EdgeState) -> anyhow::Result<()> {
     let peers = discover_peers(client, state).await?;
     tracing::debug!(count = peers.len(), "Discovered peers");
 

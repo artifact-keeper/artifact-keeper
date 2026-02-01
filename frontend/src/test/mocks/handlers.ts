@@ -1,6 +1,8 @@
 import { http, HttpResponse } from 'msw'
 
-const API_URL = 'http://localhost:9080/api/v1'
+// In test environment, axios uses empty baseURL (non-PROD mode),
+// so requests are relative paths that MSW intercepts as-is.
+const API_URL = '/api/v1'
 
 // Mock data
 export const mockUser = {
@@ -166,7 +168,7 @@ export const handlers = [
     return HttpResponse.json(newRepo, { status: 201 })
   }),
 
-  http.patch(`${API_URL}/repositories/:key`, async ({ params, request }) => {
+  http.put(`${API_URL}/repositories/:key`, async ({ params, request }) => {
     const repo = mockRepositories.find(r => r.key === params.key)
     if (!repo) {
       return HttpResponse.json(
@@ -226,7 +228,7 @@ export const handlers = [
     return HttpResponse.json(mockStats)
   }),
 
-  http.get(`${API_URL}/health`, () => {
+  http.get('/health', () => {
     return HttpResponse.json({
       status: 'healthy',
       version: '1.0.0',
