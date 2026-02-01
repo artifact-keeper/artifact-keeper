@@ -153,6 +153,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
+        // Tree browser routes with optional auth
+        .nest(
+            "/tree",
+            handlers::tree::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                optional_auth_middleware,
+            )),
+        )
         // Search routes with optional auth
         .nest(
             "/search",

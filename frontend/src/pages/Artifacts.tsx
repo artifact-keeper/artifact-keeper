@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import { Layout, Spin, message } from 'antd'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { repositoriesApi, artifactsApi, treeApi } from '../api'
@@ -156,28 +156,76 @@ const Artifacts = () => {
     setPageSize(newPageSize)
   }, [])
 
+  // Resizable left panel
+  const [siderWidth, setSiderWidth] = useState(320)
+  const isResizing = useRef(false)
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    isResizing.current = true
+    const startX = e.clientX
+    const startWidth = siderWidth
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizing.current) return
+      const newWidth = Math.max(200, Math.min(600, startWidth + (moveEvent.clientX - startX)))
+      setSiderWidth(newWidth)
+    }
+
+    const onMouseUp = () => {
+      isResizing.current = false
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+  }, [siderWidth])
+
   return (
     <Layout style={{ height: 'calc(100vh - 112px)', background: colors.bgLayout }}>
       {/* Left Panel: Repository Tree */}
-      <Sider
-        width={280}
+      <div
         style={{
+          width: siderWidth,
+          minWidth: 200,
+          maxWidth: 600,
           background: colors.bgContainer,
-          borderRight: `1px solid ${colors.border}`,
           overflow: 'auto',
+          flexShrink: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          height: '100%',
         }}
       >
-        <div style={{ padding: '16px 8px' }}>
+        <div style={{ padding: '16px 8px', flex: 1, overflow: 'auto' }}>
           <RepositoryTree
             repositories={repositories}
             loading={reposLoading}
             selectedPath={selectedPath}
             onSelect={handleTreeSelect}
-            virtualHeight={500}
             showSizes
           />
         </div>
-      </Sider>
+      </div>
+
+      {/* Resize handle */}
+      <div
+        onMouseDown={handleMouseDown}
+        style={{
+          width: 4,
+          cursor: 'col-resize',
+          background: colors.border,
+          flexShrink: 0,
+          transition: 'background 0.15s',
+        }}
+        onMouseEnter={(e) => { (e.target as HTMLElement).style.background = colors.primary || '#1677ff' }}
+        onMouseLeave={(e) => { if (!isResizing.current) (e.target as HTMLElement).style.background = colors.border }}
+      />
 
       {/* Middle Panel: Artifact List */}
       <Content

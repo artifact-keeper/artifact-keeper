@@ -45,6 +45,7 @@ pub mod security;
 pub mod signing;
 pub mod swift;
 pub mod terraform;
+pub mod tree;
 pub mod users;
 pub mod vscode;
 pub mod webhooks;
