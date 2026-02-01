@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 import { authApi } from '../api';
 import apiClient from '../api/client';
 import type { User, LoginResponse } from '../types';
@@ -24,15 +24,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const isAuthenticated = !!user;
 
-  const storeTokens = (response: LoginResponse) => {
+  function storeTokens(response: LoginResponse): void {
     localStorage.setItem('access_token', response.access_token);
     localStorage.setItem('refresh_token', response.refresh_token);
-  };
+  }
 
-  const clearTokens = () => {
+  function clearTokens(): void {
     localStorage.removeItem('access_token');
     localStorage.removeItem('refresh_token');
-  };
+  }
 
   const refreshUser = useCallback(async () => {
     try {
@@ -85,7 +85,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // Check for existing token on mount, auto-login in demo mode
   useEffect(() => {
-    const initAuth = async () => {
+    async function initAuth(): Promise<void> {
       const token = localStorage.getItem('access_token');
       if (token) {
         await refreshUser();
@@ -94,24 +94,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       // In demo mode, auto-login as admin so visitors see the full UI
+      await attemptDemoAutoLogin();
+      setIsLoading(false);
+    }
+
+    async function attemptDemoAutoLogin(): Promise<void> {
       try {
         const healthRes = await fetch('/health');
         const health = await healthRes.json();
-        if (health.demo_mode === true) {
-          try {
-            const loginRes = await authApi.login({ username: 'admin', password: 'demo' });
-            storeTokens(loginRes);
-            await refreshUser();
-          } catch {
-            // Demo auto-login failed, continue as anonymous
-          }
-        }
-      } catch {
-        // Health check failed, continue as anonymous
-      }
+        if (health.demo_mode !== true) return;
 
-      setIsLoading(false);
-    };
+        const loginRes = await authApi.login({ username: 'admin', password: 'demo' });
+        storeTokens(loginRes);
+        await refreshUser();
+      } catch {
+        // Health check or demo auto-login failed, continue as anonymous
+      }
+    }
+
     initAuth();
   }, [refreshUser]);
 

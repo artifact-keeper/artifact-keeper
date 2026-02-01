@@ -32,7 +32,7 @@ const repoTypeOptions: { value: RepositoryType; label: string }[] = [
   { value: 'virtual', label: 'Virtual' },
 ]
 
-const formatBytes = (bytes: number): string => {
+function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
   const k = 1024
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -40,7 +40,7 @@ const formatBytes = (bytes: number): string => {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`
 }
 
-const Repositories = () => {
+function Repositories() {
   useDocumentTitle('Repositories')
   const { isAuthenticated } = useAuth()
 
@@ -71,9 +71,7 @@ const Repositories = () => {
     onSuccess: () => {
       message.success('Repository updated successfully')
       queryClient.invalidateQueries({ queryKey: ['repositories'] })
-      setEditModalOpen(false)
-      setEditingRepo(null)
-      editForm.resetFields()
+      closeEditModal()
     },
     onError: () => {
       message.error('Failed to update repository')
@@ -85,14 +83,24 @@ const Repositories = () => {
     onSuccess: () => {
       message.success('Repository deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['repositories'] })
-      setDeleteModalOpen(false)
-      setDeletingRepo(null)
-      setDeleteConfirmText('')
+      closeDeleteModal()
     },
     onError: () => {
       message.error('Failed to delete repository')
     },
   })
+
+  const closeEditModal = useCallback(() => {
+    setEditModalOpen(false)
+    setEditingRepo(null)
+    editForm.resetFields()
+  }, [editForm])
+
+  const closeDeleteModal = useCallback(() => {
+    setDeleteModalOpen(false)
+    setDeletingRepo(null)
+    setDeleteConfirmText('')
+  }, [])
 
   const handleWizardSuccess = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ['repositories'] })
@@ -128,8 +136,8 @@ const Repositories = () => {
     }
   }
 
-  const onChange: TableProps<Repository>['onChange'] = (pagination, filters, sorter) => {
-    console.log('Table params:', { pagination, filters, sorter })
+  const onChange: TableProps<Repository>['onChange'] = (_pagination, _filters, _sorter) => {
+    // Table change handler for future pagination/sort integration
   }
 
   const columns: ColumnsType<Repository> = [
@@ -202,23 +210,23 @@ const Repositories = () => {
             View
           </Button>
           {isAuthenticated && (
-            <Button
-              type="link"
-              icon={<EditOutlined />}
-              onClick={() => handleEdit(record)}
-            >
-              Edit
-            </Button>
-          )}
-          {isAuthenticated && (
-            <Button
-              type="link"
-              danger
-              icon={<DeleteOutlined />}
-              onClick={() => handleDeleteClick(record)}
-            >
-              Delete
-            </Button>
+            <>
+              <Button
+                type="link"
+                icon={<EditOutlined />}
+                onClick={() => handleEdit(record)}
+              >
+                Edit
+              </Button>
+              <Button
+                type="link"
+                danger
+                icon={<DeleteOutlined />}
+                onClick={() => handleDeleteClick(record)}
+              >
+                Delete
+              </Button>
+            </>
           )}
         </Space>
       ),
@@ -309,11 +317,7 @@ const Repositories = () => {
       <Modal
         title={`Edit Repository: ${editingRepo?.key}`}
         open={editModalOpen}
-        onCancel={() => {
-          setEditModalOpen(false)
-          setEditingRepo(null)
-          editForm.resetFields()
-        }}
+        onCancel={closeEditModal}
         footer={null}
       >
         <Form
@@ -342,11 +346,7 @@ const Repositories = () => {
               <Button type="primary" htmlType="submit" loading={updateMutation.isPending}>
                 Save Changes
               </Button>
-              <Button onClick={() => {
-                setEditModalOpen(false)
-                setEditingRepo(null)
-                editForm.resetFields()
-              }}>
+              <Button onClick={closeEditModal}>
                 Cancel
               </Button>
             </Space>
@@ -363,17 +363,9 @@ const Repositories = () => {
           </Space>
         }
         open={deleteModalOpen}
-        onCancel={() => {
-          setDeleteModalOpen(false)
-          setDeletingRepo(null)
-          setDeleteConfirmText('')
-        }}
+        onCancel={closeDeleteModal}
         footer={[
-          <Button key="cancel" onClick={() => {
-            setDeleteModalOpen(false)
-            setDeletingRepo(null)
-            setDeleteConfirmText('')
-          }}>
+          <Button key="cancel" onClick={closeDeleteModal}>
             Cancel
           </Button>,
           <Button
