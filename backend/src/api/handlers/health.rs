@@ -11,6 +11,7 @@ use crate::api::SharedState;
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    pub demo_mode: bool,
     pub checks: HealthChecks,
 }
 
@@ -104,6 +105,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     let response = HealthResponse {
         status: overall_status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        demo_mode: state.config.demo_mode,
         checks: HealthChecks {
             database: db_check,
             storage: CheckStatus {
@@ -196,6 +198,7 @@ mod tests {
         let response = HealthResponse {
             status: "healthy".to_string(),
             version: "1.0.0".to_string(),
+            demo_mode: false,
             checks: HealthChecks {
                 database: CheckStatus {
                     status: "healthy".to_string(),
@@ -225,6 +228,7 @@ mod tests {
         let response = HealthResponse {
             status: "healthy".to_string(),
             version: "1.0.0".to_string(),
+            demo_mode: false,
             checks: HealthChecks {
                 database: CheckStatus {
                     status: "healthy".to_string(),
@@ -276,6 +280,7 @@ mod tests {
         let response = HealthResponse {
             status: "unhealthy".to_string(),
             version: "1.0.0".to_string(),
+            demo_mode: false,
             checks: HealthChecks {
                 database: CheckStatus {
                     status: "unhealthy".to_string(),

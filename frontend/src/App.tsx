@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { ConfigProvider, Layout, Spin } from 'antd'
 import { useAuth, ThemeProvider, useTheme } from './contexts'
@@ -36,10 +37,17 @@ import { ServerError, Forbidden } from './pages/errors'
 
 const { Content } = Layout
 
-const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === 'true'
-
 function DemoBanner() {
-  if (!DEMO_MODE) return null
+  const [demoMode, setDemoMode] = useState(false)
+
+  useEffect(() => {
+    fetch('/health')
+      .then(res => res.json())
+      .then(data => setDemoMode(data.demo_mode === true))
+      .catch(() => {})
+  }, [])
+
+  if (!demoMode) return null
   return (
     <div style={{
       background: '#fffbe6',
