@@ -163,6 +163,7 @@ impl ScanResultService {
     }
 
     /// Mark a scan as completed with severity counts.
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
         scan_id: Uuid,
@@ -296,7 +297,7 @@ impl ScanResultService {
         findings: &[RawFinding],
     ) -> Result<()> {
         for finding in findings {
-            let severity_str = serde_json::to_value(&finding.severity)
+            let severity_str = serde_json::to_value(finding.severity)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| "info".to_string());

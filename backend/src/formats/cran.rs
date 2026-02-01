@@ -55,7 +55,11 @@ impl CranHandler {
         // Check for binary package: bin/<platform>/contrib/<rversion>/<name>_<version>.<ext>
         if path.starts_with("bin/") {
             let parts: Vec<&str> = path.split('/').collect();
-            if parts.len() >= 5 && parts[1] != "" && parts[2] == "contrib" && parts[3] != "" {
+            if parts.len() >= 5
+                && !parts[1].is_empty()
+                && parts[2] == "contrib"
+                && !parts[3].is_empty()
+            {
                 let filename = parts[4..].join("/");
                 if let Some((name, rest)) = filename.rsplit_once('_') {
                     if let Some((version, _ext)) = rest.rsplit_once('.') {

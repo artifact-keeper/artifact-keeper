@@ -70,7 +70,7 @@ impl Pagination {
 ///
 /// Provides optional page and per_page parameters with sensible defaults.
 /// Can be used with `#[serde(flatten)]` in handler-specific query structs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct PaginationQuery {
     /// Requested page number (default: 1)
     pub page: Option<u32>,
@@ -87,14 +87,5 @@ impl PaginationQuery {
     /// Get the per_page value, defaulting to 20 if not specified.
     pub fn per_page(&self) -> u32 {
         self.per_page.unwrap_or(20)
-    }
-}
-
-impl Default for PaginationQuery {
-    fn default() -> Self {
-        Self {
-            page: None,
-            per_page: None,
-        }
     }
 }

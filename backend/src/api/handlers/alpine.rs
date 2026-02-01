@@ -352,6 +352,7 @@ fn generate_apkindex_text(artifacts: &[AlpineArtifact], arch: &str) -> String {
 ///   2. `APKINDEX` — the package index
 ///
 /// When `signature` is `None`, only the `APKINDEX` entry is included.
+#[allow(clippy::result_large_err)]
 fn create_apkindex_tar_gz(
     apkindex_text: &str,
     signature: Option<&[u8]>,

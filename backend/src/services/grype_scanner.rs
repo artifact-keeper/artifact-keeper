@@ -329,6 +329,7 @@ impl Scanner for GrypeScanner {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
         Artifact {
             id: uuid::Uuid::new_v4(),

@@ -13,6 +13,7 @@ use crate::EdgeState;
 
 /// A discoverable peer returned by the discovery API.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct DiscoverablePeer {
     pub node_id: Uuid,
     pub name: String,

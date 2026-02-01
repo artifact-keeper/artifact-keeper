@@ -777,6 +777,7 @@ async fn push_package(
 
 /// Extract the .nupkg bytes from the request body.
 /// Handles both raw binary upload and multipart/form-data.
+#[allow(clippy::result_large_err)]
 fn extract_nupkg_bytes(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Response> {
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -795,6 +796,7 @@ fn extract_nupkg_bytes(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Respon
 }
 
 /// Simple multipart extraction: find the file content between boundaries.
+#[allow(clippy::result_large_err)]
 fn extract_nupkg_from_multipart(content_type: &str, body: &[u8]) -> Result<Bytes, Response> {
     // Extract boundary from content-type header.
     let boundary = content_type

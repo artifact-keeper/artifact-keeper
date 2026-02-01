@@ -62,6 +62,7 @@ pub fn router() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BatchRequest {
     operation: String,
     #[serde(default)]
@@ -160,6 +161,7 @@ struct LockListResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct VerifyLocksRequest {
     #[serde(rename = "ref")]
     lock_ref: Option<LockRef>,
@@ -276,6 +278,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::result_large_err)]
 fn validate_oid(oid: &str) -> Result<(), Response> {
     if oid.len() != 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(lfs_error_response(

@@ -13,6 +13,7 @@ use crate::EdgeState;
 
 /// Chunk manifest entry from the transfer API.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct ChunkEntry {
     pub chunk_index: i32,
     pub byte_offset: i64,
@@ -24,6 +25,7 @@ pub struct ChunkEntry {
 
 /// Transfer session from the transfer API.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct TransferSession {
     pub id: Uuid,
     pub artifact_id: Uuid,
@@ -39,6 +41,7 @@ pub struct TransferSession {
 
 /// Chunk manifest response from the transfer API.
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct ChunkManifestResponse {
     pub session_id: Uuid,
     pub chunks: Vec<ChunkEntry>,
@@ -46,6 +49,7 @@ pub struct ChunkManifestResponse {
 
 /// Scored peer from the peer API.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct ScoredPeer {
     pub node_id: Uuid,
     pub endpoint_url: String,
@@ -327,7 +331,7 @@ pub async fn get_scored_peers(
 
 /// Build a chunk availability bitfield from a set of completed chunk indices.
 fn build_bitmap(total_chunks: i32, completed: &[i32]) -> Vec<u8> {
-    let byte_count = ((total_chunks as usize) + 7) / 8;
+    let byte_count = (total_chunks as usize).div_ceil(8);
     let mut bitmap = vec![0u8; byte_count];
     for &idx in completed {
         let byte_index = idx as usize / 8;
@@ -385,7 +389,7 @@ pub async fn chunked_fetch(
         .map(|c| c.chunk_index)
         .collect();
 
-    let mut pending_chunks: Vec<ChunkEntry> = manifest
+    let pending_chunks: Vec<ChunkEntry> = manifest
         .chunks
         .into_iter()
         .filter(|c| c.status != "completed")
@@ -468,7 +472,6 @@ pub async fn chunked_fetch(
             let client = client.clone();
             let state = state.clone();
             let sources = sources.clone();
-            let artifact_id = artifact_id;
             let session_id = session.id;
 
             let handle = tokio::spawn(async move {
@@ -499,8 +502,8 @@ pub async fn chunked_fetch(
                     // Update bitfield (become seeder for this chunk)
                     let bitmap = build_bitmap(session.total_chunks, &completed_indices);
                     if let Err(e) = update_chunk_availability(
-                        &client,
-                        &state,
+                        client,
+                        state,
                         artifact_id,
                         &bitmap,
                         session.total_chunks,
@@ -513,8 +516,8 @@ pub async fn chunked_fetch(
                 Err(e) => {
                     tracing::error!(chunk_index, error = %e, "Chunk download failed permanently");
                     let _ = report_session_failed(
-                        &client,
-                        &state,
+                        client,
+                        state,
                         session.id,
                         &format!("Chunk {} failed: {}", chunk_index, e),
                     )

@@ -174,7 +174,7 @@ mod security_model_tests {
     fn test_score_penalty_calculation() {
         // Simulate: 1 critical + 2 high + 3 medium = 25 + 20 + 9 = 54 penalty
         // Score = 100 - 54 = 46, Grade = D
-        let penalty = 1 * Severity::Critical.penalty_weight()
+        let penalty = Severity::Critical.penalty_weight()
             + 2 * Severity::High.penalty_weight()
             + 3 * Severity::Medium.penalty_weight();
         let score = (100 - penalty).max(0);
@@ -187,7 +187,7 @@ mod security_model_tests {
     fn test_score_penalty_all_severities() {
         // Test with all severity types
         let penalty = 2 * Severity::Critical.penalty_weight()  // 50
-            + 1 * Severity::High.penalty_weight()              // 10
+            + Severity::High.penalty_weight()                   // 10
             + 2 * Severity::Medium.penalty_weight()            // 6
             + 3 * Severity::Low.penalty_weight()               // 3
             + 5 * Severity::Info.penalty_weight(); // 0
@@ -246,7 +246,7 @@ mod security_model_tests {
     #[test]
     fn test_single_critical_impact() {
         // A single critical vulnerability significantly impacts score
-        let penalty = 1 * Severity::Critical.penalty_weight();
+        let penalty = Severity::Critical.penalty_weight();
         let score = (100 - penalty).max(0);
         assert_eq!(penalty, 25);
         assert_eq!(score, 75);

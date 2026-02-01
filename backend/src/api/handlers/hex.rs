@@ -310,7 +310,7 @@ async fn publish_package(
     }
 
     // Validate the tarball path using the HexHandler
-    let tarball_path = format!("tarballs/package-0.0.0.tar");
+    let tarball_path = "tarballs/package-0.0.0.tar".to_string();
     HexHandler::parse_path(&tarball_path).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,

@@ -69,7 +69,7 @@ pub struct ChunkAvailability {
 impl ChunkAvailability {
     /// Creates a zero-filled bitmap large enough to hold `total_chunks` bits.
     pub fn new_bitmap(total_chunks: usize) -> Vec<u8> {
-        let byte_count = (total_chunks + 7) / 8;
+        let byte_count = total_chunks.div_ceil(8);
         vec![0u8; byte_count]
     }
 

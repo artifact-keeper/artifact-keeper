@@ -656,6 +656,7 @@ fn xml_escape(s: &str) -> String {
 /// Extract plugin file and metadata from a multipart/form-data body.
 ///
 /// Returns (file_bytes, plugin_name, plugin_version).
+#[allow(clippy::result_large_err)]
 fn extract_plugin_from_multipart(
     content_type: &str,
     body: &[u8],

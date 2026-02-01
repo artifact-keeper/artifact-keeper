@@ -737,6 +737,10 @@ mod tests {
             ldap_url: None,
             ldap_base_dn: None,
             trivy_url: None,
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/scan-workspace".into(),
+            demo_mode: false,
         };
 
         let oidc_config = OidcConfig::from_config(&config);

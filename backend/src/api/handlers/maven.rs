@@ -174,8 +174,6 @@ fn content_type_for_path(path: &str) -> &'static str {
         "application/xml"
     } else if path.ends_with(".jar") || path.ends_with(".war") {
         "application/java-archive"
-    } else if path.ends_with(".aar") {
-        "application/octet-stream"
     } else {
         "application/octet-stream"
     }

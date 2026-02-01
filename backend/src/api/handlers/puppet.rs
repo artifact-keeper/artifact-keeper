@@ -148,6 +148,7 @@ async fn resolve_puppet_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
 }
 
 /// Parse an "owner-name" string into (owner, name) by splitting on the first hyphen.
+#[allow(clippy::result_large_err)]
 fn parse_owner_name(s: &str) -> Result<(String, String), Response> {
     let first_hyphen = s.find('-').ok_or_else(|| {
         (
@@ -168,6 +169,7 @@ fn parse_owner_name(s: &str) -> Result<(String, String), Response> {
 }
 
 /// Parse an "owner-name-version" string into (owner, name, version).
+#[allow(clippy::result_large_err)]
 fn parse_owner_name_version(s: &str) -> Result<(String, String, String), Response> {
     let first_hyphen = s.find('-').ok_or_else(|| {
         (

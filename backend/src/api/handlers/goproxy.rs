@@ -102,6 +102,7 @@ enum GoProxyRequest {
 ///   `github.com/!azure/go-sdk/@v/list`
 ///   `github.com/!azure/go-sdk/@v/v1.0.0.info`
 ///   `github.com/!azure/go-sdk/@latest`
+#[allow(clippy::result_large_err)]
 fn parse_path(raw_path: &str) -> Result<GoProxyRequest, Response> {
     // Strip leading slash if present (axum wildcard may include it)
     let path = raw_path.strip_prefix('/').unwrap_or(raw_path);

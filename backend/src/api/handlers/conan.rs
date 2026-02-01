@@ -221,6 +221,7 @@ fn recipe_storage_key(
 }
 
 /// Build a storage key for a package file.
+#[allow(clippy::too_many_arguments)]
 fn package_storage_key(
     name: &str,
     version: &str,
@@ -265,6 +266,7 @@ fn recipe_artifact_path(
 }
 
 /// Build the artifact path for a package file.
+#[allow(clippy::too_many_arguments)]
 fn package_artifact_path(
     name: &str,
     version: &str,
@@ -922,6 +924,7 @@ async fn package_revisions(
 // GET  .../packages/{pkg_id}/revisions/{pkg_rev}/files/{path} — Download package file
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::type_complexity)]
 async fn package_file_download(
     State(state): State<SharedState>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision, file_path)): Path<(
@@ -1006,6 +1009,7 @@ async fn package_file_download(
 // PUT  .../packages/{pkg_id}/revisions/{pkg_rev}/files/{path} — Upload package file
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::type_complexity)]
 async fn package_file_upload(
     State(state): State<SharedState>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision, file_path)): Path<(

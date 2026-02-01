@@ -177,7 +177,7 @@ impl AdvisoryClient {
                         let matches = Self::parse_osv_response(&body, chunk);
                         // Update cache
                         let mut cache = self.cache.write().await;
-                        for (_i, dep) in chunk.iter().enumerate() {
+                        for dep in chunk.iter() {
                             let key = format!(
                                 "{}:{}:{}",
                                 dep.ecosystem,
@@ -667,11 +667,13 @@ impl DependencyScanner {
         let path = artifact.path.to_lowercase();
 
         // For RPM/DEB/APK packages, treat the artifact itself as a dependency
-        let ecosystem = if path.ends_with(".rpm") || path.contains("/rpm/") {
-            Some("Linux")
-        } else if path.ends_with(".deb") || path.contains("/deb/") {
-            Some("Linux")
-        } else if path.ends_with(".apk") || path.contains("/alpine/") {
+        let ecosystem = if path.ends_with(".rpm")
+            || path.contains("/rpm/")
+            || path.ends_with(".deb")
+            || path.contains("/deb/")
+            || path.ends_with(".apk")
+            || path.contains("/alpine/")
+        {
             Some("Linux")
         } else {
             None

@@ -444,6 +444,10 @@ mod tests {
             ldap_url: Some("ldap://localhost:389".into()),
             ldap_base_dn: Some("dc=example,dc=com".into()),
             trivy_url: None,
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/scan-workspace".into(),
+            demo_mode: false,
         };
 
         let ldap_config = LdapConfig::from_config(&config);
