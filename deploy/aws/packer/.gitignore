@@ -1,0 +1,4 @@
+*.auto.pkrvars.hcl
+!*.auto.pkrvars.hcl.example
+.packer/
+packer_cache/

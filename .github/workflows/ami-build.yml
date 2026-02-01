@@ -1,0 +1,100 @@
+name: Build AMI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Artifact Keeper version to bake into the AMI"
+        required: true
+        type: string
+      regions:
+        description: "Comma-separated list of additional regions to copy AMI to (optional)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-ami:
+    name: Build Artifact Keeper AMI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_AMI_BUILDER_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Packer Init
+        working-directory: deploy/aws/packer
+        run: packer init .
+
+      - name: Packer Validate
+        working-directory: deploy/aws/packer
+        run: packer validate -var "artifact_keeper_version=${{ steps.version.outputs.version }}" .
+
+      - name: Packer Build
+        working-directory: deploy/aws/packer
+        run: |
+          REGIONS_ARG=""
+          if [ -n "${{ inputs.regions }}" ]; then
+            REGIONS_ARG="-var ami_regions=[$(echo '${{ inputs.regions }}' | sed 's/,/","/g' | sed 's/^/"/;s/$/"/')]"
+          fi
+
+          packer build \
+            -var "artifact_keeper_version=${{ steps.version.outputs.version }}" \
+            -color=false \
+            ${REGIONS_ARG} \
+            . 2>&1 | tee /tmp/packer-output.log
+
+      - name: Extract AMI ID
+        id: ami
+        run: |
+          AMI_ID=$(grep -oP 'ami-[a-f0-9]+' /tmp/packer-output.log | tail -1)
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+          echo "### AMI Built Successfully" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| AMI ID | \`${AMI_ID}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${{ steps.version.outputs.version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | \`us-east-1\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update AMI manifest
+        if: github.event_name == 'release'
+        run: |
+          mkdir -p deploy/aws
+          cat > deploy/aws/ami-manifest.json <<EOF
+          {
+            "version": "${{ steps.version.outputs.version }}",
+            "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "amis": {
+              "us-east-1": "${{ steps.ami.outputs.ami_id }}"
+            }
+          }
+          EOF
+          echo "AMI manifest updated."
