@@ -7,26 +7,69 @@ Edge nodes enable distributed caching of artifacts closer to consumers, reducing
 
 ## Architecture Overview
 
-```text
-┌─────────────────┐
-│  Primary Node   │  (Central registry, source of truth)
-│  (All regions)  │
-└────────┬────────┘
-         │
-    ┌────┴────┬────────┬─────────┐
-    │         │        │         │
-┌───▼───┐ ┌──▼───┐ ┌──▼───┐ ┌───▼───┐
-│ Edge  │ │ Edge │ │ Edge │ │ Edge  │
-│ US-W  │ │ US-E │ │ EU   │ │ APAC  │
-└───────┘ └──────┘ └──────┘ └───────┘
+```mermaid
+graph TD
+    DEV["👩‍💻 Developer\nSydney"]
+    CI["🔄 CI/CD\nGitHub Actions"]
+    PM["📦 Package Manager\nnpm · pip · docker"]
+
+    subgraph PRIMARY["🏛️ Primary Node · us-east-1"]
+        direction TB
+        HUB_BE["⚙️ Backend\nSource of Truth"]
+        HUB_DB[("🐘 PostgreSQL")]
+        HUB_ST["💾 Storage"]
+        HUB_MS["🔍 Meilisearch"]
+        HUB_BE --> HUB_DB
+        HUB_BE --> HUB_ST
+        HUB_BE --> HUB_MS
+    end
+
+    subgraph EDGES["🌐 Edge Nodes"]
+        direction LR
+
+        subgraph USW["us-west-2"]
+            E1["📡 Edge\nCache · Read-Only"]
+        end
+
+        subgraph EU["eu-west-1"]
+            E2["📡 Edge\nCache · Read-Only"]
+        end
+
+        subgraph AP["ap-southeast-1"]
+            E3["📡 Edge\nCache · Read-Only"]
+        end
+    end
+
+    CI -->|"push"| HUB_BE
+    HUB_BE -->|"Chunked\nReplication"| E1
+    HUB_BE -->|"Chunked\nReplication"| E2
+    HUB_BE -->|"Chunked\nReplication"| E3
+
+    E1 <-->|"P2P Mesh"| E2
+    E2 <-->|"P2P Mesh"| E3
+    E1 <-->|"P2P Mesh"| E3
+
+    DEV -->|"pull"| E3
+    PM -->|"install"| E1
+
+    classDef primary fill:#2ea44f,color:#fff,stroke:#2ea44f,font-weight:bold
+    classDef edge fill:#1d63ed,color:#fff,stroke:#1d63ed
+    classDef client fill:#6f42c1,color:#fff,stroke:#6f42c1
+    classDef datastore fill:#d97706,color:#fff,stroke:#d97706
+
+    class HUB_BE primary
+    class HUB_DB,HUB_ST,HUB_MS datastore
+    class E1,E2,E3 edge
+    class DEV,CI,PM client
 ```
 
 ### Key Concepts
 
-- **Primary Node**: The authoritative registry where artifacts are uploaded
-- **Edge Nodes**: Read-only cache nodes that serve artifacts to local consumers
-- **Replication**: Automatic synchronization of artifacts from primary to edges
-- **Network-Aware Routing**: Clients automatically routed to nearest edge
+- **Primary Node**: The authoritative registry where artifacts are uploaded — source of truth for all metadata and storage
+- **Edge Nodes**: Read-only cache nodes that serve artifacts to local consumers with low latency
+- **Chunked Replication**: Artifacts are split into chunks for reliable, resumable delivery to edge nodes
+- **P2P Mesh**: Edge nodes transfer chunks between each other, reducing hub bandwidth
+- **Network-Aware Routing**: Clients automatically redirected to the nearest healthy edge
 
 ## Setting Up Edge Nodes
 

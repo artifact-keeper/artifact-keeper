@@ -7,33 +7,75 @@ Deploy Artifact Keeper on a single EC2 instance using Docker Compose. The AMI co
 
 ## Architecture
 
-```text
-┌──────────────────────────────────────────────────┐
-│                  EC2 Instance                     │
-│                                                   │
-│  ┌───────────┐                                   │
-│  │   Nginx   │  (host — handles SSL/TLS)         │
-│  │  (80/443) │                                   │
-│  └─────┬─────┘                                   │
-│        │                                          │
-│  ┌─────▼──────────── Docker Compose ───────────┐ │
-│  │                                              │ │
-│  │  ┌──────────┐  ┌──────────────────────────┐ │ │
-│  │  │ Frontend │  │   Backend (8080)          │ │ │
-│  │  │  (3000)  │  └────────┬─────────────────┘ │ │
-│  │  └──────────┘           │                    │ │
-│  │               ┌─────────┼──────────┐         │ │
-│  │         ┌─────▼───┐ ┌───▼─────┐ ┌─▼──────┐ │ │
-│  │         │Postgres │ │Meili-   │ │ Trivy  │ │ │
-│  │         │  (5432) │ │search   │ │ (8090) │ │ │
-│  │         └─────────┘ └─────────┘ └────────┘ │ │
-│  └──────────────────────────────────────────────┘ │
-│                                                   │
-│  /data/  (EBS gp3 volume)                        │
-└──────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    Internet["🌐 Internet"]
+
+    subgraph EC2["☁️ EC2 Instance · Ubuntu 24.04"]
+        direction TB
+
+        subgraph HOST["Host Services"]
+            direction LR
+            NGINX["🔒 Nginx\n:80 · :443\nSSL Termination"]
+            UFW["🛡️ UFW Firewall"]
+            F2B["🚫 Fail2ban"]
+        end
+
+        subgraph DOCKER["🐳 Docker Compose"]
+            direction TB
+
+            subgraph APP["Application Layer"]
+                direction LR
+                FE["⚛️ Frontend\nReact 19\n:3000"]
+                BE["⚙️ Backend\nRust · Axum\n:8080"]
+            end
+
+            subgraph DATA_SERVICES["Data Services"]
+                direction LR
+                PG["🐘 PostgreSQL 16\n:5432"]
+                MS["🔍 Meilisearch\n:7700"]
+                TV["🛡️ Trivy\n:8090"]
+            end
+
+            FE ~~~ BE
+            BE --> PG
+            BE --> MS
+            BE --> TV
+        end
+
+        subgraph EBS["💾 EBS gp3 Volume · /data/"]
+            direction LR
+            PG_DATA["postgres/"]
+            MS_DATA["meilisearch/"]
+            STORAGE["storage/"]
+            TV_CACHE["trivy-cache/"]
+        end
+    end
+
+    Internet --> UFW --> NGINX
+    NGINX -->|"/ → :3000"| FE
+    NGINX -->|"/api · /health → :8080"| BE
+    PG -.-> PG_DATA
+    MS -.-> MS_DATA
+    BE -.-> STORAGE
+    TV -.-> TV_CACHE
+
+    classDef ec2 fill:#ff9900,color:#fff,stroke:#ff9900,font-weight:bold
+    classDef host fill:#232f3e,color:#fff,stroke:#232f3e
+    classDef docker fill:#1d63ed,color:#fff,stroke:#1d63ed
+    classDef app fill:#2ea44f,color:#fff,stroke:#2ea44f
+    classDef data fill:#6f42c1,color:#fff,stroke:#6f42c1
+    classDef ebs fill:#d73a49,color:#fff,stroke:#d73a49
+    classDef internet fill:#0969da,color:#fff,stroke:#0969da,font-weight:bold
+
+    class Internet internet
+    class NGINX,UFW,F2B host
+    class FE,BE app
+    class PG,MS,TV data
+    class PG_DATA,MS_DATA,STORAGE,TV_CACHE ebs
 ```
 
-Nginx runs on the host for SSL termination. All application services run as Docker containers managed by Docker Compose. Data is persisted to `/data/` on a dedicated EBS volume.
+**Nginx** runs on the host for SSL termination (with optional Let's Encrypt). All application services run as Docker containers managed by Docker Compose. Data is persisted to `/data/` on a dedicated encrypted EBS gp3 volume.
 
 ## Prerequisites
 

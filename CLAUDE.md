@@ -120,7 +120,7 @@ Rust 1.75+ (backend), TypeScript 5.x (frontend): Follow standard conventions
 - **Demo EC2 instance** (`i-0caaf8acac6f85d4d`, Elastic IP `3.222.57.187`): Only pull pre-built images from `ghcr.io`, never `docker compose build`. Use `docker compose pull && docker compose up -d`.
 - **SSH access**: `ssh ubuntu@3.222.57.187` (uses local SSH key)
 - **Demo stack**: Managed via systemd service `artifact-keeper-demo` and Caddy reverse proxy for TLS.
-- **Docker images** are published to `ghcr.io/brandonrc/artifact-keeper-backend` and `ghcr.io/brandonrc/artifact-keeper-frontend` by the Docker Publish CI workflow on every push to main.
+- **Docker images** are published to `ghcr.io/artifact-keeper/artifact-keeper-backend` and `ghcr.io/artifact-keeper/artifact-keeper-frontend` by the Docker Publish CI workflow on every push to main.
 - **GitHub Pages site** (`/site/` directory): Combined landing page + Starlight docs, deployed to `artifactkeeper.com`.
 
 <!-- MANUAL ADDITIONS END -->

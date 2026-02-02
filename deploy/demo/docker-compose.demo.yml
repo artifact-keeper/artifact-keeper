@@ -19,7 +19,7 @@ services:
       retries: 5
 
   backend:
-    image: ghcr.io/brandonrc/artifact-keeper-backend:latest
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest
     user: "0:0"
     environment:
       DATABASE_URL: postgres://registry:registry-demo@postgres:5432/artifact_registry
@@ -45,7 +45,7 @@ services:
       - trivy_cache:/root/.cache/trivy
 
   frontend:
-    image: ghcr.io/brandonrc/artifact-keeper-frontend:latest
+    image: ghcr.io/artifact-keeper/artifact-keeper-frontend:latest
     ports:
       - "3000:80"
     depends_on:

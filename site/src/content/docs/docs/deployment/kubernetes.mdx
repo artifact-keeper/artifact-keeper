@@ -16,24 +16,71 @@ Deploy Artifact Keeper on Kubernetes for high availability, scalability, and clo
 
 ## Architecture Overview
 
-```text
-┌─────────────────────────────────────────────┐
-│              Ingress (HTTPS)                │
-└──────────────┬──────────────────────────────┘
-               │
-       ┌───────┴────────┐
-       │                │
-┌──────▼──────┐  ┌──────▼──────┐
-│  Frontend   │  │   Backend   │
-│  Deployment │  │  Deployment │
-│  (2 pods)   │  │  (2 pods)   │
-└─────────────┘  └──────┬──────┘
-                        │
-                 ┌──────▼──────┐
-                 │  PostgreSQL │
-                 │ StatefulSet │
-                 │   (1 pod)   │
-                 └─────────────┘
+```mermaid
+graph TD
+    CLIENT["🌐 Clients\nBrowser · CLI · Package Managers"]
+
+    subgraph K8S["☸ Kubernetes Cluster"]
+        direction TB
+
+        subgraph INGRESS_LAYER["Ingress Layer"]
+            ING["🔒 Ingress Controller\nNginx / Traefik\nTLS via cert-manager"]
+        end
+
+        subgraph APP["Application Tier"]
+            direction LR
+            FE["⚛️ Frontend\nDeployment\n2+ pods"]
+            BE["⚙️ Backend\nDeployment\n2+ pods"]
+            HPA["📈 HPA\nAuto-scale\n2 → 10 pods"]
+        end
+
+        subgraph DATA["Data Tier"]
+            direction LR
+            PG["🐘 PostgreSQL\nStatefulSet\n1 pod"]
+            MS["🔍 Meilisearch\nStatefulSet\n1 pod"]
+            TV["🛡️ Trivy\nDeployment\n1 pod"]
+        end
+
+        subgraph STORAGE["Persistent Storage"]
+            direction LR
+            PVC_PG["💾 PVC\nPostgreSQL\n50 Gi"]
+            PVC_ART["💾 PVC\nArtifacts\n100 Gi"]
+            PVC_BAK["💾 PVC\nBackups\n50 Gi"]
+        end
+
+        subgraph OPS["Operations"]
+            direction LR
+            BACKUP["⏰ CronJob\nDB Backup\n2 AM daily"]
+            MON["📊 ServiceMonitor\nPrometheus\nMetrics"]
+        end
+    end
+
+    CLIENT --> ING
+    ING -->|"/"| FE
+    ING -->|"/api"| BE
+    HPA -.-|"scales"| BE
+    BE --> PG
+    BE --> MS
+    BE --> TV
+    PG -.-> PVC_PG
+    BE -.-> PVC_ART
+    BACKUP -.-> PVC_BAK
+    BACKUP -.-> PG
+    MON -.-> BE
+
+    classDef ingress fill:#ff9900,color:#fff,stroke:#ff9900,font-weight:bold
+    classDef app fill:#2ea44f,color:#fff,stroke:#2ea44f
+    classDef data fill:#6f42c1,color:#fff,stroke:#6f42c1
+    classDef storage fill:#d73a49,color:#fff,stroke:#d73a49
+    classDef ops fill:#1d63ed,color:#fff,stroke:#1d63ed
+    classDef client fill:#0969da,color:#fff,stroke:#0969da,font-weight:bold
+
+    class CLIENT client
+    class ING ingress
+    class FE,BE,HPA app
+    class PG,MS,TV data
+    class PVC_PG,PVC_ART,PVC_BAK storage
+    class BACKUP,MON ops
 ```
 
 ## Quick Start
