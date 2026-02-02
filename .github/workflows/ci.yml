@@ -233,6 +233,40 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ════════════════════════════════════════════════════════════════════════════
+  # TIER 1.5: SMOKE E2E (Every Push/PR) - Target: < 20 minutes
+  # ════════════════════════════════════════════════════════════════════════════
+
+  smoke-e2e:
+    name: 🔥 Smoke E2E Tests
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Run smoke E2E tests (PyPI, npm, Cargo)
+        run: |
+          docker compose -f docker-compose.test.yml --profile smoke up \
+            --build \
+            --abort-on-container-exit
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-e2e-results
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans
+
+  # ════════════════════════════════════════════════════════════════════════════
   # SECURITY (Runs on all events, non-blocking)
   # ════════════════════════════════════════════════════════════════════════════
 
@@ -275,7 +309,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only require Tier 1 jobs for all PRs/pushes
     # Tier 2 jobs (integration, docker) are checked conditionally
-    needs: [lint-rust, lint-typescript, test-backend-unit, test-frontend-unit, build-backend, build-frontend, security-audit]
+    needs: [lint-rust, lint-typescript, test-backend-unit, test-frontend-unit, build-backend, build-frontend, smoke-e2e, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -329,6 +363,13 @@ jobs:
             tier1_pass=false
           fi
 
+          if [[ "${{ needs.smoke-e2e.result }}" == "success" ]]; then
+            echo "✅ Smoke E2E Tests: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Smoke E2E Tests: ${{ needs.smoke-e2e.result }}" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Security (Non-blocking)" >> $GITHUB_STEP_SUMMARY
 
@@ -348,4 +389,4 @@ jobs:
 
           echo "✅ **CI Passed**: All Tier 1 jobs completed successfully" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "_Note: E2E tests run separately on release or manual trigger._" >> $GITHUB_STEP_SUMMARY
+          echo "_Note: Smoke E2E (PyPI, npm, Cargo) runs on every PR. Full E2E suite available on release or manual trigger._" >> $GITHUB_STEP_SUMMARY

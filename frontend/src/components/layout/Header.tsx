@@ -81,6 +81,11 @@ const AppHeader = () => {
               style={{ marginRight: 4 }}
             />
           )}
+          <img
+            src="/logo-48.png"
+            alt="Artifact Keeper"
+            style={{ width: 32, height: 32, flexShrink: 0 }}
+          />
           <div style={{ flex: 1, maxWidth: isMobile ? 'none' : 400 }}>
             <QuickSearch
               placeholder={isMobile ? 'Search...' : 'Search artifacts...'}

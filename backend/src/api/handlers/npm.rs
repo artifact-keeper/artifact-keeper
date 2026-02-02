@@ -173,18 +173,18 @@ async fn resolve_npm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 async fn get_metadata(
     State(state): State<SharedState>,
     Path((repo_key, package)): Path<(String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
-    get_package_metadata(&state, &repo_key, &package).await
+    get_package_metadata(&state, &repo_key, &package, &headers).await
 }
 
 async fn get_scoped_metadata(
     State(state): State<SharedState>,
     Path((repo_key, scope, package)): Path<(String, String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Response, Response> {
     let full_name = format!("@{}/{}", scope, package);
-    get_package_metadata(&state, &repo_key, &full_name).await
+    get_package_metadata(&state, &repo_key, &full_name, &headers).await
 }
 
 /// Build and return the npm package metadata JSON for all versions.
@@ -192,7 +192,18 @@ async fn get_package_metadata(
     state: &SharedState,
     repo_key: &str,
     package_name: &str,
+    headers: &HeaderMap,
 ) -> Result<Response, Response> {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let base_url = format!("{}://{}", scheme, host);
+
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
     // Find all artifacts for this package name
@@ -239,7 +250,10 @@ async fn get_package_metadata(
         let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
 
         // Build the tarball URL
-        let tarball_url = format!("/npm/{}/{}/-/{}", repo_key, package_name, filename);
+        let tarball_url = format!(
+            "{}/npm/{}/{}/-/{}",
+            base_url, repo_key, package_name, filename
+        );
 
         // Get version-specific metadata from artifact_metadata if available
         let version_metadata = artifact
@@ -260,11 +274,23 @@ async fn get_package_metadata(
             .or_insert_with(|| serde_json::Value::String(package_name.to_string()));
         obj.entry("version".to_string())
             .or_insert_with(|| serde_json::Value::String(version.clone()));
+        // npm expects shasum (SHA-1) or integrity (subresource integrity hash).
+        // We only store SHA-256, so provide it via the integrity field.
+        use base64::Engine;
+        let hex = &artifact.checksum_sha256;
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect();
+        let integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
         obj.insert(
             "dist".to_string(),
             serde_json::json!({
                 "tarball": tarball_url,
-                "shasum": &artifact.checksum_sha256,
+                "integrity": integrity,
             }),
         );
 
