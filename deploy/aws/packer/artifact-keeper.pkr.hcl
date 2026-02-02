@@ -39,7 +39,7 @@ variable "ami_regions" {
 
 source "amazon-ebs" "artifact-keeper" {
   ami_name        = "artifact-keeper-${var.artifact_keeper_version}-{{timestamp}}"
-  ami_description = "Artifact Keeper ${var.artifact_keeper_version} — open-source artifact registry. Docker-based deployment with PostgreSQL, Meilisearch, Trivy."
+  ami_description = "Artifact Keeper ${var.artifact_keeper_version} - open-source artifact registry with PostgreSQL, Meilisearch, and Trivy."
   instance_type   = var.instance_type
   region          = var.aws_region
   ami_regions     = var.ami_regions
@@ -78,6 +78,11 @@ source "amazon-ebs" "artifact-keeper" {
 
 build {
   sources = ["source.amazon-ebs.artifact-keeper"]
+
+  # Create destination directory first
+  provisioner "shell" {
+    inline = ["mkdir -p /tmp/ak-scripts"]
+  }
 
   # Upload scripts and compose file
   provisioner "file" {
