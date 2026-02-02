@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 echo "==> [02] Setting up Artifact Keeper (Docker Compose)"
 
@@ -7,21 +7,34 @@ AK_DIR="/opt/artifact-keeper"
 mkdir -p "${AK_DIR}"
 
 # Copy compose file and first-boot script from packer upload
-cp /tmp/ak-scripts/docker-compose.yml "${AK_DIR}/docker-compose.yml"
-cp /tmp/ak-scripts/first-boot.sh "${AK_DIR}/first-boot.sh"
-cp /tmp/ak-scripts/nginx-host.conf "${AK_DIR}/nginx-host.conf"
+# Debug: show what packer uploaded
+echo "==> Contents of /tmp/ak-scripts:"
+find /tmp/ak-scripts -type f 2>/dev/null || true
+ls -laR /tmp/ak-scripts/ 2>/dev/null || true
+
+# Find the source directory (packer may nest under scripts/ or upload flat)
+SRC=$(find /tmp/ak-scripts -name "docker-compose.yml" -printf '%h' -quit 2>/dev/null || true)
+if [ -z "${SRC}" ]; then
+    echo "ERROR: docker-compose.yml not found in /tmp/ak-scripts"
+    exit 1
+fi
+echo "==> Found files in: ${SRC}"
+
+cp "${SRC}/docker-compose.yml" "${AK_DIR}/docker-compose.yml"
+cp "${SRC}/first-boot.sh" "${AK_DIR}/first-boot.sh"
+cp "${SRC}/nginx-host.conf" "${AK_DIR}/nginx-host.conf"
 chmod +x "${AK_DIR}/first-boot.sh"
 
 # Create data directories
 mkdir -p /data/{postgres,meilisearch,storage,trivy-cache}
 
 # Pull images now so first boot is fast
-export ARTIFACT_KEEPER_VERSION="${ARTIFACT_KEEPER_VERSION}"
+AK_VERSION="${ARTIFACT_KEEPER_VERSION:-latest}"
 cd "${AK_DIR}"
 
 # Write the .env with the version tag
 cat > "${AK_DIR}/.env" <<EOF
-ARTIFACT_KEEPER_VERSION=${ARTIFACT_KEEPER_VERSION}
+ARTIFACT_KEEPER_VERSION=${AK_VERSION}
 # Populated by first-boot:
 DB_PASSWORD=changeme
 JWT_SECRET=changeme
