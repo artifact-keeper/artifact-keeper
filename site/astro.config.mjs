@@ -11,10 +11,10 @@ export default defineConfig({
       description: 'The open-source artifact registry. Documentation, guides, and API reference.',
       plugins: [starlightClientMermaid()],
       logo: {
-        light: './src/assets/logo-light.svg',
-        dark: './src/assets/logo-dark.svg',
+        src: './src/assets/logo.png',
         replacesTitle: false,
       },
+      favicon: '/favicon.png',
       social: {
         github: 'https://github.com/artifact-keeper/artifact-keeper',
       },
