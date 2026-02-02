@@ -24,6 +24,8 @@ pub fn router() -> Router<SharedState> {
         .route("/dashboard", get(get_dashboard))
         // Scores
         .route("/scores", get(get_all_scores))
+        // Scan configs
+        .route("/configs", get(list_scan_configs))
         // Scan operations
         .route("/scan", post(trigger_scan))
         .route("/scans", get(list_scans))
@@ -45,10 +47,10 @@ pub fn router() -> Router<SharedState> {
 pub fn repo_security_router() -> Router<SharedState> {
     Router::new()
         .route(
-            "/security",
+            "/:key/security",
             get(get_repo_security).put(update_repo_security),
         )
-        .route("/security/scans", get(list_repo_scans))
+        .route("/:key/security/scans", get(list_repo_scans))
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +395,16 @@ async fn get_all_scores(
     let svc = ScanResultService::new(state.db.clone());
     let scores = svc.get_all_scores().await?;
     let response: Vec<ScoreResponse> = scores.into_iter().map(ScoreResponse::from).collect();
+    Ok(Json(response))
+}
+
+async fn list_scan_configs(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+) -> Result<Json<Vec<ScanConfigResponse>>> {
+    let svc = ScanConfigService::new(state.db.clone());
+    let configs = svc.list_configs().await?;
+    let response: Vec<ScanConfigResponse> = configs.into_iter().map(ScanConfigResponse::from).collect();
     Ok(Json(response))
 }
 

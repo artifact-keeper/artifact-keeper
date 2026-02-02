@@ -81,6 +81,25 @@ impl ScanConfigService {
         Ok(config)
     }
 
+    /// List all scan configurations (for admin overview / filtering).
+    pub async fn list_configs(&self) -> Result<Vec<ScanConfig>> {
+        let configs = sqlx::query_as!(
+            ScanConfig,
+            r#"
+            SELECT id, repository_id, scan_enabled, scan_on_upload, scan_on_proxy,
+                   block_on_policy_violation, severity_threshold, created_at, updated_at
+            FROM scan_configs
+            WHERE scan_enabled = true
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+        Ok(configs)
+    }
+
     /// Quick check: is scanning enabled for this repository?
     pub async fn is_scan_enabled(&self, repository_id: Uuid) -> Result<bool> {
         let result = sqlx::query_scalar!(

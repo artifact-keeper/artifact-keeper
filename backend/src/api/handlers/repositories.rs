@@ -49,6 +49,8 @@ pub fn router() -> Router<SharedState> {
         )
         // Download uses a separate route prefix to avoid wildcard conflict
         .route("/:key/download/*path", get(download_artifact))
+        // Security routes nested under repository
+        .merge(super::security::repo_security_router())
 }
 
 #[derive(Debug, Deserialize)]

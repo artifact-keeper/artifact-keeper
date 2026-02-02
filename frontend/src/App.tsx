@@ -114,6 +114,7 @@ function AppContent() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/repositories" element={<Repositories />} />
             <Route path="/repositories/:key" element={<RepositoryDetail />} />
+            <Route path="/repositories/:key/artifacts/:artifactId" element={<RepositoryDetail />} />
             <Route path="/artifacts" element={<Artifacts />} />
             <Route path="/packages" element={<Packages />} />
             <Route path="/builds" element={<Builds />} />

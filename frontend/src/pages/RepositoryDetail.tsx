@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   Card,
@@ -18,7 +18,10 @@ import {
   Upload,
   Form,
   Progress,
-  Tooltip
+  Tooltip,
+  Switch,
+  Select,
+  Collapse
 } from 'antd'
 import {
   ArrowLeftOutlined,
@@ -31,13 +34,15 @@ import {
   InboxOutlined,
   InfoCircleOutlined,
   CopyOutlined,
-  CheckOutlined
+  CheckOutlined,
+  SafetyCertificateOutlined
 } from '@ant-design/icons'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import type { ColumnsType } from 'antd/es/table'
 import type { UploadFile } from 'antd/es/upload/interface'
-import { repositoriesApi, artifactsApi } from '../api'
+import { repositoriesApi, artifactsApi, securityApi } from '../api'
 import type { Artifact } from '../types'
+import { useAuth } from '../contexts/AuthContext'
 import { useDocumentTitle } from '../hooks'
 
 const { Search } = Input
@@ -53,10 +58,11 @@ const formatBytes = (bytes: number): string => {
 }
 
 const RepositoryDetail = () => {
-  const { key } = useParams<{ key: string }>()
+  const { key, artifactId } = useParams<{ key: string; artifactId?: string }>()
   useDocumentTitle(key ? `Repository: ${key}` : 'Repository')
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  const { user } = useAuth()
   const [searchQuery, setSearchQuery] = useState('')
   const [uploadModalOpen, setUploadModalOpen] = useState(false)
   const [detailModalOpen, setDetailModalOpen] = useState(false)
@@ -66,6 +72,7 @@ const RepositoryDetail = () => {
   const [fileList, setFileList] = useState<UploadFile[]>([])
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [form] = Form.useForm()
+  const [securityForm] = Form.useForm()
 
   const { data: repository, isLoading: repoLoading } = useQuery({
     queryKey: ['repository', key],
@@ -78,6 +85,36 @@ const RepositoryDetail = () => {
     queryFn: () => artifactsApi.list(key!, { search: searchQuery || undefined, per_page: 100 }),
     enabled: !!key,
   })
+
+  const { data: repoSecurity, isLoading: securityLoading } = useQuery({
+    queryKey: ['repository-security', key],
+    queryFn: () => securityApi.getRepoSecurity(key!),
+    enabled: !!key && !!user?.is_admin,
+  })
+
+  const updateSecurityMutation = useMutation({
+    mutationFn: (values: { scan_enabled: boolean; scan_on_upload: boolean; scan_on_proxy: boolean; block_on_policy_violation: boolean; severity_threshold: string }) =>
+      securityApi.updateRepoSecurity(key!, values),
+    onSuccess: () => {
+      message.success('Security settings updated')
+      queryClient.invalidateQueries({ queryKey: ['repository-security', key] })
+      queryClient.invalidateQueries({ queryKey: ['security', 'scan-configs'] })
+    },
+    onError: () => {
+      message.error('Failed to update security settings')
+    },
+  })
+
+  // Auto-open artifact detail modal when navigated via /repositories/:key/artifacts/:artifactId
+  useEffect(() => {
+    if (artifactId && artifactsData?.items) {
+      const artifact = artifactsData.items.find((a: Artifact) => a.id === artifactId)
+      if (artifact) {
+        setSelectedArtifact(artifact)
+        setDetailModalOpen(true)
+      }
+    }
+  }, [artifactId, artifactsData])
 
   const deleteMutation = useMutation({
     mutationFn: (path: string) => artifactsApi.delete(key!, path),
@@ -300,6 +337,77 @@ const RepositoryDetail = () => {
           )}
         </Descriptions>
       </Card>
+
+      {user?.is_admin && (
+        <Collapse
+          style={{ marginBottom: 16 }}
+          items={[{
+            key: 'security',
+            label: (
+              <Space>
+                <SafetyCertificateOutlined />
+                <span>Security Scan Settings</span>
+                {repoSecurity?.config?.scan_enabled ? (
+                  <Tag color="green">Enabled</Tag>
+                ) : (
+                  <Tag>Disabled</Tag>
+                )}
+              </Space>
+            ),
+            children: securityLoading ? (
+              <Spin />
+            ) : (
+              <Form
+                form={securityForm}
+                layout="horizontal"
+                labelCol={{ span: 8 }}
+                wrapperCol={{ span: 16 }}
+                style={{ maxWidth: 500 }}
+                initialValues={{
+                  scan_enabled: repoSecurity?.config?.scan_enabled ?? false,
+                  scan_on_upload: repoSecurity?.config?.scan_on_upload ?? true,
+                  scan_on_proxy: repoSecurity?.config?.scan_on_proxy ?? false,
+                  block_on_policy_violation: repoSecurity?.config?.block_on_policy_violation ?? false,
+                  severity_threshold: repoSecurity?.config?.severity_threshold ?? 'high',
+                }}
+                onFinish={(values) => updateSecurityMutation.mutate(values)}
+              >
+                <Form.Item name="scan_enabled" label="Enable Scanning" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+                <Form.Item name="scan_on_upload" label="Scan on Upload" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+                <Form.Item name="scan_on_proxy" label="Scan on Proxy" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+                <Form.Item name="block_on_policy_violation" label="Block on Violation" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+                <Form.Item name="severity_threshold" label="Severity Threshold">
+                  <Select
+                    options={[
+                      { label: 'Critical', value: 'critical' },
+                      { label: 'High', value: 'high' },
+                      { label: 'Medium', value: 'medium' },
+                      { label: 'Low', value: 'low' },
+                    ]}
+                  />
+                </Form.Item>
+                <Form.Item wrapperCol={{ offset: 8, span: 16 }}>
+                  <Button
+                    type="primary"
+                    htmlType="submit"
+                    loading={updateSecurityMutation.isPending}
+                  >
+                    Save Settings
+                  </Button>
+                </Form.Item>
+              </Form>
+            ),
+          }]}
+        />
+      )}
 
       <Card
         title="Artifacts"

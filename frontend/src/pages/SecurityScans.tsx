@@ -46,6 +46,15 @@ export default function SecurityScans() {
     },
   });
 
+  // Fetch scan-enabled repo IDs so we can filter the trigger modal
+  const { data: scanEnabledRepoIds } = useQuery({
+    queryKey: ['security', 'scan-configs'],
+    queryFn: async () => {
+      const { data } = await apiClient.get('/api/v1/security/configs');
+      return new Set((data || []).map((c: any) => c.repository_id));
+    },
+  });
+
   const { data: repoArtifacts } = useQuery({
     queryKey: ['repository-artifacts', selectedRepoId],
     queryFn: async () => {
@@ -257,9 +266,12 @@ export default function SecurityScans() {
                 form.setFieldValue('artifact_id', undefined);
               }}
               options={(repos || []).map((r: any) => ({
-                label: `${r.name || r.key} (${r.format})`,
-                value: r.id,
-              }))}
+                  label: scanEnabledRepoIds?.has(r.id)
+                    ? `${r.name || r.key} (${r.format})`
+                    : `${r.name || r.key} (${r.format}) — scanning disabled`,
+                  value: r.id,
+                  disabled: scanEnabledRepoIds != null && !scanEnabledRepoIds.has(r.id),
+                }))}
             />
           </Form.Item>
           <Form.Item
