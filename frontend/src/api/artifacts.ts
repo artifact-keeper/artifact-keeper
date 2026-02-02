@@ -31,7 +31,7 @@ export const artifactsApi = {
   },
 
   getDownloadUrl: (repoKey: string, artifactPath: string): string => {
-    const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:9080';
+    const baseUrl = import.meta.env.VITE_API_URL || '';
     return `${baseUrl}/api/v1/repositories/${repoKey}/artifacts/${encodeURIComponent(artifactPath)}/download`;
   },
 

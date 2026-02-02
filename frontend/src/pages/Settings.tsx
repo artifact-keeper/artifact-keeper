@@ -40,7 +40,7 @@ const Settings = () => {
               <Card>
                 <Form layout="vertical">
                   <Form.Item label="API URL">
-                    <Input disabled value={import.meta.env.VITE_API_URL || 'http://localhost:9080'} />
+                    <Input disabled value={import.meta.env.VITE_API_URL || window.location.origin} />
                   </Form.Item>
                   <Form.Item label="Version">
                     <Input disabled value="1.0.0" />
