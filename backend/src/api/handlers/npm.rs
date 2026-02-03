@@ -610,6 +610,27 @@ async fn publish_package(
         .execute(&state.db)
         .await;
 
+        // Populate packages / package_versions tables (best-effort)
+        {
+            let pkg_svc =
+                crate::services::package_service::PackageService::new(state.db.clone());
+            let description = version_data
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            pkg_svc
+                .try_create_or_update_from_artifact(
+                    repo.id,
+                    package_name,
+                    version,
+                    size_bytes,
+                    &sha256,
+                    description.as_deref(),
+                    Some(serde_json::json!({ "format": "npm" })),
+                )
+                .await;
+        }
+
         info!(
             "npm publish: {} {} ({}) to repo {}",
             package_name, version, tarball_filename, repo_key

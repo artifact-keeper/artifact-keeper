@@ -789,6 +789,23 @@ async fn upload(
     .execute(&state.db)
     .await;
 
+    // Populate packages / package_versions tables (best-effort)
+    {
+        let pkg_svc =
+            crate::services::package_service::PackageService::new(state.db.clone());
+        pkg_svc
+            .try_create_or_update_from_artifact(
+                repo.id,
+                &normalized,
+                &pkg_version,
+                size_bytes,
+                &computed_sha256,
+                summary.as_deref(),
+                Some(serde_json::json!({ "format": "pypi" })),
+            )
+            .await;
+    }
+
     info!(
         "PyPI upload: {} {} ({}) to repo {}",
         pkg_name, pkg_version, filename, repo_key

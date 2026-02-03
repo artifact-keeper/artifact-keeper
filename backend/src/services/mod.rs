@@ -2,6 +2,7 @@
 
 pub mod artifact_service;
 pub mod auth_config_service;
+pub mod build_service;
 pub mod artifactory_client;
 pub mod artifactory_import;
 pub mod audit_service;
@@ -16,6 +17,7 @@ pub mod migration_service;
 pub mod migration_worker;
 pub mod oidc_service;
 pub mod openscap_scanner;
+pub mod package_service;
 pub mod peer_instance_service;
 pub mod peer_service;
 pub mod plugin_registry;

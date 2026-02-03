@@ -1,0 +1,6 @@
+-- Add VCS and metadata fields to builds table
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS vcs_url TEXT;
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS vcs_revision VARCHAR(255);
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS vcs_branch VARCHAR(255);
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS vcs_message TEXT;
+ALTER TABLE builds ADD COLUMN IF NOT EXISTS metadata JSONB;

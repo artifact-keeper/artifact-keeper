@@ -241,6 +241,23 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Populate packages / package_versions tables (non-blocking)
+        if let Some(ref ver) = artifact.version {
+            let pkg_svc =
+                crate::services::package_service::PackageService::new(self.db.clone());
+            pkg_svc
+                .try_create_or_update_from_artifact(
+                    artifact.repository_id,
+                    &artifact.name,
+                    ver,
+                    artifact.size_bytes,
+                    &artifact.checksum_sha256,
+                    None,
+                    None,
+                )
+                .await;
+        }
+
         // Trigger AfterUpload hooks (non-blocking - don't fail upload if hooks fail)
         let artifact_info = ArtifactInfo::from(&artifact);
         self.trigger_hook_non_blocking(PluginEventType::AfterUpload, &artifact_info)
