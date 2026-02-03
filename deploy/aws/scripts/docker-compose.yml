@@ -59,10 +59,3 @@ services:
       meilisearch:
         condition: service_healthy
 
-  frontend:
-    image: ghcr.io/artifact-keeper/artifact-keeper-frontend:${ARTIFACT_KEEPER_VERSION:-latest}
-    restart: always
-    ports:
-      - "127.0.0.1:3000:80"
-    depends_on:
-      - backend

@@ -10,7 +10,6 @@ resources:
   - postgres-statefulset.yaml
   - minio-statefulset.yaml
   - backend-deployment.yaml
-  - frontend-deployment.yaml
   - edge-deployment.yaml
   - ingress.yaml
 
@@ -21,8 +20,6 @@ commonLabels:
 # Image customization - override in overlays
 images:
   - name: artifact-keeper-backend
-    newTag: latest
-  - name: artifact-keeper-frontend
     newTag: latest
   - name: artifact-keeper-edge
     newTag: latest

@@ -2,12 +2,10 @@
 # Supports Docker Compose profiles for selective test execution
 #
 # Usage:
-#   docker compose -f docker-compose.test.yml up --abort-on-container-exit    # Playwright E2E tests
 #   docker compose -f docker-compose.test.yml --profile pypi up               # PyPI native client tests
 #   docker compose -f docker-compose.test.yml --profile all up                # All native client tests
 #
 # Profiles:
-#   (default)   - Playwright E2E tests (frontend/backend)
 #   pypi        - PyPI/pip tests (smoke)
 #   npm         - NPM tests (smoke)
 #   cargo       - Cargo/crates tests (smoke)
@@ -104,56 +102,6 @@ services:
     networks:
       - e2e-test-network
     profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all"]
-
-  # ==========================================================================
-  # PLAYWRIGHT E2E TESTS (Default Profile)
-  # ==========================================================================
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      target: development
-    container_name: e2e-test-frontend
-    depends_on:
-      backend:
-        condition: service_healthy
-    environment:
-      VITE_API_URL: http://backend:8080
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:5173').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
-      interval: 5s
-      timeout: 10s
-      start_period: 30s
-      retries: 10
-    networks:
-      - e2e-test-network
-
-  playwright:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile.playwright
-    container_name: e2e-test-playwright
-    depends_on:
-      frontend:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
-    environment:
-      BASE_URL: http://frontend:5173
-      API_URL: http://backend:8080
-      CI: "true"
-      # Filter to run only @smoke tests by default for faster CI feedback
-      TEST_TAG: ${TEST_TAG:-@smoke}
-    volumes:
-      - ./test-results:/app/test-results:z
-      - ./playwright-report:/app/playwright-report:z
-    command: >
-      npx playwright test
-      --reporter=html
-      --config=playwright.config.ts
-    networks:
-      - e2e-test-network
 
   # ==========================================================================
   # SMOKE TEST SERVICES (pypi, npm, cargo)

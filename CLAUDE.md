@@ -3,20 +3,10 @@
 Auto-generated from all feature plans. Last updated: 2026-01-14
 
 ## Active Technologies
-- Rust 1.75+ (backend), TypeScript 5.x (frontend) + wasmtime 21.0+, wasmtime-wasi, wit-bindgen, git2, axum (002-wasm-plugin-system)
-- PostgreSQL (existing), filesystem for WASM binaries (002-wasm-plugin-system)
-- TypeScript 5.3, React 19.x + Ant Design 6.x, React Router 7.x, TanStack Query 5.x, Axios (003-frontend-ui-parity)
-- N/A (frontend only, uses backend APIs) (003-frontend-ui-parity)
-- Rust 1.75+ (backend), TypeScript 5.x (frontend) + axum, sqlx, tokio, reqwest (backend); React 19, Ant Design 6, TanStack Query 5 (frontend) (004-artifactory-migration)
-- PostgreSQL (migration job state), existing Artifact Keeper storage (migrated artifacts) (004-artifactory-migration)
-- Rust 1.75+ (backend), TypeScript 5.3 (frontend), Bash/YAML (CI workflows) + GitHub Actions, Docker Compose, Playwright, Vitest, Cargo test, axum-test (005-staged-testing-ci)
-- PostgreSQL (test database), local filesystem (test artifacts) (005-staged-testing-ci)
-- TypeScript 5.3 + Playwright 1.41+, React 19.x, Ant Design 6.x (006-ui-e2e-coverage)
-- N/A (E2E tests interact with running backend via HTTP) (006-ui-e2e-coverage)
-- Rust 1.75+ + axum, serde, serde_json (007-shared-dto)
-- N/A (no storage changes) (007-shared-dto)
-
-- Rust 1.75+ (backend), TypeScript 5.x (frontend) (001-artifact-registry)
+- Rust 1.75+ (backend) + wasmtime 21.0+, wasmtime-wasi, wit-bindgen, git2, axum
+- PostgreSQL (existing), filesystem for WASM binaries
+- Rust 1.75+ + axum, sqlx, tokio, reqwest
+- Rust 1.75+ + axum, serde, serde_json
 
 ## Project Structure
 
@@ -33,10 +23,6 @@ tests/
 cargo fmt --check
 cargo clippy --workspace
 cargo test --workspace --lib
-
-# Frontend lint and unit tests
-cd frontend && npm run lint && npm run type-check
-cd frontend && npm run test:run
 ```
 
 ### Integration Tests (Tier 2) - Main Branch Only
@@ -95,7 +81,7 @@ gh workflow run e2e.yml -f profile=all -f include_stress=true
 
 ## Code Style
 
-Rust 1.75+ (backend), TypeScript 5.x (frontend): Follow standard conventions
+Rust 1.75+: Follow standard conventions
 
 ## Git & GitHub
 
@@ -108,8 +94,7 @@ Rust 1.75+ (backend), TypeScript 5.x (frontend): Follow standard conventions
 
 ## Recent Changes
 - 007-shared-dto: Added Rust 1.75+ + axum, serde, serde_json
-- 006-ui-e2e-coverage: Added TypeScript 5.3 + Playwright 1.41+, React 19.x, Ant Design 6.x
-- 005-staged-testing-ci: Added Rust 1.75+ (backend), TypeScript 5.3 (frontend), Bash/YAML (CI workflows) + GitHub Actions, Docker Compose, Playwright, Vitest, Cargo test, axum-test
+- Frontend removed: Moved to separate repository (artifact-keeper-web)
 
 
 <!-- MANUAL ADDITIONS START -->
@@ -120,7 +105,7 @@ Rust 1.75+ (backend), TypeScript 5.x (frontend): Follow standard conventions
 - **Demo EC2 instance** (`i-0caaf8acac6f85d4d`, Elastic IP `3.222.57.187`): Only pull pre-built images from `ghcr.io`, never `docker compose build`. Use `docker compose pull && docker compose up -d`.
 - **SSH access**: `ssh ubuntu@3.222.57.187` (uses local SSH key)
 - **Demo stack**: Managed via systemd service `artifact-keeper-demo` and Caddy reverse proxy for TLS.
-- **Docker images** are published to `ghcr.io/artifact-keeper/artifact-keeper-backend` and `ghcr.io/artifact-keeper/artifact-keeper-frontend` by the Docker Publish CI workflow on every push to main.
+- **Docker images** are published to `ghcr.io/artifact-keeper/artifact-keeper-backend` by the Docker Publish CI workflow on every push to main.
 - **GitHub Pages site** (`/site/` directory): Combined landing page + Starlight docs, deployed to `artifactkeeper.com`.
 
 <!-- MANUAL ADDITIONS END -->

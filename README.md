@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io/artifact-keeper/artifact-keeper-backend)
 
-An enterprise-grade, open-source artifact registry supporting **45+ package formats**. Built with Rust and React.
+An enterprise-grade, open-source artifact registry supporting **45+ package formats**. Built with Rust.
 
 [Documentation](https://artifactkeeper.com/docs/) | [Demo](https://demo.artifactkeeper.com) | [Website](https://artifactkeeper.com)
 
@@ -24,8 +24,7 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 
 ```mermaid
 graph LR
-    Client["Browser / CLI / Package Manager"]
-    Frontend["Frontend\nReact 19 · Ant Design 6\nTanStack Query 5"]
+    Client["CLI / Package Manager / Frontend"]
     Backend["Backend\nRust · Axum\n45+ format handlers"]
     DB[(PostgreSQL 16)]
     Storage["Storage\nFilesystem / S3"]
@@ -35,9 +34,7 @@ graph LR
     Edge1["Edge Node"]
     Edge2["Edge Node"]
 
-    Client --> Frontend
     Client --> Backend
-    Frontend --> Backend
     Backend --> DB
     Backend --> Storage
     Backend --> Meili
@@ -238,24 +235,18 @@ cd artifact-keeper
 docker compose up -d
 ```
 
-The UI is available at [http://localhost:30173](http://localhost:30173) and the API at [http://localhost:30080](http://localhost:30080).
+The API is available at [http://localhost:30080](http://localhost:30080).
 
 Default credentials: `admin` / `admin`
 
 ### Manual Build
 
 ```bash
-# Backend
 cargo build --release
 ./target/release/artifact-keeper
-
-# Frontend
-cd frontend
-npm install
-npm run dev
 ```
 
-Requires Rust 1.75+, Node.js 20+, and PostgreSQL 16+.
+Requires Rust 1.75+ and PostgreSQL 16+.
 
 ## Configuration
 
@@ -279,14 +270,13 @@ Three-tier testing strategy:
 
 | Tier | Trigger | What runs |
 |------|---------|-----------|
-| **1** | Every push/PR | `cargo fmt`, `cargo clippy`, `cargo test --lib`, frontend lint + Vitest |
+| **1** | Every push/PR | `cargo fmt`, `cargo clippy`, `cargo test --lib` |
 | **2** | Main branch | Integration tests with PostgreSQL |
-| **3** | Release/manual | Full E2E with Playwright, native client tests for 10 formats, stress + failure injection |
+| **3** | Release/manual | Native client tests for 10 formats, stress + failure injection |
 
 ```bash
 # Tier 1 - Fast checks
 cargo test --workspace --lib
-cd frontend && npm run test:run
 
 # Tier 3 - Full E2E
 ./scripts/run-e2e-tests.sh --profile all
@@ -304,13 +294,6 @@ artifact-keeper/
 │   │   ├── models/   # Data models (18 types)
 │   │   └── storage/  # FS and S3 backends
 │   └── migrations/   # 33 PostgreSQL migrations
-├── frontend/         # React 19 + TypeScript + Ant Design 6
-│   ├── src/
-│   │   ├── pages/    # 29 page components
-│   │   ├── components/
-│   │   ├── api/      # API client modules
-│   │   └── contexts/ # Auth, Theme
-│   └── e2e/          # Playwright E2E tests
 ├── edge/             # Edge node service (Rust)
 ├── site/             # Documentation site (Astro + Starlight)
 ├── specs/            # Feature specifications
@@ -326,8 +309,6 @@ artifact-keeper/
 | Backend language | **Rust** | Memory safety, performance, strong type system |
 | Web framework | **Axum** | Tower middleware ecosystem, async-first |
 | Database | **PostgreSQL 16** | JSONB for metadata, mature ecosystem |
-| Frontend | **React 19 + TypeScript** | Component model, type safety |
-| UI library | **Ant Design 6** | Enterprise-grade components out of the box |
 | Search | **Meilisearch** | Fast full-text search, easy to operate |
 | Security scanning | **Trivy + Grype** | Complementary coverage, industry standard |
 | Plugin runtime | **Wasmtime** | Sandboxed, portable, WIT contract system |
@@ -347,4 +328,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-Built with Rust and TypeScript. "JFrog" and "Artifactory" are trademarks of JFrog Ltd. Artifact Keeper is not affiliated with or endorsed by JFrog.
+Built with Rust. "JFrog" and "Artifactory" are trademarks of JFrog Ltd. Artifact Keeper is not affiliated with or endorsed by JFrog.

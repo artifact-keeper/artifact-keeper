@@ -32,9 +32,6 @@ case "${1:-start}" in
     echo "Start the backend:"
     echo "  source .env.local-dev && cargo run -p artifact-keeper-backend"
     echo ""
-    echo "Start the frontend:"
-    echo "  cd frontend && npm run dev"
-    echo ""
     ;;
 
   stop)

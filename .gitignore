@@ -29,11 +29,9 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Node.js (frontend)
+# Node.js (site)
 node_modules/
 dist/
-.next/
-.nuxt/
 *.tsbuildinfo
 
 # Coverage

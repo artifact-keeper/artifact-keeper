@@ -44,13 +44,6 @@ services:
     volumes:
       - trivy_cache:/root/.cache/trivy
 
-  frontend:
-    image: ghcr.io/artifact-keeper/artifact-keeper-frontend:latest
-    ports:
-      - "3000:80"
-    depends_on:
-      - backend
-
   # Seed container — runs once then exits
   seed:
     image: postgres:15-alpine

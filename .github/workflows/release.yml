@@ -97,53 +97,13 @@ jobs:
           path: dist/${{ matrix.name }}.tar.gz*
 
   # ════════════════════════════════════════════════════════════════════════════
-  # BUILD FRONTEND
-  # ════════════════════════════════════════════════════════════════════════════
-
-  build-frontend:
-    name: Build Frontend
-    runs-on: ubuntu-latest
-    needs: [e2e-gate]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install dependencies
-        working-directory: frontend
-        run: npm ci
-
-      - name: Build
-        working-directory: frontend
-        run: npm run build
-
-      - name: Package
-        run: |
-          cd frontend
-          tar -czvf ../frontend-dist.tar.gz dist/
-          cd ..
-          sha256sum frontend-dist.tar.gz > frontend-dist.tar.gz.sha256
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-dist-release
-          path: frontend-dist.tar.gz*
-
-  # ════════════════════════════════════════════════════════════════════════════
   # CREATE RELEASE
   # ════════════════════════════════════════════════════════════════════════════
 
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-frontend]
+    needs: [build-binaries]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -172,7 +132,6 @@ jobs:
 
           ### Features
           - Full-featured artifact registry supporting 11+ package formats
-          - React TypeScript frontend with Ant Design UI
           - JWT authentication with role-based access control
           - Repository management (local, remote, virtual)
           - Artifact upload, download, and search
@@ -197,16 +156,11 @@ jobs:
           | Linux | arm64 | `artifact-keeper-linux-arm64.tar.gz` |
           | macOS | amd64 | `artifact-keeper-darwin-amd64.tar.gz` |
           | macOS | arm64 | `artifact-keeper-darwin-arm64.tar.gz` |
-          | Frontend | - | `frontend-dist.tar.gz` |
 
           ### Docker Images
 
           ```bash
-          # Backend
           docker pull ghcr.io/${{ github.repository }}-backend:${{ steps.version.outputs.tag }}
-
-          # Frontend
-          docker pull ghcr.io/${{ github.repository }}-frontend:${{ steps.version.outputs.tag }}
           ```
 
           ### Quick Start

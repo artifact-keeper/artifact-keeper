@@ -1,19 +1,17 @@
 # Local development stack
 #
 # Runs only infrastructure (Postgres) in Docker.
-# Backend and frontend run natively on the host for fast iteration.
+# Backend runs natively on the host for fast iteration.
 #
 # Usage:
 #   docker compose -f docker-compose.local-dev.yml up -d
 #
-# Then in separate terminals:
+# Then:
 #   DATABASE_URL=postgresql://registry:registry@localhost:30432/artifact_registry cargo run -p artifact-keeper-backend
-#   cd frontend && npm run dev
 #
 # Ports:
 #   Postgres: 30432  (host) -> 5432 (container)
 #   Backend:  8080   (run natively)
-#   Frontend: 5173   (run natively via vite)
 
 services:
   postgres:

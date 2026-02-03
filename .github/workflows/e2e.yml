@@ -84,54 +84,6 @@ jobs:
           retention-days: 1
 
   # ════════════════════════════════════════════════════════════════════════════
-  # PLAYWRIGHT E2E TESTS (Frontend + Backend)
-  # ════════════════════════════════════════════════════════════════════════════
-
-  playwright-e2e:
-    name: 🎭 Playwright E2E
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v5
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-e2e-${{ github.sha }}
-          restore-keys: ${{ runner.os }}-buildx-e2e-
-
-      - name: Create results directories
-        run: mkdir -p test-results playwright-report
-
-      - name: Run Playwright E2E tests
-        run: |
-          docker compose -f docker-compose.test.yml up \
-            --build \
-            --abort-on-container-exit \
-            --exit-code-from playwright
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: playwright-report
-          path: playwright-report/
-          retention-days: 14
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: e2e-results
-          path: test-results/
-          retention-days: 14
-
-      - name: Cleanup
-        if: always()
-        run: docker compose -f docker-compose.test.yml down -v --remove-orphans
-
-  # ════════════════════════════════════════════════════════════════════════════
   # NATIVE CLIENT TESTS
   # ════════════════════════════════════════════════════════════════════════════
 
@@ -255,7 +207,7 @@ jobs:
   e2e-complete:
     name: ✅ E2E Complete
     runs-on: ubuntu-latest
-    needs: [playwright-e2e, native-client-tests, stress-tests, failure-tests]
+    needs: [native-client-tests, stress-tests, failure-tests]
     if: always()
     steps:
       - name: Check E2E status
@@ -268,14 +220,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           overall_pass=true
-
-          # Playwright E2E
-          if [[ "${{ needs.playwright-e2e.result }}" == "success" ]]; then
-            echo "✅ Playwright E2E: Passed" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ Playwright E2E: ${{ needs.playwright-e2e.result }}" >> $GITHUB_STEP_SUMMARY
-            overall_pass=false
-          fi
 
           # Native Client Tests
           if [[ "${{ needs.native-client-tests.result }}" == "success" ]]; then
