@@ -109,9 +109,7 @@ impl HealthMonitorService {
         let start = std::time::Instant::now();
 
         let (status, message) = match self.http_client.get(&full_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                ("healthy".to_string(), None)
-            }
+            Ok(resp) if resp.status().is_success() => ("healthy".to_string(), None),
             Ok(resp) => (
                 "unhealthy".to_string(),
                 Some(format!("HTTP {}", resp.status())),
@@ -168,10 +166,7 @@ impl HealthMonitorService {
     pub async fn check_database(&self) -> Result<ServiceHealthEntry> {
         let start = std::time::Instant::now();
 
-        let (status, message) = match sqlx::query("SELECT 1")
-            .fetch_one(&self.db)
-            .await
-        {
+        let (status, message) = match sqlx::query("SELECT 1").fetch_one(&self.db).await {
             Ok(_) => ("healthy".to_string(), None),
             Err(e) => (
                 "unavailable".to_string(),
@@ -382,19 +377,13 @@ impl HealthMonitorService {
     }
 
     /// Suppress alerts for a service until a given time.
-    pub async fn suppress_alerts(
-        &self,
-        service_name: &str,
-        until: DateTime<Utc>,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE alert_state SET suppressed_until = $2 WHERE service_name = $1",
-        )
-        .bind(service_name)
-        .bind(until)
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    pub async fn suppress_alerts(&self, service_name: &str, until: DateTime<Utc>) -> Result<()> {
+        sqlx::query("UPDATE alert_state SET suppressed_until = $2 WHERE service_name = $1")
+            .bind(service_name)
+            .bind(until)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
     }

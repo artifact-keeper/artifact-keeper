@@ -373,8 +373,7 @@ impl AnalyticsService {
             artifacts_start: start_artifacts,
             artifacts_end: end_artifacts,
             artifacts_added: end_artifacts - start_artifacts,
-            downloads_in_period: end_downloads
-                - start.map(|s| s.total_downloads).unwrap_or(0),
+            downloads_in_period: end_downloads - start.map(|s| s.total_downloads).unwrap_or(0),
         })
     }
 

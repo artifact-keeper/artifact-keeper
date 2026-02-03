@@ -19,18 +19,17 @@ pub fn init_metrics() -> PrometheusHandle {
 }
 
 /// Axum middleware that records HTTP request metrics.
-pub async fn metrics_middleware(
-    request: Request<Body>,
-    next: Next,
-) -> Response<Body> {
+pub async fn metrics_middleware(request: Request<Body>, next: Next) -> Response<Body> {
     let method = request.method().clone().to_string();
     let path = request.uri().path().to_string();
     // Normalize path to avoid high-cardinality labels (strip UUIDs and IDs)
     let normalized = normalize_path(&path);
 
     let start = Instant::now();
-    counter!("ak_http_requests_total", "method" => method.clone(), "path" => normalized.clone()).increment(1);
-    gauge!("ak_http_requests_in_flight", "method" => method.clone(), "path" => normalized.clone()).increment(1.0);
+    counter!("ak_http_requests_total", "method" => method.clone(), "path" => normalized.clone())
+        .increment(1);
+    gauge!("ak_http_requests_in_flight", "method" => method.clone(), "path" => normalized.clone())
+        .increment(1.0);
 
     let response = next.run(request).await;
 
@@ -68,7 +67,8 @@ fn normalize_path(path: &str) -> String {
 /// Record an artifact upload event.
 pub fn record_artifact_upload(repo_key: &str, format: &str, size_bytes: u64) {
     counter!("ak_artifact_uploads_total", "repository" => repo_key.to_string(), "format" => format.to_string()).increment(1);
-    histogram!("ak_artifact_upload_size_bytes", "format" => format.to_string()).record(size_bytes as f64);
+    histogram!("ak_artifact_upload_size_bytes", "format" => format.to_string())
+        .record(size_bytes as f64);
 }
 
 /// Record an artifact download event.
@@ -80,14 +80,16 @@ pub fn record_artifact_download(repo_key: &str, format: &str) {
 pub fn record_backup(backup_type: &str, success: bool, duration_secs: f64) {
     let status = if success { "success" } else { "failure" };
     counter!("ak_backup_operations_total", "type" => backup_type.to_string(), "status" => status.to_string()).increment(1);
-    histogram!("ak_backup_duration_seconds", "type" => backup_type.to_string()).record(duration_secs);
+    histogram!("ak_backup_duration_seconds", "type" => backup_type.to_string())
+        .record(duration_secs);
 }
 
 /// Record a security scan event.
 pub fn record_security_scan(scanner: &str, success: bool, duration_secs: f64) {
     let status = if success { "success" } else { "failure" };
     counter!("ak_security_scans_total", "scanner" => scanner.to_string(), "status" => status.to_string()).increment(1);
-    histogram!("ak_security_scan_duration_seconds", "scanner" => scanner.to_string()).record(duration_secs);
+    histogram!("ak_security_scan_duration_seconds", "scanner" => scanner.to_string())
+        .record(duration_secs);
 }
 
 /// Record a webhook delivery event.
@@ -110,7 +112,8 @@ pub fn set_user_gauge(total_users: i64) {
 
 /// Record a cleanup operation.
 pub fn record_cleanup(cleanup_type: &str, items_removed: u64) {
-    counter!("ak_cleanup_items_removed_total", "type" => cleanup_type.to_string()).increment(items_removed);
+    counter!("ak_cleanup_items_removed_total", "type" => cleanup_type.to_string())
+        .increment(items_removed);
 }
 
 #[cfg(test)]

@@ -737,6 +737,8 @@ mod tests {
             ldap_url: None,
             ldap_base_dn: None,
             trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
             meilisearch_url: None,
             meilisearch_api_key: None,
             scan_workspace_path: "/scan-workspace".into(),

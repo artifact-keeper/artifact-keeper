@@ -232,12 +232,10 @@ impl CrashReportingService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let total = sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM crash_reports"#,
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let total = sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM crash_reports"#)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok((reports, total))
     }
@@ -305,8 +303,7 @@ impl CrashReportingService {
                     settings.review_before_send = row.value.as_bool().unwrap_or(true);
                 }
                 "telemetry_scrub_level" => {
-                    settings.scrub_level =
-                        row.value.as_str().unwrap_or("standard").to_string();
+                    settings.scrub_level = row.value.as_str().unwrap_or("standard").to_string();
                 }
                 "telemetry_include_logs" => {
                     settings.include_logs = row.value.as_bool().unwrap_or(false);
@@ -419,7 +416,8 @@ fn scrub_pii(input: &str, level: ScrubLevel) -> String {
     output = home_re.replace_all(&output, "/[USER_DIR]").to_string();
 
     // Standard+: scrub JWT tokens
-    let jwt_re = regex::Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap();
+    let jwt_re =
+        regex::Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap();
     output = jwt_re.replace_all(&output, "[JWT_TOKEN]").to_string();
 
     if level == ScrubLevel::Aggressive {
@@ -441,8 +439,13 @@ fn scrub_json_pii(value: &serde_json::Value, level: ScrubLevel) -> serde_json::V
                 .filter(|(key, _)| {
                     // Skip keys that are likely to contain PII
                     let sensitive_keys = [
-                        "password", "secret", "token", "api_key", "authorization",
-                        "cookie", "session",
+                        "password",
+                        "secret",
+                        "token",
+                        "api_key",
+                        "authorization",
+                        "cookie",
+                        "session",
                     ];
                     if level != ScrubLevel::Minimal
                         && sensitive_keys

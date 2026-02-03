@@ -115,8 +115,7 @@ pub fn spawn_all(db: PgPool, config: Config) {
 
                 match service.execute_all_enabled().await {
                     Ok(results) => {
-                        let total_removed: i64 =
-                            results.iter().map(|r| r.artifacts_removed).sum();
+                        let total_removed: i64 = results.iter().map(|r| r.artifacts_removed).sum();
                         let total_freed: i64 = results.iter().map(|r| r.bytes_freed).sum();
                         if total_removed > 0 {
                             tracing::info!(
@@ -169,10 +168,7 @@ struct BackupScheduleRow {
 }
 
 /// Check for due backup schedules and execute them.
-async fn execute_due_backup_schedules(
-    db: &PgPool,
-    config: &Config,
-) -> crate::error::Result<()> {
+async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::error::Result<()> {
     // Find schedules where next_run_at <= now
     let due_schedules = sqlx::query_as::<_, BackupScheduleRow>(
         r#"
@@ -195,7 +191,10 @@ async fn execute_due_backup_schedules(
     let storage = match StorageService::from_config(config).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            tracing::error!("Failed to create storage service for scheduled backups: {}", e);
+            tracing::error!(
+                "Failed to create storage service for scheduled backups: {}",
+                e
+            );
             return Err(e);
         }
     };
@@ -222,29 +221,27 @@ async fn execute_due_backup_schedules(
         let start = std::time::Instant::now();
 
         match create_result {
-            Ok(backup) => {
-                match service.execute(backup.id).await {
-                    Ok(completed) => {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        tracing::info!(
-                            "Scheduled backup '{}' completed: {} bytes, {} artifacts",
-                            schedule_row.name,
-                            completed.size_bytes.unwrap_or(0),
-                            completed.artifact_count.unwrap_or(0)
-                        );
-                        metrics_service::record_backup(&backup_type_str, true, elapsed);
-                    }
-                    Err(e) => {
-                        let elapsed = start.elapsed().as_secs_f64();
-                        tracing::error!(
-                            "Scheduled backup '{}' execution failed: {}",
-                            schedule_row.name,
-                            e
-                        );
-                        metrics_service::record_backup(&backup_type_str, false, elapsed);
-                    }
+            Ok(backup) => match service.execute(backup.id).await {
+                Ok(completed) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    tracing::info!(
+                        "Scheduled backup '{}' completed: {} bytes, {} artifacts",
+                        schedule_row.name,
+                        completed.size_bytes.unwrap_or(0),
+                        completed.artifact_count.unwrap_or(0)
+                    );
+                    metrics_service::record_backup(&backup_type_str, true, elapsed);
                 }
-            }
+                Err(e) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    tracing::error!(
+                        "Scheduled backup '{}' execution failed: {}",
+                        schedule_row.name,
+                        e
+                    );
+                    metrics_service::record_backup(&backup_type_str, false, elapsed);
+                }
+            },
             Err(e) => {
                 let elapsed = start.elapsed().as_secs_f64();
                 tracing::error!(
