@@ -13,6 +13,7 @@ use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
 use crate::services::wasm_plugin_service::WasmPluginService;
 use crate::storage::StorageBackend;
+use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ pub struct AppState {
     pub wasm_plugin_service: Option<Arc<WasmPluginService>>,
     pub scanner_service: Option<Arc<ScannerService>>,
     pub meili_service: Option<Arc<MeiliService>>,
+    pub metrics_handle: Option<Arc<PrometheusHandle>>,
 }
 
 impl AppState {
@@ -36,6 +38,7 @@ impl AppState {
             wasm_plugin_service: None,
             scanner_service: None,
             meili_service: None,
+            metrics_handle: None,
         }
     }
 
@@ -53,6 +56,7 @@ impl AppState {
             wasm_plugin_service: Some(wasm_plugin_service),
             scanner_service: None,
             meili_service: None,
+            metrics_handle: None,
         }
     }
 
@@ -64,6 +68,11 @@ impl AppState {
     /// Set the Meilisearch service for search indexing.
     pub fn set_meili_service(&mut self, meili_service: Arc<MeiliService>) {
         self.meili_service = Some(meili_service);
+    }
+
+    /// Set the Prometheus metrics handle for rendering /metrics output.
+    pub fn set_metrics_handle(&mut self, handle: PrometheusHandle) {
+        self.metrics_handle = Some(Arc::new(handle));
     }
 
     /// Create an ArtifactService with the shared Meilisearch and scanner services.

@@ -2,6 +2,10 @@
 
 pub mod admin;
 pub mod alpine;
+pub mod analytics;
+pub mod lifecycle;
+pub mod monitoring;
+pub mod telemetry;
 pub mod ansible;
 pub mod artifacts;
 pub mod auth;

@@ -15,6 +15,7 @@ pub mod meili_service;
 pub mod migration_service;
 pub mod migration_worker;
 pub mod oidc_service;
+pub mod openscap_scanner;
 pub mod peer_service;
 pub mod plugin_registry;
 pub mod plugin_service;
@@ -33,3 +34,11 @@ pub mod transfer_service;
 pub mod trivy_fs_scanner;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
+
+// Observability & lifecycle
+pub mod analytics_service;
+pub mod crash_reporting_service;
+pub mod health_monitor_service;
+pub mod lifecycle_service;
+pub mod metrics_service;
+pub mod scheduler_service;
