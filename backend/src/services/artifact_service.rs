@@ -419,15 +419,17 @@ impl ArtifactService {
         Ok(artifact)
     }
 
-    /// List artifacts in a repository with pagination
+    /// List artifacts in a repository with pagination and optional search
     pub async fn list(
         &self,
         repository_id: Uuid,
         path_prefix: Option<&str>,
+        search_query: Option<&str>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<Artifact>, i64)> {
         let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
 
         let artifacts = sqlx::query_as!(
             Artifact,
@@ -441,6 +443,7 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2)
+              AND ($5::text IS NULL OR LOWER(name) LIKE $5 OR LOWER(path) LIKE $5)
             ORDER BY path
             OFFSET $3
             LIMIT $4
@@ -448,7 +451,8 @@ impl ArtifactService {
             repository_id,
             prefix_pattern,
             offset,
-            limit
+            limit,
+            search_pattern,
         )
         .fetch_all(&self.db)
         .await
@@ -461,9 +465,11 @@ impl ArtifactService {
             WHERE repository_id = $1
               AND is_deleted = false
               AND ($2::text IS NULL OR path LIKE $2)
+              AND ($3::text IS NULL OR LOWER(name) LIKE $3 OR LOWER(path) LIKE $3)
             "#,
             repository_id,
-            prefix_pattern
+            prefix_pattern,
+            search_pattern,
         )
         .fetch_one(&self.db)
         .await

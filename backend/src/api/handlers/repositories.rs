@@ -373,6 +373,7 @@ pub async fn list_artifacts(
         .list(
             repo.id,
             query.path_prefix.as_deref(),
+            query.q.as_deref(),
             offset,
             per_page as i64,
         )
