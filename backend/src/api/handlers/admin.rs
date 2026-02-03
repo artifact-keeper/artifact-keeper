@@ -251,7 +251,8 @@ pub async fn restore_backup(
         target_repository_id: payload.target_repository_id,
     };
 
-    // TODO: Implement actual restore
+    // TODO: BackupService::restore holds tar::Archive (non-Send) across await points.
+    // Needs refactoring to extract entries synchronously first, then do async operations.
     // let result = service.restore(id, options).await?;
 
     Ok(Json(RestoreResponse {

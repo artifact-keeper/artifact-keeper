@@ -16,10 +16,12 @@ use artifact_keeper_backend::{
     error::Result,
     services::{
         meili_service::MeiliService,
+        metrics_service,
         plugin_registry::PluginRegistry,
         scan_config_service::ScanConfigService,
         scan_result_service::ScanResultService,
         scanner_service::{AdvisoryClient, ScannerService},
+        scheduler_service,
         wasm_plugin_service::WasmPluginService,
     },
 };
@@ -68,6 +70,8 @@ async fn main() -> Result<()> {
         config.trivy_url.clone(),
         config.storage_path.clone(),
         config.scan_workspace_path.clone(),
+        config.openscap_url.clone(),
+        config.openscap_profile.clone(),
     ));
 
     // Initialize Meilisearch (optional, graceful fallback)
@@ -118,10 +122,14 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Initialize Prometheus metrics recorder
+    let metrics_handle = metrics_service::init_metrics();
+    tracing::info!("Prometheus metrics recorder initialized");
+
     // Create application state with WASM plugin support
     let mut app_state = api::AppState::with_wasm_plugins(
         config.clone(),
-        db_pool,
+        db_pool.clone(),
         plugin_registry,
         wasm_plugin_service,
     );
@@ -129,11 +137,18 @@ async fn main() -> Result<()> {
     if let Some(meili) = meili_service {
         app_state.set_meili_service(meili);
     }
+    app_state.set_metrics_handle(metrics_handle);
     let state = Arc::new(app_state);
+
+    // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
+    scheduler_service::spawn_all(db_pool, config.clone());
 
     // Build router
     let app = Router::new()
         .merge(api::routes::create_router(state))
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::services::metrics_service::metrics_middleware,
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

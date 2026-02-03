@@ -193,10 +193,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         // Admin routes with auth middleware
         .nest(
             "/admin",
-            handlers::admin::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::admin::router()
+                .nest("/analytics", handlers::analytics::router())
+                .nest("/lifecycle", handlers::lifecycle::router())
+                .nest("/telemetry", handlers::telemetry::router())
+                .nest("/monitoring", handlers::monitoring::router())
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Plugin routes with auth middleware
         .nest(

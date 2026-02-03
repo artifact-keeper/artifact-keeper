@@ -125,62 +125,26 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     }
 }
 
-/// Prometheus metrics endpoint
-pub async fn metrics() -> impl IntoResponse {
-    // TODO: Implement proper Prometheus metrics collection
-    let metrics = r#"# HELP artifact_keeper_http_requests_total Total HTTP requests
-# TYPE artifact_keeper_http_requests_total counter
-artifact_keeper_http_requests_total{method="GET",path="/health"} 1
-"#;
+/// Prometheus metrics endpoint.
+/// Renders all registered metrics from the metrics-exporter-prometheus recorder.
+pub async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
+    let output = if let Some(ref handle) = state.metrics_handle {
+        handle.render()
+    } else {
+        "# No metrics recorder installed\n".to_string()
+    };
 
     (
         StatusCode::OK,
         [("content-type", "text/plain; charset=utf-8")],
-        metrics,
+        output,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-        routing::get,
-        Router,
-    };
     use serde_json;
-    use tower::ServiceExt;
-
-    /// Test the metrics endpoint returns valid Prometheus format
-    #[tokio::test]
-    async fn test_metrics_endpoint() {
-        let app = Router::new().route("/metrics", get(metrics));
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let content_type = response.headers().get("content-type").unwrap();
-        assert!(content_type.to_str().unwrap().contains("text/plain"));
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_str = String::from_utf8(body.to_vec()).unwrap();
-
-        // Verify Prometheus format
-        assert!(body_str.contains("# HELP artifact_keeper_http_requests_total"));
-        assert!(body_str.contains("# TYPE artifact_keeper_http_requests_total counter"));
-    }
 
     /// Test HealthResponse serialization
     #[test]
