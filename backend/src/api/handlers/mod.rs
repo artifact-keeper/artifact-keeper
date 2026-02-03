@@ -45,6 +45,8 @@ pub mod sbt;
 pub mod search;
 pub mod security;
 pub mod signing;
+pub mod sso;
+pub mod sso_admin;
 pub mod swift;
 pub mod telemetry;
 pub mod terraform;

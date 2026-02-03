@@ -1,6 +1,7 @@
 //! Business logic services.
 
 pub mod artifact_service;
+pub mod auth_config_service;
 pub mod artifactory_client;
 pub mod artifactory_import;
 pub mod audit_service;

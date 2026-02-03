@@ -97,6 +97,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     Router::new()
         // Auth routes - split into public and protected
         .nest("/auth", handlers::auth::public_router())
+        .nest("/auth/sso", handlers::sso::router())
         .nest(
             "/auth",
             handlers::auth::protected_router().layer(middleware::from_fn_with_state(
@@ -198,6 +199,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 .nest("/lifecycle", handlers::lifecycle::router())
                 .nest("/telemetry", handlers::telemetry::router())
                 .nest("/monitoring", handlers::monitoring::router())
+                .nest("/sso", handlers::sso_admin::router())
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     auth_middleware,
