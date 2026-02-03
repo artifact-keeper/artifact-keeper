@@ -463,7 +463,10 @@ impl BackupService {
         Ok(())
     }
 
-    /// Restore from a backup
+    /// Restore from a backup.
+    ///
+    /// Extracts all tar entries synchronously first (tar::Archive is !Send),
+    /// then performs async database/storage restore operations.
     pub async fn restore(&self, backup_id: Uuid, options: RestoreOptions) -> Result<RestoreResult> {
         let backup = self.get_by_id(backup_id).await?;
 
@@ -473,62 +476,97 @@ impl BackupService {
             ));
         }
 
-        // Download and extract backup
+        // Download backup archive
         let storage_path = backup
             .storage_path
             .as_ref()
             .ok_or_else(|| AppError::Internal("Backup has no storage path".to_string()))?;
         let tar_data = self.storage.get(storage_path).await?;
-        let decoder = GzDecoder::new(tar_data.as_ref());
-        let mut archive = Archive::new(decoder);
 
+        // Phase 1: Extract all entries synchronously (tar::Archive is !Send)
+        let entries = Self::extract_entries(&tar_data)?;
+
+        // Phase 2: Async restore from extracted data
         let mut result = RestoreResult {
             tables_restored: Vec::new(),
             artifacts_restored: 0,
             errors: Vec::new(),
         };
 
-        for entry in archive
-            .entries()
-            .map_err(|e| AppError::Internal(e.to_string()))?
-        {
-            let mut entry = entry.map_err(|e| AppError::Internal(e.to_string()))?;
-            let path = entry
-                .path()
-                .map_err(|e| AppError::Internal(e.to_string()))?
-                .to_path_buf();
+        // Restore database tables in dependency order
+        if options.restore_database {
+            let table_order = [
+                "users",
+                "roles",
+                "user_roles",
+                "repositories",
+                "repository_permissions",
+                "artifacts",
+                "download_stats",
+                "api_tokens",
+            ];
 
-            if path.starts_with("database/") && options.restore_database {
-                // Restore database table
+            // Restore ordered tables first
+            for table_name in &table_order {
+                if let Some(content) = entries.iter().find(|(p, _)| {
+                    p.starts_with("database/")
+                        && p.file_stem().and_then(|s| s.to_str()) == Some(table_name)
+                }) {
+                    match self.restore_table(table_name, &content.1).await {
+                        Ok(rows) => {
+                            tracing::info!("Restored {} rows into table '{}'", rows, table_name);
+                            result.tables_restored.push(table_name.to_string());
+                        }
+                        Err(e) => result
+                            .errors
+                            .push(format!("Failed to restore {}: {}", table_name, e)),
+                    }
+                }
+            }
+
+            // Restore any remaining database entries not in the ordered list
+            for (path, content) in &entries {
+                if !path.starts_with("database/") {
+                    continue;
+                }
                 let table_name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown");
-
-                let mut content = Vec::new();
-                entry
-                    .read_to_end(&mut content)
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-                match self.restore_table(table_name, &content).await {
-                    Ok(_) => result.tables_restored.push(table_name.to_string()),
+                if table_order.contains(&table_name) {
+                    continue; // already restored above
+                }
+                match self.restore_table(table_name, content).await {
+                    Ok(rows) => {
+                        tracing::info!("Restored {} rows into table '{}'", rows, table_name);
+                        result.tables_restored.push(table_name.to_string());
+                    }
                     Err(e) => result
                         .errors
                         .push(format!("Failed to restore {}: {}", table_name, e)),
                 }
-            } else if path.starts_with("artifacts/") && options.restore_artifacts {
-                // Restore artifact
+            }
+        }
+
+        // Restore artifact files
+        if options.restore_artifacts {
+            for (path, content) in &entries {
+                if !path.starts_with("artifacts/") {
+                    continue;
+                }
                 let storage_key = path
                     .strip_prefix("artifacts/")
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
+                if storage_key.is_empty() {
+                    continue;
+                }
 
-                let mut content = Vec::new();
-                entry
-                    .read_to_end(&mut content)
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-                match self.storage.put(&storage_key, Bytes::from(content)).await {
+                match self
+                    .storage
+                    .put(&storage_key, Bytes::from(content.clone()))
+                    .await
+                {
                     Ok(_) => result.artifacts_restored += 1,
                     Err(e) => result
                         .errors
@@ -540,36 +578,76 @@ impl BackupService {
         Ok(result)
     }
 
-    async fn restore_table(&self, table: &str, content: &[u8]) -> Result<()> {
-        let rows: Vec<serde_json::Value> = serde_json::from_slice(content)?;
+    /// Extract all entries from a tar.gz archive synchronously.
+    /// Returns a Vec of (path, content) pairs so that async code can
+    /// process them without holding the non-Send Archive across await points.
+    fn extract_entries(tar_data: &[u8]) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+        let decoder = GzDecoder::new(tar_data);
+        let mut archive = Archive::new(decoder);
+        let mut entries = Vec::new();
 
-        // Tables need to be restored in dependency order
-        // This is a simplified version - production would need proper ordering
-        for row in rows {
-            let columns: Vec<String> = row
-                .as_object()
-                .map(|obj| obj.keys().cloned().collect())
-                .unwrap_or_default();
+        for entry in archive
+            .entries()
+            .map_err(|e| AppError::Internal(format!("Failed to read archive entries: {}", e)))?
+        {
+            let mut entry =
+                entry.map_err(|e| AppError::Internal(format!("Failed to read entry: {}", e)))?;
+            let path = entry
+                .path()
+                .map_err(|e| AppError::Internal(format!("Failed to read entry path: {}", e)))?
+                .to_path_buf();
 
-            if columns.is_empty() {
-                continue;
-            }
+            let mut content = Vec::new();
+            entry
+                .read_to_end(&mut content)
+                .map_err(|e| AppError::Internal(format!("Failed to read entry data: {}", e)))?;
 
-            let placeholders: Vec<String> =
-                (1..=columns.len()).map(|i| format!("${}", i)).collect();
-
-            let query = format!(
-                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING",
-                table,
-                columns.join(", "),
-                placeholders.join(", ")
-            );
-
-            // This is simplified - real implementation would handle data types properly
-            tracing::debug!("Would execute: {} with {:?}", query, row);
+            entries.push((path, content));
         }
 
-        Ok(())
+        Ok(entries)
+    }
+
+    /// Restore a single database table from JSON data.
+    /// Uses jsonb_populate_record for proper type coercion.
+    async fn restore_table(&self, table: &str, content: &[u8]) -> Result<usize> {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(content)?;
+        let mut restored = 0usize;
+
+        // Validate table name to prevent SQL injection (only allow alphanumeric + underscore)
+        if !table.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(AppError::Validation(format!(
+                "Invalid table name: {}",
+                table
+            )));
+        }
+
+        for row in &rows {
+            // Use jsonb_populate_record to let Postgres handle type coercion
+            let query = format!(
+                "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
+            );
+
+            match sqlx::query(&query)
+                .bind(row)
+                .execute(&self.db)
+                .await
+            {
+                Ok(result) => {
+                    restored += result.rows_affected() as usize;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to restore row in '{}': {} (row: {})",
+                        table,
+                        e,
+                        serde_json::to_string(row).unwrap_or_default()
+                    );
+                }
+            }
+        }
+
+        Ok(restored)
     }
 
     /// Delete a backup

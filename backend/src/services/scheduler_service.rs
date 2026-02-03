@@ -3,14 +3,20 @@
 //! Runs periodic tasks: daily metric snapshots, lifecycle policy execution,
 //! health monitoring, backup schedule execution, and metric gauge updates.
 
+use chrono::Utc;
+use cron::Schedule;
 use sqlx::PgPool;
+use std::str::FromStr;
+use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
 use crate::config::Config;
 use crate::services::analytics_service::AnalyticsService;
+use crate::services::backup_service::{BackupService, BackupType, CreateBackupRequest};
 use crate::services::health_monitor_service::{HealthMonitorService, MonitorConfig};
 use crate::services::lifecycle_service::LifecycleService;
 use crate::services::metrics_service;
+use crate::services::storage_service::StorageService;
 
 /// Database gauge stats for Prometheus metrics.
 #[derive(Debug, sqlx::FromRow)]
@@ -130,7 +136,162 @@ pub fn spawn_all(db: PgPool, config: Config) {
         });
     }
 
-    tracing::info!("Background schedulers started: metrics, health monitor, lifecycle");
+    // Backup schedule execution (check every 5 minutes)
+    {
+        let db = db.clone();
+        let config_clone = config.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            let mut ticker = interval(Duration::from_secs(300)); // 5 minutes
+
+            loop {
+                ticker.tick().await;
+                if let Err(e) = execute_due_backup_schedules(&db, &config_clone).await {
+                    tracing::warn!("Backup schedule check failed: {}", e);
+                }
+            }
+        });
+    }
+
+    tracing::info!(
+        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules"
+    );
+}
+
+/// A row from the backup_schedules table.
+#[derive(Debug, sqlx::FromRow)]
+struct BackupScheduleRow {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub backup_type: BackupType,
+    pub cron_expression: String,
+    pub include_repositories: Option<Vec<uuid::Uuid>>,
+}
+
+/// Check for due backup schedules and execute them.
+async fn execute_due_backup_schedules(
+    db: &PgPool,
+    config: &Config,
+) -> crate::error::Result<()> {
+    // Find schedules where next_run_at <= now
+    let due_schedules = sqlx::query_as::<_, BackupScheduleRow>(
+        r#"
+        SELECT id, name, backup_type, cron_expression, include_repositories
+        FROM backup_schedules
+        WHERE is_enabled = true
+          AND (next_run_at IS NULL OR next_run_at <= NOW())
+        ORDER BY next_run_at ASC NULLS FIRST
+        LIMIT 5
+        "#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+    if due_schedules.is_empty() {
+        return Ok(());
+    }
+
+    let storage = match StorageService::from_config(config).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!("Failed to create storage service for scheduled backups: {}", e);
+            return Err(e);
+        }
+    };
+
+    for schedule_row in &due_schedules {
+        tracing::info!(
+            "Executing scheduled backup '{}' (type: {:?})",
+            schedule_row.name,
+            schedule_row.backup_type
+        );
+
+        let service = BackupService::new(db.clone(), storage.clone());
+
+        // Create and execute the backup
+        let create_result = service
+            .create(CreateBackupRequest {
+                backup_type: schedule_row.backup_type,
+                repository_ids: schedule_row.include_repositories.clone(),
+                created_by: None, // system-initiated
+            })
+            .await;
+
+        let backup_type_str = format!("{:?}", schedule_row.backup_type).to_lowercase();
+        let start = std::time::Instant::now();
+
+        match create_result {
+            Ok(backup) => {
+                match service.execute(backup.id).await {
+                    Ok(completed) => {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        tracing::info!(
+                            "Scheduled backup '{}' completed: {} bytes, {} artifacts",
+                            schedule_row.name,
+                            completed.size_bytes.unwrap_or(0),
+                            completed.artifact_count.unwrap_or(0)
+                        );
+                        metrics_service::record_backup(&backup_type_str, true, elapsed);
+                    }
+                    Err(e) => {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        tracing::error!(
+                            "Scheduled backup '{}' execution failed: {}",
+                            schedule_row.name,
+                            e
+                        );
+                        metrics_service::record_backup(&backup_type_str, false, elapsed);
+                    }
+                }
+            }
+            Err(e) => {
+                let elapsed = start.elapsed().as_secs_f64();
+                tracing::error!(
+                    "Failed to create scheduled backup '{}': {}",
+                    schedule_row.name,
+                    e
+                );
+                metrics_service::record_backup(&backup_type_str, false, elapsed);
+            }
+        }
+
+        // Compute and update next_run_at from cron expression
+        let next_run = compute_next_run(&schedule_row.cron_expression);
+        let _ = sqlx::query(
+            "UPDATE backup_schedules SET last_run_at = NOW(), next_run_at = $2, updated_at = NOW() WHERE id = $1",
+        )
+        .bind(schedule_row.id)
+        .bind(next_run)
+        .execute(db)
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Parse a cron expression and compute the next run time.
+fn compute_next_run(cron_expr: &str) -> Option<chrono::DateTime<Utc>> {
+    // The cron crate expects 7-field expressions (sec min hour dom month dow year)
+    // but users typically write 5-field (min hour dom month dow).
+    // Prepend "0 " for seconds if we detect a 5-field expression.
+    let normalized = if cron_expr.split_whitespace().count() == 5 {
+        format!("0 {}", cron_expr)
+    } else {
+        cron_expr.to_string()
+    };
+
+    match Schedule::from_str(&normalized) {
+        Ok(schedule) => schedule.upcoming(Utc).next(),
+        Err(e) => {
+            tracing::warn!(
+                "Invalid cron expression '{}': {}. Falling back to 24h from now.",
+                cron_expr,
+                e
+            );
+            Some(Utc::now() + chrono::Duration::hours(24))
+        }
+    }
 }
 
 /// Update Prometheus gauge metrics from database state.

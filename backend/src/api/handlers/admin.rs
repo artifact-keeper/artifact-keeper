@@ -239,26 +239,25 @@ pub async fn restore_backup(
     Path(id): Path<Uuid>,
     Json(payload): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>> {
-    let storage: StorageService = StorageService::from_config(&state.config)
-        .await
-        .map_err(|e: AppError| e)?;
-    let _service = BackupService::new(state.db.clone(), Arc::new(storage));
-    let _id = id;
+    let storage = Arc::new(
+        StorageService::from_config(&state.config)
+            .await
+            .map_err(|e: AppError| e)?,
+    );
+    let service = BackupService::new(state.db.clone(), storage);
 
-    let _options = RestoreOptions {
+    let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),
         restore_artifacts: payload.restore_artifacts.unwrap_or(true),
         target_repository_id: payload.target_repository_id,
     };
 
-    // TODO: BackupService::restore holds tar::Archive (non-Send) across await points.
-    // Needs refactoring to extract entries synchronously first, then do async operations.
-    // let result = service.restore(id, options).await?;
+    let result = service.restore(id, options).await?;
 
     Ok(Json(RestoreResponse {
-        tables_restored: vec![],
-        artifacts_restored: 0,
-        errors: vec![],
+        tables_restored: result.tables_restored,
+        artifacts_restored: result.artifacts_restored,
+        errors: result.errors,
     }))
 }
 

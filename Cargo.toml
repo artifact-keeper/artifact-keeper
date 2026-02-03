@@ -56,6 +56,7 @@ uuid = { version = "1.7", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
 
 # HTTP client (for proxy repos)
 reqwest = { version = "0.13", features = ["json", "stream", "form"] }
