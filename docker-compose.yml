@@ -92,9 +92,9 @@ services:
       backend:
         condition: service_healthy
     environment:
-      NEXT_PUBLIC_API_URL: http://backend:8080
+      BACKEND_URL: http://backend:8080
     ports:
-      - "30173:3000"
+      - "3000:3000"
     restart: unless-stopped
 
   openscap:

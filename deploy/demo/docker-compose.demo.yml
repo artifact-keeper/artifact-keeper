@@ -47,7 +47,7 @@ services:
   web:
     image: ghcr.io/artifact-keeper/artifact-keeper-web:latest
     environment:
-      NEXT_PUBLIC_API_URL: http://backend:8080
+      BACKEND_URL: http://backend:8080
     ports:
       - "3000:3000"
     depends_on:
