@@ -68,6 +68,12 @@ pub struct Config {
     /// Trivy server URL for container image scanning (optional)
     pub trivy_url: Option<String>,
 
+    /// OpenSCAP wrapper URL for compliance scanning (optional)
+    pub openscap_url: Option<String>,
+
+    /// OpenSCAP SCAP profile to evaluate (default: standard)
+    pub openscap_profile: String,
+
     /// Meilisearch URL for search indexing (optional)
     pub meilisearch_url: Option<String>,
 
@@ -79,6 +85,15 @@ pub struct Config {
 
     /// Demo mode: blocks all write operations (POST/PUT/DELETE/PATCH) except auth
     pub demo_mode: bool,
+
+    /// Peer instance name for mesh identification
+    pub peer_instance_name: String,
+
+    /// Public endpoint URL where this instance can be reached by peers
+    pub peer_public_endpoint: String,
+
+    /// API key for authenticating peer-to-peer requests
+    pub peer_api_key: String,
 }
 
 impl Config {
@@ -106,11 +121,20 @@ impl Config {
             ldap_url: env::var("LDAP_URL").ok(),
             ldap_base_dn: env::var("LDAP_BASE_DN").ok(),
             trivy_url: env::var("TRIVY_URL").ok(),
+            openscap_url: env::var("OPENSCAP_URL").ok(),
+            openscap_profile: env::var("OPENSCAP_PROFILE")
+                .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
             meilisearch_url: env::var("MEILISEARCH_URL").ok(),
             meilisearch_api_key: env::var("MEILISEARCH_API_KEY").ok(),
             scan_workspace_path: env::var("SCAN_WORKSPACE_PATH")
                 .unwrap_or_else(|_| "/scan-workspace".into()),
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
+            peer_instance_name: env::var("PEER_INSTANCE_NAME")
+                .unwrap_or_else(|_| "artifact-keeper-local".into()),
+            peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
+            peer_api_key: env::var("PEER_API_KEY")
+                .unwrap_or_else(|_| "change-me-in-production".into()),
         })
     }
 }

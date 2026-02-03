@@ -23,8 +23,8 @@ pub enum PeerStatus {
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct PeerConnection {
     pub id: Uuid,
-    pub source_node_id: Uuid,
-    pub target_node_id: Uuid,
+    pub source_peer_id: Uuid,
+    pub target_peer_id: Uuid,
     pub status: PeerStatus,
     pub latency_ms: Option<i32>,
     pub bandwidth_estimate_bps: Option<i64>,

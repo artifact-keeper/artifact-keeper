@@ -427,7 +427,7 @@ pub struct SystemStats {
     pub total_storage_bytes: i64,
     pub total_downloads: i64,
     pub total_users: i64,
-    pub active_edge_nodes: i64,
+    pub active_peers: i64,
     pub pending_sync_tasks: i64,
 }
 
@@ -463,7 +463,7 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     let active_edge_count = sqlx::query_scalar!(
-        "SELECT COUNT(*) as \"count!\" FROM edge_nodes WHERE status = 'online'"
+        "SELECT COUNT(*) as \"count!\" FROM peer_instances WHERE status = 'online'"
     )
     .fetch_one(&state.db)
     .await
@@ -482,7 +482,7 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         total_storage_bytes: artifact_stats.size,
         total_downloads: download_count,
         total_users: user_count,
-        active_edge_nodes: active_edge_count,
+        active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
     }))
 }
@@ -491,14 +491,14 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
 pub struct CleanupRequest {
     pub cleanup_audit_logs: Option<bool>,
     pub cleanup_old_backups: Option<bool>,
-    pub cleanup_stale_edge_nodes: Option<bool>,
+    pub cleanup_stale_peers: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CleanupResponse {
     pub audit_logs_deleted: i64,
     pub backups_deleted: i64,
-    pub edge_nodes_marked_offline: i64,
+    pub peers_marked_offline: i64,
 }
 
 /// Run cleanup tasks
@@ -510,7 +510,7 @@ pub async fn run_cleanup(
     let mut result = CleanupResponse {
         audit_logs_deleted: 0,
         backups_deleted: 0,
-        edge_nodes_marked_offline: 0,
+        peers_marked_offline: 0,
     };
 
     // Get settings for cleanup
@@ -531,10 +531,10 @@ pub async fn run_cleanup(
             .await? as i64;
     }
 
-    if request.cleanup_stale_edge_nodes.unwrap_or(false) {
-        use crate::services::edge_service::EdgeService;
-        let edge_service = EdgeService::new(state.db.clone());
-        result.edge_nodes_marked_offline = edge_service
+    if request.cleanup_stale_peers.unwrap_or(false) {
+        use crate::services::peer_instance_service::PeerInstanceService;
+        let peer_service = PeerInstanceService::new(state.db.clone());
+        result.peers_marked_offline = peer_service
             .mark_stale_offline(settings.edge_stale_threshold_minutes)
             .await? as i64;
     }

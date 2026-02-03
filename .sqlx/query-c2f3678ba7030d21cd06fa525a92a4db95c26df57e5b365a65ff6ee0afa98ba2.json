@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT repository_id FROM peer_repo_subscriptions WHERE peer_instance_id = $1 AND sync_enabled = true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c2f3678ba7030d21cd06fa525a92a4db95c26df57e5b365a65ff6ee0afa98ba2"
+}

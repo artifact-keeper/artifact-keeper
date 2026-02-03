@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
-/// Sync status reused from edge service
+/// Sync status reused from peer instance service
 #[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
 #[sqlx(type_name = "sync_status", rename_all = "snake_case")]
 pub enum SyncStatus {
@@ -25,7 +25,7 @@ pub enum SyncStatus {
 pub struct TransferSession {
     pub id: Uuid,
     pub artifact_id: Uuid,
-    pub requesting_node_id: Uuid,
+    pub requesting_peer_id: Uuid,
     pub total_size: i64,
     pub chunk_size: i32,
     pub total_chunks: i32,
@@ -39,7 +39,7 @@ pub struct TransferSession {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-/// Chunk manifest entry returned to requesting edge
+/// Chunk manifest entry returned to requesting peer
 #[derive(Debug, serde::Serialize)]
 pub struct ChunkManifestEntry {
     pub chunk_index: i32,
@@ -47,13 +47,13 @@ pub struct ChunkManifestEntry {
     pub byte_length: i32,
     pub checksum: String,
     pub status: String,
-    pub source_node_id: Option<Uuid>,
+    pub source_peer_id: Option<Uuid>,
 }
 
 /// Peer chunk availability for swarm coordination
 #[derive(Debug, serde::Serialize)]
 pub struct PeerChunkInfo {
-    pub edge_node_id: Uuid,
+    pub peer_instance_id: Uuid,
     pub available_chunks: i32,
     pub total_chunks: i32,
     pub chunk_bitmap: Vec<u8>,
@@ -63,7 +63,7 @@ pub struct PeerChunkInfo {
 #[derive(Debug)]
 pub struct InitTransferRequest {
     pub artifact_id: Uuid,
-    pub requesting_node_id: Uuid,
+    pub requesting_peer_id: Uuid,
     pub chunk_size: Option<i32>,
 }
 
@@ -100,20 +100,20 @@ impl TransferService {
             TransferSession,
             r#"
             INSERT INTO transfer_sessions
-                (artifact_id, requesting_node_id, total_size, chunk_size, total_chunks,
+                (artifact_id, requesting_peer_id, total_size, chunk_size, total_chunks,
                  checksum_algo, artifact_checksum, status)
             VALUES ($1, $2, $3, $4, $5, 'sha256', $6, 'pending')
-            ON CONFLICT (artifact_id, requesting_node_id) DO UPDATE
+            ON CONFLICT (artifact_id, requesting_peer_id) DO UPDATE
                 SET status = 'pending', completed_chunks = 0,
                     started_at = NULL, completed_at = NULL, error_message = NULL
             RETURNING
-                id, artifact_id, requesting_node_id, total_size, chunk_size,
+                id, artifact_id, requesting_peer_id, total_size, chunk_size,
                 total_chunks, completed_chunks, checksum_algo, artifact_checksum,
                 status as "status: SyncStatus",
                 error_message, created_at, started_at, completed_at
             "#,
             req.artifact_id,
-            req.requesting_node_id,
+            req.requesting_peer_id,
             total_size,
             chunk_size,
             total_chunks,
@@ -160,7 +160,7 @@ impl TransferService {
             SELECT
                 chunk_index, byte_offset, byte_length, checksum,
                 status as "status!: String",
-                source_node_id
+                source_peer_id
             FROM transfer_chunks
             WHERE session_id = $1
             ORDER BY chunk_index
@@ -180,7 +180,7 @@ impl TransferService {
             TransferSession,
             r#"
             SELECT
-                id, artifact_id, requesting_node_id, total_size, chunk_size,
+                id, artifact_id, requesting_peer_id, total_size, chunk_size,
                 total_chunks, completed_chunks, checksum_algo, artifact_checksum,
                 status as "status: SyncStatus",
                 error_message, created_at, started_at, completed_at
@@ -203,20 +203,20 @@ impl TransferService {
         session_id: Uuid,
         chunk_index: i32,
         checksum: &str,
-        source_node_id: Option<Uuid>,
+        source_peer_id: Option<Uuid>,
     ) -> Result<()> {
         // Update chunk status
         let result = sqlx::query!(
             r#"
             UPDATE transfer_chunks
-            SET status = 'completed', checksum = $3, source_node_id = $4,
+            SET status = 'completed', checksum = $3, source_peer_id = $4,
                 downloaded_at = NOW(), attempts = attempts + 1
             WHERE session_id = $1 AND chunk_index = $2 AND status != 'completed'
             "#,
             session_id,
             chunk_index,
             checksum,
-            source_node_id,
+            source_peer_id,
         )
         .execute(&self.db)
         .await
@@ -270,7 +270,7 @@ impl TransferService {
         sqlx::query!(
             r#"
             UPDATE transfer_chunks
-            SET status = 'pending', source_node_id = NULL
+            SET status = 'pending', source_peer_id = NULL
             WHERE session_id = $1 AND chunk_index = $2 AND status = 'failed'
             "#,
             session_id,
@@ -337,11 +337,11 @@ impl TransferService {
         Ok(())
     }
 
-    /// Update chunk availability for a node/artifact pair.
+    /// Update chunk availability for a peer instance/artifact pair.
     /// The bitmap uses big-endian encoding: bit 0 = MSB of byte 0.
     pub async fn update_chunk_availability(
         &self,
-        edge_node_id: Uuid,
+        peer_instance_id: Uuid,
         artifact_id: Uuid,
         chunk_bitmap: &[u8],
         total_chunks: i32,
@@ -355,12 +355,12 @@ impl TransferService {
         sqlx::query!(
             r#"
             INSERT INTO chunk_availability
-                (edge_node_id, artifact_id, chunk_bitmap, total_chunks, available_chunks)
+                (peer_instance_id, artifact_id, chunk_bitmap, total_chunks, available_chunks)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (edge_node_id, artifact_id) DO UPDATE
+            ON CONFLICT (peer_instance_id, artifact_id) DO UPDATE
                 SET chunk_bitmap = $3, available_chunks = $5, updated_at = NOW()
             "#,
-            edge_node_id,
+            peer_instance_id,
             artifact_id,
             chunk_bitmap,
             total_chunks,
@@ -378,26 +378,26 @@ impl TransferService {
     pub async fn get_peers_with_chunks(
         &self,
         artifact_id: Uuid,
-        requesting_node_id: Uuid,
+        requesting_peer_id: Uuid,
     ) -> Result<Vec<PeerChunkInfo>> {
         let peers = sqlx::query_as!(
             PeerChunkInfo,
             r#"
             SELECT
-                ca.edge_node_id,
+                ca.peer_instance_id,
                 ca.available_chunks,
                 ca.total_chunks,
                 ca.chunk_bitmap
             FROM chunk_availability ca
-            JOIN edge_nodes en ON en.id = ca.edge_node_id
+            JOIN peer_instances pi ON pi.id = ca.peer_instance_id
             WHERE ca.artifact_id = $1
-              AND ca.edge_node_id != $2
+              AND ca.peer_instance_id != $2
               AND ca.available_chunks > 0
-              AND en.status IN ('online', 'syncing')
+              AND pi.status IN ('online', 'syncing')
             ORDER BY ca.available_chunks DESC
             "#,
             artifact_id,
-            requesting_node_id,
+            requesting_peer_id,
         )
         .fetch_all(&self.db)
         .await
@@ -406,21 +406,21 @@ impl TransferService {
         Ok(peers)
     }
 
-    /// Get pending (resumable) transfer sessions for an edge node.
-    pub async fn get_pending_sessions(&self, node_id: Uuid) -> Result<Vec<TransferSession>> {
+    /// Get pending (resumable) transfer sessions for a peer instance.
+    pub async fn get_pending_sessions(&self, peer_id: Uuid) -> Result<Vec<TransferSession>> {
         let sessions = sqlx::query_as!(
             TransferSession,
             r#"
             SELECT
-                id, artifact_id, requesting_node_id, total_size, chunk_size,
+                id, artifact_id, requesting_peer_id, total_size, chunk_size,
                 total_chunks, completed_chunks, checksum_algo, artifact_checksum,
                 status as "status: SyncStatus",
                 error_message, created_at, started_at, completed_at
             FROM transfer_sessions
-            WHERE requesting_node_id = $1 AND status IN ('pending', 'in_progress')
+            WHERE requesting_peer_id = $1 AND status IN ('pending', 'in_progress')
             ORDER BY created_at
             "#,
-            node_id,
+            peer_id,
         )
         .fetch_all(&self.db)
         .await

@@ -1,0 +1,172 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                id, name, endpoint_url,\n                status as \"status: InstanceStatus\",\n                region, cache_size_bytes, cache_used_bytes,\n                last_heartbeat_at, last_sync_at, sync_filter,\n                max_bandwidth_bps, sync_window_start, sync_window_end,\n                sync_window_timezone, concurrent_transfers_limit,\n                active_transfers, backoff_until, consecutive_failures,\n                bytes_transferred_total, transfer_failures_total,\n                api_key, is_local,\n                created_at, updated_at\n            FROM peer_instances\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "endpoint_url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "status: InstanceStatus",
+        "type_info": {
+          "Custom": {
+            "name": "instance_status",
+            "kind": {
+              "Enum": [
+                "online",
+                "offline",
+                "syncing",
+                "degraded"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "region",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "cache_size_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "cache_used_bytes",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "last_heartbeat_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_sync_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "sync_filter",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 10,
+        "name": "max_bandwidth_bps",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "sync_window_start",
+        "type_info": "Time"
+      },
+      {
+        "ordinal": 12,
+        "name": "sync_window_end",
+        "type_info": "Time"
+      },
+      {
+        "ordinal": 13,
+        "name": "sync_window_timezone",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "concurrent_transfers_limit",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 15,
+        "name": "active_transfers",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 16,
+        "name": "backoff_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "consecutive_failures",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 18,
+        "name": "bytes_transferred_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 19,
+        "name": "transfer_failures_total",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 20,
+        "name": "api_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 21,
+        "name": "is_local",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 22,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 23,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "698d15dbb26cf224b50897439de22464c380ae3cc84809da98753a63145c2ae6"
+}

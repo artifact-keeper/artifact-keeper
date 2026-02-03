@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO peer_instances (id, name, endpoint_url, api_key)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT (name) DO UPDATE\n                SET endpoint_url = $3, api_key = $4, updated_at = NOW()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "047947938d72f740ef32641dcbac6f491ba1620f70013bae5c8c84963ad12a39"
+}

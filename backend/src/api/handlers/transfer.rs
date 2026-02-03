@@ -12,7 +12,7 @@ use crate::api::SharedState;
 use crate::error::Result;
 use crate::services::transfer_service::{InitTransferRequest, TransferService};
 
-/// Create transfer routes (nested under /api/v1/edge-nodes/:id/transfer)
+/// Create transfer routes (nested under /api/v1/peers/:id/transfer)
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/init", post(init_transfer))
@@ -38,7 +38,7 @@ pub struct InitTransferBody {
 pub struct TransferSessionResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
-    pub requesting_node_id: Uuid,
+    pub requesting_peer_id: Uuid,
     pub total_size: i64,
     pub chunk_size: i32,
     pub total_chunks: i32,
@@ -61,13 +61,13 @@ pub struct ChunkEntry {
     pub byte_length: i32,
     pub checksum: String,
     pub status: String,
-    pub source_node_id: Option<Uuid>,
+    pub source_peer_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CompleteChunkBody {
     pub checksum: String,
-    pub source_node_id: Option<Uuid>,
+    pub source_peer_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,10 +75,10 @@ pub struct FailBody {
     pub error: String,
 }
 
-/// POST /api/v1/edge-nodes/:id/transfer/init
+/// POST /api/v1/peers/:id/transfer/init
 async fn init_transfer(
     State(state): State<SharedState>,
-    Path(node_id): Path<Uuid>,
+    Path(peer_id): Path<Uuid>,
     Json(body): Json<InitTransferBody>,
 ) -> Result<Json<TransferSessionResponse>> {
     let service = TransferService::new(state.db.clone());
@@ -86,7 +86,7 @@ async fn init_transfer(
     let session = service
         .init_transfer(InitTransferRequest {
             artifact_id: body.artifact_id,
-            requesting_node_id: node_id,
+            requesting_peer_id: peer_id,
             chunk_size: body.chunk_size,
         })
         .await?;
@@ -94,7 +94,7 @@ async fn init_transfer(
     Ok(Json(TransferSessionResponse {
         id: session.id,
         artifact_id: session.artifact_id,
-        requesting_node_id: session.requesting_node_id,
+        requesting_peer_id: session.requesting_peer_id,
         total_size: session.total_size,
         chunk_size: session.chunk_size,
         total_chunks: session.total_chunks,
@@ -105,10 +105,10 @@ async fn init_transfer(
     }))
 }
 
-/// GET /api/v1/edge-nodes/:id/transfer/:session_id/chunks
+/// GET /api/v1/peers/:id/transfer/:session_id/chunks
 async fn get_chunk_manifest(
     State(state): State<SharedState>,
-    Path((_node_id, session_id)): Path<(Uuid, Uuid)>,
+    Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ChunkManifestResponse>> {
     let service = TransferService::new(state.db.clone());
     let chunks = service.get_chunk_manifest(session_id).await?;
@@ -123,16 +123,16 @@ async fn get_chunk_manifest(
                 byte_length: c.byte_length,
                 checksum: c.checksum,
                 status: c.status,
-                source_node_id: c.source_node_id,
+                source_peer_id: c.source_peer_id,
             })
             .collect(),
     }))
 }
 
-/// GET /api/v1/edge-nodes/:id/transfer/:session_id
+/// GET /api/v1/peers/:id/transfer/:session_id
 async fn get_session(
     State(state): State<SharedState>,
-    Path((_node_id, session_id)): Path<(Uuid, Uuid)>,
+    Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<TransferSessionResponse>> {
     let service = TransferService::new(state.db.clone());
     let session = service.get_session(session_id).await?;
@@ -140,7 +140,7 @@ async fn get_session(
     Ok(Json(TransferSessionResponse {
         id: session.id,
         artifact_id: session.artifact_id,
-        requesting_node_id: session.requesting_node_id,
+        requesting_peer_id: session.requesting_peer_id,
         total_size: session.total_size,
         chunk_size: session.chunk_size,
         total_chunks: session.total_chunks,
@@ -151,22 +151,22 @@ async fn get_session(
     }))
 }
 
-/// POST /api/v1/edge-nodes/:id/transfer/:session_id/chunk/:chunk_index/complete
+/// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/complete
 async fn complete_chunk(
     State(state): State<SharedState>,
-    Path((_node_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
+    Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
     Json(body): Json<CompleteChunkBody>,
 ) -> Result<()> {
     let service = TransferService::new(state.db.clone());
     service
-        .complete_chunk(session_id, chunk_index, &body.checksum, body.source_node_id)
+        .complete_chunk(session_id, chunk_index, &body.checksum, body.source_peer_id)
         .await
 }
 
-/// POST /api/v1/edge-nodes/:id/transfer/:session_id/chunk/:chunk_index/fail
+/// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/fail
 async fn fail_chunk(
     State(state): State<SharedState>,
-    Path((_node_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
+    Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
     Json(body): Json<FailBody>,
 ) -> Result<()> {
     let service = TransferService::new(state.db.clone());
@@ -175,28 +175,28 @@ async fn fail_chunk(
         .await
 }
 
-/// POST /api/v1/edge-nodes/:id/transfer/:session_id/chunk/:chunk_index/retry
+/// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/retry
 async fn retry_chunk(
     State(state): State<SharedState>,
-    Path((_node_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
+    Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
 ) -> Result<()> {
     let service = TransferService::new(state.db.clone());
     service.retry_chunk(session_id, chunk_index).await
 }
 
-/// POST /api/v1/edge-nodes/:id/transfer/:session_id/complete
+/// POST /api/v1/peers/:id/transfer/:session_id/complete
 async fn complete_session(
     State(state): State<SharedState>,
-    Path((_node_id, session_id)): Path<(Uuid, Uuid)>,
+    Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
     let service = TransferService::new(state.db.clone());
     service.complete_session(session_id).await
 }
 
-/// POST /api/v1/edge-nodes/:id/transfer/:session_id/fail
+/// POST /api/v1/peers/:id/transfer/:session_id/fail
 async fn fail_session(
     State(state): State<SharedState>,
-    Path((_node_id, session_id)): Path<(Uuid, Uuid)>,
+    Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<FailBody>,
 ) -> Result<()> {
     let service = TransferService::new(state.db.clone());

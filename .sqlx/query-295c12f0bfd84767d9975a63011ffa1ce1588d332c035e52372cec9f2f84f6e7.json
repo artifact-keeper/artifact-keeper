@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT\n                pi.id as node_id,\n                pi.name,\n                pi.endpoint_url,\n                pi.region,\n                pi.status as \"status!: String\"\n            FROM peer_instances pi\n            JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id\n            WHERE pi.id != $1\n              AND pi.status IN ('online', 'syncing')\n              AND prs.sync_enabled = true\n              AND prs.repository_id IN (\n                  SELECT repository_id FROM peer_repo_subscriptions\n                  WHERE peer_instance_id = $1 AND sync_enabled = true\n              )\n            ORDER BY pi.region, pi.name\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "endpoint_url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "region",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "status!: String",
+        "type_info": {
+          "Custom": {
+            "name": "instance_status",
+            "kind": {
+              "Enum": [
+                "online",
+                "offline",
+                "syncing",
+                "degraded"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "295c12f0bfd84767d9975a63011ffa1ce1588d332c035e52372cec9f2f84f6e7"
+}

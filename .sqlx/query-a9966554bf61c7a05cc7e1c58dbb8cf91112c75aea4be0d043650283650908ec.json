@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM peer_repo_subscriptions WHERE peer_instance_id = $1 AND repository_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a9966554bf61c7a05cc7e1c58dbb8cf91112c75aea4be0d043650283650908ec"
+}

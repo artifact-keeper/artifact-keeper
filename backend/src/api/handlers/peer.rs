@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::services::peer_service::{PeerService, PeerStatus, ProbeResult};
 use crate::services::transfer_service::TransferService;
 
-/// Create peer routes (nested under /api/v1/edge-nodes/:id/peers)
+/// Create peer routes (nested under /api/v1/peers/:id/connections)
 pub fn peer_router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_peers))
@@ -22,7 +22,7 @@ pub fn peer_router() -> Router<SharedState> {
         .route("/:target_id/unreachable", post(mark_unreachable))
 }
 
-/// Create chunk availability routes (nested under /api/v1/edge-nodes/:id/chunks)
+/// Create chunk availability routes (nested under /api/v1/peers/:id/chunks)
 pub fn chunk_router() -> Router<SharedState> {
     Router::new()
         .route(
@@ -33,7 +33,7 @@ pub fn chunk_router() -> Router<SharedState> {
         .route("/:artifact_id/scored-peers", get(get_scored_peers))
 }
 
-/// Create network profile routes (nested under /api/v1/edge-nodes/:id)
+/// Create network profile routes (nested under /api/v1/peers/:id)
 pub fn network_profile_router() -> Router<SharedState> {
     Router::new().route("/network-profile", put(update_network_profile))
 }
@@ -48,7 +48,7 @@ pub struct ListPeersQuery {
 #[derive(Debug, Serialize)]
 pub struct PeerResponse {
     pub id: Uuid,
-    pub target_node_id: Uuid,
+    pub target_peer_id: Uuid,
     pub status: String,
     pub latency_ms: Option<i32>,
     pub bandwidth_estimate_bps: Option<i64>,
@@ -63,14 +63,14 @@ pub struct PeerResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct ProbeBody {
-    pub target_node_id: Uuid,
+    pub target_peer_id: Uuid,
     pub latency_ms: i32,
     pub bandwidth_estimate_bps: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DiscoverablePeerResponse {
-    pub node_id: Uuid,
+    pub peer_id: Uuid,
     pub name: String,
     pub endpoint_url: String,
     pub region: Option<String>,
@@ -79,7 +79,7 @@ pub struct DiscoverablePeerResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ChunkAvailabilityResponse {
-    pub edge_node_id: Uuid,
+    pub peer_instance_id: Uuid,
     pub artifact_id: Uuid,
     pub chunk_bitmap: Vec<u8>,
     pub total_chunks: i32,
@@ -94,7 +94,7 @@ pub struct UpdateChunkAvailabilityBody {
 
 #[derive(Debug, Serialize)]
 pub struct ScoredPeerResponse {
-    pub node_id: Uuid,
+    pub peer_id: Uuid,
     pub endpoint_url: String,
     pub latency_ms: Option<i32>,
     pub bandwidth_estimate_bps: Option<i64>,
@@ -123,21 +123,21 @@ fn parse_peer_status(s: &str) -> Option<PeerStatus> {
 
 // --- Handlers ---
 
-/// GET /api/v1/edge-nodes/:id/peers
+/// GET /api/v1/peers/:id/connections
 async fn list_peers(
     State(state): State<SharedState>,
-    Path(node_id): Path<Uuid>,
+    Path(peer_id): Path<Uuid>,
     Query(query): Query<ListPeersQuery>,
 ) -> Result<Json<Vec<PeerResponse>>> {
     let service = PeerService::new(state.db.clone());
     let status_filter = query.status.as_ref().and_then(|s| parse_peer_status(s));
-    let peers = service.list_peers(node_id, status_filter).await?;
+    let peers = service.list_peers(peer_id, status_filter).await?;
 
     let items: Vec<PeerResponse> = peers
         .into_iter()
         .map(|p| PeerResponse {
             id: p.id,
-            target_node_id: p.target_node_id,
+            target_peer_id: p.target_peer_id,
             status: p.status.to_string(),
             latency_ms: p.latency_ms,
             bandwidth_estimate_bps: p.bandwidth_estimate_bps,
@@ -154,18 +154,18 @@ async fn list_peers(
     Ok(Json(items))
 }
 
-/// GET /api/v1/edge-nodes/:id/peers/discover
+/// GET /api/v1/peers/:id/connections/discover
 async fn discover_peers(
     State(state): State<SharedState>,
-    Path(node_id): Path<Uuid>,
+    Path(peer_id): Path<Uuid>,
 ) -> Result<Json<Vec<DiscoverablePeerResponse>>> {
     let service = PeerService::new(state.db.clone());
-    let peers = service.discover_peers(node_id).await?;
+    let peers = service.discover_peers(peer_id).await?;
 
     let items: Vec<DiscoverablePeerResponse> = peers
         .into_iter()
         .map(|p| DiscoverablePeerResponse {
-            node_id: p.node_id,
+            peer_id: p.node_id,
             name: p.name,
             endpoint_url: p.endpoint_url,
             region: p.region,
@@ -176,18 +176,18 @@ async fn discover_peers(
     Ok(Json(items))
 }
 
-/// POST /api/v1/edge-nodes/:id/peers/probe
+/// POST /api/v1/peers/:id/connections/probe
 async fn probe_peer(
     State(state): State<SharedState>,
-    Path(node_id): Path<Uuid>,
+    Path(peer_id): Path<Uuid>,
     Json(body): Json<ProbeBody>,
 ) -> Result<Json<PeerResponse>> {
     let service = PeerService::new(state.db.clone());
     let peer = service
         .upsert_probe_result(
-            node_id,
+            peer_id,
             ProbeResult {
-                target_node_id: body.target_node_id,
+                target_peer_id: body.target_peer_id,
                 latency_ms: body.latency_ms,
                 bandwidth_estimate_bps: body.bandwidth_estimate_bps,
             },
@@ -196,7 +196,7 @@ async fn probe_peer(
 
     Ok(Json(PeerResponse {
         id: peer.id,
-        target_node_id: peer.target_node_id,
+        target_peer_id: peer.target_peer_id,
         status: peer.status.to_string(),
         latency_ms: peer.latency_ms,
         bandwidth_estimate_bps: peer.bandwidth_estimate_bps,
@@ -210,27 +210,27 @@ async fn probe_peer(
     }))
 }
 
-/// POST /api/v1/edge-nodes/:id/peers/:target_id/unreachable
+/// POST /api/v1/peers/:id/connections/:target_id/unreachable
 async fn mark_unreachable(
     State(state): State<SharedState>,
-    Path((node_id, target_id)): Path<(Uuid, Uuid)>,
+    Path((peer_id, target_id)): Path<(Uuid, Uuid)>,
 ) -> Result<()> {
     let service = PeerService::new(state.db.clone());
-    service.mark_unreachable(node_id, target_id).await
+    service.mark_unreachable(peer_id, target_id).await
 }
 
-/// GET /api/v1/edge-nodes/:id/chunks/:artifact_id
+/// GET /api/v1/peers/:id/chunks/:artifact_id
 async fn get_chunk_availability(
     State(state): State<SharedState>,
-    Path((node_id, artifact_id)): Path<(Uuid, Uuid)>,
+    Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<ChunkAvailabilityResponse>> {
     let row = sqlx::query!(
         r#"
-        SELECT edge_node_id, artifact_id, chunk_bitmap, total_chunks, available_chunks
+        SELECT peer_instance_id, artifact_id, chunk_bitmap, total_chunks, available_chunks
         FROM chunk_availability
-        WHERE edge_node_id = $1 AND artifact_id = $2
+        WHERE peer_instance_id = $1 AND artifact_id = $2
         "#,
-        node_id,
+        peer_id,
         artifact_id,
     )
     .fetch_optional(&state.db)
@@ -239,7 +239,7 @@ async fn get_chunk_availability(
     .ok_or_else(|| crate::error::AppError::NotFound("No chunk availability data".to_string()))?;
 
     Ok(Json(ChunkAvailabilityResponse {
-        edge_node_id: row.edge_node_id,
+        peer_instance_id: row.peer_instance_id,
         artifact_id: row.artifact_id,
         chunk_bitmap: row.chunk_bitmap,
         total_chunks: row.total_chunks,
@@ -247,30 +247,30 @@ async fn get_chunk_availability(
     }))
 }
 
-/// PUT /api/v1/edge-nodes/:id/chunks/:artifact_id
+/// PUT /api/v1/peers/:id/chunks/:artifact_id
 async fn update_chunk_availability(
     State(state): State<SharedState>,
-    Path((node_id, artifact_id)): Path<(Uuid, Uuid)>,
+    Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<UpdateChunkAvailabilityBody>,
 ) -> Result<()> {
     let service = TransferService::new(state.db.clone());
     service
-        .update_chunk_availability(node_id, artifact_id, &body.chunk_bitmap, body.total_chunks)
+        .update_chunk_availability(peer_id, artifact_id, &body.chunk_bitmap, body.total_chunks)
         .await
 }
 
-/// GET /api/v1/edge-nodes/:id/chunks/:artifact_id/peers
+/// GET /api/v1/peers/:id/chunks/:artifact_id/peers
 async fn get_peers_with_chunks(
     State(state): State<SharedState>,
-    Path((node_id, artifact_id)): Path<(Uuid, Uuid)>,
+    Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<ChunkAvailabilityResponse>>> {
     let service = TransferService::new(state.db.clone());
-    let peers = service.get_peers_with_chunks(artifact_id, node_id).await?;
+    let peers = service.get_peers_with_chunks(artifact_id, peer_id).await?;
 
     let items: Vec<ChunkAvailabilityResponse> = peers
         .into_iter()
         .map(|p| ChunkAvailabilityResponse {
-            edge_node_id: p.edge_node_id,
+            peer_instance_id: p.peer_instance_id,
             artifact_id,
             chunk_bitmap: p.chunk_bitmap,
             total_chunks: p.total_chunks,
@@ -281,20 +281,20 @@ async fn get_peers_with_chunks(
     Ok(Json(items))
 }
 
-/// GET /api/v1/edge-nodes/:id/chunks/:artifact_id/scored-peers
+/// GET /api/v1/peers/:id/chunks/:artifact_id/scored-peers
 async fn get_scored_peers(
     State(state): State<SharedState>,
-    Path((node_id, artifact_id)): Path<(Uuid, Uuid)>,
+    Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<ScoredPeerResponse>>> {
     let service = PeerService::new(state.db.clone());
     let peers = service
-        .get_scored_peers_for_artifact(node_id, artifact_id)
+        .get_scored_peers_for_artifact(peer_id, artifact_id)
         .await?;
 
     let items: Vec<ScoredPeerResponse> = peers
         .into_iter()
         .map(|p| ScoredPeerResponse {
-            node_id: p.node_id,
+            peer_id: p.node_id,
             endpoint_url: p.endpoint_url,
             latency_ms: p.latency_ms,
             bandwidth_estimate_bps: p.bandwidth_estimate_bps,
@@ -306,10 +306,10 @@ async fn get_scored_peers(
     Ok(Json(items))
 }
 
-/// PUT /api/v1/edge-nodes/:id/network-profile
+/// PUT /api/v1/peers/:id/network-profile
 async fn update_network_profile(
     State(state): State<SharedState>,
-    Path(node_id): Path<Uuid>,
+    Path(peer_id): Path<Uuid>,
     Json(body): Json<NetworkProfileBody>,
 ) -> Result<()> {
     // Parse time strings if provided
@@ -333,7 +333,7 @@ async fn update_network_profile(
 
     sqlx::query!(
         r#"
-        UPDATE edge_nodes SET
+        UPDATE peer_instances SET
             max_bandwidth_bps = COALESCE($2, max_bandwidth_bps),
             sync_window_start = COALESCE($3, sync_window_start),
             sync_window_end = COALESCE($4, sync_window_end),
@@ -342,7 +342,7 @@ async fn update_network_profile(
             updated_at = NOW()
         WHERE id = $1
         "#,
-        node_id,
+        peer_id,
         body.max_bandwidth_bps,
         window_start,
         window_end,

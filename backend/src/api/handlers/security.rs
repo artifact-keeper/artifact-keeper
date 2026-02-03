@@ -404,7 +404,8 @@ async fn list_scan_configs(
 ) -> Result<Json<Vec<ScanConfigResponse>>> {
     let svc = ScanConfigService::new(state.db.clone());
     let configs = svc.list_configs().await?;
-    let response: Vec<ScanConfigResponse> = configs.into_iter().map(ScanConfigResponse::from).collect();
+    let response: Vec<ScanConfigResponse> =
+        configs.into_iter().map(ScanConfigResponse::from).collect();
     Ok(Json(response))
 }
 
@@ -425,7 +426,7 @@ async fn trigger_scan(
 
     if let Some(artifact_id) = body.artifact_id {
         tokio::spawn(async move {
-            if let Err(e) = scanner.scan_artifact(artifact_id).await {
+            if let Err(e) = scanner.scan_artifact_with_options(artifact_id, true).await {
                 tracing::error!("Scan failed for artifact {}: {}", artifact_id, e);
             }
         });
@@ -448,7 +449,10 @@ async fn trigger_scan(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     tokio::spawn(async move {
-        if let Err(e) = scanner.scan_repository(repository_id).await {
+        if let Err(e) = scanner
+            .scan_repository_with_options(repository_id, true)
+            .await
+        {
             tracing::error!("Repository scan failed for {}: {}", repository_id, e);
         }
     });
@@ -626,9 +630,11 @@ async fn delete_policy(
 
 async fn get_repo_security(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<RepoSecurityResponse>> {
+    let _auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     // Resolve repository by key
     let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
         .fetch_optional(&state.db)
@@ -650,10 +656,12 @@ async fn get_repo_security(
 
 async fn update_repo_security(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
     Json(body): Json<UpsertScanConfigRequest>,
 ) -> Result<Json<ScanConfigResponse>> {
+    let _auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
         .fetch_optional(&state.db)
         .await
@@ -693,10 +701,12 @@ async fn list_artifact_scans(
 
 async fn list_repo_scans(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
     Query(query): Query<ListScansQuery>,
 ) -> Result<Json<ScanListResponse>> {
+    let _auth =
+        auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo = sqlx::query_scalar!("SELECT id FROM repositories WHERE key = $1", key,)
         .fetch_optional(&state.db)
         .await

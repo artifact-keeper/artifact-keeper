@@ -9,7 +9,7 @@ use super::sync_task::SyncStatus;
 
 /// Transfer session entity for chunked artifact transfers.
 ///
-/// Tracks an artifact being transferred to a requesting node
+/// Tracks an artifact being transferred to a requesting peer
 /// using swarm-based chunked distribution. Each session breaks
 /// an artifact into fixed-size chunks that can be sourced from
 /// multiple peers in parallel.
@@ -17,7 +17,7 @@ use super::sync_task::SyncStatus;
 pub struct TransferSession {
     pub id: Uuid,
     pub artifact_id: Uuid,
-    pub requesting_node_id: Uuid,
+    pub requesting_peer_id: Uuid,
     pub total_size: i64,
     pub chunk_size: i32,
     pub total_chunks: i32,
@@ -44,21 +44,21 @@ pub struct TransferChunk {
     pub byte_length: i32,
     pub checksum: String,
     pub status: SyncStatus,
-    pub source_node_id: Option<Uuid>,
+    pub source_peer_id: Option<Uuid>,
     pub attempts: i32,
     pub last_error: Option<String>,
     pub downloaded_at: Option<DateTime<Utc>>,
 }
 
-/// Chunk availability bitmap for an artifact on an edge node.
+/// Chunk availability bitmap for an artifact on a peer instance.
 ///
 /// Uses a compact bitfield representation where bit N being set
-/// indicates the node has chunk N. For a 500MB artifact with 1MB
+/// indicates the peer has chunk N. For a 500MB artifact with 1MB
 /// chunks, this requires only 63 bytes.
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct ChunkAvailability {
     pub id: Uuid,
-    pub edge_node_id: Uuid,
+    pub peer_instance_id: Uuid,
     pub artifact_id: Uuid,
     pub chunk_bitmap: Vec<u8>,
     pub total_chunks: i32,

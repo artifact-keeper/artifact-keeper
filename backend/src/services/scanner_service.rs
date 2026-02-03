@@ -791,6 +791,7 @@ pub struct ScannerService {
 }
 
 impl ScannerService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: PgPool,
         advisory_client: Arc<AdvisoryClient>,
@@ -799,6 +800,8 @@ impl ScannerService {
         trivy_url: Option<String>,
         storage_base_path: String,
         scan_workspace_path: String,
+        openscap_url: Option<String>,
+        openscap_profile: String,
     ) -> Self {
         let dep_scanner: Arc<dyn Scanner> = Arc::new(DependencyScanner::new(advisory_client));
         let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
@@ -818,6 +821,18 @@ impl ScannerService {
         info!("Grype scanner enabled");
         scanners.push(Arc::new(GrypeScanner::new(scan_workspace_path.clone())));
 
+        // OpenSCAP compliance scanner (optional sidecar)
+        if let Some(url) = openscap_url {
+            info!("OpenSCAP compliance scanner enabled at {}", url);
+            scanners.push(Arc::new(
+                crate::services::openscap_scanner::OpenScapScanner::new(
+                    url,
+                    openscap_profile,
+                    scan_workspace_path.clone(),
+                ),
+            ));
+        }
+
         Self {
             db,
             scanners,
@@ -830,7 +845,9 @@ impl ScannerService {
 
     /// Scan a single artifact: run all applicable scanners, persist results,
     /// recalculate the repository security score.
-    pub async fn scan_artifact(&self, artifact_id: Uuid) -> Result<()> {
+    /// Scan a single artifact. When `force` is true, skip the repo scan-enabled check
+    /// (used for on-demand scans triggered manually by an admin).
+    pub async fn scan_artifact_with_options(&self, artifact_id: Uuid, force: bool) -> Result<()> {
         // Fetch artifact and content
         let artifact = sqlx::query_as!(
             Artifact,
@@ -849,11 +866,12 @@ impl ScannerService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
-        // Check if scanning is enabled for this repo
-        if !self
-            .scan_config_service
-            .is_scan_enabled(artifact.repository_id)
-            .await?
+        // Check if scanning is enabled for this repo (skip check if forced)
+        if !force
+            && !self
+                .scan_config_service
+                .is_scan_enabled(artifact.repository_id)
+                .await?
         {
             info!(
                 "Scanning not enabled for repository {}, skipping artifact {}",
@@ -1003,8 +1021,24 @@ impl ScannerService {
         Ok(())
     }
 
+    /// Scan a single artifact (respects repo scan-enabled config).
+    pub async fn scan_artifact(&self, artifact_id: Uuid) -> Result<()> {
+        self.scan_artifact_with_options(artifact_id, false).await
+    }
+
     /// Scan all non-deleted artifacts in a repository.
     pub async fn scan_repository(&self, repository_id: Uuid) -> Result<u32> {
+        self.scan_repository_with_options(repository_id, false)
+            .await
+    }
+
+    /// Scan all artifacts in a repository.
+    /// When `force` is true, bypass the scan-enabled config check (for manual triggers).
+    pub async fn scan_repository_with_options(
+        &self,
+        repository_id: Uuid,
+        force: bool,
+    ) -> Result<u32> {
         let artifact_ids: Vec<Uuid> = sqlx::query_scalar!(
             "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
             repository_id,
@@ -1015,12 +1049,12 @@ impl ScannerService {
 
         let count = artifact_ids.len() as u32;
         info!(
-            "Starting repository scan for {}: {} artifacts",
-            repository_id, count
+            "Starting repository scan for {}: {} artifacts (force={})",
+            repository_id, count, force
         );
 
         for artifact_id in artifact_ids {
-            if let Err(e) = self.scan_artifact(artifact_id).await {
+            if let Err(e) = self.scan_artifact_with_options(artifact_id, force).await {
                 warn!(
                     "Failed to scan artifact {} in repo {}: {}",
                     artifact_id, repository_id, e

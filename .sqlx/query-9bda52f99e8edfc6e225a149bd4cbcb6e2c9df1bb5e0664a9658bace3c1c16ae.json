@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                pc.target_peer_id as node_id,\n                pi.endpoint_url,\n                pc.latency_ms,\n                pc.bandwidth_estimate_bps,\n                COALESCE(ca.available_chunks, 0) as \"available_chunks!: i32\"\n            FROM peer_connections pc\n            JOIN peer_instances pi ON pi.id = pc.target_peer_id\n            LEFT JOIN chunk_availability ca\n                ON ca.peer_instance_id = pc.target_peer_id AND ca.artifact_id = $2\n            WHERE pc.source_peer_id = $1\n              AND pc.status = 'active'\n              AND pi.status IN ('online', 'syncing')\n            ORDER BY pc.latency_ms ASC NULLS LAST\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "node_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "endpoint_url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "latency_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "bandwidth_estimate_bps",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "available_chunks!: i32",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "9bda52f99e8edfc6e225a149bd4cbcb6e2c9df1bb5e0664a9658bace3c1c16ae"
+}

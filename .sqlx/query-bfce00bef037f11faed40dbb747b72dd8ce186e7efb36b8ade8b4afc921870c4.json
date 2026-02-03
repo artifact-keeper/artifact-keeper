@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO peer_connections (source_peer_id, target_peer_id, status)\n            VALUES ($1, $2, 'active')\n            ON CONFLICT (source_peer_id, target_peer_id) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bfce00bef037f11faed40dbb747b72dd8ce186e7efb36b8ade8b4afc921870c4"
+}

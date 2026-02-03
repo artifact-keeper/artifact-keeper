@@ -177,12 +177,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // Edge node routes with auth middleware
+        // Peer instance routes with auth middleware
         .nest(
-            "/edge-nodes",
-            handlers::edge::router()
+            "/peers",
+            handlers::peers::router()
                 .nest("/:id/transfer", handlers::transfer::router())
-                .nest("/:id/peers", handlers::peer::peer_router())
+                .nest("/:id/connections", handlers::peer::peer_router())
                 .nest("/:id/chunks", handlers::peer::chunk_router())
                 .merge(handlers::peer::network_profile_router())
                 .layer(middleware::from_fn_with_state(

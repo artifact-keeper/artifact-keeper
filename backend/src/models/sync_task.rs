@@ -1,4 +1,4 @@
-//! Sync task model for edge node synchronization.
+//! Sync task model for peer instance synchronization.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,14 +16,14 @@ pub enum SyncStatus {
     Cancelled,
 }
 
-/// Sync task entity for artifact replication to edge nodes.
+/// Sync task entity for artifact replication to peer instances.
 ///
 /// Each sync task represents a single artifact that needs to be
-/// synchronized to an edge node.
+/// synchronized to a peer instance.
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct SyncTask {
     pub id: Uuid,
-    pub edge_node_id: Uuid,
+    pub peer_instance_id: Uuid,
     pub artifact_id: Uuid,
     pub status: SyncStatus,
     pub priority: i32,
@@ -34,14 +34,14 @@ pub struct SyncTask {
     pub created_at: DateTime<Utc>,
 }
 
-/// Edge cache entry entity.
+/// Peer cache entry entity.
 ///
-/// Tracks artifacts cached on edge nodes for LRU eviction
+/// Tracks artifacts cached on peer instances for LRU eviction
 /// and access statistics.
 #[derive(Debug, Clone, FromRow, Serialize)]
-pub struct EdgeCacheEntry {
+pub struct PeerCacheEntry {
     pub id: Uuid,
-    pub edge_node_id: Uuid,
+    pub peer_instance_id: Uuid,
     pub artifact_id: Uuid,
     pub size_bytes: i64,
     pub last_accessed_at: DateTime<Utc>,

@@ -52,6 +52,10 @@ async fn main() -> Result<()> {
     sqlx::migrate!("./migrations").run(&db_pool).await?;
     tracing::info!("Database migrations complete");
 
+    // Initialize peer identity for mesh networking
+    let peer_id = init_peer_identity(&db_pool, &config).await?;
+    tracing::info!("Peer identity: {} ({})", config.peer_instance_name, peer_id);
+
     // Initialize WASM plugin system (T068)
     let plugins_dir =
         PathBuf::from(std::env::var("PLUGINS_DIR").unwrap_or_else(|_| "./plugins".to_string()));
@@ -235,6 +239,63 @@ async fn initialize_wasm_plugins(
     );
 
     Ok((registry, wasm_service))
+}
+
+/// Initialize or retrieve the persistent peer identity for this instance.
+async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::Uuid> {
+    // Check if identity already exists
+    let existing: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT peer_instance_id FROM peer_instance_identity LIMIT 1")
+            .fetch_optional(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    if let Some(id) = existing {
+        // Update name/endpoint in case config changed
+        sqlx::query(
+            "UPDATE peer_instance_identity SET name = $1, endpoint_url = $2, updated_at = NOW()",
+        )
+        .bind(&config.peer_instance_name)
+        .bind(&config.peer_public_endpoint)
+        .execute(db)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+        return Ok(id);
+    }
+
+    // Generate new identity
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO peer_instance_identity (peer_instance_id, name, endpoint_url) VALUES ($1, $2, $3)",
+    )
+    .bind(id)
+    .bind(&config.peer_instance_name)
+    .bind(&config.peer_public_endpoint)
+    .execute(db)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    // Also register this instance in the peer_instances table as is_local=true
+    sqlx::query(
+        r#"
+        INSERT INTO peer_instances (name, endpoint_url, status, api_key, is_local)
+        VALUES ($1, $2, 'online', $3, true)
+        ON CONFLICT (name) DO UPDATE SET
+            endpoint_url = EXCLUDED.endpoint_url,
+            api_key = EXCLUDED.api_key,
+            status = 'online',
+            is_local = true,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&config.peer_instance_name)
+    .bind(&config.peer_public_endpoint)
+    .bind(&config.peer_api_key)
+    .execute(db)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    Ok(id)
 }
 
 /// Load active plugins from the database.
