@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use tower_http::cors::{Any, CorsLayer};
+use axum::http::{header, Method};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -153,12 +154,29 @@ async fn main() -> Result<()> {
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::services::metrics_service::metrics_middleware,
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer({
+            // In production the frontend is served from the same origin, so
+            // credentials + same-origin work without an explicit allow-origin.
+            // In development the Next.js dev server runs on a different port,
+            // so we must whitelist that origin and enable credentials.
+            if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" {
+                let origins: Vec<_> = std::env::var("CORS_ORIGINS")
+                    .unwrap_or_else(|_| "http://localhost:3000".into())
+                    .split(',')
+                    .map(|s| s.trim().parse().expect("invalid CORS origin"))
+                    .collect();
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::list(origins))
+                    .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT, header::COOKIE])
+                    .allow_credentials(true)
+            } else {
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any)
+            }
+        })
         .layer(TraceLayer::new_for_http());
 
     // Start server

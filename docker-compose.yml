@@ -34,6 +34,8 @@ services:
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       TRIVY_URL: http://trivy:8090
       OPENSCAP_URL: http://openscap:8091
       OPENSCAP_PROFILE: ${OPENSCAP_PROFILE:-xccdf_org.ssgproject.content_profile_standard}
