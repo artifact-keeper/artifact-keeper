@@ -4,15 +4,19 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, State},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
 
 /// Create public auth routes (no auth required)
@@ -25,7 +29,9 @@ pub fn public_router() -> Router<SharedState> {
 
 /// Create protected auth routes (auth required)
 pub fn protected_router() -> Router<SharedState> {
-    Router::new().route("/me", get(get_current_user))
+    Router::new()
+        .route("/me", get(get_current_user))
+        .route("/ticket", post(create_download_ticket))
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +51,7 @@ pub struct LoginResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct RefreshTokenRequest {
-    pub refresh_token: String,
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,46 +67,63 @@ pub struct UserResponse {
 pub async fn login(
     State(state): State<SharedState>,
     Json(payload): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>> {
+) -> Result<Response> {
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (user, tokens) = auth_service
         .authenticate(&payload.username, &payload.password)
         .await?;
 
-    Ok(Json(LoginResponse {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
+    let body = LoginResponse {
+        access_token: tokens.access_token.clone(),
+        refresh_token: tokens.refresh_token.clone(),
         expires_in: tokens.expires_in,
         token_type: "Bearer".to_string(),
         must_change_password: user.must_change_password,
-    }))
+    };
+
+    let mut response = Json(body).into_response();
+    set_auth_cookies(response.headers_mut(), &tokens.access_token, &tokens.refresh_token, tokens.expires_in);
+    Ok(response)
 }
 
 /// Logout current session
-pub async fn logout(State(_state): State<SharedState>) -> Result<()> {
-    // JWT tokens are stateless, so logout is handled client-side
-    // For API tokens, the client should delete the token
-    // In a production system, you might maintain a token blacklist
-    Ok(())
+pub async fn logout(State(_state): State<SharedState>) -> Result<Response> {
+    let mut response = ().into_response();
+    let secure_flag = if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" { "" } else { " Secure;" };
+    let clear_access = format!("ak_access_token=; HttpOnly;{} SameSite=Strict; Path=/; Max-Age=0", secure_flag);
+    let clear_refresh = format!("ak_refresh_token=; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth/refresh; Max-Age=0", secure_flag);
+    response.headers_mut().append(SET_COOKIE, clear_access.parse().unwrap());
+    response.headers_mut().append(SET_COOKIE, clear_refresh.parse().unwrap());
+    Ok(response)
 }
 
 /// Refresh access token
 pub async fn refresh_token(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(payload): Json<RefreshTokenRequest>,
-) -> Result<Json<LoginResponse>> {
+) -> Result<Response> {
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (user, tokens) = auth_service.refresh_tokens(&payload.refresh_token).await?;
+    // Try body first, then fall back to cookie
+    let refresh_token_str = payload.refresh_token
+        .or_else(|| extract_cookie(&headers, "ak_refresh_token").map(String::from))
+        .ok_or_else(|| AppError::Authentication("Missing refresh token".into()))?;
 
-    Ok(Json(LoginResponse {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
+    let (user, tokens) = auth_service.refresh_tokens(&refresh_token_str).await?;
+
+    let body = LoginResponse {
+        access_token: tokens.access_token.clone(),
+        refresh_token: tokens.refresh_token.clone(),
         expires_in: tokens.expires_in,
         token_type: "Bearer".to_string(),
         must_change_password: user.must_change_password,
-    }))
+    };
+
+    let mut response = Json(body).into_response();
+    set_auth_cookies(response.headers_mut(), &tokens.access_token, &tokens.refresh_token, tokens.expires_in);
+    Ok(response)
 }
 
 /// Get current user info
@@ -170,6 +193,35 @@ pub async fn create_api_token(
     }))
 }
 
+/// Extract a cookie value by name from request headers.
+pub(crate) fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';')
+                .map(|c| c.trim())
+                .find_map(|c| c.strip_prefix(&format!("{}=", name)))
+        })
+}
+
+/// Set httpOnly auth cookies on a response.
+/// In development mode (ENVIRONMENT=development), the Secure flag is omitted
+/// so cookies work over plain HTTP on localhost.
+pub(crate) fn set_auth_cookies(headers: &mut HeaderMap, access_token: &str, refresh_token: &str, expires_in: u64) {
+    let secure_flag = if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" { "" } else { " Secure;" };
+    let access_cookie = format!(
+        "ak_access_token={}; HttpOnly;{} SameSite=Strict; Path=/; Max-Age={}",
+        access_token, secure_flag, expires_in
+    );
+    let refresh_cookie = format!(
+        "ak_refresh_token={}; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth/refresh; Max-Age={}",
+        refresh_token, secure_flag, 7 * 24 * 3600
+    );
+    headers.append(SET_COOKIE, access_cookie.parse().unwrap());
+    headers.append(SET_COOKIE, refresh_cookie.parse().unwrap());
+}
+
 /// Revoke an API token
 pub async fn revoke_api_token(
     State(state): State<SharedState>,
@@ -183,4 +235,42 @@ pub async fn revoke_api_token(
         .await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Download tickets
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTicketRequest {
+    pub purpose: String,
+    pub resource_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TicketResponse {
+    pub ticket: String,
+    pub expires_in: u64,
+}
+
+/// Create a short-lived, single-use download/stream ticket for the current user.
+/// The ticket can be passed as a `?ticket=` query parameter on endpoints that
+/// cannot use `Authorization` headers (e.g. `<a>` downloads, `EventSource` SSE).
+pub async fn create_download_ticket(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<CreateTicketRequest>,
+) -> Result<Json<TicketResponse>> {
+    let ticket = AuthConfigService::create_download_ticket(
+        &state.db,
+        auth.user_id,
+        &payload.purpose,
+        payload.resource_path.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(TicketResponse {
+        ticket,
+        expires_in: 30,
+    }))
 }

@@ -269,7 +269,7 @@ pub struct LdapTestResult {
 // Encryption key — in production, load from config / env
 // ---------------------------------------------------------------------------
 
-fn encryption_key() -> String {
+pub fn encryption_key() -> String {
     std::env::var("SSO_ENCRYPTION_KEY")
         .or_else(|_| std::env::var("JWT_SECRET"))
         .unwrap_or_else(|_| "artifact-keeper-sso-encryption-key".to_string())
@@ -1268,6 +1268,68 @@ impl AuthConfigService {
                     AppError::Internal(format!("Failed to cleanup exchange codes: {e}"))
                 })?;
 
+        Ok(result.rows_affected())
+    }
+
+    // -----------------------------------------------------------------------
+    // Download Tickets (short-lived, single-use tokens for downloads/streams)
+    // -----------------------------------------------------------------------
+
+    /// Create a short-lived download ticket for a user.
+    /// Tickets expire after 30 seconds and are single-use.
+    pub async fn create_download_ticket(
+        pool: &PgPool,
+        user_id: Uuid,
+        purpose: &str,
+        resource_path: Option<&str>,
+    ) -> Result<String> {
+        let ticket = format!(
+            "{}{}",
+            Uuid::new_v4().to_string().replace('-', ""),
+            Uuid::new_v4().to_string().replace('-', ""),
+        );
+
+        sqlx::query(
+            r#"INSERT INTO download_tickets (ticket, user_id, purpose, resource_path)
+               VALUES ($1, $2, $3, $4)"#,
+        )
+        .bind(&ticket)
+        .bind(user_id)
+        .bind(purpose)
+        .bind(resource_path)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(ticket)
+    }
+
+    /// Validate and consume a download ticket (single-use).
+    /// Returns (user_id, purpose, resource_path) if valid.
+    pub async fn validate_download_ticket(
+        pool: &PgPool,
+        ticket: &str,
+    ) -> Result<(Uuid, String, Option<String>)> {
+        let row: (Uuid, String, Option<String>) = sqlx::query_as(
+            r#"DELETE FROM download_tickets
+               WHERE ticket = $1 AND expires_at > NOW()
+               RETURNING user_id, purpose, resource_path"#,
+        )
+        .bind(ticket)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::Authentication("Invalid or expired download ticket".into()))?;
+
+        Ok(row)
+    }
+
+    /// Clean up expired download tickets. Intended to be called periodically.
+    pub async fn cleanup_expired_download_tickets(pool: &PgPool) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM download_tickets WHERE expires_at < NOW()")
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(result.rows_affected())
     }
 }

@@ -38,6 +38,7 @@ pub mod plugins;
 pub mod pub_registry;
 pub mod puppet;
 pub mod pypi;
+pub mod remote_instances;
 pub mod repositories;
 pub mod rpm;
 pub mod rubygems;

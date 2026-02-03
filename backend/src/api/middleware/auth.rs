@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Request, State},
-    http::{header::AUTHORIZATION, HeaderName, StatusCode},
+    http::{header::{AUTHORIZATION, COOKIE}, HeaderName, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -96,6 +96,20 @@ fn extract_token(request: &Request) -> ExtractedToken<'_> {
         .and_then(|h| h.to_str().ok())
     {
         return ExtractedToken::ApiKey(api_key);
+    }
+
+    // Check cookie as fallback (for browser sessions with httpOnly cookies)
+    if let Some(cookie_header) = request
+        .headers()
+        .get(COOKIE)
+        .and_then(|h| h.to_str().ok())
+    {
+        for cookie in cookie_header.split(';') {
+            let cookie = cookie.trim();
+            if let Some(token) = cookie.strip_prefix("ak_access_token=") {
+                return ExtractedToken::Bearer(token);
+            }
+        }
     }
 
     ExtractedToken::None

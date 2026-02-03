@@ -6,12 +6,14 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    response::Redirect,
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::api::handlers::auth::set_auth_cookies;
 
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -255,7 +257,7 @@ async fn ldap_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Json(req): Json<LdapLoginRequest>,
-) -> Result<Json<serde_json::Value>> {
+) -> Result<Response> {
     // Get decrypted LDAP config
     let (row, bind_password) = AuthConfigService::get_ldap_decrypted(&state.db, id).await?;
 
@@ -292,11 +294,16 @@ async fn ldap_login(
         },
     ).await?;
 
-    Ok(Json(serde_json::json!({
+    let body = serde_json::json!({
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
         "token_type": "Bearer",
-    })))
+    });
+
+    // Default expires_in for LDAP tokens (1 hour = 3600 seconds)
+    let mut response = Json(body).into_response();
+    set_auth_cookies(response.headers_mut(), &tokens.access_token, &tokens.refresh_token, 3600);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -424,15 +431,20 @@ struct ExchangeCodeResponse {
 async fn exchange_code(
     State(state): State<SharedState>,
     Json(req): Json<ExchangeCodeRequest>,
-) -> Result<Json<ExchangeCodeResponse>> {
+) -> Result<Response> {
     let (access_token, refresh_token) =
         AuthConfigService::exchange_code(&state.db, &req.code).await?;
 
-    Ok(Json(ExchangeCodeResponse {
-        access_token,
-        refresh_token,
+    let body = ExchangeCodeResponse {
+        access_token: access_token.clone(),
+        refresh_token: refresh_token.clone(),
         token_type: "Bearer".to_string(),
-    }))
+    };
+
+    // Default expires_in for SSO tokens (1 hour = 3600 seconds)
+    let mut response = Json(body).into_response();
+    set_auth_cookies(response.headers_mut(), &access_token, &refresh_token, 3600);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

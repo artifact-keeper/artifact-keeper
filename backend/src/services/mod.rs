@@ -22,6 +22,7 @@ pub mod plugin_registry;
 pub mod plugin_service;
 pub mod policy_service;
 pub mod proxy_service;
+pub mod remote_instance_service;
 pub mod repository_service;
 pub mod saml_service;
 pub mod scan_config_service;
