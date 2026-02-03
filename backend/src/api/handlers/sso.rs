@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -31,6 +31,7 @@ pub fn router() -> Router<SharedState> {
         .route("/ldap/:id/login", post(ldap_login))
         .route("/saml/:id/login", get(saml_login))
         .route("/saml/:id/acs", post(saml_acs))
+        .route("/exchange", post(exchange_code))
 }
 
 // ---------------------------------------------------------------------------
@@ -224,11 +225,17 @@ async fn oidc_callback(
         )
         .await?;
 
-    // 9. Redirect to frontend with tokens
+    // 9. Create a short-lived exchange code instead of passing raw tokens in the URL
+    let exchange_code = AuthConfigService::create_exchange_code(
+        &state.db,
+        &tokens.access_token,
+        &tokens.refresh_token,
+    )
+    .await?;
+
     let frontend_url = format!(
-        "/auth/callback?token={}&refresh_token={}",
-        urlencoding::encode(&tokens.access_token),
-        urlencoding::encode(&tokens.refresh_token),
+        "/auth/callback?code={}",
+        urlencoding::encode(&exchange_code),
     );
 
     Ok(Redirect::temporary(&frontend_url))
@@ -382,14 +389,50 @@ async fn saml_acs(
         },
     ).await?;
 
-    // Redirect to frontend with tokens
+    // Create a short-lived exchange code instead of passing raw tokens in the URL
+    let exchange_code = AuthConfigService::create_exchange_code(
+        &state.db,
+        &tokens.access_token,
+        &tokens.refresh_token,
+    )
+    .await?;
+
     let frontend_url = format!(
-        "/auth/callback?token={}&refresh_token={}",
-        urlencoding::encode(&tokens.access_token),
-        urlencoding::encode(&tokens.refresh_token),
+        "/auth/callback?code={}",
+        urlencoding::encode(&exchange_code),
     );
 
     Ok(Redirect::temporary(&frontend_url))
+}
+
+// ---------------------------------------------------------------------------
+// Exchange code endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ExchangeCodeRequest {
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExchangeCodeResponse {
+    access_token: String,
+    refresh_token: String,
+    token_type: String,
+}
+
+async fn exchange_code(
+    State(state): State<SharedState>,
+    Json(req): Json<ExchangeCodeRequest>,
+) -> Result<Json<ExchangeCodeResponse>> {
+    let (access_token, refresh_token) =
+        AuthConfigService::exchange_code(&state.db, &req.code).await?;
+
+    Ok(Json(ExchangeCodeResponse {
+        access_token,
+        refresh_token,
+        token_type: "Bearer".to_string(),
+    }))
 }
 
 // ---------------------------------------------------------------------------

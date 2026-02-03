@@ -1198,4 +1198,76 @@ impl AuthConfigService {
 
         Ok(result.rows_affected())
     }
+
+    // -----------------------------------------------------------------------
+    // SSO Exchange Codes (authorization code exchange pattern)
+    // -----------------------------------------------------------------------
+
+    /// Create a short-lived, single-use exchange code that wraps the given
+    /// access and refresh tokens. The frontend will POST this code back to
+    /// exchange it for the real tokens over a secure channel instead of
+    /// receiving raw JWTs in URL query parameters.
+    pub async fn create_exchange_code(
+        pool: &PgPool,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> Result<String> {
+        let code = format!(
+            "{}{}",
+            Uuid::new_v4().to_string().replace('-', ""),
+            Uuid::new_v4().to_string().replace('-', ""),
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO sso_exchange_codes (code, access_token, refresh_token)
+            VALUES ($1, $2, $3)
+            "#,
+        )
+        .bind(&code)
+        .bind(access_token)
+        .bind(refresh_token)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create exchange code: {e}")))?;
+
+        Ok(code)
+    }
+
+    /// Consume a single-use exchange code and return the associated tokens.
+    /// The code is deleted atomically so it cannot be replayed.
+    pub async fn exchange_code(
+        pool: &PgPool,
+        code: &str,
+    ) -> Result<(String, String)> {
+        let row = sqlx::query_as::<_, (String, String)>(
+            r#"
+            DELETE FROM sso_exchange_codes
+            WHERE code = $1 AND expires_at > NOW()
+            RETURNING access_token, refresh_token
+            "#,
+        )
+        .bind(code)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to exchange code: {e}")))?
+        .ok_or_else(|| {
+            AppError::Authentication("Invalid or expired exchange code".to_string())
+        })?;
+
+        Ok(row)
+    }
+
+    /// Remove all expired exchange codes. Intended to be called periodically.
+    pub async fn cleanup_expired_exchange_codes(pool: &PgPool) -> Result<u64> {
+        let result =
+            sqlx::query("DELETE FROM sso_exchange_codes WHERE expires_at < NOW()")
+                .execute(pool)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to cleanup exchange codes: {e}"))
+                })?;
+
+        Ok(result.rows_affected())
+    }
 }
