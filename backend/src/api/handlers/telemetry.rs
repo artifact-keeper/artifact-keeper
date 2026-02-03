@@ -11,7 +11,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::crash_reporting_service::{CrashReport, CrashReportingService, TelemetrySettings};
+use crate::services::crash_reporting_service::{
+    CrashReport, CrashReportingService, TelemetrySettings,
+};
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -23,9 +25,7 @@ pub fn router() -> Router<SharedState> {
 }
 
 /// GET /api/v1/admin/telemetry/settings
-pub async fn get_settings(
-    State(state): State<SharedState>,
-) -> Result<Json<TelemetrySettings>> {
+pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<TelemetrySettings>> {
     let service = CrashReportingService::new(state.db.clone());
     let settings = service.get_settings().await?;
     Ok(Json(settings))

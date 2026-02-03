@@ -628,11 +628,7 @@ impl BackupService {
                 "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table}, $1) ON CONFLICT DO NOTHING"
             );
 
-            match sqlx::query(&query)
-                .bind(row)
-                .execute(&self.db)
-                .await
-            {
+            match sqlx::query(&query).bind(row).execute(&self.db).await {
                 Ok(result) => {
                     restored += result.rows_affected() as usize;
                 }

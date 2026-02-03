@@ -138,10 +138,7 @@ impl LifecycleService {
     }
 
     /// List lifecycle policies, optionally filtered by repository.
-    pub async fn list_policies(
-        &self,
-        repository_id: Option<Uuid>,
-    ) -> Result<Vec<LifecyclePolicy>> {
+    pub async fn list_policies(&self, repository_id: Option<Uuid>) -> Result<Vec<LifecyclePolicy>> {
         let policies = sqlx::query_as::<_, LifecyclePolicy>(
             r#"
             SELECT id, repository_id, name, description, enabled,
@@ -234,11 +231,7 @@ impl LifecycleService {
     }
 
     /// Execute a policy (dry_run=true previews without deleting).
-    pub async fn execute_policy(
-        &self,
-        id: Uuid,
-        dry_run: bool,
-    ) -> Result<PolicyExecutionResult> {
+    pub async fn execute_policy(&self, id: Uuid, dry_run: bool) -> Result<PolicyExecutionResult> {
         let policy = self.get_policy(id).await?;
 
         if !policy.enabled && !dry_run {
@@ -297,7 +290,11 @@ impl LifecycleService {
             match self.execute_policy(policy.id, false).await {
                 Ok(result) => results.push(result),
                 Err(e) => {
-                    tracing::error!("Failed to execute lifecycle policy '{}': {}", policy.name, e);
+                    tracing::error!(
+                        "Failed to execute lifecycle policy '{}': {}",
+                        policy.name,
+                        e
+                    );
                     results.push(PolicyExecutionResult {
                         policy_id: policy.id,
                         policy_name: policy.name,
@@ -325,7 +322,9 @@ impl LifecycleService {
             .config
             .get("days")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| AppError::Validation("max_age_days requires 'days' in config".to_string()))?;
+            .ok_or_else(|| {
+                AppError::Validation("max_age_days requires 'days' in config".to_string())
+            })?;
 
         let matched = if policy.repository_id.is_some() {
             sqlx::query_as::<_, CountBytes>(
@@ -409,7 +408,9 @@ impl LifecycleService {
             .config
             .get("keep")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| AppError::Validation("max_versions requires 'keep' in config".to_string()))?;
+            .ok_or_else(|| {
+                AppError::Validation("max_versions requires 'keep' in config".to_string())
+            })?;
 
         let repo_id = policy.repository_id.ok_or_else(|| {
             AppError::Validation("max_versions requires a repository_id".to_string())
@@ -553,9 +554,7 @@ impl LifecycleService {
             .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                AppError::Validation(
-                    "tag_pattern_delete requires 'pattern' in config".to_string(),
-                )
+                AppError::Validation("tag_pattern_delete requires 'pattern' in config".to_string())
             })?;
 
         let repo_filter = policy.repository_id;
@@ -614,7 +613,9 @@ impl LifecycleService {
             .get("quota_bytes")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| {
-                AppError::Validation("size_quota_bytes requires 'quota_bytes' in config".to_string())
+                AppError::Validation(
+                    "size_quota_bytes requires 'quota_bytes' in config".to_string(),
+                )
             })?;
 
         let repo_id = policy.repository_id.ok_or_else(|| {
@@ -676,13 +677,11 @@ impl LifecycleService {
         let mut removed = 0i64;
 
         if !dry_run && !to_remove.is_empty() {
-            let result = sqlx::query(
-                "UPDATE artifacts SET is_deleted = true WHERE id = ANY($1)",
-            )
-            .bind(&to_remove)
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            let result = sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = ANY($1)")
+                .bind(&to_remove)
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
             removed = result.rows_affected() as i64;
         }
 
@@ -698,11 +697,7 @@ impl LifecycleService {
     }
 
     /// Validate policy config based on type.
-    fn validate_policy_config(
-        &self,
-        policy_type: &str,
-        config: &serde_json::Value,
-    ) -> Result<()> {
+    fn validate_policy_config(&self, policy_type: &str, config: &serde_json::Value) -> Result<()> {
         match policy_type {
             "max_age_days" => {
                 config
@@ -749,9 +744,8 @@ impl LifecycleService {
                         ))
                     })?;
                 // Validate regex
-                regex::Regex::new(pattern).map_err(|e| {
-                    AppError::Validation(format!("Invalid regex pattern: {}", e))
-                })?;
+                regex::Regex::new(pattern)
+                    .map_err(|e| AppError::Validation(format!("Invalid regex pattern: {}", e)))?;
             }
             "size_quota_bytes" => {
                 config

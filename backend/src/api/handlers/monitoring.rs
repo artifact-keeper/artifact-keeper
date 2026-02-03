@@ -43,9 +43,7 @@ pub async fn get_health_log(
 }
 
 /// GET /api/v1/admin/monitoring/alerts
-pub async fn get_alert_states(
-    State(state): State<SharedState>,
-) -> Result<Json<Vec<AlertState>>> {
+pub async fn get_alert_states(State(state): State<SharedState>) -> Result<Json<Vec<AlertState>>> {
     let monitor = HealthMonitorService::new(state.db.clone(), MonitorConfig::default());
     let states = monitor.get_alert_states().await?;
     Ok(Json(states))
