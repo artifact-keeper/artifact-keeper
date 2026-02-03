@@ -110,6 +110,43 @@ impl LdapService {
         })
     }
 
+    /// Create LDAP service from database-stored config
+    pub fn from_db_config(
+        db: PgPool,
+        name: &str,
+        server_url: &str,
+        bind_dn: Option<&str>,
+        bind_password: Option<&str>,
+        user_base_dn: &str,
+        user_filter: &str,
+        username_attr: &str,
+        email_attr: &str,
+        display_name_attr: &str,
+        groups_attr: &str,
+        admin_group_dn: Option<&str>,
+        use_starttls: bool,
+    ) -> Self {
+        let _ = name; // reserved for logging/diagnostics
+        let config = LdapConfig {
+            url: server_url.to_string(),
+            base_dn: user_base_dn.to_string(),
+            user_filter: user_filter.to_string(),
+            bind_dn: bind_dn.map(String::from),
+            bind_password: bind_password.map(String::from),
+            username_attr: username_attr.to_string(),
+            email_attr: email_attr.to_string(),
+            display_name_attr: display_name_attr.to_string(),
+            groups_attr: groups_attr.to_string(),
+            admin_group_dn: admin_group_dn.map(String::from),
+            use_starttls,
+        };
+        Self {
+            db,
+            config,
+            http_client: Client::new(),
+        }
+    }
+
     /// Create LDAP service from explicit config
     pub fn with_config(db: PgPool, config: LdapConfig) -> Self {
         Self {
@@ -300,89 +337,106 @@ impl LdapService {
         pattern.replace("{}", username)
     }
 
-    /// Validate LDAP credentials
-    ///
-    /// This is a placeholder for actual LDAP bind operation.
-    /// In production, implement using ldap3 crate or an LDAP proxy.
+    /// Validate LDAP credentials via real LDAP simple bind.
     async fn validate_ldap_credentials(&self, user_dn: &str, password: &str) -> Result<()> {
-        // In a real implementation, this would perform an LDAP simple bind:
-        //
-        // use ldap3::{LdapConnAsync, drive};
-        // let (conn, mut ldap) = LdapConnAsync::new(&self.config.url).await
-        //     .map_err(|e| AppError::Authentication(format!("LDAP connection failed: {}", e)))?;
-        // drive!(conn);
-        //
-        // if self.config.use_starttls {
-        //     ldap.start_tls().await
-        //         .map_err(|e| AppError::Authentication(format!("STARTTLS failed: {}", e)))?;
-        // }
-        //
-        // let result = ldap.simple_bind(user_dn, password).await
-        //     .map_err(|e| AppError::Authentication(format!("LDAP bind failed: {}", e)))?;
-        //
-        // if result.rc != 0 {
-        //     return Err(AppError::Authentication("Invalid credentials".into()));
-        // }
-        //
-        // ldap.unbind().await.ok();
+        use ldap3::{LdapConnAsync, LdapConnSettings};
+        use std::time::Duration;
 
-        // Placeholder validation - in production, remove this check
-        // and implement actual LDAP bind
-        if password.len() < 4 {
+        let settings = LdapConnSettings::new()
+            .set_conn_timeout(Duration::from_secs(10))
+            .set_starttls(self.config.use_starttls);
+
+        let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
+            .await
+            .map_err(|e| AppError::Authentication(format!("LDAP connection failed: {e}")))?;
+
+        ldap3::drive!(conn);
+
+        let result = ldap.simple_bind(user_dn, password)
+            .await
+            .map_err(|e| AppError::Authentication(format!("LDAP bind failed: {e}")))?;
+
+        if result.rc != 0 {
             return Err(AppError::Authentication("Invalid credentials".into()));
         }
 
-        tracing::debug!(
-            user_dn = %user_dn,
-            ldap_url = %self.config.url,
-            "LDAP bind would be performed here"
-        );
-
+        ldap.unbind().await.ok();
         Ok(())
     }
 
-    /// Get user information from LDAP
-    ///
-    /// This is a placeholder for actual LDAP search operation.
+    /// Get user information from LDAP via real search.
     async fn get_user_info(&self, username: &str, user_dn: &str) -> Result<LdapUserInfo> {
-        // In a real implementation with ldap3:
-        //
-        // let search_filter = self.config.user_filter.replace("{username}", username);
-        // let attrs = vec![
-        //     &self.config.username_attr,
-        //     &self.config.email_attr,
-        //     &self.config.display_name_attr,
-        //     &self.config.groups_attr,
-        // ];
-        //
-        // let (results, _) = ldap.search(
-        //     &self.config.base_dn,
-        //     Scope::Subtree,
-        //     &search_filter,
-        //     attrs,
-        // ).await?.success()?;
-        //
-        // Parse results and extract attributes...
+        use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+        use std::time::Duration;
 
-        // Construct default user info from available data
-        // In production, this would come from LDAP search results
-        let email = std::env::var(format!("LDAP_USER_{}_EMAIL", username.to_uppercase()))
-            .unwrap_or_else(|_| format!("{}@example.com", username));
+        // If we have a bind DN, use search-then-bind
+        // Otherwise return basic info from the DN
+        if let (Some(bind_dn), Some(bind_pw)) = (&self.config.bind_dn, &self.config.bind_password) {
+            let settings = LdapConnSettings::new()
+                .set_conn_timeout(Duration::from_secs(10))
+                .set_starttls(self.config.use_starttls);
 
-        let display_name =
-            std::env::var(format!("LDAP_USER_{}_NAME", username.to_uppercase())).ok();
+            let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
+                .await
+                .map_err(|e| AppError::Internal(format!("LDAP connection failed: {e}")))?;
 
-        let groups: Vec<String> =
-            std::env::var(format!("LDAP_USER_{}_GROUPS", username.to_uppercase()))
-                .map(|g| g.split(',').map(|s| s.trim().to_string()).collect())
-                .unwrap_or_default();
+            ldap3::drive!(conn);
 
+            ldap.simple_bind(bind_dn, bind_pw)
+                .await
+                .map_err(|e| AppError::Internal(format!("Service account bind failed: {e}")))?
+                .success()
+                .map_err(|e| AppError::Internal(format!("Service account bind failed: {e}")))?;
+
+            let search_filter = self.config.user_filter.replace("{username}", username);
+            let attrs = vec![
+                self.config.username_attr.as_str(),
+                self.config.email_attr.as_str(),
+                self.config.display_name_attr.as_str(),
+                self.config.groups_attr.as_str(),
+            ];
+
+            let (results, _) = ldap.search(&self.config.base_dn, Scope::Subtree, &search_filter, attrs)
+                .await
+                .map_err(|e| AppError::Internal(format!("LDAP search failed: {e}")))?
+                .success()
+                .map_err(|e| AppError::Internal(format!("LDAP search failed: {e}")))?;
+
+            ldap.unbind().await.ok();
+
+            if let Some(entry) = results.into_iter().next() {
+                let entry = SearchEntry::construct(entry);
+
+                let email = entry.attrs.get(&self.config.email_attr)
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}@unknown", username));
+
+                let display_name = entry.attrs.get(&self.config.display_name_attr)
+                    .and_then(|v| v.first())
+                    .cloned();
+
+                let groups = entry.attrs.get(&self.config.groups_attr)
+                    .cloned()
+                    .unwrap_or_default();
+
+                return Ok(LdapUserInfo {
+                    dn: entry.dn,
+                    username: username.to_string(),
+                    email,
+                    display_name,
+                    groups,
+                });
+            }
+        }
+
+        // Fallback: construct basic info from the DN
         Ok(LdapUserInfo {
             dn: user_dn.to_string(),
             username: username.to_string(),
-            email,
-            display_name,
-            groups,
+            email: format!("{}@unknown", username),
+            display_name: None,
+            groups: Vec::new(),
         })
     }
 
@@ -444,6 +498,8 @@ mod tests {
             ldap_url: Some("ldap://localhost:389".into()),
             ldap_base_dn: Some("dc=example,dc=com".into()),
             trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
             meilisearch_url: None,
             meilisearch_api_key: None,
             scan_workspace_path: "/scan-workspace".into(),

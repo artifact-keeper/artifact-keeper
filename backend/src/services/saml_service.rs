@@ -174,6 +174,49 @@ impl SamlService {
         })
     }
 
+    /// Create SAML service from database-stored config
+    pub fn from_db_config(
+        db: PgPool,
+        entity_id: &str,
+        sso_url: &str,
+        slo_url: Option<&str>,
+        certificate: Option<&str>,
+        sp_entity_id: &str,
+        acs_url: &str,
+        name_id_format: &str,
+        attribute_mapping: &serde_json::Value,
+        sign_requests: bool,
+        require_signed_assertions: bool,
+        admin_group: Option<&str>,
+    ) -> Self {
+        let _ = (name_id_format, slo_url); // reserved for future use
+        let username_attr = attribute_mapping.get("username").and_then(|v| v.as_str()).unwrap_or("NameID").to_string();
+        let email_attr = attribute_mapping.get("email").and_then(|v| v.as_str()).unwrap_or("email").to_string();
+        let display_name_attr = attribute_mapping.get("display_name").and_then(|v| v.as_str()).unwrap_or("displayName").to_string();
+        let groups_attr = attribute_mapping.get("groups").and_then(|v| v.as_str()).unwrap_or("groups").to_string();
+
+        let config = SamlConfig {
+            idp_metadata_url: None,
+            idp_sso_url: sso_url.to_string(),
+            idp_issuer: entity_id.to_string(),
+            idp_certificate: certificate.map(String::from),
+            sp_entity_id: sp_entity_id.to_string(),
+            acs_url: acs_url.to_string(),
+            username_attr,
+            email_attr,
+            display_name_attr,
+            groups_attr,
+            admin_group: admin_group.map(String::from),
+            sign_requests,
+            require_signed_assertions,
+        };
+        Self {
+            db,
+            config,
+            http_client: Client::new(),
+        }
+    }
+
     /// Create SAML service from explicit config
     pub fn with_config(db: PgPool, config: SamlConfig) -> Self {
         Self {

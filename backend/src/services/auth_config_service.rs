@@ -269,7 +269,11 @@ pub struct LdapTestResult {
 // Encryption key — in production, load from config / env
 // ---------------------------------------------------------------------------
 
-const ENCRYPTION_KEY: &str = "artifact-keeper-sso-encryption-key";
+fn encryption_key() -> String {
+    std::env::var("SSO_&encryption_key()")
+        .or_else(|_| std::env::var("JWT_SECRET"))
+        .unwrap_or_else(|_| "artifact-keeper-sso-encryption-key".to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Service implementation
@@ -337,7 +341,7 @@ impl AuthConfigService {
 
         let encrypted_bytes = hex::decode(&row.client_secret_encrypted)
             .map_err(|e| AppError::Internal(format!("Failed to decode secret hex: {e}")))?;
-        let secret = decrypt_credentials(&encrypted_bytes, ENCRYPTION_KEY)
+        let secret = decrypt_credentials(&encrypted_bytes, &encryption_key())
             .map_err(|e| AppError::Internal(format!("Failed to decrypt secret: {e}")))?;
 
         Ok((row, secret))
@@ -345,7 +349,7 @@ impl AuthConfigService {
 
     pub async fn create_oidc(pool: &PgPool, req: CreateOidcConfigRequest) -> Result<OidcConfigResponse> {
         let id = Uuid::new_v4();
-        let encrypted = encrypt_credentials(&req.client_secret, ENCRYPTION_KEY);
+        let encrypted = encrypt_credentials(&req.client_secret, &encryption_key());
         let encrypted_hex = hex::encode(&encrypted);
         let scopes = req.scopes.unwrap_or_else(|| vec![
             "openid".to_string(),
@@ -412,7 +416,7 @@ impl AuthConfigService {
 
         // Preserve existing encrypted secret if not provided
         let secret_hex = if let Some(new_secret) = &req.client_secret {
-            let encrypted = encrypt_credentials(new_secret, ENCRYPTION_KEY);
+            let encrypted = encrypt_credentials(new_secret, &encryption_key());
             hex::encode(&encrypted)
         } else {
             existing.client_secret_encrypted
@@ -563,7 +567,7 @@ impl AuthConfigService {
             } else {
                 let encrypted_bytes = hex::decode(hex_str)
                     .map_err(|e| AppError::Internal(format!("Failed to decode bind password hex: {e}")))?;
-                let plain = decrypt_credentials(&encrypted_bytes, ENCRYPTION_KEY)
+                let plain = decrypt_credentials(&encrypted_bytes, &encryption_key())
                     .map_err(|e| AppError::Internal(format!("Failed to decrypt bind password: {e}")))?;
                 Some(plain)
             }
@@ -578,7 +582,7 @@ impl AuthConfigService {
         let id = Uuid::new_v4();
 
         let bind_password_hex: Option<String> = req.bind_password.as_ref().map(|pw| {
-            let encrypted = encrypt_credentials(pw, ENCRYPTION_KEY);
+            let encrypted = encrypt_credentials(pw, &encryption_key());
             hex::encode(&encrypted)
         });
 
@@ -670,7 +674,7 @@ impl AuthConfigService {
 
         // Preserve existing encrypted password if not provided
         let bind_password_hex: Option<String> = if let Some(new_pw) = &req.bind_password {
-            let encrypted = encrypt_credentials(new_pw, ENCRYPTION_KEY);
+            let encrypted = encrypt_credentials(new_pw, &encryption_key());
             Some(hex::encode(&encrypted))
         } else {
             existing.bind_password_encrypted
