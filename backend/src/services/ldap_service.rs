@@ -113,7 +113,7 @@ impl LdapService {
     /// Create LDAP service from database-stored config
     pub fn from_db_config(
         db: PgPool,
-        name: &str,
+        _name: &str,
         server_url: &str,
         bind_dn: Option<&str>,
         bind_password: Option<&str>,
@@ -126,7 +126,6 @@ impl LdapService {
         admin_group_dn: Option<&str>,
         use_starttls: bool,
     ) -> Self {
-        let _ = name; // reserved for logging/diagnostics
         let config = LdapConfig {
             url: server_url.to_string(),
             base_dn: user_base_dn.to_string(),

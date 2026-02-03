@@ -16,8 +16,11 @@ use uuid::Uuid;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::AuthProvider;
-use crate::services::auth_config_service::{AuthConfigService, SsoProviderInfo};
+use crate::services::auth_config_service::AuthConfigService;
+use crate::services::auth_config_service::SsoProviderInfo;
 use crate::services::auth_service::{AuthService, FederatedCredentials};
+use crate::services::ldap_service::LdapService;
+use crate::services::saml_service::SamlService;
 
 /// Create public SSO routes (no auth required)
 pub fn router() -> Router<SharedState> {
@@ -59,7 +62,7 @@ async fn oidc_login(
     let state_str = session.state;
     let nonce_str = session.nonce.unwrap_or_default();
 
-    // 4. Fetch OIDC discovery document to find authorization_endpoint
+    // 3. Fetch OIDC discovery document to find authorization_endpoint
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
         row.issuer_url.trim_end_matches('/')
@@ -81,10 +84,10 @@ async fn oidc_login(
             AppError::Internal("OIDC discovery missing authorization_endpoint".into())
         })?;
 
-    // 5. Build redirect_uri (default to our callback endpoint)
+    // 4. Build redirect_uri (default to our callback endpoint)
     let redirect_uri = format!("/api/v1/auth/sso/oidc/{id}/callback");
 
-    // 6. Build authorization URL
+    // 5. Build authorization URL
     let scope = if row.scopes.is_empty() {
         "openid profile email".to_string()
     } else {
@@ -246,9 +249,6 @@ async fn ldap_login(
     Path(id): Path<Uuid>,
     Json(req): Json<LdapLoginRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    use crate::services::auth_config_service::AuthConfigService;
-    use crate::services::ldap_service::LdapService;
-
     // Get decrypted LDAP config
     let (row, bind_password) = AuthConfigService::get_ldap_decrypted(&state.db, id).await?;
 
@@ -300,9 +300,6 @@ async fn saml_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Redirect> {
-    use crate::services::auth_config_service::AuthConfigService;
-    use crate::services::saml_service::SamlService;
-
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
@@ -311,9 +308,6 @@ async fn saml_login(
 
     // Build ACS URL
     let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
-
-    // Parse attribute mapping
-    let attr_mapping = row.attribute_mapping;
 
     // Create SAML service from DB config
     let saml_svc = SamlService::from_db_config(
@@ -325,7 +319,7 @@ async fn saml_login(
         &row.sp_entity_id,
         &acs_url,
         &row.name_id_format,
-        &attr_mapping,
+        &row.attribute_mapping,
         row.sign_requests,
         row.require_signed_assertions,
         row.admin_group.as_deref(),
@@ -350,15 +344,11 @@ async fn saml_acs(
     Path(id): Path<Uuid>,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
 ) -> Result<Redirect> {
-    use crate::services::auth_config_service::AuthConfigService;
-    use crate::services::saml_service::SamlService;
-
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
     // Build ACS URL
     let acs_url = format!("/api/v1/auth/sso/saml/{}/acs", id);
-    let attr_mapping = row.attribute_mapping;
 
     // Create SAML service
     let saml_svc = SamlService::from_db_config(
@@ -370,7 +360,7 @@ async fn saml_acs(
         &row.sp_entity_id,
         &acs_url,
         &row.name_id_format,
-        &attr_mapping,
+        &row.attribute_mapping,
         row.sign_requests,
         row.require_signed_assertions,
         row.admin_group.as_deref(),

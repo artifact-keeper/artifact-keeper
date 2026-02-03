@@ -270,7 +270,7 @@ pub struct LdapTestResult {
 // ---------------------------------------------------------------------------
 
 fn encryption_key() -> String {
-    std::env::var("SSO_&encryption_key()")
+    std::env::var("SSO_ENCRYPTION_KEY")
         .or_else(|_| std::env::var("JWT_SECRET"))
         .unwrap_or_else(|_| "artifact-keeper-sso-encryption-key".to_string())
 }
@@ -561,19 +561,17 @@ impl AuthConfigService {
         .map_err(|e| AppError::Internal(format!("Failed to get LDAP config: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("LDAP config {id} not found")))?;
 
-        let password = if let Some(ref hex_str) = row.bind_password_encrypted {
-            if hex_str.is_empty() {
-                None
-            } else {
+        let password = row
+            .bind_password_encrypted
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|hex_str| {
                 let encrypted_bytes = hex::decode(hex_str)
                     .map_err(|e| AppError::Internal(format!("Failed to decode bind password hex: {e}")))?;
-                let plain = decrypt_credentials(&encrypted_bytes, &encryption_key())
-                    .map_err(|e| AppError::Internal(format!("Failed to decrypt bind password: {e}")))?;
-                Some(plain)
-            }
-        } else {
-            None
-        };
+                decrypt_credentials(&encrypted_bytes, &encryption_key())
+                    .map_err(|e| AppError::Internal(format!("Failed to decrypt bind password: {e}")))
+            })
+            .transpose()?;
 
         Ok((row, password))
     }
@@ -783,32 +781,20 @@ impl AuthConfigService {
         let addr = format!("{host}:{port}");
         let timeout = std::time::Duration::from_secs(5);
 
-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-            Ok(Ok(_stream)) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                Ok(LdapTestResult {
-                    success: true,
-                    message: format!("Successfully connected to {addr}"),
-                    response_time_ms: elapsed,
-                })
-            }
-            Ok(Err(e)) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                Ok(LdapTestResult {
-                    success: false,
-                    message: format!("Connection to {addr} failed: {e}"),
-                    response_time_ms: elapsed,
-                })
-            }
-            Err(_) => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                Ok(LdapTestResult {
-                    success: false,
-                    message: format!("Connection to {addr} timed out after 5s"),
-                    response_time_ms: elapsed,
-                })
-            }
-        }
+        let result = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await;
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        let (success, message) = match result {
+            Ok(Ok(_)) => (true, format!("Successfully connected to {addr}")),
+            Ok(Err(e)) => (false, format!("Connection to {addr} failed: {e}")),
+            Err(_) => (false, format!("Connection to {addr} timed out after 5s")),
+        };
+
+        Ok(LdapTestResult {
+            success,
+            message,
+            response_time_ms: elapsed,
+        })
     }
 
     fn parse_ldap_url(url: &str) -> Result<(String, u16)> {
@@ -902,7 +888,7 @@ impl AuthConfigService {
     }
 
     pub async fn get_saml_decrypted(pool: &PgPool, id: Uuid) -> Result<SamlConfigRow> {
-        let row = sqlx::query_as::<_, SamlConfigRow>(
+        sqlx::query_as::<_, SamlConfigRow>(
             r#"
             SELECT id, name, entity_id, sso_url, slo_url, certificate,
                    name_id_format, attribute_mapping, sp_entity_id,
@@ -916,10 +902,7 @@ impl AuthConfigService {
         .fetch_optional(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to get SAML config: {e}")))?
-        .ok_or_else(|| AppError::NotFound(format!("SAML config {id} not found")))?;
-
-        // Certificate is stored as-is (not encrypted), so just return the row.
-        Ok(row)
+        .ok_or_else(|| AppError::NotFound(format!("SAML config {id} not found")))
     }
 
     pub async fn create_saml(pool: &PgPool, req: CreateSamlConfigRequest) -> Result<SamlConfigResponse> {
@@ -1095,78 +1078,54 @@ impl AuthConfigService {
     pub async fn list_enabled_providers(pool: &PgPool) -> Result<Vec<SsoProviderInfo>> {
         let mut providers: Vec<SsoProviderInfo> = Vec::new();
 
-        // OIDC providers
-        let oidc_rows = sqlx::query_as::<_, OidcConfigRow>(
-            r#"
-            SELECT id, name, issuer_url, client_id, client_secret_encrypted,
-                   scopes, attribute_mapping, is_enabled, auto_create_users,
-                   created_at, updated_at
-            FROM oidc_configs
-            WHERE is_enabled = true
-            ORDER BY name
-            "#,
+        // OIDC providers (only fetch id and name)
+        let oidc_rows = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, name FROM oidc_configs WHERE is_enabled = true ORDER BY name",
         )
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to list OIDC providers: {e}")))?;
 
-        for row in oidc_rows {
+        for (id, name) in oidc_rows {
             providers.push(SsoProviderInfo {
-                id: row.id,
-                name: row.name,
+                login_url: format!("/auth/sso/oidc/{id}/login"),
+                id,
+                name,
                 provider_type: "oidc".to_string(),
-                login_url: format!("/auth/sso/oidc/{}/login", row.id),
             });
         }
 
-        // LDAP providers
-        let ldap_rows = sqlx::query_as::<_, LdapConfigRow>(
-            r#"
-            SELECT id, name, server_url, bind_dn, bind_password_encrypted,
-                   user_base_dn, user_filter, group_base_dn, group_filter,
-                   email_attribute, display_name_attribute, username_attribute,
-                   groups_attribute, admin_group_dn, use_starttls,
-                   is_enabled, priority, created_at, updated_at
-            FROM ldap_configs
-            WHERE is_enabled = true
-            ORDER BY priority, name
-            "#,
+        // LDAP providers (only fetch id and name)
+        let ldap_rows = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, name FROM ldap_configs WHERE is_enabled = true ORDER BY priority, name",
         )
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to list LDAP providers: {e}")))?;
 
-        for row in ldap_rows {
+        for (id, name) in ldap_rows {
             providers.push(SsoProviderInfo {
-                id: row.id,
-                name: row.name,
+                login_url: format!("/auth/sso/ldap/{id}/login"),
+                id,
+                name,
                 provider_type: "ldap".to_string(),
-                login_url: format!("/auth/sso/ldap/{}/login", row.id),
             });
         }
 
-        // SAML providers
-        let saml_rows = sqlx::query_as::<_, SamlConfigRow>(
-            r#"
-            SELECT id, name, entity_id, sso_url, slo_url, certificate,
-                   name_id_format, attribute_mapping, sp_entity_id,
-                   sign_requests, require_signed_assertions, admin_group,
-                   is_enabled, created_at, updated_at
-            FROM saml_configs
-            WHERE is_enabled = true
-            ORDER BY name
-            "#,
+        // SAML providers (only fetch id and name)
+        let saml_rows = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, name FROM saml_configs WHERE is_enabled = true ORDER BY name",
         )
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to list SAML providers: {e}")))?;
 
-        for row in saml_rows {
+        for (id, name) in saml_rows {
             providers.push(SsoProviderInfo {
-                id: row.id,
-                name: row.name,
+                login_url: format!("/auth/sso/saml/{id}/login"),
+                id,
+                name,
                 provider_type: "saml".to_string(),
-                login_url: format!("/auth/sso/saml/{}/login", row.id),
             });
         }
 
