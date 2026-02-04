@@ -237,6 +237,9 @@ docker compose up -d
 
 Open [http://localhost:9080](http://localhost:9080) in your browser.
 
+> **Production:** Set `SITE_ADDRESS=yourdomain.com` in your environment or `.env` file
+> and Caddy will automatically provision TLS certificates via Let's Encrypt.
+
 The admin password is generated on first boot. Retrieve it from the logs:
 
 ```bash

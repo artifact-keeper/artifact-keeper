@@ -119,7 +119,7 @@ services:
       web:
         condition: service_started
     environment:
-      DOMAIN: ${DOMAIN:-localhost}
+      SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost:80}
     ports:
       - "${HTTP_PORT:-9080}:80"
       - "${HTTPS_PORT:-9443}:443"
