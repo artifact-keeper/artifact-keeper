@@ -1,6 +1,6 @@
 ---
 title: "Docker Compose Deployment"
-description: "Production deployment using Docker Compose with PostgreSQL, backend, and frontend services"
+description: "Production deployment using Docker Compose with PostgreSQL, backend, and web dashboard services"
 ---
 
 Deploy Artifact Keeper using Docker Compose for a complete, containerized setup.
@@ -128,9 +128,9 @@ services:
     networks:
       - artifact-keeper
 
-  frontend:
-    image: artifact-keeper/frontend:latest
-    container_name: artifact-keeper-frontend
+  web:
+    image: artifact-keeper/web:latest
+    container_name: artifact-keeper-web
     environment:
       REACT_APP_API_URL: http://localhost:8080
     ports:
@@ -324,8 +324,8 @@ scrape_configs:
 # Build backend
 docker build -t artifact-keeper/backend:latest -f docker/Dockerfile.backend .
 
-# Build frontend
-docker build -t artifact-keeper/frontend:latest -f docker/Dockerfile.frontend .
+# Build web dashboard
+docker build -t artifact-keeper/web:latest -f docker/Dockerfile.web .
 ```
 
 ### Use Pre-built Images
@@ -333,7 +333,7 @@ docker build -t artifact-keeper/frontend:latest -f docker/Dockerfile.frontend .
 ```bash
 # Pull from Docker Hub (when available)
 docker pull artifact-keeper/backend:latest
-docker pull artifact-keeper/frontend:latest
+docker pull artifact-keeper/web:latest
 ```
 
 ## Managing Services
@@ -470,7 +470,7 @@ services:
       - "80:80"
       - "443:443"
     depends_on:
-      - frontend
+      - web
       - backend
     restart: unless-stopped
     networks:
@@ -484,8 +484,8 @@ upstream backend {
     server backend:8080;
 }
 
-upstream frontend {
-    server frontend:80;
+upstream web {
+    server web:80;
 }
 
 server {
@@ -512,7 +512,7 @@ server {
     }
 
     location / {
-        proxy_pass http://frontend;
+        proxy_pass http://web;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
     }
