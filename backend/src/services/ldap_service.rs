@@ -503,6 +503,9 @@ mod tests {
             meilisearch_api_key: None,
             scan_workspace_path: "/scan-workspace".into(),
             demo_mode: false,
+            peer_instance_name: "test".into(),
+            peer_public_endpoint: "http://localhost:8080".into(),
+            peer_api_key: "test-key".into(),
         };
 
         let ldap_config = LdapConfig::from_config(&config);

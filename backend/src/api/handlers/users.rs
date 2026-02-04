@@ -15,6 +15,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::auth_service::AuthService;
+use std::sync::atomic::Ordering;
 
 /// Create user routes
 pub fn router() -> Router<SharedState> {
@@ -586,6 +587,15 @@ pub async fn change_password(
     // Hash new password
     let new_hash = AuthService::hash_password(&payload.new_password)?;
 
+    // Check if this user had must_change_password set (for setup mode unlock)
+    let had_must_change: bool =
+        sqlx::query_scalar("SELECT must_change_password FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .unwrap_or(false);
+
     // Update password and clear must_change_password flag
     let result = sqlx::query!(
         "UPDATE users SET password_hash = $2, must_change_password = false, updated_at = NOW() WHERE id = $1",
@@ -598,6 +608,23 @@ pub async fn change_password(
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("User not found".to_string()));
+    }
+
+    // If this user had must_change_password, check if setup mode should be unlocked
+    if had_must_change && state.setup_required.load(Ordering::Relaxed) {
+        state.setup_required.store(false, Ordering::Relaxed);
+        tracing::info!("Setup complete. API fully unlocked.");
+
+        // Delete the password file (best-effort)
+        let password_file =
+            std::path::Path::new(&state.config.storage_path).join("admin.password");
+        if password_file.exists() {
+            if let Err(e) = std::fs::remove_file(&password_file) {
+                tracing::warn!("Failed to delete admin password file: {}", e);
+            } else {
+                tracing::info!("Deleted admin password file: {}", password_file.display());
+            }
+        }
     }
 
     Ok(())

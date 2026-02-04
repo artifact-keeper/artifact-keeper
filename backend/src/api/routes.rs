@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::handlers;
 use super::middleware::auth::{auth_middleware, optional_auth_middleware};
 use super::middleware::demo::demo_guard;
+use super::middleware::setup::setup_guard;
 use super::SharedState;
 use crate::services::auth_service::AuthService;
 
@@ -77,6 +78,9 @@ pub fn create_router(state: SharedState) -> Router {
         // VS Code Extension Marketplace API
         .nest("/vscode", handlers::vscode::router());
 
+    // Apply setup guard (locks API until admin password is changed)
+    router = router.layer(middleware::from_fn_with_state(state.clone(), setup_guard));
+
     // Apply demo mode guard if enabled
     if state.config.demo_mode {
         tracing::info!("Demo mode enabled — write operations will be blocked");
@@ -95,6 +99,8 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     ));
 
     Router::new()
+        // Setup status (public, no auth)
+        .nest("/setup", handlers::auth::setup_router())
         // Auth routes - split into public and protected
         .nest("/auth", handlers::auth::public_router())
         .nest("/auth/sso", handlers::sso::router())

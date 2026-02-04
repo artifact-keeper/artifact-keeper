@@ -240,10 +240,32 @@ Open [http://localhost:30080](http://localhost:30080) in your browser.
 > **Production:** Set `SITE_ADDRESS=yourdomain.com` in your environment or `.env` file
 > and Caddy will automatically provision TLS certificates via Let's Encrypt.
 
-Default credentials: **admin** / **admin**
+On first boot, a random admin password is generated and written to a file inside the container:
 
-> **Important:** Change the default password after first login. For production,
-> set `ADMIN_PASSWORD` in your `.env` file or `docker-compose.yml`.
+```bash
+docker exec artifact-keeper-backend cat /data/storage/admin.password
+```
+
+The API is **locked** until you change this password. Log in and change it to unlock:
+
+```bash
+# Login
+TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<password-from-file>"}' | jq -r '.access_token')
+
+# Get your user ID
+USER_ID=$(curl -s http://localhost:30080/api/v1/auth/me \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.id')
+
+# Change password (unlocks the API)
+curl -X POST "http://localhost:30080/api/v1/users/$USER_ID/password" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"new_password":"your-secure-password"}'
+```
+
+> **Tip:** To skip the setup lock, set `ADMIN_PASSWORD=yourpass` in your `.env` file before starting.
 
 #### What starts
 
@@ -259,17 +281,11 @@ Default credentials: **admin** / **admin**
 #### Verify it's working
 
 ```bash
-# Health check
+# Health check (always works, even during setup lock)
 curl http://localhost:30080/health
 
-# Login and get a token
-TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin"}' | jq -r '.token')
-
-# List repositories
-curl -s http://localhost:30080/api/v1/repositories \
-  -H "Authorization: Bearer $TOKEN" | jq
+# Check setup status
+curl http://localhost:30080/api/v1/setup/status
 ```
 
 ### Manual Build
