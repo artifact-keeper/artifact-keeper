@@ -338,26 +338,33 @@ async fn provision_admin_user(db: &sqlx::PgPool) -> Result<()> {
         return Ok(());
     }
 
-    // Generate a 20-character random password
-    const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
-    let mut rng = rand::rng();
-    let password: String = (0..20)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
+    // Use ADMIN_PASSWORD env var if set, otherwise generate a random one
+    let (password, must_change) = match std::env::var("ADMIN_PASSWORD") {
+        Ok(p) if !p.is_empty() => (p, false),
+        _ => {
+            const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
+            let mut rng = rand::rng();
+            let p: String = (0..20)
+                .map(|_| {
+                    let idx = rng.random_range(0..CHARSET.len());
+                    CHARSET[idx] as char
+                })
+                .collect();
+            (p, true)
+        }
+    };
 
     let password_hash = AuthService::hash_password(&password)?;
 
     sqlx::query(
         r#"
         INSERT INTO users (username, email, password_hash, is_admin, must_change_password)
-        VALUES ('admin', 'admin@localhost', $1, true, true)
+        VALUES ('admin', 'admin@localhost', $1, true, $2)
         ON CONFLICT (username) DO NOTHING
         "#,
     )
     .bind(&password_hash)
+    .bind(must_change)
     .execute(db)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
@@ -374,7 +381,7 @@ async fn provision_admin_user(db: &sqlx::PgPool) -> Result<()> {
         ║   on first login.                                        ║\n\
         ║                                                          ║\n\
         ╚══════════════════════════════════════════════════════════╝",
-        password
+        if must_change { &password } else { "***set via ADMIN_PASSWORD***" }
     );
 
     Ok(())

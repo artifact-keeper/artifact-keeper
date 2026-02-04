@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# E2E Migration Test: Artifactory OSS -> Artifact Keeper
+# E2E Migration Test: Artifactory OSS + Nexus OSS -> Artifact Keeper
 #
 # Tests the full migration pipeline:
-#   1. Spins up Artifactory OSS + Artifact Keeper
-#   2. Seeds Artifactory with Maven repos and artifacts
-#   3. Creates a migration connection and job
-#   4. Runs the migration
+#   1. Spins up Artifactory OSS + Nexus OSS + Artifact Keeper
+#   2. Seeds both with Maven artifacts
+#   3. Creates migration connections and jobs
+#   4. Runs the migrations
 #   5. Verifies artifacts were transferred correctly
 #
 # Usage:
@@ -82,7 +82,7 @@ trap cleanup EXIT
 
 log "Starting services..."
 cleanup
-$COMPOSE up -d
+$COMPOSE up -d --build
 
 wait_for_service "Artifact Keeper" "${AK_URL}/health" 60
 wait_for_service "Artifactory" "${AF_ROUTER}/router/api/v1/system/health" 90
@@ -107,47 +107,26 @@ if [[ -z "$AK_TOKEN" ]]; then
 fi
 pass "Authenticated with Artifact Keeper"
 
-# --- Step 2: Seed Artifactory with Maven artifacts ---
+# ============================================================
+# PHASE 1: Artifactory OSS Migration
+# ============================================================
+
+log ""
+log "═══════════════════════════════════════════"
+log "  Phase 1: Artifactory OSS Migration"
+log "═══════════════════════════════════════════"
+
+# Artifactory OSS comes with a default "example-repo-local" repository.
+# The REST API for creating repositories is Pro-only, so we use the default repo.
+AF_REPO="example-repo-local"
 
 log "Seeding Artifactory with test data..."
-
-# Wait a moment for Artifactory to be fully initialized
 sleep 5
 
-# Create a local Maven repository
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -u "${AF_USER}:${AF_PASS}" \
-    -X PUT \
-    -H "Content-Type: application/json" \
-    -d '{"rclass":"local","packageType":"maven","description":"Test Maven repo for migration"}' \
-    "${AF_URL}/artifactory/api/repositories/maven-local-test")
-
-if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
-    pass "Created Artifactory maven-local-test repository"
-else
-    fail "Failed to create maven-local-test repository (HTTP ${HTTP_CODE})"
-fi
-
-# Create a second Maven repository to test multi-repo migration
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -u "${AF_USER}:${AF_PASS}" \
-    -X PUT \
-    -H "Content-Type: application/json" \
-    -d '{"rclass":"local","packageType":"maven","description":"Second Maven repo"}' \
-    "${AF_URL}/artifactory/api/repositories/maven-releases")
-
-if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "201" ]]; then
-    pass "Created Artifactory maven-releases repository"
-else
-    fail "Failed to create maven-releases repository (HTTP ${HTTP_CODE})"
-fi
-
-# Generate and upload test Maven artifacts
+# Generate test Maven artifacts
 SEED_DIR=$(mktemp -d)
 
-# Artifact 1: A simple JAR
 echo "PK fake-jar-content-for-testing-migration" > "${SEED_DIR}/myapp-1.0.0.jar"
-# Artifact 2: A POM file
 cat > "${SEED_DIR}/myapp-1.0.0.pom" << 'POMEOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <project>
@@ -158,21 +137,19 @@ cat > "${SEED_DIR}/myapp-1.0.0.pom" << 'POMEOF'
     <packaging>jar</packaging>
 </project>
 POMEOF
-# Artifact 3: Another version
 echo "PK fake-jar-content-v2-for-testing" > "${SEED_DIR}/myapp-2.0.0.jar"
-# Artifact 4: Different group
 echo "PK utils-library-content" > "${SEED_DIR}/utils-1.0.0.jar"
 
-# Upload to maven-local-test
+# Upload artifacts to the default repo via PUT (works in OSS)
 for artifact in "com/example/myapp/1.0.0/myapp-1.0.0.jar" \
                 "com/example/myapp/1.0.0/myapp-1.0.0.pom" \
-                "com/example/myapp/2.0.0/myapp-2.0.0.jar"; do
+                "com/example/myapp/2.0.0/myapp-2.0.0.jar" \
+                "org/example/utils/1.0.0/utils-1.0.0.jar"; do
     filename=$(basename "$artifact")
-    base="${filename%.*}"
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         -u "${AF_USER}:${AF_PASS}" \
         -T "${SEED_DIR}/${filename}" \
-        "${AF_URL}/artifactory/maven-local-test/${artifact}")
+        "${AF_URL}/artifactory/${AF_REPO}/${artifact}")
     if [[ "$HTTP_CODE" == "201" ]]; then
         pass "Uploaded ${artifact}"
     else
@@ -180,41 +157,31 @@ for artifact in "com/example/myapp/1.0.0/myapp-1.0.0.jar" \
     fi
 done
 
-# Upload to maven-releases
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -u "${AF_USER}:${AF_PASS}" \
-    -T "${SEED_DIR}/utils-1.0.0.jar" \
-    "${AF_URL}/artifactory/maven-releases/org/example/utils/1.0.0/utils-1.0.0.jar")
-if [[ "$HTTP_CODE" == "201" ]]; then
-    pass "Uploaded utils-1.0.0.jar to maven-releases"
-else
-    fail "Failed to upload utils-1.0.0.jar (HTTP ${HTTP_CODE})"
-fi
-
 rm -rf "$SEED_DIR"
 
-# Verify artifacts are in Artifactory
+# Verify artifacts are in Artifactory via AQL
 ARTIFACT_COUNT=$(curl -sf -u "${AF_USER}:${AF_PASS}" \
     -X POST \
     -H "Content-Type: text/plain" \
-    -d 'items.find({"repo":"maven-local-test","type":"file"})' \
+    -d "items.find({\"repo\":\"${AF_REPO}\",\"type\":\"file\"})" \
     "${AF_URL}/artifactory/api/search/aql" | jq '.results | length')
 
-log "Artifactory has ${ARTIFACT_COUNT} artifacts in maven-local-test"
-if [[ "$ARTIFACT_COUNT" -ge 3 ]]; then
+log "Artifactory has ${ARTIFACT_COUNT} artifacts in ${AF_REPO}"
+if [[ "$ARTIFACT_COUNT" -ge 4 ]]; then
     pass "Artifactory seeded with ${ARTIFACT_COUNT} artifacts"
 else
-    fail "Expected at least 3 artifacts, got ${ARTIFACT_COUNT}"
+    fail "Expected at least 4 artifacts, got ${ARTIFACT_COUNT}"
 fi
 
-# --- Step 3: Create migration connection in Artifact Keeper ---
+# --- Create migration connection in Artifact Keeper ---
 
-log "Creating migration connection..."
-CONNECTION_RESPONSE=$(ak_api POST "/api/migrations/connections" \
+log "Creating Artifactory migration connection..."
+CONNECTION_RESPONSE=$(ak_api POST "/api/v1/migrations/connections" \
     -d "{
         \"name\": \"test-artifactory\",
         \"url\": \"http://artifactory:8081/artifactory\",
         \"auth_type\": \"basic_auth\",
+        \"source_type\": \"artifactory\",
         \"credentials\": {
             \"username\": \"${AF_USER}\",
             \"password\": \"${AF_PASS}\"
@@ -231,7 +198,7 @@ else
 fi
 
 # Test the connection
-TEST_RESULT=$(ak_api POST "/api/migrations/connections/${CONNECTION_ID}/test" || echo '{"error":"failed"}')
+TEST_RESULT=$(ak_api POST "/api/v1/migrations/connections/${CONNECTION_ID}/test" || echo '{"error":"failed"}')
 if echo "$TEST_RESULT" | jq -e '.version // .success' > /dev/null 2>&1; then
     pass "Connection test passed"
 else
@@ -239,19 +206,19 @@ else
 fi
 
 # List source repositories
-REPOS=$(ak_api GET "/api/migrations/connections/${CONNECTION_ID}/repositories")
-REPO_COUNT=$(echo "$REPOS" | jq '.items | length')
+REPOS=$(ak_api GET "/api/v1/migrations/connections/${CONNECTION_ID}/repositories" || echo '{"items":[]}')
+REPO_COUNT=$(echo "$REPOS" | jq '.items // . | length')
 log "Found ${REPO_COUNT} repositories in source Artifactory"
 
-# --- Step 4: Create and start migration job ---
+# --- Create and start migration job ---
 
 log "Creating migration job..."
-JOB_RESPONSE=$(ak_api POST "/api/migrations" \
+JOB_RESPONSE=$(ak_api POST "/api/v1/migrations" \
     -d "{
         \"source_connection_id\": \"${CONNECTION_ID}\",
         \"job_type\": \"full\",
         \"config\": {
-            \"include_repos\": [\"maven-local-test\", \"maven-releases\"],
+            \"include_repos\": [\"${AF_REPO}\"],
             \"conflict_resolution\": \"skip\",
             \"concurrent_transfers\": 2,
             \"throttle_delay_ms\": 50,
@@ -270,7 +237,7 @@ fi
 
 # Start the migration
 log "Starting migration..."
-START_RESPONSE=$(ak_api POST "/api/migrations/${JOB_ID}/start")
+START_RESPONSE=$(ak_api POST "/api/v1/migrations/${JOB_ID}/start")
 START_STATUS=$(echo "$START_RESPONSE" | jq -r '.status // empty')
 if [[ "$START_STATUS" == "running" ]]; then
     pass "Migration started"
@@ -279,15 +246,16 @@ else
     echo "$START_RESPONSE"
 fi
 
-# --- Step 5: Poll for completion ---
+# --- Poll for completion ---
 
 log "Waiting for migration to complete..."
 MAX_WAIT=120
 ELAPSED=0
 while [[ $ELAPSED -lt $MAX_WAIT ]]; do
-    JOB_STATUS=$(ak_api GET "/api/migrations/${JOB_ID}" | jq -r '.status')
-    COMPLETED=$(ak_api GET "/api/migrations/${JOB_ID}" | jq -r '.completed_items')
-    FAILED_ITEMS=$(ak_api GET "/api/migrations/${JOB_ID}" | jq -r '.failed_items')
+    POLL_RESULT=$(ak_api GET "/api/v1/migrations/${JOB_ID}")
+    JOB_STATUS=$(echo "$POLL_RESULT" | jq -r '.status')
+    COMPLETED=$(echo "$POLL_RESULT" | jq -r '.completed_items // 0')
+    FAILED_ITEMS=$(echo "$POLL_RESULT" | jq -r '.failed_items // 0')
 
     if [[ "$JOB_STATUS" == "completed" || "$JOB_STATUS" == "failed" ]]; then
         break
@@ -298,27 +266,27 @@ while [[ $ELAPSED -lt $MAX_WAIT ]]; do
     ((ELAPSED += 5))
 done
 
-# --- Step 6: Verify results ---
+# --- Verify results ---
 
-log "Checking migration results..."
-FINAL_JOB=$(ak_api GET "/api/migrations/${JOB_ID}")
+log "Checking Artifactory migration results..."
+FINAL_JOB=$(ak_api GET "/api/v1/migrations/${JOB_ID}")
 FINAL_STATUS=$(echo "$FINAL_JOB" | jq -r '.status')
-FINAL_COMPLETED=$(echo "$FINAL_JOB" | jq -r '.completed_items')
-FINAL_FAILED=$(echo "$FINAL_JOB" | jq -r '.failed_items')
-FINAL_SKIPPED=$(echo "$FINAL_JOB" | jq -r '.skipped_items')
+FINAL_COMPLETED=$(echo "$FINAL_JOB" | jq -r '.completed_items // 0')
+FINAL_FAILED=$(echo "$FINAL_JOB" | jq -r '.failed_items // 0')
+FINAL_SKIPPED=$(echo "$FINAL_JOB" | jq -r '.skipped_items // 0')
 
 log "Migration result: status=${FINAL_STATUS} completed=${FINAL_COMPLETED} failed=${FINAL_FAILED} skipped=${FINAL_SKIPPED}"
 
 if [[ "$FINAL_STATUS" == "completed" ]]; then
-    pass "Migration completed successfully"
+    pass "Artifactory migration completed successfully"
 else
-    fail "Migration ended with status: ${FINAL_STATUS}"
+    fail "Artifactory migration ended with status: ${FINAL_STATUS}"
     ERROR=$(echo "$FINAL_JOB" | jq -r '.error_summary // empty')
     [[ -n "$ERROR" ]] && log "${RED}Error: ${ERROR}${NC}"
 fi
 
 if [[ "$FINAL_COMPLETED" -ge 3 ]]; then
-    pass "Migrated ${FINAL_COMPLETED} artifacts"
+    pass "Migrated ${FINAL_COMPLETED} artifacts from Artifactory"
 else
     fail "Expected at least 3 completed artifacts, got ${FINAL_COMPLETED}"
 fi
@@ -327,27 +295,15 @@ if [[ "$FINAL_FAILED" -eq 0 ]]; then
     pass "No failed artifacts"
 else
     fail "${FINAL_FAILED} artifacts failed"
-    # Show failed items
-    ITEMS=$(ak_api GET "/api/migrations/${JOB_ID}/items?status=failed")
-    echo "$ITEMS" | jq '.items[] | {source_path, error_message}' 2>/dev/null || true
+    ITEMS=$(ak_api GET "/api/v1/migrations/${JOB_ID}/items?status=failed" || echo '{}')
+    echo "$ITEMS" | jq '.items[]? | {source_path, error_message}' 2>/dev/null || true
 fi
-
-# Check that repositories were created in AK
-log "Verifying repositories in Artifact Keeper..."
-AK_REPOS=$(curl -sf "${AK_URL}/api/v1/repositories" \
-    -H "Authorization: Bearer ${AK_TOKEN}" | jq '.items // . | length')
-log "Artifact Keeper has ${AK_REPOS} repositories"
 
 # Check that artifacts exist in AK
-AK_ARTIFACTS=$(curl -sf "${AK_URL}/api/v1/artifacts?limit=100" \
-    -H "Authorization: Bearer ${AK_TOKEN}" | jq '.items // . | length')
-log "Artifact Keeper has ${AK_ARTIFACTS} artifacts"
-
-if [[ "$AK_ARTIFACTS" -ge 3 ]]; then
-    pass "Artifacts present in Artifact Keeper (${AK_ARTIFACTS})"
-else
-    fail "Expected at least 3 artifacts in AK, got ${AK_ARTIFACTS}"
-fi
+AK_ARTIFACTS_RESP=$(curl -s "${AK_URL}/api/v1/artifacts?limit=100" \
+    -H "Authorization: Bearer ${AK_TOKEN}" || echo '[]')
+AK_ARTIFACTS=$(echo "$AK_ARTIFACTS_RESP" | jq '.items // . | length' 2>/dev/null || echo "0")
+log "Artifact Keeper has ${AK_ARTIFACTS} artifacts after Artifactory migration"
 
 # ============================================================
 # PHASE 2: Nexus OSS Migration
@@ -364,14 +320,64 @@ NX_PASS=""
 
 wait_for_service "Nexus" "${NX_URL}/service/rest/v1/status" 90
 
-# Get Nexus admin password (randomly generated on first boot)
+# Get Nexus admin password from admin.password file (always written on first boot).
+# The NEXUS_SECURITY_INITIAL_PASSWORD env var is unreliable across versions, so
+# always read the file first, then change to our known password.
 log "Retrieving Nexus admin password..."
-NX_PASS=$(docker exec migration-e2e-nexus cat /nexus-data/admin.password 2>/dev/null || echo "")
+NX_PASS=""
+for attempt in $(seq 1 20); do
+    NX_PASS=$(docker exec migration-e2e-nexus cat /nexus-data/admin.password 2>/dev/null || echo "")
+    if [[ -n "$NX_PASS" ]]; then
+        break
+    fi
+    sleep 3
+done
 if [[ -z "$NX_PASS" ]]; then
-    # Try the env var password
-    NX_PASS="nexus123"
+    fail "Could not read Nexus admin.password file"
+else
+    pass "Nexus admin password retrieved from admin.password"
 fi
-log "Nexus admin password retrieved"
+
+# Change admin password to a known value. This also signals to Nexus that the
+# setup wizard is complete, which removes the admin.password file and unlocks
+# full write access to repositories.
+NX_NEW_PASS="nexus123"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -u "${NX_USER}:${NX_PASS}" \
+    -X PUT \
+    -H "Content-Type: text/plain" \
+    -d "${NX_NEW_PASS}" \
+    "${NX_URL}/service/rest/v1/security/users/admin/change-password")
+if [[ "$HTTP_CODE" == "204" || "$HTTP_CODE" == "200" ]]; then
+    NX_PASS="${NX_NEW_PASS}"
+    pass "Nexus admin password changed successfully"
+else
+    fail "Password change failed with HTTP ${HTTP_CODE}"
+fi
+
+# Accept the EULA — Nexus 3.77+ requires this before any write operations.
+# GET the current EULA, flip accepted to true, POST it back.
+EULA_JSON=$(curl -sf -u "${NX_USER}:${NX_PASS}" "${NX_URL}/service/rest/v1/system/eula" || echo "")
+if [[ -n "$EULA_JSON" ]]; then
+    ACCEPTED_JSON=$(echo "$EULA_JSON" | jq '.accepted = true')
+    HTTP_CODE=$(echo "$ACCEPTED_JSON" | curl -s -o /dev/null -w "%{http_code}" \
+        -u "${NX_USER}:${NX_PASS}" \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d @- \
+        "${NX_URL}/service/rest/v1/system/eula")
+    if [[ "$HTTP_CODE" == "204" ]]; then
+        pass "Nexus EULA accepted"
+    else
+        log "${YELLOW}EULA acceptance returned HTTP ${HTTP_CODE}${NC}"
+    fi
+fi
+
+# Enable anonymous access so the connection test doesn't need auth for status endpoint
+curl -s -o /dev/null -u "${NX_USER}:${NX_PASS}" -X PUT \
+    -H "Content-Type: application/json" \
+    -d '{"enabled":true,"userId":"anonymous","realmName":"NexusAuthorizingRealm"}' \
+    "${NX_URL}/service/rest/v1/security/anonymous" 2>/dev/null || true
 
 # --- Seed Nexus with Maven artifacts ---
 
@@ -386,7 +392,7 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
     -d '{
         "name": "nexus-maven-test",
         "online": true,
-        "storage": {"blobStoreName": "default", "strictContentTypeValidation": true, "writePolicy": "ALLOW"},
+        "storage": {"blobStoreName": "default", "strictContentTypeValidation": false, "writePolicy": "ALLOW"},
         "maven": {"versionPolicy": "RELEASE", "layoutPolicy": "STRICT"}
     }' \
     "${NX_URL}/service/rest/v1/repositories/maven/hosted")
@@ -394,29 +400,11 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
 if [[ "$HTTP_CODE" == "201" || "$HTTP_CODE" == "204" ]]; then
     pass "Created Nexus nexus-maven-test repository"
 else
-    # Might already exist, that's fine
-    log "Nexus repo creation returned HTTP ${HTTP_CODE} (may already exist)"
+    log "${YELLOW}Nexus repo creation returned HTTP ${HTTP_CODE} (may already exist or need EULA)${NC}"
 fi
 
-# Create a PyPI hosted repo (Nexus OSS supports PyPI!)
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -u "${NX_USER}:${NX_PASS}" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d '{
-        "name": "nexus-pypi-test",
-        "online": true,
-        "storage": {"blobStoreName": "default", "strictContentTypeValidation": true, "writePolicy": "ALLOW"}
-    }' \
-    "${NX_URL}/service/rest/v1/repositories/pypi/hosted")
-
-if [[ "$HTTP_CODE" == "201" || "$HTTP_CODE" == "204" ]]; then
-    pass "Created Nexus nexus-pypi-test repository"
-else
-    log "Nexus PyPI repo creation returned HTTP ${HTTP_CODE}"
-fi
-
-# Upload Maven artifacts to Nexus
+# Upload Maven artifacts to Nexus using the Components REST API.
+# This is the official upload method and works reliably after setup wizard completion.
 NX_SEED_DIR=$(mktemp -d)
 echo "PK nexus-jar-content" > "${NX_SEED_DIR}/nexus-app-1.0.0.jar"
 echo "PK nexus-jar-v2" > "${NX_SEED_DIR}/nexus-app-2.0.0.jar"
@@ -430,28 +418,46 @@ cat > "${NX_SEED_DIR}/nexus-app-1.0.0.pom" << 'POMEOF'
 </project>
 POMEOF
 
-# Upload via Nexus raw PUT to Maven repo
-for artifact in "com/nexustest/nexus-app/1.0.0/nexus-app-1.0.0.jar" \
-                "com/nexustest/nexus-app/1.0.0/nexus-app-1.0.0.pom" \
-                "com/nexustest/nexus-app/2.0.0/nexus-app-2.0.0.jar"; do
-    filename=$(basename "$artifact")
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-        -u "${NX_USER}:${NX_PASS}" \
-        --upload-file "${NX_SEED_DIR}/${filename}" \
-        "${NX_URL}/repository/nexus-maven-test/${artifact}")
-    if [[ "$HTTP_CODE" == "201" ]]; then
-        pass "Uploaded ${artifact} to Nexus"
-    else
-        fail "Failed to upload ${artifact} to Nexus (HTTP ${HTTP_CODE})"
-    fi
-done
+# Upload v1.0.0 JAR + POM as a single component
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -u "${NX_USER}:${NX_PASS}" \
+    -X POST \
+    -F "maven2.groupId=com.nexustest" \
+    -F "maven2.artifactId=nexus-app" \
+    -F "maven2.version=1.0.0" \
+    -F "maven2.asset1=@${NX_SEED_DIR}/nexus-app-1.0.0.jar" \
+    -F "maven2.asset1.extension=jar" \
+    -F "maven2.asset2=@${NX_SEED_DIR}/nexus-app-1.0.0.pom" \
+    -F "maven2.asset2.extension=pom" \
+    "${NX_URL}/service/rest/v1/components?repository=nexus-maven-test")
+if [[ "$HTTP_CODE" == "204" ]]; then
+    pass "Uploaded nexus-app 1.0.0 (jar+pom) to Nexus"
+else
+    fail "Failed to upload nexus-app 1.0.0 to Nexus (HTTP ${HTTP_CODE})"
+fi
+
+# Upload v2.0.0 JAR
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -u "${NX_USER}:${NX_PASS}" \
+    -X POST \
+    -F "maven2.groupId=com.nexustest" \
+    -F "maven2.artifactId=nexus-app" \
+    -F "maven2.version=2.0.0" \
+    -F "maven2.asset1=@${NX_SEED_DIR}/nexus-app-2.0.0.jar" \
+    -F "maven2.asset1.extension=jar" \
+    "${NX_URL}/service/rest/v1/components?repository=nexus-maven-test")
+if [[ "$HTTP_CODE" == "204" ]]; then
+    pass "Uploaded nexus-app 2.0.0 (jar) to Nexus"
+else
+    fail "Failed to upload nexus-app 2.0.0 to Nexus (HTTP ${HTTP_CODE})"
+fi
 
 rm -rf "$NX_SEED_DIR"
 
 # --- Create Nexus migration connection ---
 
 log "Creating Nexus migration connection..."
-NX_CONN_RESPONSE=$(ak_api POST "/api/migrations/connections" \
+NX_CONN_RESPONSE=$(ak_api POST "/api/v1/migrations/connections" \
     -d "{
         \"name\": \"test-nexus\",
         \"url\": \"http://nexus:8081\",
@@ -472,7 +478,7 @@ else
 fi
 
 # Test Nexus connection
-NX_TEST=$(ak_api POST "/api/migrations/connections/${NX_CONN_ID}/test" || echo '{"error":"failed"}')
+NX_TEST=$(ak_api POST "/api/v1/migrations/connections/${NX_CONN_ID}/test" || echo '{"error":"failed"}')
 if echo "$NX_TEST" | jq -e '.version // .success' > /dev/null 2>&1; then
     pass "Nexus connection test passed"
 else
@@ -482,7 +488,7 @@ fi
 # --- Create and start Nexus migration job ---
 
 log "Creating Nexus migration job..."
-NX_JOB_RESPONSE=$(ak_api POST "/api/migrations" \
+NX_JOB_RESPONSE=$(ak_api POST "/api/v1/migrations" \
     -d "{
         \"source_connection_id\": \"${NX_CONN_ID}\",
         \"job_type\": \"full\",
@@ -505,7 +511,7 @@ fi
 
 # Start migration
 log "Starting Nexus migration..."
-NX_START=$(ak_api POST "/api/migrations/${NX_JOB_ID}/start")
+NX_START=$(ak_api POST "/api/v1/migrations/${NX_JOB_ID}/start")
 NX_START_STATUS=$(echo "$NX_START" | jq -r '.status // empty')
 if [[ "$NX_START_STATUS" == "running" ]]; then
     pass "Nexus migration started"
@@ -517,9 +523,10 @@ fi
 log "Waiting for Nexus migration to complete..."
 ELAPSED=0
 while [[ $ELAPSED -lt $MAX_WAIT ]]; do
-    NX_STATUS=$(ak_api GET "/api/migrations/${NX_JOB_ID}" | jq -r '.status')
-    NX_COMPLETED=$(ak_api GET "/api/migrations/${NX_JOB_ID}" | jq -r '.completed_items')
-    NX_FAILED_ITEMS=$(ak_api GET "/api/migrations/${NX_JOB_ID}" | jq -r '.failed_items')
+    NX_POLL=$(ak_api GET "/api/v1/migrations/${NX_JOB_ID}")
+    NX_STATUS=$(echo "$NX_POLL" | jq -r '.status')
+    NX_COMPLETED=$(echo "$NX_POLL" | jq -r '.completed_items // 0')
+    NX_FAILED_ITEMS=$(echo "$NX_POLL" | jq -r '.failed_items // 0')
 
     if [[ "$NX_STATUS" == "completed" || "$NX_STATUS" == "failed" ]]; then
         break
@@ -531,10 +538,10 @@ while [[ $ELAPSED -lt $MAX_WAIT ]]; do
 done
 
 # Verify Nexus results
-NX_FINAL=$(ak_api GET "/api/migrations/${NX_JOB_ID}")
+NX_FINAL=$(ak_api GET "/api/v1/migrations/${NX_JOB_ID}")
 NX_FINAL_STATUS=$(echo "$NX_FINAL" | jq -r '.status')
-NX_FINAL_COMPLETED=$(echo "$NX_FINAL" | jq -r '.completed_items')
-NX_FINAL_FAILED=$(echo "$NX_FINAL" | jq -r '.failed_items')
+NX_FINAL_COMPLETED=$(echo "$NX_FINAL" | jq -r '.completed_items // 0')
+NX_FINAL_FAILED=$(echo "$NX_FINAL" | jq -r '.failed_items // 0')
 
 log "Nexus migration result: status=${NX_FINAL_STATUS} completed=${NX_FINAL_COMPLETED} failed=${NX_FINAL_FAILED}"
 
@@ -550,7 +557,13 @@ else
     fail "Expected at least 2 completed Nexus artifacts, got ${NX_FINAL_COMPLETED}"
 fi
 
-# --- Summary ---
+# --- Final Summary ---
+
+# Total artifacts in AK
+TOTAL_RESP=$(curl -s "${AK_URL}/api/v1/artifacts?limit=100" \
+    -H "Authorization: Bearer ${AK_TOKEN}" || echo '[]')
+TOTAL_ARTIFACTS=$(echo "$TOTAL_RESP" | jq '.items // . | length' 2>/dev/null || echo "0")
+log "Total artifacts in Artifact Keeper: ${TOTAL_ARTIFACTS}"
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════${NC}"

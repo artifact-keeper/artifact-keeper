@@ -38,5 +38,14 @@ const canonicalURL = new URL(Astro.url.pathname, Astro.site);
   </head>
   <body class="font-sans text-gray-900 bg-white">
     <slot />
+    <script>
+      document.querySelectorAll('.js-email-link').forEach((el) => {
+        const name = el.getAttribute('data-name');
+        const domain = el.getAttribute('data-domain');
+        if (name && domain) {
+          el.setAttribute('href', 'mail' + 'to:' + name + '@' + domain);
+        }
+      });
+    </script>
   </body>
 </html>

@@ -14,8 +14,27 @@ services:
     tmpfs:
       - /var/lib/postgresql/data
 
+  # Artifactory OSS requires its own PostgreSQL since v7.x latest
+  artifactory-db:
+    image: postgres:16-alpine
+    container_name: migration-e2e-artifactory-db
+    environment:
+      POSTGRES_USER: artifactory
+      POSTGRES_PASSWORD: artifactory
+      POSTGRES_DB: artifactory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U artifactory -d artifactory"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    tmpfs:
+      - /var/lib/postgresql/data
+
   backend:
-    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile.backend
+    image: migration-e2e-backend:local
     container_name: migration-e2e-backend
     depends_on:
       postgres:
@@ -29,6 +48,7 @@ services:
       RUST_LOG: info,artifact_keeper=debug
       ENVIRONMENT: development
       MIGRATION_ENCRYPTION_KEY: e2e-test-key
+      ADMIN_PASSWORD: admin
       HOST: 0.0.0.0
       PORT: 8080
     ports:
@@ -38,27 +58,34 @@ services:
       interval: 5s
       timeout: 3s
       retries: 15
-    tmpfs:
-      - /data/storage
-      - /data/backups
-      - /data/plugins
+    volumes:
+      - backend-storage:/data/storage
+      - backend-backups:/data/backups
+      - backend-plugins:/data/plugins
 
   artifactory:
     image: releases-docker.jfrog.io/jfrog/artifactory-oss:latest
     container_name: migration-e2e-artifactory
+    depends_on:
+      artifactory-db:
+        condition: service_healthy
     ports:
       - "18081:8081"
       - "18082:8082"
     environment:
-      JF_SHARED_DATABASE_TYPE: derby
+      JF_SHARED_DATABASE_TYPE: postgresql
+      JF_SHARED_DATABASE_DRIVER: org.postgresql.Driver
+      JF_SHARED_DATABASE_URL: jdbc:postgresql://artifactory-db:5432/artifactory
+      JF_SHARED_DATABASE_USERNAME: artifactory
+      JF_SHARED_DATABASE_PASSWORD: artifactory
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8082/router/api/v1/system/health"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 60s
-    tmpfs:
-      - /var/opt/jfrog/artifactory/data
+      start_period: 120s
+    volumes:
+      - artifactory-data:/var/opt/jfrog/artifactory
 
   nexus:
     image: sonatype/nexus3:latest
@@ -66,13 +93,19 @@ services:
     ports:
       - "18083:8081"
     environment:
-      INSTALL4J_ADD_VM_PARAMS: "-Xms512m -Xmx1200m -XX:MaxDirectMemorySize=1g"
-      NEXUS_SECURITY_INITIAL_PASSWORD: "nexus123"
+      INSTALL4J_ADD_VM_PARAMS: "-Xms512m -Xmx1200m -XX:MaxDirectMemorySize=1g -Dnexus.security.anticsrftoken.enabled=false"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/service/rest/v1/status"]
       interval: 10s
       timeout: 5s
       retries: 40
       start_period: 90s
-    tmpfs:
-      - /nexus-data
+    volumes:
+      - nexus-data:/nexus-data
+
+volumes:
+  artifactory-data:
+  nexus-data:
+  backend-storage:
+  backend-backups:
+  backend-plugins:

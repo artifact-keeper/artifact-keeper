@@ -498,7 +498,7 @@ impl ArtifactoryClient {
         limit: i64,
     ) -> Result<AqlResponse, ArtifactoryError> {
         let query = format!(
-            r#"items.find({{"repo": "{}"}}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").sort({{"$asc": ["path", "name"]}}).offset({}).limit({})"#,
+            r#"items.find({{"repo": "{}","type":"file"}}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").offset({}).limit({})"#,
             repo_key, offset, limit
         );
         self.search_aql(&query).await
@@ -524,7 +524,7 @@ impl ArtifactoryClient {
         }
 
         let query = format!(
-            r#"items.find({{{}}}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").sort({{"$asc": ["path", "name"]}}).offset({}).limit({})"#,
+            r#"items.find({{{},"type":"file"}}).include("repo", "path", "name", "size", "created", "modified", "sha256", "actual_sha1").offset({}).limit({})"#,
             conditions.join(", "),
             offset,
             limit
