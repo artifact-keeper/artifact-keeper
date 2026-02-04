@@ -31,6 +31,7 @@ services:
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}

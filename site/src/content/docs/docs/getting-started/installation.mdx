@@ -13,36 +13,55 @@ The easiest way to run Artifact Keeper with all dependencies.
 
 ### Full Stack Setup
 
-The included `docker-compose.yml` provides a complete setup with:
-- Artifact Keeper backend (Rust API server)
-- Frontend (React UI)
-- PostgreSQL 15 (metadata storage)
-- MinIO (S3-compatible artifact storage)
-- Trivy (vulnerability scanning)
+The included `docker-compose.yml` provides a complete setup:
+
+| Service | Image | Description |
+|---------|-------|-------------|
+| **Backend** | `ghcr.io/artifact-keeper/artifact-keeper-backend` | Rust API server (45+ format handlers) |
+| **Web UI** | `ghcr.io/artifact-keeper/artifact-keeper-web` | Next.js frontend |
+| **Caddy** | `caddy:2-alpine` | Reverse proxy with automatic TLS |
+| **PostgreSQL** | `postgres:16-alpine` | Metadata database |
+| **Meilisearch** | `getmeili/meilisearch:v1.12` | Full-text search |
+| **Trivy** | `aquasec/trivy:latest` | Vulnerability scanning |
 
 ```bash
-git clone https://github.com/yourusername/artifact-keeper.git
+git clone https://github.com/artifact-keeper/artifact-keeper.git
 cd artifact-keeper
 docker compose up -d
 ```
 
 **Default Ports**:
-- Frontend: `http://localhost:3000`
-- Backend API: `http://localhost:8080`
-- MinIO Console: `http://localhost:9001`
+- Web UI + API: `http://localhost:30080` (HTTP) / `https://localhost:30443` (HTTPS)
+- PostgreSQL: `localhost:30432`
+- Meilisearch: `localhost:7700`
 
-### Customizing Docker Compose
+**Default credentials**: `admin` / `admin` — change immediately in production.
 
-Edit `docker-compose.yml` or create a `docker-compose.override.yml`:
+### Environment Configuration
 
-```yaml
-services:
-  backend:
-    environment:
-      - LOG_LEVEL=debug
-      - JWT_SECRET=your-secret-key-change-this
-    volumes:
-      - ./local-storage:/var/lib/artifact-keeper/artifacts
+Create a `.env` file in the project root to override defaults:
+
+```bash
+# Authentication
+JWT_SECRET=generate-a-secure-random-string-here
+ADMIN_PASSWORD=your-secure-password
+
+# Logging
+RUST_LOG=info
+
+# Caddy (for production with a real domain)
+SITE_ADDRESS=registry.example.com
+
+# Custom ports
+HTTP_PORT=30080
+HTTPS_PORT=30443
+```
+
+Generate secure secrets:
+
+```bash
+openssl rand -base64 64   # JWT secret
+openssl rand -base64 32   # Admin password
 ```
 
 ## From Source
@@ -52,15 +71,13 @@ Build Artifact Keeper from source for development or custom deployments.
 ### Prerequisites
 
 - **Rust**: 1.75 or later ([install rustup](https://rustup.rs/))
-- **Node.js**: 20.x or later ([install node](https://nodejs.org/))
-- **PostgreSQL**: 15 or later
+- **PostgreSQL**: 16 or later
 - **Git**: For cloning the repository
 
 ### Build Backend
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/artifact-keeper.git
+git clone https://github.com/artifact-keeper/artifact-keeper.git
 cd artifact-keeper
 
 # Build backend (release mode)
@@ -69,38 +86,22 @@ cargo build --release
 # Binary will be at: target/release/artifact-keeper
 ```
 
-### Build Frontend
-
-```bash
-cd frontend
-
-# Install dependencies
-npm install
-
-# Build for production
-npm run build
-
-# Production build will be in: dist/
-```
-
 ### Setup Database
 
 1. **Create PostgreSQL database**:
 
 ```sql
-CREATE DATABASE artifact_keeper;
-CREATE USER artifact_keeper WITH PASSWORD 'your-password';
-GRANT ALL PRIVILEGES ON DATABASE artifact_keeper TO artifact_keeper;
+CREATE DATABASE artifact_registry;
+CREATE USER registry WITH PASSWORD 'your-password';
+GRANT ALL PRIVILEGES ON DATABASE artifact_registry TO registry;
 ```
 
-2. **Run migrations**:
+2. **Run the backend** (migrations run automatically on first start):
 
 ```bash
-# Set database URL
-export DATABASE_URL=postgresql://artifact_keeper:your-password@localhost/artifact_keeper
-
-# Run migrations (handled automatically on first start)
-./target/release/artifact-keeper migrate
+export DATABASE_URL=postgresql://registry:your-password@localhost/artifact_registry
+export JWT_SECRET=generate-a-secure-random-string-here
+./target/release/artifact-keeper
 ```
 
 ### Configure Environment
@@ -109,31 +110,18 @@ Create a `.env` file or set environment variables:
 
 ```bash
 # Required
-export DATABASE_URL=postgresql://artifact_keeper:your-password@localhost/artifact_keeper
-export JWT_SECRET=generate-a-secure-random-string-here
+DATABASE_URL=postgresql://registry:your-password@localhost/artifact_registry
+JWT_SECRET=generate-a-secure-random-string-here
 
 # Optional
-export BIND_ADDRESS=0.0.0.0:8080
-export LOG_LEVEL=info
-export STORAGE_BACKEND=filesystem
-export STORAGE_PATH=/var/lib/artifact-keeper/artifacts
+HOST=0.0.0.0
+PORT=8080
+RUST_LOG=info,artifact_keeper=debug
+STORAGE_PATH=/var/lib/artifact-keeper/artifacts
+ADMIN_PASSWORD=your-secure-password
 ```
 
-See the [Configuration Reference](/getting-started/configuration) for all available options.
-
-### Run the Application
-
-```bash
-# Start backend
-./target/release/artifact-keeper
-
-# In another terminal, serve frontend (for development)
-cd frontend
-npm run dev
-
-# Or serve the production build with a static file server
-npx serve -s dist -l 3000
-```
+See the [Configuration Reference](/docs/getting-started/configuration) for all available options.
 
 ## Production Deployment
 
@@ -166,37 +154,16 @@ sudo systemctl start artifact-keeper
 sudo systemctl status artifact-keeper
 ```
 
-### Reverse Proxy (Nginx)
+### Reverse Proxy
 
-```nginx
-server {
-    listen 80;
-    server_name artifacts.example.com;
+The Docker Compose setup includes Caddy as a reverse proxy with automatic TLS. For production with a real domain:
 
-    # Frontend
-    location / {
-        root /var/www/artifact-keeper/frontend;
-        try_files $uri $uri/ /index.html;
-    }
-
-    # Backend API
-    location /api {
-        proxy_pass http://localhost:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # Package repositories
-    location ~ ^/(maven|npm|docker|pypi) {
-        proxy_pass http://localhost:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        client_max_body_size 1G;
-    }
-}
+```bash
+# In your .env file
+SITE_ADDRESS=registry.example.com
 ```
+
+Caddy will automatically obtain and renew Let's Encrypt certificates.
 
 ## Storage Options
 
@@ -205,15 +172,8 @@ server {
 Simple and performant for single-node deployments:
 
 ```bash
-export STORAGE_BACKEND=filesystem
-export STORAGE_PATH=/var/lib/artifact-keeper/artifacts
-```
-
-Ensure the directory exists and is writable:
-
-```bash
-sudo mkdir -p /var/lib/artifact-keeper/artifacts
-sudo chown artifact-keeper:artifact-keeper /var/lib/artifact-keeper/artifacts
+STORAGE_BACKEND=filesystem
+STORAGE_PATH=/var/lib/artifact-keeper/artifacts
 ```
 
 ### S3-Compatible Storage
@@ -221,35 +181,34 @@ sudo chown artifact-keeper:artifact-keeper /var/lib/artifact-keeper/artifacts
 For distributed deployments or cloud environments:
 
 ```bash
-export STORAGE_BACKEND=s3
-export S3_BUCKET=artifact-keeper
-export S3_REGION=us-east-1
-export S3_ENDPOINT=https://s3.amazonaws.com  # Optional, for MinIO/custom endpoints
-export AWS_ACCESS_KEY_ID=your-access-key
-export AWS_SECRET_ACCESS_KEY=your-secret-key
+STORAGE_BACKEND=s3
+S3_BUCKET=artifact-keeper
+S3_REGION=us-east-1
+S3_ENDPOINT=https://s3.amazonaws.com
+AWS_ACCESS_KEY_ID=your-access-key
+AWS_SECRET_ACCESS_KEY=your-secret-key
 ```
 
 Works with AWS S3, MinIO, DigitalOcean Spaces, and other S3-compatible services.
 
 ## Verification
 
-Check that everything is running:
-
 ```bash
-# Backend health check
+# Health check (via Caddy)
+curl http://localhost:30080/health
+
+# Direct backend health check
 curl http://localhost:8080/health
 
-# Expected response:
-# {"status":"healthy"}
-
-# Frontend
-curl http://localhost:3000
-
-# Should return the HTML of the React app
+# Login
+curl -X POST http://localhost:30080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}'
 ```
 
 ## Next Steps
 
-- [Configuration Reference](/getting-started/configuration) - Configure authentication, scanning, and integrations
-- [Quickstart Guide](/getting-started/quickstart) - Create your first repository and push artifacts
-- [Package Formats](/package-formats) - See all supported formats and endpoints
+- [Configuration Reference](/docs/getting-started/configuration) — All environment variables
+- [Quickstart Guide](/docs/getting-started/quickstart) — Create your first repository
+- [Docker Deployment](/docs/deployment/docker) — Production Docker Compose details
+- [Package Formats](/docs/package-formats) — All supported formats and endpoints

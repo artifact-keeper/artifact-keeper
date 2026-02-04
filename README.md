@@ -240,14 +240,10 @@ Open [http://localhost:30080](http://localhost:30080) in your browser.
 > **Production:** Set `SITE_ADDRESS=yourdomain.com` in your environment or `.env` file
 > and Caddy will automatically provision TLS certificates via Let's Encrypt.
 
-The admin password is generated on first boot. Retrieve it from the logs:
+Default credentials: **admin** / **admin**
 
-```bash
-docker logs artifact-keeper-backend 2>&1 | grep -A2 "Admin user created"
-```
-
-> **Tip:** To set a known password, add `ADMIN_PASSWORD=your-password` to the backend
-> environment in `docker-compose.yml` before starting.
+> **Important:** Change the default password after first login. For production,
+> set `ADMIN_PASSWORD` in your `.env` file or `docker-compose.yml`.
 
 #### What starts
 
@@ -269,7 +265,7 @@ curl http://localhost:30080/health
 # Login and get a token
 TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"YOUR_PASSWORD"}' | jq -r '.token')
+  -d '{"username":"admin","password":"admin"}' | jq -r '.token')
 
 # List repositories
 curl -s http://localhost:30080/api/v1/repositories \

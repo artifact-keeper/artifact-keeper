@@ -1,6 +1,6 @@
 ---
 title: "Docker Compose Deployment"
-description: "Production deployment using Docker Compose with PostgreSQL, backend, and web dashboard services"
+description: "Deploy Artifact Keeper using Docker Compose with all services"
 ---
 
 Deploy Artifact Keeper using Docker Compose for a complete, containerized setup.
@@ -20,521 +20,185 @@ git clone https://github.com/artifact-keeper/artifact-keeper.git
 cd artifact-keeper
 ```
 
-### 2. Create Environment File
-
-Create `.env` file in the project root:
+### 2. Start Services
 
 ```bash
-# Database
-DB_PASSWORD=change-me-in-production
+docker compose up -d
+```
 
-# JWT Authentication
-JWT_SECRET=generate-secure-secret-here
+### 3. Verify Deployment
 
-# Storage
-STORAGE_BACKEND=filesystem
-STORAGE_PATH=/data/artifacts
+```bash
+# Check service status
+docker compose ps
 
-# Admin user (first-time setup)
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin  # Change on first login
+# Health check
+curl http://localhost:30080/health
+
+# Access web UI
+open http://localhost:30080
+
+# Login: admin / admin
+```
+
+## Architecture
+
+The default `docker-compose.yml` runs these services:
+
+| Service | Image | Port | Description |
+|---------|-------|------|-------------|
+| **Backend** | `ghcr.io/artifact-keeper/artifact-keeper-backend` | 8080 (internal) | Rust API server |
+| **Web UI** | `ghcr.io/artifact-keeper/artifact-keeper-web` | 3000 (internal) | Next.js frontend |
+| **Caddy** | `caddy:2-alpine` | **30080** (HTTP), **30443** (HTTPS) | Reverse proxy |
+| **PostgreSQL** | `postgres:16-alpine` | 30432 | Metadata database |
+| **Meilisearch** | `getmeili/meilisearch:v1.12` | 7700 | Full-text search |
+| **Trivy** | `aquasec/trivy:latest` | 8090 | Vulnerability scanning |
+
+Caddy routes:
+- `/api/*` and `/health` → Backend (port 8080)
+- Everything else → Web UI (port 3000)
+
+## Production Configuration
+
+### Environment Variables
+
+Create a `.env` file in the project root:
+
+```bash
+# Security (REQUIRED for production)
+JWT_SECRET=your-secure-64-char-secret-here
+ADMIN_PASSWORD=your-secure-admin-password
+
+# Caddy — set your domain for automatic Let's Encrypt TLS
+SITE_ADDRESS=registry.example.com
+
+# Custom ports (optional)
+HTTP_PORT=80
+HTTPS_PORT=443
+
+# Logging
+RUST_LOG=info
+
+# CORS
+CORS_ORIGINS=https://registry.example.com
 ```
 
 Generate secure secrets:
 
 ```bash
-# Generate JWT secret
-openssl rand -base64 64
-
-# Generate database password
-openssl rand -base64 32
+openssl rand -base64 64   # JWT secret
+openssl rand -base64 32   # Admin password
 ```
 
-### 3. Start Services
+### With S3 Storage
 
-```bash
-docker-compose up -d
-```
-
-### 4. Verify Deployment
-
-```bash
-# Check service status
-docker-compose ps
-
-# View logs
-docker-compose logs -f
-
-# Access web UI
-open http://localhost:3000
-
-# Test API
-curl http://localhost:8080/api/v1/health
-```
-
-## Production Docker Compose Configuration
-
-Create `docker-compose.yml`:
-
-```yaml
-version: '3.8'
-
-services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: artifact-keeper-db
-    environment:
-      POSTGRES_DB: artifact_registry
-      POSTGRES_USER: registry
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U registry"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-
-  backend:
-    image: artifact-keeper/backend:latest
-    container_name: artifact-keeper-backend
-    environment:
-      DATABASE_URL: postgres://registry:${DB_PASSWORD}@postgres:5432/artifact_registry
-      JWT_SECRET: ${JWT_SECRET}
-      STORAGE_BACKEND: ${STORAGE_BACKEND:-filesystem}
-      STORAGE_PATH: /data/artifacts
-      RUST_LOG: info
-      PORT: 8080
-    volumes:
-      - artifact_data:/data/artifacts
-      - backup_data:/data/backups
-    ports:
-      - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-
-  web:
-    image: artifact-keeper/web:latest
-    container_name: artifact-keeper-web
-    environment:
-      REACT_APP_API_URL: http://localhost:8080
-    ports:
-      - "3000:80"
-    depends_on:
-      - backend
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-
-volumes:
-  postgres_data:
-    driver: local
-  artifact_data:
-    driver: local
-  backup_data:
-    driver: local
-
-networks:
-  artifact-keeper:
-    driver: bridge
-```
-
-## Extended Configuration with Optional Services
-
-### With Trivy Security Scanner
-
-Add security scanning capabilities:
+Add S3-compatible storage to the backend environment in `docker-compose.yml`:
 
 ```yaml
 services:
-  # ... existing services ...
-
-  trivy:
-    image: aquasec/trivy:latest
-    container_name: artifact-keeper-trivy
-    command: ["server", "--listen", "0.0.0.0:8090"]
-    ports:
-      - "8090:8090"
-    volumes:
-      - trivy_cache:/root/.cache
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-
   backend:
-    # ... existing config ...
     environment:
-      # ... existing env vars ...
-      TRIVY_ENABLED: "true"
-      TRIVY_URL: http://trivy:8090
-
-volumes:
-  # ... existing volumes ...
-  trivy_cache:
-    driver: local
-```
-
-### With MinIO S3 Storage
-
-Use MinIO for S3-compatible object storage:
-
-```yaml
-services:
-  # ... existing services ...
-
-  minio:
-    image: minio/minio:latest
-    container_name: artifact-keeper-minio
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
-    volumes:
-      - minio_data:/data
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-
-  backend:
-    # ... existing config ...
-    environment:
-      # ... existing env vars ...
       STORAGE_BACKEND: s3
-      S3_ENDPOINT: http://minio:9000
-      S3_BUCKET: artifacts
+      S3_ENDPOINT: https://s3.amazonaws.com
+      S3_BUCKET: artifact-keeper
       S3_REGION: us-east-1
-      S3_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minioadmin}
-      S3_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-minioadmin}
-      S3_FORCE_PATH_STYLE: "true"
-    depends_on:
-      - minio
-
-volumes:
-  # ... existing volumes ...
-  minio_data:
-    driver: local
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
 ```
 
-Create MinIO bucket on first startup:
+Works with AWS S3, MinIO, DigitalOcean Spaces, and other S3-compatible services.
+
+### With OpenSCAP Scanning
+
+Enable OpenSCAP compliance scanning (requires local build):
 
 ```bash
-# Wait for MinIO to start
-sleep 10
-
-# Create bucket
-docker exec artifact-keeper-minio \
-  mc alias set local http://localhost:9000 minioadmin minioadmin
-
-docker exec artifact-keeper-minio \
-  mc mb local/artifacts
-```
-
-### With Prometheus and Grafana
-
-Add monitoring stack:
-
-```yaml
-services:
-  # ... existing services ...
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: artifact-keeper-prometheus
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-    ports:
-      - "9090:9090"
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: artifact-keeper-grafana
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
-    ports:
-      - "3001:3000"
-    depends_on:
-      - prometheus
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-
-volumes:
-  # ... existing volumes ...
-  prometheus_data:
-    driver: local
-  grafana_data:
-    driver: local
-```
-
-Create `prometheus.yml`:
-
-```yaml
-global:
-  scrape_interval: 15s
-
-scrape_configs:
-  - job_name: 'artifact-keeper'
-    static_configs:
-      - targets: ['backend:8080']
-```
-
-## Building Images
-
-### Build from Source
-
-```bash
-# Build backend
-docker build -t artifact-keeper/backend:latest -f docker/Dockerfile.backend .
-
-# Build web dashboard
-docker build -t artifact-keeper/web:latest -f docker/Dockerfile.web .
-```
-
-### Use Pre-built Images
-
-```bash
-# Pull from Docker Hub (when available)
-docker pull artifact-keeper/backend:latest
-docker pull artifact-keeper/web:latest
+docker compose --profile scanning up -d
 ```
 
 ## Managing Services
 
-### Start Services
+### Start / Stop
 
 ```bash
 # Start all services
-docker-compose up -d
+docker compose up -d
 
-# Start specific service
-docker-compose up -d backend
-```
-
-### Stop Services
-
-```bash
 # Stop all services
-docker-compose down
+docker compose down
 
-# Stop and remove volumes (WARNING: deletes data)
-docker-compose down -v
+# Stop and remove volumes (WARNING: deletes all data)
+docker compose down -v
 ```
 
 ### View Logs
 
 ```bash
 # All services
-docker-compose logs -f
+docker compose logs -f
 
 # Specific service
-docker-compose logs -f backend
+docker compose logs -f backend
 
 # Last 100 lines
-docker-compose logs --tail=100 backend
+docker compose logs --tail=100 backend
 ```
 
-### Restart Services
+### Update to Latest
 
 ```bash
-# Restart all
-docker-compose restart
-
-# Restart specific service
-docker-compose restart backend
-```
-
-### Update Services
-
-```bash
-# Pull latest images
-docker-compose pull
-
-# Restart with new images
-docker-compose up -d
+docker compose pull
+docker compose up -d
 ```
 
 ## Data Persistence
 
-### Volume Management
+All data is stored in Docker named volumes:
+
+| Volume | Contents |
+|--------|----------|
+| `postgres_data` | Database (users, repositories, metadata) |
+| `artifact_storage` | Uploaded artifacts |
+| `backup_storage` | Automated backups |
+| `meilisearch_data` | Search indexes |
+| `trivy_cache` | Vulnerability database cache |
+| `caddy_data` | TLS certificates |
+
+### Backup Database
 
 ```bash
-# List volumes
-docker volume ls
+docker compose exec postgres pg_dump -U registry artifact_registry | gzip > backup.sql.gz
+```
 
-# Inspect volume
-docker volume inspect artifact-keeper_artifact_data
+### Restore Database
 
-# Backup volume
+```bash
+gunzip < backup.sql.gz | docker compose exec -T postgres psql -U registry artifact_registry
+```
+
+### Backup Artifacts
+
+```bash
 docker run --rm \
-  -v artifact-keeper_artifact_data:/data \
+  -v artifact-keeper_artifact_storage:/data \
   -v $(pwd):/backup \
   alpine tar czf /backup/artifacts-backup.tar.gz /data
-
-# Restore volume
-docker run --rm \
-  -v artifact-keeper_artifact_data:/data \
-  -v $(pwd):/backup \
-  alpine tar xzf /backup/artifacts-backup.tar.gz -C /
-```
-
-### Database Backup
-
-```bash
-# Backup database
-docker-compose exec postgres pg_dump -U registry artifact_registry | gzip > backup.sql.gz
-
-# Restore database
-gunzip < backup.sql.gz | docker-compose exec -T postgres psql -U registry artifact_registry
-```
-
-## Resource Limits
-
-Configure resource constraints:
-
-```yaml
-services:
-  backend:
-    # ... existing config ...
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
-
-  postgres:
-    # ... existing config ...
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 1G
-```
-
-## Reverse Proxy with Nginx
-
-Add Nginx for SSL termination and routing:
-
-```yaml
-services:
-  nginx:
-    image: nginx:alpine
-    container_name: artifact-keeper-nginx
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro
-    ports:
-      - "80:80"
-      - "443:443"
-    depends_on:
-      - web
-      - backend
-    restart: unless-stopped
-    networks:
-      - artifact-keeper
-```
-
-Create `nginx.conf`:
-
-```nginx
-upstream backend {
-    server backend:8080;
-}
-
-upstream web {
-    server web:80;
-}
-
-server {
-    listen 80;
-    server_name registry.example.com;
-    return 301 https://$server_name$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name registry.example.com;
-
-    ssl_certificate /etc/nginx/ssl/cert.pem;
-    ssl_certificate_key /etc/nginx/ssl/key.pem;
-
-    client_max_body_size 10G;
-
-    location /api/ {
-        proxy_pass http://backend;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location / {
-        proxy_pass http://web;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
 ```
 
 ## Health Checks
 
-Monitor service health:
-
 ```bash
-# Check all services
-docker-compose ps
+# All services
+docker compose ps
 
-# Backend health
-curl http://localhost:8080/api/v1/health
+# Backend health (detailed)
+curl -s http://localhost:30080/health | jq
 
-# Database health
-docker-compose exec postgres pg_isready -U registry
+# Database
+docker compose exec postgres pg_isready -U registry
 
-# Frontend health
-curl http://localhost:3000
+# Meilisearch
+curl -s http://localhost:7700/health | jq
 ```
 
 ## Troubleshooting
@@ -542,51 +206,34 @@ curl http://localhost:3000
 ### Services Won't Start
 
 ```bash
-# Check logs
-docker-compose logs
-
-# Verify environment variables
-docker-compose config
-
-# Check port conflicts
-netstat -tulpn | grep -E ':(3000|8080|5432)'
+docker compose logs
+docker compose config   # Verify environment variables
 ```
 
-### Database Connection Errors
+### Port Conflicts
+
+Change ports in `.env`:
 
 ```bash
-# Verify database is running
-docker-compose ps postgres
-
-# Check database logs
-docker-compose logs postgres
-
-# Test connection
-docker-compose exec postgres psql -U registry -d artifact_registry -c '\conninfo'
+HTTP_PORT=8080
+HTTPS_PORT=8443
 ```
 
 ### Out of Disk Space
 
 ```bash
-# Check disk usage
-df -h
-
-# Clean up Docker
-docker system prune -a --volumes
-
-# Check volume sizes
-docker system df -v
+docker system df -v      # Check Docker disk usage
+docker system prune -a   # Clean unused images/containers
 ```
 
 ## Production Checklist
 
-- [ ] Change default passwords (database, admin user)
-- [ ] Generate secure JWT secret
-- [ ] Configure SSL/TLS certificates
-- [ ] Set up automated backups
+- [ ] Set strong `JWT_SECRET` (64+ characters)
+- [ ] Set `ADMIN_PASSWORD` and change default after first login
+- [ ] Set `SITE_ADDRESS` to your domain for auto-TLS
+- [ ] Configure S3 or persistent volume for artifact storage
+- [ ] Set up automated database backups
 - [ ] Configure log rotation
-- [ ] Set resource limits
-- [ ] Enable monitoring
+- [ ] Set resource limits (`deploy.resources` in compose)
 - [ ] Configure firewall rules
-- [ ] Set up log aggregation
-- [ ] Test disaster recovery
+- [ ] Set up monitoring and alerting

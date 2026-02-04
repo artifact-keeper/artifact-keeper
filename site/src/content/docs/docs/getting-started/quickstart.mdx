@@ -17,7 +17,7 @@ Get Artifact Keeper up and running in minutes using Docker Compose.
 1. **Clone the repository**:
 
 ```bash
-git clone https://github.com/yourusername/artifact-keeper.git
+git clone https://github.com/artifact-keeper/artifact-keeper.git
 cd artifact-keeper
 ```
 
@@ -28,71 +28,95 @@ docker compose up -d
 ```
 
 This starts the full stack:
-- Artifact Keeper backend and frontend
-- PostgreSQL database
-- MinIO (S3-compatible storage)
-- Trivy (vulnerability scanner)
+- **Backend** — Rust API server with 45+ format handlers
+- **Web UI** — Next.js frontend
+- **Caddy** — Reverse proxy (HTTP on port 30080, HTTPS on port 30443)
+- **PostgreSQL 16** — Metadata storage
+- **Meilisearch** — Full-text search
+- **Trivy** — Vulnerability scanning
 
 3. **Access the UI**:
 
-Open your browser to [http://localhost:3000](http://localhost:3000)
+Open [http://localhost:30080](http://localhost:30080) in your browser.
 
 4. **Login**:
 
-Use the default credentials:
-- **Username**: `admin`
-- **Password**: `admin`
+Default credentials: **admin** / **admin**
 
-**Important**: Change the default password immediately in production environments.
+:::caution
+Change the default password immediately. For production, set `ADMIN_PASSWORD` in your `.env` file before starting.
+:::
+
+5. **Verify everything works**:
+
+```bash
+# Health check
+curl http://localhost:30080/health
+
+# Login and get a token
+TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin"}' | jq -r '.token')
+
+# List repositories
+curl -s http://localhost:30080/api/v1/repositories \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
 
 ## First Steps
 
 ### Create Your First Repository
 
-1. Navigate to **Repositories** in the sidebar
-2. Click **Create Repository**
-3. Choose a package format (e.g., Maven, npm, Docker)
-4. Enter a repository name and description
-5. Click **Create**
+```bash
+curl -X POST http://localhost:30080/api/v1/repositories \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key": "my-maven-repo",
+    "format": "maven",
+    "repo_type": "local",
+    "description": "My first Maven repository"
+  }'
+```
+
+Or use the Web UI: navigate to **Repositories** and click **Create Repository**.
 
 ### Push Your First Artifact
-
-Depending on your package format:
 
 **Maven** (in your `pom.xml`):
 ```xml
 <distributionManagement>
   <repository>
     <id>artifact-keeper</id>
-    <url>http://localhost:8080/maven/my-repo</url>
+    <url>http://localhost:30080/api/v1/maven/my-maven-repo</url>
   </repository>
 </distributionManagement>
 ```
 
 **npm** (using `.npmrc`):
 ```
-registry=http://localhost:8080/npm/my-repo/
-//localhost:8080/npm/my-repo/:_authToken=YOUR_TOKEN
+registry=http://localhost:30080/api/v1/npm/my-npm-repo/
+//localhost:30080/api/v1/npm/my-npm-repo/:_authToken=YOUR_TOKEN
 ```
 
 **Docker**:
 ```bash
-docker tag myimage:latest localhost:8080/docker/my-repo/myimage:latest
-docker push localhost:8080/docker/my-repo/myimage:latest
+docker tag myimage:latest localhost:30080/api/v1/docker/my-docker-repo/myimage:latest
+docker push localhost:30080/api/v1/docker/my-docker-repo/myimage:latest
 ```
 
-### Browse Artifacts
-
-1. Navigate to **Repositories** and select your repository
-2. Browse uploaded artifacts
-3. View metadata, dependencies, and security scan results
-4. Search across all artifacts using the search bar
+**PyPI** (using twine):
+```bash
+twine upload --repository-url http://localhost:30080/api/v1/pypi/my-pypi-repo/ \
+  -u admin -p admin dist/*
+```
 
 ## Next Steps
 
-- [Installation Guide](/getting-started/installation) - Deploy from source or customize your Docker setup
-- [Configuration Reference](/getting-started/configuration) - Configure storage, authentication, and integrations
-- [Package Formats](/package-formats) - See all supported package formats and their endpoints
+- [Installation Guide](/docs/getting-started/installation) — Build from source or customize your deployment
+- [Configuration Reference](/docs/getting-started/configuration) — Storage, authentication, and integrations
+- [Package Formats](/docs/package-formats) — All 45+ supported formats and their endpoints
+- [Docker Deployment](/docs/deployment/docker) — Production Docker Compose setup
 
 ## Stopping the Services
 

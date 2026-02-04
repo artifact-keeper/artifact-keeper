@@ -33,7 +33,7 @@ Configure Artifact Keeper using environment variables. This page provides a comp
 | `JWT_ACCESS_TOKEN_EXPIRY` | No | `900` | Access token expiration in seconds (15 minutes) |
 | `JWT_REFRESH_TOKEN_EXPIRY` | No | `604800` | Refresh token expiration in seconds (7 days) |
 | `ADMIN_USERNAME` | No | `admin` | Default admin username (first-time setup) |
-| `ADMIN_PASSWORD` | No | `admin` | Default admin password (change on first login) |
+| `ADMIN_PASSWORD` | No | auto-generated | Admin password for first-time setup. If not set, a random 20-character password is generated and logged on first boot. Set this in docker-compose.yml or .env for predictable credentials. |
 | `REQUIRE_HTTPS` | No | `false` | Require HTTPS for all connections |
 | `RATE_LIMIT_LOGIN` | No | `5` | Maximum login attempts |
 | `RATE_LIMIT_WINDOW` | No | `300` | Rate limit window in seconds (5 minutes) |
