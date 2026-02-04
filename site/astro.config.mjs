@@ -16,7 +16,7 @@ export default defineConfig({
       },
       favicon: '/favicon.png',
       social: {
-        github: 'https://github.com/artifact-keeper/artifact-keeper',
+        github: 'https://github.com/artifact-keeper',
       },
       customCss: ['./src/styles/custom.css'],
       disable404Route: true,
