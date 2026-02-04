@@ -32,6 +32,9 @@ beads.left.meta.json
 beads.right.jsonl
 beads.right.meta.json
 
+# Agent interaction logs (local-only audit trail)
+interactions.jsonl
+
 # Sync state (local-only, per-machine)
 # These files are machine-specific and should not be shared across clones
 .sync.lock

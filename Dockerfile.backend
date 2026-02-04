@@ -1,24 +1,39 @@
-# Build stage
-FROM rust:1.92-slim-bookworm as builder
-
+# ---------- Stage 1: Plan dependencies ----------
+FROM rust:1.92-slim-bookworm AS planner
+RUN cargo install cargo-chef --locked
 WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY backend ./backend
+COPY edge ./edge
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Install build dependencies
+# ---------- Stage 2: Build dependencies (cached) ----------
+FROM rust:1.92-slim-bookworm AS deps
+RUN cargo install cargo-chef --locked
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+# This layer is cached as long as Cargo.toml/Cargo.lock don't change
+ENV SQLX_OFFLINE=true
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Force cache bust for migration changes - pass --build-arg CACHE_BUST=$(date +%s)
-ARG CACHE_BUST=1
-
-# Copy workspace files
+# ---------- Stage 3: Build binary ----------
+FROM rust:1.92-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+# Re-use cached dependency artifacts
+COPY --from=deps /app/target target
+COPY --from=deps /usr/local/cargo /usr/local/cargo
 COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
 COPY edge ./edge
-
-# SQLx offline mode - use cached query data for compile-time checking
 ENV SQLX_OFFLINE=true
 RUN cargo build --release --bin artifact-keeper
 
