@@ -121,8 +121,8 @@ services:
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost:80}
     ports:
-      - "${HTTP_PORT:-9080}:80"
-      - "${HTTPS_PORT:-9443}:443"
+      - "${HTTP_PORT:-30080}:80"
+      - "${HTTPS_PORT:-30443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

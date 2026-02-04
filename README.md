@@ -235,7 +235,7 @@ cd artifact-keeper
 docker compose up -d
 ```
 
-Open [http://localhost:9080](http://localhost:9080) in your browser.
+Open [http://localhost:30080](http://localhost:30080) in your browser.
 
 > **Production:** Set `SITE_ADDRESS=yourdomain.com` in your environment or `.env` file
 > and Caddy will automatically provision TLS certificates via Let's Encrypt.
@@ -255,7 +255,7 @@ docker logs artifact-keeper-backend 2>&1 | grep -A2 "Admin user created"
 |---------|-------------|------|
 | **Backend** | Rust API server (45+ format handlers) | 8080 (internal) |
 | **Web UI** | Next.js frontend | 3000 (internal) |
-| **Caddy** | Reverse proxy + auto-TLS | **9080** (HTTP), 9443 (HTTPS) |
+| **Caddy** | Reverse proxy + auto-TLS | **30080** (HTTP), 30443 (HTTPS) |
 | **PostgreSQL** | Database | 30432 |
 | **Meilisearch** | Full-text search | 7700 |
 | **Trivy** | Vulnerability scanning | 8090 |
@@ -264,15 +264,15 @@ docker logs artifact-keeper-backend 2>&1 | grep -A2 "Admin user created"
 
 ```bash
 # Health check
-curl http://localhost:9080/health
+curl http://localhost:30080/health
 
 # Login and get a token
-TOKEN=$(curl -s http://localhost:9080/api/v1/auth/login \
+TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"YOUR_PASSWORD"}' | jq -r '.token')
 
 # List repositories
-curl -s http://localhost:9080/api/v1/repositories \
+curl -s http://localhost:30080/api/v1/repositories \
   -H "Authorization: Bearer $TOKEN" | jq
 ```
 
