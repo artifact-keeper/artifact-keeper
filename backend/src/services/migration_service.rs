@@ -40,6 +40,9 @@ pub enum MigrationError {
         actual: String,
     },
 
+    #[error("Storage error: {0}")]
+    StorageError(String),
+
     #[error("Migration error: {0}")]
     Other(String),
 }
@@ -152,9 +155,12 @@ impl MigrationService {
 
         let (url, auth_type, credentials_enc) = connection;
 
-        // Decrypt credentials (TODO: actual decryption)
-        let credentials_json = String::from_utf8(credentials_enc)
-            .map_err(|e| MigrationError::ConfigError(e.to_string()))?;
+        // Decrypt credentials using the migration encryption key
+        let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
+            .unwrap_or_else(|_| "default-migration-key-change-in-prod".to_string());
+        let credentials_json =
+            crate::services::encryption::decrypt_credentials(&credentials_enc, &encryption_key)
+                .map_err(|e| MigrationError::ConfigError(format!("Decryption failed: {}", e)))?;
 
         #[derive(serde::Deserialize)]
         struct Credentials {

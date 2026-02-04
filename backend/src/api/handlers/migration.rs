@@ -17,6 +17,8 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::convert::Infallible;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -26,6 +28,10 @@ use crate::services::artifactory_client::{
     ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig,
 };
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
+use crate::services::migration_worker::{ConflictResolution, MigrationWorker, WorkerConfig};
+use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
+use crate::services::source_registry::SourceRegistry;
+use crate::storage::filesystem::FilesystemStorage;
 
 /// Create the migration router
 pub fn router() -> Router<SharedState> {
@@ -68,6 +74,7 @@ pub struct SourceConnectionRow {
     pub url: String,
     pub auth_type: String,
     pub credentials_enc: Vec<u8>,
+    pub source_type: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub created_by: Option<Uuid>,
     pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -130,6 +137,8 @@ pub struct CreateConnectionRequest {
     pub url: String,
     pub auth_type: String,
     pub credentials: ConnectionCredentials,
+    /// Source registry type: "artifactory" (default) or "nexus"
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -145,6 +154,7 @@ pub struct ConnectionResponse {
     pub name: String,
     pub url: String,
     pub auth_type: String,
+    pub source_type: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -156,6 +166,7 @@ impl From<SourceConnectionRow> for ConnectionResponse {
             name: row.name,
             url: row.url,
             auth_type: row.auth_type,
+            source_type: row.source_type,
             created_at: row.created_at,
             verified_at: row.verified_at,
         }
@@ -386,7 +397,7 @@ async fn list_connections(
 
     let connections: Vec<SourceConnectionRow> = sqlx::query_as(
         r#"
-        SELECT id, name, url, auth_type, credentials_enc, created_at, created_by, verified_at
+        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
         FROM source_connections
         ORDER BY created_at DESC
         "#,
@@ -415,15 +426,16 @@ async fn create_connection(
 
     let connection: SourceConnectionRow = sqlx::query_as(
         r#"
-        INSERT INTO source_connections (name, url, auth_type, credentials_enc)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, name, url, auth_type, credentials_enc, created_at, created_by, verified_at
+        INSERT INTO source_connections (name, url, auth_type, credentials_enc, source_type)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
         "#,
     )
     .bind(&req.name)
     .bind(&req.url)
     .bind(&req.auth_type)
     .bind(&credentials_enc)
+    .bind(req.source_type.as_deref().unwrap_or("artifactory"))
     .fetch_one(&state.db)
     .await?;
 
@@ -437,7 +449,7 @@ async fn get_connection(
 ) -> Result<Json<ConnectionResponse>> {
     let connection: SourceConnectionRow = sqlx::query_as(
         r#"
-        SELECT id, name, url, auth_type, credentials_enc, created_at, created_by, verified_at
+        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
         FROM source_connections
         WHERE id = $1
         "#,
@@ -474,7 +486,7 @@ async fn test_connection(
 ) -> Result<Json<ConnectionTestResult>> {
     let connection: SourceConnectionRow = sqlx::query_as(
         r#"
-        SELECT id, name, url, auth_type, credentials_enc, created_at, created_by, verified_at
+        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
         FROM source_connections
         WHERE id = $1
         "#,
@@ -484,8 +496,8 @@ async fn test_connection(
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    // Create Artifactory client
-    let client = match create_artifactory_client(&connection) {
+    // Create source registry client
+    let client = match create_source_client(&connection) {
         Ok(c) => c,
         Err(e) => {
             return Ok(Json(ConnectionTestResult {
@@ -543,6 +555,40 @@ async fn test_connection(
     Ok(Json(result))
 }
 
+/// Create the appropriate source registry client based on connection type
+fn create_source_client(
+    connection: &SourceConnectionRow,
+) -> std::result::Result<Arc<dyn SourceRegistry>, String> {
+    match connection.source_type.as_str() {
+        "nexus" => {
+            let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
+                .unwrap_or_else(|_| "default-migration-key-change-in-prod".to_string());
+            let credentials_json =
+                decrypt_credentials(&connection.credentials_enc, &encryption_key)
+                    .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
+            let creds: ConnectionCredentials = serde_json::from_str(&credentials_json)
+                .map_err(|e| format!("Failed to parse credentials: {}", e))?;
+
+            let config = NexusClientConfig {
+                base_url: connection.url.clone(),
+                auth: NexusAuth {
+                    username: creds.username.unwrap_or_default(),
+                    password: creds.password.unwrap_or_default(),
+                },
+                ..Default::default()
+            };
+            let client =
+                NexusClient::new(config).map_err(|e| format!("Failed to create Nexus client: {}", e))?;
+            Ok(Arc::new(client))
+        }
+        _ => {
+            // Default: Artifactory
+            let client = create_artifactory_client(connection)?;
+            Ok(Arc::new(client))
+        }
+    }
+}
+
 /// Helper to create an Artifactory client from a connection row
 fn create_artifactory_client(
     connection: &SourceConnectionRow,
@@ -593,7 +639,7 @@ async fn list_source_repositories(
     // Fetch connection
     let connection: SourceConnectionRow = sqlx::query_as(
         r#"
-        SELECT id, name, url, auth_type, credentials_enc, created_at, created_by, verified_at
+        SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at
         FROM source_connections
         WHERE id = $1
         "#,
@@ -603,11 +649,11 @@ async fn list_source_repositories(
     .await?
     .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
 
-    // Create Artifactory client
-    let client = create_artifactory_client(&connection)
+    // Create source registry client
+    let client = create_source_client(&connection)
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
 
-    // List repositories from Artifactory
+    // List repositories from source
     let repos = client
         .list_repositories()
         .await
@@ -796,7 +842,54 @@ async fn start_migration(
         AppError::Conflict("Migration cannot be started (wrong state or not found)".into())
     })?;
 
-    // TODO: Spawn background worker to process migration
+    // Fetch connection to create Artifactory client
+    let connection: SourceConnectionRow = sqlx::query_as(
+        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
+    )
+    .bind(job.source_connection_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+
+    let client = create_source_client(&connection)
+        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
+
+    // Parse migration config for conflict resolution
+    let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
+    let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
+
+    // Create storage backend
+    let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(FilesystemStorage::new(
+        &state.config.storage_path,
+    ));
+
+    // Create cancellation token for this job
+    let cancel_token = CancellationToken::new();
+
+    // Create and spawn the migration worker
+    let worker_config = WorkerConfig {
+        concurrency: config.concurrent_transfers.max(1) as usize,
+        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
+        dry_run: config.dry_run,
+        ..Default::default()
+    };
+
+    let db = state.db.clone();
+    let fail_db = state.db.clone();
+    let job_id = job.id;
+    tokio::spawn(async move {
+        let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
+        if let Err(e) = worker.process_job(job_id, client, conflict_resolution, None).await {
+            tracing::error!(job_id = %job_id, error = %e, "Migration worker failed");
+            let _ = sqlx::query(
+                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
+            )
+            .bind(job_id)
+            .bind(e.to_string())
+            .execute(&fail_db)
+            .await;
+        }
+    });
 
     Ok(Json(job.into()))
 }
@@ -848,7 +941,49 @@ async fn resume_migration(
         AppError::Conflict("Migration cannot be resumed (wrong state or not found)".into())
     })?;
 
-    // TODO: Resume background worker
+    // Fetch connection and spawn worker (same as start)
+    let connection: SourceConnectionRow = sqlx::query_as(
+        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
+    )
+    .bind(job.source_connection_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+
+    let client = create_source_client(&connection)
+        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
+
+    let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
+    let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
+
+    let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(FilesystemStorage::new(
+        &state.config.storage_path,
+    ));
+    let cancel_token = CancellationToken::new();
+
+    let worker_config = WorkerConfig {
+        concurrency: config.concurrent_transfers.max(1) as usize,
+        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
+        dry_run: config.dry_run,
+        ..Default::default()
+    };
+
+    let db = state.db.clone();
+    let fail_db = state.db.clone();
+    let job_id = job.id;
+    tokio::spawn(async move {
+        let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
+        if let Err(e) = worker.resume_job(job_id, client, conflict_resolution, None).await {
+            tracing::error!(job_id = %job_id, error = %e, "Migration resume failed");
+            let _ = sqlx::query(
+                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
+            )
+            .bind(job_id)
+            .bind(e.to_string())
+            .execute(&fail_db)
+            .await;
+        }
+    });
 
     Ok(Json(job.into()))
 }

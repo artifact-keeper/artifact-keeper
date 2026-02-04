@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: migration-e2e-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  backend:
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest
+    container_name: migration-e2e-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      JWT_SECRET: migration-e2e-test-secret
+      RUST_LOG: info,artifact_keeper=debug
+      ENVIRONMENT: development
+      MIGRATION_ENCRYPTION_KEY: e2e-test-key
+      HOST: 0.0.0.0
+      PORT: 8080
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    tmpfs:
+      - /data/storage
+      - /data/backups
+      - /data/plugins
+
+  artifactory:
+    image: releases-docker.jfrog.io/jfrog/artifactory-oss:latest
+    container_name: migration-e2e-artifactory
+    ports:
+      - "18081:8081"
+      - "18082:8082"
+    environment:
+      JF_SHARED_DATABASE_TYPE: derby
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/router/api/v1/system/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    tmpfs:
+      - /var/opt/jfrog/artifactory/data
+
+  nexus:
+    image: sonatype/nexus3:latest
+    container_name: migration-e2e-nexus
+    ports:
+      - "18083:8081"
+    environment:
+      INSTALL4J_ADD_VM_PARAMS: "-Xms512m -Xmx1200m -XX:MaxDirectMemorySize=1g"
+      NEXUS_SECURITY_INITIAL_PASSWORD: "nexus123"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/service/rest/v1/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 90s
+    tmpfs:
+      - /nexus-data
