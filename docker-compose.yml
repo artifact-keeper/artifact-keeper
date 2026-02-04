@@ -87,6 +87,8 @@ services:
       context: .
       dockerfile: Dockerfile.openscap
     container_name: artifact-keeper-openscap
+    profiles:
+      - scanning
     ports:
       - "8091:8091"
     volumes:

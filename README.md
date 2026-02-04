@@ -235,9 +235,43 @@ cd artifact-keeper
 docker compose up -d
 ```
 
-The API is available at [http://localhost:30080](http://localhost:30080).
+Open [http://localhost:9080](http://localhost:9080) in your browser.
 
-Default credentials: `admin` / `admin`
+The admin password is generated on first boot. Retrieve it from the logs:
+
+```bash
+docker logs artifact-keeper-backend 2>&1 | grep -A2 "Admin user created"
+```
+
+> **Tip:** To set a known password, add `ADMIN_PASSWORD=your-password` to the backend
+> environment in `docker-compose.yml` before starting.
+
+#### What starts
+
+| Service | Description | Port |
+|---------|-------------|------|
+| **Backend** | Rust API server (45+ format handlers) | 8080 (internal) |
+| **Web UI** | Next.js frontend | 3000 (internal) |
+| **Caddy** | Reverse proxy + auto-TLS | **9080** (HTTP), 9443 (HTTPS) |
+| **PostgreSQL** | Database | 30432 |
+| **Meilisearch** | Full-text search | 7700 |
+| **Trivy** | Vulnerability scanning | 8090 |
+
+#### Verify it's working
+
+```bash
+# Health check
+curl http://localhost:9080/health
+
+# Login and get a token
+TOKEN=$(curl -s http://localhost:9080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"YOUR_PASSWORD"}' | jq -r '.token')
+
+# List repositories
+curl -s http://localhost:9080/api/v1/repositories \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
 
 ### Manual Build
 
