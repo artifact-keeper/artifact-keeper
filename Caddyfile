@@ -1,0 +1,5 @@
+{$DOMAIN:localhost} {
+	reverse_proxy /api/* backend:8080
+	reverse_proxy /health backend:8080
+	reverse_proxy web:3000
+}

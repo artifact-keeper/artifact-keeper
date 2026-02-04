@@ -21,11 +21,5 @@ CREATE TABLE users (
 CREATE INDEX idx_users_username ON users(username);
 CREATE INDEX idx_users_external_id ON users(auth_provider, external_id);
 
--- Create default admin user (password: admin123)
-INSERT INTO users (username, email, password_hash, is_admin)
-VALUES (
-    'admin',
-    'admin@localhost',
-    '$2b$12$mDTrYw3xrIZ9N1cJGHACduiUbLDWKk.39QKIIvjI1uBHMiMKUiiSK',
-    true
-);
+-- Admin user is created programmatically on first boot with a random password.
+-- See main.rs: provision_admin_user()

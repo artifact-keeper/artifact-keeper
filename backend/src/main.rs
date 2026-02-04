@@ -10,12 +10,15 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use rand::Rng;
+
 use artifact_keeper_backend::{
     api,
     config::Config,
     db,
     error::Result,
     services::{
+        auth_service::AuthService,
         meili_service::MeiliService,
         metrics_service,
         plugin_registry::PluginRegistry,
@@ -52,6 +55,9 @@ async fn main() -> Result<()> {
     // Run migrations
     sqlx::migrate!("./migrations").run(&db_pool).await?;
     tracing::info!("Database migrations complete");
+
+    // Provision admin user on first boot (random password printed to logs)
+    provision_admin_user(&db_pool).await?;
 
     // Initialize peer identity for mesh networking
     let peer_id = init_peer_identity(&db_pool, &config).await?;
@@ -314,6 +320,64 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     Ok(id)
+}
+
+/// Provision the initial admin user on first boot.
+///
+/// If no admin user exists in the database, generates a secure random password,
+/// creates the admin user with `must_change_password=true`, and prints the
+/// credentials to the log. On subsequent boots this is a no-op.
+async fn provision_admin_user(db: &sqlx::PgPool) -> Result<()> {
+    let admin_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true)")
+            .fetch_one(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    if admin_exists {
+        return Ok(());
+    }
+
+    // Generate a 20-character random password
+    const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
+    let mut rng = rand::rng();
+    let password: String = (0..20)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect();
+
+    let password_hash = AuthService::hash_password(&password)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (username, email, password_hash, is_admin, must_change_password)
+        VALUES ('admin', 'admin@localhost', $1, true, true)
+        ON CONFLICT (username) DO NOTHING
+        "#,
+    )
+    .bind(&password_hash)
+    .execute(db)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    tracing::info!("\n\
+        ╔══════════════════════════════════════════════════════════╗\n\
+        ║                                                          ║\n\
+        ║   Initial admin credentials created:                     ║\n\
+        ║                                                          ║\n\
+        ║   Username:  admin                                       ║\n\
+        ║   Password:  {:<43}║\n\
+        ║                                                          ║\n\
+        ║   You will be required to change this password            ║\n\
+        ║   on first login.                                        ║\n\
+        ║                                                          ║\n\
+        ╚══════════════════════════════════════════════════════════╝",
+        password
+    );
+
+    Ok(())
 }
 
 /// Load active plugins from the database.

@@ -33,7 +33,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
       ENVIRONMENT: ${ENVIRONMENT:-development}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}
       TRIVY_URL: http://trivy:8090
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
@@ -46,8 +46,6 @@ services:
       - backup_storage:/data/backups
       - plugins_storage:/data/plugins
       - scan_workspace:/scan-workspace
-    ports:
-      - "30080:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -108,8 +106,25 @@ services:
         condition: service_healthy
     environment:
       BACKEND_URL: http://backend:8080
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: artifact-keeper-caddy
+    depends_on:
+      backend:
+        condition: service_healthy
+      web:
+        condition: service_started
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
     ports:
-      - "3000:3000"
+      - "${HTTP_PORT:-9080}:80"
+      - "${HTTPS_PORT:-9443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     restart: unless-stopped
 
 volumes:
@@ -126,6 +141,10 @@ volumes:
   meilisearch_data:
     driver: local
   scan_workspace:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
     driver: local
 
 networks:
