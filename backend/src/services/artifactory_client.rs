@@ -151,7 +151,7 @@ pub struct AqlResponse {
     pub range: AqlRange,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AqlResult {
     pub repo: String,
     pub path: String,
@@ -609,6 +609,51 @@ impl ArtifactoryClient {
     /// List all permission targets (v2 API)
     pub async fn list_permissions(&self) -> Result<PermissionsResponse, ArtifactoryError> {
         self.get("/api/v2/security/permissions").await
+    }
+}
+
+// Implement SourceRegistry trait for migration compatibility
+#[async_trait::async_trait]
+impl crate::services::source_registry::SourceRegistry for ArtifactoryClient {
+    async fn ping(&self) -> Result<bool, ArtifactoryError> {
+        self.ping().await
+    }
+
+    async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError> {
+        self.get_version().await
+    }
+
+    async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError> {
+        self.list_repositories().await
+    }
+
+    async fn list_artifacts(
+        &self,
+        repo_key: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<AqlResponse, ArtifactoryError> {
+        self.list_artifacts(repo_key, offset, limit).await
+    }
+
+    async fn download_artifact(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<bytes::Bytes, ArtifactoryError> {
+        self.download_artifact(repo_key, path).await
+    }
+
+    async fn get_properties(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<PropertiesResponse, ArtifactoryError> {
+        self.get_properties(repo_key, path).await
+    }
+
+    fn source_type(&self) -> &'static str {
+        "artifactory"
     }
 }
 

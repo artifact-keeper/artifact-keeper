@@ -126,7 +126,7 @@ impl ArtifactService {
     }
 
     /// Generate content-addressable storage key from checksum
-    fn storage_key_from_checksum(checksum: &str) -> String {
+    pub fn storage_key_from_checksum(checksum: &str) -> String {
         // Use first 4 chars for directory sharding: ab/cd/abcd...
         format!("{}/{}/{}", &checksum[..2], &checksum[2..4], checksum)
     }

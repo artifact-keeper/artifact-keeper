@@ -5,6 +5,8 @@ pub mod auth_config_service;
 pub mod build_service;
 pub mod artifactory_client;
 pub mod artifactory_import;
+pub mod nexus_client;
+pub mod source_registry;
 pub mod audit_service;
 pub mod auth_service;
 pub mod backup_service;

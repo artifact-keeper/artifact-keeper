@@ -6,15 +6,20 @@
 //! - Progress tracking
 //! - Checkpoint saving for resumability
 
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::models::migration::{MigrationItemType, MigrationJobStatus};
+use crate::services::artifact_service::ArtifactService;
 use crate::services::artifactory_client::ArtifactoryClient;
 use crate::services::migration_service::{MigrationError, MigrationService};
+use crate::services::source_registry::SourceRegistry;
+use crate::storage::StorageBackend;
 
 /// Configuration for the migration worker
 #[derive(Debug, Clone)]
@@ -85,25 +90,39 @@ pub struct ProgressUpdate {
 pub struct MigrationWorker {
     db: PgPool,
     migration_service: MigrationService,
+    storage: Arc<dyn StorageBackend>,
     config: WorkerConfig,
+    cancel_token: CancellationToken,
 }
 
 impl MigrationWorker {
     /// Create a new migration worker
-    pub fn new(db: PgPool, config: WorkerConfig) -> Self {
+    pub fn new(
+        db: PgPool,
+        storage: Arc<dyn StorageBackend>,
+        config: WorkerConfig,
+        cancel_token: CancellationToken,
+    ) -> Self {
         let migration_service = MigrationService::new(db.clone());
         Self {
             db,
             migration_service,
+            storage,
             config,
+            cancel_token,
         }
+    }
+
+    /// Get a reference to the database pool
+    pub fn db_ref(&self) -> &PgPool {
+        &self.db
     }
 
     /// Process a migration job
     pub async fn process_job(
         &self,
         job_id: Uuid,
-        client: Arc<ArtifactoryClient>,
+        client: Arc<dyn SourceRegistry>,
         conflict_resolution: ConflictResolution,
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     ) -> Result<(), MigrationError> {
@@ -116,24 +135,11 @@ impl MigrationWorker {
                 .fetch_one(&self.db)
                 .await?;
 
-        let config = job.0;
-        let include_artifacts = config
-            .get("include_artifacts")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let include_metadata = config
-            .get("include_metadata")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let repos: Vec<String> = config
-            .get("include_repositories")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let config: crate::models::migration::MigrationConfig =
+            serde_json::from_value(job.0).unwrap_or_default();
+        let include_artifacts = true;
+        let include_metadata = true;
+        let repos = config.include_repos.clone();
 
         // Update job status to running
         self.migration_service
@@ -147,6 +153,19 @@ impl MigrationWorker {
 
         // Process each repository
         for repo_key in &repos {
+            // Check for pause/cancel
+            if self.cancel_token.is_cancelled() {
+                tracing::info!(job_id = %job_id, "Migration cancelled by user");
+                self.migration_service
+                    .update_job_status(job_id, MigrationJobStatus::Cancelled)
+                    .await?;
+                return Ok(());
+            }
+            if self.is_paused(job_id).await? {
+                tracing::info!(job_id = %job_id, "Migration paused by user");
+                return Ok(());
+            }
+
             if include_artifacts {
                 match self
                     .process_repository_artifacts(
@@ -222,7 +241,7 @@ impl MigrationWorker {
     async fn process_repository_artifacts(
         &self,
         job_id: Uuid,
-        client: Arc<ArtifactoryClient>,
+        client: Arc<dyn SourceRegistry>,
         repo_key: &str,
         conflict_resolution: ConflictResolution,
         include_metadata: bool,
@@ -244,6 +263,11 @@ impl MigrationWorker {
             }
 
             for artifact in &artifacts.results {
+                // Check for pause/cancel between artifacts
+                if self.cancel_token.is_cancelled() || self.is_paused(job_id).await? {
+                    return Ok(());
+                }
+
                 let artifact_path = if artifact.path == "." {
                     artifact.name.clone()
                 } else {
@@ -257,7 +281,20 @@ impl MigrationWorker {
                     .clone()
                     .or_else(|| artifact.actual_sha1.clone());
 
-                // Add migration item to database
+                // Skip if already completed (resume support)
+                let already_done: Option<(String,)> = sqlx::query_as(
+                    "SELECT status FROM migration_items WHERE job_id = $1 AND source_path = $2 AND status = 'completed'"
+                )
+                .bind(job_id)
+                .bind(&source_path)
+                .fetch_optional(&self.db)
+                .await?;
+                if already_done.is_some() {
+                    *skipped += 1;
+                    continue;
+                }
+
+                // Add migration item to database (or get existing one on resume)
                 let item_id = self
                     .add_migration_item(
                         job_id,
@@ -392,6 +429,7 @@ impl MigrationWorker {
             r#"
             INSERT INTO migration_items (job_id, item_type, source_path, size_bytes, checksum_source)
             VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (job_id, source_path) DO UPDATE SET size_bytes = EXCLUDED.size_bytes
             RETURNING id
             "#,
         )
@@ -409,25 +447,42 @@ impl MigrationWorker {
     /// Check if an artifact already exists with the same checksum
     async fn check_artifact_duplicate(
         &self,
-        _path: &str,
-        _checksum: Option<&str>,
-        _conflict_resolution: ConflictResolution,
+        path: &str,
+        checksum: Option<&str>,
+        conflict_resolution: ConflictResolution,
     ) -> Result<bool, MigrationError> {
-        // TODO: Check against Artifact Keeper storage
-        // For now, never skip
-        Ok(false)
+        // Check if an artifact with this path already exists
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT checksum_sha256 FROM artifacts WHERE path = $1 AND is_deleted = false LIMIT 1",
+        )
+        .bind(path)
+        .fetch_optional(&self.db)
+        .await?;
+
+        match existing {
+            None => Ok(false), // No duplicate
+            Some((existing_checksum,)) => match conflict_resolution {
+                ConflictResolution::Skip => {
+                    // Skip if checksums match (identical content)
+                    Ok(checksum.map_or(true, |c| c == existing_checksum))
+                }
+                ConflictResolution::Overwrite => Ok(false), // Always process
+                ConflictResolution::Rename => Ok(false),    // Always process (will rename)
+            },
+        }
     }
 
     /// Transfer an artifact from Artifactory to Artifact Keeper
     async fn transfer_artifact(
         &self,
-        client: Arc<ArtifactoryClient>,
+        client: Arc<dyn SourceRegistry>,
         repo_key: &str,
         artifact_path: &str,
         include_metadata: bool,
     ) -> Result<TransferResult, MigrationError> {
         // Download artifact from Artifactory
         let artifact_data = client.download_artifact(repo_key, artifact_path).await?;
+        let content_size = artifact_data.len();
 
         // Calculate checksum
         let mut hasher = Sha256::new();
@@ -444,13 +499,53 @@ impl MigrationWorker {
             None
         };
 
-        // TODO: Upload to Artifact Keeper storage
-        // For now, we just simulate the transfer
+        // Upload to Artifact Keeper storage using CAS key
+        let storage_key = ArtifactService::storage_key_from_checksum(&checksum);
+
+        if !self.config.dry_run {
+            // Check if content already exists (deduplication)
+            let exists = self.storage.exists(&storage_key).await.unwrap_or(false);
+            if !exists {
+                self.storage
+                    .put(&storage_key, Bytes::from(artifact_data))
+                    .await
+                    .map_err(|e| MigrationError::StorageError(e.to_string()))?;
+            }
+
+            // Insert artifact record into the database
+            let repo_id: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM repositories WHERE key = $1"
+            )
+            .bind(repo_key)
+            .fetch_optional(&self.db)
+            .await?;
+
+            if let Some((repository_id,)) = repo_id {
+                let name = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+                let path_str = format!("{}/{}", repo_key, artifact_path);
+                sqlx::query(
+                    r#"
+                    INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, storage_key, content_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream')
+                    ON CONFLICT (repository_id, path) WHERE is_deleted = false DO NOTHING
+                    "#,
+                )
+                .bind(repository_id)
+                .bind(&path_str)
+                .bind(name)
+                .bind(content_size as i64)
+                .bind(&checksum)
+                .bind(&storage_key)
+                .execute(&self.db)
+                .await?;
+            }
+        }
+
         let target_path = format!("{}/{}", repo_key, artifact_path);
 
         tracing::debug!(
             path = %artifact_path,
-            size = artifact_data.len(),
+            size = content_size,
             checksum = %checksum,
             "Artifact transferred"
         );
@@ -814,11 +909,21 @@ impl MigrationWorker {
         Ok(())
     }
 
+    /// Check if the job has been paused via the database
+    async fn is_paused(&self, job_id: Uuid) -> Result<bool, MigrationError> {
+        let status: (String,) =
+            sqlx::query_as("SELECT status FROM migration_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok(status.0 == "paused" || status.0 == "cancelled")
+    }
+
     /// Resume a paused migration job
     pub async fn resume_job(
         &self,
         job_id: Uuid,
-        client: Arc<ArtifactoryClient>,
+        client: Arc<dyn SourceRegistry>,
         conflict_resolution: ConflictResolution,
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     ) -> Result<(), MigrationError> {
