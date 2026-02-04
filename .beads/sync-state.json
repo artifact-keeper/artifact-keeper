@@ -1,0 +1,7 @@
+{
+  "last_failure": "2026-02-04T09:10:17.404324-06:00",
+  "failure_count": 2,
+  "backoff_until": "2026-02-04T09:11:17.404324-06:00",
+  "needs_manual_sync": false,
+  "failure_reason": "git pull failed: exit status 1\nssh: connect to host github.com port 22: Operation timed out\r\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n"
+}
