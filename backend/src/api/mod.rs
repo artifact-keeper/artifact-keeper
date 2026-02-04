@@ -15,6 +15,7 @@ use crate::services::wasm_plugin_service::WasmPluginService;
 use crate::storage::StorageBackend;
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Application state shared across handlers
@@ -27,6 +28,8 @@ pub struct AppState {
     pub scanner_service: Option<Arc<ScannerService>>,
     pub meili_service: Option<Arc<MeiliService>>,
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
+    /// When true, most API endpoints return 403 until the admin changes the default password.
+    pub setup_required: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -39,6 +42,7 @@ impl AppState {
             scanner_service: None,
             meili_service: None,
             metrics_handle: None,
+            setup_required: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -57,6 +61,7 @@ impl AppState {
             scanner_service: None,
             meili_service: None,
             metrics_handle: None,
+            setup_required: Arc::new(AtomicBool::new(false)),
         }
     }
 

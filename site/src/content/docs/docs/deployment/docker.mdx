@@ -26,7 +26,7 @@ cd artifact-keeper
 docker compose up -d
 ```
 
-### 3. Verify Deployment
+### 3. Complete First-Boot Setup
 
 ```bash
 # Check service status
@@ -35,11 +35,15 @@ docker compose ps
 # Health check
 curl http://localhost:30080/health
 
-# Access web UI
-open http://localhost:30080
+# Read the generated admin password
+docker exec artifact-keeper-backend cat /data/storage/admin.password
 
-# Login: admin / admin
+# Login, change password, and unlock the API (see Quickstart for full steps)
 ```
+
+The API is locked until the admin password is changed. See the [Quickstart Guide](/docs/getting-started/quickstart) for step-by-step instructions.
+
+To skip the setup lock, set `ADMIN_PASSWORD` in your `.env` file before starting.
 
 ## Architecture
 
@@ -67,7 +71,7 @@ Create a `.env` file in the project root:
 ```bash
 # Security (REQUIRED for production)
 JWT_SECRET=your-secure-64-char-secret-here
-ADMIN_PASSWORD=your-secure-admin-password
+# ADMIN_PASSWORD=your-secure-admin-password  # Set to skip first-boot setup lock
 
 # Caddy — set your domain for automatic Let's Encrypt TLS
 SITE_ADDRESS=registry.example.com
@@ -229,7 +233,7 @@ docker system prune -a   # Clean unused images/containers
 ## Production Checklist
 
 - [ ] Set strong `JWT_SECRET` (64+ characters)
-- [ ] Set `ADMIN_PASSWORD` and change default after first login
+- [ ] Change the admin password on first login (or set `ADMIN_PASSWORD` env var)
 - [ ] Set `SITE_ADDRESS` to your domain for auto-TLS
 - [ ] Configure S3 or persistent volume for artifact storage
 - [ ] Set up automated database backups

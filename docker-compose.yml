@@ -31,7 +31,10 @@ services:
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-please}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      # ADMIN_PASSWORD: set this to skip first-boot setup lock.
+      # If unset, a random password is written to /data/storage/admin.password
+      # and the API is locked until the admin changes it.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}

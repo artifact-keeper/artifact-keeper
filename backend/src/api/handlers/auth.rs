@@ -18,6 +18,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
+use std::sync::atomic::Ordering;
 
 /// Create public auth routes (no auth required)
 pub fn public_router() -> Router<SharedState> {
@@ -25,6 +26,18 @@ pub fn public_router() -> Router<SharedState> {
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/refresh", post(refresh_token))
+}
+
+/// Setup status endpoint (public, no auth required)
+pub fn setup_router() -> Router<SharedState> {
+    Router::new().route("/status", get(setup_status))
+}
+
+/// Returns whether initial setup (password change) is required.
+pub async fn setup_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "setup_required": state.setup_required.load(Ordering::Relaxed)
+    }))
 }
 
 /// Create protected auth routes (auth required)

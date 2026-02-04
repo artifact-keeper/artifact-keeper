@@ -56,8 +56,8 @@ async fn main() -> Result<()> {
     sqlx::migrate!("./migrations").run(&db_pool).await?;
     tracing::info!("Database migrations complete");
 
-    // Provision admin user on first boot (random password printed to logs)
-    provision_admin_user(&db_pool).await?;
+    // Provision admin user on first boot; returns true when setup lock is needed
+    let setup_required = provision_admin_user(&db_pool, &config.storage_path).await?;
 
     // Initialize peer identity for mesh networking
     let peer_id = init_peer_identity(&db_pool, &config).await?;
@@ -149,6 +149,9 @@ async fn main() -> Result<()> {
         app_state.set_meili_service(meili);
     }
     app_state.set_metrics_handle(metrics_handle);
+    app_state
+        .setup_required
+        .store(setup_required, std::sync::atomic::Ordering::Relaxed);
     let state = Arc::new(app_state);
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
@@ -322,27 +325,48 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
     Ok(id)
 }
 
-/// Provision the initial admin user on first boot.
+/// Provision the initial admin user on first boot and determine setup mode.
 ///
-/// If no admin user exists in the database, generates a secure random password,
-/// creates the admin user with `must_change_password=true`, and prints the
-/// credentials to the log. On subsequent boots this is a no-op.
-async fn provision_admin_user(db: &sqlx::PgPool) -> Result<()> {
-    let admin_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE is_admin = true)")
-            .fetch_one(db)
-            .await
-            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+/// Returns `true` when the API should be locked until the admin changes
+/// the default password (i.e. `must_change_password` is still set and no
+/// explicit `ADMIN_PASSWORD` env var was provided).
+async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<bool> {
+    use std::path::Path;
 
-    if admin_exists {
-        return Ok(());
+    let password_file = Path::new(storage_path).join("admin.password");
+
+    // Check if an admin user already exists
+    let admin_row: Option<(bool,)> = sqlx::query_as(
+        "SELECT must_change_password FROM users WHERE is_admin = true LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    if let Some((must_change,)) = admin_row {
+        // Admin already exists — determine if setup lock is needed
+        if must_change {
+            tracing::warn!(
+                "Admin user has not changed default password. API is locked until password is changed."
+            );
+            // Ensure the password file still exists for the user to read
+            if password_file.exists() {
+                tracing::info!(
+                    "Admin password file: {}",
+                    password_file.display()
+                );
+            }
+            return Ok(true);
+        }
+        return Ok(false);
     }
 
-    // Use ADMIN_PASSWORD env var if set, otherwise generate a random one
+    // No admin exists — create one
     let (password, must_change) = match std::env::var("ADMIN_PASSWORD") {
         Ok(p) if !p.is_empty() => (p, false),
         _ => {
-            const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
+            const CHARSET: &[u8] =
+                b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
             let mut rng = rand::rng();
             let p: String = (0..20)
                 .map(|_| {
@@ -369,22 +393,40 @@ async fn provision_admin_user(db: &sqlx::PgPool) -> Result<()> {
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
-    tracing::info!("\n\
-        ╔══════════════════════════════════════════════════════════╗\n\
-        ║                                                          ║\n\
-        ║   Initial admin credentials created:                     ║\n\
-        ║                                                          ║\n\
-        ║   Username:  admin                                       ║\n\
-        ║   Password:  {:<43}║\n\
-        ║                                                          ║\n\
-        ║   You will be required to change this password            ║\n\
-        ║   on first login.                                        ║\n\
-        ║                                                          ║\n\
-        ╚══════════════════════════════════════════════════════════╝",
-        if must_change { &password } else { "***set via ADMIN_PASSWORD***" }
-    );
-
-    Ok(())
+    if must_change {
+        // Write password to a file so users can retrieve it
+        if let Err(e) = std::fs::write(&password_file, &password) {
+            tracing::error!("Failed to write admin password file: {}", e);
+            // Fall back to logging the password directly
+            tracing::info!("Generated admin password: {}", password);
+        } else {
+            tracing::info!(
+                "Admin password written to: {}", password_file.display()
+            );
+        }
+        tracing::info!(
+            "\n\
+            ===========================================================\n\
+            \n\
+              Initial admin user created.\n\
+            \n\
+              Username:  admin\n\
+              Password:  see file {}\n\
+            \n\
+              Read it:   docker exec artifact-keeper-backend cat {}\n\
+            \n\
+              The API is LOCKED until you change this password.\n\
+              Login and call POST /api/v1/users/<id>/password to unlock.\n\
+            \n\
+            ===========================================================",
+            password_file.display(),
+            password_file.display(),
+        );
+        Ok(true)
+    } else {
+        tracing::info!("Admin user created with password from ADMIN_PASSWORD env var");
+        Ok(false)
+    }
 }
 
 /// Load active plugins from the database.
