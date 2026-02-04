@@ -119,11 +119,10 @@ services:
       web:
         condition: service_started
     environment:
-      SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost:80}
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
     ports:
       - "${HTTP_PORT:-30080}:80"
-      # Uncomment for HTTPS (set SITE_ADDRESS=yourdomain.com for auto-TLS)
-      # - "${HTTPS_PORT:-30443}:443"
+      - "${HTTPS_PORT:-30443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

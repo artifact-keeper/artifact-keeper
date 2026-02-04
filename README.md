@@ -255,7 +255,7 @@ docker logs artifact-keeper-backend 2>&1 | grep -A2 "Admin user created"
 |---------|-------------|------|
 | **Backend** | Rust API server (45+ format handlers) | 8080 (internal) |
 | **Web UI** | Next.js frontend | 3000 (internal) |
-| **Caddy** | Reverse proxy (auto-TLS when configured) | **30080** (HTTP) |
+| **Caddy** | Reverse proxy + local TLS | **30080** (HTTP), **30443** (HTTPS) |
 | **PostgreSQL** | Database | 30432 |
 | **Meilisearch** | Full-text search | 7700 |
 | **Trivy** | Vulnerability scanning | 8090 |
