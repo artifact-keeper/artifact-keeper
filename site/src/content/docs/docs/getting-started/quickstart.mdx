@@ -34,17 +34,25 @@ This starts the full stack:
 
 Open [http://localhost:30080](http://localhost:30080) in your browser.
 
-3. **Get the admin password**:
+3. **Complete first-time setup**:
 
-On first boot, a random password is generated and written to a file inside the container. The API is locked until you change it.
+On first boot, you'll see the setup screen with instructions to retrieve the generated admin password:
+
+![First-time setup screen](./first-time-setup.png)
+
+Run the command shown in the banner to get your password, then log in with username `admin`.
+
+:::tip
+To skip the setup lock entirely, set `ADMIN_PASSWORD=yourpass` in your `.env` file before starting.
+:::
+
+<details>
+<summary>**CLI alternative** (for automation or headless setups)</summary>
 
 ```bash
+# Get the generated password
 docker exec artifact-keeper-backend cat /data/storage/admin.password
-```
 
-4. **Login and change password to unlock the API**:
-
-```bash
 # Login with the generated password
 TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
   -H "Content-Type: application/json" \
@@ -61,11 +69,9 @@ curl -X POST "http://localhost:30080/api/v1/users/$USER_ID/password" \
   -d '{"new_password":"your-secure-password"}'
 ```
 
-:::tip
-To skip the setup lock entirely, set `ADMIN_PASSWORD=yourpass` in your `.env` file before starting.
-:::
+</details>
 
-5. **Verify everything works**:
+4. **Verify everything works**:
 
 ```bash
 # Health check
