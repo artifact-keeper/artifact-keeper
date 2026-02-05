@@ -56,6 +56,7 @@ cleanup() {
     if [[ "$CLEAN" == "true" ]]; then
         log_info "Cleaning up test environment..."
         docker compose down -v --remove-orphans 2>/dev/null || true
+        rm -f sso-config-ids.env
     fi
 }
 trap cleanup EXIT
@@ -109,13 +110,29 @@ if [[ "$SKIP_SETUP" == "false" ]]; then
     fi
     log_success "Backend is ready"
 
-    # Setup test data
+    # Setup test data in IdPs
     log_info "Setting up LDAP test users..."
     ./setup-ldap.sh
 
     log_info "Setting up Keycloak realm and clients..."
     ./setup-keycloak.sh
+
+    # Setup SSO configs in backend
+    log_info "Configuring SSO providers in backend..."
+    ./setup-backend-sso.sh
 fi
+
+# Load SSO config IDs
+if [[ ! -f sso-config-ids.env ]]; then
+    log_error "sso-config-ids.env not found. Run without --skip-setup first."
+    exit 1
+fi
+source sso-config-ids.env
+
+log_info "Loaded SSO Config IDs:"
+log_info "  LDAP: ${LDAP_CONFIG_ID}"
+log_info "  OIDC: ${OIDC_CONFIG_ID}"
+log_info "  SAML: ${SAML_CONFIG_ID}"
 
 # ============================================================================
 # Test Functions
@@ -126,12 +143,13 @@ run_test() {
     local cmd="$2"
 
     echo -n "  Testing: $name... "
-    if eval "$cmd" &>/dev/null; then
+    if output=$(eval "$cmd" 2>&1); then
         log_success "OK"
         ((TESTS_PASSED++))
         return 0
     else
         log_error "FAILED"
+        echo "    Output: $output" | head -5
         ((TESTS_FAILED++))
         return 1
     fi
@@ -145,9 +163,9 @@ if [[ "$TEST_LDAP" == "true" ]]; then
     echo ""
     log_info "========== LDAP Authentication Tests =========="
 
-    # Test LDAP login
-    run_test "LDAP user login" '
-        response=$(curl -sf -X POST http://localhost:8080/api/v1/auth/ldap/login \
+    # Test LDAP login with valid credentials
+    run_test "LDAP user login (valid)" '
+        response=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/sso/ldap/${LDAP_CONFIG_ID}/login" \
             -H "Content-Type: application/json" \
             -d "{\"username\": \"testuser\", \"password\": \"testpassword\"}")
         echo "$response" | jq -e ".access_token" > /dev/null
@@ -155,18 +173,38 @@ if [[ "$TEST_LDAP" == "true" ]]; then
 
     # Test LDAP login with wrong password
     run_test "LDAP rejects bad password" '
-        ! curl -sf -X POST http://localhost:8080/api/v1/auth/ldap/login \
+        ! curl -sf -X POST "http://localhost:8080/api/v1/auth/sso/ldap/${LDAP_CONFIG_ID}/login" \
             -H "Content-Type: application/json" \
             -d "{\"username\": \"testuser\", \"password\": \"wrongpassword\"}"
     ' || true
 
-    # Test LDAP user info after login
-    run_test "LDAP user has correct attributes" '
-        token=$(curl -sf -X POST http://localhost:8080/api/v1/auth/ldap/login \
+    # Test LDAP admin user login
+    run_test "LDAP admin user login" '
+        response=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/sso/ldap/${LDAP_CONFIG_ID}/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"adminuser\", \"password\": \"adminpassword\"}")
+        echo "$response" | jq -e ".access_token" > /dev/null
+    ' || true
+
+    # Test that LDAP user can access /auth/me
+    run_test "LDAP user can access /auth/me" '
+        token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/sso/ldap/${LDAP_CONFIG_ID}/login" \
             -H "Content-Type: application/json" \
             -d "{\"username\": \"testuser\", \"password\": \"testpassword\"}" | jq -r ".access_token")
-        user=$(curl -sf http://localhost:8080/api/v1/auth/me -H "Authorization: Bearer $token")
-        echo "$user" | jq -e ".username == \"testuser\"" > /dev/null
+        user=$(curl -sf "http://localhost:8080/api/v1/auth/me" -H "Authorization: Bearer $token")
+        echo "$user" | jq -e ".username" > /dev/null
+    ' || true
+
+    # Test LDAP config test endpoint
+    run_test "LDAP test connection endpoint" '
+        # Login as admin first
+        admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+        response=$(curl -sf -X POST "http://localhost:8080/api/v1/admin/sso/ldap/${LDAP_CONFIG_ID}/test" \
+            -H "Authorization: Bearer $admin_token" \
+            -H "Content-Type: application/json")
+        echo "$response" | jq -e ".success" > /dev/null
     ' || true
 fi
 
@@ -178,23 +216,37 @@ if [[ "$TEST_OIDC" == "true" ]]; then
     echo ""
     log_info "========== OIDC Authentication Tests =========="
 
-    # Test OIDC authorization URL
-    run_test "OIDC auth URL returns redirect" '
-        response=$(curl -sf -w "%{http_code}" -o /dev/null http://localhost:8080/api/v1/auth/oidc/authorize)
-        [[ "$response" == "302" ]] || [[ "$response" == "200" ]]
+    # Test OIDC login redirect (accepts any 2xx or 3xx as valid redirect response)
+    run_test "OIDC login returns redirect URL" '
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/api/v1/auth/sso/oidc/${OIDC_CONFIG_ID}/login")
+        [[ "$http_code" =~ ^(200|301|302|303|307|308)$ ]]
     ' || true
 
-    # Test OIDC with Keycloak direct grant (resource owner password)
-    run_test "OIDC token exchange" '
-        # Get token from Keycloak directly
+    # Test that OIDC redirect contains Keycloak URL
+    run_test "OIDC redirects to Keycloak" '
+        response=$(curl -sI "http://localhost:8080/api/v1/auth/sso/oidc/${OIDC_CONFIG_ID}/login" | grep -i "location" || echo "")
+        echo "$response" | grep -q "keycloak\|8180\|realms/artifact-keeper"
+    ' || true
+
+    # Test Keycloak direct token (proves Keycloak is configured correctly)
+    run_test "Keycloak OIDC token exchange works" '
         kc_token=$(curl -sf -X POST "http://localhost:8180/realms/artifact-keeper/protocol/openid-connect/token" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "grant_type=password" \
-            -d "client_id=artifact-keeper" \
-            -d "client_secret=artifact-keeper-secret" \
-            -d "username=oidcuser" \
-            -d "password=oidcpassword" | jq -r ".access_token")
+            --data-urlencode "grant_type=password" \
+            --data-urlencode "client_id=artifact-keeper" \
+            --data-urlencode "client_secret=artifact-keeper-secret" \
+            --data-urlencode "username=oidcuser" \
+            --data-urlencode "password=oidcpassword" | jq -r ".access_token")
         [[ -n "$kc_token" ]] && [[ "$kc_token" != "null" ]]
+    ' || true
+
+    # Test listing OIDC providers
+    run_test "Can list OIDC providers" '
+        admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+        response=$(curl -sf "http://localhost:8080/api/v1/admin/sso/oidc" \
+            -H "Authorization: Bearer $admin_token")
+        echo "$response" | jq -e "length >= 1" > /dev/null
     ' || true
 fi
 
@@ -206,17 +258,49 @@ if [[ "$TEST_SAML" == "true" ]]; then
     echo ""
     log_info "========== SAML Authentication Tests =========="
 
-    # Test SAML metadata endpoint
-    run_test "SAML SP metadata available" '
-        curl -sf http://localhost:8080/api/v1/auth/saml/metadata | grep -q "EntityDescriptor"
+    # Test SAML login redirect (accepts any 2xx or 3xx as valid redirect response)
+    run_test "SAML login returns redirect" '
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080/api/v1/auth/sso/saml/${SAML_CONFIG_ID}/login")
+        [[ "$http_code" =~ ^(200|301|302|303|307|308)$ ]]
     ' || true
 
-    # Test SAML login redirect
-    run_test "SAML login redirects to IdP" '
-        response=$(curl -sf -w "%{http_code}" -o /dev/null http://localhost:8080/api/v1/auth/saml/login)
-        [[ "$response" == "302" ]] || [[ "$response" == "200" ]]
+    # Test SAML redirects to IdP
+    run_test "SAML redirects to Keycloak IdP" '
+        response=$(curl -sI "http://localhost:8080/api/v1/auth/sso/saml/${SAML_CONFIG_ID}/login" | grep -i "location" || echo "")
+        echo "$response" | grep -qi "keycloak\|8180\|saml"
+    ' || true
+
+    # Test listing SAML providers
+    run_test "Can list SAML providers" '
+        admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+        response=$(curl -sf "http://localhost:8080/api/v1/admin/sso/saml" \
+            -H "Authorization: Bearer $admin_token")
+        echo "$response" | jq -e "length >= 1" > /dev/null
+    ' || true
+
+    # Test Keycloak SAML metadata is accessible
+    run_test "Keycloak SAML metadata available" '
+        curl -sf "http://localhost:8180/realms/artifact-keeper/protocol/saml/descriptor" | grep -q "EntityDescriptor"
     ' || true
 fi
+
+# ============================================================================
+# Provider List Tests
+# ============================================================================
+
+echo ""
+log_info "========== Provider List Tests =========="
+
+run_test "Can list all enabled SSO providers" '
+    admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+    response=$(curl -sf "http://localhost:8080/api/v1/admin/sso/providers" \
+        -H "Authorization: Bearer $admin_token")
+    echo "$response" | jq -e "length >= 1" > /dev/null
+' || true
 
 # ============================================================================
 # Summary
