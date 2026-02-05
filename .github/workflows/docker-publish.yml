@@ -14,10 +14,11 @@ on:
 env:
   REGISTRY: ghcr.io
   BACKEND_IMAGE: ${{ github.repository }}-backend
+  OPENSCAP_IMAGE: ${{ github.repository }}-openscap
 
 jobs:
-  build:
-    name: Build (${{ matrix.platform }})
+  build-backend:
+    name: Backend (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -63,8 +64,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=build-${{ matrix.platform }}
-          cache-to: type=gha,scope=build-${{ matrix.platform }},mode=max
+          cache-from: type=gha,scope=backend-${{ matrix.platform }}
+          cache-to: type=gha,scope=backend-${{ matrix.platform }},mode=max
 
       - name: Export digest
         run: |
@@ -75,15 +76,79 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          name: backend-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: Create Multi-Arch Manifest
+  build-openscap:
+    name: OpenSCAP (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    outputs:
+      digest-amd64: ${{ steps.build.outputs.digest }}
+      digest-arm64: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.openscap
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=openscap-${{ matrix.platform }}
+          cache-to: type=gha,scope=openscap-${{ matrix.platform }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: openscap-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-backend:
+    name: Backend Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: build
+    needs: build-backend
     permissions:
       contents: read
       packages: write
@@ -95,7 +160,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: backend-digests-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
@@ -136,15 +201,82 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
-          subject-digest: ${{ needs.build.outputs.digest-amd64 }}
+          subject-digest: ${{ needs.build-backend.outputs.digest-amd64 }}
           push-to-registry: true
         continue-on-error: true
 
+  merge-openscap:
+    name: OpenSCAP Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: build-openscap
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: openscap-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:${{ steps.meta.outputs.version }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
+          subject-digest: ${{ needs.build-openscap.outputs.digest-amd64 }}
+          push-to-registry: true
+        continue-on-error: true
+
+  summary:
+    name: Publish Summary
+    runs-on: ubuntu-latest
+    needs: [merge-backend, merge-openscap]
+    if: always()
+    steps:
       - name: Summary
         run: |
-          echo "## 🐳 Docker Images Published" >> $GITHUB_STEP_SUMMARY
+          echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Backend" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### OpenSCAP" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY

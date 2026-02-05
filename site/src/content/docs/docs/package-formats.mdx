@@ -11,7 +11,53 @@ This page is a quick reference index. Click through to the detailed guide pages 
 
 ---
 
-## Languages & Runtimes
+## Complete Format Reference
+
+**35 native formats** with full wire-protocol support, plus **17 aliases** for alternative clients that share an underlying protocol. Custom formats can be added at any time via [WASM plugins](/docs/advanced/plugins/).
+
+| # | Format | Key | Category | Native Clients |
+|---|--------|-----|----------|----------------|
+| 1 | Maven | `maven` | Languages | Maven, Gradle |
+| 2 | npm | `npm` | Languages | npm, Yarn, pnpm, Bower |
+| 3 | PyPI | `pypi` | Languages | pip, Poetry, pipenv, twine |
+| 4 | NuGet | `nuget` | Languages | dotnet, NuGet CLI, Chocolatey |
+| 5 | Cargo | `cargo` | Languages | cargo |
+| 6 | Go | `go` | Languages | go mod |
+| 7 | RubyGems | `rubygems` | Languages | gem, Bundler |
+| 8 | Composer | `composer` | Languages | Composer |
+| 9 | Hex | `hex` | Languages | mix, rebar3 |
+| 10 | Pub | `pub` | Languages | dart pub, flutter pub |
+| 11 | Swift | `swift` | Languages | Swift Package Manager |
+| 12 | CocoaPods | `cocoapods` | Languages | pod |
+| 13 | CRAN | `cran` | Languages | R, install.packages |
+| 14 | SBT | `sbt` | Languages | sbt, Ivy |
+| 15 | Conda | `conda_native` | Languages | conda, mamba, micromamba |
+| 16 | Docker / OCI | `docker` | Containers | Docker, Podman, Buildx, ORAS |
+| 17 | Helm | `helm` | Infrastructure | helm |
+| 18 | Terraform | `terraform` | Infrastructure | terraform, tofu |
+| 19 | Vagrant | `vagrant` | Infrastructure | vagrant |
+| 20 | Chef | `chef` | Infrastructure | knife, Berkshelf |
+| 21 | Puppet | `puppet` | Infrastructure | puppet module |
+| 22 | Ansible | `ansible` | Infrastructure | ansible-galaxy |
+| 23 | Debian / APT | `debian` | System Packages | apt, dpkg |
+| 24 | RPM / YUM | `rpm` | System Packages | yum, dnf, zypper |
+| 25 | Alpine / APK | `alpine` | System Packages | apk |
+| 26 | OPKG | `opkg` | System Packages | opkg (OpenWrt) |
+| 27 | Conan | `conan` | C / C++ | conan (v2) |
+| 28 | Bazel | `bazel` | C / C++ | bazel, bazelisk |
+| 29 | HuggingFace | `huggingface` | ML / AI | huggingface_hub, transformers |
+| 30 | ML Model | `mlmodel` | ML / AI | Generic model storage |
+| 31 | VS Code | `vscode` | Editor Extensions | VS Code, Cursor, Windsurf, Kiro |
+| 32 | JetBrains | `jetbrains` | Editor Extensions | IntelliJ, PyCharm, WebStorm |
+| 33 | Git LFS | `gitlfs` | Other | git lfs |
+| 34 | P2 | `p2` | Other | Eclipse IDE |
+| 35 | Generic | `generic` | Other | curl, wget, any HTTP client |
+
+---
+
+## Detailed Guides by Category
+
+### Languages & Runtimes
 
 | Format | Key | Native Clients | Guide |
 |--------|-----|----------------|-------|
@@ -114,14 +160,17 @@ The **Generic** format is useful for build outputs, documentation bundles, or an
 
 Many package managers share underlying protocols. These aliases automatically resolve to their primary handlers:
 
-```
-bower → npm             buildx → docker         chocolatey → nuget
-conda → pypi            cursor → vscode         helm_oci → docker
-kiro → vscode           opentofu → terraform    oras → docker
-pnpm → npm              podman → docker         poetry → pypi
-powershell → nuget      wasm_oci → docker       windsurf → vscode
-yarn → npm
-```
+| Alias | Resolves To | Alias | Resolves To |
+|-------|-------------|-------|-------------|
+| `bower` | npm | `podman` | docker |
+| `yarn` | npm | `buildx` | docker |
+| `pnpm` | npm | `oras` | docker |
+| `gradle` | maven | `wasm_oci` | docker |
+| `poetry` | pypi | `helm_oci` | docker |
+| `conda` | pypi | `cursor` | vscode |
+| `chocolatey` | nuget | `windsurf` | vscode |
+| `powershell` | nuget | `kiro` | vscode |
+| `opentofu` | terraform | | |
 
 ---
 

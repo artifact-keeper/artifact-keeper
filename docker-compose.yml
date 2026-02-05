@@ -87,12 +87,8 @@ services:
     restart: unless-stopped
 
   openscap:
-    build:
-      context: .
-      dockerfile: Dockerfile.openscap
+    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest
     container_name: artifact-keeper-openscap
-    profiles:
-      - scanning
     ports:
       - "8091:8091"
     volumes:
