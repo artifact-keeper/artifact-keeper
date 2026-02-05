@@ -6,11 +6,13 @@
 	bind 0.0.0.0
 	reverse_proxy /api/* backend:8080
 	reverse_proxy /health backend:8080
+	reverse_proxy /metrics backend:8080
 	reverse_proxy web:3000
 }
 
 :80 {
 	reverse_proxy /api/* backend:8080
 	reverse_proxy /health backend:8080
+	reverse_proxy /metrics backend:8080
 	reverse_proxy web:3000
 }
