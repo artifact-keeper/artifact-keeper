@@ -791,8 +791,7 @@ async fn upload(
 
     // Populate packages / package_versions tables (best-effort)
     {
-        let pkg_svc =
-            crate::services::package_service::PackageService::new(state.db.clone());
+        let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
         pkg_svc
             .try_create_or_update_from_artifact(
                 repo.id,

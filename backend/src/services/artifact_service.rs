@@ -243,8 +243,7 @@ impl ArtifactService {
 
         // Populate packages / package_versions tables (non-blocking)
         if let Some(ref ver) = artifact.version {
-            let pkg_svc =
-                crate::services::package_service::PackageService::new(self.db.clone());
+            let pkg_svc = crate::services::package_service::PackageService::new(self.db.clone());
             pkg_svc
                 .try_create_or_update_from_artifact(
                     artifact.repository_id,

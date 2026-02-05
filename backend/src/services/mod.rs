@@ -1,15 +1,13 @@
 //! Business logic services.
 
 pub mod artifact_service;
-pub mod auth_config_service;
-pub mod build_service;
 pub mod artifactory_client;
 pub mod artifactory_import;
-pub mod nexus_client;
-pub mod source_registry;
 pub mod audit_service;
+pub mod auth_config_service;
 pub mod auth_service;
 pub mod backup_service;
+pub mod build_service;
 pub mod encryption;
 pub mod grype_scanner;
 pub mod image_scanner;
@@ -17,6 +15,7 @@ pub mod ldap_service;
 pub mod meili_service;
 pub mod migration_service;
 pub mod migration_worker;
+pub mod nexus_client;
 pub mod oidc_service;
 pub mod openscap_scanner;
 pub mod package_service;
@@ -34,6 +33,7 @@ pub mod scan_result_service;
 pub mod scanner_service;
 pub mod search_service;
 pub mod signing_service;
+pub mod source_registry;
 pub mod storage_service;
 pub mod token_service;
 pub mod transfer_service;

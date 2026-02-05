@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::http::{header, Method};
+use axum::Router;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -176,8 +176,20 @@ async fn main() -> Result<()> {
                     .collect();
                 CorsLayer::new()
                     .allow_origin(AllowOrigin::list(origins))
-                    .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS])
-                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT, header::COOKIE])
+                    .allow_methods([
+                        Method::GET,
+                        Method::POST,
+                        Method::PUT,
+                        Method::PATCH,
+                        Method::DELETE,
+                        Method::OPTIONS,
+                    ])
+                    .allow_headers([
+                        header::CONTENT_TYPE,
+                        header::AUTHORIZATION,
+                        header::ACCEPT,
+                        header::COOKIE,
+                    ])
                     .allow_credentials(true)
             } else {
                 CorsLayer::new()
@@ -336,12 +348,11 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     let password_file = Path::new(storage_path).join("admin.password");
 
     // Check if an admin user already exists
-    let admin_row: Option<(bool,)> = sqlx::query_as(
-        "SELECT must_change_password FROM users WHERE is_admin = true LIMIT 1",
-    )
-    .fetch_optional(db)
-    .await
-    .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+    let admin_row: Option<(bool,)> =
+        sqlx::query_as("SELECT must_change_password FROM users WHERE is_admin = true LIMIT 1")
+            .fetch_optional(db)
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     if let Some((must_change,)) = admin_row {
         // Admin already exists — determine if setup lock is needed
@@ -351,10 +362,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             );
             // Ensure the password file still exists for the user to read
             if password_file.exists() {
-                tracing::info!(
-                    "Admin password file: {}",
-                    password_file.display()
-                );
+                tracing::info!("Admin password file: {}", password_file.display());
             }
             return Ok(true);
         }
@@ -400,9 +408,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             // Fall back to logging the password directly
             tracing::info!("Generated admin password: {}", password);
         } else {
-            tracing::info!(
-                "Admin password written to: {}", password_file.display()
-            );
+            tracing::info!("Admin password written to: {}", password_file.display());
         }
         tracing::info!(
             "\n\

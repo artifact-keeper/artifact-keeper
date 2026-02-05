@@ -347,15 +347,20 @@ impl AuthConfigService {
         Ok((row, secret))
     }
 
-    pub async fn create_oidc(pool: &PgPool, req: CreateOidcConfigRequest) -> Result<OidcConfigResponse> {
+    pub async fn create_oidc(
+        pool: &PgPool,
+        req: CreateOidcConfigRequest,
+    ) -> Result<OidcConfigResponse> {
         let id = Uuid::new_v4();
         let encrypted = encrypt_credentials(&req.client_secret, &encryption_key());
         let encrypted_hex = hex::encode(&encrypted);
-        let scopes = req.scopes.unwrap_or_else(|| vec![
-            "openid".to_string(),
-            "profile".to_string(),
-            "email".to_string(),
-        ]);
+        let scopes = req.scopes.unwrap_or_else(|| {
+            vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string(),
+            ]
+        });
         let attribute_mapping = req.attribute_mapping.unwrap_or(serde_json::json!({}));
         let is_enabled = req.is_enabled.unwrap_or(true);
         let auto_create_users = req.auto_create_users.unwrap_or(true);
@@ -463,7 +468,11 @@ impl AuthConfigService {
         Ok(())
     }
 
-    pub async fn toggle_oidc(pool: &PgPool, id: Uuid, toggle: ToggleRequest) -> Result<OidcConfigResponse> {
+    pub async fn toggle_oidc(
+        pool: &PgPool,
+        id: Uuid,
+        toggle: ToggleRequest,
+    ) -> Result<OidcConfigResponse> {
         let row = sqlx::query_as::<_, OidcConfigRow>(
             r#"
             UPDATE oidc_configs SET is_enabled = $1, updated_at = NOW()
@@ -543,7 +552,10 @@ impl AuthConfigService {
         Ok(Self::ldap_row_to_response(row))
     }
 
-    pub async fn get_ldap_decrypted(pool: &PgPool, id: Uuid) -> Result<(LdapConfigRow, Option<String>)> {
+    pub async fn get_ldap_decrypted(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> Result<(LdapConfigRow, Option<String>)> {
         let row = sqlx::query_as::<_, LdapConfigRow>(
             r#"
             SELECT id, name, server_url, bind_dn, bind_password_encrypted,
@@ -566,17 +578,22 @@ impl AuthConfigService {
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(|hex_str| {
-                let encrypted_bytes = hex::decode(hex_str)
-                    .map_err(|e| AppError::Internal(format!("Failed to decode bind password hex: {e}")))?;
-                decrypt_credentials(&encrypted_bytes, &encryption_key())
-                    .map_err(|e| AppError::Internal(format!("Failed to decrypt bind password: {e}")))
+                let encrypted_bytes = hex::decode(hex_str).map_err(|e| {
+                    AppError::Internal(format!("Failed to decode bind password hex: {e}"))
+                })?;
+                decrypt_credentials(&encrypted_bytes, &encryption_key()).map_err(|e| {
+                    AppError::Internal(format!("Failed to decrypt bind password: {e}"))
+                })
             })
             .transpose()?;
 
         Ok((row, password))
     }
 
-    pub async fn create_ldap(pool: &PgPool, req: CreateLdapConfigRequest) -> Result<LdapConfigResponse> {
+    pub async fn create_ldap(
+        pool: &PgPool,
+        req: CreateLdapConfigRequest,
+    ) -> Result<LdapConfigResponse> {
         let id = Uuid::new_v4();
 
         let bind_password_hex: Option<String> = req.bind_password.as_ref().map(|pw| {
@@ -586,9 +603,13 @@ impl AuthConfigService {
 
         let user_filter = req.user_filter.unwrap_or_else(|| "(uid={0})".to_string());
         let email_attribute = req.email_attribute.unwrap_or_else(|| "mail".to_string());
-        let display_name_attribute = req.display_name_attribute.unwrap_or_else(|| "cn".to_string());
+        let display_name_attribute = req
+            .display_name_attribute
+            .unwrap_or_else(|| "cn".to_string());
         let username_attribute = req.username_attribute.unwrap_or_else(|| "uid".to_string());
-        let groups_attribute = req.groups_attribute.unwrap_or_else(|| "memberOf".to_string());
+        let groups_attribute = req
+            .groups_attribute
+            .unwrap_or_else(|| "memberOf".to_string());
         let use_starttls = req.use_starttls.unwrap_or(false);
         let is_enabled = req.is_enabled.unwrap_or(true);
         let priority = req.priority.unwrap_or(0);
@@ -662,8 +683,12 @@ impl AuthConfigService {
         let group_base_dn = req.group_base_dn.or(existing.group_base_dn);
         let group_filter = req.group_filter.or(existing.group_filter);
         let email_attribute = req.email_attribute.unwrap_or(existing.email_attribute);
-        let display_name_attribute = req.display_name_attribute.unwrap_or(existing.display_name_attribute);
-        let username_attribute = req.username_attribute.unwrap_or(existing.username_attribute);
+        let display_name_attribute = req
+            .display_name_attribute
+            .unwrap_or(existing.display_name_attribute);
+        let username_attribute = req
+            .username_attribute
+            .unwrap_or(existing.username_attribute);
         let groups_attribute = req.groups_attribute.unwrap_or(existing.groups_attribute);
         let admin_group_dn = req.admin_group_dn.or(existing.admin_group_dn);
         let use_starttls = req.use_starttls.unwrap_or(existing.use_starttls);
@@ -731,7 +756,11 @@ impl AuthConfigService {
         Ok(())
     }
 
-    pub async fn toggle_ldap(pool: &PgPool, id: Uuid, toggle: ToggleRequest) -> Result<LdapConfigResponse> {
+    pub async fn toggle_ldap(
+        pool: &PgPool,
+        id: Uuid,
+        toggle: ToggleRequest,
+    ) -> Result<LdapConfigResponse> {
         let row = sqlx::query_as::<_, LdapConfigRow>(
             r#"
             UPDATE ldap_configs SET is_enabled = $1, updated_at = NOW()
@@ -905,13 +934,18 @@ impl AuthConfigService {
         .ok_or_else(|| AppError::NotFound(format!("SAML config {id} not found")))
     }
 
-    pub async fn create_saml(pool: &PgPool, req: CreateSamlConfigRequest) -> Result<SamlConfigResponse> {
+    pub async fn create_saml(
+        pool: &PgPool,
+        req: CreateSamlConfigRequest,
+    ) -> Result<SamlConfigResponse> {
         let id = Uuid::new_v4();
         let name_id_format = req.name_id_format.unwrap_or_else(|| {
             "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_string()
         });
         let attribute_mapping = req.attribute_mapping.unwrap_or(serde_json::json!({}));
-        let sp_entity_id = req.sp_entity_id.unwrap_or_else(|| "artifact-keeper".to_string());
+        let sp_entity_id = req
+            .sp_entity_id
+            .unwrap_or_else(|| "artifact-keeper".to_string());
         let sign_requests = req.sign_requests.unwrap_or(false);
         let require_signed_assertions = req.require_signed_assertions.unwrap_or(true);
         let is_enabled = req.is_enabled.unwrap_or(true);
@@ -979,7 +1013,9 @@ impl AuthConfigService {
         let attribute_mapping = req.attribute_mapping.unwrap_or(existing.attribute_mapping);
         let sp_entity_id = req.sp_entity_id.unwrap_or(existing.sp_entity_id);
         let sign_requests = req.sign_requests.unwrap_or(existing.sign_requests);
-        let require_signed_assertions = req.require_signed_assertions.unwrap_or(existing.require_signed_assertions);
+        let require_signed_assertions = req
+            .require_signed_assertions
+            .unwrap_or(existing.require_signed_assertions);
         let admin_group = req.admin_group.or(existing.admin_group);
         let is_enabled = req.is_enabled.unwrap_or(existing.is_enabled);
 
@@ -1030,7 +1066,11 @@ impl AuthConfigService {
         Ok(())
     }
 
-    pub async fn toggle_saml(pool: &PgPool, id: Uuid, toggle: ToggleRequest) -> Result<SamlConfigResponse> {
+    pub async fn toggle_saml(
+        pool: &PgPool,
+        id: Uuid,
+        toggle: ToggleRequest,
+    ) -> Result<SamlConfigResponse> {
         let row = sqlx::query_as::<_, SamlConfigRow>(
             r#"
             UPDATE saml_configs SET is_enabled = $1, updated_at = NOW()
@@ -1236,10 +1276,7 @@ impl AuthConfigService {
 
     /// Consume a single-use exchange code and return the associated tokens.
     /// The code is deleted atomically so it cannot be replayed.
-    pub async fn exchange_code(
-        pool: &PgPool,
-        code: &str,
-    ) -> Result<(String, String)> {
+    pub async fn exchange_code(pool: &PgPool, code: &str) -> Result<(String, String)> {
         let row = sqlx::query_as::<_, (String, String)>(
             r#"
             DELETE FROM sso_exchange_codes
@@ -1251,22 +1288,17 @@ impl AuthConfigService {
         .fetch_optional(pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to exchange code: {e}")))?
-        .ok_or_else(|| {
-            AppError::Authentication("Invalid or expired exchange code".to_string())
-        })?;
+        .ok_or_else(|| AppError::Authentication("Invalid or expired exchange code".to_string()))?;
 
         Ok(row)
     }
 
     /// Remove all expired exchange codes. Intended to be called periodically.
     pub async fn cleanup_expired_exchange_codes(pool: &PgPool) -> Result<u64> {
-        let result =
-            sqlx::query("DELETE FROM sso_exchange_codes WHERE expires_at < NOW()")
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!("Failed to cleanup exchange codes: {e}"))
-                })?;
+        let result = sqlx::query("DELETE FROM sso_exchange_codes WHERE expires_at < NOW()")
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to cleanup exchange codes: {e}")))?;
 
         Ok(result.rows_affected())
     }

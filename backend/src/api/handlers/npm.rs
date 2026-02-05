@@ -612,8 +612,7 @@ async fn publish_package(
 
         // Populate packages / package_versions tables (best-effort)
         {
-            let pkg_svc =
-                crate::services::package_service::PackageService::new(state.db.clone());
+            let pkg_svc = crate::services::package_service::PackageService::new(state.db.clone());
             let description = version_data
                 .get("description")
                 .and_then(|v| v.as_str())

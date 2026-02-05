@@ -17,6 +17,27 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::auth_service::AuthService;
 
+/// Build a TOTP instance from raw secret bytes and a username label.
+fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
+    TOTP::new(
+        Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret_bytes,
+        Some("ArtifactKeeper".to_string()),
+        username,
+    )
+    .map_err(|e| AppError::Internal(format!("TOTP error: {}", e)))
+}
+
+/// Decode a base32-encoded secret string into raw bytes.
+fn decode_secret(encoded: &str) -> Result<Vec<u8>> {
+    Secret::Encoded(encoded.to_string())
+        .to_bytes()
+        .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))
+}
+
 /// Public TOTP routes (no auth required -- uses totp_token)
 pub fn public_router() -> Router<SharedState> {
     Router::new().route("/verify", post(verify_totp))
@@ -51,18 +72,10 @@ pub async fn setup_totp(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret
-            .to_bytes()
-            .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))?,
-        Some("ArtifactKeeper".to_string()),
-        user.username.clone(),
-    )
-    .map_err(|e| AppError::Internal(format!("TOTP error: {}", e)))?;
+    let secret_bytes = secret
+        .to_bytes()
+        .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))?;
+    let totp = build_totp(secret_bytes, user.username.clone())?;
 
     let qr_code_url = totp.get_url();
 
@@ -100,36 +113,21 @@ pub async fn enable_totp(
     Json(payload): Json<TotpCodeRequest>,
 ) -> Result<Json<TotpEnableResponse>> {
     // Fetch stored secret
-    let user = sqlx::query!(
-        "SELECT totp_secret FROM users WHERE id = $1",
-        auth.user_id
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let user = sqlx::query!("SELECT totp_secret FROM users WHERE id = $1", auth.user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     let secret_str = user.totp_secret.ok_or_else(|| {
         AppError::Validation("TOTP not set up. Call /auth/totp/setup first.".to_string())
     })?;
 
-    let secret = Secret::Encoded(secret_str.clone());
     let username_row = sqlx::query!("SELECT username FROM users WHERE id = $1", auth.user_id)
         .fetch_one(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret
-            .to_bytes()
-            .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))?,
-        Some("ArtifactKeeper".to_string()),
-        username_row.username,
-    )
-    .map_err(|e| AppError::Internal(format!("TOTP error: {}", e)))?;
+    let totp = build_totp(decode_secret(&secret_str)?, username_row.username)?;
 
     // Verify code
     if !totp
@@ -220,19 +218,7 @@ pub async fn verify_totp(
         .totp_secret
         .ok_or_else(|| AppError::Authentication("TOTP not configured".to_string()))?;
 
-    let secret = Secret::Encoded(secret_str);
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret
-            .to_bytes()
-            .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))?,
-        Some("ArtifactKeeper".to_string()),
-        user_row.username.clone(),
-    )
-    .map_err(|e| AppError::Internal(format!("TOTP error: {}", e)))?;
+    let totp = build_totp(decode_secret(&secret_str)?, user_row.username.clone())?;
 
     let code_valid = totp
         .check_current(&payload.code)
@@ -364,19 +350,7 @@ pub async fn disable_totp(
         .totp_secret
         .ok_or_else(|| AppError::Authentication("TOTP not configured".to_string()))?;
 
-    let secret = Secret::Encoded(secret_str);
-    let totp = TOTP::new(
-        Algorithm::SHA1,
-        6,
-        1,
-        30,
-        secret
-            .to_bytes()
-            .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))?,
-        Some("ArtifactKeeper".to_string()),
-        user.username,
-    )
-    .map_err(|e| AppError::Internal(format!("TOTP error: {}", e)))?;
+    let totp = build_totp(decode_secret(&secret_str)?, user.username)?;
 
     if !totp
         .check_current(&payload.code)

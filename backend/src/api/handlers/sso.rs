@@ -40,9 +40,7 @@ pub fn router() -> Router<SharedState> {
 // List enabled providers (public)
 // ---------------------------------------------------------------------------
 
-async fn list_providers(
-    State(state): State<SharedState>,
-) -> Result<Json<Vec<SsoProviderInfo>>> {
+async fn list_providers(State(state): State<SharedState>) -> Result<Json<Vec<SsoProviderInfo>>> {
     let result = AuthConfigService::list_enabled_providers(&state.db).await?;
     Ok(Json(result))
 }
@@ -51,17 +49,12 @@ async fn list_providers(
 // OIDC login redirect
 // ---------------------------------------------------------------------------
 
-async fn oidc_login(
-    State(state): State<SharedState>,
-    Path(id): Path<Uuid>,
-) -> Result<Redirect> {
+async fn oidc_login(State(state): State<SharedState>, Path(id): Path<Uuid>) -> Result<Redirect> {
     // 1. Get decrypted OIDC config
-    let (row, _client_secret) =
-        AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
+    let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
     // 2. Create SSO session for CSRF protection (generates state + nonce internally)
-    let session =
-        AuthConfigService::create_sso_session(&state.db, "oidc", id).await?;
+    let session = AuthConfigService::create_sso_session(&state.db, "oidc", id).await?;
     let state_str = session.state;
     let nonce_str = session.nonce.unwrap_or_default();
 
@@ -126,12 +119,10 @@ async fn oidc_callback(
     Query(params): Query<OidcCallbackQuery>,
 ) -> Result<Redirect> {
     // 1. Validate SSO session (CSRF check)
-    let _session =
-        AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
+    let _session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
 
     // 2. Get decrypted OIDC config
-    let (row, client_secret) =
-        AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
+    let (row, client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
     // 3. Fetch OIDC discovery for token_endpoint
     let discovery_url = format!(
@@ -186,10 +177,7 @@ async fn oidc_callback(
         .ok_or_else(|| AppError::Internal("ID token missing sub claim".into()))?
         .to_string();
 
-    let email = claims["email"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let email = claims["email"].as_str().unwrap_or_default().to_string();
 
     let preferred_username = claims["preferred_username"]
         .as_str()
@@ -197,9 +185,7 @@ async fn oidc_callback(
         .unwrap_or(&sub)
         .to_string();
 
-    let display_name = claims["name"]
-        .as_str()
-        .map(|s| s.to_string());
+    let display_name = claims["name"].as_str().map(|s| s.to_string());
 
     let groups = claims["groups"]
         .as_array()
@@ -211,8 +197,7 @@ async fn oidc_callback(
         .unwrap_or_default();
 
     // 8. Authenticate via federated flow (find/create user + generate tokens)
-    let auth_service =
-        AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (_user, tokens) = auth_service
         .authenticate_federated(
@@ -283,16 +268,18 @@ async fn ldap_login(
 
     // Sync user to local DB and generate JWT
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = auth_service.authenticate_federated(
-        AuthProvider::Ldap,
-        FederatedCredentials {
-            external_id: ldap_user.dn,
-            username: ldap_user.username,
-            email: ldap_user.email,
-            display_name: ldap_user.display_name,
-            groups: ldap_user.groups,
-        },
-    ).await?;
+    let (_user, tokens) = auth_service
+        .authenticate_federated(
+            AuthProvider::Ldap,
+            FederatedCredentials {
+                external_id: ldap_user.dn,
+                username: ldap_user.username,
+                email: ldap_user.email,
+                display_name: ldap_user.display_name,
+                groups: ldap_user.groups,
+            },
+        )
+        .await?;
 
     let body = serde_json::json!({
         "access_token": tokens.access_token,
@@ -302,7 +289,12 @@ async fn ldap_login(
 
     // Default expires_in for LDAP tokens (1 hour = 3600 seconds)
     let mut response = Json(body).into_response();
-    set_auth_cookies(response.headers_mut(), &tokens.access_token, &tokens.refresh_token, 3600);
+    set_auth_cookies(
+        response.headers_mut(),
+        &tokens.access_token,
+        &tokens.refresh_token,
+        3600,
+    );
     Ok(response)
 }
 
@@ -310,10 +302,7 @@ async fn ldap_login(
 // SAML login + ACS
 // ---------------------------------------------------------------------------
 
-async fn saml_login(
-    State(state): State<SharedState>,
-    Path(id): Path<Uuid>,
-) -> Result<Redirect> {
+async fn saml_login(State(state): State<SharedState>, Path(id): Path<Uuid>) -> Result<Redirect> {
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
@@ -385,16 +374,18 @@ async fn saml_acs(
 
     // Sync user and generate tokens
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (_user, tokens) = auth_service.authenticate_federated(
-        AuthProvider::Saml,
-        FederatedCredentials {
-            external_id: saml_user.name_id,
-            username: saml_user.username,
-            email: saml_user.email,
-            display_name: saml_user.display_name,
-            groups: saml_user.groups,
-        },
-    ).await?;
+    let (_user, tokens) = auth_service
+        .authenticate_federated(
+            AuthProvider::Saml,
+            FederatedCredentials {
+                external_id: saml_user.name_id,
+                username: saml_user.username,
+                email: saml_user.email,
+                display_name: saml_user.display_name,
+                groups: saml_user.groups,
+            },
+        )
+        .await?;
 
     // Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(

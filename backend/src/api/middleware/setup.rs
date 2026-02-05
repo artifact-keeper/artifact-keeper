@@ -31,23 +31,13 @@ pub async fn setup_guard(
 
     let path = request.uri().path();
 
-    // Always allow health/readiness/metrics
-    if path == "/health" || path == "/ready" || path == "/metrics" {
-        return next.run(request).await;
-    }
+    let is_allowed = matches!(
+        path,
+        "/health" | "/ready" | "/metrics" | "/api/v1/setup/status"
+    ) || path.starts_with("/api/v1/auth")
+        || (path.starts_with("/api/v1/users/") && path.ends_with("/password"));
 
-    // Allow auth endpoints (login, refresh, logout, me, SSO)
-    if path.starts_with("/api/v1/auth") {
-        return next.run(request).await;
-    }
-
-    // Allow setup status check
-    if path == "/api/v1/setup/status" {
-        return next.run(request).await;
-    }
-
-    // Allow password change: POST /api/v1/users/:id/password
-    if path.starts_with("/api/v1/users/") && path.ends_with("/password") {
+    if is_allowed {
         return next.run(request).await;
     }
 

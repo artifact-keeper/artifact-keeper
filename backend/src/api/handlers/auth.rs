@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
+use axum::http::header::{COOKIE, SET_COOKIE};
+use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, State},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use axum::http::header::{COOKIE, SET_COOKIE};
-use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -118,18 +118,19 @@ pub async fn login(
     };
 
     let mut response = Json(body).into_response();
-    set_auth_cookies(response.headers_mut(), &tokens.access_token, &tokens.refresh_token, tokens.expires_in);
+    set_auth_cookies(
+        response.headers_mut(),
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+    );
     Ok(response)
 }
 
 /// Logout current session
 pub async fn logout(State(_state): State<SharedState>) -> Result<Response> {
     let mut response = ().into_response();
-    let secure_flag = if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" { "" } else { " Secure;" };
-    let clear_access = format!("ak_access_token=; HttpOnly;{} SameSite=Strict; Path=/; Max-Age=0", secure_flag);
-    let clear_refresh = format!("ak_refresh_token=; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth/refresh; Max-Age=0", secure_flag);
-    response.headers_mut().append(SET_COOKIE, clear_access.parse().unwrap());
-    response.headers_mut().append(SET_COOKIE, clear_refresh.parse().unwrap());
+    clear_auth_cookies(response.headers_mut());
     Ok(response)
 }
 
@@ -142,7 +143,8 @@ pub async fn refresh_token(
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     // Try body first, then fall back to cookie
-    let refresh_token_str = payload.refresh_token
+    let refresh_token_str = payload
+        .refresh_token
         .or_else(|| extract_cookie(&headers, "ak_refresh_token").map(String::from))
         .ok_or_else(|| AppError::Authentication("Missing refresh token".into()))?;
 
@@ -159,7 +161,12 @@ pub async fn refresh_token(
     };
 
     let mut response = Json(body).into_response();
-    set_auth_cookies(response.headers_mut(), &tokens.access_token, &tokens.refresh_token, tokens.expires_in);
+    set_auth_cookies(
+        response.headers_mut(),
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+    );
     Ok(response)
 }
 
@@ -237,27 +244,57 @@ pub(crate) fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&
         .get(COOKIE)
         .and_then(|h| h.to_str().ok())
         .and_then(|cookies| {
-            cookies.split(';')
+            cookies
+                .split(';')
                 .map(|c| c.trim())
                 .find_map(|c| c.strip_prefix(&format!("{}=", name)))
         })
 }
 
+/// Returns the `Secure;` cookie flag unless running in development mode,
+/// where cookies must work over plain HTTP on localhost.
+fn secure_flag() -> &'static str {
+    if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" {
+        ""
+    } else {
+        " Secure;"
+    }
+}
+
 /// Set httpOnly auth cookies on a response.
-/// In development mode (ENVIRONMENT=development), the Secure flag is omitted
-/// so cookies work over plain HTTP on localhost.
-pub(crate) fn set_auth_cookies(headers: &mut HeaderMap, access_token: &str, refresh_token: &str, expires_in: u64) {
-    let secure_flag = if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" { "" } else { " Secure;" };
+pub(crate) fn set_auth_cookies(
+    headers: &mut HeaderMap,
+    access_token: &str,
+    refresh_token: &str,
+    expires_in: u64,
+) {
+    let flag = secure_flag();
     let access_cookie = format!(
         "ak_access_token={}; HttpOnly;{} SameSite=Strict; Path=/; Max-Age={}",
-        access_token, secure_flag, expires_in
+        access_token, flag, expires_in
     );
-    let refresh_cookie = format!(
+    let refresh_cookie =
+        format!(
         "ak_refresh_token={}; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth/refresh; Max-Age={}",
-        refresh_token, secure_flag, 7 * 24 * 3600
+        refresh_token, flag, 7 * 24 * 3600
     );
     headers.append(SET_COOKIE, access_cookie.parse().unwrap());
     headers.append(SET_COOKIE, refresh_cookie.parse().unwrap());
+}
+
+/// Clear auth cookies by setting Max-Age=0.
+fn clear_auth_cookies(headers: &mut HeaderMap) {
+    let flag = secure_flag();
+    let clear_access = format!(
+        "ak_access_token=; HttpOnly;{} SameSite=Strict; Path=/; Max-Age=0",
+        flag
+    );
+    let clear_refresh = format!(
+        "ak_refresh_token=; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth/refresh; Max-Age=0",
+        flag
+    );
+    headers.append(SET_COOKIE, clear_access.parse().unwrap());
+    headers.append(SET_COOKIE, clear_refresh.parse().unwrap());
 }
 
 /// Revoke an API token
