@@ -1,0 +1,113 @@
+version: "3.8"
+
+# SSO E2E Test Environment
+# Spins up OpenLDAP and Keycloak to test LDAP/OIDC/SAML auth flows
+
+services:
+  # OpenLDAP for LDAP authentication testing
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: sso-test-ldap
+    environment:
+      LDAP_ORGANISATION: "Artifact Keeper Test"
+      LDAP_DOMAIN: "test.local"
+      LDAP_ADMIN_PASSWORD: "adminpassword"
+      LDAP_CONFIG_PASSWORD: "configpassword"
+      LDAP_READONLY_USER: "true"
+      LDAP_READONLY_USER_USERNAME: "readonly"
+      LDAP_READONLY_USER_PASSWORD: "readonlypassword"
+    ports:
+      - "3389:389"
+      - "3636:636"
+    volumes:
+      - ldap_data:/var/lib/ldap
+      - ldap_config:/etc/ldap/slapd.d
+    healthcheck:
+      test: ["CMD", "ldapsearch", "-x", "-H", "ldap://localhost", "-b", "dc=test,dc=local", "-D", "cn=admin,dc=test,dc=local", "-w", "adminpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Keycloak for OIDC and SAML testing
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: sso-test-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+    command: start-dev
+    ports:
+      - "8180:8080"
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # PostgreSQL for Artifact Keeper
+  postgres:
+    image: postgres:16-alpine
+    container_name: sso-test-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Artifact Keeper backend (uses local build or pulled image)
+  backend:
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest
+    container_name: sso-test-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openldap:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://registry:registry@postgres:5432/artifact_registry
+      JWT_SECRET: test-jwt-secret-for-sso-e2e-testing-only
+      RUST_LOG: info,artifact_keeper=debug
+
+      # LDAP config
+      LDAP_URL: ldap://openldap:389
+      LDAP_BASE_DN: dc=test,dc=local
+      LDAP_BIND_DN: cn=admin,dc=test,dc=local
+      LDAP_BIND_PASSWORD: adminpassword
+      LDAP_USER_FILTER: "(uid={username})"
+      LDAP_GROUP_BASE_DN: ou=groups,dc=test,dc=local
+      LDAP_GROUP_FILTER: "(memberUid={username})"
+
+      # OIDC config (Keycloak)
+      OIDC_ISSUER: http://keycloak:8080/realms/artifact-keeper
+      OIDC_CLIENT_ID: artifact-keeper
+      OIDC_CLIENT_SECRET: artifact-keeper-secret
+      OIDC_REDIRECT_URI: http://localhost:8080/api/v1/auth/oidc/callback
+
+      # SAML config (Keycloak)
+      SAML_IDP_METADATA_URL: http://keycloak:8080/realms/artifact-keeper/protocol/saml/descriptor
+      SAML_SP_ENTITY_ID: artifact-keeper
+      SAML_ACS_URL: http://localhost:8080/api/v1/auth/saml/acs
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ldap_data:
+  ldap_config:
+  keycloak_data:
