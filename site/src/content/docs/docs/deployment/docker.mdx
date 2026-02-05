@@ -13,16 +13,12 @@ Deploy Artifact Keeper using Docker Compose for a complete, containerized setup.
 
 ## Quick Start
 
-### 1. Clone Repository
+### 1. Download and Start
 
 ```bash
-git clone https://github.com/artifact-keeper/artifact-keeper.git
-cd artifact-keeper
-```
-
-### 2. Start Services
-
-```bash
+mkdir artifact-keeper && cd artifact-keeper
+curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/Caddyfile
 docker compose up -d
 ```
 
