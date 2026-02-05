@@ -65,50 +65,39 @@ trap cleanup EXIT
 # Environment Setup
 # ============================================================================
 
+# Wait for a service to become ready.
+# Usage: wait_for_service <name> <check_cmd> <retries> <sleep_seconds>
+wait_for_service() {
+    local name="$1" check_cmd="$2" retries="$3" interval="$4"
+    log_info "Waiting for ${name}..."
+    for i in $(seq 1 "$retries"); do
+        if eval "$check_cmd" &>/dev/null; then
+            log_success "${name} is ready"
+            return 0
+        fi
+        sleep "$interval"
+    done
+    log_error "${name} failed to start"
+    return 1
+}
+
 if [[ "$SKIP_SETUP" == "false" ]]; then
     log_info "Starting SSO test environment..."
     docker compose up -d
 
     log_info "Waiting for services to be healthy..."
 
-    # Wait for OpenLDAP
-    log_info "Waiting for OpenLDAP..."
-    for i in {1..30}; do
-        if docker compose exec -T openldap ldapsearch -x -H ldap://localhost -b "dc=test,dc=local" -D "cn=admin,dc=test,dc=local" -w adminpassword &>/dev/null; then
-            break
-        fi
-        sleep 2
-    done
-    log_success "OpenLDAP is ready"
+    wait_for_service "OpenLDAP" \
+        'docker compose exec -T openldap ldapsearch -x -H ldap://localhost -b "dc=test,dc=local" -D "cn=admin,dc=test,dc=local" -w adminpassword' \
+        30 2
 
-    # Wait for Keycloak (no timeout command on macOS, use loop)
-    log_info "Waiting for Keycloak (this may take a minute)..."
-    for i in {1..40}; do
-        if curl -sf http://localhost:8180/health/ready &>/dev/null; then
-            break
-        fi
-        sleep 3
-    done
-    if ! curl -sf http://localhost:8180/health/ready &>/dev/null; then
-        log_error "Keycloak failed to start"
-        exit 1
-    fi
-    log_success "Keycloak is ready"
+    wait_for_service "Keycloak" \
+        'curl -sf http://localhost:8180/health/ready' \
+        40 3
 
-    # Wait for backend
-    log_info "Waiting for Artifact Keeper backend..."
-    for i in {1..30}; do
-        if curl -sf http://localhost:8080/health &>/dev/null; then
-            break
-        fi
-        sleep 2
-    done
-    if ! curl -sf http://localhost:8080/health &>/dev/null; then
-        log_error "Backend failed to start"
-        docker compose logs backend | tail -50
-        exit 1
-    fi
-    log_success "Backend is ready"
+    wait_for_service "Backend" \
+        'curl -sf http://localhost:8080/health' \
+        30 2 || { docker compose logs backend | tail -50; exit 1; }
 
     # Setup test data in IdPs
     log_info "Setting up LDAP test users..."
@@ -155,6 +144,13 @@ run_test() {
     fi
 }
 
+# Get an admin JWT token from the backend
+get_admin_token() {
+    curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
+        -H "Content-Type: application/json" \
+        -d '{"username": "admin", "password": "admin123"}' | jq -r ".access_token"
+}
+
 # ============================================================================
 # LDAP Tests
 # ============================================================================
@@ -197,10 +193,7 @@ if [[ "$TEST_LDAP" == "true" ]]; then
 
     # Test LDAP config test endpoint
     run_test "LDAP test connection endpoint" '
-        # Login as admin first
-        admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+        admin_token=$(get_admin_token)
         response=$(curl -sf -X POST "http://localhost:8080/api/v1/admin/sso/ldap/${LDAP_CONFIG_ID}/test" \
             -H "Authorization: Bearer $admin_token" \
             -H "Content-Type: application/json")
@@ -241,9 +234,7 @@ if [[ "$TEST_OIDC" == "true" ]]; then
 
     # Test listing OIDC providers
     run_test "Can list OIDC providers" '
-        admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+        admin_token=$(get_admin_token)
         response=$(curl -sf "http://localhost:8080/api/v1/admin/sso/oidc" \
             -H "Authorization: Bearer $admin_token")
         echo "$response" | jq -e "length >= 1" > /dev/null
@@ -272,9 +263,7 @@ if [[ "$TEST_SAML" == "true" ]]; then
 
     # Test listing SAML providers
     run_test "Can list SAML providers" '
-        admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
-            -H "Content-Type: application/json" \
-            -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+        admin_token=$(get_admin_token)
         response=$(curl -sf "http://localhost:8080/api/v1/admin/sso/saml" \
             -H "Authorization: Bearer $admin_token")
         echo "$response" | jq -e "length >= 1" > /dev/null
@@ -294,9 +283,7 @@ echo ""
 log_info "========== Provider List Tests =========="
 
 run_test "Can list all enabled SSO providers" '
-    admin_token=$(curl -sf -X POST "http://localhost:8080/api/v1/auth/login" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\": \"admin\", \"password\": \"admin123\"}" | jq -r ".access_token")
+    admin_token=$(get_admin_token)
     response=$(curl -sf "http://localhost:8080/api/v1/admin/sso/providers" \
         -H "Authorization: Bearer $admin_token")
     echo "$response" | jq -e "length >= 1" > /dev/null

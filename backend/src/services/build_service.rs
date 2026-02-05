@@ -178,13 +178,11 @@ impl BuildService {
         }
 
         // Verify build exists
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM builds WHERE id = $1)",
-        )
-        .bind(build_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM builds WHERE id = $1)")
+            .bind(build_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         if !exists {
             return Err(AppError::NotFound(format!("Build {} not found", build_id)));

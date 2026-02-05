@@ -114,10 +114,7 @@ impl NexusClient {
     }
 
     /// Build an authenticated GET request
-    async fn get<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<T, ArtifactoryError> {
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ArtifactoryError> {
         if self.config.throttle_delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(self.config.throttle_delay_ms)).await;
         }
@@ -151,10 +148,7 @@ impl NexusClient {
 
     /// Check if Nexus is reachable
     pub async fn ping(&self) -> Result<bool, ArtifactoryError> {
-        let url = format!(
-            "{}/service/rest/v1/status/writable",
-            self.config.base_url
-        );
+        let url = format!("{}/service/rest/v1/status/writable", self.config.base_url);
         let response = self
             .client
             .get(&url)
@@ -166,13 +160,13 @@ impl NexusClient {
 
     /// Get Nexus version — returns in the same format as Artifactory for compatibility
     pub async fn get_version(&self) -> Result<SystemVersionResponse, ArtifactoryError> {
-        let status: NexusStatusResponse = self
-            .get("/service/rest/v1/status")
-            .await
-            .unwrap_or(NexusStatusResponse {
-                edition: Some("Unknown".into()),
-                version: Some("Unknown".into()),
-            });
+        let status: NexusStatusResponse =
+            self.get("/service/rest/v1/status")
+                .await
+                .unwrap_or(NexusStatusResponse {
+                    edition: Some("Unknown".into()),
+                    version: Some("Unknown".into()),
+                });
 
         Ok(SystemVersionResponse {
             version: status.version.unwrap_or_else(|| "unknown".into()),
@@ -184,8 +178,7 @@ impl NexusClient {
 
     /// List all repositories — returns in the same format as Artifactory for compatibility
     pub async fn list_repositories(&self) -> Result<Vec<RepositoryListItem>, ArtifactoryError> {
-        let repos: Vec<NexusRepository> =
-            self.get("/service/rest/v1/repositories").await?;
+        let repos: Vec<NexusRepository> = self.get("/service/rest/v1/repositories").await?;
 
         Ok(repos
             .into_iter()
@@ -227,10 +220,13 @@ impl NexusClient {
 
             for component in &page.items {
                 for asset in &component.assets {
-                    let path_str = asset
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| format!("{}/{}", component.name, component.version.as_deref().unwrap_or("0")));
+                    let path_str = asset.path.clone().unwrap_or_else(|| {
+                        format!(
+                            "{}/{}",
+                            component.name,
+                            component.version.as_deref().unwrap_or("0")
+                        )
+                    });
                     let (dir, name) = match path_str.rsplit_once('/') {
                         Some((d, n)) => (d.to_string(), n.to_string()),
                         None => (".".to_string(), path_str),
@@ -281,10 +277,7 @@ impl NexusClient {
         repo_name: &str,
         path: &str,
     ) -> Result<bytes::Bytes, ArtifactoryError> {
-        let url = format!(
-            "{}/repository/{}/{}",
-            self.config.base_url, repo_name, path
-        );
+        let url = format!("{}/repository/{}/{}", self.config.base_url, repo_name, path);
         let response = self
             .client
             .get(&url)

@@ -577,8 +577,8 @@ fn create_source_client(
                 },
                 ..Default::default()
             };
-            let client =
-                NexusClient::new(config).map_err(|e| format!("Failed to create Nexus client: {}", e))?;
+            let client = NexusClient::new(config)
+                .map_err(|e| format!("Failed to create Nexus client: {}", e))?;
             Ok(Arc::new(client))
         }
         _ => {
@@ -859,9 +859,8 @@ async fn start_migration(
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
 
     // Create storage backend
-    let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(FilesystemStorage::new(
-        &state.config.storage_path,
-    ));
+    let storage: Arc<dyn crate::storage::StorageBackend> =
+        Arc::new(FilesystemStorage::new(&state.config.storage_path));
 
     // Create cancellation token for this job
     let cancel_token = CancellationToken::new();
@@ -879,7 +878,10 @@ async fn start_migration(
     let job_id = job.id;
     tokio::spawn(async move {
         let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
-        if let Err(e) = worker.process_job(job_id, client, conflict_resolution, None).await {
+        if let Err(e) = worker
+            .process_job(job_id, client, conflict_resolution, None)
+            .await
+        {
             tracing::error!(job_id = %job_id, error = %e, "Migration worker failed");
             let _ = sqlx::query(
                 "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
@@ -956,9 +958,8 @@ async fn resume_migration(
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
 
-    let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(FilesystemStorage::new(
-        &state.config.storage_path,
-    ));
+    let storage: Arc<dyn crate::storage::StorageBackend> =
+        Arc::new(FilesystemStorage::new(&state.config.storage_path));
     let cancel_token = CancellationToken::new();
 
     let worker_config = WorkerConfig {
@@ -973,7 +974,10 @@ async fn resume_migration(
     let job_id = job.id;
     tokio::spawn(async move {
         let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
-        if let Err(e) = worker.resume_job(job_id, client, conflict_resolution, None).await {
+        if let Err(e) = worker
+            .resume_job(job_id, client, conflict_resolution, None)
+            .await
+        {
             tracing::error!(job_id = %job_id, error = %e, "Migration resume failed");
             let _ = sqlx::query(
                 "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"

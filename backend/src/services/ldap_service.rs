@@ -353,7 +353,8 @@ impl LdapService {
 
         ldap3::drive!(conn);
 
-        let result = ldap.simple_bind(user_dn, password)
+        let result = ldap
+            .simple_bind(user_dn, password)
             .await
             .map_err(|e| AppError::Authentication(format!("LDAP bind failed: {e}")))?;
 
@@ -397,7 +398,8 @@ impl LdapService {
                 self.config.groups_attr.as_str(),
             ];
 
-            let (results, _) = ldap.search(&self.config.base_dn, Scope::Subtree, &search_filter, attrs)
+            let (results, _) = ldap
+                .search(&self.config.base_dn, Scope::Subtree, &search_filter, attrs)
                 .await
                 .map_err(|e| AppError::Internal(format!("LDAP search failed: {e}")))?
                 .success()
@@ -408,16 +410,22 @@ impl LdapService {
             if let Some(entry) = results.into_iter().next() {
                 let entry = SearchEntry::construct(entry);
 
-                let email = entry.attrs.get(&self.config.email_attr)
+                let email = entry
+                    .attrs
+                    .get(&self.config.email_attr)
                     .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or_else(|| format!("{}@unknown", username));
 
-                let display_name = entry.attrs.get(&self.config.display_name_attr)
+                let display_name = entry
+                    .attrs
+                    .get(&self.config.display_name_attr)
                     .and_then(|v| v.first())
                     .cloned();
 
-                let groups = entry.attrs.get(&self.config.groups_attr)
+                let groups = entry
+                    .attrs
+                    .get(&self.config.groups_attr)
                     .cloned()
                     .unwrap_or_default();
 

@@ -64,14 +64,12 @@ impl RemoteInstanceService {
 
     /// Delete a remote instance (only if it belongs to `user_id`).
     pub async fn delete(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<()> {
-        let result = sqlx::query(
-            "DELETE FROM remote_instances WHERE id = $1 AND user_id = $2",
-        )
-        .bind(id)
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let result = sqlx::query("DELETE FROM remote_instances WHERE id = $1 AND user_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound("Remote instance not found".into()));
@@ -80,11 +78,7 @@ impl RemoteInstanceService {
     }
 
     /// Return the (url, decrypted_api_key) for a remote instance.
-    pub async fn get_decrypted(
-        pool: &PgPool,
-        id: Uuid,
-        user_id: Uuid,
-    ) -> Result<(String, String)> {
+    pub async fn get_decrypted(pool: &PgPool, id: Uuid, user_id: Uuid) -> Result<(String, String)> {
         let row = sqlx::query(
             "SELECT url, api_key_encrypted FROM remote_instances WHERE id = $1 AND user_id = $2",
         )

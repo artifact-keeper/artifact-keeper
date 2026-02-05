@@ -58,14 +58,9 @@ async fn create_instance(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> Result<Json<RemoteInstanceResponse>> {
-    let instance = RemoteInstanceService::create(
-        &state.db,
-        auth.user_id,
-        &req.name,
-        &req.url,
-        &req.api_key,
-    )
-    .await?;
+    let instance =
+        RemoteInstanceService::create(&state.db, auth.user_id, &req.name, &req.url, &req.api_key)
+            .await?;
     Ok(Json(instance))
 }
 
@@ -91,10 +86,7 @@ fn build_target_url(base: &str, path: &str) -> String {
 async fn reqwest_to_axum(resp: reqwest::Response) -> Result<Response> {
     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .cloned();
+    let content_type = resp.headers().get("content-type").cloned();
     let body = resp
         .bytes()
         .await
@@ -118,8 +110,7 @@ async fn proxy_get(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
-    let (url, api_key) =
-        RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
+    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
     let resp = reqwest::Client::new()
@@ -138,8 +129,7 @@ async fn proxy_post(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    let (url, api_key) =
-        RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
+    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
     let resp = reqwest::Client::new()
@@ -160,8 +150,7 @@ async fn proxy_put(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
-    let (url, api_key) =
-        RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
+    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
     let resp = reqwest::Client::new()
@@ -181,8 +170,7 @@ async fn proxy_delete(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
-    let (url, api_key) =
-        RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
+    let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
     let resp = reqwest::Client::new()

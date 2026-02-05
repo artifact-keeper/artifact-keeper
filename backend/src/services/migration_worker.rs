@@ -513,12 +513,11 @@ impl MigrationWorker {
             }
 
             // Insert artifact record into the database
-            let repo_id: Option<(Uuid,)> = sqlx::query_as(
-                "SELECT id FROM repositories WHERE key = $1"
-            )
-            .bind(repo_key)
-            .fetch_optional(&self.db)
-            .await?;
+            let repo_id: Option<(Uuid,)> =
+                sqlx::query_as("SELECT id FROM repositories WHERE key = $1")
+                    .bind(repo_key)
+                    .fetch_optional(&self.db)
+                    .await?;
 
             if let Some((repository_id,)) = repo_id {
                 let name = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
@@ -911,11 +910,10 @@ impl MigrationWorker {
 
     /// Check if the job has been paused via the database
     async fn is_paused(&self, job_id: Uuid) -> Result<bool, MigrationError> {
-        let status: (String,) =
-            sqlx::query_as("SELECT status FROM migration_jobs WHERE id = $1")
-                .bind(job_id)
-                .fetch_one(&self.db)
-                .await?;
+        let status: (String,) = sqlx::query_as("SELECT status FROM migration_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&self.db)
+            .await?;
         Ok(status.0 == "paused" || status.0 == "cancelled")
     }
 
