@@ -41,12 +41,8 @@ services:
       - "8180:8080"
     volumes:
       - keycloak_data:/opt/keycloak/data
-    healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
+    # Note: Healthcheck disabled - script handles wait via external curl
+    # Keycloak image doesn't have curl/wget installed
 
   # PostgreSQL for Artifact Keeper
   postgres:
@@ -74,10 +70,16 @@ services:
       openldap:
         condition: service_healthy
       keycloak:
-        condition: service_healthy
+        condition: service_started
+    user: root
+    volumes:
+      - backend_data:/data
     environment:
       DATABASE_URL: postgres://registry:registry@postgres:5432/artifact_registry
       JWT_SECRET: test-jwt-secret-for-sso-e2e-testing-only
+      ADMIN_PASSWORD: admin123
+      STORAGE_PATH: /data/storage
+      PLUGINS_ENABLED: "false"
       RUST_LOG: info,artifact_keeper=debug
 
       # LDAP config
@@ -111,3 +113,4 @@ volumes:
   ldap_data:
   ldap_config:
   keycloak_data:
+  backend_data:

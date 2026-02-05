@@ -72,17 +72,41 @@ if [[ "$SKIP_SETUP" == "false" ]]; then
 
     # Wait for OpenLDAP
     log_info "Waiting for OpenLDAP..."
-    timeout 60 bash -c 'until docker compose exec -T openldap ldapsearch -x -H ldap://localhost -b "dc=test,dc=local" -D "cn=admin,dc=test,dc=local" -w adminpassword &>/dev/null; do sleep 2; done'
+    for i in {1..30}; do
+        if docker compose exec -T openldap ldapsearch -x -H ldap://localhost -b "dc=test,dc=local" -D "cn=admin,dc=test,dc=local" -w adminpassword &>/dev/null; then
+            break
+        fi
+        sleep 2
+    done
     log_success "OpenLDAP is ready"
 
-    # Wait for Keycloak
+    # Wait for Keycloak (no timeout command on macOS, use loop)
     log_info "Waiting for Keycloak (this may take a minute)..."
-    timeout 120 bash -c 'until curl -sf http://localhost:8180/health/ready &>/dev/null; do sleep 3; done'
+    for i in {1..40}; do
+        if curl -sf http://localhost:8180/health/ready &>/dev/null; then
+            break
+        fi
+        sleep 3
+    done
+    if ! curl -sf http://localhost:8180/health/ready &>/dev/null; then
+        log_error "Keycloak failed to start"
+        exit 1
+    fi
     log_success "Keycloak is ready"
 
     # Wait for backend
     log_info "Waiting for Artifact Keeper backend..."
-    timeout 60 bash -c 'until curl -sf http://localhost:8080/health &>/dev/null; do sleep 2; done'
+    for i in {1..30}; do
+        if curl -sf http://localhost:8080/health &>/dev/null; then
+            break
+        fi
+        sleep 2
+    done
+    if ! curl -sf http://localhost:8080/health &>/dev/null; then
+        log_error "Backend failed to start"
+        docker compose logs backend | tail -50
+        exit 1
+    fi
     log_success "Backend is ready"
 
     # Setup test data

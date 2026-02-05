@@ -15,12 +15,11 @@ echo "Configuring Keycloak for SSO testing..."
 
 # Get admin token
 echo "Getting admin access token..."
-ADMIN_TOKEN=$(curl -sf -X POST "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
-    -H "Content-Type: application/x-www-form-urlencoded" \
-    -d "username=${ADMIN_USER}" \
-    -d "password=${ADMIN_PASSWORD}" \
-    -d "grant_type=password" \
-    -d "client_id=admin-cli" | jq -r '.access_token')
+ADMIN_TOKEN=$(curl -s "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+    --data-urlencode "username=${ADMIN_USER}" \
+    --data-urlencode "password=${ADMIN_PASSWORD}" \
+    --data-urlencode "grant_type=password" \
+    --data-urlencode "client_id=admin-cli" | jq -r '.access_token')
 
 if [[ -z "$ADMIN_TOKEN" ]] || [[ "$ADMIN_TOKEN" == "null" ]]; then
     echo "Failed to get admin token"
@@ -30,7 +29,7 @@ fi
 AUTH_HEADER="Authorization: Bearer ${ADMIN_TOKEN}"
 
 # Check if realm exists
-REALM_EXISTS=$(curl -sf -o /dev/null -w "%{http_code}" \
+REALM_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "$AUTH_HEADER" \
     "${KEYCLOAK_URL}/admin/realms/${REALM}")
 
