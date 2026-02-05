@@ -1,0 +1,164 @@
+---
+import LandingLayout from '../layouts/LandingLayout.astro';
+import Navbar from '../components/landing/Navbar.astro';
+import Footer from '../components/landing/Footer.astro';
+
+const lastUpdated = "February 5, 2026";
+---
+
+<LandingLayout
+  title="Privacy Policy — Artifact Keeper"
+  description="Privacy Policy for Artifact Keeper applications and services."
+>
+  <Navbar />
+
+  <main class="max-w-4xl mx-auto px-6 py-16">
+    <h1 class="text-4xl font-bold mb-4">Privacy Policy</h1>
+    <p class="text-gray-500 mb-8">Last updated: {lastUpdated}</p>
+
+    <div class="prose prose-lg max-w-none">
+      <p>
+        This Privacy Policy describes how Artifact Keeper ("we", "us", or "our") collects, uses, and shares
+        information when you use our applications and services, including:
+      </p>
+      <ul>
+        <li>Artifact Keeper Server (self-hosted)</li>
+        <li>Artifact Keeper for iOS</li>
+        <li>Artifact Keeper for macOS</li>
+        <li>Artifact Keeper for Android</li>
+        <li>Artifact Keeper Web Interface</li>
+      </ul>
+
+      <h2>Information We Collect</h2>
+
+      <h3>Self-Hosted Server</h3>
+      <p>
+        Artifact Keeper Server is designed to be self-hosted on your own infrastructure. When you run
+        Artifact Keeper Server:
+      </p>
+      <ul>
+        <li><strong>We do not collect any data.</strong> All data remains on your servers under your control.</li>
+        <li>No telemetry, analytics, or usage data is sent to us.</li>
+        <li>No network requests are made to our servers.</li>
+      </ul>
+
+      <h3>Mobile and Desktop Applications</h3>
+      <p>
+        Our iOS, macOS, and Android applications connect to Artifact Keeper servers that you configure.
+        These apps:
+      </p>
+      <ul>
+        <li><strong>Store server credentials locally</strong> on your device using secure storage (Keychain on Apple platforms, EncryptedSharedPreferences on Android).</li>
+        <li><strong>Do not collect personal information</strong> or send data to us.</li>
+        <li><strong>Do not include third-party analytics</strong> or advertising SDKs.</li>
+        <li><strong>Communicate only</strong> with the Artifact Keeper servers you configure.</li>
+      </ul>
+
+      <h3>Demo Instance</h3>
+      <p>
+        If you use our public demo instance at demo.artifactkeeper.com:
+      </p>
+      <ul>
+        <li>Basic server logs (IP addresses, timestamps) may be collected for security and abuse prevention.</li>
+        <li>Any artifacts you upload to the demo are visible to other demo users and may be periodically deleted.</li>
+        <li>Do not upload sensitive or private data to the demo instance.</li>
+      </ul>
+
+      <h2>How We Use Information</h2>
+      <p>
+        For self-hosted installations and our mobile/desktop apps, we do not collect or use any of your information.
+      </p>
+      <p>
+        For the demo instance, server logs may be used to:
+      </p>
+      <ul>
+        <li>Monitor for abuse and security threats</li>
+        <li>Debug technical issues</li>
+        <li>Understand general usage patterns (not individual behavior)</li>
+      </ul>
+
+      <h2>Data Storage and Security</h2>
+      <p>
+        <strong>Self-hosted:</strong> You are responsible for securing your own Artifact Keeper installation.
+        We recommend following the security best practices in our documentation.
+      </p>
+      <p>
+        <strong>Mobile apps:</strong> Credentials are stored using platform-native secure storage:
+      </p>
+      <ul>
+        <li>iOS/macOS: Keychain Services</li>
+        <li>Android: EncryptedSharedPreferences with Android Keystore</li>
+      </ul>
+
+      <h2>Third-Party Services</h2>
+      <p>
+        Our applications do not integrate with third-party analytics, advertising, or tracking services.
+      </p>
+      <p>
+        If you configure SSO authentication (LDAP, OIDC, SAML), your Artifact Keeper server will communicate
+        with your identity provider according to your configuration.
+      </p>
+
+      <h2>Children's Privacy</h2>
+      <p>
+        Artifact Keeper is a developer tool intended for use by software development professionals.
+        Our services are not directed at children under 13 years of age, and we do not knowingly collect
+        personal information from children under 13.
+      </p>
+
+      <h2>Your Rights</h2>
+      <p>
+        Since we do not collect personal data from self-hosted installations or mobile apps, there is
+        no personal data for us to provide, correct, or delete.
+      </p>
+      <p>
+        For the demo instance, you may contact us to request deletion of any data associated with your use.
+      </p>
+
+      <h2>Changes to This Policy</h2>
+      <p>
+        We may update this Privacy Policy from time to time. We will notify you of any changes by
+        posting the new Privacy Policy on this page and updating the "Last updated" date.
+      </p>
+
+      <h2>Open Source</h2>
+      <p>
+        Artifact Keeper is open source software. You can review our code to verify our privacy practices:
+      </p>
+      <ul>
+        <li><a href="https://github.com/artifact-keeper/artifact-keeper" class="text-blue-600 hover:underline">Server</a></li>
+        <li><a href="https://github.com/artifact-keeper/artifact-keeper-ios" class="text-blue-600 hover:underline">iOS/macOS App</a></li>
+        <li><a href="https://github.com/artifact-keeper/artifact-keeper-android" class="text-blue-600 hover:underline">Android App</a></li>
+        <li><a href="https://github.com/artifact-keeper/artifact-keeper-web" class="text-blue-600 hover:underline">Web Interface</a></li>
+      </ul>
+
+      <h2>Contact Us</h2>
+      <p>
+        If you have questions about this Privacy Policy, please contact us at:
+      </p>
+      <p>
+        <a href="mailto:privacy@artifactkeeper.com" class="text-blue-600 hover:underline">privacy@artifactkeeper.com</a>
+      </p>
+      <p>
+        Or open an issue on our <a href="https://github.com/artifact-keeper/artifact-keeper/issues" class="text-blue-600 hover:underline">GitHub repository</a>.
+      </p>
+    </div>
+  </main>
+
+  <Footer />
+</LandingLayout>
+
+<style>
+  .prose h2 {
+    @apply text-2xl font-bold mt-10 mb-4;
+  }
+  .prose h3 {
+    @apply text-xl font-semibold mt-6 mb-3;
+  }
+  .prose p {
+    @apply mb-4 leading-relaxed;
+  }
+  .prose ul {
+    @apply list-disc pl-6 mb-4 space-y-2;
+  }
+</style>
