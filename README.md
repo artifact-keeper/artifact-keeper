@@ -227,109 +227,24 @@ Extend Artifact Keeper with custom format handlers compiled to WebAssembly.
 
 ## Quick Start
 
-### Docker Compose
-
 ```bash
-git clone https://github.com/artifact-keeper/artifact-keeper.git
-cd artifact-keeper
+mkdir artifact-keeper && cd artifact-keeper
+curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/Caddyfile
 docker compose up -d
 ```
 
-Open [http://localhost:30080](http://localhost:30080) in your browser.
+Open [http://localhost:30080](http://localhost:30080) and follow the first-time setup instructions.
 
-> **Production:** Set `SITE_ADDRESS=yourdomain.com` in your environment or `.env` file
-> and Caddy will automatically provision TLS certificates via Let's Encrypt.
+**[Full Quickstart Guide →](https://artifactkeeper.com/docs/getting-started/quickstart/)**
 
-On first boot, a random admin password is generated and written to a file inside the container:
+## Documentation
 
-```bash
-docker exec artifact-keeper-backend cat /data/storage/admin.password
-```
-
-The API is **locked** until you change this password. Log in and change it to unlock:
-
-```bash
-# Login
-TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"<password-from-file>"}' | jq -r '.access_token')
-
-# Get your user ID
-USER_ID=$(curl -s http://localhost:30080/api/v1/auth/me \
-  -H "Authorization: Bearer $TOKEN" | jq -r '.id')
-
-# Change password (unlocks the API)
-curl -X POST "http://localhost:30080/api/v1/users/$USER_ID/password" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"new_password":"your-secure-password"}'
-```
-
-> **Tip:** To skip the setup lock, set `ADMIN_PASSWORD=yourpass` in your `.env` file before starting.
-
-#### What starts
-
-| Service | Description | Port |
-|---------|-------------|------|
-| **Backend** | Rust API server (45+ format handlers) | 8080 (internal) |
-| **Web UI** | Next.js frontend | 3000 (internal) |
-| **Caddy** | Reverse proxy + local TLS | **30080** (HTTP), **30443** (HTTPS) |
-| **PostgreSQL** | Database | 30432 |
-| **Meilisearch** | Full-text search | 7700 |
-| **Trivy** | Vulnerability scanning | 8090 |
-
-#### Verify it's working
-
-```bash
-# Health check (always works, even during setup lock)
-curl http://localhost:30080/health
-
-# Check setup status
-curl http://localhost:30080/api/v1/setup/status
-```
-
-### Manual Build
-
-```bash
-cargo build --release
-./target/release/artifact-keeper
-```
-
-Requires Rust 1.75+ and PostgreSQL 16+.
-
-## Configuration
-
-Key environment variables (see [full reference](https://artifactkeeper.com/docs/reference/environment/)):
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | **Required** |
-| `JWT_SECRET` | Secret for signing JWT tokens | **Required** |
-| `STORAGE_BACKEND` | `filesystem` or `s3` | `filesystem` |
-| `STORAGE_PATH` | Local storage directory | `/var/lib/artifact-keeper/artifacts` |
-| `S3_BUCKET` | S3 bucket name | - |
-| `S3_ENDPOINT` | S3-compatible endpoint URL | - |
-| `TRIVY_URL` | Trivy server for security scanning | - |
-| `MEILISEARCH_URL` | Meilisearch for full-text search | - |
-| `DEMO_MODE` | Block all write operations | `false` |
-
-## Testing
-
-Three-tier testing strategy:
-
-| Tier | Trigger | What runs |
-|------|---------|-----------|
-| **1** | Every push/PR | `cargo fmt`, `cargo clippy`, `cargo test --lib` |
-| **2** | Main branch | Integration tests with PostgreSQL |
-| **3** | Release/manual | Native client tests for 10 formats, stress + failure injection |
-
-```bash
-# Tier 1 - Fast checks
-cargo test --workspace --lib
-
-# Tier 3 - Full E2E
-./scripts/run-e2e-tests.sh --profile all
-```
+- **[Quickstart](https://artifactkeeper.com/docs/getting-started/quickstart/)** — Get running in 5 minutes
+- **[Installation](https://artifactkeeper.com/docs/getting-started/installation/)** — Docker Compose or build from source
+- **[Configuration](https://artifactkeeper.com/docs/getting-started/configuration/)** — Environment variables reference
+- **[Package Formats](https://artifactkeeper.com/docs/package-formats/)** — All 45+ supported formats
+- **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
 
 ## Project Structure
 

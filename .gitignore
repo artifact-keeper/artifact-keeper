@@ -89,3 +89,4 @@ AGENTS.md
 # PKI keys (generated for testing)
 .pki/*.key
 .pki/gpg-signing.key
+docker-compose.override.yml

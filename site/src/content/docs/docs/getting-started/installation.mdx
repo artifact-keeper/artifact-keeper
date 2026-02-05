@@ -35,7 +35,7 @@ docker compose up -d
 - PostgreSQL: `localhost:30432`
 - Meilisearch: `localhost:7700`
 
-**First-boot setup**: A random admin password is written to `/data/storage/admin.password` inside the container. The API is locked until you change it. Run `docker exec artifact-keeper-backend cat /data/storage/admin.password` to retrieve it. Set `ADMIN_PASSWORD` in your `.env` to skip the setup lock.
+**First-boot setup**: A random admin password is written to `/data/storage/admin.password` inside the container. The API is locked until you change it. Run `docker exec artifact-keeper-backend cat /data/storage/admin.password && echo` to retrieve it. Set `ADMIN_PASSWORD` in your `.env` to skip the setup lock.
 
 ### Environment Configuration
 

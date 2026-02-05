@@ -36,7 +36,7 @@ docker compose ps
 curl http://localhost:30080/health
 
 # Read the generated admin password
-docker exec artifact-keeper-backend cat /data/storage/admin.password
+docker exec artifact-keeper-backend cat /data/storage/admin.password && echo
 
 # Login, change password, and unlock the API (see Quickstart for full steps)
 ```

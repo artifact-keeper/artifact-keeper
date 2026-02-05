@@ -58,7 +58,7 @@ pub async fn setup_guard(
             "error": "SETUP_REQUIRED",
             "message": "Initial setup is required. Change the admin password to unlock the API.",
             "instructions": [
-                "1. Read the generated password: docker exec artifact-keeper-backend cat /data/storage/admin.password",
+                "1. Read the generated password: docker exec artifact-keeper-backend cat /data/storage/admin.password && echo",
                 "2. Login: POST /api/v1/auth/login with {\"username\":\"admin\",\"password\":\"<from-file>\"}",
                 "3. Change password: POST /api/v1/users/<id>/password with {\"new_password\":\"<your-password>\"}",
                 "4. The API will unlock automatically after the password is changed."

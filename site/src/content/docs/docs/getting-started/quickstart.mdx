@@ -51,7 +51,7 @@ To skip the setup lock entirely, set `ADMIN_PASSWORD=yourpass` in your `.env` fi
 
 ```bash
 # Get the generated password
-docker exec artifact-keeper-backend cat /data/storage/admin.password
+docker exec artifact-keeper-backend cat /data/storage/admin.password && echo
 
 # Login with the generated password
 TOKEN=$(curl -s http://localhost:30080/api/v1/auth/login \
@@ -71,13 +71,23 @@ curl -X POST "http://localhost:30080/api/v1/users/$USER_ID/password" \
 
 </details>
 
-4. **Verify everything works**:
+4. **Secure your admin account**:
+
+After changing your password, enable Two-Factor Authentication (2FA) for the admin account. Navigate to **My Profile → Security** and click **Enable Two-Factor Authentication**.
+
+![Profile Security tab with 2FA option](./profile-security.png)
+
+:::caution[Recommended]
+Always enable 2FA on the admin account. This protects against credential theft and is required for production deployments.
+:::
+
+5. **Verify everything works**:
 
 ```bash
 # Health check
 curl http://localhost:30080/health
 
-# List repositories (use the token from step 5, or login with your new password)
+# List repositories
 curl -s http://localhost:30080/api/v1/repositories \
   -H "Authorization: Bearer $TOKEN" | jq
 ```
