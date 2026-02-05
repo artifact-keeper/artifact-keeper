@@ -60,6 +60,10 @@ pub struct LoginResponse {
     pub expires_in: u64,
     pub token_type: String,
     pub must_change_password: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totp_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totp_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +78,7 @@ pub struct UserResponse {
     pub email: String,
     pub display_name: Option<String>,
     pub is_admin: bool,
+    pub totp_enabled: bool,
 }
 
 /// Login with credentials
@@ -87,12 +92,29 @@ pub async fn login(
         .authenticate(&payload.username, &payload.password)
         .await?;
 
+    // If TOTP is enabled, return a pending token instead of real tokens
+    if user.totp_enabled {
+        let totp_token = auth_service.generate_totp_pending_token(&user)?;
+        let body = LoginResponse {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_in: tokens.expires_in,
+            token_type: "Bearer".to_string(),
+            must_change_password: user.must_change_password,
+            totp_required: Some(true),
+            totp_token: Some(totp_token),
+        };
+        return Ok(Json(body).into_response());
+    }
+
     let body = LoginResponse {
         access_token: tokens.access_token.clone(),
         refresh_token: tokens.refresh_token.clone(),
         expires_in: tokens.expires_in,
         token_type: "Bearer".to_string(),
         must_change_password: user.must_change_password,
+        totp_required: None,
+        totp_token: None,
     };
 
     let mut response = Json(body).into_response();
@@ -132,6 +154,8 @@ pub async fn refresh_token(
         expires_in: tokens.expires_in,
         token_type: "Bearer".to_string(),
         must_change_password: user.must_change_password,
+        totp_required: None,
+        totp_token: None,
     };
 
     let mut response = Json(body).into_response();
@@ -146,7 +170,7 @@ pub async fn get_current_user(
 ) -> Result<Json<UserResponse>> {
     let user = sqlx::query!(
         r#"
-        SELECT id, username, email, display_name, is_admin
+        SELECT id, username, email, display_name, is_admin, totp_enabled
         FROM users
         WHERE id = $1 AND is_active = true
         "#,
@@ -163,6 +187,7 @@ pub async fn get_current_user(
         email: user.email,
         display_name: user.display_name,
         is_admin: user.is_admin,
+        totp_enabled: user.totp_enabled,
     }))
 }
 

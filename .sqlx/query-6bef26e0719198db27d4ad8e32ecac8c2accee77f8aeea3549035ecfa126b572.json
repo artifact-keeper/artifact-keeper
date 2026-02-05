@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = $2\n            ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = 'ldap'\n            ",
   "describe": {
     "columns": [
       {
@@ -67,36 +67,43 @@
       },
       {
         "ordinal": 10,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "totp_backup_codes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "totp_verified_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        {
-          "Custom": {
-            "name": "auth_provider",
-            "kind": {
-              "Enum": [
-                "local",
-                "ldap",
-                "saml",
-                "oidc"
-              ]
-            }
-          }
-        }
+        "Text"
       ]
     },
     "nullable": [
@@ -112,8 +119,12 @@
       false,
       true,
       false,
+      true,
+      true,
+      true,
+      false,
       false
     ]
   },
-  "hash": "302b8e2bd401b4f11f87fb15240949e4fdd9d48154d98895ed7037c0abc5e97a"
+  "hash": "6bef26e0719198db27d4ad8e32ecac8c2accee77f8aeea3549035ecfa126b572"
 }

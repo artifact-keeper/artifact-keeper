@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, must_change_password,\n            last_login_at, created_at, updated_at\n        FROM users\n        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)\n          AND ($2::boolean IS NULL OR is_active = $2)\n          AND ($3::boolean IS NULL OR is_admin = $3)\n        ORDER BY username\n        OFFSET $4\n        LIMIT $5\n        ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = $2\n            ",
   "describe": {
     "columns": [
       {
@@ -67,16 +67,36 @@
       },
       {
         "ordinal": 10,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "totp_backup_codes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "totp_verified_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -84,10 +104,19 @@
     "parameters": {
       "Left": [
         "Text",
-        "Bool",
-        "Bool",
-        "Int8",
-        "Int8"
+        {
+          "Custom": {
+            "name": "auth_provider",
+            "kind": {
+              "Enum": [
+                "local",
+                "ldap",
+                "saml",
+                "oidc"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": [
@@ -103,8 +132,12 @@
       false,
       true,
       false,
+      true,
+      true,
+      true,
+      false,
       false
     ]
   },
-  "hash": "5a702d0ddbecccd20d07f40368ad33463c79261d16c81bc42980c1b02df97666"
+  "hash": "314ba5c31792bb73cd2d4186f41ff54c9aa9e1fec8c8f93e23088e1ffd53de7a"
 }

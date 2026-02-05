@@ -111,6 +111,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // TOTP 2FA routes
+        .nest("/auth/totp", handlers::totp::public_router())
+        .nest(
+            "/auth/totp",
+            handlers::totp::protected_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Repository routes with optional auth middleware
         // (some endpoints require auth, others are optional - handlers will check)
         .nest(

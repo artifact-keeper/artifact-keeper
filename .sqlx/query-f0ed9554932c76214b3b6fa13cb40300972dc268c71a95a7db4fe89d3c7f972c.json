@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = 'oidc'\n            ",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, auth_provider, external_id, is_admin, is_active)\n            VALUES ($1, $2, $3, $4, 'oidc', $5, $6, true)\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                last_login_at, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -67,23 +67,48 @@
       },
       {
         "ordinal": 10,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "totp_backup_codes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "totp_verified_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Bool"
       ]
     },
     "nullable": [
@@ -99,8 +124,12 @@
       false,
       true,
       false,
+      true,
+      true,
+      true,
+      false,
       false
     ]
   },
-  "hash": "cc5b1dfc9c26f9857fe26d7fea6639a8aa7e7d6b7ec8d09bc03be408fe886535"
+  "hash": "f0ed9554932c76214b3b6fa13cb40300972dc268c71a95a7db4fe89d3c7f972c"
 }

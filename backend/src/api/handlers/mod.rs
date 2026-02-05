@@ -51,6 +51,7 @@ pub mod sso_admin;
 pub mod swift;
 pub mod telemetry;
 pub mod terraform;
+pub mod totp;
 pub mod transfer;
 pub mod tree;
 pub mod users;

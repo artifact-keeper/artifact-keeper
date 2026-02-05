@@ -96,6 +96,7 @@ impl AuthService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE username = $1 AND is_active = true
@@ -208,6 +209,7 @@ impl AuthService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true
@@ -294,6 +296,7 @@ impl AuthService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true
@@ -451,6 +454,7 @@ impl AuthService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE username = $1 AND auth_provider = 'ldap' AND is_active = true
@@ -654,6 +658,7 @@ impl AuthService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE external_id = $1 AND auth_provider = $2
@@ -683,6 +688,7 @@ impl AuthService {
                     id, username, email, password_hash, display_name,
                     auth_provider as "auth_provider: AuthProvider",
                     external_id, is_admin, is_active, must_change_password,
+                    totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     last_login_at, created_at, updated_at
                 "#,
                 existing.id,
@@ -708,6 +714,7 @@ impl AuthService {
                     id, username, email, password_hash, display_name,
                     auth_provider as "auth_provider: AuthProvider",
                     external_id, is_admin, is_active, must_change_password,
+                    totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     last_login_at, created_at, updated_at
                 "#,
                 credentials.username,
@@ -801,6 +808,7 @@ impl AuthService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             "#,
             external_id,
@@ -825,6 +833,7 @@ impl AuthService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE auth_provider = $1 AND is_active = true
@@ -837,6 +846,36 @@ impl AuthService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(users)
+    }
+
+    // =========================================================================
+    // TOTP 2FA Support
+    // =========================================================================
+
+    /// Generate a short-lived token for TOTP verification pending state
+    pub fn generate_totp_pending_token(&self, user: &User) -> Result<String> {
+        let now = Utc::now();
+        let exp = now + Duration::minutes(5);
+        let claims = Claims {
+            sub: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            is_admin: user.is_admin,
+            iat: now.timestamp(),
+            exp: exp.timestamp(),
+            token_type: "totp_pending".to_string(),
+        };
+        encode(&Header::default(), &claims, &self.encoding_key)
+            .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
+    }
+
+    /// Validate a TOTP pending token and return claims
+    pub fn validate_totp_pending_token(&self, token: &str) -> Result<Claims> {
+        let token_data = self.decode_token(token)?;
+        if token_data.claims.token_type != "totp_pending" {
+            return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+        Ok(token_data.claims)
     }
 }
 

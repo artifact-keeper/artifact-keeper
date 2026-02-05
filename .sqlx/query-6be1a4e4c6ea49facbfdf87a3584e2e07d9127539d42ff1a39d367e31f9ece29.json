@@ -1,0 +1,130 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            last_login_at, created_at, updated_at\n        FROM users\n        WHERE id = $1 AND is_active = true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "password_hash",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "auth_provider: AuthProvider",
+        "type_info": {
+          "Custom": {
+            "name": "auth_provider",
+            "kind": {
+              "Enum": [
+                "local",
+                "ldap",
+                "saml",
+                "oidc"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "external_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "is_admin",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "must_change_password",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "totp_backup_codes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "totp_verified_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "6be1a4e4c6ea49facbfdf87a3584e2e07d9127539d42ff1a39d367e31f9ece29"
+}

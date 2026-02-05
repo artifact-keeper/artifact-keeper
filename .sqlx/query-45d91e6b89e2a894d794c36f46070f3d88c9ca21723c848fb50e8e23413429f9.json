@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE auth_provider = $1 AND is_active = true\n            ORDER BY username\n            ",
+  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            last_login_at, created_at, updated_at\n        FROM users\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -67,35 +67,43 @@
       },
       {
         "ordinal": 10,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "totp_backup_codes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "totp_verified_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        {
-          "Custom": {
-            "name": "auth_provider",
-            "kind": {
-              "Enum": [
-                "local",
-                "ldap",
-                "saml",
-                "oidc"
-              ]
-            }
-          }
-        }
+        "Uuid"
       ]
     },
     "nullable": [
@@ -111,8 +119,12 @@
       false,
       true,
       false,
+      true,
+      true,
+      true,
+      false,
       false
     ]
   },
-  "hash": "010d5547e8c134597ede04bc14b91501159eab5e24b43c5ded78d49839024627"
+  "hash": "45d91e6b89e2a894d794c36f46070f3d88c9ca21723c848fb50e8e23413429f9"
 }

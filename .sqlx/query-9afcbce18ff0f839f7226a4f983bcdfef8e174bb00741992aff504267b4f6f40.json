@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                UPDATE users\n                SET\n                    username = $2,\n                    email = $3,\n                    display_name = $4,\n                    is_admin = $5,\n                    is_active = true,\n                    updated_at = NOW()\n                WHERE id = $1\n                RETURNING\n                    id, username, email, password_hash, display_name,\n                    auth_provider as \"auth_provider: AuthProvider\",\n                    external_id, is_admin, is_active, must_change_password,\n                    last_login_at, created_at, updated_at\n                ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = 'saml'\n            ",
   "describe": {
     "columns": [
       {
@@ -67,27 +67,43 @@
       },
       {
         "ordinal": 10,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "totp_backup_codes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "totp_verified_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Bool"
+        "Text"
       ]
     },
     "nullable": [
@@ -103,8 +119,12 @@
       false,
       true,
       false,
+      true,
+      true,
+      true,
+      false,
       false
     ]
   },
-  "hash": "32494028190f20ee2ac7cd225dc38af219e2a3da68a4b2351a7f299ea02cb122"
+  "hash": "9afcbce18ff0f839f7226a4f983bcdfef8e174bb00741992aff504267b4f6f40"
 }

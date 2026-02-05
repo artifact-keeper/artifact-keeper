@@ -209,6 +209,7 @@ impl LdapService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE external_id = $1 AND auth_provider = 'ldap'
@@ -259,6 +260,7 @@ impl LdapService {
                 id, username, email, password_hash, display_name,
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, must_change_password,
+                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 last_login_at, created_at, updated_at
             "#,
             user_id,

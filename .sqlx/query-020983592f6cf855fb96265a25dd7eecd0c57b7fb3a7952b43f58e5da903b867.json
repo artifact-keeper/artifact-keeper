@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO users (id, username, email, display_name, auth_provider, external_id, is_admin, is_active)\n            VALUES ($1, $2, $3, $4, 'saml', $5, $6, true)\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                last_login_at, created_at, updated_at\n            ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE auth_provider = $1 AND is_active = true\n            ORDER BY username\n            ",
   "describe": {
     "columns": [
       {
@@ -67,28 +67,55 @@
       },
       {
         "ordinal": 10,
+        "name": "totp_secret",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "totp_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "totp_backup_codes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "totp_verified_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
         "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 11,
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 12,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Bool"
+        {
+          "Custom": {
+            "name": "auth_provider",
+            "kind": {
+              "Enum": [
+                "local",
+                "ldap",
+                "saml",
+                "oidc"
+              ]
+            }
+          }
+        }
       ]
     },
     "nullable": [
@@ -104,8 +131,12 @@
       false,
       true,
       false,
+      true,
+      true,
+      true,
+      false,
       false
     ]
   },
-  "hash": "0a9b63c35be3e2c7f7d2eecb63ba9fc13bc43db898d52868d9eada8b13ee2ac1"
+  "hash": "020983592f6cf855fb96265a25dd7eecd0c57b7fb3a7952b43f58e5da903b867"
 }

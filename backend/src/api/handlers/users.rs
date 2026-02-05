@@ -128,6 +128,7 @@ pub async fn list_users(
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, must_change_password,
+            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             last_login_at, created_at, updated_at
         FROM users
         WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
@@ -205,6 +206,7 @@ pub async fn create_user(
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, must_change_password,
+            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             last_login_at, created_at, updated_at
         "#,
         payload.username,
@@ -249,6 +251,7 @@ pub async fn get_user(
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, must_change_password,
+            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             last_login_at, created_at, updated_at
         FROM users
         WHERE id = $1
@@ -285,6 +288,7 @@ pub async fn update_user(
             id, username, email, password_hash, display_name,
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, must_change_password,
+            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             last_login_at, created_at, updated_at
         "#,
         id,

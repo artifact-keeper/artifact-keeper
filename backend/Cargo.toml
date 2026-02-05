@@ -99,6 +99,7 @@ git2.workspace = true
 
 # Base64 encoding
 base64 = "0.22"
+totp-rs = { version = "5", features = ["qr", "gen_secret"] }
 
 # Search engine
 meilisearch-sdk = { workspace = true }
