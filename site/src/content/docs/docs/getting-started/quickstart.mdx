@@ -10,20 +10,14 @@ Get Artifact Keeper up and running in minutes using Docker Compose.
 ## Prerequisites
 
 - Docker and Docker Compose installed
-- Git (to clone the repository)
 
 ## Quick Start
 
-1. **Clone the repository**:
+1. **Download and start**:
 
 ```bash
-git clone https://github.com/artifact-keeper/artifact-keeper.git
-cd artifact-keeper
-```
-
-2. **Start the services**:
-
-```bash
+mkdir artifact-keeper && cd artifact-keeper
+curl -fsSL https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker-compose.yml -o docker-compose.yml
 docker compose up -d
 ```
 
@@ -35,11 +29,11 @@ This starts the full stack:
 - **Meilisearch** — Full-text search
 - **Trivy** — Vulnerability scanning
 
-3. **Access the UI**:
+2. **Access the UI**:
 
 Open [http://localhost:30080](http://localhost:30080) in your browser.
 
-4. **Get the admin password**:
+3. **Get the admin password**:
 
 On first boot, a random password is generated and written to a file inside the container. The API is locked until you change it.
 
@@ -47,7 +41,7 @@ On first boot, a random password is generated and written to a file inside the c
 docker exec artifact-keeper-backend cat /data/storage/admin.password
 ```
 
-5. **Login and change password to unlock the API**:
+4. **Login and change password to unlock the API**:
 
 ```bash
 # Login with the generated password
@@ -70,7 +64,7 @@ curl -X POST "http://localhost:30080/api/v1/users/$USER_ID/password" \
 To skip the setup lock entirely, set `ADMIN_PASSWORD=yourpass` in your `.env` file before starting.
 :::
 
-6. **Verify everything works**:
+5. **Verify everything works**:
 
 ```bash
 # Health check
