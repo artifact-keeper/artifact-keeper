@@ -85,6 +85,34 @@ Rust 1.75+: Follow standard conventions
 
 ## Git & GitHub
 
+### Branch Protection — NEVER push directly to main
+
+All changes must go through pull requests:
+
+1. **Create a feature branch** from main:
+   ```bash
+   git checkout main && git pull
+   git checkout -b feat/short-description   # or fix/, chore/, docs/
+   ```
+
+2. **Make changes and commit** to the feature branch
+
+3. **Push and create PR**:
+   ```bash
+   git push -u origin feat/short-description
+   gh pr create --fill   # or with --title and --body
+   ```
+
+4. **Merge via GitHub** after CI passes (squash merge preferred)
+
+Branch naming conventions:
+- `feat/` — new features
+- `fix/` — bug fixes
+- `chore/` — maintenance, dependencies, CI
+- `docs/` — documentation only
+
+### Other Git Rules
+
 - **Do NOT add Co-Authored-By lines** to commit messages
 - **Always use `gh` CLI** for GitHub operations (PRs, issues, workflows, etc.)
   - Use `gh pr create` for pull requests
