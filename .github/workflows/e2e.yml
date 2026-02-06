@@ -81,13 +81,18 @@ jobs:
           echo "Workspace: $GITHUB_WORKSPACE"
           echo "PWD: $(pwd)"
           ls -la .pki/ || echo "No .pki directory!"
-          ls -la $GITHUB_WORKSPACE/.pki/ || echo "No workspace .pki!"
+          # Make all PKI files readable for upload
+          chmod -R a+r .pki/
 
       - name: Upload PKI artifacts
         uses: actions/upload-artifact@v4
         with:
           name: pki-assets
-          path: ${{ github.workspace }}/.pki/
+          path: |
+            .pki/*.crt
+            .pki/*.key
+            .pki/*.pub
+            .pki/*.txt
           if-no-files-found: error
           retention-days: 1
 
