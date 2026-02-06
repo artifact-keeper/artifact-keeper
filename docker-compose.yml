@@ -8,6 +8,7 @@ services:
       POSTGRES_DB: artifact_registry
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     ports:
       - "30432:5432"
     healthcheck:
@@ -43,6 +44,10 @@ services:
       SCAN_WORKSPACE_PATH: /scan-workspace
       MEILISEARCH_URL: http://meilisearch:7700
       MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-artifact-keeper-dev-key}
+      # Dependency-Track integration
+      DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
+      DEPENDENCY_TRACK_API_KEY: ${DEPENDENCY_TRACK_API_KEY:-}
+      DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-true}
       HOST: 0.0.0.0
       PORT: 8080
     volumes:
@@ -100,6 +105,56 @@ services:
       retries: 3
     restart: unless-stopped
 
+  # OWASP Dependency-Track for SBOM analysis and vulnerability tracking
+  # https://dependencytrack.org/
+  dependency-track-apiserver:
+    image: dependencytrack/apiserver:4.11.4
+    container_name: artifact-keeper-dtrack-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database configuration (uses same Postgres, different database)
+      ALPINE_DATABASE_MODE: external
+      ALPINE_DATABASE_URL: jdbc:postgresql://postgres:5432/dependency_track
+      ALPINE_DATABASE_DRIVER: org.postgresql.Driver
+      ALPINE_DATABASE_USERNAME: registry
+      ALPINE_DATABASE_PASSWORD: registry
+      # API configuration
+      ALPINE_DATA_DIRECTORY: /data
+      # Enable API key authentication
+      ALPINE_ENFORCE_AUTHENTICATION: "true"
+      # Optional: Enable CORS for frontend
+      ALPINE_CORS_ENABLED: "true"
+      ALPINE_CORS_ALLOW_ORIGIN: "*"
+    volumes:
+      - dtrack_data:/data
+    ports:
+      - "8092:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/version"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  # Optional: Dependency-Track native frontend (for debugging/admin)
+  # We integrate DT data into our own UI, but this is useful for direct access
+  dependency-track-frontend:
+    image: dependencytrack/frontend:4.11.4
+    container_name: artifact-keeper-dtrack-frontend
+    profiles:
+      - dtrack-ui  # Only starts with: docker compose --profile dtrack-ui up
+    depends_on:
+      dependency-track-apiserver:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://localhost:8092
+    ports:
+      - "8093:8080"
+    restart: unless-stopped
+
   web:
     image: ghcr.io/artifact-keeper/artifact-keeper-web:latest
     container_name: artifact-keeper-web
@@ -147,6 +202,8 @@ volumes:
   caddy_data:
     driver: local
   caddy_config:
+    driver: local
+  dtrack_data:
     driver: local
 
 networks:

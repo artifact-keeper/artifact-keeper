@@ -8,6 +8,7 @@ pub mod auth_config_service;
 pub mod auth_service;
 pub mod backup_service;
 pub mod build_service;
+pub mod dependency_track_service;
 pub mod encryption;
 pub mod grype_scanner;
 pub mod image_scanner;
