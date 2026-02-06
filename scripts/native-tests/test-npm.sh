@@ -5,6 +5,8 @@ set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 REPO_KEY="${REPO_KEY:-test-npm}"
+ADMIN_USER="${ADMIN_USER:-admin}"
+ADMIN_PASS="${ADMIN_PASS:-admin123}"
 CA_CERT="${CA_CERT:-}"
 TEST_VERSION="1.0.$(date +%s)"
 
@@ -13,6 +15,19 @@ NPM_REGISTRY="${REGISTRY_URL}/npm/${REPO_KEY}/"
 echo "==> NPM Native Client Test"
 echo "Registry: $NPM_REGISTRY"
 echo "Version: $TEST_VERSION"
+
+# Ensure the NPM repository exists
+echo "==> Ensuring $REPO_KEY repository exists..."
+TOKEN=$(curl -sf -X POST "$REGISTRY_URL/api/v1/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>process.stdout.write(JSON.parse(d).access_token))" 2>/dev/null || true)
+
+if [ -n "$TOKEN" ]; then
+  curl -sf -X POST "$REGISTRY_URL/api/v1/repositories" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"key\":\"$REPO_KEY\",\"name\":\"Test NPM\",\"format\":\"npm\",\"repo_type\":\"local\",\"is_public\":true}" 2>/dev/null || true
+fi
 
 # Generate test package
 echo "==> Generating test package..."

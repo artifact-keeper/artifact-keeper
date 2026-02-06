@@ -55,6 +55,7 @@ services:
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: e2e-test-secret-key-32-bytes-long
+      ADMIN_PASSWORD: admin123
       RUST_LOG: info
       TRIVY_URL: http://trivy:8090
       HOST: 0.0.0.0
