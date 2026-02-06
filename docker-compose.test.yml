@@ -84,9 +84,8 @@ services:
     command: >
       sh -c "
         apk add --no-cache openssl gnupg bash curl &&
-        chmod +x /scripts/pki/*.sh &&
-        /scripts/pki/generate-certs.sh /pki &&
-        /scripts/pki/generate-gpg.sh /pki &&
+        bash /scripts/pki/generate-certs.sh /pki &&
+        bash /scripts/pki/generate-gpg.sh /pki &&
         echo 'PKI setup complete' &&
         touch /pki/.ready &&
         tail -f /dev/null
