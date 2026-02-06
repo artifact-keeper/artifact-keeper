@@ -78,6 +78,50 @@ services:
     networks:
       - e2e-test-network
 
+  # Bootstrap: create test repositories after backend is healthy
+  setup:
+    image: alpine:3.19
+    container_name: e2e-test-setup
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: >
+      sh -c "
+        apk add --no-cache curl jq >/dev/null 2>&1 &&
+        echo '==> Logging in as admin...' &&
+        TOKEN=$$(curl -sf -X POST http://backend:8080/api/v1/auth/login \
+          -H 'Content-Type: application/json' \
+          -d '{\"username\":\"admin\",\"password\":\"admin123\"}' | jq -r '.access_token') &&
+        echo '==> Creating test repositories...' &&
+        for repo in \
+          '{\"key\":\"test-pypi\",\"name\":\"Test PyPI\",\"format\":\"pypi\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-npm\",\"name\":\"Test NPM\",\"format\":\"npm\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-cargo\",\"name\":\"Test Cargo\",\"format\":\"cargo\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-maven\",\"name\":\"Test Maven\",\"format\":\"maven\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-go\",\"name\":\"Test Go\",\"format\":\"go\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-rpm\",\"name\":\"Test RPM\",\"format\":\"rpm\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-deb\",\"name\":\"Test Debian\",\"format\":\"debian\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-helm\",\"name\":\"Test Helm\",\"format\":\"helm\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-conda\",\"name\":\"Test Conda\",\"format\":\"conda\",\"repo_type\":\"local\",\"is_public\":true}' \
+          '{\"key\":\"test-docker\",\"name\":\"Test Docker\",\"format\":\"docker\",\"repo_type\":\"local\",\"is_public\":true}'; do
+          curl -sf -X POST http://backend:8080/api/v1/repositories \
+            -H \"Authorization: Bearer $$TOKEN\" \
+            -H 'Content-Type: application/json' \
+            -d \"$$repo\" >/dev/null 2>&1 || true
+        done &&
+        echo '==> Setup complete' &&
+        touch /tmp/.setup-done &&
+        tail -f /dev/null
+      "
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/.setup-done"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks:
+      - e2e-test-network
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all"]
+
   # PKI service generates certificates and GPG keys on startup
   pki:
     image: alpine:3.19
@@ -111,7 +155,7 @@ services:
     image: python:3.12-slim
     container_name: e2e-test-pypi
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -131,7 +175,7 @@ services:
     image: node:20-slim
     container_name: e2e-test-npm
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -151,7 +195,7 @@ services:
     image: rust:1.75-slim
     container_name: e2e-test-cargo
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -175,7 +219,7 @@ services:
     image: maven:3.9-eclipse-temurin-21
     container_name: e2e-test-maven
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -196,7 +240,7 @@ services:
     image: golang:1.22-alpine
     container_name: e2e-test-go
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -218,7 +262,7 @@ services:
     image: rockylinux/rockylinux:9-ubi-init
     container_name: e2e-test-rpm
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -239,7 +283,7 @@ services:
     image: debian:bookworm-slim
     container_name: e2e-test-deb
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -260,7 +304,7 @@ services:
     image: alpine/helm:3.14
     container_name: e2e-test-helm
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -280,7 +324,7 @@ services:
     image: continuumio/miniconda3:latest
     container_name: e2e-test-conda
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy
@@ -300,7 +344,7 @@ services:
     image: docker:24-cli
     container_name: e2e-test-docker
     depends_on:
-      backend:
+      setup:
         condition: service_healthy
       pki:
         condition: service_healthy

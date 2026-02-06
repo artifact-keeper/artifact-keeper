@@ -22,17 +22,6 @@ command -v pip3 >/dev/null || { echo "SKIP: pip3 not found"; exit 0; }
 echo "==> Installing test dependencies..."
 pip3 install --quiet twine build 2>/dev/null || true
 
-# Ensure the PyPI repository exists
-echo "==> Ensuring test-pypi repository exists..."
-TOKEN=$(curl -sf -X POST "$REGISTRY_URL/api/v1/auth/login" \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-
-curl -sf -X POST "$REGISTRY_URL/api/v1/repositories" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d "{\"key\":\"$PYPI_REPO_KEY\",\"name\":\"Test PyPI\",\"format\":\"pypi\",\"repo_type\":\"local\",\"is_public\":true}" 2>/dev/null || true
-
 # Generate test package
 echo "==> Generating test package..."
 WORK_DIR="$(mktemp -d)"

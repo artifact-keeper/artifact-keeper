@@ -4,31 +4,12 @@
 set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080/api/v1/repositories/test-cargo}"
-ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
 CA_CERT="${CA_CERT:-}"
 TEST_VERSION="1.0.$(date +%s | cut -c1-6)"
-
-# Derive base API URL from REGISTRY_URL (strip /api/v1/repositories/*)
-BASE_URL=$(echo "$REGISTRY_URL" | sed 's|/api/v1/repositories/.*||')
-REPO_KEY=$(echo "$REGISTRY_URL" | grep -o '[^/]*$')
 
 echo "==> Cargo Native Client Test"
 echo "Registry: $REGISTRY_URL"
 echo "Version: $TEST_VERSION"
-
-# Ensure the Cargo repository exists
-echo "==> Ensuring $REPO_KEY repository exists..."
-TOKEN=$(curl -sf -X POST "$BASE_URL/api/v1/auth/login" \
-  -H 'Content-Type: application/json' \
-  -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PASS\"}" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p' 2>/dev/null || true)
-
-if [ -n "$TOKEN" ]; then
-  curl -sf -X POST "$BASE_URL/api/v1/repositories" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H 'Content-Type: application/json' \
-    -d "{\"key\":\"$REPO_KEY\",\"name\":\"Test Cargo\",\"format\":\"cargo\",\"repo_type\":\"local\",\"is_public\":true}" 2>/dev/null || true
-fi
 
 # Generate test crate
 echo "==> Generating test crate..."
