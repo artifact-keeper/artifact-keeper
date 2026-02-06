@@ -32,6 +32,7 @@ bcrypt = "0.18"
 sha2 = "0.10"
 md-5 = "0.10"
 sha1 = "0.10"
+hmac = "0.12"
 
 # S3 storage using rust-s3 crate (works with Rust 1.75+)
 rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
