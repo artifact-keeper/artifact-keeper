@@ -56,6 +56,7 @@ export default defineConfig({
           label: 'Security',
           items: [
             { label: 'Vulnerability Scanning', slug: 'docs/security/scanning' },
+            { label: 'SBOM & License Compliance', slug: 'docs/security/sbom' },
             { label: 'Security Policies', slug: 'docs/security/policies' },
             { label: 'Artifact Signing', slug: 'docs/security/signing' },
           ],

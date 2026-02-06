@@ -1,0 +1,413 @@
+---
+title: "SBOM & License Compliance"
+description: "Generate Software Bill of Materials (SBOM) and enforce license compliance policies"
+---
+
+Artifact Keeper provides comprehensive Software Bill of Materials (SBOM) generation and license compliance management to help you understand and control your software supply chain.
+
+## Overview
+
+A Software Bill of Materials (SBOM) is a complete inventory of all components, libraries, and dependencies in your software artifacts. Artifact Keeper can generate SBOMs in industry-standard formats and track CVE history across artifact versions.
+
+### Key Features
+
+- **SBOM Generation**: Automatic generation in CycloneDX 1.5 and SPDX 2.3 formats
+- **Component Tracking**: Full inventory of packages, versions, and licenses
+- **CVE History**: Track vulnerabilities across artifact versions over time
+- **License Policies**: Enforce allowed/denied license lists with configurable actions
+- **Multi-Platform UI**: View SBOMs in Web, iOS, and Android apps
+
+## SBOM Formats
+
+Artifact Keeper supports two industry-standard SBOM formats:
+
+### CycloneDX
+
+[CycloneDX](https://cyclonedx.org/) is a lightweight SBOM standard designed for security contexts:
+
+- **Version**: CycloneDX 1.5
+- **Use cases**: Vulnerability tracking, dependency analysis, license compliance
+- **Output**: JSON format
+
+### SPDX
+
+[SPDX](https://spdx.dev/) (Software Package Data Exchange) is an ISO standard for communicating software bill of materials:
+
+- **Version**: SPDX 2.3
+- **Use cases**: License compliance, legal review, supply chain transparency
+- **Output**: JSON format
+
+## Generating SBOMs
+
+### Via API
+
+Generate an SBOM for an artifact:
+
+```bash
+POST /api/v1/sbom
+Content-Type: application/json
+
+{
+  "artifact_id": "uuid-of-artifact",
+  "format": "cyclonedx",
+  "force_regenerate": false
+}
+```
+
+Response:
+
+```json
+{
+  "id": "sbom-uuid",
+  "artifact_id": "artifact-uuid",
+  "format": "cyclonedx",
+  "format_version": "1.5",
+  "component_count": 142,
+  "dependency_count": 89,
+  "license_count": 12,
+  "licenses": ["MIT", "Apache-2.0", "BSD-3-Clause"],
+  "generated_at": "2024-01-15T10:30:00Z",
+  "generator": "artifact-keeper"
+}
+```
+
+### Via Web UI
+
+1. Navigate to **Repositories** → select a repository
+2. Click on an artifact to open the detail dialog
+3. Select the **SBOM** tab
+4. Choose format (CycloneDX or SPDX)
+5. Click **Generate** or **Regenerate**
+
+### Via Mobile Apps
+
+Both iOS and Android apps provide SBOM viewing:
+
+1. Navigate to an artifact detail screen
+2. Tap the **SBOM** section
+3. Select format and generate if needed
+4. View components, licenses, and CVE history
+
+## SBOM Content
+
+### Retrieving Full SBOM
+
+Get the complete SBOM with raw content:
+
+```bash
+GET /api/v1/sbom/{sbom_id}
+```
+
+Response includes the full SBOM document in the `content` field.
+
+### Component List
+
+Get the list of components in an SBOM:
+
+```bash
+GET /api/v1/sbom/{sbom_id}/components
+```
+
+Response:
+
+```json
+[
+  {
+    "id": "component-uuid",
+    "name": "lodash",
+    "version": "4.17.21",
+    "purl": "pkg:npm/lodash@4.17.21",
+    "licenses": ["MIT"],
+    "component_type": "library",
+    "supplier": "Lodash Contributors"
+  }
+]
+```
+
+### Download SBOM
+
+Export SBOM as JSON file:
+
+```bash
+GET /api/v1/sbom/{sbom_id}/download
+```
+
+Returns the SBOM document as a downloadable JSON file.
+
+## CVE History Tracking
+
+Artifact Keeper tracks CVE history for each artifact, showing how vulnerabilities have been detected and resolved over time.
+
+### Get CVE History
+
+```bash
+GET /api/v1/sbom/cve/history/{artifact_id}
+```
+
+Response:
+
+```json
+[
+  {
+    "id": "cve-history-uuid",
+    "cve_id": "CVE-2024-1234",
+    "severity": "high",
+    "status": "fixed",
+    "affected_component": "lodash",
+    "affected_version": "4.17.20",
+    "fixed_version": "4.17.21",
+    "first_detected_at": "2024-01-10T10:00:00Z",
+    "last_detected_at": "2024-01-12T10:00:00Z",
+    "cvss_score": 7.5
+  }
+]
+```
+
+### CVE Status Values
+
+- **open**: Vulnerability currently affects the artifact
+- **fixed**: Vulnerability was present but is now resolved
+- **acknowledged**: Vulnerability accepted as known risk
+- **false_positive**: Marked as not applicable
+
+### CVE Trends Dashboard
+
+Get aggregate CVE statistics:
+
+```bash
+GET /api/v1/sbom/cve/trends?days=30&repository_id=optional-repo-id
+```
+
+Response:
+
+```json
+{
+  "total_cves": 45,
+  "open_cves": 12,
+  "fixed_cves": 28,
+  "acknowledged_cves": 5,
+  "critical_count": 2,
+  "high_count": 8,
+  "medium_count": 15,
+  "low_count": 20,
+  "avg_days_to_fix": 4.5
+}
+```
+
+## License Policies
+
+License policies allow you to enforce which open source licenses are allowed in your software supply chain.
+
+### Policy Structure
+
+```json
+{
+  "name": "Production License Policy",
+  "description": "Approved licenses for production deployments",
+  "allowed_licenses": ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC"],
+  "denied_licenses": ["GPL-3.0", "AGPL-3.0", "SSPL-1.0"],
+  "allow_unknown": false,
+  "action": "block",
+  "is_enabled": true
+}
+```
+
+### Policy Actions
+
+- **allow**: Log but permit artifacts with denied licenses
+- **warn**: Display warning but allow artifact operations
+- **block**: Prevent artifact deployment/download
+
+### Create License Policy
+
+```bash
+POST /api/v1/sbom/license-policies
+Content-Type: application/json
+
+{
+  "name": "Strict OSS Policy",
+  "description": "Only permissive licenses allowed",
+  "allowed_licenses": ["MIT", "Apache-2.0", "BSD-3-Clause"],
+  "denied_licenses": ["GPL-3.0", "AGPL-3.0"],
+  "allow_unknown": false,
+  "action": "block",
+  "is_enabled": true
+}
+```
+
+### Update License Policy
+
+```bash
+PUT /api/v1/sbom/license-policies/{policy_id}
+Content-Type: application/json
+
+{
+  "is_enabled": false
+}
+```
+
+### Delete License Policy
+
+```bash
+DELETE /api/v1/sbom/license-policies/{policy_id}
+```
+
+### List License Policies
+
+```bash
+GET /api/v1/sbom/license-policies
+```
+
+### Check License Compliance
+
+Validate licenses against policies:
+
+```bash
+POST /api/v1/sbom/check-compliance
+Content-Type: application/json
+
+{
+  "licenses": ["MIT", "GPL-3.0", "Unknown"],
+  "repository_id": "optional-repo-uuid"
+}
+```
+
+Response:
+
+```json
+{
+  "compliant": false,
+  "action": "block",
+  "violations": [
+    {
+      "license": "GPL-3.0",
+      "reason": "License is in denied list"
+    },
+    {
+      "license": "Unknown",
+      "reason": "Unknown licenses not allowed"
+    }
+  ],
+  "warnings": []
+}
+```
+
+## UI Integration
+
+### Web Dashboard
+
+The web UI provides comprehensive SBOM management:
+
+**Artifact SBOM Tab:**
+- Format selector (CycloneDX/SPDX)
+- Stats grid showing component, dependency, and license counts
+- Paginated components table with search
+- CVE history timeline
+- Raw JSON viewer
+- Download button
+
+**Admin License Policies Page:**
+- List all policies with status indicators
+- Create/edit/delete policies
+- Toggle policy enabled state
+- View allowed/denied license counts
+
+**Dashboard CVE Widget (Admin):**
+- Total CVE count across all artifacts
+- Open CVEs requiring attention
+- Critical and high severity counts
+
+### iOS/macOS App
+
+Navigate to artifact detail → SBOM section:
+- Format picker (CycloneDX/SPDX)
+- Stats display
+- Component list
+- CVE history with severity badges
+- Generate/regenerate buttons
+
+License policies are managed in Security → Licenses tab.
+
+### Android App
+
+Navigate to artifact detail → SBOM section:
+- Similar functionality to iOS
+- Material 3 design
+- Compose-based UI
+
+## Best Practices
+
+### SBOM Generation
+
+- **Generate on publish**: Automatically generate SBOMs when artifacts are published
+- **Both formats**: Generate both CycloneDX and SPDX for maximum compatibility
+- **Regular updates**: Regenerate SBOMs when dependencies change
+
+### License Compliance
+
+- **Start permissive**: Begin with warnings, then tighten to blocking
+- **Document exceptions**: Track why specific licenses are allowed or denied
+- **Regular review**: Audit policies quarterly
+- **Unknown licenses**: Consider blocking unknown licenses in production
+
+### CVE Management
+
+- **Monitor trends**: Track CVE trends on the dashboard
+- **Set SLAs**: Define remediation timeframes by severity
+- **Acknowledge wisely**: Document reasons when acknowledging CVEs
+- **Historical tracking**: Use CVE history for audit trails
+
+## Integration Examples
+
+### CI/CD Pipeline
+
+```yaml
+name: Build and SBOM Check
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push artifact
+        run: |
+          npm publish --registry https://registry.example.com
+
+      - name: Generate SBOM
+        run: |
+          curl -X POST https://registry.example.com/api/v1/sbom \
+            -H "Authorization: Bearer ${{ secrets.REGISTRY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"artifact_id": "${{ env.ARTIFACT_ID }}", "format": "cyclonedx"}'
+
+      - name: Check license compliance
+        run: |
+          RESULT=$(curl -X POST https://registry.example.com/api/v1/sbom/check-compliance \
+            -H "Authorization: Bearer ${{ secrets.REGISTRY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"licenses": ${{ env.DETECTED_LICENSES }}}')
+
+          if [ "$(echo $RESULT | jq -r '.compliant')" != "true" ]; then
+            echo "License compliance check failed"
+            echo $RESULT | jq '.violations'
+            exit 1
+          fi
+```
+
+### Export for Compliance
+
+```bash
+# Export all SBOMs for a repository
+for artifact in $(curl -s /api/v1/artifacts?repository_id=prod-repo | jq -r '.[].id'); do
+  curl -s "/api/v1/sbom?artifact_id=$artifact" | jq -r '.[0].id' | \
+    xargs -I {} curl -s "/api/v1/sbom/{}/download" > "sbom-$artifact.json"
+done
+```
+
+## See Also
+
+- [Vulnerability Scanning](/docs/security/scanning) - CVE detection and scanning configuration
+- [Security Policies](/docs/security/policies) - Broader security policy enforcement
+- [Artifact Signing](/docs/security/signing) - Verify artifact integrity
