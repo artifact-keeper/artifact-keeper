@@ -76,11 +76,19 @@ jobs:
           chmod +x scripts/pki/generate-gpg.sh
           scripts/pki/generate-gpg.sh .pki
 
+      - name: List PKI files
+        run: |
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "PWD: $(pwd)"
+          ls -la .pki/ || echo "No .pki directory!"
+          ls -la $GITHUB_WORKSPACE/.pki/ || echo "No workspace .pki!"
+
       - name: Upload PKI artifacts
         uses: actions/upload-artifact@v4
         with:
           name: pki-assets
-          path: .pki/
+          path: ${{ github.workspace }}/.pki/
+          if-no-files-found: error
           retention-days: 1
 
   # ════════════════════════════════════════════════════════════════════════════
