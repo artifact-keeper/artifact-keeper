@@ -73,6 +73,20 @@ DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" 
 ./scripts/native-tests/test-grpc-sbom.sh
 ```
 
+### WASM Plugin E2E Tests
+```bash
+# Run all WASM plugin tests (requires backend running on port 8080)
+./scripts/native-tests/test-wasm-plugins.sh
+
+# Run individual test suites
+./scripts/native-tests/test-wasm-plugins.sh git        # Git installation tests
+./scripts/native-tests/test-wasm-plugins.sh lifecycle  # Enable/disable/uninstall
+./scripts/native-tests/test-wasm-plugins.sh reload     # Hot-reload tests
+
+# Run with custom API URL
+API_URL=http://localhost:8080 ./scripts/native-tests/test-wasm-plugins.sh
+```
+
 ### Stress and Failure Tests
 ```bash
 # Stress tests (100 concurrent uploads)
