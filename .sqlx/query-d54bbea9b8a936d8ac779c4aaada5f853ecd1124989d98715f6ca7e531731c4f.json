@@ -76,7 +76,8 @@
               "Enum": [
                 "local",
                 "remote",
-                "virtual"
+                "virtual",
+                "staging"
               ]
             }
           }
