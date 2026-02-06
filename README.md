@@ -280,6 +280,112 @@ artifact-keeper/
 | Plugin runtime | **Wasmtime** | Sandboxed, portable, WIT contract system |
 | Storage | **Filesystem / S3** | Simple default, cloud-ready upgrade path |
 
+## CI/CD Pipeline
+
+Seven GitHub Actions workflows handle testing, publishing, and deployment.
+
+```mermaid
+flowchart TD
+    subgraph TRIGGER["Triggers"]
+        PUSH["Push / PR<br/>to main"]
+        TAG["Tag v*"]
+        CRON["Daily 2 AM UTC"]
+        SITE_PUSH["Push to site/**"]
+    end
+
+    subgraph CI["ci.yml — Every Push/PR"]
+        direction TB
+        LINT["🦀 Lint Rust<br/>fmt + clippy"]
+        UNIT["🧪 Unit Tests<br/>cargo test --lib"]
+        INTEG["🔗 Integration Tests<br/>+ PostgreSQL<br/>(main push only)"]
+        SMOKE["🔥 Smoke E2E<br/>PyPI · npm · Cargo<br/>docker-compose.test.yml"]
+        AUDIT["🔒 Security Audit<br/>cargo audit"]
+        CI_OK["✅ CI Complete"]
+
+        LINT --> UNIT
+        LINT --> INTEG
+        UNIT --> SMOKE
+        SMOKE --> CI_OK
+        AUDIT --> CI_OK
+    end
+
+    subgraph DOCKER["docker-publish.yml — Push to main / tags"]
+        direction TB
+        BE_BUILD["Backend<br/>amd64 + arm64"]
+        OS_BUILD["OpenSCAP<br/>amd64 + arm64"]
+        BE_MERGE["Multi-Arch<br/>Manifest"]
+        OS_MERGE["Multi-Arch<br/>Manifest"]
+
+        BE_BUILD --> BE_MERGE
+        OS_BUILD --> OS_MERGE
+    end
+
+    subgraph E2E["e2e.yml — Manual / called by release"]
+        direction TB
+        PKI["🔐 Setup PKI<br/>TLS + GPG"]
+        NATIVE["📦 Native Client Tests<br/>10 formats"]
+        STRESS["🔥 Stress Tests<br/>100 concurrent uploads"]
+        FAILURE["💥 Failure Tests<br/>crash · db · storage"]
+
+        PKI --> NATIVE
+        NATIVE --> STRESS
+        NATIVE --> FAILURE
+    end
+
+    subgraph RELEASE["release.yml — Tags v*"]
+        direction TB
+        E2E_GATE["🚦 E2E Gate<br/>all formats + stress + failure"]
+        BINARIES["📦 Build Binaries<br/>linux + macOS<br/>amd64 + arm64"]
+        GH_RELEASE["🚀 GitHub Release<br/>binaries + checksums"]
+
+        E2E_GATE --> BINARIES
+        BINARIES --> GH_RELEASE
+    end
+
+    subgraph NIGHTLY["scheduled-tests.yml — Daily"]
+        direction TB
+        NIGHTLY_E2E["🌙 Nightly Smoke E2E"]
+        DEP_CHECK["🔍 Dependency Check"]
+        SEC_SCAN["🔒 Security Scan"]
+    end
+
+    subgraph SITE["site.yml"]
+        PAGES["📄 Build + Deploy<br/>GitHub Pages"]
+    end
+
+    subgraph AMI["ami-build.yml"]
+        PACKER["🖥️ Packer Build AMI"]
+    end
+
+    PUSH --> CI
+    PUSH --> DOCKER
+    TAG --> RELEASE
+    TAG --> DOCKER
+    CRON --> NIGHTLY
+    SITE_PUSH --> SITE
+    GH_RELEASE -.->|"on release published"| AMI
+
+    classDef trigger fill:#6f42c1,color:#fff,stroke:#6f42c1
+    classDef ci fill:#2ea44f,color:#fff,stroke:#2ea44f
+    classDef docker fill:#0969da,color:#fff,stroke:#0969da
+    classDef release fill:#d97706,color:#fff,stroke:#d97706
+
+    class PUSH,TAG,CRON,SITE_PUSH trigger
+    class LINT,UNIT,INTEG,SMOKE,AUDIT,CI_OK ci
+    class BE_BUILD,OS_BUILD,BE_MERGE,OS_MERGE docker
+    class E2E_GATE,BINARIES,GH_RELEASE release
+```
+
+| Workflow | Trigger | What It Does |
+|----------|---------|--------------|
+| **ci.yml** | Every push/PR | Lint, unit tests, integration tests, smoke E2E (PyPI, npm, Cargo) |
+| **docker-publish.yml** | Push to main, tags | Multi-arch Docker images (backend + OpenSCAP) to ghcr.io |
+| **e2e.yml** | Manual or called by release | Full E2E: 10 native client formats, stress, failure injection |
+| **release.yml** | Tags `v*` | E2E gate, cross-platform binaries, GitHub Release |
+| **scheduled-tests.yml** | Daily 2 AM UTC | Nightly smoke E2E, dependency check, security scan |
+| **site.yml** | Push to `site/**` | Build and deploy docs to GitHub Pages |
+| **ami-build.yml** | On release published | Bake AWS AMI with Packer |
+
 ## Contributing
 
 We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
