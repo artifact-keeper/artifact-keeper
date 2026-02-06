@@ -84,15 +84,14 @@ jobs:
           # Make all PKI files readable for upload
           chmod -R a+r .pki/
 
+      - name: Tar PKI files
+        run: tar -cvf pki-assets.tar .pki/
+
       - name: Upload PKI artifacts
         uses: actions/upload-artifact@v4
         with:
           name: pki-assets
-          path: |
-            .pki/*.crt
-            .pki/*.key
-            .pki/*.pub
-            .pki/*.txt
+          path: pki-assets.tar
           if-no-files-found: error
           retention-days: 1
 
@@ -111,13 +110,15 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Download PKI assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v4
         with:
           name: pki-assets
-          path: .pki
 
-      - name: Set PKI permissions
-        run: chmod 600 .pki/*.key 2>/dev/null || true
+      - name: Extract PKI assets
+        run: |
+          tar -xvf pki-assets.tar
+          chmod 600 .pki/*.key 2>/dev/null || true
+          ls -la .pki/
 
       - name: Create test scripts directory
         run: mkdir -p scripts/native-tests
