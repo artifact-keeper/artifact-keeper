@@ -95,7 +95,8 @@
               "Enum": [
                 "local",
                 "remote",
-                "virtual"
+                "virtual",
+                "staging"
               ]
             }
           }
@@ -231,7 +232,8 @@
               "Enum": [
                 "local",
                 "remote",
-                "virtual"
+                "virtual",
+                "staging"
               ]
             }
           }

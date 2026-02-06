@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*)::BIGINT as \"count!\" FROM promotion_history WHERE source_repo_id = $1 OR target_repo_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "ea34ab3c60f2516104c672ddfe7d85e058a8d47c8fbc303543bb3ce2abc0d6f7"
+}

@@ -188,6 +188,7 @@ fn parse_repo_type(s: &str) -> Result<RepositoryType> {
         "local" => Ok(RepositoryType::Local),
         "remote" => Ok(RepositoryType::Remote),
         "virtual" => Ok(RepositoryType::Virtual),
+        "staging" => Ok(RepositoryType::Staging),
         _ => Err(AppError::Validation(format!("Invalid repo type: {}", s))),
     }
 }

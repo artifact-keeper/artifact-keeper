@@ -268,6 +268,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Promotion routes with auth middleware (staging -> release workflow)
+        .nest(
+            "/promotion",
+            handlers::promotion::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Remote instance management & proxy routes with auth middleware
         .nest(
             "/instances",
