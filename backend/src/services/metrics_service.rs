@@ -53,7 +53,7 @@ fn normalize_path(path: &str) -> String {
             if seg.len() == 36 && seg.chars().filter(|c| *c == '-').count() == 4 {
                 // UUID pattern
                 ":id".to_string()
-            } else if seg.parse::<i64>().is_ok() && seg.len() > 0 {
+            } else if seg.parse::<i64>().is_ok() && !seg.is_empty() {
                 // Numeric ID
                 ":id".to_string()
             } else {

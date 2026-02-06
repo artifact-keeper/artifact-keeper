@@ -856,7 +856,7 @@ impl AuthConfigService {
             name: row.name,
             server_url: row.server_url,
             bind_dn: row.bind_dn,
-            has_bind_password: row.bind_password_encrypted.map_or(false, |p| !p.is_empty()),
+            has_bind_password: row.bind_password_encrypted.is_some_and(|p| !p.is_empty()),
             user_base_dn: row.user_base_dn,
             user_filter: row.user_filter,
             group_base_dn: row.group_base_dn,

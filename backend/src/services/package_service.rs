@@ -28,6 +28,7 @@ impl PackageService {
     /// blocked.
     ///
     /// Returns the `packages.id` on success.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_or_update_from_artifact(
         &self,
         repository_id: Uuid,
@@ -83,6 +84,7 @@ impl PackageService {
     }
 
     /// Fire-and-forget wrapper that logs errors instead of propagating them.
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_create_or_update_from_artifact(
         &self,
         repository_id: Uuid,

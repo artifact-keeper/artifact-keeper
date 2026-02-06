@@ -46,13 +46,15 @@ pub enum ScrubLevel {
     Aggressive,
 }
 
-impl ScrubLevel {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for ScrubLevel {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s {
             "minimal" => Self::Minimal,
             "aggressive" => Self::Aggressive,
             _ => Self::Standard,
-        }
+        })
     }
 }
 
@@ -97,7 +99,7 @@ impl CrashReportingService {
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "standard".to_string());
 
-        Ok(ScrubLevel::from_str(&level))
+        Ok(level.parse::<ScrubLevel>().unwrap())
     }
 
     /// Record a crash/error. Deduplicates by error signature.
