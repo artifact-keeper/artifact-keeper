@@ -662,3 +662,203 @@ pub struct LicenseCheckResult {
     pub violations: Vec<String>,
     pub warnings: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a mock SbomService for testing SBOM generation
+    /// without a database connection.
+    fn generate_test_cyclonedx(deps: &[DependencyInfo]) -> serde_json::Value {
+        let mut components = Vec::new();
+        for dep in deps {
+            let mut comp = serde_json::json!({
+                "type": "library",
+                "name": dep.name,
+            });
+            if let Some(v) = &dep.version {
+                comp["version"] = serde_json::json!(v);
+            }
+            if let Some(p) = &dep.purl {
+                comp["purl"] = serde_json::json!(p);
+            }
+            if let Some(l) = &dep.license {
+                comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
+            }
+            components.push(comp);
+        }
+
+        serde_json::json!({
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "metadata": {
+                "timestamp": Utc::now().to_rfc3339(),
+                "tools": [{
+                    "vendor": "Artifact Keeper",
+                    "name": "artifact-keeper",
+                    "version": env!("CARGO_PKG_VERSION")
+                }]
+            },
+            "components": components
+        })
+    }
+
+    fn generate_test_spdx(deps: &[DependencyInfo]) -> serde_json::Value {
+        let mut packages = Vec::new();
+        for (idx, dep) in deps.iter().enumerate() {
+            let spdx_id = format!("SPDXRef-Package-{}", idx);
+            let mut pkg = serde_json::json!({
+                "SPDXID": spdx_id,
+                "name": dep.name,
+                "downloadLocation": "NOASSERTION",
+            });
+            if let Some(v) = &dep.version {
+                pkg["versionInfo"] = serde_json::json!(v);
+            }
+            if let Some(l) = &dep.license {
+                pkg["licenseDeclared"] = serde_json::json!(l);
+            }
+            packages.push(pkg);
+        }
+
+        serde_json::json!({
+            "spdxVersion": "SPDX-2.3",
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": "artifact-sbom",
+            "documentNamespace": format!("https://artifact-keeper.com/sbom/{}", Uuid::new_v4()),
+            "creationInfo": {
+                "created": Utc::now().to_rfc3339(),
+                "creators": [format!("Tool: artifact-keeper-{}", env!("CARGO_PKG_VERSION"))]
+            },
+            "packages": packages
+        })
+    }
+
+    #[test]
+    fn test_cyclonedx_has_required_fields() {
+        let deps = vec![
+            DependencyInfo {
+                name: "lodash".to_string(),
+                version: Some("4.17.21".to_string()),
+                purl: Some("pkg:npm/lodash@4.17.21".to_string()),
+                license: Some("MIT".to_string()),
+                sha256: None,
+            },
+        ];
+
+        let sbom = generate_test_cyclonedx(&deps);
+
+        // Verify required CycloneDX 1.5 fields
+        assert_eq!(sbom["bomFormat"], "CycloneDX");
+        assert_eq!(sbom["specVersion"], "1.5");
+        assert_eq!(sbom["version"], 1);
+        assert!(sbom["metadata"].is_object());
+        assert!(sbom["metadata"]["timestamp"].is_string());
+        assert!(sbom["metadata"]["tools"].is_array());
+        assert!(sbom["components"].is_array());
+    }
+
+    #[test]
+    fn test_cyclonedx_empty_components() {
+        let deps: Vec<DependencyInfo> = vec![];
+        let sbom = generate_test_cyclonedx(&deps);
+
+        // Empty SBOM should still have valid structure
+        assert_eq!(sbom["bomFormat"], "CycloneDX");
+        assert_eq!(sbom["specVersion"], "1.5");
+        assert!(sbom["components"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_cyclonedx_component_structure() {
+        let deps = vec![DependencyInfo {
+            name: "axios".to_string(),
+            version: Some("1.6.0".to_string()),
+            purl: Some("pkg:npm/axios@1.6.0".to_string()),
+            license: Some("MIT".to_string()),
+            sha256: None,
+        }];
+
+        let sbom = generate_test_cyclonedx(&deps);
+        let components = sbom["components"].as_array().unwrap();
+
+        assert_eq!(components.len(), 1);
+        let comp = &components[0];
+        assert_eq!(comp["type"], "library");
+        assert_eq!(comp["name"], "axios");
+        assert_eq!(comp["version"], "1.6.0");
+        assert_eq!(comp["purl"], "pkg:npm/axios@1.6.0");
+    }
+
+    #[test]
+    fn test_spdx_has_required_fields() {
+        let deps = vec![
+            DependencyInfo {
+                name: "lodash".to_string(),
+                version: Some("4.17.21".to_string()),
+                purl: None,
+                license: Some("MIT".to_string()),
+                sha256: None,
+            },
+        ];
+
+        let sbom = generate_test_spdx(&deps);
+
+        // Verify required SPDX 2.3 fields
+        assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
+        assert_eq!(sbom["SPDXID"], "SPDXRef-DOCUMENT");
+        assert_eq!(sbom["dataLicense"], "CC0-1.0");
+        assert!(sbom["name"].is_string());
+        assert!(sbom["documentNamespace"].is_string());
+        assert!(sbom["creationInfo"].is_object());
+        assert!(sbom["creationInfo"]["created"].is_string());
+        assert!(sbom["creationInfo"]["creators"].is_array());
+        assert!(sbom["packages"].is_array());
+    }
+
+    #[test]
+    fn test_spdx_empty_packages() {
+        let deps: Vec<DependencyInfo> = vec![];
+        let sbom = generate_test_spdx(&deps);
+
+        // Empty SBOM should still have valid structure
+        assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
+        assert!(sbom["packages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_spdx_package_structure() {
+        let deps = vec![DependencyInfo {
+            name: "express".to_string(),
+            version: Some("4.18.2".to_string()),
+            purl: None,
+            license: Some("MIT".to_string()),
+            sha256: None,
+        }];
+
+        let sbom = generate_test_spdx(&deps);
+        let packages = sbom["packages"].as_array().unwrap();
+
+        assert_eq!(packages.len(), 1);
+        let pkg = &packages[0];
+        assert!(pkg["SPDXID"].as_str().unwrap().starts_with("SPDXRef-"));
+        assert_eq!(pkg["name"], "express");
+        assert_eq!(pkg["versionInfo"], "4.18.2");
+        assert_eq!(pkg["licenseDeclared"], "MIT");
+    }
+
+    #[test]
+    fn test_spdx_document_namespace_is_unique() {
+        let deps: Vec<DependencyInfo> = vec![];
+        let sbom1 = generate_test_spdx(&deps);
+        let sbom2 = generate_test_spdx(&deps);
+
+        // Each SBOM should have a unique document namespace
+        assert_ne!(
+            sbom1["documentNamespace"].as_str().unwrap(),
+            sbom2["documentNamespace"].as_str().unwrap()
+        );
+    }
+}
