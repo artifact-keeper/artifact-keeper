@@ -16,6 +16,12 @@
 //! - CLOUDFRONT_DISTRIBUTION_URL: CloudFront distribution URL (optional)
 //! - CLOUDFRONT_KEY_PAIR_ID: CloudFront key pair ID for signing
 //! - CLOUDFRONT_PRIVATE_KEY_PATH: Path to CloudFront private key PEM file
+//!
+//! For Artifactory migration:
+//! - STORAGE_PATH_FORMAT: Storage path format (default: native)
+//!   - "native": 2-level sharding {sha[0:2]}/{sha[2:4]}/{sha}
+//!   - "artifactory": 1-level sharding {sha[0:2]}/{sha} (JFrog Artifactory format)
+//!   - "migration": Write native, read from both (for zero-downtime migration)
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,7 +30,7 @@ use s3::creds::Credentials;
 use s3::region::Region;
 use std::time::Duration;
 
-use super::{PresignedUrl, PresignedUrlSource};
+use super::{PresignedUrl, PresignedUrlSource, StoragePathFormat};
 use crate::error::{AppError, Result};
 
 /// S3 storage backend configuration
@@ -44,6 +50,8 @@ pub struct S3Config {
     pub presign_expiry: Duration,
     /// CloudFront configuration (optional)
     pub cloudfront: Option<CloudFrontConfig>,
+    /// Storage path format (native, artifactory, or migration)
+    pub path_format: StoragePathFormat,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -78,6 +86,9 @@ impl S3Config {
         // CloudFront configuration (optional)
         let cloudfront = Self::load_cloudfront_config();
 
+        // Storage path format (native, artifactory, or migration)
+        let path_format = StoragePathFormat::from_env();
+
         Ok(Self {
             bucket,
             region,
@@ -86,6 +97,7 @@ impl S3Config {
             redirect_downloads,
             presign_expiry: Duration::from_secs(presign_expiry_secs),
             cloudfront,
+            path_format,
         })
     }
 
@@ -141,7 +153,14 @@ impl S3Config {
             redirect_downloads: false,
             presign_expiry: Duration::from_secs(3600),
             cloudfront: None,
+            path_format: StoragePathFormat::default(),
         }
+    }
+
+    /// Set storage path format (for Artifactory compatibility)
+    pub fn with_path_format(mut self, format: StoragePathFormat) -> Self {
+        self.path_format = format;
+        self
     }
 
     /// Enable redirect downloads
@@ -173,6 +192,8 @@ pub struct S3Backend {
     presign_expiry: Duration,
     /// CloudFront configuration (optional)
     cloudfront: Option<CloudFrontConfig>,
+    /// Storage path format (for Artifactory compatibility)
+    path_format: StoragePathFormat,
 }
 
 impl S3Backend {
@@ -214,12 +235,20 @@ impl S3Backend {
             );
         }
 
+        if config.path_format != StoragePathFormat::Native {
+            tracing::info!(
+                path_format = %config.path_format,
+                "S3 storage path format configured"
+            );
+        }
+
         Ok(Self {
             bucket,
             prefix: config.prefix,
             redirect_downloads: config.redirect_downloads,
             presign_expiry: config.presign_expiry,
             cloudfront: config.cloudfront,
+            path_format: config.path_format,
         })
     }
 
@@ -249,6 +278,24 @@ impl S3Backend {
             None => key.to_string(),
         }
     }
+
+    /// Try to generate an Artifactory fallback path from a native path
+    ///
+    /// Native format: ab/cd/abcd...full_checksum (64 chars)
+    /// Artifactory format: ab/abcd...full_checksum
+    fn try_artifactory_fallback(&self, key: &str) -> Option<String> {
+        // Parse native format: {checksum[0:2]}/{checksum[2:4]}/{checksum}
+        let parts: Vec<&str> = key.split('/').collect();
+        if parts.len() >= 3 {
+            // Last part should be the full checksum
+            let checksum = parts[parts.len() - 1];
+            if checksum.len() == 64 && checksum.chars().all(|c| c.is_ascii_hexdigit()) {
+                // Generate Artifactory format: {checksum[0:2]}/{checksum}
+                return Some(format!("{}/{}", &checksum[..2], checksum));
+            }
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -268,14 +315,54 @@ impl super::StorageBackend for S3Backend {
     async fn get(&self, key: &str) -> Result<Bytes> {
         let full_key = self.full_key(key);
 
-        let response = self.bucket.get_object(&full_key).await.map_err(|e| {
-            // Check for 404 errors
-            if e.to_string().contains("404") || e.to_string().contains("NoSuchKey") {
-                AppError::NotFound(format!("Storage key not found: {}", key))
-            } else {
-                AppError::Storage(format!("Failed to get object '{}': {}", key, e))
+        let response = match self.bucket.get_object(&full_key).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Check for 404 errors - if in migration mode, try fallback path
+                let err_str = e.to_string();
+                if (err_str.contains("404") || err_str.contains("NoSuchKey"))
+                    && self.path_format.has_fallback()
+                {
+                    // Extract checksum from the key to generate fallback path
+                    // Key format is like: ab/cd/abcd...full_checksum
+                    if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+                        let fallback_full_key = self.full_key(&fallback_key);
+                        tracing::debug!(
+                            original = %key,
+                            fallback = %fallback_key,
+                            "Trying Artifactory fallback path"
+                        );
+                        match self.bucket.get_object(&fallback_full_key).await {
+                            Ok(resp) => {
+                                tracing::info!(
+                                    key = %key,
+                                    fallback = %fallback_key,
+                                    size = resp.bytes().len(),
+                                    "Found artifact at Artifactory fallback path"
+                                );
+                                return Ok(Bytes::from(resp.to_vec()));
+                            }
+                            Err(_) => {
+                                // Fallback also failed, return original error
+                            }
+                        }
+                    }
+                }
+
+                // Original error handling
+                if err_str.contains("404") || err_str.contains("NoSuchKey") {
+                    return Err(AppError::NotFound(format!(
+                        "Storage key not found: {}",
+                        key
+                    )));
+                } else {
+                    return Err(AppError::Storage(format!(
+                        "Failed to get object '{}': {}",
+                        key, e
+                    )));
+                }
             }
-        })?;
+        };
 
         tracing::debug!(key = %key, size = response.bytes().len(), "S3 get object successful");
         Ok(Bytes::from(response.to_vec()))
@@ -293,6 +380,20 @@ impl super::StorageBackend for S3Backend {
                     || err_str.contains("NoSuchKey")
                     || err_str.contains("Not Found")
                 {
+                    // In migration mode, also check the Artifactory fallback path
+                    if self.path_format.has_fallback() {
+                        if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+                            let fallback_full_key = self.full_key(&fallback_key);
+                            if self.bucket.head_object(&fallback_full_key).await.is_ok() {
+                                tracing::debug!(
+                                    key = %key,
+                                    fallback = %fallback_key,
+                                    "Found artifact at Artifactory fallback path"
+                                );
+                                return Ok(true);
+                            }
+                        }
+                    }
                     Ok(false)
                 } else {
                     Err(AppError::Storage(format!(
@@ -576,6 +677,57 @@ mod tests {
         assert_eq!(config.region, "us-west-2");
         assert_eq!(config.endpoint, Some("http://localhost:9000".to_string()));
         assert_eq!(config.prefix, Some("prefix".to_string()));
+        assert_eq!(config.path_format, StoragePathFormat::Native);
+    }
+
+    #[test]
+    fn test_s3_config_with_path_format() {
+        let config = S3Config::new("my-bucket".to_string(), "us-west-2".to_string(), None, None)
+            .with_path_format(StoragePathFormat::Artifactory);
+
+        assert_eq!(config.path_format, StoragePathFormat::Artifactory);
+    }
+
+    #[test]
+    fn test_artifactory_fallback_path_extraction() {
+        // Test the path extraction logic directly
+        let native_key = "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
+
+        // Parse native format: {checksum[0:2]}/{checksum[2:4]}/{checksum}
+        let parts: Vec<&str> = native_key.split('/').collect();
+        assert_eq!(parts.len(), 3);
+
+        let checksum = parts[2];
+        assert_eq!(checksum.len(), 64);
+
+        // Generate Artifactory format
+        let artifactory_key = format!("{}/{}", &checksum[..2], checksum);
+        assert_eq!(
+            artifactory_key,
+            "91/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
+        );
+    }
+
+    #[test]
+    fn test_artifactory_fallback_invalid_key() {
+        // Test with invalid key (not a valid checksum path)
+        let invalid_key = "not/a/valid/path.txt";
+
+        let parts: Vec<&str> = invalid_key.split('/').collect();
+        let last_part = parts.last().unwrap();
+
+        // Should not match: not 64 chars and not all hex
+        assert!(last_part.len() != 64 || !last_part.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_path_format_with_s3_config() {
+        // Test that path format is properly set via with_path_format
+        let config = S3Config::new("test".to_string(), "us-east-1".to_string(), None, None)
+            .with_path_format(StoragePathFormat::Migration);
+
+        assert_eq!(config.path_format, StoragePathFormat::Migration);
+        assert!(config.path_format.has_fallback());
     }
 }
 

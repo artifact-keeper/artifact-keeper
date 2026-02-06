@@ -8,17 +8,23 @@ secret:
     - "**/test-*.sh"
     - "scripts/native-tests/**"
     - "**/.astro/**"
-    
+    # Storage backend files contain test keys in #[cfg(test)] modules
+    - "backend/src/storage/*.rs"
+
   # Specific patterns to ignore
   ignored-matches:
-    # Test RSA keys for unit testing (GCS backend)
+    # Test RSA keys for unit testing (GCS, CloudFront backends)
     - match: "BEGIN PRIVATE KEY"
       name: "Test RSA key for unit tests"
-      
+    - match: "BEGIN RSA PRIVATE KEY"
+      name: "Test RSA key for unit tests"
+    - match: "END PRIVATE KEY"
+      name: "Test RSA key for unit tests"
+
     # Default test password used in examples and integration tests
     - match: "admin123"
       name: "Default test password"
-      
+
     # Astro build cache hashes
     - match: "data-store.json"
       name: "Astro build cache"

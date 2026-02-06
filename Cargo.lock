@@ -165,6 +165,7 @@ dependencies = [
  "futures",
  "git2",
  "hex",
+ "hmac",
  "jsonwebtoken",
  "ldap3",
  "md-5",
