@@ -73,6 +73,15 @@ DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" 
 ./scripts/native-tests/test-grpc-sbom.sh
 ```
 
+### Dependency-Track Integration Tests
+```bash
+# Run Dependency-Track integration tests (requires docker compose up)
+./scripts/native-tests/test-dependency-track.sh
+
+# With API key for full tests
+DEPENDENCY_TRACK_API_KEY=your-key ./scripts/native-tests/test-dependency-track.sh
+```
+
 ### WASM Plugin E2E Tests
 ```bash
 # Run all WASM plugin tests (requires backend running on port 8080)
