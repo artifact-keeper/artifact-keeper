@@ -6,7 +6,6 @@
 //! - Progress tracking
 //! - Checkpoint saving for resumability
 
-use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -507,7 +506,7 @@ impl MigrationWorker {
             let exists = self.storage.exists(&storage_key).await.unwrap_or(false);
             if !exists {
                 self.storage
-                    .put(&storage_key, Bytes::from(artifact_data))
+                    .put(&storage_key, artifact_data)
                     .await
                     .map_err(|e| MigrationError::StorageError(e.to_string()))?;
             }

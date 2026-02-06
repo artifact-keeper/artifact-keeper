@@ -111,6 +111,7 @@ impl LdapService {
     }
 
     /// Create LDAP service from database-stored config
+    #[allow(clippy::too_many_arguments)]
     pub fn from_db_config(
         db: PgPool,
         _name: &str,

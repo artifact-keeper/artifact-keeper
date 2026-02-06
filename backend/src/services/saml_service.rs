@@ -175,6 +175,7 @@ impl SamlService {
     }
 
     /// Create SAML service from database-stored config
+    #[allow(clippy::too_many_arguments)]
     pub fn from_db_config(
         db: PgPool,
         entity_id: &str,

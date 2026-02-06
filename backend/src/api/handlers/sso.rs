@@ -339,6 +339,7 @@ struct SamlAcsForm {
     #[serde(rename = "SAMLResponse")]
     saml_response: String,
     #[serde(rename = "RelayState")]
+    #[allow(dead_code)]
     relay_state: Option<String>,
 }
 
