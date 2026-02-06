@@ -1,9 +1,9 @@
 ---
-title: "Edge Nodes & Replication"
-description: "Distributed caching with edge nodes for global artifact distribution"
+title: "Peer Replication"
+description: "Recursive peer-to-peer replication for global artifact distribution"
 ---
 
-Edge nodes enable distributed caching of artifacts closer to consumers, reducing latency and primary server load for geographically distributed teams.
+Peer replication enables distributed artifact storage across multiple Artifact Keeper instances. Every peer is a full instance — same backend, database, and storage — that can originate replication to other peers. There is no distinction between "primary" and "edge"; any peer can push to or pull from any other peer.
 
 ## Architecture Overview
 
@@ -13,119 +13,100 @@ graph TD
     CI["🔄 CI/CD\nGitHub Actions"]
     PM["📦 Package Manager\nnpm · pip · docker"]
 
-    subgraph PRIMARY["🏛️ Primary Node · us-east-1"]
+    subgraph P1["🏛️ Peer · us-east-1"]
         direction TB
-        HUB_BE["⚙️ Backend\nSource of Truth"]
-        HUB_DB[("🐘 PostgreSQL")]
-        HUB_ST["💾 Storage"]
-        HUB_MS["🔍 Meilisearch"]
-        HUB_BE --> HUB_DB
-        HUB_BE --> HUB_ST
-        HUB_BE --> HUB_MS
+        P1_BE["⚙️ Backend"]
+        P1_DB[("🐘 PostgreSQL")]
+        P1_ST["💾 Storage"]
+        P1_MS["🔍 Meilisearch"]
+        P1_BE --> P1_DB
+        P1_BE --> P1_ST
+        P1_BE --> P1_MS
     end
 
-    subgraph EDGES["🌐 Edge Nodes"]
+    subgraph PEERS["🌐 Peer Instances"]
         direction LR
 
         subgraph USW["us-west-2"]
-            E1["📡 Edge\nCache · Read-Only"]
+            P2_BE["⚙️ Peer\nFull Instance"]
         end
 
         subgraph EU["eu-west-1"]
-            E2["📡 Edge\nCache · Read-Only"]
+            P3_BE["⚙️ Peer\nFull Instance"]
         end
 
         subgraph AP["ap-southeast-1"]
-            E3["📡 Edge\nCache · Read-Only"]
+            P4_BE["⚙️ Peer\nFull Instance"]
         end
     end
 
-    CI -->|"push"| HUB_BE
-    HUB_BE -->|"Chunked\nReplication"| E1
-    HUB_BE -->|"Chunked\nReplication"| E2
-    HUB_BE -->|"Chunked\nReplication"| E3
+    CI -->|"push"| P1_BE
+    P1_BE <-->|"Chunked\nReplication"| P2_BE
+    P1_BE <-->|"Chunked\nReplication"| P3_BE
+    P1_BE <-->|"Chunked\nReplication"| P4_BE
 
-    E1 <-->|"P2P Mesh"| E2
-    E2 <-->|"P2P Mesh"| E3
-    E1 <-->|"P2P Mesh"| E3
+    P2_BE <-->|"P2P Mesh"| P3_BE
+    P3_BE <-->|"P2P Mesh"| P4_BE
+    P2_BE <-->|"P2P Mesh"| P4_BE
 
-    DEV -->|"pull"| E3
-    PM -->|"install"| E1
+    DEV -->|"pull"| P4_BE
+    PM -->|"install"| P2_BE
 
-    classDef primary fill:#2ea44f,color:#fff,stroke:#2ea44f,font-weight:bold
-    classDef edge fill:#1d63ed,color:#fff,stroke:#1d63ed
+    classDef peer fill:#2ea44f,color:#fff,stroke:#2ea44f,font-weight:bold
     classDef client fill:#6f42c1,color:#fff,stroke:#6f42c1
     classDef datastore fill:#d97706,color:#fff,stroke:#d97706
 
-    class HUB_BE primary
-    class HUB_DB,HUB_ST,HUB_MS datastore
-    class E1,E2,E3 edge
+    class P1_BE,P2_BE,P3_BE,P4_BE peer
+    class P1_DB,P1_ST,P1_MS datastore
     class DEV,CI,PM client
 ```
 
 ### Key Concepts
 
-- **Primary Node**: The authoritative registry where artifacts are uploaded — source of truth for all metadata and storage
-- **Edge Nodes**: Read-only cache nodes that serve artifacts to local consumers with low latency
-- **Chunked Replication**: Artifacts are split into chunks for reliable, resumable delivery to edge nodes
-- **P2P Mesh**: Edge nodes transfer chunks between each other, reducing hub bandwidth
-- **Network-Aware Routing**: Clients automatically redirected to the nearest healthy edge
+- **Peer Instance**: A full Artifact Keeper deployment (backend, database, storage) that participates in the replication mesh
+- **Recursive Replication**: Any peer can originate replication to any other peer — no fixed hub
+- **Chunked Replication**: Artifacts are split into chunks for reliable, resumable delivery between peers
+- **P2P Mesh**: Peers transfer chunks between each other, distributing load across the network
+- **Network-Aware Routing**: Clients automatically redirected to the nearest healthy peer
 
-## Setting Up Edge Nodes
+## Setting Up Peers
 
-### Primary Node Configuration
+### Peer Configuration
+
+Each peer is a full Artifact Keeper deployment. Configure peering by pointing peers at each other:
 
 ```bash
-# Primary node settings
-ROLE=primary
-EDGE_ENABLED=true
-EDGE_SECRET_KEY=generate-secure-secret-here
+# Enable peering
+PEER_ENABLED=true
+PEER_SECRET_KEY=generate-secure-secret-here
 
-# Allow edge node registration
-EDGE_AUTO_REGISTER=true  # Or manually approve
+# Allow automatic peer registration
+PEER_AUTO_REGISTER=true  # Or manually approve
 ```
 
-### Edge Node Configuration
+### Registering a Peer
+
+Peers discover each other on startup or can be registered manually:
 
 ```bash
-# Edge node settings
-ROLE=edge
-PRIMARY_URL=https://primary.example.com
-EDGE_API_KEY=your-edge-api-key-from-primary
-EDGE_REGION=us-west-2
-EDGE_CACHE_SIZE_MB=102400  # 100 GB cache
-
-# Storage for cached artifacts
-STORAGE_BACKEND=filesystem
-STORAGE_PATH=/var/lib/artifact-keeper/cache
-```
-
-### Edge Node Registration
-
-Edge nodes automatically register with the primary on startup:
-
-```bash
-# Start edge node
-./artifact-keeper-edge
-
-# Manual registration via API
-curl -X POST https://primary.example.com/api/v1/edge-nodes \
+# Register a peer via API
+curl -X POST https://peer-a.example.com/api/v1/peers \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "edge-us-west",
+    "name": "peer-us-west",
     "region": "us-west-2",
-    "url": "https://edge-usw.example.com",
+    "url": "https://peer-b.example.com",
     "capacity_mb": 102400
   }'
 ```
 
-## Edge Node Management
+## Peer Management
 
-### Listing Edge Nodes
+### Listing Peers
 
 ```bash
-curl https://primary.example.com/api/v1/edge-nodes \
+curl https://peer-a.example.com/api/v1/peers \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -135,13 +116,13 @@ Response:
 {
   "nodes": [
     {
-      "id": "edge-123",
-      "name": "edge-us-west",
+      "id": "peer-123",
+      "name": "peer-us-west",
       "region": "us-west-2",
-      "url": "https://edge-usw.example.com",
+      "url": "https://peer-b.example.com",
       "status": "healthy",
       "last_heartbeat": "2026-02-01T12:34:56Z",
-      "cache_size_mb": 45678,
+      "storage_used_mb": 45678,
       "capacity_mb": 102400,
       "repositories": ["repo-1", "repo-2"]
     }
@@ -151,25 +132,25 @@ Response:
 
 ### Heartbeat Mechanism
 
-Edge nodes send periodic heartbeats to the primary:
+Peers exchange periodic heartbeats:
 
 ```bash
-# Edge node heartbeat interval
-EDGE_HEARTBEAT_INTERVAL=60  # Seconds
+# Heartbeat interval
+PEER_HEARTBEAT_INTERVAL=60  # Seconds
 ```
 
 If a heartbeat is missed:
-- After 3 minutes: Node marked as degraded
-- After 10 minutes: Node marked as offline
-- Clients automatically fail over to primary or other edges
+- After 3 minutes: Peer marked as degraded
+- After 10 minutes: Peer marked as offline
+- Clients automatically fail over to other peers
 
-### Assigning Repositories to Edges
+### Assigning Repositories to Peers
 
-Control which repositories are cached by which edge nodes:
+Control which repositories are replicated to which peers:
 
 ```bash
-# Assign repository to edge
-curl -X POST https://primary.example.com/api/v1/edge-nodes/edge-123/repositories \
+# Assign repository to peer
+curl -X POST https://peer-a.example.com/api/v1/peers/peer-123/repositories \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -177,8 +158,8 @@ curl -X POST https://primary.example.com/api/v1/edge-nodes/edge-123/repositories
     "priority": "high"
   }'
 
-# Remove repository from edge
-curl -X DELETE https://primary.example.com/api/v1/edge-nodes/edge-123/repositories/repo-456 \
+# Remove repository from peer
+curl -X DELETE https://peer-a.example.com/api/v1/peers/peer-123/repositories/repo-456 \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
@@ -192,38 +173,38 @@ curl -X DELETE https://primary.example.com/api/v1/edge-nodes/edge-123/repositori
 
 ### Automatic Replication
 
-When an artifact is uploaded to the primary:
+When an artifact is uploaded to any peer:
 
-1. Primary accepts upload and stores artifact
-2. Primary notifies assigned edge nodes
-3. Edges download artifact in background
-4. Edges report completion to primary
+1. Peer accepts upload and stores artifact
+2. Peer notifies connected peers
+3. Receiving peers download artifact in background
+4. Receiving peers report completion
 
 ### Peer-to-Peer Chunk Transfer
 
-For large artifacts, edges can transfer chunks from each other:
+For large artifacts, peers can transfer chunks from each other:
 
 ```bash
 # Enable P2P transfer
-EDGE_P2P_ENABLED=true
-EDGE_P2P_MAX_PEERS=5
+PEER_P2P_ENABLED=true
+PEER_P2P_MAX_PEERS=5
 ```
 
 Transfer flow:
 
-1. Edge A requests artifact from primary
-2. Primary responds with peer list (edges that already have it)
-3. Edge A downloads chunks from multiple peers in parallel
-4. Edge A verifies integrity and serves to clients
+1. Peer A requests artifact from Peer B
+2. Peer B responds with peer list (peers that already have it)
+3. Peer A downloads chunks from multiple peers in parallel
+4. Peer A verifies integrity and serves to clients
 
 ### Bandwidth Control
 
 ```bash
 # Limit replication bandwidth
-EDGE_REPLICATION_BANDWIDTH_MBPS=100
+PEER_REPLICATION_BANDWIDTH_MBPS=100
 
 # Replication schedule (off-peak hours)
-EDGE_REPLICATION_SCHEDULE="0 2-6 * * *"  # 2 AM - 6 AM
+PEER_REPLICATION_SCHEDULE="0 2-6 * * *"  # 2 AM - 6 AM
 ```
 
 ### Selective Sync
@@ -232,33 +213,33 @@ Configure what gets replicated:
 
 ```bash
 # Only replicate artifacts larger than threshold
-EDGE_MIN_ARTIFACT_SIZE_MB=10
+PEER_MIN_ARTIFACT_SIZE_MB=10
 
 # Only replicate recently accessed artifacts
-EDGE_SYNC_STRATEGY=lru  # or 'all', 'popular'
+PEER_SYNC_STRATEGY=lru  # or 'all', 'popular'
 
 # Maximum age of artifacts to replicate
-EDGE_MAX_ARTIFACT_AGE_DAYS=90
+PEER_MAX_ARTIFACT_AGE_DAYS=90
 ```
 
 ## Network-Aware Scheduling
 
-Clients are automatically routed to the optimal edge node based on:
+Clients are automatically routed to the optimal peer based on:
 
 ### Geographic Routing
 
 ```bash
-# Client makes request to primary
-curl https://primary.example.com/api/v1/packages/my-app/1.0.0/download
+# Client makes request to any peer
+curl https://peer-a.example.com/api/v1/packages/my-app/1.0.0/download
 
-# Primary responds with redirect to nearest edge
+# Peer responds with redirect to nearest peer
 HTTP/1.1 302 Found
-Location: https://edge-usw.example.com/api/v1/packages/my-app/1.0.0/download
+Location: https://peer-usw.example.com/api/v1/packages/my-app/1.0.0/download
 ```
 
 ### Load Balancing
 
-If multiple edges serve a region:
+If multiple peers serve a region:
 
 - Round-robin distribution
 - Least-connections algorithm
@@ -266,28 +247,28 @@ If multiple edges serve a region:
 
 ### Fallback Strategy
 
-If edge is unavailable:
+If a peer is unavailable:
 
-1. Try next nearest edge
-2. Fall back to primary
+1. Try next nearest peer
+2. Fall back to any reachable peer
 3. Client retries with exponential backoff
 
 ### Client Configuration
 
-Configure client to use edge-aware registry:
+Configure client to use peer-aware registry:
 
 ```bash
 # Docker
-docker login primary.example.com  # Automatically redirected
+docker login peer-a.example.com  # Automatically redirected to nearest peer
 
 # Maven
 <mirror>
   <id>artifact-keeper</id>
-  <url>https://primary.example.com/maven2</url>
+  <url>https://peer-a.example.com/maven2</url>
 </mirror>
 
 # npm (supports redirects)
-npm config set registry https://primary.example.com/npm/
+npm config set registry https://peer-a.example.com/npm/
 ```
 
 ## Cache Management
@@ -295,8 +276,8 @@ npm config set registry https://primary.example.com/npm/
 ### Cache Size Limits
 
 ```bash
-EDGE_CACHE_SIZE_MB=102400  # Hard limit
-EDGE_CACHE_HIGH_WATER_MARK=90  # Start eviction at 90%
+PEER_CACHE_SIZE_MB=102400  # Hard limit
+PEER_CACHE_HIGH_WATER_MARK=90  # Start eviction at 90%
 ```
 
 ### Eviction Policies
@@ -308,7 +289,7 @@ When cache is full:
 - **FIFO** (First In First Out): Evict oldest cached
 
 ```bash
-EDGE_EVICTION_POLICY=lru
+PEER_EVICTION_POLICY=lru
 ```
 
 ### Cache Warming
@@ -316,8 +297,8 @@ EDGE_EVICTION_POLICY=lru
 Pre-populate cache with important artifacts:
 
 ```bash
-curl -X POST https://edge-usw.example.com/api/v1/cache/warm \
-  -H "Authorization: Bearer $EDGE_API_KEY" \
+curl -X POST https://peer-usw.example.com/api/v1/cache/warm \
+  -H "Authorization: Bearer $PEER_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "repository_id": "repo-123",
@@ -332,31 +313,31 @@ Invalidate cached artifacts when updated:
 
 ```bash
 # Invalidate specific artifact
-curl -X DELETE https://edge-usw.example.com/api/v1/cache/artifacts/artifact-789 \
-  -H "Authorization: Bearer $EDGE_API_KEY"
+curl -X DELETE https://peer-usw.example.com/api/v1/cache/artifacts/artifact-789 \
+  -H "Authorization: Bearer $PEER_API_KEY"
 
 # Invalidate entire repository
-curl -X DELETE https://edge-usw.example.com/api/v1/cache/repositories/repo-123 \
-  -H "Authorization: Bearer $EDGE_API_KEY"
+curl -X DELETE https://peer-usw.example.com/api/v1/cache/repositories/repo-123 \
+  -H "Authorization: Bearer $PEER_API_KEY"
 ```
 
 ## Monitoring
 
-### Edge Node Metrics
+### Peer Metrics
 
 ```text
-artifact_keeper_edge_cache_size_bytes
-artifact_keeper_edge_cache_hits_total
-artifact_keeper_edge_cache_misses_total
-artifact_keeper_edge_replication_lag_seconds
-artifact_keeper_edge_p2p_transfers_total
+artifact_keeper_peer_cache_size_bytes
+artifact_keeper_peer_cache_hits_total
+artifact_keeper_peer_cache_misses_total
+artifact_keeper_peer_replication_lag_seconds
+artifact_keeper_peer_p2p_transfers_total
 ```
 
 ### Health Checks
 
 ```bash
-# Check edge health
-curl https://edge-usw.example.com/api/v1/health
+# Check peer health
+curl https://peer-usw.example.com/api/v1/health
 
 # Response
 {
@@ -364,7 +345,7 @@ curl https://edge-usw.example.com/api/v1/health
   "cache_size_mb": 45678,
   "capacity_mb": 102400,
   "cache_hit_rate": 0.87,
-  "primary_reachable": true,
+  "peers_reachable": 3,
   "last_sync": "2026-02-01T12:30:00Z"
 }
 ```
@@ -373,15 +354,15 @@ curl https://edge-usw.example.com/api/v1/health
 
 ```bash
 # Check replication lag
-curl https://primary.example.com/api/v1/edge-nodes/edge-123/replication-status \
+curl https://peer-a.example.com/api/v1/peers/peer-123/replication-status \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ## Deployment Patterns
 
-### Global CDN Pattern
+### Global Distribution Pattern
 
-Deploy edge nodes in each major region:
+Deploy peers in each major region:
 
 - us-east-1 (Virginia)
 - us-west-2 (Oregon)
@@ -390,7 +371,7 @@ Deploy edge nodes in each major region:
 
 ### Office/Site Pattern
 
-Deploy edge node in each office location:
+Deploy a peer in each office location:
 
 - Headquarters
 - Regional offices
@@ -399,8 +380,8 @@ Deploy edge node in each office location:
 
 ### Hybrid Cloud Pattern
 
-- Primary in cloud (AWS, GCP, Azure)
-- Edge nodes on-premises for low-latency access
+- Cloud peers in AWS, GCP, or Azure
+- On-premises peers for low-latency access
 - Synchronization over VPN or direct connect
 
 ## Security Considerations
@@ -408,60 +389,60 @@ Deploy edge node in each office location:
 ### API Key Rotation
 
 ```bash
-# Generate new edge API key
-curl -X POST https://primary.example.com/api/v1/edge-nodes/edge-123/rotate-key \
+# Generate new peer API key
+curl -X POST https://peer-a.example.com/api/v1/peers/peer-123/rotate-key \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 
-# Update edge configuration
-EDGE_API_KEY=new-key-here
+# Update peer configuration
+PEER_API_KEY=new-key-here
 
-# Restart edge node
+# Restart peer
 ```
 
 ### TLS/mTLS
 
-Use mutual TLS for edge-to-primary communication:
+Use mutual TLS for peer-to-peer communication:
 
 ```bash
-# Primary validates edge certificates
-EDGE_MTLS_ENABLED=true
-EDGE_CA_CERT=/etc/ssl/ca.crt
+# Peer validates other peer certificates
+PEER_MTLS_ENABLED=true
+PEER_CA_CERT=/etc/ssl/ca.crt
 
-# Edge presents client certificate
-EDGE_CLIENT_CERT=/etc/ssl/edge.crt
-EDGE_CLIENT_KEY=/etc/ssl/edge.key
+# Peer presents client certificate
+PEER_CLIENT_CERT=/etc/ssl/peer.crt
+PEER_CLIENT_KEY=/etc/ssl/peer.key
 ```
 
 ### Network Segmentation
 
-- Edge nodes in DMZ or public subnet
-- Primary in private subnet
-- Firewall rules limiting edge-to-primary traffic
+- Public-facing peers in DMZ or public subnet
+- Internal peers in private subnet
+- Firewall rules limiting peer-to-peer traffic to known peers
 
 ## Troubleshooting
 
-### Edge Node Not Registering
+### Peer Not Registering
 
 Check network connectivity:
 
 ```bash
-curl https://primary.example.com/api/v1/health
+curl https://peer-a.example.com/api/v1/health
 ```
 
 Verify API key:
 
 ```bash
-echo $EDGE_API_KEY
+echo $PEER_API_KEY
 ```
 
-Check primary logs for registration attempts.
+Check peer logs for registration attempts.
 
 ### High Replication Lag
 
 - Increase bandwidth allocation
 - Enable P2P transfers
-- Add more edge nodes to distribute load
-- Check network latency to primary
+- Add more peers to distribute load
+- Check network latency between peers
 
 ### Low Cache Hit Rate
 

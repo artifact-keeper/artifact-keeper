@@ -123,28 +123,26 @@ Configure Artifact Keeper using environment variables. This page provides a comp
 | `GC_RETENTION_DAYS` | No | `90` | Keep artifacts for N days |
 | `GC_DRY_RUN` | No | `false` | Dry run mode (log without deleting) |
 
-## Edge Nodes
+## Peer Replication
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ROLE` | No | `primary` | Node role (primary, edge) |
-| `EDGE_ENABLED` | No | `false` | Enable edge node support |
-| `EDGE_SECRET_KEY` | No | - | Secret key for edge authentication |
-| `EDGE_AUTO_REGISTER` | No | `true` | Allow automatic edge registration |
-| `PRIMARY_URL` | No | - | Primary node URL (for edge nodes) |
-| `EDGE_API_KEY` | No | - | API key for edge node (from primary) |
-| `EDGE_REGION` | No | - | Edge node region identifier |
-| `EDGE_CACHE_SIZE_MB` | No | `102400` | Edge cache size in MB (100 GB) |
-| `EDGE_HEARTBEAT_INTERVAL` | No | `60` | Heartbeat interval in seconds |
-| `EDGE_P2P_ENABLED` | No | `false` | Enable peer-to-peer transfers |
-| `EDGE_P2P_MAX_PEERS` | No | `5` | Maximum P2P peers |
-| `EDGE_REPLICATION_BANDWIDTH_MBPS` | No | - | Replication bandwidth limit |
-| `EDGE_REPLICATION_SCHEDULE` | No | - | Replication schedule (cron) |
-| `EDGE_MIN_ARTIFACT_SIZE_MB` | No | - | Minimum artifact size to replicate |
-| `EDGE_SYNC_STRATEGY` | No | `lru` | Sync strategy (lru, all, popular) |
-| `EDGE_MAX_ARTIFACT_AGE_DAYS` | No | - | Maximum artifact age to replicate |
-| `EDGE_CACHE_HIGH_WATER_MARK` | No | `90` | Start eviction at N% capacity |
-| `EDGE_EVICTION_POLICY` | No | `lru` | Eviction policy (lru, lfu, fifo) |
+| `PEER_ENABLED` | No | `false` | Enable peer replication |
+| `PEER_SECRET_KEY` | No | - | Secret key for peer authentication |
+| `PEER_AUTO_REGISTER` | No | `true` | Allow automatic peer registration |
+| `PEER_API_KEY` | No | - | API key for peer-to-peer auth |
+| `PEER_REGION` | No | - | Peer region identifier |
+| `PEER_CACHE_SIZE_MB` | No | `102400` | Peer cache size in MB (100 GB) |
+| `PEER_HEARTBEAT_INTERVAL` | No | `60` | Heartbeat interval in seconds |
+| `PEER_P2P_ENABLED` | No | `false` | Enable P2P chunk transfers |
+| `PEER_P2P_MAX_PEERS` | No | `5` | Maximum P2P peers |
+| `PEER_REPLICATION_BANDWIDTH_MBPS` | No | - | Replication bandwidth limit |
+| `PEER_REPLICATION_SCHEDULE` | No | - | Replication schedule (cron) |
+| `PEER_MIN_ARTIFACT_SIZE_MB` | No | - | Minimum artifact size to replicate |
+| `PEER_SYNC_STRATEGY` | No | `lru` | Sync strategy (lru, all, popular) |
+| `PEER_MAX_ARTIFACT_AGE_DAYS` | No | - | Maximum artifact age to replicate |
+| `PEER_CACHE_HIGH_WATER_MARK` | No | `90` | Start eviction at N% capacity |
+| `PEER_EVICTION_POLICY` | No | `lru` | Eviction policy (lru, lfu, fifo) |
 
 ## Plugins
 
@@ -261,7 +259,7 @@ BACKUP_ENABLED=true
 BACKUP_SCHEDULE="0 2 * * *"
 ```
 
-### S3 Storage with Edge Nodes
+### S3 Storage with Peer Replication
 
 ```bash
 # Database
@@ -275,10 +273,9 @@ S3_REGION=us-east-1
 S3_ACCESS_KEY_ID=your-access-key
 S3_SECRET_ACCESS_KEY=your-secret-key
 
-# Edge Nodes
-ROLE=primary
-EDGE_ENABLED=true
-EDGE_SECRET_KEY=edge-secret-key
+# Peer Replication
+PEER_ENABLED=true
+PEER_SECRET_KEY=peer-secret-key
 
 # Backups
 BACKUP_ENABLED=true

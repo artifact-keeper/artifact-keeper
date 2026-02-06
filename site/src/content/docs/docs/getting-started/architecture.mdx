@@ -9,16 +9,16 @@ Artifact Keeper is designed as a modular, layered system. This page walks throug
 
 ```mermaid
 graph LR
-    Client["Browser / CLI\nPackage Manager"]
-    Frontend["Frontend\nReact 19 · Ant Design 6\nTanStack Query 5"]
-    Backend["Backend\nRust · Axum\n45+ format handlers"]
+    Client["Browser / CLI<br/>Package Manager"]
+    Frontend["Frontend<br/>React 19 · Ant Design 6<br/>TanStack Query 5"]
+    Backend["Backend<br/>Rust · Axum<br/>45+ format handlers"]
     DB[(PostgreSQL 16)]
-    Storage["Storage\nFilesystem / S3"]
-    Meili["Meilisearch\nFull-text search"]
-    Trivy["Trivy\nContainer & FS scanning"]
-    Grype["Grype\nDependency scanning"]
-    Edge1["Edge Node"]
-    Edge2["Edge Node"]
+    Storage["Storage<br/>Filesystem / S3"]
+    Meili["Meilisearch<br/>Full-text search"]
+    Trivy["Trivy<br/>Container & FS scanning"]
+    Grype["Grype<br/>Dependency scanning"]
+    Peer1["Peer Instance"]
+    Peer2["Peer Instance"]
 
     Client --> Frontend
     Client --> Backend
@@ -28,9 +28,9 @@ graph LR
     Backend --> Meili
     Backend --> Trivy
     Backend --> Grype
-    Backend <-->|Borg Replication| Edge1
-    Backend <-->|Borg Replication| Edge2
-    Edge1 <-->|P2P Mesh| Edge2
+    Backend <-->|Borg Replication| Peer1
+    Backend <-->|Borg Replication| Peer2
+    Peer1 <-->|P2P Mesh| Peer2
 ```
 
 **Five core services** make up a full deployment:
@@ -55,29 +55,29 @@ flowchart TD
 
     subgraph MW["Middleware Pipeline"]
         direction LR
-        CORS["CORS"] --> AUTH["Auth\nJWT · OIDC · LDAP\nSAML · API Key"]
+        CORS["CORS"] --> AUTH["Auth<br/>JWT · OIDC · LDAP<br/>SAML · API Key"]
         AUTH --> RL["Rate Limiter"]
-        RL --> TRACE["Tracing\n+ Metrics"]
-        TRACE --> DEMO["Demo Mode\nGuard"]
+        RL --> TRACE["Tracing<br/>+ Metrics"]
+        TRACE --> DEMO["Demo Mode<br/>Guard"]
     end
 
     MW --> ROUTER["Router · 50+ route groups"]
 
     subgraph HANDLERS["Handler Layer"]
-        FMT["Format Handlers\nMaven · PyPI · NPM\nDocker · 41 more"]
-        CORE["Core Handlers\nRepos · Artifacts\nUsers · Auth"]
-        ADV["Advanced Handlers\nSecurity · Plugins\nEdge · Migration"]
+        FMT["Format Handlers<br/>Maven · PyPI · NPM<br/>Docker · 41 more"]
+        CORE["Core Handlers<br/>Repos · Artifacts<br/>Users · Auth"]
+        ADV["Advanced Handlers<br/>Security · Plugins<br/>Peers · Migration"]
     end
 
     ROUTER --> HANDLERS
 
     subgraph SERVICES["Service Layer"]
         direction LR
-        ART["Artifact\nService"]
-        REPO["Repository\nService"]
-        SCAN["Scanner\nService"]
-        PLUG["Plugin\nService"]
-        SEARCH["Search\nService"]
+        ART["Artifact<br/>Service"]
+        REPO["Repository<br/>Service"]
+        SCAN["Scanner<br/>Service"]
+        PLUG["Plugin<br/>Service"]
+        SEARCH["Search<br/>Service"]
     end
 
     HANDLERS --> SERVICES
@@ -85,7 +85,7 @@ flowchart TD
     subgraph DATA["Data Layer"]
         direction LR
         PG[(PostgreSQL)]
-        FS["Storage\nFS / S3"]
+        FS["Storage<br/>FS / S3"]
         MS["Meilisearch"]
         SC["Trivy / Grype"]
     end
@@ -99,7 +99,7 @@ Handlers are thin HTTP endpoints. They validate input, call services, and format
 
 - **Format handlers** — One per package format (Maven, PyPI, NPM, Docker/OCI, etc.). Each speaks the native wire protocol that `pip install`, `npm publish`, `docker push`, etc. expect.
 - **Core handlers** — Repositories, artifacts, users, auth, search, tree browsing.
-- **Advanced handlers** — Security scanning, WASM plugins, edge nodes, migration, webhooks, signing.
+- **Advanced handlers** — Security scanning, WASM plugins, peer replication, migration, webhooks, signing.
 
 ### Services
 
@@ -113,7 +113,7 @@ Services contain the business logic. They are injected into handlers via Axum's 
 | `ScannerService` | Orchestrates Trivy and Grype, aggregates findings |
 | `MeiliService` | Index management, search queries |
 | `WasmPluginService` | Plugin install, enable, disable, hot reload |
-| `EdgeService` | Edge node registration, sync coordination |
+| `PeerService` | Peer registration, replication coordination |
 | `MigrationService` | Artifactory import orchestration |
 | `StorageService` | Abstraction over filesystem and S3 backends |
 | `SigningService` | GPG/RSA signing for Debian, RPM, Alpine, Conda |
@@ -138,7 +138,7 @@ PostgreSQL 16 with 33 migrations covering:
 - **Auth**: api_tokens, groups, permissions
 - **Plugins**: plugins, plugin_hooks, plugin_events, plugin_config, format_handlers
 - **Security**: scan_configs, scan_results, findings, security_scores, signing_keys
-- **Replication**: edge_nodes, peer_connections, transfer_sessions, network_profiles, sync_tasks
+- **Replication**: peers, peer_connections, transfer_sessions, network_profiles, sync_tasks
 - **Operations**: audit_log, webhooks, system_settings, backups, migration_jobs
 
 All queries are compile-time checked via SQLx.
@@ -147,14 +147,14 @@ All queries are compile-time checked via SQLx.
 
 ```mermaid
 flowchart LR
-    UP["Artifact\nUpload"] --> HASH{"SHA-256\nDedup"}
-    HASH -->|New artifact| T["Trivy\nFS Scanner"]
-    HASH -->|New artifact| G["Grype\nDependency Scanner"]
-    HASH -->|Already scanned| CACHE["Cached\nResults"]
-    T --> SCORE["Vulnerability\nScore (A-F)"]
+    UP["Artifact<br/>Upload"] --> HASH{"SHA-256<br/>Dedup"}
+    HASH -->|New artifact| T["Trivy<br/>FS Scanner"]
+    HASH -->|New artifact| G["Grype<br/>Dependency Scanner"]
+    HASH -->|Already scanned| CACHE["Cached<br/>Results"]
+    T --> SCORE["Vulnerability<br/>Score (A-F)"]
     G --> SCORE
     CACHE --> SCORE
-    SCORE --> POL{"Policy\nEngine"}
+    SCORE --> POL{"Policy<br/>Engine"}
     POL -->|Pass| OK["Stored"]
     POL -->|Fail| Q["Quarantined"]
 ```
@@ -172,9 +172,9 @@ Multiple auth providers can be active simultaneously:
 
 ```mermaid
 flowchart LR
-    REQ["Request"] --> EXT{"Extract\nCredentials"}
-    EXT -->|"Authorization: Bearer"| JWT["JWT\nValidation"]
-    EXT -->|"Authorization: ApiKey"| API["API Token\nLookup"]
+    REQ["Request"] --> EXT{"Extract<br/>Credentials"}
+    EXT -->|"Authorization: Bearer"| JWT["JWT<br/>Validation"]
+    EXT -->|"Authorization: ApiKey"| API["API Token<br/>Lookup"]
     EXT -->|"X-API-Key"| API
 
     JWT --> USER["User Context"]
@@ -182,10 +182,10 @@ flowchart LR
 
     subgraph PROVIDERS["Identity Providers"]
         direction TB
-        LOCAL["Local\n(bcrypt)"]
-        OIDC["OpenID\nConnect"]
-        LDAP["LDAP\nDirectory"]
-        SAML["SAML 2.0\nSSO"]
+        LOCAL["Local<br/>(bcrypt)"]
+        OIDC["OpenID<br/>Connect"]
+        LDAP["LDAP<br/>Directory"]
+        SAML["SAML 2.0<br/>SSO"]
     end
 
     USER -.->|"Authenticated via"| PROVIDERS
@@ -202,27 +202,26 @@ flowchart LR
 
 ```mermaid
 graph TD
-    HUB["Hub Node\n(Primary Registry)"]
-    E1["Edge Node\nUS-West"]
-    E2["Edge Node\nEU-Central"]
-    E3["Edge Node\nAP-Southeast"]
+    P1["Peer<br/>US-West"]
+    P2["Peer<br/>EU-Central"]
+    P3["Peer<br/>AP-Southeast"]
+    P4["Peer<br/>US-East"]
 
-    HUB <-->|"Chunked Transfer\n+ Scheduling"| E1
-    HUB <-->|"Chunked Transfer\n+ Scheduling"| E2
-    HUB <-->|"Chunked Transfer\n+ Scheduling"| E3
-    E1 <-->|"P2P Mesh"| E2
-    E2 <-->|"P2P Mesh"| E3
-    E1 <-->|"P2P Mesh"| E3
+    P1 <-->|"Chunked Transfer"| P2
+    P1 <-->|"Chunked Transfer"| P4
+    P2 <-->|"Chunked Transfer"| P3
+    P3 <-->|"Chunked Transfer"| P4
+    P1 <-->|"P2P Mesh"| P3
+    P2 <-->|"P2P Mesh"| P4
 ```
 
-The replication system distributes artifacts to edge nodes close to consumers:
+The replication system distributes artifacts across a recursive peer mesh:
 
-- **Hub-and-spoke** — The primary registry pushes to registered edge nodes.
-- **P2P mesh** — Edge nodes can pull from each other, reducing hub bandwidth.
+- **Recursive peers** — Every peer is a full Artifact Keeper instance (backend, DB, storage) that can originate replication to other peers.
+- **P2P mesh** — Peers transfer chunks between each other, with no single hub bottleneck.
 - **Chunked transfers** — Large artifacts are split into chunks for reliable delivery.
 - **Network-aware scheduling** — Bandwidth and latency profiles determine transfer priority.
 - **Replication priorities** — Immediate, Scheduled, OnDemand, or LocalOnly per repository.
-- **Cache management** — TTL and LRU eviction per edge node with configurable capacity.
 
 ## WASM Plugin System
 
@@ -230,16 +229,16 @@ Custom format handlers can be written in any language that compiles to WASM (Rus
 
 ```mermaid
 flowchart LR
-    SRC["Plugin Source\nGit / ZIP / Local"] --> MANIFEST["Manifest\nValidation"]
-    MANIFEST --> COMPILE["Wasmtime\nLoad & Link"]
-    COMPILE --> REG["Plugin\nRegistry"]
-    REG --> FMT["FormatHandler\nTrait"]
+    SRC["Plugin Source<br/>Git / ZIP / Local"] --> MANIFEST["Manifest<br/>Validation"]
+    MANIFEST --> COMPILE["Wasmtime<br/>Load & Link"]
+    COMPILE --> REG["Plugin<br/>Registry"]
+    REG --> FMT["FormatHandler<br/>Trait"]
 
     subgraph SANDBOX["Sandbox Limits"]
         direction TB
-        CPU["Fuel-based\nCPU limit"]
-        MEM["64 MB\nMemory cap"]
-        TIME["Configurable\nTimeout"]
+        CPU["Fuel-based<br/>CPU limit"]
+        MEM["64 MB<br/>Memory cap"]
+        TIME["Configurable<br/>Timeout"]
     end
 
     COMPILE -.-> SANDBOX
@@ -284,7 +283,7 @@ artifact-keeper/
 │   │   ├── api/        # API client modules
 │   │   └── contexts/   # Auth and Theme providers
 │   └── e2e/            # Playwright E2E tests
-├── edge/               # Edge node service (Rust)
+├── edge/               # Peer replication service (Rust)
 ├── site/               # Documentation (Astro + Starlight)
 ├── specs/              # Feature specifications
 ├── scripts/            # Test runners and utilities

@@ -14,7 +14,7 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 - **45+ Package Formats** - Native protocol support for Maven, PyPI, NPM, Docker/OCI, Cargo, Go, Helm, and 38 more
 - **WASM Plugin System** - Extend with custom format handlers via WebAssembly (WIT-based, Wasmtime runtime)
 - **Security Scanning** - Automated vulnerability detection with Trivy and Grype, policy engine, quarantine workflow
-- **Borg Replication** - Mesh edge sync with swarm-based artifact distribution and P2P transfers
+- **Borg Replication** - Recursive peer mesh with swarm-based artifact distribution and P2P transfers
 - **Full-Text Search** - Meilisearch-powered search across all repositories and artifacts
 - **Multi-Auth** - JWT, OpenID Connect, LDAP, SAML 2.0, and API token support
 - **Artifactory Migration** - Built-in tooling to migrate repositories, artifacts, and permissions from JFrog Artifactory
@@ -25,14 +25,15 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 ```mermaid
 graph LR
     Client["CLI / Package Manager / Frontend"]
-    Backend["Backend\nRust · Axum\n45+ format handlers"]
+    Backend["Backend<br/>Rust · Axum<br/>45+ format handlers"]
     DB[(PostgreSQL 16)]
-    Storage["Storage\nFilesystem / S3"]
-    Meili["Meilisearch\nFull-text search"]
-    Trivy["Trivy\nContainer & FS scanning"]
-    Grype["Grype\nDependency scanning"]
-    Edge1["Edge Node"]
-    Edge2["Edge Node"]
+    Storage["Storage<br/>Filesystem / S3"]
+    Meili["Meilisearch<br/>Full-text search"]
+    Trivy["Trivy<br/>Container & FS scanning"]
+    Grype["Grype<br/>Dependency scanning"]
+    OpenSCAP["OpenSCAP<br/>Compliance scanning"]
+    Peer1["Peer Instance"]
+    Peer2["Peer Instance"]
 
     Client --> Backend
     Backend --> DB
@@ -40,9 +41,10 @@ graph LR
     Backend --> Meili
     Backend --> Trivy
     Backend --> Grype
-    Backend <-->|Borg Replication| Edge1
-    Backend <-->|Borg Replication| Edge2
-    Edge1 <-->|P2P Mesh| Edge2
+    Backend --> OpenSCAP
+    Backend <-->|Borg Replication| Peer1
+    Backend <-->|Borg Replication| Peer2
+    Peer1 <-->|P2P Mesh| Peer2
 ```
 
 ## Backend Architecture
@@ -55,29 +57,29 @@ flowchart TD
 
     subgraph MW["Middleware"]
         direction LR
-        CORS["CORS"] --> AUTH["Auth\nJWT · OIDC · LDAP\nSAML · API Key"]
+        CORS["CORS"] --> AUTH["Auth<br/>JWT · OIDC · LDAP<br/>SAML · API Key"]
         AUTH --> RL["Rate Limiter"]
-        RL --> TRACE["Tracing\n+ Metrics"]
-        TRACE --> DEMO["Demo Mode\nGuard"]
+        RL --> TRACE["Tracing<br/>+ Metrics"]
+        TRACE --> DEMO["Demo Mode<br/>Guard"]
     end
 
-    MW --> ROUTER["Router\n50+ route groups"]
+    MW --> ROUTER["Router<br/>50+ route groups"]
 
     subgraph HANDLERS["Handler Layer"]
-        FMT["Format Handlers\nMaven · PyPI · NPM\nDocker · 41 more"]
-        CORE["Core Handlers\nRepos · Artifacts\nUsers · Auth"]
-        ADV["Advanced Handlers\nSecurity · Plugins\nEdge · Migration"]
+        FMT["Format Handlers<br/>Maven · PyPI · NPM<br/>Docker · 41 more"]
+        CORE["Core Handlers<br/>Repos · Artifacts<br/>Users · Auth"]
+        ADV["Advanced Handlers<br/>Security · Plugins<br/>Peers · Migration"]
     end
 
     ROUTER --> HANDLERS
 
     subgraph SERVICES["Service Layer"]
         direction LR
-        ART["Artifact\nService"]
-        REPO["Repository\nService"]
-        SCAN["Scanner\nService"]
-        PLUG["Plugin\nService"]
-        SEARCH["Search\nService"]
+        ART["Artifact<br/>Service"]
+        REPO["Repository<br/>Service"]
+        SCAN["Scanner<br/>Service"]
+        PLUG["Plugin<br/>Service"]
+        SEARCH["Search<br/>Service"]
     end
 
     HANDLERS --> SERVICES
@@ -85,9 +87,9 @@ flowchart TD
     subgraph DATA["Data Layer"]
         direction LR
         PG[(PostgreSQL)]
-        FS["Storage\nFS / S3"]
+        FS["Storage<br/>FS / S3"]
         MS["Meilisearch"]
-        SC["Trivy / Grype"]
+        SC["Trivy / Grype / OpenSCAP"]
     end
 
     SERVICES --> DATA
@@ -175,14 +177,14 @@ Every artifact upload is automatically scanned for known vulnerabilities.
 
 ```mermaid
 flowchart LR
-    UP["Artifact\nUpload"] --> HASH{"SHA-256\nDedup"}
-    HASH -->|New artifact| T["Trivy\nFS Scanner"]
-    HASH -->|New artifact| G["Grype\nDependency Scanner"]
-    HASH -->|Already scanned| CACHE["Cached\nResults"]
-    T --> SCORE["Vulnerability\nScore (A-F)"]
+    UP["Artifact<br/>Upload"] --> HASH{"SHA-256<br/>Dedup"}
+    HASH -->|New artifact| T["Trivy<br/>FS Scanner"]
+    HASH -->|New artifact| G["Grype<br/>Dependency Scanner"]
+    HASH -->|Already scanned| CACHE["Cached<br/>Results"]
+    T --> SCORE["Vulnerability<br/>Score A-F"]
     G --> SCORE
     CACHE --> SCORE
-    SCORE --> POL{"Policy\nEngine"}
+    SCORE --> POL{"Policy<br/>Engine"}
     POL -->|Pass| OK["Stored"]
     POL -->|Fail| Q["Quarantined"]
 ```
@@ -194,26 +196,26 @@ flowchart LR
 
 ## Borg Replication
 
-Distributed artifact caching with a hub-and-spoke topology that supports peer-to-peer transfers.
+Recursive peer-to-peer replication where every node is a full Artifact Keeper instance. No thin caches — each peer runs the same stack and can serve as an origin for other peers.
 
 ```mermaid
 graph TD
-    HUB["Hub Node\n(Primary Registry)"]
-    E1["Edge Node\nUS-West"]
-    E2["Edge Node\nEU-Central"]
-    E3["Edge Node\nAP-Southeast"]
+    P1["Peer<br/>US-West"]
+    P2["Peer<br/>EU-Central"]
+    P3["Peer<br/>AP-Southeast"]
+    P4["Peer<br/>US-East"]
 
-    HUB <-->|"Chunked Transfer\n+ Scheduling"| E1
-    HUB <-->|"Chunked Transfer\n+ Scheduling"| E2
-    HUB <-->|"Chunked Transfer\n+ Scheduling"| E3
-    E1 <-->|"P2P Mesh"| E2
-    E2 <-->|"P2P Mesh"| E3
-    E1 <-->|"P2P Mesh"| E3
+    P1 <-->|"Chunked Transfer"| P2
+    P1 <-->|"Chunked Transfer"| P4
+    P2 <-->|"Chunked Transfer"| P3
+    P3 <-->|"Chunked Transfer"| P4
+    P1 <-->|"P2P Mesh"| P3
+    P2 <-->|"P2P Mesh"| P4
 ```
 
+- **Recursive peers** - Every peer is a full instance (backend, DB, storage) that can originate replication to other peers
 - **Swarm-based distribution** - Artifacts replicate across the mesh based on demand
 - **Chunked transfers** - Large artifacts split for reliable delivery over unstable links
-- **Cache management** - TTL and LRU eviction per edge node
 - **Network-aware scheduling** - Bandwidth and latency profiling for optimal routing
 
 ## WASM Plugin System
@@ -258,7 +260,7 @@ artifact-keeper/
 │   │   ├── models/   # Data models (18 types)
 │   │   └── storage/  # FS and S3 backends
 │   └── migrations/   # 33 PostgreSQL migrations
-├── edge/             # Edge node service (Rust)
+├── edge/             # Peer replication service (Rust)
 ├── site/             # Documentation site (Astro + Starlight)
 ├── specs/            # Feature specifications
 ├── scripts/          # Test runners, native client tests, stress tests
@@ -274,7 +276,7 @@ artifact-keeper/
 | Web framework | **Axum** | Tower middleware ecosystem, async-first |
 | Database | **PostgreSQL 16** | JSONB for metadata, mature ecosystem |
 | Search | **Meilisearch** | Fast full-text search, easy to operate |
-| Security scanning | **Trivy + Grype** | Complementary coverage, industry standard |
+| Security scanning | **Trivy + Grype + OpenSCAP** | Complementary coverage, industry standard |
 | Plugin runtime | **Wasmtime** | Sandboxed, portable, WIT contract system |
 | Storage | **Filesystem / S3** | Simple default, cloud-ready upgrade path |
 
