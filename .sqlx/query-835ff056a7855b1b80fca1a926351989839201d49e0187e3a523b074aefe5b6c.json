@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE repositories\n            SET\n                name = COALESCE($2, name),\n                description = COALESCE($3, description),\n                is_public = COALESCE($4, is_public),\n                quota_bytes = COALESCE($5, quota_bytes),\n                upstream_url = COALESCE($6, upstream_url),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                created_at, updated_at\n            ",
+  "query": "\n            UPDATE repositories\n            SET\n                name = COALESCE($2, name),\n                description = COALESCE($3, description),\n                is_public = COALESCE($4, is_public),\n                quota_bytes = COALESCE($5, quota_bytes),\n                upstream_url = COALESCE($6, upstream_url),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -145,11 +145,21 @@
       },
       {
         "ordinal": 12,
+        "name": "promotion_target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "promotion_policy_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -177,9 +187,11 @@
       false,
       true,
       false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "294dc65054aa9c370aa6708551c97c240a8e0e23eb914b7bdba0db56559369d9"
+  "hash": "835ff056a7855b1b80fca1a926351989839201d49e0187e3a523b074aefe5b6c"
 }

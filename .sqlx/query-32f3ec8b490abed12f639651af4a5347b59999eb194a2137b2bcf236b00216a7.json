@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                created_at, updated_at\n            FROM repositories\n            WHERE key = $1\n            ",
+  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.promotion_target_id, r.promotion_policy_id,\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
   "describe": {
     "columns": [
       {
@@ -145,18 +145,28 @@
       },
       {
         "ordinal": 12,
+        "name": "promotion_target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "promotion_policy_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -172,9 +182,11 @@
       false,
       true,
       false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "837df798552f49645de809f20317fdbbef46cb11b4c4ad296cb86eea058b1f8d"
+  "hash": "32f3ec8b490abed12f639651af4a5347b59999eb194a2137b2bcf236b00216a7"
 }

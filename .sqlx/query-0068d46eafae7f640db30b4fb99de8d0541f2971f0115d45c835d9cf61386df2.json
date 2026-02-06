@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                r.id, r.key, r.name, r.description,\n                r.format as \"format: RepositoryFormat\",\n                r.repo_type as \"repo_type: RepositoryType\",\n                r.storage_backend, r.storage_path, r.upstream_url,\n                r.is_public, r.quota_bytes,\n                r.replication_priority as \"replication_priority: ReplicationPriority\",\n                r.created_at, r.updated_at\n            FROM repositories r\n            INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id\n            WHERE vrm.virtual_repo_id = $1\n            ORDER BY vrm.priority\n            ",
+  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -145,18 +145,105 @@
       },
       {
         "ordinal": 12,
+        "name": "promotion_target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "promotion_policy_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Varchar",
+        "Varchar",
+        "Text",
+        {
+          "Custom": {
+            "name": "repository_format",
+            "kind": {
+              "Enum": [
+                "maven",
+                "gradle",
+                "npm",
+                "pypi",
+                "nuget",
+                "go",
+                "rubygems",
+                "docker",
+                "helm",
+                "rpm",
+                "debian",
+                "conan",
+                "cargo",
+                "generic",
+                "podman",
+                "buildx",
+                "oras",
+                "wasm_oci",
+                "helm_oci",
+                "poetry",
+                "conda",
+                "yarn",
+                "bower",
+                "pnpm",
+                "chocolatey",
+                "powershell",
+                "terraform",
+                "opentofu",
+                "alpine",
+                "conda_native",
+                "composer",
+                "hex",
+                "cocoapods",
+                "swift",
+                "pub",
+                "sbt",
+                "chef",
+                "puppet",
+                "ansible",
+                "gitlfs",
+                "vscode",
+                "jetbrains",
+                "huggingface",
+                "mlmodel",
+                "cran",
+                "vagrant",
+                "opkg",
+                "p2",
+                "bazel"
+              ]
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "repository_type",
+            "kind": {
+              "Enum": [
+                "local",
+                "remote",
+                "virtual"
+              ]
+            }
+          }
+        },
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Int8"
       ]
     },
     "nullable": [
@@ -172,9 +259,11 @@
       false,
       true,
       false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "3e58c00307997311b80225fa594a3544532d34fa550c9fdf7f9fa47719b67ccb"
+  "hash": "0068d46eafae7f640db30b4fb99de8d0541f2971f0115d45c835d9cf61386df2"
 }

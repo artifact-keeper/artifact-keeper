@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+#[allow(unused_imports)] // Used by sqlx query macros
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
@@ -105,6 +106,7 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes,
                 replication_priority as "replication_priority: ReplicationPriority",
+                promotion_target_id, promotion_policy_id,
                 created_at, updated_at
             "#,
             req.key,
@@ -158,6 +160,7 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes,
                 replication_priority as "replication_priority: ReplicationPriority",
+                promotion_target_id, promotion_policy_id,
                 created_at, updated_at
             FROM repositories
             WHERE id = $1
@@ -184,6 +187,7 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes,
                 replication_priority as "replication_priority: ReplicationPriority",
+                promotion_target_id, promotion_policy_id,
                 created_at, updated_at
             FROM repositories
             WHERE key = $1
@@ -220,6 +224,7 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes,
                 replication_priority as "replication_priority: ReplicationPriority",
+                promotion_target_id, promotion_policy_id,
                 created_at, updated_at
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
@@ -284,6 +289,7 @@ impl RepositoryService {
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes,
                 replication_priority as "replication_priority: ReplicationPriority",
+                promotion_target_id, promotion_policy_id,
                 created_at, updated_at
             "#,
             id,
@@ -428,6 +434,7 @@ impl RepositoryService {
                 r.storage_backend, r.storage_path, r.upstream_url,
                 r.is_public, r.quota_bytes,
                 r.replication_priority as "replication_priority: ReplicationPriority",
+                r.promotion_target_id, r.promotion_policy_id,
                 r.created_at, r.updated_at
             FROM repositories r
             INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id

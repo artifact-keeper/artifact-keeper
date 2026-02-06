@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                is_public, quota_bytes,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                promotion_target_id, promotion_policy_id,\n                created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -145,11 +145,21 @@
       },
       {
         "ordinal": 12,
+        "name": "promotion_target_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "promotion_policy_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -172,9 +182,11 @@
       false,
       true,
       false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "ca17ce429a12296b25db23c8ab94d33b12d4bd91fa7a9b246a4f984496a4e62b"
+  "hash": "970f343d1d04542db54517b3e1db597d01f3e6c67ab2ee1d0a2d14c7b169cd4e"
 }
