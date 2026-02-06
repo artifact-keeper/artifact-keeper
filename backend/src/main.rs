@@ -225,9 +225,18 @@ async fn main() -> Result<()> {
     let cve_history_server = CveHistoryGrpcServer::new(grpc_db.clone());
     let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db);
 
+    // Include file descriptor for gRPC reflection
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(include_bytes!(
+            "grpc/generated/sbom_descriptor.bin"
+        ))
+        .build_v1()
+        .expect("Failed to build reflection service");
+
     tokio::spawn(async move {
         tracing::info!("gRPC server listening on {}", grpc_addr);
         if let Err(e) = TonicServer::builder()
+            .add_service(reflection_service)
             .add_service(SbomServiceServer::new(sbom_server))
             .add_service(CveHistoryServiceServer::new(cve_history_server))
             .add_service(SecurityPolicyServiceServer::new(security_policy_server))

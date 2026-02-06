@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     zlib1g-dev \
     liblzma-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
@@ -27,6 +28,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     zlib1g-dev \
     liblzma-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # Re-use cached dependency artifacts
@@ -37,6 +39,7 @@ COPY .sqlx ./.sqlx
 COPY backend ./backend
 COPY edge ./edge
 ENV SQLX_OFFLINE=true
+# Ensure proto files are available for tonic-build
 RUN cargo build --release --bin artifact-keeper
 
 # Runtime stage
@@ -80,8 +83,9 @@ ENV BACKUP_PATH=/data/backups
 ENV HOST=0.0.0.0
 ENV PORT=8080
 
-# Expose port
+# Expose ports (HTTP and gRPC)
 EXPOSE 8080
+EXPOSE 9090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
