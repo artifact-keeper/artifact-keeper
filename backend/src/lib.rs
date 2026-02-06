@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod formats;
+pub mod grpc;
 pub mod models;
 pub mod services;
 pub mod storage;

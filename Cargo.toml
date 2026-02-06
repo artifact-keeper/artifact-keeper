@@ -80,3 +80,9 @@ wasmtime-wasi = "24.0"
 # Git operations
 git2 = "0.19"
 meilisearch-sdk = "0.27"
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"

@@ -43,6 +43,7 @@ pub mod repositories;
 pub mod rpm;
 pub mod rubygems;
 pub mod sbt;
+pub mod sbom;
 pub mod search;
 pub mod security;
 pub mod signing;

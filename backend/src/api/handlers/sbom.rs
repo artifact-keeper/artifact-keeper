@@ -1,0 +1,598 @@
+//! SBOM (Software Bill of Materials) REST API handlers.
+
+use axum::{
+    extract::{Path, Query, State},
+    routing::{get, post},
+    Extension, Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::api::middleware::auth::AuthExtension;
+use crate::api::SharedState;
+use crate::error::{AppError, Result};
+use crate::models::sbom::{
+    CveStatus, CveTrends, LicensePolicy, PolicyAction, SbomComponent, SbomDocument, SbomFormat,
+};
+use crate::services::sbom_service::{DependencyInfo, LicenseCheckResult, SbomService};
+
+/// Create SBOM routes.
+pub fn router() -> Router<SharedState> {
+    Router::new()
+        // SBOM operations
+        .route("/", get(list_sboms).post(generate_sbom))
+        .route("/:id", get(get_sbom).delete(delete_sbom))
+        .route("/:id/components", get(get_sbom_components))
+        .route("/:id/convert", post(convert_sbom))
+        .route("/by-artifact/:artifact_id", get(get_sbom_by_artifact))
+        // CVE history
+        .route("/cve/history/:artifact_id", get(get_cve_history))
+        .route("/cve/status/:id", post(update_cve_status))
+        .route("/cve/trends", get(get_cve_trends))
+        // License policies
+        .route("/license-policies", get(list_license_policies).post(upsert_license_policy))
+        .route("/license-policies/:id", get(get_license_policy).delete(delete_license_policy))
+        .route("/check-compliance", post(check_license_compliance))
+}
+
+// === Request/Response types ===
+
+#[derive(Debug, Deserialize)]
+pub struct GenerateSbomRequest {
+    pub artifact_id: Uuid,
+    #[serde(default = "default_format")]
+    pub format: String,
+    #[serde(default)]
+    pub force_regenerate: bool,
+}
+
+fn default_format() -> String {
+    "cyclonedx".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListSbomsQuery {
+    pub artifact_id: Option<Uuid>,
+    pub repository_id: Option<Uuid>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConvertSbomRequest {
+    pub target_format: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateCveStatusRequest {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetCveTrendsQuery {
+    pub repository_id: Option<Uuid>,
+    pub days: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CheckLicenseComplianceRequest {
+    pub licenses: Vec<String>,
+    pub repository_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SbomResponse {
+    pub id: Uuid,
+    pub artifact_id: Uuid,
+    pub repository_id: Uuid,
+    pub format: String,
+    pub format_version: String,
+    pub spec_version: Option<String>,
+    pub component_count: i32,
+    pub dependency_count: i32,
+    pub license_count: i32,
+    pub licenses: Vec<String>,
+    pub content_hash: String,
+    pub generator: Option<String>,
+    pub generator_version: Option<String>,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<SbomDocument> for SbomResponse {
+    fn from(doc: SbomDocument) -> Self {
+        Self {
+            id: doc.id,
+            artifact_id: doc.artifact_id,
+            repository_id: doc.repository_id,
+            format: doc.format,
+            format_version: doc.format_version,
+            spec_version: doc.spec_version,
+            component_count: doc.component_count,
+            dependency_count: doc.dependency_count,
+            license_count: doc.license_count,
+            licenses: doc.licenses,
+            content_hash: doc.content_hash,
+            generator: doc.generator,
+            generator_version: doc.generator_version,
+            generated_at: doc.generated_at,
+            created_at: doc.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SbomContentResponse {
+    #[serde(flatten)]
+    pub metadata: SbomResponse,
+    pub content: serde_json::Value,
+}
+
+impl From<SbomDocument> for SbomContentResponse {
+    fn from(doc: SbomDocument) -> Self {
+        let content = doc.content.clone();
+        Self {
+            metadata: SbomResponse::from(doc),
+            content,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComponentResponse {
+    pub id: Uuid,
+    pub sbom_id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub purl: Option<String>,
+    pub cpe: Option<String>,
+    pub component_type: Option<String>,
+    pub licenses: Vec<String>,
+    pub sha256: Option<String>,
+    pub sha1: Option<String>,
+    pub md5: Option<String>,
+    pub supplier: Option<String>,
+    pub author: Option<String>,
+}
+
+impl From<SbomComponent> for ComponentResponse {
+    fn from(c: SbomComponent) -> Self {
+        Self {
+            id: c.id,
+            sbom_id: c.sbom_id,
+            name: c.name,
+            version: c.version,
+            purl: c.purl,
+            cpe: c.cpe,
+            component_type: c.component_type,
+            licenses: c.licenses,
+            sha256: c.sha256,
+            sha1: c.sha1,
+            md5: c.md5,
+            supplier: c.supplier,
+            author: c.author,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct LicensePolicyResponse {
+    pub id: Uuid,
+    pub repository_id: Option<Uuid>,
+    pub name: String,
+    pub description: Option<String>,
+    pub allowed_licenses: Vec<String>,
+    pub denied_licenses: Vec<String>,
+    pub allow_unknown: bool,
+    pub action: String,
+    pub is_enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<LicensePolicy> for LicensePolicyResponse {
+    fn from(p: LicensePolicy) -> Self {
+        Self {
+            id: p.id,
+            repository_id: p.repository_id,
+            name: p.name,
+            description: p.description,
+            allowed_licenses: p.allowed_licenses,
+            denied_licenses: p.denied_licenses,
+            allow_unknown: p.allow_unknown,
+            action: p.action.as_str().to_string(),
+            is_enabled: p.is_enabled,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertLicensePolicyRequest {
+    pub repository_id: Option<Uuid>,
+    pub name: String,
+    pub description: Option<String>,
+    pub allowed_licenses: Vec<String>,
+    pub denied_licenses: Vec<String>,
+    #[serde(default = "default_true")]
+    pub allow_unknown: bool,
+    #[serde(default = "default_action")]
+    pub action: String,
+    #[serde(default = "default_true")]
+    pub is_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_action() -> String {
+    "warn".to_string()
+}
+
+// === Handlers ===
+
+async fn generate_sbom(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Json(body): Json<GenerateSbomRequest>,
+) -> Result<Json<SbomResponse>> {
+    let service = SbomService::new(state.db.clone());
+    let format = SbomFormat::from_str(&body.format)
+        .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.format)))?;
+
+    // Get artifact and repository
+    let (_, repository_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT id, repository_id FROM artifacts WHERE id = $1",
+    )
+    .bind(body.artifact_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Artifact not found".into()))?;
+
+    // If force_regenerate, delete existing SBOM first
+    if body.force_regenerate {
+        if let Some(existing) = service.get_sbom_by_artifact(body.artifact_id, format).await? {
+            service.delete_sbom(existing.id).await?;
+        }
+    }
+
+    // Generate SBOM (extract dependencies from scan results if available)
+    let deps = extract_dependencies_for_artifact(&state.db, body.artifact_id).await?;
+
+    let doc = service
+        .generate_sbom(body.artifact_id, repository_id, format, deps)
+        .await?;
+
+    Ok(Json(SbomResponse::from(doc)))
+}
+
+async fn list_sboms(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Query(query): Query<ListSbomsQuery>,
+) -> Result<Json<Vec<SbomResponse>>> {
+    let service = SbomService::new(state.db.clone());
+
+    let sboms = if let Some(artifact_id) = query.artifact_id {
+        let summaries = service.list_sboms_for_artifact(artifact_id).await?;
+        summaries
+            .into_iter()
+            .map(|s| SbomResponse {
+                id: s.id,
+                artifact_id: s.artifact_id,
+                repository_id: Uuid::nil(), // Not in summary
+                format: s.format.to_string(),
+                format_version: s.format_version,
+                spec_version: None,
+                component_count: s.component_count,
+                dependency_count: s.dependency_count,
+                license_count: s.license_count,
+                licenses: s.licenses,
+                content_hash: String::new(),
+                generator: s.generator,
+                generator_version: None,
+                generated_at: s.generated_at,
+                created_at: s.created_at,
+            })
+            .collect()
+    } else {
+        // List all SBOMs (with optional filters)
+        let mut sql = "SELECT * FROM sbom_documents WHERE 1=1".to_string();
+        if query.repository_id.is_some() {
+            sql.push_str(" AND repository_id = $1");
+        }
+        if query.format.is_some() {
+            sql.push_str(if query.repository_id.is_some() {
+                " AND format = $2"
+            } else {
+                " AND format = $1"
+            });
+        }
+        sql.push_str(" ORDER BY created_at DESC LIMIT 100");
+
+        let docs: Vec<SbomDocument> = if let Some(repo_id) = query.repository_id {
+            if let Some(fmt) = &query.format {
+                sqlx::query_as(&sql)
+                    .bind(repo_id)
+                    .bind(fmt)
+                    .fetch_all(&state.db)
+                    .await?
+            } else {
+                sqlx::query_as(&sql)
+                    .bind(repo_id)
+                    .fetch_all(&state.db)
+                    .await?
+            }
+        } else if let Some(fmt) = &query.format {
+            sqlx::query_as(&sql)
+                .bind(fmt)
+                .fetch_all(&state.db)
+                .await?
+        } else {
+            sqlx::query_as("SELECT * FROM sbom_documents ORDER BY created_at DESC LIMIT 100")
+                .fetch_all(&state.db)
+                .await?
+        };
+
+        docs.into_iter().map(SbomResponse::from).collect()
+    };
+
+    Ok(Json(sboms))
+}
+
+async fn get_sbom(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SbomContentResponse>> {
+    let service = SbomService::new(state.db.clone());
+    let doc = service
+        .get_sbom(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("SBOM not found".into()))?;
+
+    Ok(Json(SbomContentResponse::from(doc)))
+}
+
+async fn get_sbom_by_artifact(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(artifact_id): Path<Uuid>,
+    Query(query): Query<ListSbomsQuery>,
+) -> Result<Json<SbomContentResponse>> {
+    let service = SbomService::new(state.db.clone());
+    let format = query
+        .format
+        .as_ref()
+        .and_then(|f| SbomFormat::from_str(f))
+        .unwrap_or(SbomFormat::CycloneDX);
+
+    let doc = service
+        .get_sbom_by_artifact(artifact_id, format)
+        .await?
+        .ok_or_else(|| AppError::NotFound("SBOM not found for artifact".into()))?;
+
+    Ok(Json(SbomContentResponse::from(doc)))
+}
+
+async fn delete_sbom(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>> {
+    let service = SbomService::new(state.db.clone());
+    service.delete_sbom(id).await?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+async fn get_sbom_components(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ComponentResponse>>> {
+    let service = SbomService::new(state.db.clone());
+    let components = service.get_sbom_components(id).await?;
+    let responses: Vec<ComponentResponse> = components.into_iter().map(ComponentResponse::from).collect();
+    Ok(Json(responses))
+}
+
+async fn convert_sbom(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ConvertSbomRequest>,
+) -> Result<Json<SbomResponse>> {
+    let service = SbomService::new(state.db.clone());
+    let target_format = SbomFormat::from_str(&body.target_format)
+        .ok_or_else(|| AppError::Validation(format!("Unknown format: {}", body.target_format)))?;
+
+    let doc = service.convert_sbom(id, target_format).await?;
+    Ok(Json(SbomResponse::from(doc)))
+}
+
+// === CVE History ===
+
+async fn get_cve_history(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(artifact_id): Path<Uuid>,
+) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
+    let service = SbomService::new(state.db.clone());
+    let entries = service.get_cve_history(artifact_id).await?;
+    Ok(Json(entries))
+}
+
+async fn update_cve_status(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateCveStatusRequest>,
+) -> Result<Json<crate::models::sbom::CveHistoryEntry>> {
+    let service = SbomService::new(state.db.clone());
+    let status = CveStatus::from_str(&body.status)
+        .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
+
+    let entry = service
+        .update_cve_status(id, status, Some(auth.user_id), body.reason.as_deref())
+        .await?;
+
+    Ok(Json(entry))
+}
+
+async fn get_cve_trends(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Query(query): Query<GetCveTrendsQuery>,
+) -> Result<Json<CveTrends>> {
+    let service = SbomService::new(state.db.clone());
+    let trends = service.get_cve_trends(query.repository_id).await?;
+    Ok(Json(trends))
+}
+
+// === License Policies ===
+
+async fn list_license_policies(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+) -> Result<Json<Vec<LicensePolicyResponse>>> {
+    let policies: Vec<LicensePolicy> =
+        sqlx::query_as("SELECT * FROM license_policies ORDER BY name")
+            .fetch_all(&state.db)
+            .await?;
+
+    let responses: Vec<LicensePolicyResponse> =
+        policies.into_iter().map(LicensePolicyResponse::from).collect();
+    Ok(Json(responses))
+}
+
+async fn get_license_policy(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<LicensePolicyResponse>> {
+    let policy: LicensePolicy =
+        sqlx::query_as("SELECT * FROM license_policies WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound("License policy not found".into()))?;
+
+    Ok(Json(LicensePolicyResponse::from(policy)))
+}
+
+async fn upsert_license_policy(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Json(body): Json<UpsertLicensePolicyRequest>,
+) -> Result<Json<LicensePolicyResponse>> {
+    let action = PolicyAction::from_str(&body.action)
+        .ok_or_else(|| AppError::Validation(format!("Unknown action: {}", body.action)))?;
+
+    let policy: LicensePolicy = sqlx::query_as(
+        r#"
+        INSERT INTO license_policies (
+            repository_id, name, description, allowed_licenses,
+            denied_licenses, allow_unknown, action, is_enabled
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (COALESCE(repository_id, '00000000-0000-0000-0000-000000000000'), name)
+        DO UPDATE SET
+            description = EXCLUDED.description,
+            allowed_licenses = EXCLUDED.allowed_licenses,
+            denied_licenses = EXCLUDED.denied_licenses,
+            allow_unknown = EXCLUDED.allow_unknown,
+            action = EXCLUDED.action,
+            is_enabled = EXCLUDED.is_enabled,
+            updated_at = NOW()
+        RETURNING *
+        "#,
+    )
+    .bind(body.repository_id)
+    .bind(&body.name)
+    .bind(&body.description)
+    .bind(&body.allowed_licenses)
+    .bind(&body.denied_licenses)
+    .bind(body.allow_unknown)
+    .bind(action.as_str())
+    .bind(body.is_enabled)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(LicensePolicyResponse::from(policy)))
+}
+
+async fn delete_license_policy(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>> {
+    sqlx::query("DELETE FROM license_policies WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+async fn check_license_compliance(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Json(body): Json<CheckLicenseComplianceRequest>,
+) -> Result<Json<LicenseCheckResult>> {
+    let service = SbomService::new(state.db.clone());
+    let policy = service
+        .get_license_policy(body.repository_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("No license policy configured".into()))?;
+
+    let result = service.check_license_compliance(&policy, &body.licenses);
+    Ok(Json(result))
+}
+
+// === Helpers ===
+
+/// Extract dependencies from scan results to populate SBOM.
+async fn extract_dependencies_for_artifact(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+) -> Result<Vec<DependencyInfo>> {
+    // Try to get findings from the latest scan
+    let findings: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT
+            COALESCE(affected_component, title) as name,
+            affected_version as version,
+            NULL::text as purl
+        FROM scan_findings sf
+        JOIN scan_results sr ON sf.scan_result_id = sr.id
+        WHERE sr.artifact_id = $1
+        ORDER BY name
+        LIMIT 1000
+        "#,
+    )
+    .bind(artifact_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let deps: Vec<DependencyInfo> = findings
+        .into_iter()
+        .filter_map(|(name, version, purl)| {
+            if name.is_empty() {
+                None
+            } else {
+                Some(DependencyInfo {
+                    name,
+                    version,
+                    purl,
+                    license: None,
+                    sha256: None,
+                })
+            }
+        })
+        .collect();
+
+    Ok(deps)
+}

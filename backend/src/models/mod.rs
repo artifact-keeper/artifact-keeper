@@ -12,6 +12,7 @@ pub mod plugin;
 pub mod plugin_manifest;
 pub mod repository;
 pub mod role;
+pub mod sbom;
 pub mod security;
 pub mod signing_key;
 pub mod sync_task;

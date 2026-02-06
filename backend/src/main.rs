@@ -17,6 +17,14 @@ use artifact_keeper_backend::{
     config::Config,
     db,
     error::Result,
+    grpc::{
+        generated::{
+            sbom_service_server::SbomServiceServer,
+            cve_history_service_server::CveHistoryServiceServer,
+            security_policy_service_server::SecurityPolicyServiceServer,
+        },
+        sbom_server::{SbomGrpcServer, CveHistoryGrpcServer, SecurityPolicyGrpcServer},
+    },
     services::{
         auth_service::AuthService,
         meili_service::MeiliService,
@@ -29,6 +37,7 @@ use artifact_keeper_backend::{
         wasm_plugin_service::WasmPluginService,
     },
 };
+use tonic::transport::Server as TonicServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -200,9 +209,34 @@ async fn main() -> Result<()> {
         })
         .layer(TraceLayer::new_for_http());
 
-    // Start server
+    // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
-    tracing::info!("Listening on {}", addr);
+    tracing::info!("HTTP server listening on {}", addr);
+
+    // Start gRPC server on a separate port
+    let grpc_port = std::env::var("GRPC_PORT")
+        .unwrap_or_else(|_| "9090".to_string())
+        .parse::<u16>()
+        .unwrap_or(9090);
+    let grpc_addr: SocketAddr = format!("0.0.0.0:{}", grpc_port).parse()?;
+
+    let grpc_db = db::create_pool(&config.database_url).await?;
+    let sbom_server = SbomGrpcServer::new(grpc_db.clone());
+    let cve_history_server = CveHistoryGrpcServer::new(grpc_db.clone());
+    let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db);
+
+    tokio::spawn(async move {
+        tracing::info!("gRPC server listening on {}", grpc_addr);
+        if let Err(e) = TonicServer::builder()
+            .add_service(SbomServiceServer::new(sbom_server))
+            .add_service(CveHistoryServiceServer::new(cve_history_server))
+            .add_service(SecurityPolicyServiceServer::new(security_policy_server))
+            .serve(grpc_addr)
+            .await
+        {
+            tracing::error!("gRPC server error: {}", e);
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

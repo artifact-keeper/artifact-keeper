@@ -28,6 +28,7 @@ pub mod proxy_service;
 pub mod remote_instance_service;
 pub mod repository_service;
 pub mod saml_service;
+pub mod sbom_service;
 pub mod scan_config_service;
 pub mod scan_result_service;
 pub mod scanner_service;

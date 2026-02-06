@@ -1,0 +1,298 @@
+syntax = "proto3";
+
+package artifact_keeper.sbom.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// SBOM Service - Software Bill of Materials management
+service SbomService {
+  // Generate an SBOM for an artifact
+  rpc GenerateSbom(GenerateSbomRequest) returns (SbomDocument);
+
+  // Get an existing SBOM by ID
+  rpc GetSbom(GetSbomRequest) returns (SbomDocument);
+
+  // Get SBOM for an artifact
+  rpc GetSbomByArtifact(GetSbomByArtifactRequest) returns (SbomDocument);
+
+  // List all SBOMs for an artifact
+  rpc ListSbomsForArtifact(ListSbomsRequest) returns (ListSbomsResponse);
+
+  // Get components from an SBOM
+  rpc GetSbomComponents(GetSbomComponentsRequest) returns (GetSbomComponentsResponse);
+
+  // Convert SBOM between formats
+  rpc ConvertSbom(ConvertSbomRequest) returns (SbomDocument);
+
+  // Delete an SBOM
+  rpc DeleteSbom(DeleteSbomRequest) returns (DeleteSbomResponse);
+
+  // Trigger SBOM regeneration
+  rpc RegenerateSbom(RegenerateSbomRequest) returns (SbomDocument);
+
+  // Check license compliance
+  rpc CheckLicenseCompliance(CheckLicenseComplianceRequest) returns (LicenseComplianceResponse);
+}
+
+// CVE History Service - Vulnerability timeline tracking
+service CveHistoryService {
+  // Get CVE history for an artifact
+  rpc GetCveHistory(GetCveHistoryRequest) returns (GetCveHistoryResponse);
+
+  // Update CVE status
+  rpc UpdateCveStatus(UpdateCveStatusRequest) returns (CveHistoryEntry);
+
+  // Get CVE trends
+  rpc GetCveTrends(GetCveTrendsRequest) returns (CveTrendsResponse);
+
+  // Trigger retroactive scan
+  rpc TriggerRetroactiveScan(RetroactiveScanRequest) returns (RetroactiveScanResponse);
+}
+
+// Security Policy Service - Policy management
+service SecurityPolicyService {
+  // Get license policy
+  rpc GetLicensePolicy(GetLicensePolicyRequest) returns (LicensePolicy);
+
+  // Create or update license policy
+  rpc UpsertLicensePolicy(UpsertLicensePolicyRequest) returns (LicensePolicy);
+
+  // Delete license policy
+  rpc DeleteLicensePolicy(DeleteLicensePolicyRequest) returns (DeleteLicensePolicyResponse);
+
+  // List all policies
+  rpc ListLicensePolicies(ListLicensePoliciesRequest) returns (ListLicensePoliciesResponse);
+}
+
+// === Messages ===
+
+enum SbomFormat {
+  SBOM_FORMAT_UNSPECIFIED = 0;
+  SBOM_FORMAT_CYCLONEDX = 1;
+  SBOM_FORMAT_SPDX = 2;
+}
+
+enum CveStatus {
+  CVE_STATUS_UNSPECIFIED = 0;
+  CVE_STATUS_OPEN = 1;
+  CVE_STATUS_FIXED = 2;
+  CVE_STATUS_ACKNOWLEDGED = 3;
+  CVE_STATUS_FALSE_POSITIVE = 4;
+}
+
+enum PolicyAction {
+  POLICY_ACTION_UNSPECIFIED = 0;
+  POLICY_ACTION_ALLOW = 1;
+  POLICY_ACTION_WARN = 2;
+  POLICY_ACTION_BLOCK = 3;
+}
+
+message SbomDocument {
+  string id = 1;
+  string artifact_id = 2;
+  string repository_id = 3;
+  SbomFormat format = 4;
+  string format_version = 5;
+  string spec_version = 6;
+  bytes content = 7; // JSON content
+  int32 component_count = 8;
+  int32 dependency_count = 9;
+  int32 license_count = 10;
+  repeated string licenses = 11;
+  string content_hash = 12;
+  string generator = 13;
+  string generator_version = 14;
+  google.protobuf.Timestamp generated_at = 15;
+  google.protobuf.Timestamp created_at = 16;
+}
+
+message SbomComponent {
+  string id = 1;
+  string sbom_id = 2;
+  string name = 3;
+  string version = 4;
+  string purl = 5;
+  string cpe = 6;
+  string component_type = 7;
+  repeated string licenses = 8;
+  string sha256 = 9;
+  string sha1 = 10;
+  string md5 = 11;
+  string supplier = 12;
+  string author = 13;
+}
+
+message CveHistoryEntry {
+  string id = 1;
+  string artifact_id = 2;
+  string cve_id = 3;
+  string affected_component = 4;
+  string affected_version = 5;
+  string fixed_version = 6;
+  string severity = 7;
+  double cvss_score = 8;
+  google.protobuf.Timestamp cve_published_at = 9;
+  google.protobuf.Timestamp first_detected_at = 10;
+  google.protobuf.Timestamp last_detected_at = 11;
+  CveStatus status = 12;
+  string acknowledged_by = 13;
+  google.protobuf.Timestamp acknowledged_at = 14;
+  string acknowledged_reason = 15;
+}
+
+message LicensePolicy {
+  string id = 1;
+  string repository_id = 2; // empty = global policy
+  string name = 3;
+  string description = 4;
+  repeated string allowed_licenses = 5;
+  repeated string denied_licenses = 6;
+  bool allow_unknown = 7;
+  PolicyAction action = 8;
+  bool is_enabled = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+// === Request/Response Messages ===
+
+message GenerateSbomRequest {
+  string artifact_id = 1;
+  SbomFormat format = 2;
+  bool force_regenerate = 3;
+}
+
+message GetSbomRequest {
+  string id = 1;
+}
+
+message GetSbomByArtifactRequest {
+  string artifact_id = 1;
+  SbomFormat format = 2;
+}
+
+message ListSbomsRequest {
+  string artifact_id = 1;
+}
+
+message ListSbomsResponse {
+  repeated SbomDocument sboms = 1;
+}
+
+message GetSbomComponentsRequest {
+  string sbom_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message GetSbomComponentsResponse {
+  repeated SbomComponent components = 1;
+  string next_page_token = 2;
+  int32 total_count = 3;
+}
+
+message ConvertSbomRequest {
+  string sbom_id = 1;
+  SbomFormat target_format = 2;
+}
+
+message DeleteSbomRequest {
+  string id = 1;
+}
+
+message DeleteSbomResponse {
+  bool success = 1;
+}
+
+message RegenerateSbomRequest {
+  string artifact_id = 1;
+  SbomFormat format = 2;
+}
+
+message CheckLicenseComplianceRequest {
+  repeated string licenses = 1;
+  string repository_id = 2; // optional, uses global policy if not set
+}
+
+message LicenseComplianceResponse {
+  bool compliant = 1;
+  repeated string violations = 2;
+  repeated string warnings = 3;
+}
+
+message GetCveHistoryRequest {
+  string artifact_id = 1;
+  CveStatus status_filter = 2; // optional
+}
+
+message GetCveHistoryResponse {
+  repeated CveHistoryEntry entries = 1;
+}
+
+message UpdateCveStatusRequest {
+  string id = 1;
+  CveStatus status = 2;
+  string reason = 3;
+}
+
+message GetCveTrendsRequest {
+  string repository_id = 1; // optional, empty = global trends
+  int32 days = 2; // default 30
+}
+
+message CveTrendsResponse {
+  int64 total_cves = 1;
+  int64 open_cves = 2;
+  int64 fixed_cves = 3;
+  int64 acknowledged_cves = 4;
+  int64 critical_count = 5;
+  int64 high_count = 6;
+  int64 medium_count = 7;
+  int64 low_count = 8;
+  double avg_days_to_fix = 9;
+  repeated CveTimelineEntry timeline = 10;
+}
+
+message CveTimelineEntry {
+  string cve_id = 1;
+  string severity = 2;
+  string affected_component = 3;
+  google.protobuf.Timestamp cve_published_at = 4;
+  google.protobuf.Timestamp first_detected_at = 5;
+  CveStatus status = 6;
+  int64 days_exposed = 7;
+}
+
+message RetroactiveScanRequest {
+  string repository_id = 1; // optional, empty = scan all
+  int32 max_artifact_age_days = 2; // default 90
+}
+
+message RetroactiveScanResponse {
+  int32 artifacts_queued = 1;
+  string job_id = 2;
+}
+
+message GetLicensePolicyRequest {
+  string repository_id = 1; // optional
+}
+
+message UpsertLicensePolicyRequest {
+  LicensePolicy policy = 1;
+}
+
+message DeleteLicensePolicyRequest {
+  string id = 1;
+}
+
+message DeleteLicensePolicyResponse {
+  bool success = 1;
+}
+
+message ListLicensePoliciesRequest {
+  string repository_id = 1; // optional filter
+}
+
+message ListLicensePoliciesResponse {
+  repeated LicensePolicy policies = 1;
+}

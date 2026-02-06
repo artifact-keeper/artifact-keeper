@@ -260,6 +260,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // SBOM routes with auth middleware
+        .nest(
+            "/sbom",
+            handlers::sbom::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Remote instance management & proxy routes with auth middleware
         .nest(
             "/instances",
