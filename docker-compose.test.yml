@@ -135,7 +135,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-pypi
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -155,7 +155,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-npm
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -175,7 +175,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-cargo
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -199,7 +199,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-maven
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -220,8 +220,8 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-go
-      GOPROXY: http://backend:8080/api/v1/repositories/test-go
+      REGISTRY_URL: http://backend:8080
+      GOPROXY: http://backend:8080/go/test-go
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -242,7 +242,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-rpm
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
       GPG_KEY: /pki/gpg-signing.pub
     volumes:
@@ -263,7 +263,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-deb
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
       GPG_KEY: /pki/gpg-signing.pub
     volumes:
@@ -284,7 +284,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-helm
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -304,7 +304,7 @@ services:
       pki:
         condition: service_healthy
     environment:
-      REGISTRY_URL: http://backend:8080/api/v1/repositories/test-conda
+      REGISTRY_URL: http://backend:8080
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro

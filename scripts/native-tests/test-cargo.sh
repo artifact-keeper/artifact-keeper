@@ -3,12 +3,15 @@
 # Tests push (cargo publish) and pull (cargo install) operations
 set -euo pipefail
 
-REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080/api/v1/repositories/test-cargo}"
+REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080}"
+REPO_KEY="${REPO_KEY:-test-cargo}"
 CA_CERT="${CA_CERT:-}"
 TEST_VERSION="1.0.$(date +%s | cut -c1-6)"
 
+CARGO_REGISTRY_URL="$REGISTRY_URL/cargo/$REPO_KEY"
+
 echo "==> Cargo Native Client Test"
-echo "Registry: $REGISTRY_URL"
+echo "Registry: $CARGO_REGISTRY_URL"
 echo "Version: $TEST_VERSION"
 
 # Generate test crate
@@ -47,18 +50,15 @@ mod tests {
 }
 EOF
 
-# Configure cargo registry
+# Configure cargo registry (sparse protocol)
 echo "==> Configuring cargo registry..."
 mkdir -p ~/.cargo
 cat >> ~/.cargo/config.toml << EOF
 [registries.test-registry]
-index = "$REGISTRY_URL/index"
+index = "sparse+$CARGO_REGISTRY_URL/index/"
 
 [registry]
 default = "test-registry"
-
-[net]
-git-fetch-with-cli = true
 EOF
 
 # Set token
