@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, name, max_severity, block_unscanned, block_on_fail, is_enabled\n            FROM scan_policies\n            WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true\n            ORDER BY repository_id DESC NULLS LAST\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "max_severity",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "block_unscanned",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "block_on_fail",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_enabled",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "9076f5f59e4e7e507f0ba65b10308073d3af5af779ac44b6ab61fcb85c383402"
+}

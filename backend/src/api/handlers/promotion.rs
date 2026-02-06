@@ -15,6 +15,8 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryType;
+use crate::models::sbom::PolicyAction;
+use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
 
 /// Require that the request is authenticated, returning an error if not.
@@ -171,17 +173,46 @@ pub async fn promote_artifact(
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found in staging repository".to_string()))?;
 
-    // TODO: Run policy checks when artifact-keeper-dwa is implemented
-    let policy_violations: Vec<PolicyViolation> = vec![];
-    if !req.skip_policy_check && !policy_violations.is_empty() {
-        return Ok(Json(PromotionResponse {
-            promoted: false,
-            source: format!("{}/{}", repo_key, artifact.path),
-            target: format!("{}/{}", req.target_repository, artifact.path),
-            promotion_id: None,
-            policy_violations,
-            message: Some("Promotion blocked by policy violations".to_string()),
-        }));
+    // Run policy checks (CVE severity, license compliance)
+    let mut policy_violations: Vec<PolicyViolation> = vec![];
+    let mut policy_result_json = serde_json::json!({"passed": true, "violations": []});
+
+    if !req.skip_policy_check {
+        let policy_service = PromotionPolicyService::new(state.db.clone());
+        let eval_result = policy_service
+            .evaluate_artifact(artifact_id, source_repo.id)
+            .await?;
+
+        // Convert service violations to handler violations
+        policy_violations = eval_result
+            .violations
+            .iter()
+            .map(|v| PolicyViolation {
+                rule: v.rule.clone(),
+                severity: v.severity.clone(),
+                message: v.message.clone(),
+            })
+            .collect();
+
+        policy_result_json = serde_json::json!({
+            "passed": eval_result.passed,
+            "action": format!("{:?}", eval_result.action).to_lowercase(),
+            "violations": eval_result.violations,
+            "cve_summary": eval_result.cve_summary,
+            "license_summary": eval_result.license_summary,
+        });
+
+        // Block promotion if policy evaluation failed with Block action
+        if !eval_result.passed && eval_result.action == PolicyAction::Block {
+            return Ok(Json(PromotionResponse {
+                promoted: false,
+                source: format!("{}/{}", repo_key, artifact.path),
+                target: format!("{}/{}", req.target_repository, artifact.path),
+                promotion_id: None,
+                policy_violations,
+                message: Some("Promotion blocked by policy violations".to_string()),
+            }));
+        }
     }
 
     // Copy artifact to target repository
@@ -249,10 +280,6 @@ pub async fn promote_artifact(
 
     // Record promotion history
     let promotion_id = Uuid::new_v4();
-    let policy_result = serde_json::json!({
-        "passed": true,
-        "violations": policy_violations
-    });
 
     sqlx::query!(
         r#"
@@ -267,7 +294,7 @@ pub async fn promote_artifact(
         source_repo.id,
         target_repo.id,
         auth.user_id,
-        policy_result,
+        policy_result_json,
         req.notes
     )
     .execute(&state.db)

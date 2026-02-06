@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT cve_id as \"cve_id!\" FROM cve_history WHERE artifact_id = $1 AND status = 'open' AND cve_id IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cve_id!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b1c30e1a7d7c0ee983f2ac2f068ade3d23ec07e0dff434bfb3d79227e8d385ea"
+}

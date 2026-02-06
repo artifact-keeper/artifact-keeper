@@ -25,6 +25,7 @@ pub mod peer_service;
 pub mod plugin_registry;
 pub mod plugin_service;
 pub mod policy_service;
+pub mod promotion_policy_service;
 pub mod proxy_service;
 pub mod remote_instance_service;
 pub mod repository_service;

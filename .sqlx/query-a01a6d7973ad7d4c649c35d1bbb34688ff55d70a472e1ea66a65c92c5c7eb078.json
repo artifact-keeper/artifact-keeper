@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                critical_count, high_count, medium_count, low_count, findings_count\n            FROM scan_results\n            WHERE artifact_id = $1 AND status = 'completed'\n            ORDER BY created_at DESC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "critical_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "high_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "medium_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "low_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "findings_count",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a01a6d7973ad7d4c649c35d1bbb34688ff55d70a472e1ea66a65c92c5c7eb078"
+}

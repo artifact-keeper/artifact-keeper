@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, name, allowed_licenses, denied_licenses, allow_unknown, action, is_enabled\n            FROM license_policies\n            WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true\n            ORDER BY repository_id DESC NULLS LAST\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "allowed_licenses",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 3,
+        "name": "denied_licenses",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "allow_unknown",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "action",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_enabled",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "360b480ec0e0ccc4a871a4d29ea2f63d9da7d4c55cadd2d92f4a7d0af5b8d857"
+}
