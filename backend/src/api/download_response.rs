@@ -1,7 +1,7 @@
 //! Download response helper for redirect support.
 //!
 //! Provides utilities for handlers to return either:
-//! - 302 redirect to presigned URL (S3/CloudFront)
+//! - 302 redirect to presigned URL (S3/CloudFront/Azure/GCS)
 //! - Streamed content (filesystem or when redirect is disabled)
 
 use axum::body::Body;
@@ -64,6 +64,8 @@ impl IntoResponse for DownloadResponse {
                 let source = match presigned.source {
                     PresignedUrlSource::S3 => "redirect-s3",
                     PresignedUrlSource::CloudFront => "redirect-cloudfront",
+                    PresignedUrlSource::Azure => "redirect-azure",
+                    PresignedUrlSource::Gcs => "redirect-gcs",
                 };
 
                 Response::builder()

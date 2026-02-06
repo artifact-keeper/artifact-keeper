@@ -1,7 +1,12 @@
 //! Storage backends.
 
+pub mod azure;
 pub mod filesystem;
+pub mod gcs;
+pub mod path_format;
 pub mod s3;
+
+pub use path_format::StoragePathFormat;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,7 +21,7 @@ pub struct PresignedUrl {
     pub url: String,
     /// When the URL expires
     pub expires_in: Duration,
-    /// Source type (s3, cloudfront, etc.)
+    /// Source type (s3, cloudfront, azure, gcs)
     pub source: PresignedUrlSource,
 }
 
@@ -27,6 +32,10 @@ pub enum PresignedUrlSource {
     S3,
     /// CloudFront signed URL
     CloudFront,
+    /// Azure Blob Storage SAS URL
+    Azure,
+    /// Google Cloud Storage signed URL
+    Gcs,
 }
 
 /// Storage backend trait
