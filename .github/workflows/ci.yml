@@ -3,8 +3,20 @@ name: CI
 on:
   push:
     branches: [main, master, develop]
+    paths-ignore:
+      - 'site/**'
+      - '*.md'
+      - 'docs/**'
+      - '.beads/**'
+      - 'LICENSE'
   pull_request:
     branches: [main, master, develop]
+    paths-ignore:
+      - 'site/**'
+      - '*.md'
+      - 'docs/**'
+      - '.beads/**'
+      - 'LICENSE'
   workflow_dispatch:
 
 concurrency:
@@ -55,14 +67,13 @@ jobs:
         run: cargo test --workspace --lib --verbose
 
   # ════════════════════════════════════════════════════════════════════════════
-  # TIER 2: INTEGRATION (Main Branch Push Only) - Target: < 15 minutes
+  # TIER 2: INTEGRATION (Main Branch Push Only)
   # ════════════════════════════════════════════════════════════════════════════
 
   test-backend-integration:
     name: 🔗 Backend Integration Tests
     runs-on: ubuntu-latest
     needs: lint-rust
-    # Only run on main branch push, not on PRs or feature branches
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     services:
       postgres:
@@ -92,37 +103,14 @@ jobs:
           SQLX_OFFLINE: true
         run: cargo test --workspace --test '*' --verbose
 
-  build-backend:
-    name: 🏗️ Build Backend
-    runs-on: ubuntu-latest
-    # Only depend on unit tests (not integration - it may be skipped on PRs)
-    needs: [test-backend-unit]
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release
-        env:
-          SQLX_OFFLINE: true
-        run: cargo build --release --workspace
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: backend-binary
-          path: target/release/artifact-keeper
-          retention-days: 7
-
   # ════════════════════════════════════════════════════════════════════════════
-  # TIER 1.5: SMOKE E2E (Every Push/PR) - Target: < 20 minutes
+  # SMOKE E2E (Every Push/PR) - Target: < 20 minutes
   # ════════════════════════════════════════════════════════════════════════════
 
   smoke-e2e:
     name: 🔥 Smoke E2E Tests
     runs-on: ubuntu-latest
-    needs: [build-backend]
+    needs: [test-backend-unit]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
@@ -165,65 +153,59 @@ jobs:
   ci-complete:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
-    # Only require Tier 1 jobs for all PRs/pushes
-    # Tier 2 jobs (integration, docker) are checked conditionally
-    needs: [lint-rust, test-backend-unit, build-backend, smoke-e2e, security-audit]
+    needs: [lint-rust, test-backend-unit, test-backend-integration, smoke-e2e, security-audit]
     if: always()
     steps:
       - name: Check CI status
         run: |
           echo "## CI Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Tier 1: Fast CI (Every Push/PR)" >> $GITHUB_STEP_SUMMARY
 
-          # Check Tier 1 jobs (required for all)
           tier1_pass=true
 
-          if [[ "${{ needs.lint-rust.result }}" == "success" ]]; then
-            echo "✅ Rust Lint: Passed" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ Rust Lint: ${{ needs.lint-rust.result }}" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
+          # Tier 1 jobs (required)
+          for job in lint-rust test-backend-unit; do
+            result="${{ needs.lint-rust.result }}"
+            [ "$job" = "test-backend-unit" ] && result="${{ needs.test-backend-unit.result }}"
+            if [[ "$result" == "success" ]]; then
+              echo "✅ $job" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ $job: $result" >> $GITHUB_STEP_SUMMARY
+              tier1_pass=false
+            fi
+          done
 
-          if [[ "${{ needs.test-backend-unit.result }}" == "success" ]]; then
-            echo "✅ Backend Unit Tests: Passed" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ Backend Unit Tests: ${{ needs.test-backend-unit.result }}" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
-
-          if [[ "${{ needs.build-backend.result }}" == "success" ]]; then
-            echo "✅ Backend Build: Passed" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ Backend Build: ${{ needs.build-backend.result }}" >> $GITHUB_STEP_SUMMARY
-            tier1_pass=false
-          fi
-
+          # Smoke E2E
           if [[ "${{ needs.smoke-e2e.result }}" == "success" ]]; then
-            echo "✅ Smoke E2E Tests: Passed" >> $GITHUB_STEP_SUMMARY
+            echo "✅ smoke-e2e" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ Smoke E2E Tests: ${{ needs.smoke-e2e.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "❌ smoke-e2e: ${{ needs.smoke-e2e.result }}" >> $GITHUB_STEP_SUMMARY
             tier1_pass=false
           fi
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Security (Non-blocking)" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
-            echo "✅ Security Audit: Passed" >> $GITHUB_STEP_SUMMARY
+          # Integration tests (main push only, skip check on PRs)
+          integ_result="${{ needs.test-backend-integration.result }}"
+          if [[ "$integ_result" == "success" ]]; then
+            echo "✅ integration-tests" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$integ_result" == "skipped" ]]; then
+            echo "⏭️ integration-tests (PR — skipped)" >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️ Security Audit: ${{ needs.security-audit.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "❌ integration-tests: $integ_result" >> $GITHUB_STEP_SUMMARY
+            tier1_pass=false
+          fi
+
+          # Security audit (non-blocking)
+          if [[ "${{ needs.security-audit.result }}" == "success" ]]; then
+            echo "✅ security-audit" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ security-audit: ${{ needs.security-audit.result }}" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Fail if any Tier 1 job failed
           if [[ "$tier1_pass" != "true" ]]; then
-            echo "❌ **CI Failed**: One or more Tier 1 jobs failed" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **CI Failed**" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
-          echo "✅ **CI Passed**: All Tier 1 jobs completed successfully" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "_Note: Smoke E2E (PyPI, npm, Cargo) runs on every PR. Full E2E suite available on release or manual trigger._" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **CI Passed**" >> $GITHUB_STEP_SUMMARY
