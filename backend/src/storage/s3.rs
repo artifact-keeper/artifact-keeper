@@ -565,3 +565,86 @@ mod tests {
         assert_eq!(config.prefix, Some("prefix".to_string()));
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::storage::StorageBackend as StorageBackendTrait;
+
+    /// Integration test for S3 presigned URLs
+    /// Run with: S3_BUCKET=your-bucket cargo test s3_presigned --lib -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore] // Requires AWS credentials and S3 bucket
+    async fn test_s3_presigned_url_generation() {
+        // Skip if S3_BUCKET not set
+        let bucket = match std::env::var("S3_BUCKET") {
+            Ok(b) => b,
+            Err(_) => {
+                println!("Skipping: S3_BUCKET not set");
+                return;
+            }
+        };
+
+        println!("Testing with bucket: {}", bucket);
+
+        // Create config with redirect enabled
+        let config = S3Config::from_env()
+            .expect("Failed to load S3 config")
+            .with_redirect_downloads(true)
+            .with_presign_expiry(Duration::from_secs(300));
+
+        let backend = S3Backend::new(config).await.expect("Failed to create S3 backend");
+
+        // Upload a test file
+        let test_key = format!("test/presign-test-{}.txt", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs());
+        let test_content = Bytes::from("Test content for presigned URL");
+
+        println!("Uploading test file: {}", test_key);
+        StorageBackendTrait::put(&backend, &test_key, test_content.clone())
+            .await
+            .expect("Failed to upload test file");
+
+        // Check supports_redirect
+        assert!(StorageBackendTrait::supports_redirect(&backend), "Backend should support redirect");
+
+        // Generate presigned URL
+        println!("Generating presigned URL...");
+        let presigned = StorageBackendTrait::get_presigned_url(
+            &backend,
+            &test_key,
+            Duration::from_secs(300),
+        )
+        .await
+        .expect("Failed to generate presigned URL");
+
+        assert!(presigned.is_some(), "Should return presigned URL");
+        let presigned = presigned.unwrap();
+        
+        println!("Presigned URL: {}...", &presigned.url[..80.min(presigned.url.len())]);
+        println!("Source: {:?}", presigned.source);
+        println!("Expires in: {:?}", presigned.expires_in);
+
+        assert!(presigned.url.contains(&bucket), "URL should contain bucket name");
+        assert!(presigned.url.contains("X-Amz-Signature"), "URL should have signature");
+
+        // Verify URL works by downloading
+        println!("Verifying presigned URL works...");
+        let client = reqwest::Client::new();
+        let response = client.get(&presigned.url).send().await.expect("Failed to fetch presigned URL");
+        assert!(response.status().is_success(), "Presigned URL should return 200");
+        
+        let body = response.bytes().await.expect("Failed to read body");
+        assert_eq!(body.as_ref(), test_content.as_ref(), "Content should match");
+        println!("✓ Presigned URL works!");
+
+        // Cleanup
+        println!("Cleaning up...");
+        StorageBackendTrait::delete(&backend, &test_key)
+            .await
+            .expect("Failed to delete test file");
+        println!("✓ Test complete");
+    }
+}
