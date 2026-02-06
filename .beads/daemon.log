@@ -39163,3 +39163,4 @@ time=2026-02-03T14:39:56.581-06:00 level=INFO msg="⚠️  WARNING: Uncommitted 
 time=2026-02-03T14:39:56.581-06:00 level=INFO msg="   Pulling from remote may overwrite local unpushed changes."
 time=2026-02-03T14:39:56.581-06:00 level=INFO msg="   Consider running 'bd sync' to commit and push your changes first."
 time=2026-02-03T14:39:58.489-06:00 level=INFO msg="JSONL removed/renamed, re-establishing watch"
+time=2026-02-06T12:27:23.668-06:00 level=INFO msg="daemon already running (lock held), exiting"

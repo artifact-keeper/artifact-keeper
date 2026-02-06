@@ -10,8 +10,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
+use crate::api::download_response::{DownloadResponse, X_ARTIFACT_STORAGE};
 use crate::api::dto::Pagination;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -23,6 +25,8 @@ use crate::services::repository_service::{
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::storage::filesystem::FilesystemStorage;
+use crate::storage::s3::{S3Backend, S3Config};
+use crate::storage::StorageBackend;
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -519,10 +523,7 @@ pub async fn download_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
 
-    let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
-    let artifact_service = ArtifactService::new(state.db.clone(), storage);
-
-    // Get client IP
+    // Get client IP for analytics
     let ip_addr = request
         .headers()
         .get("x-forwarded-for")
@@ -537,6 +538,68 @@ pub async fn download_artifact(
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+
+    // Check if S3 storage with redirect enabled
+    if repo.storage_backend == "s3" {
+        // Try to use S3 with redirect
+        if let Ok(s3_config) = S3Config::from_env() {
+            if s3_config.redirect_downloads {
+                let s3_backend = S3Backend::new(s3_config).await?;
+
+                // Get artifact metadata first using query_as for runtime checking
+                #[derive(sqlx::FromRow)]
+                struct ArtifactRow {
+                    id: Uuid,
+                    storage_key: String,
+                }
+                let artifact: ArtifactRow = sqlx::query_as(
+                    r#"
+                    SELECT id, storage_key
+                    FROM artifacts
+                    WHERE repository_id = $1 AND path = $2 AND is_deleted = false
+                    "#,
+                )
+                .bind(repo.id)
+                .bind(&path)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+                // Record download analytics
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO download_events (artifact_id, user_id, ip_address, user_agent, downloaded_at)
+                    VALUES ($1, $2, $3, $4, NOW())
+                    "#,
+                )
+                .bind(artifact.id)
+                .bind(auth.as_ref().map(|a| a.user_id))
+                .bind(ip_addr.to_string())
+                .bind(user_agent.as_deref())
+                .execute(&state.db)
+                .await;
+
+                // Try to get presigned URL
+                if let Some(presigned) = s3_backend
+                    .get_presigned_url(&artifact.storage_key, Duration::from_secs(3600))
+                    .await?
+                {
+                    tracing::info!(
+                        repo = %key,
+                        path = %path,
+                        source = ?presigned.source,
+                        "Serving artifact via redirect"
+                    );
+                    return Ok(DownloadResponse::redirect(presigned).into_response());
+                }
+            }
+        }
+    }
+
+    // Fall back to proxied download (filesystem or S3 without redirect)
+    let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
+    let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
     let (artifact, content) = artifact_service
         .download(
@@ -560,9 +623,14 @@ pub async fn download_artifact(
                 header::HeaderName::from_static("x-checksum-sha256"),
                 artifact.checksum_sha256,
             ),
+            (
+                header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                "proxy".to_string(),
+            ),
         ],
         content,
-    ))
+    )
+        .into_response())
 }
 
 /// Delete artifact

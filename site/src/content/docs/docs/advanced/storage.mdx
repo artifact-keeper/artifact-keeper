@@ -120,6 +120,169 @@ S3_SECRET_ACCESS_KEY=your-spaces-secret
 - Requires internet connectivity
 - Credential management
 
+### S3 Direct Downloads (302 Redirects)
+
+By default, artifact downloads are proxied through the Artifact Keeper backend. For S3 storage, you can enable direct downloads using presigned URLs, which:
+
+- **Reduces backend load** - clients download directly from S3
+- **Lowers egress costs** - no data transfer through your backend servers
+- **Improves performance** - S3's global infrastructure serves content faster
+- **Scales infinitely** - no backend bottleneck for downloads
+
+#### Configuration
+
+```bash
+STORAGE_BACKEND=s3
+S3_BUCKET=artifact-keeper-prod
+S3_REGION=us-east-1
+S3_REDIRECT_DOWNLOADS=true        # Enable 302 redirects
+S3_PRESIGN_EXPIRY=3600            # URL expiry in seconds (default: 1 hour)
+```
+
+#### How It Works
+
+1. Client requests artifact download from Artifact Keeper
+2. Backend generates a presigned S3 URL (valid for `S3_PRESIGN_EXPIRY` seconds)
+3. Backend returns `302 Found` with `Location` header pointing to S3
+4. Client downloads directly from S3 using the presigned URL
+
+```text
+Client                    Artifact Keeper              S3
+  |                              |                      |
+  |-- GET /artifacts/pkg.tar --> |                      |
+  |                              |-- Generate URL -->   |
+  |<-- 302 Location: s3://... -- |                      |
+  |                                                     |
+  |------------------- GET s3://... -----------------> |
+  |<------------------ [file content] ---------------- |
+```
+
+#### Response Headers
+
+When redirect is enabled, responses include:
+
+```http
+HTTP/1.1 302 Found
+Location: https://bucket.s3.amazonaws.com/path?X-Amz-Signature=...
+X-Artifact-Storage: redirect-s3
+Cache-Control: private, max-age=3600
+```
+
+The `X-Artifact-Storage` header indicates how the artifact was served:
+- `redirect-s3` - Redirected to S3 presigned URL
+- `redirect-cloudfront` - Redirected to CloudFront signed URL
+- `proxy` - Streamed through backend (filesystem or redirect disabled)
+
+#### Security Considerations
+
+- Presigned URLs grant temporary access to the specific object
+- URLs expire after `S3_PRESIGN_EXPIRY` seconds
+- Authentication is still enforced at the backend before generating URLs
+- S3 bucket should block public access; only presigned URLs work
+
+### CloudFront Integration
+
+For global distribution and even faster downloads, use CloudFront with signed URLs.
+
+#### Why CloudFront?
+
+- **Edge caching** - Popular artifacts served from nearby edge locations
+- **Lower latency** - Global CDN network
+- **Reduced S3 costs** - Cache hits don't incur S3 request fees
+- **DDoS protection** - AWS Shield integration
+
+#### Configuration
+
+```bash
+STORAGE_BACKEND=s3
+S3_BUCKET=artifact-keeper-prod
+S3_REGION=us-east-1
+S3_REDIRECT_DOWNLOADS=true
+
+# CloudFront settings
+CLOUDFRONT_DISTRIBUTION_URL=https://d1234567890.cloudfront.net
+CLOUDFRONT_KEY_PAIR_ID=APKAEIBAERJR2EXAMPLE
+CLOUDFRONT_PRIVATE_KEY_PATH=/etc/artifact-keeper/cloudfront-private-key.pem
+# Or inline:
+# CLOUDFRONT_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n..."
+```
+
+#### CloudFront Setup
+
+1. **Create CloudFront Distribution**
+   - Origin: Your S3 bucket
+   - Origin Access Control (OAC): Restrict bucket access to CloudFront only
+   - Viewer Protocol Policy: Redirect HTTP to HTTPS
+
+2. **Create CloudFront Key Pair**
+   ```bash
+   # Generate RSA key pair
+   openssl genrsa -out cloudfront-private-key.pem 2048
+   openssl rsa -in cloudfront-private-key.pem -pubout -out cloudfront-public-key.pem
+   ```
+
+3. **Upload Public Key to CloudFront**
+   - Go to CloudFront → Key Management → Public Keys
+   - Create public key with your `cloudfront-public-key.pem`
+   - Note the Key Pair ID (e.g., `APKAEIBAERJR2EXAMPLE`)
+
+4. **Create Key Group**
+   - Go to CloudFront → Key Management → Key Groups
+   - Create key group with your public key
+
+5. **Configure Distribution Behavior**
+   - Restrict Viewer Access: Yes
+   - Trusted Key Groups: Select your key group
+
+6. **Update S3 Bucket Policy**
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Principal": {
+           "Service": "cloudfront.amazonaws.com"
+         },
+         "Action": "s3:GetObject",
+         "Resource": "arn:aws:s3:::artifact-keeper-prod/*",
+         "Condition": {
+           "StringEquals": {
+             "AWS:SourceArn": "arn:aws:cloudfront::123456789012:distribution/EDFDVBD6EXAMPLE"
+           }
+         }
+       }
+     ]
+   }
+   ```
+
+#### CloudFront Response Headers
+
+When CloudFront is configured, downloads redirect to the CDN:
+
+```http
+HTTP/1.1 302 Found
+Location: https://d1234567890.cloudfront.net/path?Policy=...&Signature=...&Key-Pair-Id=...
+X-Artifact-Storage: redirect-cloudfront
+Cache-Control: private, max-age=3600
+```
+
+#### Fallback Behavior
+
+If CloudFront configuration is incomplete or fails:
+1. Falls back to S3 presigned URLs (if S3 redirect enabled)
+2. Falls back to proxied download (if all else fails)
+
+### Disabling Redirects
+
+To proxy all downloads through the backend (useful for auditing or custom headers):
+
+```bash
+S3_REDIRECT_DOWNLOADS=false
+```
+
+All downloads will stream through the backend with `X-Artifact-Storage: proxy`.
+
 ## MinIO as S3 Alternative
 
 MinIO provides S3-compatible object storage that you can self-host.

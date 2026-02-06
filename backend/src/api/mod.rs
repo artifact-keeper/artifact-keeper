@@ -1,5 +1,6 @@
 //! API module - HTTP handlers and middleware.
 
+pub mod download_response;
 pub mod dto;
 pub mod handlers;
 pub mod middleware;
