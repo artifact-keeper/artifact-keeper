@@ -85,34 +85,9 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-    command: >
-      sh -c "
-        apk add --no-cache curl jq >/dev/null 2>&1 &&
-        echo '==> Logging in as admin...' &&
-        TOKEN=$$(curl -sf -X POST http://backend:8080/api/v1/auth/login \
-          -H 'Content-Type: application/json' \
-          -d '{\"username\":\"admin\",\"password\":\"admin123\"}' | jq -r '.access_token') &&
-        echo '==> Creating test repositories...' &&
-        for repo in \
-          '{\"key\":\"test-pypi\",\"name\":\"Test PyPI\",\"format\":\"pypi\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-npm\",\"name\":\"Test NPM\",\"format\":\"npm\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-cargo\",\"name\":\"Test Cargo\",\"format\":\"cargo\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-maven\",\"name\":\"Test Maven\",\"format\":\"maven\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-go\",\"name\":\"Test Go\",\"format\":\"go\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-rpm\",\"name\":\"Test RPM\",\"format\":\"rpm\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-deb\",\"name\":\"Test Debian\",\"format\":\"debian\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-helm\",\"name\":\"Test Helm\",\"format\":\"helm\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-conda\",\"name\":\"Test Conda\",\"format\":\"conda\",\"repo_type\":\"local\",\"is_public\":true}' \
-          '{\"key\":\"test-docker\",\"name\":\"Test Docker\",\"format\":\"docker\",\"repo_type\":\"local\",\"is_public\":true}'; do
-          curl -sf -X POST http://backend:8080/api/v1/repositories \
-            -H \"Authorization: Bearer $$TOKEN\" \
-            -H 'Content-Type: application/json' \
-            -d \"$$repo\" >/dev/null 2>&1 || true
-        done &&
-        echo '==> Setup complete' &&
-        touch /tmp/.setup-done &&
-        tail -f /dev/null
-      "
+    volumes:
+      - ./scripts/e2e-setup.sh:/setup.sh:ro
+    command: ["sh", "/setup.sh"]
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/.setup-done"]
       interval: 2s
