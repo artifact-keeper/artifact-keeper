@@ -5,6 +5,71 @@ description: "Automatic security vulnerability scanning for artifacts in Artifac
 
 Artifact Keeper provides integrated vulnerability scanning for artifacts using multiple scanning engines to detect security issues before they reach production.
 
+## CVE Data Sources
+
+Artifact Keeper uses industry-standard vulnerability databases through its scanner integrations. Understanding where CVE data comes from helps you evaluate the coverage and freshness of security scans.
+
+### Primary Data Source: OSV (Open Source Vulnerabilities)
+
+The default scanner (Trivy) pulls vulnerability data from [osv.dev](https://osv.dev), Google's open source vulnerability database. OSV aggregates data from:
+
+- **NVD (National Vulnerability Database)** — The U.S. government repository of CVE data
+- **GitHub Security Advisories** — Vulnerabilities reported through GitHub's security advisory system
+- **Language-specific databases**:
+  - **npm**: npm security advisories
+  - **PyPI**: Python Packaging Advisory Database
+  - **RubyGems**: Ruby Advisory Database
+  - **Cargo**: RustSec Advisory Database
+  - **Go**: Go Vulnerability Database
+  - **Maven**: OSS Index
+
+### Database Update Frequency
+
+| Scanner | Update Frequency | Method |
+|---------|------------------|--------|
+| Trivy | Every 6 hours | Automatic background sync |
+| Grype | Every 24 hours | Automatic on startup |
+| Manual | On-demand | `trivy image --download-db-only` |
+
+### Retroactive CVE Updates
+
+When new CVEs are disclosed, Artifact Keeper can re-scan existing artifacts:
+
+1. **Scheduled rescans**: Configure periodic rescans in `SCAN_RESCAN_INTERVAL` (e.g., `24h`)
+2. **On-demand rescans**: Trigger via API or UI when a new critical CVE is announced
+3. **CVE timeline tracking**: The scan results show when the CVE was first published vs. when the artifact was uploaded
+
+```yaml
+# Enable scheduled rescans
+scanning:
+  rescan:
+    enabled: true
+    interval: "24h"        # Rescan all artifacts daily
+    max_artifact_age: "90d" # Only rescan artifacts from last 90 days
+    priority: "low"        # Background priority
+```
+
+### Checking CVE Freshness
+
+View the CVE database update timestamp:
+
+```bash
+GET /api/v1/security/database/status
+```
+
+```json
+{
+  "databases": {
+    "trivy": {
+      "version": "2024-01-15T10:00:00Z",
+      "cve_count": 245892,
+      "last_updated": "2024-01-15T12:30:00Z",
+      "next_update": "2024-01-15T18:30:00Z"
+    }
+  }
+}
+```
+
 ## Overview
 
 Artifact Keeper automatically scans uploaded artifacts for known vulnerabilities and security issues using industry-standard scanning tools.
