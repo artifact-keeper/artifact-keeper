@@ -70,7 +70,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --profile PROFILE  Test profile to run (smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker)"
+            echo "  --profile PROFILE  Test profile to run (smoke, all, redteam, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker)"
             echo "  --build            Force rebuild all containers"
             echo "  --clean            Clean up containers and volumes after tests"
             echo "  --stress           Run stress tests after E2E tests"
@@ -131,6 +131,21 @@ docker compose -f docker-compose.test.yml down -v --remove-orphans 2>/dev/null |
 
 # Set up environment variables for test configuration
 export TEST_TAG="${TEST_TAG}"
+
+# Red team profile: run security tests only (no Playwright)
+if [ "$PROFILE" = "redteam" ]; then
+    echo -e "${BLUE}Running red team security tests...${NC}"
+    docker compose -f docker-compose.test.yml --profile redteam up \
+        $BUILD_FLAG --abort-on-container-exit
+    REDTEAM_EXIT=$?
+    echo ""
+    if [ $REDTEAM_EXIT -eq 0 ]; then
+        echo -e "${GREEN}Red team tests completed.${NC}"
+    else
+        echo -e "${RED}Red team tests failed (exit code: $REDTEAM_EXIT).${NC}"
+    fi
+    exit $REDTEAM_EXIT
+fi
 
 # Build and start containers with profile
 echo -e "${BLUE}Running Playwright E2E tests...${NC}"

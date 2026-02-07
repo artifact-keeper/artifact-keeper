@@ -1,0 +1,52 @@
+# Red team security testing container
+# Usage: docker compose -f docker-compose.test.yml --profile redteam up --build
+
+FROM alpine:3.19
+
+# Core tools from Alpine repos
+RUN apk add --no-cache \
+    bash \
+    curl \
+    jq \
+    nmap \
+    nmap-ncat \
+    nmap-scripts \
+    openssl \
+    python3 \
+    py3-pip \
+    perl \
+    perl-net-ssleay \
+    git \
+    unzip \
+    && true
+
+# nikto (not in Alpine repos, clone from source)
+RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \
+    ln -s /opt/nikto/program/nikto.pl /usr/local/bin/nikto && \
+    chmod +x /opt/nikto/program/nikto.pl
+
+# grpcurl (latest release binary)
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then ARCH="linux_x86_64"; \
+    elif [ "$ARCH" = "aarch64" ]; then ARCH="linux_arm64"; fi && \
+    GRPCURL_VERSION=$(curl -sL https://api.github.com/repos/fullstorydev/grpcurl/releases/latest | jq -r .tag_name) && \
+    curl -sL "https://github.com/fullstorydev/grpcurl/releases/download/${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION#v}_${ARCH}.tar.gz" | \
+    tar -xz -C /usr/local/bin grpcurl && \
+    chmod +x /usr/local/bin/grpcurl
+
+# nuclei (latest release binary)
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then ARCH="linux_amd64"; \
+    elif [ "$ARCH" = "aarch64" ]; then ARCH="linux_arm64"; fi && \
+    NUCLEI_VERSION=$(curl -sL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | jq -r .tag_name) && \
+    curl -sL "https://github.com/projectdiscovery/nuclei/releases/download/${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION#v}_${ARCH}.zip" -o /tmp/nuclei.zip && \
+    unzip -o /tmp/nuclei.zip -d /usr/local/bin && \
+    chmod +x /usr/local/bin/nuclei && \
+    rm /tmp/nuclei.zip
+
+# sqlmap (pip install)
+RUN pip3 install --no-cache-dir --break-system-packages sqlmap
+
+WORKDIR /redteam
+
+CMD ["bash", "/scripts/run-all.sh"]

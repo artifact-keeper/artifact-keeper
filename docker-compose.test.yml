@@ -95,7 +95,7 @@ services:
       retries: 30
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "redteam"]
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
@@ -129,7 +129,7 @@ services:
       retries: 20
     networks:
       - e2e-test-network
-    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all"]
+    profiles: ["pypi", "npm", "cargo", "maven", "go", "rpm", "deb", "helm", "conda", "docker", "smoke", "all", "redteam"]
 
   # ==========================================================================
   # SMOKE TEST SERVICES (pypi, npm, cargo)
@@ -345,6 +345,39 @@ services:
       - e2e-test-network
     profiles: ["docker", "all"]
 
+  # ==========================================================================
+  # RED TEAM SECURITY TESTING
+  # ==========================================================================
+
+  redteam:
+    build:
+      context: .
+      dockerfile: Dockerfile.redteam
+    container_name: e2e-test-redteam
+    depends_on:
+      setup:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080
+      GRPC_URL: backend:9090
+      ADMIN_USER: admin
+      ADMIN_PASS: admin123
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: registry
+      DB_PASS: registry
+      DB_NAME: artifact_registry
+      RESULTS_DIR: /results
+    volumes:
+      - ./scripts/redteam:/scripts:ro
+      - redteam-results:/results
+    command: ["bash", "/scripts/run-all.sh"]
+    cap_add:
+      - NET_RAW
+    networks:
+      - e2e-test-network
+    profiles: ["redteam"]
+
 networks:
   e2e-test-network:
     name: e2e-test-network
@@ -355,3 +388,4 @@ volumes:
   maven-cache:
   go-cache:
   trivy-cache:
+  redteam-results:
