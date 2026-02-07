@@ -2,24 +2,25 @@
 # Setup + Run + Teardown for STS Credential Rotation Test
 #
 # This script:
-#   1. Creates a temporary IAM role with S3 access
-#   2. Creates a temporary S3 bucket (or uses existing)
+#   1. Creates a temporary S3 bucket (or uses existing)
+#   2. Optionally creates a temporary IAM role (if caller is an IAM user, not root)
 #   3. Runs test-s3-sts-rotation.sh
-#   4. Tears down ALL AWS resources it created (role, policy, bucket)
+#   4. Tears down ALL AWS resources it created
 #
 # Prerequisites:
-#   - AWS CLI v2 configured with admin/root credentials
+#   - AWS CLI v2 configured with admin credentials
 #   - Backend binary built (cargo build)
-#   - PostgreSQL running locally
+#   - PostgreSQL running locally (or via Docker)
 #
 # Optional environment variables:
 #   S3_BUCKET        - Use existing bucket instead of creating one
 #   S3_REGION        - AWS region (default: us-east-1)
 #   KEEP_RESOURCES   - Set to "true" to skip teardown (for debugging)
-#   DATABASE_URL     - PostgreSQL URL (default: postgresql://registry:registry@localhost:5432/artifact_registry)
+#   DATABASE_URL     - PostgreSQL URL (default: postgresql://registry:registry@localhost:30432/artifact_registry)
+#   CREATE_ROLE      - Set to "true" to create an IAM role (requires IAM user, not root)
 #
 # Usage:
-#   ./setup-sts-test.sh                          # Create everything, test, cleanup
+#   ./setup-sts-test.sh                          # Create bucket, test, cleanup
 #   S3_BUCKET=my-bucket ./setup-sts-test.sh      # Use existing bucket
 #   KEEP_RESOURCES=true ./setup-sts-test.sh      # Don't cleanup (for debugging)
 #
@@ -31,7 +32,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 S3_REGION="${S3_REGION:-us-east-1}"
 KEEP_RESOURCES="${KEEP_RESOURCES:-false}"
-DATABASE_URL="${DATABASE_URL:-postgresql://registry:registry@localhost:5432/artifact_registry}"
+CREATE_ROLE="${CREATE_ROLE:-false}"
+DATABASE_URL="${DATABASE_URL:-postgresql://registry:registry@localhost:30432/artifact_registry}"
 
 # Unique suffix for all resources
 SUFFIX="$(date +%s)"
@@ -109,7 +111,7 @@ trap teardown EXIT
 echo -e "${CYAN}=== STS Credential Rotation Test Setup ===${NC}"
 echo ""
 
-for cmd in aws jq curl psql; do
+for cmd in aws jq curl; do
     if ! command -v "$cmd" &> /dev/null; then
         err "$cmd is not installed"
         exit 1
@@ -117,11 +119,24 @@ for cmd in aws jq curl psql; do
 done
 
 info "Verifying AWS credentials..."
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || {
+CALLER=$(aws sts get-caller-identity --output json 2>/dev/null) || {
     err "AWS credentials not configured"
     exit 1
 }
-ok "AWS account: $ACCOUNT_ID"
+ACCOUNT_ID=$(echo "$CALLER" | jq -r '.Account')
+CALLER_ARN=$(echo "$CALLER" | jq -r '.Arn')
+ok "AWS account: $ACCOUNT_ID (identity: $CALLER_ARN)"
+
+# Detect if running as root (root can't assume roles)
+IS_ROOT=false
+if echo "$CALLER_ARN" | grep -q ":root$"; then
+    IS_ROOT=true
+    if [ "$CREATE_ROLE" = "true" ]; then
+        warn "Running as root account - root cannot assume IAM roles"
+        warn "Will use get-session-token instead (CREATE_ROLE=true ignored)"
+        CREATE_ROLE=false
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1: Create S3 bucket (if not provided)
@@ -159,11 +174,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 2: Create IAM policy
+# Step 2: Optionally create IAM role (for IAM users, not root)
 # ---------------------------------------------------------------------------
-info "Creating IAM policy: $POLICY_NAME"
-
-POLICY_DOC=$(cat <<POLICY_EOF
+ROLE_ARN=""
+if [ "$CREATE_ROLE" = "true" ]; then
+    info "Creating IAM policy: $POLICY_NAME"
+    POLICY_DOC=$(cat <<POLICY_EOF
 {
     "Version": "2012-10-17",
     "Statement": [
@@ -184,82 +200,62 @@ POLICY_DOC=$(cat <<POLICY_EOF
 }
 POLICY_EOF
 )
+    POLICY_RESP=$(aws iam create-policy \
+        --policy-name "$POLICY_NAME" \
+        --policy-document "$POLICY_DOC" \
+        --output json)
+    CREATED_POLICY_ARN=$(echo "$POLICY_RESP" | jq -r '.Policy.Arn')
+    ok "IAM policy created: $CREATED_POLICY_ARN"
 
-POLICY_RESP=$(aws iam create-policy \
-    --policy-name "$POLICY_NAME" \
-    --policy-document "$POLICY_DOC" \
-    --output json)
-CREATED_POLICY_ARN=$(echo "$POLICY_RESP" | jq -r '.Policy.Arn')
-ok "IAM policy created: $CREATED_POLICY_ARN"
-
-# ---------------------------------------------------------------------------
-# Step 3: Create IAM role (assumable by current account)
-# ---------------------------------------------------------------------------
-info "Creating IAM role: $ROLE_NAME"
-
-TRUST_POLICY=$(cat <<TRUST_EOF
+    info "Creating IAM role: $ROLE_NAME"
+    TRUST_POLICY=$(cat <<TRUST_EOF
 {
     "Version": "2012-10-17",
     "Statement": [
         {
             "Effect": "Allow",
             "Principal": {
-                "AWS": "arn:aws:iam::${ACCOUNT_ID}:root"
+                "AWS": "${CALLER_ARN}"
             },
-            "Action": "sts:AssumeRole",
-            "Condition": {}
+            "Action": "sts:AssumeRole"
         }
     ]
 }
 TRUST_EOF
 )
+    aws iam create-role \
+        --role-name "$ROLE_NAME" \
+        --assume-role-policy-document "$TRUST_POLICY" \
+        --max-session-duration 3600 \
+        --description "Temporary role for artifact-keeper STS credential rotation test" \
+        --output json > /dev/null
+    CREATED_ROLE="$ROLE_NAME"
 
-aws iam create-role \
-    --role-name "$ROLE_NAME" \
-    --assume-role-policy-document "$TRUST_POLICY" \
-    --max-session-duration 900 \
-    --description "Temporary role for artifact-keeper STS credential rotation test" \
-    --output json > /dev/null
-CREATED_ROLE="$ROLE_NAME"
+    aws iam attach-role-policy \
+        --role-name "$ROLE_NAME" \
+        --policy-arn "$CREATED_POLICY_ARN"
+    ok "IAM role created and policy attached"
 
-aws iam attach-role-policy \
-    --role-name "$ROLE_NAME" \
-    --policy-arn "$CREATED_POLICY_ARN"
-
-ok "IAM role created and policy attached"
-
-# IAM propagation delay - roles take a few seconds to become assumable
-info "Waiting for IAM role propagation (10s)..."
-sleep 10
-
-# Verify role is assumable
-info "Verifying role can be assumed..."
-ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
-VERIFY=$(aws sts assume-role \
-    --role-arn "$ROLE_ARN" \
-    --role-session-name "verify-test" \
-    --duration-seconds 900 \
-    --output json 2>&1) || {
-    err "Cannot assume role. IAM may still be propagating. Try again in 30s."
-    echo "$VERIFY"
-    exit 1
-}
-ok "Role is assumable: $ROLE_ARN"
+    info "Waiting for IAM role propagation (15s)..."
+    sleep 15
+    ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+    ok "Role ready: $ROLE_ARN"
+else
+    info "Skipping IAM role creation (using get-session-token mode)"
+fi
 
 # ---------------------------------------------------------------------------
-# Step 4: Run the test
+# Step 3: Run the test
 # ---------------------------------------------------------------------------
 echo ""
 echo -e "${CYAN}=== Running STS Credential Rotation Test ===${NC}"
 echo ""
 
-STS_ROLE_ARN="$ROLE_ARN" \
-S3_BUCKET="$S3_BUCKET" \
-S3_REGION="$S3_REGION" \
-DATABASE_URL="$DATABASE_URL" \
-SKIP_CLEANUP=true \
-    "${SCRIPT_DIR}/test-s3-sts-rotation.sh"
+export S3_BUCKET S3_REGION DATABASE_URL
+export SKIP_CLEANUP=true
+[ -n "$ROLE_ARN" ] && export STS_ROLE_ARN="$ROLE_ARN"
 
+"${SCRIPT_DIR}/test-s3-sts-rotation.sh"
 TEST_EXIT=$?
 
 # The trap will handle teardown

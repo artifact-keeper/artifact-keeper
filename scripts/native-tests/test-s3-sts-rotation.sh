@@ -2,44 +2,46 @@
 # S3 STS Credential Rotation E2E Test
 #
 # Verifies that presigned URLs survive STS credential rotation.
-# Uses short-lived AssumeRole credentials to prove that the backend
-# refreshes credentials before generating each presigned URL (Option A),
+# Uses short-lived session tokens to prove that the backend refreshes
+# credentials before generating each presigned URL (Option A),
 # and that dedicated signing credentials work independently (Option B).
 #
+# Supports two modes:
+#   - get-session-token (default): Works with any AWS identity including root
+#   - assume-role: Use when STS_ROLE_ARN is provided (requires IAM user, not root)
+#
 # Prerequisites:
-#   - AWS CLI v2 configured with long-lived IAM credentials
-#   - An IAM role that the current user can assume (with s3:* on test bucket)
+#   - AWS CLI v2 configured with valid credentials
 #   - Backend built but NOT yet running (this script manages the backend process)
-#   - PostgreSQL running (DATABASE_URL accessible)
+#   - PostgreSQL running (DATABASE_URL accessible, or via DB_CONTAINER docker)
 #   - jq, curl installed
 #
 # Required environment variables:
-#   STS_ROLE_ARN     - IAM role ARN to assume (e.g., arn:aws:iam::123:role/test-role)
 #   S3_BUCKET        - S3 bucket for testing
 #
 # Optional environment variables:
+#   STS_ROLE_ARN     - IAM role ARN to assume (omit to use get-session-token)
 #   S3_REGION        - AWS region (default: us-east-1)
 #   API_URL          - Backend URL (default: http://localhost:8080)
 #   ADMIN_USER       - Admin username (default: admin)
 #   ADMIN_PASS       - Admin password (default: admin123)
-#   DATABASE_URL     - PostgreSQL URL (default: postgresql://registry:registry@localhost:5432/artifact_registry)
+#   DATABASE_URL     - PostgreSQL URL (default: postgresql://registry:registry@localhost:30432/artifact_registry)
+#   DB_CONTAINER     - Docker container for psql fallback (default: artifact-keeper-dev-db)
 #   BACKEND_BIN      - Path to backend binary (default: auto-detect from cargo)
-#   STS_DURATION     - STS credential duration in seconds (default: 900, minimum)
+#   STS_DURATION     - STS credential duration in seconds (default: 900)
 #   SKIP_CLEANUP     - Set to "true" to skip cleanup
 #
 # Usage:
-#   STS_ROLE_ARN=arn:aws:iam::123456789:role/artifact-keeper-test \
-#   S3_BUCKET=my-test-bucket \
-#     ./test-s3-sts-rotation.sh
+#   S3_BUCKET=my-test-bucket ./test-s3-sts-rotation.sh
+#
+#   # With assume-role (requires IAM user, not root):
+#   STS_ROLE_ARN=arn:aws:iam::123:role/test-role S3_BUCKET=my-bucket ./test-s3-sts-rotation.sh
 #
 # What this tests:
 #   1. Backend starts with short-lived STS credentials
-#   2. Presigned URL generated immediately → valid (download succeeds)
-#   3. Backend process is restarted with EXPIRED credentials (simulated by
-#      setting AWS_SESSION_TOKEN to a bogus value while keeping the real
-#      credentials in the environment for the SDK's metadata refresh)
-#   4. Presigned URL generated after restart → still valid (proves refresh works)
-#   5. Option B: Dedicated signing credentials bypass STS entirely
+#   2. Presigned URL generated immediately -> valid (download succeeds)
+#   3. Backend restarted, presigned URL still valid (credential refresh works)
+#   4. Option B: Dedicated signing credentials bypass STS entirely
 #
 # Cost estimate: ~$0.02 (a few S3 PUTs/GETs + STS API calls)
 
@@ -49,15 +51,16 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET is required}"
-STS_ROLE_ARN="${STS_ROLE_ARN:?STS_ROLE_ARN is required}"
+STS_ROLE_ARN="${STS_ROLE_ARN:-}"
 S3_REGION="${S3_REGION:-us-east-1}"
 API_URL="${API_URL:-http://localhost:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
 ADMIN_PASS="${ADMIN_PASS:-admin123}"
-DATABASE_URL="${DATABASE_URL:-postgresql://registry:registry@localhost:5432/artifact_registry}"
+DATABASE_URL="${DATABASE_URL:-postgresql://registry:registry@localhost:30432/artifact_registry}"
 BACKEND_BIN="${BACKEND_BIN:-}"
 STS_DURATION="${STS_DURATION:-900}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
+DB_CONTAINER="${DB_CONTAINER:-artifact-keeper-dev-db}"
 
 # Test identifiers
 TEST_ID="sts-rotation-$$-$(date +%s)"
@@ -80,6 +83,26 @@ header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
 
 FAILURES=0
 
+# Helper: run SQL via local psql or docker exec
+run_sql() {
+    local sql="$1"
+    if command -v psql &>/dev/null; then
+        psql "$DATABASE_URL" -c "$sql" 2>&1
+    else
+        docker exec "$DB_CONTAINER" psql -U registry -d artifact_registry -c "$sql" 2>&1
+    fi
+}
+
+# Helper: run SQL and return raw value (no headers, no alignment)
+run_sql_value() {
+    local sql="$1"
+    if command -v psql &>/dev/null; then
+        psql "$DATABASE_URL" -t -A -c "$sql" 2>/dev/null
+    else
+        docker exec "$DB_CONTAINER" psql -U registry -d artifact_registry -t -A -c "$sql" 2>/dev/null
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
@@ -99,7 +122,7 @@ cleanup() {
     aws s3 rm "s3://${S3_BUCKET}/${TEST_REPO}/" --recursive --quiet 2>/dev/null || true
 
     info "Cleaning up database..."
-    psql "$DATABASE_URL" -c "
+    run_sql "
         DELETE FROM artifacts WHERE repository_id IN (
             SELECT id FROM repositories WHERE key LIKE 'sts-test-${TEST_ID}%'
         );
@@ -113,13 +136,21 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 header "Checking Prerequisites"
 
-for cmd in curl jq aws psql; do
+for cmd in curl jq aws; do
     if ! command -v "$cmd" &> /dev/null; then
         echo "ERROR: $cmd is not installed"
         exit 1
     fi
 done
-pass "Required tools installed (curl, jq, aws, psql)"
+# Check for psql locally or via docker
+if command -v psql &>/dev/null; then
+    pass "Required tools installed (curl, jq, aws, psql)"
+elif docker exec "$DB_CONTAINER" pg_isready -U registry 2>/dev/null | grep -q "accepting"; then
+    pass "Required tools installed (curl, jq, aws, psql via docker)"
+else
+    echo "ERROR: Neither psql nor DB container ($DB_CONTAINER) available"
+    exit 1
+fi
 
 # Verify AWS identity
 info "Verifying AWS credentials..."
@@ -141,10 +172,13 @@ pass "S3 bucket accessible: ${S3_BUCKET}"
 
 # Find backend binary
 if [ -z "$BACKEND_BIN" ]; then
-    BACKEND_BIN=$(find target/release -name "artifact-keeper-backend" -type f 2>/dev/null | head -1)
-    if [ -z "$BACKEND_BIN" ]; then
-        BACKEND_BIN=$(find target/debug -name "artifact-keeper-backend" -type f 2>/dev/null | head -1)
-    fi
+    REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+    for name in artifact-keeper artifact-keeper-backend; do
+        BACKEND_BIN=$(find "$REPO_ROOT/target/release" -name "$name" -type f 2>/dev/null | head -1)
+        [ -n "$BACKEND_BIN" ] && break
+        BACKEND_BIN=$(find "$REPO_ROOT/target/debug" -name "$name" -type f 2>/dev/null | head -1)
+        [ -n "$BACKEND_BIN" ] && break
+    done
     if [ -z "$BACKEND_BIN" ]; then
         echo "ERROR: Cannot find backend binary. Build with 'cargo build' or set BACKEND_BIN."
         exit 1
@@ -153,39 +187,57 @@ fi
 pass "Backend binary found: $BACKEND_BIN"
 
 # Verify database connectivity
-psql "$DATABASE_URL" -c "SELECT 1;" > /dev/null 2>&1 || {
-    echo "ERROR: Cannot connect to PostgreSQL at $DATABASE_URL"
+run_sql "SELECT 1;" > /dev/null 2>&1 || {
+    echo "ERROR: Cannot connect to PostgreSQL"
     exit 1
 }
 pass "Database accessible"
 
 # ---------------------------------------------------------------------------
-# Step 1: Assume role with short-lived credentials
+# Step 1: Get short-lived STS credentials
 # ---------------------------------------------------------------------------
-header "Step 1: Assuming IAM Role with Short-Lived Credentials"
+header "Step 1: Obtaining Short-Lived STS Credentials"
 
-info "Assuming role: ${STS_ROLE_ARN} (duration: ${STS_DURATION}s)"
-STS_RESPONSE=$(aws sts assume-role \
-    --role-arn "$STS_ROLE_ARN" \
-    --role-session-name "artifact-keeper-sts-test-${TEST_ID}" \
-    --duration-seconds "$STS_DURATION" \
-    --output json 2>&1) || {
-    echo "ERROR: Failed to assume role. Ensure your IAM user has sts:AssumeRole permission."
-    echo "$STS_RESPONSE"
-    exit 1
-}
+# Save the caller's long-lived credentials for Option B testing later
+LONG_LIVED_ACCESS_KEY=$(aws configure get aws_access_key_id 2>/dev/null || echo "")
+LONG_LIVED_SECRET_KEY=$(aws configure get aws_secret_access_key 2>/dev/null || echo "")
+
+if [ -n "$STS_ROLE_ARN" ]; then
+    info "Assuming role: ${STS_ROLE_ARN} (duration: ${STS_DURATION}s)"
+    STS_RESPONSE=$(aws sts assume-role \
+        --role-arn "$STS_ROLE_ARN" \
+        --role-session-name "artifact-keeper-sts-test-${TEST_ID}" \
+        --duration-seconds "$STS_DURATION" \
+        --output json 2>&1) || {
+        echo "ERROR: Failed to assume role. Ensure your identity can assume this role."
+        echo "$STS_RESPONSE"
+        exit 1
+    }
+    pass "Role assumed successfully"
+else
+    info "Using get-session-token (duration: ${STS_DURATION}s)"
+    STS_RESPONSE=$(aws sts get-session-token \
+        --duration-seconds "$STS_DURATION" \
+        --output json 2>&1) || {
+        echo "ERROR: Failed to get session token."
+        echo "$STS_RESPONSE"
+        exit 1
+    }
+    pass "Session token obtained successfully"
+fi
 
 STS_ACCESS_KEY=$(echo "$STS_RESPONSE" | jq -r '.Credentials.AccessKeyId')
 STS_SECRET_KEY=$(echo "$STS_RESPONSE" | jq -r '.Credentials.SecretAccessKey')
 STS_SESSION_TOKEN=$(echo "$STS_RESPONSE" | jq -r '.Credentials.SessionToken')
 STS_EXPIRATION=$(echo "$STS_RESPONSE" | jq -r '.Credentials.Expiration')
 
-pass "Role assumed successfully"
 info "Credentials expire at: ${STS_EXPIRATION}"
 info "Access Key ID: ${STS_ACCESS_KEY:0:8}..."
 
 # Calculate remaining TTL
-EXPIRY_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$STS_EXPIRATION" +%s 2>/dev/null || \
+# Parse ISO 8601 expiry (handles both "Z" and "+00:00" suffixes)
+STS_EXPIRATION_CLEAN=$(echo "$STS_EXPIRATION" | sed 's/+00:00$/Z/' | sed 's/Z$//')
+EXPIRY_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$STS_EXPIRATION_CLEAN" +%s 2>/dev/null || \
                date -d "$STS_EXPIRATION" +%s 2>/dev/null || echo "0")
 NOW_EPOCH=$(date +%s)
 REMAINING_TTL=$((EXPIRY_EPOCH - NOW_EPOCH))
@@ -196,12 +248,7 @@ info "Remaining credential TTL: ${REMAINING_TTL}s"
 # ---------------------------------------------------------------------------
 header "Step 2: Starting Backend with STS Credentials"
 
-# Upload a test file directly to S3 first (using our long-lived creds)
 TEST_CONTENT="STS rotation test content - ${TEST_ID}"
-echo "$TEST_CONTENT" | aws s3 cp - "s3://${S3_BUCKET}/${TEST_REPO}/packages/test-pkg/1.0.0/test-artifact.txt" \
-    --region "$S3_REGION" --quiet
-pass "Test artifact uploaded to S3"
-
 BACKEND_LOG="/tmp/sts-test-backend-${TEST_ID}.log"
 
 info "Starting backend with STS credentials..."
@@ -214,6 +261,8 @@ S3_REDIRECT_DOWNLOADS=true \
 S3_PRESIGN_EXPIRY_SECS=3600 \
 STORAGE_BACKEND=s3 \
 DATABASE_URL="$DATABASE_URL" \
+JWT_SECRET="${JWT_SECRET:-test-secret-for-sts-rotation}" \
+ADMIN_PASSWORD="${ADMIN_PASS}" \
 RUST_LOG=info \
 "$BACKEND_BIN" > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
@@ -271,22 +320,37 @@ CREATE_RESP=$(curl -sf -X POST "${API_URL}/api/v1/repositories" \
 REPO_ID=$(echo "$CREATE_RESP" | jq -r '.id')
 pass "Repository created: $REPO_ID"
 
-# Point the repo to our S3 prefix
-psql "$DATABASE_URL" -c "
+# Compute sha256 of test content for storage key
+TEST_SHA256=$(printf '%s' "$TEST_CONTENT" | shasum -a 256 | awk '{print $1}')
+STORAGE_KEY="${TEST_SHA256:0:2}/${TEST_SHA256:2:2}/${TEST_SHA256}"
+info "Storage key: ${STORAGE_KEY}"
+
+# Put the artifact directly in S3 (using long-lived creds, not STS)
+info "Uploading test artifact to S3..."
+printf '%s' "$TEST_CONTENT" | AWS_ACCESS_KEY_ID="$LONG_LIVED_ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$LONG_LIVED_SECRET_KEY" \
+    AWS_SESSION_TOKEN="" \
+    aws s3 cp - "s3://${S3_BUCKET}/${STORAGE_KEY}" --region "$S3_REGION" --quiet
+pass "Artifact uploaded to S3"
+
+# Insert artifact record directly in the database
+TEST_SIZE=${#TEST_CONTENT}
+info "Seeding artifact record in database..."
+run_sql "
+    INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key)
+    VALUES ('${REPO_ID}', 'test-pkg/1.0.0/test-artifact.txt', 'test-artifact.txt', '1.0.0',
+            ${TEST_SIZE}, '${TEST_SHA256}', 'text/plain', '${STORAGE_KEY}')
+    ON CONFLICT (repository_id, path) DO NOTHING;
+" > /dev/null 2>&1
+pass "Artifact record seeded"
+
+# Switch repository to S3 storage backend
+run_sql "
     UPDATE repositories
-    SET storage_backend = 's3', storage_path = '${TEST_REPO}'
+    SET storage_backend = 's3'
     WHERE key = '${TEST_REPO}'
 " > /dev/null 2>&1
-pass "Repository configured for S3"
-
-# Register the artifact in the database
-psql "$DATABASE_URL" -c "
-    INSERT INTO artifacts (repository_id, path, storage_key, size_bytes, sha256)
-    VALUES ('${REPO_ID}', 'test-pkg/1.0.0/test-artifact.txt',
-            '${TEST_REPO}/packages/test-pkg/1.0.0/test-artifact.txt',
-            ${#TEST_CONTENT}, encode(sha256(E'${TEST_CONTENT}'), 'hex'))
-    ON CONFLICT DO NOTHING;
-" > /dev/null 2>&1 || warn "Could not seed artifact record (may already exist)"
+pass "Repository switched to S3 storage backend"
 
 # ---------------------------------------------------------------------------
 # Step 4: Test presigned URL with fresh STS credentials
@@ -301,9 +365,9 @@ info "Requesting presigned URL..."
 DOWNLOAD_HEADERS=$(curl -sI "${API_URL}/api/v1/repositories/${TEST_REPO}/download/test-pkg/1.0.0/test-artifact.txt" \
     -H "Authorization: Bearer $TOKEN" 2>&1)
 
-HTTP_STATUS=$(echo "$DOWNLOAD_HEADERS" | grep -i "^HTTP" | tail -1 | awk '{print $2}')
-LOCATION=$(echo "$DOWNLOAD_HEADERS" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n')
-STORAGE_HDR=$(echo "$DOWNLOAD_HEADERS" | grep -i "x-artifact-storage" | awk '{print $2}' | tr -d '\r\n')
+HTTP_STATUS=$(echo "$DOWNLOAD_HEADERS" | grep -i "^HTTP" | tail -1 | awk '{print $2}' || echo "")
+LOCATION=$(echo "$DOWNLOAD_HEADERS" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n' || echo "")
+STORAGE_HDR=$(echo "$DOWNLOAD_HEADERS" | grep -i "x-artifact-storage" | awk '{print $2}' | tr -d '\r\n' || echo "")
 
 info "HTTP Status: $HTTP_STATUS"
 info "Storage: ${STORAGE_HDR:-N/A}"
@@ -383,6 +447,8 @@ S3_REDIRECT_DOWNLOADS=true \
 S3_PRESIGN_EXPIRY_SECS=3600 \
 STORAGE_BACKEND=s3 \
 DATABASE_URL="$DATABASE_URL" \
+JWT_SECRET="${JWT_SECRET:-test-secret-for-sts-rotation}" \
+ADMIN_PASSWORD="${ADMIN_PASS}" \
 RUST_LOG=debug \
 "$BACKEND_BIN" > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
@@ -409,8 +475,8 @@ else
     DOWNLOAD_HEADERS2=$(curl -sI "${API_URL}/api/v1/repositories/${TEST_REPO}/download/test-pkg/1.0.0/test-artifact.txt" \
         -H "Authorization: Bearer $TOKEN" 2>&1)
 
-    HTTP_STATUS2=$(echo "$DOWNLOAD_HEADERS2" | grep -i "^HTTP" | tail -1 | awk '{print $2}')
-    LOCATION2=$(echo "$DOWNLOAD_HEADERS2" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n')
+    HTTP_STATUS2=$(echo "$DOWNLOAD_HEADERS2" | grep -i "^HTTP" | tail -1 | awk '{print $2}' || echo "")
+    LOCATION2=$(echo "$DOWNLOAD_HEADERS2" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n' || echo "")
 
     if [ "$HTTP_STATUS2" = "302" ] && [ -n "$LOCATION2" ]; then
         DOWNLOADED2=$(curl -sf "$LOCATION2" 2>&1) || DOWNLOADED2=""
@@ -444,10 +510,10 @@ wait "$BACKEND_PID" 2>/dev/null || true
 BACKEND_PID=""
 sleep 1
 
-# Get the caller's own long-lived credentials for signing
-# (In production this would be a separate IAM user's keys)
-SIGNING_ACCESS_KEY=$(aws configure get aws_access_key_id 2>/dev/null || echo "")
-SIGNING_SECRET_KEY=$(aws configure get aws_secret_access_key 2>/dev/null || echo "")
+# Use the caller's long-lived credentials for signing (saved earlier)
+# In production this would be a dedicated IAM user's keys
+SIGNING_ACCESS_KEY="$LONG_LIVED_ACCESS_KEY"
+SIGNING_SECRET_KEY="$LONG_LIVED_SECRET_KEY"
 
 if [ -n "$SIGNING_ACCESS_KEY" ] && [ -n "$SIGNING_SECRET_KEY" ]; then
     info "Using caller's IAM credentials as dedicated signing keys"
@@ -464,6 +530,8 @@ if [ -n "$SIGNING_ACCESS_KEY" ] && [ -n "$SIGNING_SECRET_KEY" ]; then
     S3_PRESIGN_SECRET_ACCESS_KEY="$SIGNING_SECRET_KEY" \
     STORAGE_BACKEND=s3 \
     DATABASE_URL="$DATABASE_URL" \
+    JWT_SECRET="${JWT_SECRET:-test-secret-for-sts-rotation}" \
+    ADMIN_PASSWORD="${ADMIN_PASS}" \
     RUST_LOG=info \
     "$BACKEND_BIN" > "$BACKEND_LOG" 2>&1 &
     BACKEND_PID=$!
@@ -494,8 +562,8 @@ if [ -n "$SIGNING_ACCESS_KEY" ] && [ -n "$SIGNING_SECRET_KEY" ]; then
         DOWNLOAD_HEADERS3=$(curl -sI "${API_URL}/api/v1/repositories/${TEST_REPO}/download/test-pkg/1.0.0/test-artifact.txt" \
             -H "Authorization: Bearer $TOKEN" 2>&1)
 
-        HTTP_STATUS3=$(echo "$DOWNLOAD_HEADERS3" | grep -i "^HTTP" | tail -1 | awk '{print $2}')
-        LOCATION3=$(echo "$DOWNLOAD_HEADERS3" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n')
+        HTTP_STATUS3=$(echo "$DOWNLOAD_HEADERS3" | grep -i "^HTTP" | tail -1 | awk '{print $2}' || echo "")
+        LOCATION3=$(echo "$DOWNLOAD_HEADERS3" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n' || echo "")
 
         if [ "$HTTP_STATUS3" = "302" ] && [ -n "$LOCATION3" ]; then
             # Verify the URL was NOT signed with STS creds (no Security-Token)
