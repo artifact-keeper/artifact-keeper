@@ -9,7 +9,6 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::models::sbom::PolicyAction;
 
-/// Policy violation found during evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyViolation {
     pub rule: String,
@@ -18,22 +17,15 @@ pub struct PolicyViolation {
     pub details: Option<serde_json::Value>,
 }
 
-/// Result of policy evaluation for an artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyEvaluationResult {
-    /// Whether the artifact passes all policies
     pub passed: bool,
-    /// Action to take: allow, warn, or block
     pub action: PolicyAction,
-    /// List of policy violations
     pub violations: Vec<PolicyViolation>,
-    /// CVE summary
     pub cve_summary: Option<CveSummary>,
-    /// License summary
     pub license_summary: Option<LicenseSummary>,
 }
 
-/// Summary of CVE findings for an artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CveSummary {
     pub critical_count: i32,
@@ -44,7 +36,6 @@ pub struct CveSummary {
     pub open_cves: Vec<String>,
 }
 
-/// Summary of license findings for an artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LicenseSummary {
     pub licenses_found: Vec<String>,
@@ -52,16 +43,123 @@ pub struct LicenseSummary {
     pub unknown_licenses: Vec<String>,
 }
 
-/// CVE threshold policy configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CveThresholdPolicy {
-    pub max_critical: i32,
-    pub max_high: i32,
-    pub max_medium: Option<i32>,
-    pub max_low: Option<i32>,
+/// Evaluate CVE counts against a severity threshold, returning violations for
+/// any severity level that exceeds the implied limit.
+fn evaluate_cve_thresholds(
+    summary: &CveSummary,
+    max_severity: &str,
+    block_on_fail: bool,
+) -> Vec<PolicyViolation> {
+    let (max_critical, max_high, max_medium) = match max_severity.to_lowercase().as_str() {
+        "critical" => (0, i32::MAX, i32::MAX),
+        "high" => (0, 0, i32::MAX),
+        "medium" | "low" => (0, 0, 0),
+        _ => (0, 0, i32::MAX),
+    };
+
+    let checks: &[(&str, i32, i32)] = &[
+        ("critical", summary.critical_count, max_critical),
+        ("high", summary.high_count, max_high),
+        ("medium", summary.medium_count, max_medium),
+    ];
+
+    checks
+        .iter()
+        .filter(|(_, count, max)| count > max)
+        .map(|(severity, count, max)| PolicyViolation {
+            rule: "cve-severity-threshold".to_string(),
+            severity: severity.to_string(),
+            message: format!(
+                "Found {} {} vulnerabilities (max allowed: {})",
+                count,
+                if *severity == "high" {
+                    "high severity"
+                } else {
+                    severity
+                },
+                max
+            ),
+            details: Some(serde_json::json!({
+                "count": count,
+                "max_allowed": max,
+                "block_on_fail": block_on_fail
+            })),
+        })
+        .collect()
 }
 
-/// Service for evaluating promotion policies.
+/// Evaluate licenses found in an SBOM against a license policy, returning
+/// violations for denied or unrecognized licenses.
+fn evaluate_license_policy(
+    summary: &LicenseSummary,
+    policy: &LicensePolicyConfig,
+) -> Vec<PolicyViolation> {
+    let mut violations = Vec::new();
+    let mut denied_found = Vec::new();
+    let mut unknown_found = Vec::new();
+
+    for license in &summary.licenses_found {
+        let normalized = license.to_uppercase();
+
+        if policy
+            .denied_licenses
+            .iter()
+            .any(|d| d.to_uppercase() == normalized)
+        {
+            denied_found.push(license.clone());
+            continue;
+        }
+
+        if !policy.allowed_licenses.is_empty()
+            && !policy
+                .allowed_licenses
+                .iter()
+                .any(|a| a.to_uppercase() == normalized)
+            && !policy.allow_unknown
+        {
+            unknown_found.push(license.clone());
+        }
+    }
+
+    if !denied_found.is_empty() {
+        violations.push(PolicyViolation {
+            rule: "license-compliance".to_string(),
+            severity: match policy.action {
+                PolicyAction::Block => "critical".to_string(),
+                PolicyAction::Warn => "medium".to_string(),
+                PolicyAction::Allow => "low".to_string(),
+            },
+            message: format!(
+                "Found {} denied licenses: {}",
+                denied_found.len(),
+                denied_found.join(", ")
+            ),
+            details: Some(serde_json::json!({
+                "denied_licenses": denied_found,
+                "policy_name": policy.name
+            })),
+        });
+    }
+
+    if !unknown_found.is_empty() {
+        violations.push(PolicyViolation {
+            rule: "license-compliance".to_string(),
+            severity: "medium".to_string(),
+            message: format!(
+                "Found {} licenses not in allowed list: {}",
+                unknown_found.len(),
+                unknown_found.join(", ")
+            ),
+            details: Some(serde_json::json!({
+                "unknown_licenses": unknown_found,
+                "policy_name": policy.name
+            })),
+        });
+    }
+
+    violations
+}
+
 pub struct PromotionPolicyService {
     db: PgPool,
 }
@@ -71,7 +169,6 @@ impl PromotionPolicyService {
         Self { db }
     }
 
-    /// Evaluate an artifact against all applicable policies.
     pub async fn evaluate_artifact(
         &self,
         artifact_id: Uuid,
@@ -80,26 +177,15 @@ impl PromotionPolicyService {
         let mut violations = Vec::new();
         let mut action = PolicyAction::Allow;
 
-        // Get CVE summary from scan results
         let cve_summary = self.get_cve_summary(artifact_id).await?;
-
-        // Get license summary from SBOM
         let license_summary = self.get_license_summary(artifact_id).await?;
-
-        // Get scan policy for repository (if any)
         let scan_policy = self.get_scan_policy(repository_id).await?;
-
-        // Get license policy for repository (if any)
         let license_policy = self.get_license_policy(repository_id).await?;
 
-        // Evaluate CVE thresholds
         if let Some(ref summary) = cve_summary {
             if let Some(ref policy) = scan_policy {
-                let cve_violations = self.evaluate_cve_thresholds(
-                    summary,
-                    &policy.max_severity,
-                    policy.block_on_fail,
-                );
+                let cve_violations =
+                    evaluate_cve_thresholds(summary, &policy.max_severity, policy.block_on_fail);
 
                 for v in cve_violations {
                     if v.severity == "critical" || v.severity == "high" {
@@ -109,29 +195,26 @@ impl PromotionPolicyService {
                     }
                     violations.push(v);
                 }
-            } else {
+            } else if summary.critical_count > 0 {
                 // Default policy: block on any critical CVEs
-                if summary.critical_count > 0 {
-                    action = PolicyAction::Block;
-                    violations.push(PolicyViolation {
-                        rule: "default-cve-policy".to_string(),
-                        severity: "critical".to_string(),
-                        message: format!(
-                            "Artifact has {} critical vulnerabilities",
-                            summary.critical_count
-                        ),
-                        details: Some(serde_json::json!({
-                            "cves": summary.open_cves
-                        })),
-                    });
-                }
+                action = PolicyAction::Block;
+                violations.push(PolicyViolation {
+                    rule: "default-cve-policy".to_string(),
+                    severity: "critical".to_string(),
+                    message: format!(
+                        "Artifact has {} critical vulnerabilities",
+                        summary.critical_count
+                    ),
+                    details: Some(serde_json::json!({
+                        "cves": summary.open_cves
+                    })),
+                });
             }
         }
 
-        // Evaluate license compliance
         if let Some(ref summary) = license_summary {
             if let Some(ref policy) = license_policy {
-                let license_violations = self.evaluate_license_policy(summary, policy);
+                let license_violations = evaluate_license_policy(summary, policy);
 
                 for v in license_violations {
                     match policy.action {
@@ -157,9 +240,7 @@ impl PromotionPolicyService {
         })
     }
 
-    /// Get CVE summary for an artifact from scan results.
     async fn get_cve_summary(&self, artifact_id: Uuid) -> Result<Option<CveSummary>> {
-        // Get the latest scan result for this artifact
         let scan = sqlx::query!(
             r#"
             SELECT
@@ -174,29 +255,27 @@ impl PromotionPolicyService {
         .fetch_optional(&self.db)
         .await?;
 
-        if let Some(scan) = scan {
-            // Get open CVEs - use a type annotation to help sqlx
-            let cves: Vec<String> = sqlx::query_scalar!(
-                r#"SELECT DISTINCT cve_id as "cve_id!" FROM cve_history WHERE artifact_id = $1 AND status = 'open' AND cve_id IS NOT NULL"#,
-                artifact_id
-            )
-            .fetch_all(&self.db)
-            .await?;
+        let Some(scan) = scan else {
+            return Ok(None);
+        };
 
-            Ok(Some(CveSummary {
-                critical_count: scan.critical_count,
-                high_count: scan.high_count,
-                medium_count: scan.medium_count,
-                low_count: scan.low_count,
-                total_count: scan.findings_count,
-                open_cves: cves,
-            }))
-        } else {
-            Ok(None)
-        }
+        let cves: Vec<String> = sqlx::query_scalar!(
+            r#"SELECT DISTINCT cve_id as "cve_id!" FROM cve_history WHERE artifact_id = $1 AND status = 'open' AND cve_id IS NOT NULL"#,
+            artifact_id
+        )
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(Some(CveSummary {
+            critical_count: scan.critical_count,
+            high_count: scan.high_count,
+            medium_count: scan.medium_count,
+            low_count: scan.low_count,
+            total_count: scan.findings_count,
+            open_cves: cves,
+        }))
     }
 
-    /// Get license summary for an artifact from SBOM.
     async fn get_license_summary(&self, artifact_id: Uuid) -> Result<Option<LicenseSummary>> {
         let sbom = sqlx::query!(
             r#"
@@ -211,18 +290,13 @@ impl PromotionPolicyService {
         .fetch_optional(&self.db)
         .await?;
 
-        if let Some(sbom) = sbom {
-            Ok(Some(LicenseSummary {
-                licenses_found: sbom.licenses.unwrap_or_default(),
-                denied_licenses: vec![],
-                unknown_licenses: vec![],
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(sbom.map(|s| LicenseSummary {
+            licenses_found: s.licenses.unwrap_or_default(),
+            denied_licenses: vec![],
+            unknown_licenses: vec![],
+        }))
     }
 
-    /// Get scan policy for a repository.
     async fn get_scan_policy(&self, repository_id: Uuid) -> Result<Option<ScanPolicyConfig>> {
         let policy = sqlx::query!(
             r#"
@@ -238,15 +312,14 @@ impl PromotionPolicyService {
         .await?;
 
         Ok(policy.map(|p| ScanPolicyConfig {
-            id: p.id,
-            name: p.name,
+            _id: p.id,
+            _name: p.name,
             max_severity: p.max_severity,
-            block_unscanned: p.block_unscanned,
+            _block_unscanned: p.block_unscanned,
             block_on_fail: p.block_on_fail,
         }))
     }
 
-    /// Get license policy for a repository.
     async fn get_license_policy(&self, repository_id: Uuid) -> Result<Option<LicensePolicyConfig>> {
         let policy = sqlx::query!(
             r#"
@@ -262,7 +335,7 @@ impl PromotionPolicyService {
         .await?;
 
         Ok(policy.map(|p| LicensePolicyConfig {
-            id: p.id,
+            _id: p.id,
             name: p.name,
             allowed_licenses: p.allowed_licenses.unwrap_or_default(),
             denied_licenses: p.denied_licenses.unwrap_or_default(),
@@ -270,168 +343,20 @@ impl PromotionPolicyService {
             action: PolicyAction::parse(&p.action).unwrap_or(PolicyAction::Warn),
         }))
     }
-
-    /// Evaluate CVE thresholds against scan results.
-    fn evaluate_cve_thresholds(
-        &self,
-        summary: &CveSummary,
-        max_severity: &str,
-        block_on_fail: bool,
-    ) -> Vec<PolicyViolation> {
-        let mut violations = Vec::new();
-
-        // Parse max_severity to determine thresholds
-        let (max_critical, max_high, max_medium) = match max_severity.to_lowercase().as_str() {
-            "critical" => (0, i32::MAX, i32::MAX),
-            "high" => (0, 0, i32::MAX),
-            "medium" => (0, 0, 0),
-            "low" => (0, 0, 0),
-            _ => (0, 0, i32::MAX), // Default to blocking critical and high
-        };
-
-        if summary.critical_count > max_critical {
-            violations.push(PolicyViolation {
-                rule: "cve-severity-threshold".to_string(),
-                severity: "critical".to_string(),
-                message: format!(
-                    "Found {} critical vulnerabilities (max allowed: {})",
-                    summary.critical_count, max_critical
-                ),
-                details: Some(serde_json::json!({
-                    "count": summary.critical_count,
-                    "max_allowed": max_critical,
-                    "block_on_fail": block_on_fail
-                })),
-            });
-        }
-
-        if summary.high_count > max_high {
-            violations.push(PolicyViolation {
-                rule: "cve-severity-threshold".to_string(),
-                severity: "high".to_string(),
-                message: format!(
-                    "Found {} high severity vulnerabilities (max allowed: {})",
-                    summary.high_count, max_high
-                ),
-                details: Some(serde_json::json!({
-                    "count": summary.high_count,
-                    "max_allowed": max_high,
-                    "block_on_fail": block_on_fail
-                })),
-            });
-        }
-
-        if summary.medium_count > max_medium {
-            violations.push(PolicyViolation {
-                rule: "cve-severity-threshold".to_string(),
-                severity: "medium".to_string(),
-                message: format!(
-                    "Found {} medium severity vulnerabilities (max allowed: {})",
-                    summary.medium_count, max_medium
-                ),
-                details: Some(serde_json::json!({
-                    "count": summary.medium_count,
-                    "max_allowed": max_medium,
-                    "block_on_fail": block_on_fail
-                })),
-            });
-        }
-
-        violations
-    }
-
-    /// Evaluate license policy against SBOM licenses.
-    fn evaluate_license_policy(
-        &self,
-        summary: &LicenseSummary,
-        policy: &LicensePolicyConfig,
-    ) -> Vec<PolicyViolation> {
-        let mut violations = Vec::new();
-        let mut denied_found = Vec::new();
-        let mut unknown_found = Vec::new();
-
-        for license in &summary.licenses_found {
-            let normalized = license.to_uppercase();
-
-            // Check if license is explicitly denied
-            if policy
-                .denied_licenses
-                .iter()
-                .any(|d| d.to_uppercase() == normalized)
-            {
-                denied_found.push(license.clone());
-                continue;
-            }
-
-            // Check if license is in allowed list (if allowed list is non-empty)
-            if !policy.allowed_licenses.is_empty() {
-                let is_allowed = policy
-                    .allowed_licenses
-                    .iter()
-                    .any(|a| a.to_uppercase() == normalized);
-
-                if !is_allowed && !policy.allow_unknown {
-                    unknown_found.push(license.clone());
-                }
-            }
-        }
-
-        if !denied_found.is_empty() {
-            violations.push(PolicyViolation {
-                rule: "license-compliance".to_string(),
-                severity: match policy.action {
-                    PolicyAction::Block => "critical".to_string(),
-                    PolicyAction::Warn => "medium".to_string(),
-                    PolicyAction::Allow => "low".to_string(),
-                },
-                message: format!(
-                    "Found {} denied licenses: {}",
-                    denied_found.len(),
-                    denied_found.join(", ")
-                ),
-                details: Some(serde_json::json!({
-                    "denied_licenses": denied_found,
-                    "policy_name": policy.name
-                })),
-            });
-        }
-
-        if !unknown_found.is_empty() {
-            violations.push(PolicyViolation {
-                rule: "license-compliance".to_string(),
-                severity: "medium".to_string(),
-                message: format!(
-                    "Found {} licenses not in allowed list: {}",
-                    unknown_found.len(),
-                    unknown_found.join(", ")
-                ),
-                details: Some(serde_json::json!({
-                    "unknown_licenses": unknown_found,
-                    "policy_name": policy.name
-                })),
-            });
-        }
-
-        violations
-    }
 }
 
-/// Internal config struct for scan policy.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct ScanPolicyConfig {
-    id: Uuid,
-    name: String,
+    _id: Uuid,
+    _name: String,
     max_severity: String,
-    block_unscanned: bool,
+    _block_unscanned: bool,
     block_on_fail: bool,
 }
 
-/// Internal config struct for license policy.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct LicensePolicyConfig {
-    id: Uuid,
+    _id: Uuid,
     name: String,
     allowed_licenses: Vec<String>,
     denied_licenses: Vec<String>,
@@ -442,53 +367,6 @@ struct LicensePolicyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Helper function to test CVE threshold evaluation without needing a DB connection
-    fn evaluate_cve_thresholds_test(
-        summary: &CveSummary,
-        max_severity: &str,
-        block_on_fail: bool,
-    ) -> Vec<PolicyViolation> {
-        let mut violations = Vec::new();
-
-        let (max_critical, max_high, _max_medium) = match max_severity.to_lowercase().as_str() {
-            "critical" => (0, i32::MAX, i32::MAX),
-            "high" => (0, 0, i32::MAX),
-            "medium" => (0, 0, 0),
-            "low" => (0, 0, 0),
-            _ => (0, 0, i32::MAX),
-        };
-
-        if summary.critical_count > max_critical {
-            violations.push(PolicyViolation {
-                rule: "cve-severity-threshold".to_string(),
-                severity: "critical".to_string(),
-                message: format!(
-                    "Found {} critical vulnerabilities (max allowed: {})",
-                    summary.critical_count, max_critical
-                ),
-                details: Some(serde_json::json!({
-                    "count": summary.critical_count,
-                    "max_allowed": max_critical,
-                    "block_on_fail": block_on_fail
-                })),
-            });
-        }
-
-        if summary.high_count > max_high {
-            violations.push(PolicyViolation {
-                rule: "cve-severity-threshold".to_string(),
-                severity: "high".to_string(),
-                message: format!(
-                    "Found {} high severity vulnerabilities (max allowed: {})",
-                    summary.high_count, max_high
-                ),
-                details: None,
-            });
-        }
-
-        violations
-    }
 
     #[test]
     fn test_cve_threshold_evaluation() {
@@ -501,13 +379,11 @@ mod tests {
             open_cves: vec!["CVE-2024-1234".to_string()],
         };
 
-        // Test with max_severity = "high" (should block critical and high)
-        let violations = evaluate_cve_thresholds_test(&summary, "high", true);
-        assert_eq!(violations.len(), 2); // Critical and High violations
+        let violations = evaluate_cve_thresholds(&summary, "high", true);
+        assert_eq!(violations.len(), 2);
 
-        // Test with max_severity = "critical" (should only block critical)
-        let violations = evaluate_cve_thresholds_test(&summary, "critical", true);
-        assert_eq!(violations.len(), 1); // Only critical violation
+        let violations = evaluate_cve_thresholds(&summary, "critical", true);
+        assert_eq!(violations.len(), 1);
     }
 
     #[test]
@@ -523,7 +399,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            id: Uuid::new_v4(),
+            _id: Uuid::new_v4(),
             name: "test-policy".to_string(),
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -531,35 +407,8 @@ mod tests {
             action: PolicyAction::Block,
         };
 
-        // Test the logic directly
-        let mut violations = Vec::new();
-        let mut denied_found = Vec::new();
-
-        for license in &summary.licenses_found {
-            let normalized = license.to_uppercase();
-            if policy
-                .denied_licenses
-                .iter()
-                .any(|d| d.to_uppercase() == normalized)
-            {
-                denied_found.push(license.clone());
-            }
-        }
-
-        if !denied_found.is_empty() {
-            violations.push(PolicyViolation {
-                rule: "license-compliance".to_string(),
-                severity: "critical".to_string(),
-                message: format!(
-                    "Found {} denied licenses: {}",
-                    denied_found.len(),
-                    denied_found.join(", ")
-                ),
-                details: None,
-            });
-        }
-
-        assert_eq!(violations.len(), 1); // GPL-3.0 is denied
+        let violations = evaluate_license_policy(&summary, &policy);
+        assert_eq!(violations.len(), 1);
         assert!(violations[0].message.contains("GPL-3.0"));
     }
 }

@@ -19,12 +19,10 @@ use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
 
-/// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
-/// Create promotion routes (nested under /api/v1/promotion)
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/repositories/:key/promote", post(promote_artifacts_bulk))
@@ -38,31 +36,20 @@ pub fn router() -> Router<SharedState> {
         )
 }
 
-// ============================================================================
-// Request/Response DTOs
-// ============================================================================
-
 #[derive(Debug, Deserialize)]
 pub struct PromoteArtifactRequest {
-    /// Target repository key (e.g., "release/npm")
     pub target_repository: String,
-    /// Skip policy checks (requires admin privileges)
     #[serde(default)]
     pub skip_policy_check: bool,
-    /// Optional notes for the promotion record
     pub notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct BulkPromoteRequest {
-    /// Target repository key
     pub target_repository: String,
-    /// List of artifact IDs to promote
     pub artifact_ids: Vec<Uuid>,
-    /// Skip policy checks (requires admin privileges)
     #[serde(default)]
     pub skip_policy_check: bool,
-    /// Optional notes for all promotion records
     pub notes: Option<String>,
 }
 
@@ -118,11 +105,41 @@ pub struct PromotionHistoryResponse {
     pub pagination: Pagination,
 }
 
-// ============================================================================
-// Handlers
-// ============================================================================
+/// Validate that source is staging and target is local, with matching formats.
+fn validate_promotion_repos(
+    source: &crate::models::repository::Repository,
+    target: &crate::models::repository::Repository,
+) -> Result<()> {
+    if source.repo_type != RepositoryType::Staging {
+        return Err(AppError::Validation(
+            "Source repository must be a staging repository".to_string(),
+        ));
+    }
+    if target.repo_type != RepositoryType::Local {
+        return Err(AppError::Validation(
+            "Target repository must be a local (release) repository".to_string(),
+        ));
+    }
+    if source.format != target.format {
+        return Err(AppError::Validation(format!(
+            "Repository format mismatch: source is {:?}, target is {:?}",
+            source.format, target.format
+        )));
+    }
+    Ok(())
+}
 
-/// Promote a single artifact from staging to release repository
+fn failed_response(source: String, target: String, message: String) -> PromotionResponse {
+    PromotionResponse {
+        promoted: false,
+        source,
+        target,
+        promotion_id: None,
+        policy_violations: vec![],
+        message: Some(message),
+    }
+}
+
 pub async fn promote_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -132,31 +149,10 @@ pub async fn promote_artifact(
     let auth = require_auth(auth)?;
     let repo_service = RepositoryService::new(state.db.clone());
 
-    // Verify source is a staging repository
     let source_repo = repo_service.get_by_key(&repo_key).await?;
-    if source_repo.repo_type != RepositoryType::Staging {
-        return Err(AppError::Validation(
-            "Source repository must be a staging repository".to_string(),
-        ));
-    }
-
-    // Verify target repository exists and is local (release)
     let target_repo = repo_service.get_by_key(&req.target_repository).await?;
-    if target_repo.repo_type != RepositoryType::Local {
-        return Err(AppError::Validation(
-            "Target repository must be a local (release) repository".to_string(),
-        ));
-    }
+    validate_promotion_repos(&source_repo, &target_repo)?;
 
-    // Verify formats match
-    if source_repo.format != target_repo.format {
-        return Err(AppError::Validation(format!(
-            "Repository format mismatch: source is {:?}, target is {:?}",
-            source_repo.format, target_repo.format
-        )));
-    }
-
-    // Get the artifact
     let artifact = sqlx::query_as!(
         crate::models::artifact::Artifact,
         r#"
@@ -176,7 +172,6 @@ pub async fn promote_artifact(
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found in staging repository".to_string()))?;
 
-    // Run policy checks (CVE severity, license compliance)
     let mut policy_violations: Vec<PolicyViolation> = vec![];
     let mut policy_result_json = serde_json::json!({"passed": true, "violations": []});
 
@@ -186,7 +181,6 @@ pub async fn promote_artifact(
             .evaluate_artifact(artifact_id, source_repo.id)
             .await?;
 
-        // Convert service violations to handler violations
         policy_violations = eval_result
             .violations
             .iter()
@@ -205,7 +199,6 @@ pub async fn promote_artifact(
             "license_summary": eval_result.license_summary,
         });
 
-        // Block promotion if policy evaluation failed with Block action
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
             return Ok(Json(PromotionResponse {
                 promoted: false,
@@ -218,34 +211,28 @@ pub async fn promote_artifact(
         }
     }
 
-    // Copy artifact to target repository
     let new_artifact_id = Uuid::new_v4();
-    let new_storage_key = format!(
+    let dest_path = format!(
         "{}/{}",
         target_repo.storage_path.trim_end_matches('/'),
         artifact.path
     );
-
-    // Copy the file
     let source_path = format!(
         "{}/{}",
         source_repo.storage_path.trim_end_matches('/'),
         artifact.storage_key
     );
-    let dest_path = &new_storage_key;
 
-    // Create parent directories
-    if let Some(parent) = std::path::Path::new(dest_path).parent() {
+    if let Some(parent) = std::path::Path::new(&dest_path).parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create directories: {}", e)))?;
     }
 
-    tokio::fs::copy(&source_path, dest_path)
+    tokio::fs::copy(&source_path, &dest_path)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to copy artifact: {}", e)))?;
 
-    // Insert artifact record in target repo
     sqlx::query!(
         r#"
         INSERT INTO artifacts (
@@ -281,9 +268,7 @@ pub async fn promote_artifact(
         }
     })?;
 
-    // Record promotion history
     let promotion_id = Uuid::new_v4();
-
     sqlx::query!(
         r#"
         INSERT INTO promotion_history (
@@ -322,7 +307,6 @@ pub async fn promote_artifact(
     }))
 }
 
-/// Promote multiple artifacts from staging to release repository
 pub async fn promote_artifacts_bulk(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -332,28 +316,15 @@ pub async fn promote_artifacts_bulk(
     let auth = require_auth(auth)?;
     let repo_service = RepositoryService::new(state.db.clone());
 
-    // Verify source is a staging repository
     let source_repo = repo_service.get_by_key(&repo_key).await?;
-    if source_repo.repo_type != RepositoryType::Staging {
-        return Err(AppError::Validation(
-            "Source repository must be a staging repository".to_string(),
-        ));
-    }
-
-    // Verify target repository exists and is local (release)
     let target_repo = repo_service.get_by_key(&req.target_repository).await?;
-    if target_repo.repo_type != RepositoryType::Local {
-        return Err(AppError::Validation(
-            "Target repository must be a local (release) repository".to_string(),
-        ));
-    }
+    validate_promotion_repos(&source_repo, &target_repo)?;
 
     let mut results = Vec::new();
     let mut promoted = 0;
     let mut failed = 0;
 
     for artifact_id in &req.artifact_ids {
-        // Get the artifact
         let artifact = match sqlx::query_as!(
             crate::models::artifact::Artifact,
             r#"
@@ -374,31 +345,24 @@ pub async fn promote_artifacts_bulk(
             Ok(Some(a)) => a,
             Ok(None) => {
                 failed += 1;
-                results.push(PromotionResponse {
-                    promoted: false,
-                    source: format!("{}/{}", repo_key, artifact_id),
-                    target: req.target_repository.clone(),
-                    promotion_id: None,
-                    policy_violations: vec![],
-                    message: Some("Artifact not found".to_string()),
-                });
+                results.push(failed_response(
+                    format!("{}/{}", repo_key, artifact_id),
+                    req.target_repository.clone(),
+                    "Artifact not found".to_string(),
+                ));
                 continue;
             }
             Err(e) => {
                 failed += 1;
-                results.push(PromotionResponse {
-                    promoted: false,
-                    source: format!("{}/{}", repo_key, artifact_id),
-                    target: req.target_repository.clone(),
-                    promotion_id: None,
-                    policy_violations: vec![],
-                    message: Some(format!("Database error: {}", e)),
-                });
+                results.push(failed_response(
+                    format!("{}/{}", repo_key, artifact_id),
+                    req.target_repository.clone(),
+                    format!("Database error: {}", e),
+                ));
                 continue;
             }
         };
 
-        // Copy artifact file
         let source_path = format!(
             "{}/{}",
             source_repo.storage_path.trim_end_matches('/'),
@@ -409,36 +373,31 @@ pub async fn promote_artifacts_bulk(
             target_repo.storage_path.trim_end_matches('/'),
             artifact.path
         );
+        let source_display = format!("{}/{}", repo_key, artifact.path);
+        let target_display = format!("{}/{}", req.target_repository, artifact.path);
 
         if let Some(parent) = std::path::Path::new(&dest_path).parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 failed += 1;
-                results.push(PromotionResponse {
-                    promoted: false,
-                    source: format!("{}/{}", repo_key, artifact.path),
-                    target: format!("{}/{}", req.target_repository, artifact.path),
-                    promotion_id: None,
-                    policy_violations: vec![],
-                    message: Some(format!("Failed to create directories: {}", e)),
-                });
+                results.push(failed_response(
+                    source_display,
+                    target_display,
+                    format!("Failed to create directories: {}", e),
+                ));
                 continue;
             }
         }
 
         if let Err(e) = tokio::fs::copy(&source_path, &dest_path).await {
             failed += 1;
-            results.push(PromotionResponse {
-                promoted: false,
-                source: format!("{}/{}", repo_key, artifact.path),
-                target: format!("{}/{}", req.target_repository, artifact.path),
-                promotion_id: None,
-                policy_violations: vec![],
-                message: Some(format!("Failed to copy artifact: {}", e)),
-            });
+            results.push(failed_response(
+                source_display,
+                target_display,
+                format!("Failed to copy artifact: {}", e),
+            ));
             continue;
         }
 
-        // Insert artifact record
         let new_artifact_id = Uuid::new_v4();
         let insert_result: std::result::Result<_, sqlx::Error> = sqlx::query!(
             r#"
@@ -472,18 +431,10 @@ pub async fn promote_artifacts_bulk(
             } else {
                 format!("Database error: {}", e)
             };
-            results.push(PromotionResponse {
-                promoted: false,
-                source: format!("{}/{}", repo_key, artifact.path),
-                target: format!("{}/{}", req.target_repository, artifact.path),
-                promotion_id: None,
-                policy_violations: vec![],
-                message: Some(msg),
-            });
+            results.push(failed_response(source_display, target_display, msg));
             continue;
         }
 
-        // Record promotion history
         let promotion_id = Uuid::new_v4();
         let policy_result = serde_json::json!({"passed": true, "violations": []});
 
@@ -509,8 +460,8 @@ pub async fn promote_artifacts_bulk(
         promoted += 1;
         results.push(PromotionResponse {
             promoted: true,
-            source: format!("{}/{}", repo_key, artifact.path),
-            target: format!("{}/{}", req.target_repository, artifact.path),
+            source: source_display,
+            target: target_display,
             promotion_id: Some(promotion_id),
             policy_violations: vec![],
             message: Some("Promoted successfully".to_string()),
@@ -534,7 +485,6 @@ pub async fn promote_artifacts_bulk(
     }))
 }
 
-/// Get promotion history for a repository
 pub async fn promotion_history(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
