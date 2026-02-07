@@ -53,23 +53,12 @@ pub struct LicenseSummary {
 }
 
 /// CVE threshold policy configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CveThresholdPolicy {
     pub max_critical: i32,
     pub max_high: i32,
     pub max_medium: Option<i32>,
     pub max_low: Option<i32>,
-}
-
-impl Default for CveThresholdPolicy {
-    fn default() -> Self {
-        Self {
-            max_critical: 0,
-            max_high: 0,
-            max_medium: None,
-            max_low: None,
-        }
-    }
 }
 
 /// Service for evaluating promotion policies.
@@ -106,8 +95,11 @@ impl PromotionPolicyService {
         // Evaluate CVE thresholds
         if let Some(ref summary) = cve_summary {
             if let Some(ref policy) = scan_policy {
-                let cve_violations =
-                    self.evaluate_cve_thresholds(summary, &policy.max_severity, policy.block_on_fail);
+                let cve_violations = self.evaluate_cve_thresholds(
+                    summary,
+                    &policy.max_severity,
+                    policy.block_on_fail,
+                );
 
                 for v in cve_violations {
                     if v.severity == "critical" || v.severity == "high" {
@@ -392,7 +384,11 @@ impl PromotionPolicyService {
                     PolicyAction::Warn => "medium".to_string(),
                     PolicyAction::Allow => "low".to_string(),
                 },
-                message: format!("Found {} denied licenses: {}", denied_found.len(), denied_found.join(", ")),
+                message: format!(
+                    "Found {} denied licenses: {}",
+                    denied_found.len(),
+                    denied_found.join(", ")
+                ),
                 details: Some(serde_json::json!({
                     "denied_licenses": denied_found,
                     "policy_name": policy.name
@@ -422,6 +418,7 @@ impl PromotionPolicyService {
 
 /// Internal config struct for scan policy.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ScanPolicyConfig {
     id: Uuid,
     name: String,
@@ -432,6 +429,7 @@ struct ScanPolicyConfig {
 
 /// Internal config struct for license policy.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct LicensePolicyConfig {
     id: Uuid,
     name: String,
@@ -453,7 +451,7 @@ mod tests {
     ) -> Vec<PolicyViolation> {
         let mut violations = Vec::new();
 
-        let (max_critical, max_high, max_medium) = match max_severity.to_lowercase().as_str() {
+        let (max_critical, max_high, _max_medium) = match max_severity.to_lowercase().as_str() {
             "critical" => (0, i32::MAX, i32::MAX),
             "high" => (0, 0, i32::MAX),
             "medium" => (0, 0, 0),
@@ -515,7 +513,11 @@ mod tests {
     #[test]
     fn test_license_policy_evaluation() {
         let summary = LicenseSummary {
-            licenses_found: vec!["MIT".to_string(), "GPL-3.0".to_string(), "Apache-2.0".to_string()],
+            licenses_found: vec![
+                "MIT".to_string(),
+                "GPL-3.0".to_string(),
+                "Apache-2.0".to_string(),
+            ],
             denied_licenses: vec![],
             unknown_licenses: vec![],
         };
@@ -535,7 +537,11 @@ mod tests {
 
         for license in &summary.licenses_found {
             let normalized = license.to_uppercase();
-            if policy.denied_licenses.iter().any(|d| d.to_uppercase() == normalized) {
+            if policy
+                .denied_licenses
+                .iter()
+                .any(|d| d.to_uppercase() == normalized)
+            {
                 denied_found.push(license.clone());
             }
         }
@@ -544,7 +550,11 @@ mod tests {
             violations.push(PolicyViolation {
                 rule: "license-compliance".to_string(),
                 severity: "critical".to_string(),
-                message: format!("Found {} denied licenses: {}", denied_found.len(), denied_found.join(", ")),
+                message: format!(
+                    "Found {} denied licenses: {}",
+                    denied_found.len(),
+                    denied_found.join(", ")
+                ),
                 details: None,
             });
         }

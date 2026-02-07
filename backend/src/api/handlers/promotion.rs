@@ -32,7 +32,10 @@ pub fn router() -> Router<SharedState> {
             "/repositories/:key/artifacts/:artifact_id/promote",
             post(promote_artifact),
         )
-        .route("/repositories/:key/promotion-history", get(promotion_history))
+        .route(
+            "/repositories/:key/promotion-history",
+            get(promotion_history),
+        )
 }
 
 // ============================================================================
