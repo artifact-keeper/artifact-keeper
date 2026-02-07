@@ -10,21 +10,22 @@ set -uo pipefail
 header "Default Credentials Testing"
 
 # --- Test 1: Admin login with default credentials ---
-info "Attempting admin login with default credentials (admin:admin123)"
+# Credentials sourced from env vars ADMIN_USER / ADMIN_PASS (see lib.sh)
+info "Attempting admin login with default credentials (${ADMIN_USER}:***)"
 
 LOGIN_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
     -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"admin123"}' \
+    -d "{\"username\":\"${ADMIN_USER}\",\"password\":\"${ADMIN_PASS}\"}" \
     "${REGISTRY_URL}/api/v1/auth/login" 2>&1) || true
 
 LOGIN_BODY=$(echo "$LOGIN_RESPONSE" | head -n -1)
 LOGIN_STATUS=$(echo "$LOGIN_RESPONSE" | tail -n 1)
 
 if [ "$LOGIN_STATUS" = "200" ]; then
-    fail "Default admin credentials accepted (admin:admin123) - HTTP 200"
+    fail "Default admin credentials accepted (${ADMIN_USER}:***) - HTTP 200"
     add_finding "CRITICAL" "default-creds/admin-login" \
-        "Default admin credentials (admin:admin123) are active. An attacker can gain full administrative access to the registry. Change the admin password immediately." \
-        "POST /api/v1/auth/login with {username:admin, password:admin123} returned HTTP 200. Response body (truncated): $(echo "$LOGIN_BODY" | head -c 500)"
+        "Default admin credentials are active. An attacker can gain full administrative access to the registry. Change the admin password immediately." \
+        "POST /api/v1/auth/login with default credentials returned HTTP 200. Response body (truncated): $(echo "$LOGIN_BODY" | head -c 500)"
 elif [ "$LOGIN_STATUS" = "401" ] || [ "$LOGIN_STATUS" = "403" ]; then
     pass "Default admin credentials rejected (HTTP ${LOGIN_STATUS})"
 else
