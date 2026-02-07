@@ -40,6 +40,11 @@ S3_REGION="${S3_REGION:-us-east-1}"
 KEEP_RESOURCES="${KEEP_RESOURCES:-false}"
 DATABASE_URL="${DATABASE_URL:-postgresql://registry:registry@localhost:30432/artifact_registry}"
 
+# Capture the caller's original AWS credentials BEFORE we override them
+# for the temp user. These are needed for IAM admin operations (key rotation test).
+ORIGINAL_AWS_ACCESS_KEY="${AWS_ACCESS_KEY_ID:-$(aws configure get aws_access_key_id 2>/dev/null || echo "")}"
+ORIGINAL_AWS_SECRET_KEY="${AWS_SECRET_ACCESS_KEY:-$(aws configure get aws_secret_access_key 2>/dev/null || echo "")}"
+
 # Unique suffix for all resources
 SUFFIX="$(date +%s)"
 ROLE_NAME="ak-sts-test-role-${SUFFIX}"
@@ -381,14 +386,23 @@ export WAIT_FOR_EXPIRY="${WAIT_FOR_EXPIRY:-false}"
 
 if [ "$IS_ROOT" = true ]; then
     # Run the test AS the temporary IAM user (so AssumeRole works)
+    # Pass admin creds separately for IAM operations (fast rotation test)
     info "Running test as IAM user: $USER_NAME"
     AWS_ACCESS_KEY_ID="$CREATED_ACCESS_KEY_ID" \
     AWS_SECRET_ACCESS_KEY="$USER_SECRET_KEY" \
     AWS_SESSION_TOKEN="" \
+    IAM_ADMIN_ACCESS_KEY_ID="$ORIGINAL_AWS_ACCESS_KEY" \
+    IAM_ADMIN_SECRET_ACCESS_KEY="$ORIGINAL_AWS_SECRET_KEY" \
+    SIGNING_USER_NAME="$CREATED_USER" \
         "${SCRIPT_DIR}/test-s3-sts-rotation.sh"
     TEST_EXIT=$?
 else
-    "${SCRIPT_DIR}/test-s3-sts-rotation.sh"
+    # Non-root: caller has admin perms; extract username from ARN for rotation test
+    IAM_USER_NAME=$(echo "$CALLER_ARN" | sed -n 's|.*:user/||p')
+    IAM_ADMIN_ACCESS_KEY_ID="$ORIGINAL_AWS_ACCESS_KEY" \
+    IAM_ADMIN_SECRET_ACCESS_KEY="$ORIGINAL_AWS_SECRET_KEY" \
+    SIGNING_USER_NAME="${IAM_USER_NAME}" \
+        "${SCRIPT_DIR}/test-s3-sts-rotation.sh"
     TEST_EXIT=$?
 fi
 

@@ -32,6 +32,9 @@
 #   BACKEND_BIN      - Path to backend binary (default: auto-detect from cargo)
 #   STS_DURATION     - STS credential duration in seconds (default: 900)
 #   WAIT_FOR_EXPIRY  - Set to "true" to wait for credential expiry (~16 min)
+#   IAM_ADMIN_ACCESS_KEY_ID     - Admin creds for IAM operations (fast rotation test)
+#   IAM_ADMIN_SECRET_ACCESS_KEY - Admin creds for IAM operations (fast rotation test)
+#   SIGNING_USER_NAME           - IAM user name for key rotation (fast rotation test)
 #   SKIP_CLEANUP     - Set to "true" to skip cleanup
 #
 # Usage:
@@ -47,6 +50,7 @@
 #   Step 5: (--wait-for-expiry) New presigned URL SUCCEEDS (refresh works)
 #   Step 6: Backend restart + credential refresh path exercised
 #   Step 7: Option B: Dedicated signing credentials bypass STS entirely
+#   Step 8: FAST PROOF: Deactivate signing key -> URL dies instantly -> reactivate -> works
 #
 # Cost estimate: ~$0.02 (a few S3 PUTs/GETs + STS API calls)
 
@@ -67,6 +71,11 @@ STS_DURATION="${STS_DURATION:-900}"
 WAIT_FOR_EXPIRY="${WAIT_FOR_EXPIRY:-false}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
 DB_CONTAINER="${DB_CONTAINER:-artifact-keeper-dev-db}"
+
+# For fast credential rotation test (passed by setup-sts-test.sh)
+IAM_ADMIN_ACCESS_KEY_ID="${IAM_ADMIN_ACCESS_KEY_ID:-}"
+IAM_ADMIN_SECRET_ACCESS_KEY="${IAM_ADMIN_SECRET_ACCESS_KEY:-}"
+SIGNING_USER_NAME="${SIGNING_USER_NAME:-}"
 
 # Test identifiers
 TEST_ID="sts-rotation-$$-$(date +%s)"
@@ -247,9 +256,10 @@ info "Access Key ID: ${STS_ACCESS_KEY:0:8}..."
 
 # Calculate remaining TTL
 # Parse ISO 8601 expiry (handles both "Z" and "+00:00" suffixes)
+# IMPORTANT: Use -u flag so macOS date interprets the timestamp as UTC (not local time)
 STS_EXPIRATION_CLEAN=$(echo "$STS_EXPIRATION" | sed 's/+00:00$/Z/' | sed 's/Z$//')
-EXPIRY_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$STS_EXPIRATION_CLEAN" +%s 2>/dev/null || \
-               date -d "$STS_EXPIRATION" +%s 2>/dev/null || echo "0")
+EXPIRY_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$STS_EXPIRATION_CLEAN" +%s 2>/dev/null || \
+               date -u -d "$STS_EXPIRATION" +%s 2>/dev/null || echo "0")
 NOW_EPOCH=$(date +%s)
 REMAINING_TTL=$((EXPIRY_EPOCH - NOW_EPOCH))
 info "Remaining credential TTL: ${REMAINING_TTL}s"
@@ -751,6 +761,164 @@ if [ -n "$SIGNING_ACCESS_KEY" ] && [ -n "$SIGNING_SECRET_KEY" ]; then
 else
     warn "No long-lived IAM credentials found; skipping Option B test"
     info "Set aws_access_key_id/aws_secret_access_key in ~/.aws/credentials to test"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 8: Fast Credential Rotation Proof
+#
+# Instead of waiting 900s for STS creds to expire, we deactivate the IAM
+# access key that the backend uses for presigned URL signing (Option B).
+# S3 validates the signing key at request time, so a deactivated key
+# causes immediate 403 rejection — proving "credential dies = URL dies".
+#
+# We reuse the SAME key from Step 7 (already propagated and working),
+# avoiding any key-creation propagation delays.
+#
+# Flow:
+#   1. Save presigned URL from Step 7 (signed with active key)
+#   2. Deactivate the signing key
+#   3. Old presigned URL -> FAILS (403)
+#   4. New presigned URL from backend -> also FAILS (backend still signs with dead key)
+#   5. Reactivate the signing key
+#   6. New presigned URL -> WORKS
+# ---------------------------------------------------------------------------
+SIGNING_KEY_TO_ROTATE="${SIGNING_ACCESS_KEY:-$LONG_LIVED_ACCESS_KEY}"
+
+if [ -n "$IAM_ADMIN_ACCESS_KEY_ID" ] && [ -n "$IAM_ADMIN_SECRET_ACCESS_KEY" ] && \
+   [ -n "$SIGNING_USER_NAME" ] && [ -n "$SIGNING_KEY_TO_ROTATE" ]; then
+    header "Step 8: Fast Credential Rotation Proof (Key Deactivation)"
+
+    # The backend from Step 7 is still running with SIGNING_KEY_TO_ROTATE as
+    # the dedicated signing key. We already verified it works in Step 7.
+
+    # Save the presigned URL from Step 7 for testing after deactivation
+    SAVED_PRESIGNED_URL="${LOCATION3:-}"
+    if [ -n "$SAVED_PRESIGNED_URL" ]; then
+        info "Using presigned URL from Step 7 as baseline"
+    else
+        # Get a fresh one if Step 7's URL wasn't saved
+        info "Getting baseline presigned URL..."
+        LOGIN_RESP=$(curl -sf -X POST "${API_URL}/api/v1/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\": \"${ADMIN_USER}\", \"password\": \"${ADMIN_PASS}\"}" 2>&1) || true
+        TOKEN=$(echo "$LOGIN_RESP" | jq -r '.access_token')
+        HDRS_BASE=$(curl -sI "${API_URL}/api/v1/repositories/${TEST_REPO}/download/test-pkg/1.0.0/test-artifact.txt" \
+            -H "Authorization: Bearer $TOKEN" 2>&1)
+        SAVED_PRESIGNED_URL=$(echo "$HDRS_BASE" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n' || echo "")
+    fi
+
+    if [ -z "$SAVED_PRESIGNED_URL" ]; then
+        warn "No presigned URL available for rotation test. Skipping."
+    else
+        # Verify baseline works
+        BASELINE_DL=$(curl -sf "$SAVED_PRESIGNED_URL" 2>&1) || BASELINE_DL=""
+        if [ "$BASELINE_DL" = "$TEST_CONTENT" ]; then
+            pass "Baseline: presigned URL works before key deactivation"
+        else
+            warn "Baseline presigned URL returned unexpected content (${#BASELINE_DL} bytes)"
+            info "Content: ${BASELINE_DL:0:200}"
+        fi
+
+        # --- DEACTIVATE the signing key ---
+        info "Deactivating signing key ${SIGNING_KEY_TO_ROTATE:0:8}... for user $SIGNING_USER_NAME"
+        AWS_ACCESS_KEY_ID="$IAM_ADMIN_ACCESS_KEY_ID" \
+        AWS_SECRET_ACCESS_KEY="$IAM_ADMIN_SECRET_ACCESS_KEY" \
+        AWS_SESSION_TOKEN="" \
+        aws iam update-access-key \
+            --user-name "$SIGNING_USER_NAME" \
+            --access-key-id "$SIGNING_KEY_TO_ROTATE" \
+            --status Inactive 2>&1 || {
+            fail "Could not deactivate signing key"
+        }
+        pass "Signing key deactivated"
+
+        # IAM key status changes need time to propagate to S3.
+        # AWS docs say "usually under a minute, rarely up to 15 min."
+        # We retry with increasing waits to handle propagation.
+        info "Waiting for key deactivation to propagate to S3..."
+
+        KEY_DEAD=false
+        for WAIT_TIME in 5 10 15 30; do
+            sleep "$WAIT_TIME"
+            info "  Checking after ${WAIT_TIME}s..."
+
+            OLD_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$SAVED_PRESIGNED_URL" 2>&1 || echo "000")
+            if [ "$OLD_CODE" = "403" ] || [ "$OLD_CODE" = "400" ]; then
+                pass "Presigned URL REJECTED (HTTP $OLD_CODE) after deactivation — propagated!"
+                KEY_DEAD=true
+                break
+            elif [ "$OLD_CODE" = "200" ]; then
+                info "  Still returning 200 — propagation pending..."
+            else
+                info "  Got HTTP $OLD_CODE"
+            fi
+        done
+
+        if [ "$KEY_DEAD" = true ]; then
+            # Also verify that NEW presigned URLs from the backend are rejected
+            info "Requesting NEW presigned URL from backend (still signing with dead key)..."
+            HDRS_DEAD=$(curl -sI "${API_URL}/api/v1/repositories/${TEST_REPO}/download/test-pkg/1.0.0/test-artifact.txt" \
+                -H "Authorization: Bearer $TOKEN" 2>&1)
+            LOC_DEAD=$(echo "$HDRS_DEAD" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n' || echo "")
+
+            if [ -n "$LOC_DEAD" ]; then
+                DEAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$LOC_DEAD" 2>&1 || echo "000")
+                if [ "$DEAD_CODE" = "403" ] || [ "$DEAD_CODE" = "400" ]; then
+                    pass "NEW presigned URL also REJECTED (HTTP $DEAD_CODE) — key is dead"
+                else
+                    warn "NEW presigned URL returned HTTP $DEAD_CODE (expected 403)"
+                fi
+            fi
+        else
+            fail "Key deactivation did not propagate within 60s. S3 may be slow today."
+        fi
+
+        # --- REACTIVATE the signing key ---
+        info "Reactivating signing key..."
+        AWS_ACCESS_KEY_ID="$IAM_ADMIN_ACCESS_KEY_ID" \
+        AWS_SECRET_ACCESS_KEY="$IAM_ADMIN_SECRET_ACCESS_KEY" \
+        AWS_SESSION_TOKEN="" \
+        aws iam update-access-key \
+            --user-name "$SIGNING_USER_NAME" \
+            --access-key-id "$SIGNING_KEY_TO_ROTATE" \
+            --status Active 2>&1 || true
+        pass "Signing key reactivated"
+
+        # Wait for reactivation to propagate
+        info "Waiting for key reactivation to propagate..."
+        KEY_ALIVE=false
+        for WAIT_TIME in 5 10 15 30; do
+            sleep "$WAIT_TIME"
+            info "  Checking after ${WAIT_TIME}s..."
+
+            HDRS_ALIVE=$(curl -sI "${API_URL}/api/v1/repositories/${TEST_REPO}/download/test-pkg/1.0.0/test-artifact.txt" \
+                -H "Authorization: Bearer $TOKEN" 2>&1)
+            LOC_ALIVE=$(echo "$HDRS_ALIVE" | grep -i "^location:" | sed 's/[Ll]ocation: //' | tr -d '\r\n' || echo "")
+
+            if [ -n "$LOC_ALIVE" ]; then
+                DL_ALIVE=$(curl -sf "$LOC_ALIVE" 2>&1) || DL_ALIVE=""
+                if [ "$DL_ALIVE" = "$TEST_CONTENT" ]; then
+                    pass "Presigned URL WORKS again after key reactivation"
+                    KEY_ALIVE=true
+                    break
+                else
+                    info "  Download returned unexpected content — propagation pending..."
+                fi
+            fi
+        done
+
+        if [ "$KEY_DEAD" = true ] && [ "$KEY_ALIVE" = true ]; then
+            echo ""
+            echo -e "  ${GREEN}>>> FAST PROOF: Deactivated key = presigned URL REJECTED by S3"
+            echo -e "  >>> FAST PROOF: Reactivated key = presigned URL WORKS again"
+            echo -e "  >>> Credential rotation directly controls presigned URL validity${NC}"
+        elif [ "$KEY_ALIVE" != true ]; then
+            fail "Key reactivation did not propagate within 60s"
+        fi
+    fi
+else
+    info "Skipping fast rotation test (requires IAM_ADMIN_*, SIGNING_USER_NAME, and signing key)"
+    info "Run via setup-sts-test.sh for the full test including credential rotation"
 fi
 
 # ---------------------------------------------------------------------------
