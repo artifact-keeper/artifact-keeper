@@ -1,7 +1,0 @@
-{
-  "last_failure": "2026-02-07T17:13:51.555413-06:00",
-  "failure_count": 2,
-  "backoff_until": "2026-02-07T17:14:51.555413-06:00",
-  "needs_manual_sync": false,
-  "failure_reason": "git pull failed: exit status 128\nFrom github.com:artifact-keeper/artifact-keeper\n * branch            feat/dependency-track-integration -\u003e FETCH_HEAD\nhint: You have divergent branches and need to specify how to reconcile them.\nhint: You can do so by running one of the following commands sometime before\nhint: your next pull:\nhint:\nhint:   git config pull.rebase false  # merge\nhint:   git config pull.rebase true   # rebase\nhint:   git config pull.ff only       # fast-forward only\nhint:\nhint: You can replace \"git config\" with \"git config --global\" to set a default\nhint: preference for all repositories. You can also pass --rebase, --no-rebase,\nhint: or --ff-only on the command line to override the configured default per\nhint: invocation.\nfatal: Need to specify how to reconcile divergent branches.\n"
-}
