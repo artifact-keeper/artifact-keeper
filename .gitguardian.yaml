@@ -7,6 +7,7 @@ secret:
     - "**/test_*.rs"
     - "**/test-*.sh"
     - "scripts/native-tests/**"
+    - "scripts/redteam/**"
     - "**/.astro/**"
     # Storage backend files contain test keys in #[cfg(test)] modules
     - "backend/src/storage/*.rs"
