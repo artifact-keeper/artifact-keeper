@@ -7,7 +7,7 @@ ALTER TYPE repository_type ADD VALUE IF NOT EXISTS 'staging';
 -- Add promotion tracking columns to repositories
 ALTER TABLE repositories
     ADD COLUMN IF NOT EXISTS promotion_target_id UUID REFERENCES repositories(id),
-    ADD COLUMN IF NOT EXISTS promotion_policy_id UUID REFERENCES security_policies(id);
+    ADD COLUMN IF NOT EXISTS promotion_policy_id UUID;
 
 -- Create promotion history table
 CREATE TABLE IF NOT EXISTS promotion_history (
