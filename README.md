@@ -1,5 +1,10 @@
 # Artifact Keeper
 
+> [!CAUTION]
+> **🚧 Pre-Release Notice 🚧**
+>
+> Please wait for **`v1.0.0-rc2`** before testing. We're actively incorporating community feedback to ensure a great first-use experience. Thank you for your patience!
+
 [![CI](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml/badge.svg)](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
