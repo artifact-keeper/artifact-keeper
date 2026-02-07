@@ -101,4 +101,9 @@ fi
 
 echo ""
 echo "Report: $REPORT_FILE"
+
+# Exit non-zero if any findings were detected (regression gate)
+if [ $_FAIL_COUNT -gt 0 ]; then
+    exit 1
+fi
 exit 0
