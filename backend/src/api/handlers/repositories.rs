@@ -233,9 +233,33 @@ pub async fn list_repositories(
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
+    // Batch fetch storage usage for all repos in one query
+    let repo_ids: Vec<Uuid> = repos.iter().map(|r| r.id).collect();
+    let storage_map: std::collections::HashMap<Uuid, i64> = if !repo_ids.is_empty() {
+        sqlx::query_as::<_, (Uuid, i64)>(
+            r#"
+            SELECT repository_id, COALESCE(SUM(size_bytes), 0)::BIGINT
+            FROM artifacts
+            WHERE repository_id = ANY($1) AND is_deleted = false
+            GROUP BY repository_id
+            "#,
+        )
+        .bind(&repo_ids)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .into_iter()
+        .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
-        .map(|r| repo_to_response(r, 0)) // Storage usage calculated on-demand per repo
+        .map(|r| {
+            let storage = storage_map.get(&r.id).copied().unwrap_or(0);
+            repo_to_response(r, storage)
+        })
         .collect();
 
     Ok(Json(RepositoryListResponse {
