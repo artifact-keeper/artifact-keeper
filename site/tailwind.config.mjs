@@ -9,11 +9,11 @@ export default {
     extend: {
       colors: {
         brand: {
-          DEFAULT: '#3EB065',
-          hover: '#7CCF83',
-          active: '#2D9050',
-          light: '#F0FFF4',
-          dark: '#152033',
+          DEFAULT: '#FF9900',
+          hover: '#FFCC66',
+          active: '#E68A00',
+          light: '#FFF8E8',
+          dark: '#1A1A2E',
         },
       },
       fontFamily: {
