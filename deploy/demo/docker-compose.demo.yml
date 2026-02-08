@@ -29,11 +29,14 @@ services:
       JWT_SECRET: demo-instance-jwt-secret-not-for-production
       DEMO_MODE: "true"
       TRIVY_URL: http://trivy:8090
+      OPENSCAP_URL: http://openscap:8091
+      SCAN_WORKSPACE_PATH: /scan-workspace
       LOG_LEVEL: info
     ports:
       - "8080:8080"
     volumes:
       - artifact_data:/data
+      - scan_workspace:/scan-workspace
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,6 +46,17 @@ services:
     command: ["server", "--listen", "0.0.0.0:8090"]
     volumes:
       - trivy_cache:/root/.cache/trivy
+      - scan_workspace:/scan-workspace:ro
+
+  openscap:
+    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest
+    volumes:
+      - scan_workspace:/scan-workspace:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   web:
     image: ghcr.io/artifact-keeper/artifact-keeper-web:latest
@@ -72,3 +86,4 @@ volumes:
   postgres_data:
   artifact_data:
   trivy_cache:
+  scan_workspace:
