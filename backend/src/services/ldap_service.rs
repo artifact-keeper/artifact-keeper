@@ -517,6 +517,7 @@ mod tests {
             peer_instance_name: "test".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-key".into(),
+            dependency_track_url: None,
         };
 
         let ldap_config = LdapConfig::from_config(&config);
