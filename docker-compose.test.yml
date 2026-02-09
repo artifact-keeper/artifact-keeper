@@ -285,7 +285,7 @@ services:
     profiles: ["deb", "all"]
 
   helm-test:
-    image: alpine/helm:3.14
+    image: alpine/helm:3.16
     container_name: e2e-test-helm
     depends_on:
       setup:
