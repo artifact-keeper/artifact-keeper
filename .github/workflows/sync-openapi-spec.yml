@@ -120,14 +120,25 @@ jobs:
           cp openapi.yaml /tmp/api-repo/openapi.yaml
 
           cd /tmp/api-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if git diff --quiet; then
             echo "No spec changes detected"
           else
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
             git add openapi.json openapi.yaml
             git commit -m "chore: sync OpenAPI spec from backend ${VERSION}"
             git push origin main
+          fi
+
+          # Tag with the same version as the backend release.
+          # This triggers the generate.yml workflow which publishes SDKs
+          # with a matching version, keeping backend + SDKs in lockstep.
+          if [ "$VERSION" != "manual" ]; then
+            git tag "$VERSION"
+            git push origin "$VERSION"
+            echo "Tagged API repo with ${VERSION} — SDK generation will start automatically"
+            echo "- **Tagged:** \`${VERSION}\` → SDK generation triggered" >> $GITHUB_STEP_SUMMARY
           fi
 
           # Clean up key
