@@ -656,7 +656,7 @@ pub struct ComponentInfo {
 }
 
 /// Result of license compliance check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LicenseCheckResult {
     pub compliant: bool,
     pub violations: Vec<String>,

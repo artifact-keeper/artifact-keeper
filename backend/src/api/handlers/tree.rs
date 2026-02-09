@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -18,14 +19,17 @@ pub fn router() -> Router<SharedState> {
     Router::new().route("/", get(get_tree))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct TreeQuery {
+    /// Repository key to browse
     pub repository_key: Option<String>,
+    /// Path prefix to browse within the repository
     pub path: Option<String>,
+    /// Whether to include metadata in the response
     pub include_metadata: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TreeNodeResponse {
     pub id: String,
     pub name: String,
@@ -43,7 +47,7 @@ pub struct TreeNodeResponse {
     pub created_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TreeResponse {
     pub nodes: Vec<TreeNodeResponse>,
 }
@@ -58,6 +62,19 @@ struct FolderEntry {
     child_count: i64,
 }
 
+#[utoipa::path(
+    get,
+    path = "/",
+    context_path = "/api/v1/tree",
+    tag = "repositories",
+    params(TreeQuery),
+    responses(
+        (status = 200, description = "Virtual folder tree for the repository", body = TreeResponse),
+        (status = 400, description = "Validation error (e.g. missing repository_key)", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_tree(
     State(state): State<SharedState>,
     Query(params): Query<TreeQuery>,
@@ -182,3 +199,7 @@ pub async fn get_tree(
 
     Ok(Json(TreeResponse { nodes }))
 }
+
+#[derive(OpenApi)]
+#[openapi(paths(get_tree), components(schemas(TreeResponse, TreeNodeResponse,)))]
+pub struct TreeApiDoc;

@@ -4,6 +4,7 @@ pub mod download_response;
 pub mod dto;
 pub mod handlers;
 pub mod middleware;
+pub mod openapi;
 pub mod routes;
 
 use crate::config::Config;

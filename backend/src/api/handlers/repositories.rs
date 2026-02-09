@@ -11,6 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::download_response::{DownloadResponse, X_ARTIFACT_STORAGE};
@@ -70,7 +71,7 @@ pub fn router() -> Router<SharedState> {
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListRepositoriesQuery {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
@@ -80,7 +81,7 @@ pub struct ListRepositoriesQuery {
     pub q: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRepositoryRequest {
     pub key: String,
     pub name: String,
@@ -92,7 +93,7 @@ pub struct CreateRepositoryRequest {
     pub quota_bytes: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateRepositoryRequest {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -100,7 +101,7 @@ pub struct UpdateRepositoryRequest {
     pub quota_bytes: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryResponse {
     pub id: Uuid,
     pub key: String,
@@ -115,7 +116,7 @@ pub struct RepositoryResponse {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryListResponse {
     pub items: Vec<RepositoryResponse>,
     pub pagination: Pagination,
@@ -235,6 +236,16 @@ fn parse_repo_type(s: &str) -> Result<RepositoryType> {
 }
 
 /// List repositories
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(ListRepositoriesQuery),
+    responses(
+        (status = 200, description = "List of repositories", body = RepositoryListResponse),
+    )
+)]
 pub async fn list_repositories(
     State(state): State<SharedState>,
     Query(query): Query<ListRepositoriesQuery>,
@@ -305,6 +316,19 @@ pub async fn list_repositories(
 }
 
 /// Create a new repository
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    request_body = CreateRepositoryRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Repository created", body = RepositoryResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 409, description = "Repository key already exists"),
+    )
+)]
 pub async fn create_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -338,6 +362,19 @@ pub async fn create_repository(
 }
 
 /// Get repository details
+#[utoipa::path(
+    get,
+    path = "/{key}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Repository details", body = RepositoryResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn get_repository(
     State(state): State<SharedState>,
     Path(key): Path<String>,
@@ -350,6 +387,22 @@ pub async fn get_repository(
 }
 
 /// Update repository
+#[utoipa::path(
+    patch,
+    path = "/{key}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = UpdateRepositoryRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Repository updated", body = RepositoryResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn update_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -381,6 +434,21 @@ pub async fn update_repository(
 }
 
 /// Delete repository
+#[utoipa::path(
+    delete,
+    path = "/{key}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Repository deleted"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn delete_repository(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -395,7 +463,7 @@ pub async fn delete_repository(
 
 // Artifact handlers (nested under repository)
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListArtifactsQuery {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
@@ -403,7 +471,7 @@ pub struct ListArtifactsQuery {
     pub path_prefix: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactResponse {
     pub id: Uuid,
     pub repository_key: String,
@@ -415,16 +483,31 @@ pub struct ArtifactResponse {
     pub content_type: String,
     pub download_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    #[schema(value_type = Option<Object>)]
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactListResponse {
     pub items: Vec<ArtifactResponse>,
     pub pagination: Pagination,
 }
 
 /// List artifacts in repository
+#[utoipa::path(
+    get,
+    path = "/{key}/artifacts",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ListArtifactsQuery,
+    ),
+    responses(
+        (status = 200, description = "List of artifacts", body = ArtifactListResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn list_artifacts(
     State(state): State<SharedState>,
     Path(key): Path<String>,
@@ -482,6 +565,20 @@ pub async fn list_artifacts(
 }
 
 /// Get artifact metadata
+#[utoipa::path(
+    get,
+    path = "/{key}/artifacts/{path}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("path" = String, Path, description = "Artifact path"),
+    ),
+    responses(
+        (status = 200, description = "Artifact metadata", body = ArtifactResponse),
+        (status = 404, description = "Artifact not found"),
+    )
+)]
 pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Path((key, path)): Path<(String, String)>,
@@ -530,6 +627,23 @@ pub async fn get_artifact_metadata(
 }
 
 /// Upload artifact
+#[utoipa::path(
+    put,
+    path = "/{key}/artifacts/{path}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("path" = String, Path, description = "Artifact path"),
+    ),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Artifact uploaded", body = ArtifactResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn upload_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -581,6 +695,21 @@ pub async fn upload_artifact(
 }
 
 /// Download artifact
+#[utoipa::path(
+    get,
+    path = "/{key}/download/{path}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("path" = String, Path, description = "Artifact path"),
+    ),
+    responses(
+        (status = 200, description = "Artifact binary content", content_type = "application/octet-stream"),
+        (status = 302, description = "Redirect to S3 presigned URL"),
+        (status = 404, description = "Artifact not found"),
+    )
+)]
 pub async fn download_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -701,6 +830,22 @@ pub async fn download_artifact(
 }
 
 /// Delete artifact
+#[utoipa::path(
+    delete,
+    path = "/{key}/artifacts/{path}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("path" = String, Path, description = "Artifact path"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Artifact deleted"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Artifact not found"),
+    )
+)]
 pub async fn delete_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -731,24 +876,24 @@ pub async fn delete_artifact(
 
 // Virtual repository member management handlers
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AddVirtualMemberRequest {
     pub member_key: String,
     pub priority: Option<i32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateVirtualMembersRequest {
     pub members: Vec<VirtualMemberPriority>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct VirtualMemberPriority {
     pub member_key: String,
     pub priority: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct VirtualMemberResponse {
     pub id: Uuid,
     pub member_repo_id: Uuid,
@@ -759,7 +904,7 @@ pub struct VirtualMemberResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct VirtualMembersListResponse {
     pub items: Vec<VirtualMemberResponse>,
 }
@@ -777,6 +922,20 @@ struct VirtualMemberRow {
 }
 
 /// List virtual repository members
+#[utoipa::path(
+    get,
+    path = "/{key}/members",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "List of virtual repository members", body = VirtualMembersListResponse),
+        (status = 400, description = "Repository is not virtual"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn list_virtual_members(
     State(state): State<SharedState>,
     Path(key): Path<String>,
@@ -829,6 +988,22 @@ pub async fn list_virtual_members(
 }
 
 /// Add a member to a virtual repository
+#[utoipa::path(
+    post,
+    path = "/{key}/members",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = AddVirtualMemberRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Member added", body = VirtualMemberResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository or member not found"),
+    )
+)]
 pub async fn add_virtual_member(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -895,6 +1070,23 @@ pub async fn add_virtual_member(
 }
 
 /// Remove a member from a virtual repository
+#[utoipa::path(
+    delete,
+    path = "/{key}/members/{member_key}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("member_key" = String, Path, description = "Member repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Member removed"),
+        (status = 400, description = "Repository is not virtual"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository or member not found"),
+    )
+)]
 pub async fn remove_virtual_member(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -925,6 +1117,23 @@ pub async fn remove_virtual_member(
 }
 
 /// Update priorities for all members (bulk reorder)
+#[utoipa::path(
+    put,
+    path = "/{key}/members",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = UpdateVirtualMembersRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Members updated", body = VirtualMembersListResponse),
+        (status = 400, description = "Repository is not virtual"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
 pub async fn update_virtual_members(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -960,3 +1169,39 @@ pub async fn update_virtual_members(
     // Return updated list
     list_virtual_members(State(state), Path(key)).await
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_repositories,
+        create_repository,
+        get_repository,
+        update_repository,
+        delete_repository,
+        list_artifacts,
+        get_artifact_metadata,
+        upload_artifact,
+        download_artifact,
+        delete_artifact,
+        list_virtual_members,
+        add_virtual_member,
+        remove_virtual_member,
+        update_virtual_members,
+    ),
+    components(schemas(
+        ListRepositoriesQuery,
+        CreateRepositoryRequest,
+        UpdateRepositoryRequest,
+        RepositoryResponse,
+        RepositoryListResponse,
+        ListArtifactsQuery,
+        ArtifactResponse,
+        ArtifactListResponse,
+        AddVirtualMemberRequest,
+        UpdateVirtualMembersRequest,
+        VirtualMemberPriority,
+        VirtualMemberResponse,
+        VirtualMembersListResponse,
+    ))
+)]
+pub struct RepositoriesApiDoc;

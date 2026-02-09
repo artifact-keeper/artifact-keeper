@@ -6,13 +6,14 @@
 
 use serde::Serialize;
 use sqlx::{FromRow, PgPool, Row};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::services::auth_config_service::encryption_key;
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct RemoteInstanceResponse {
     pub id: Uuid,
     pub name: String,

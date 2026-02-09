@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -40,12 +41,13 @@ pub fn network_profile_router() -> Router<SharedState> {
 
 // --- Request/Response types ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListPeersQuery {
+    /// Filter peers by status (active, probing, unreachable, disabled)
     pub status: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PeerResponse {
     pub id: Uuid,
     pub target_peer_id: Uuid,
@@ -61,14 +63,14 @@ pub struct PeerResponse {
     pub last_transfer_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ProbeBody {
     pub target_peer_id: Uuid,
     pub latency_ms: i32,
     pub bandwidth_estimate_bps: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DiscoverablePeerResponse {
     pub peer_id: Uuid,
     pub name: String,
@@ -77,7 +79,7 @@ pub struct DiscoverablePeerResponse {
     pub status: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChunkAvailabilityResponse {
     pub peer_instance_id: Uuid,
     pub artifact_id: Uuid,
@@ -86,13 +88,13 @@ pub struct ChunkAvailabilityResponse {
     pub available_chunks: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateChunkAvailabilityBody {
     pub chunk_bitmap: Vec<u8>,
     pub total_chunks: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScoredPeerResponse {
     pub peer_id: Uuid,
     pub endpoint_url: String,
@@ -102,7 +104,7 @@ pub struct ScoredPeerResponse {
     pub score: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct NetworkProfileBody {
     pub max_bandwidth_bps: Option<i64>,
     pub sync_window_start: Option<String>,
@@ -124,6 +126,21 @@ fn parse_peer_status(s: &str) -> Option<PeerStatus> {
 // --- Handlers ---
 
 /// GET /api/v1/peers/:id/connections
+#[utoipa::path(
+    get,
+    path = "/{id}/connections",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ListPeersQuery,
+    ),
+    responses(
+        (status = 200, description = "List of peer connections", body = Vec<PeerResponse>),
+        (status = 404, description = "Peer not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_peers(
     State(state): State<SharedState>,
     Path(peer_id): Path<Uuid>,
@@ -155,6 +172,19 @@ async fn list_peers(
 }
 
 /// GET /api/v1/peers/:id/connections/discover
+#[utoipa::path(
+    get,
+    path = "/{id}/connections/discover",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+    ),
+    responses(
+        (status = 200, description = "Discoverable peers", body = Vec<DiscoverablePeerResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn discover_peers(
     State(state): State<SharedState>,
     Path(peer_id): Path<Uuid>,
@@ -177,6 +207,20 @@ async fn discover_peers(
 }
 
 /// POST /api/v1/peers/:id/connections/probe
+#[utoipa::path(
+    post,
+    path = "/{id}/connections/probe",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+    ),
+    request_body = ProbeBody,
+    responses(
+        (status = 200, description = "Probe result recorded", body = PeerResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn probe_peer(
     State(state): State<SharedState>,
     Path(peer_id): Path<Uuid>,
@@ -211,6 +255,20 @@ async fn probe_peer(
 }
 
 /// POST /api/v1/peers/:id/connections/:target_id/unreachable
+#[utoipa::path(
+    post,
+    path = "/{id}/connections/{target_id}/unreachable",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("target_id" = Uuid, Path, description = "Target peer ID to mark unreachable"),
+    ),
+    responses(
+        (status = 200, description = "Peer marked as unreachable"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn mark_unreachable(
     State(state): State<SharedState>,
     Path((peer_id, target_id)): Path<(Uuid, Uuid)>,
@@ -220,6 +278,21 @@ async fn mark_unreachable(
 }
 
 /// GET /api/v1/peers/:id/chunks/:artifact_id
+#[utoipa::path(
+    get,
+    path = "/{id}/chunks/{artifact_id}",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("artifact_id" = Uuid, Path, description = "Artifact ID"),
+    ),
+    responses(
+        (status = 200, description = "Chunk availability for this peer and artifact", body = ChunkAvailabilityResponse),
+        (status = 404, description = "No chunk availability data", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_chunk_availability(
     State(state): State<SharedState>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
@@ -248,6 +321,21 @@ async fn get_chunk_availability(
 }
 
 /// PUT /api/v1/peers/:id/chunks/:artifact_id
+#[utoipa::path(
+    put,
+    path = "/{id}/chunks/{artifact_id}",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("artifact_id" = Uuid, Path, description = "Artifact ID"),
+    ),
+    request_body = UpdateChunkAvailabilityBody,
+    responses(
+        (status = 200, description = "Chunk availability updated"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn update_chunk_availability(
     State(state): State<SharedState>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
@@ -260,6 +348,20 @@ async fn update_chunk_availability(
 }
 
 /// GET /api/v1/peers/:id/chunks/:artifact_id/peers
+#[utoipa::path(
+    get,
+    path = "/{id}/chunks/{artifact_id}/peers",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("artifact_id" = Uuid, Path, description = "Artifact ID"),
+    ),
+    responses(
+        (status = 200, description = "Peers that have chunks for this artifact", body = Vec<ChunkAvailabilityResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_peers_with_chunks(
     State(state): State<SharedState>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
@@ -282,6 +384,20 @@ async fn get_peers_with_chunks(
 }
 
 /// GET /api/v1/peers/:id/chunks/:artifact_id/scored-peers
+#[utoipa::path(
+    get,
+    path = "/{id}/chunks/{artifact_id}/scored-peers",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("artifact_id" = Uuid, Path, description = "Artifact ID"),
+    ),
+    responses(
+        (status = 200, description = "Scored peers for artifact download", body = Vec<ScoredPeerResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_scored_peers(
     State(state): State<SharedState>,
     Path((peer_id, artifact_id)): Path<(Uuid, Uuid)>,
@@ -307,6 +423,20 @@ async fn get_scored_peers(
 }
 
 /// PUT /api/v1/peers/:id/network-profile
+#[utoipa::path(
+    put,
+    path = "/{id}/network-profile",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+    ),
+    request_body = NetworkProfileBody,
+    responses(
+        (status = 200, description = "Network profile updated"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn update_network_profile(
     State(state): State<SharedState>,
     Path(peer_id): Path<Uuid>,
@@ -355,3 +485,28 @@ async fn update_network_profile(
 
     Ok(())
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_peers,
+        discover_peers,
+        probe_peer,
+        mark_unreachable,
+        get_chunk_availability,
+        update_chunk_availability,
+        get_peers_with_chunks,
+        get_scored_peers,
+        update_network_profile,
+    ),
+    components(schemas(
+        PeerResponse,
+        ProbeBody,
+        DiscoverablePeerResponse,
+        ChunkAvailabilityResponse,
+        UpdateChunkAvailabilityBody,
+        ScoredPeerResponse,
+        NetworkProfileBody,
+    ))
+)]
+pub struct PeerApiDoc;

@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -52,7 +53,7 @@ pub fn format_router() -> Router<SharedState> {
 }
 
 /// Plugin status
-#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type, Serialize, Deserialize, ToSchema)]
 #[sqlx(type_name = "plugin_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum PluginStatus {
@@ -62,7 +63,7 @@ pub enum PluginStatus {
 }
 
 /// Plugin type
-#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type, Serialize, Deserialize, ToSchema)]
 #[sqlx(type_name = "plugin_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum PluginType {
@@ -74,14 +75,14 @@ pub enum PluginType {
     Custom,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListPluginsQuery {
     pub status: Option<String>,
     #[serde(rename = "type")]
     pub plugin_type: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PluginResponse {
     pub id: Uuid,
     pub name: String,
@@ -92,12 +93,13 @@ pub struct PluginResponse {
     pub homepage: Option<String>,
     pub status: String,
     pub plugin_type: String,
+    #[schema(value_type = Object)]
     pub config_schema: Option<serde_json::Value>,
     pub installed_at: chrono::DateTime<chrono::Utc>,
     pub enabled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PluginListResponse {
     pub items: Vec<PluginResponse>,
 }
@@ -124,6 +126,16 @@ fn parse_type(s: &str) -> Option<PluginType> {
 }
 
 /// List installed plugins
+#[utoipa::path(
+    get,
+    path = "/",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(ListPluginsQuery),
+    responses(
+        (status = 200, description = "List of installed plugins", body = PluginListResponse),
+    )
+)]
 pub async fn list_plugins(
     State(state): State<SharedState>,
     Query(query): Query<ListPluginsQuery>,
@@ -172,7 +184,7 @@ pub async fn list_plugins(
 }
 
 /// Plugin manifest from package
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct PluginManifest {
     name: String,
     version: String,
@@ -181,10 +193,24 @@ struct PluginManifest {
     author: Option<String>,
     homepage: Option<String>,
     plugin_type: String,
+    #[schema(value_type = Object)]
     config_schema: Option<serde_json::Value>,
 }
 
 /// Install plugin from uploaded package
+#[utoipa::path(
+    post,
+    path = "/",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    security(("bearer_auth" = [])),
+    request_body(content_type = "multipart/form-data", description = "Plugin package with manifest"),
+    responses(
+        (status = 200, description = "Plugin installed successfully", body = PluginResponse),
+        (status = 400, description = "Invalid plugin manifest"),
+        (status = 409, description = "Plugin already installed"),
+    )
+)]
 pub async fn install_plugin(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -269,6 +295,19 @@ pub async fn install_plugin(
 }
 
 /// Get plugin details
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID")
+    ),
+    responses(
+        (status = 200, description = "Plugin details", body = PluginResponse),
+        (status = 404, description = "Plugin not found"),
+    )
+)]
 pub async fn get_plugin(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -307,6 +346,20 @@ pub async fn get_plugin(
 }
 
 /// Uninstall plugin
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID")
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Plugin uninstalled successfully"),
+        (status = 404, description = "Plugin not found"),
+    )
+)]
 pub async fn uninstall_plugin(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -325,6 +378,20 @@ pub async fn uninstall_plugin(
 }
 
 /// Enable plugin
+#[utoipa::path(
+    post,
+    path = "/{id}/enable",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID")
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Plugin enabled successfully"),
+        (status = 404, description = "Plugin not found"),
+    )
+)]
 pub async fn enable_plugin(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -359,6 +426,20 @@ pub async fn enable_plugin(
 }
 
 /// Disable plugin
+#[utoipa::path(
+    post,
+    path = "/{id}/disable",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID")
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Plugin disabled successfully"),
+        (status = 404, description = "Plugin not found"),
+    )
+)]
 pub async fn disable_plugin(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -390,14 +471,29 @@ pub async fn disable_plugin(
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PluginConfigResponse {
     pub plugin_id: Uuid,
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
+    #[schema(value_type = Object)]
     pub schema: Option<serde_json::Value>,
 }
 
 /// Get plugin configuration
+#[utoipa::path(
+    get,
+    path = "/{id}/config",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID")
+    ),
+    responses(
+        (status = 200, description = "Plugin configuration", body = PluginConfigResponse),
+        (status = 404, description = "Plugin not found"),
+    )
+)]
 pub async fn get_plugin_config(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -422,12 +518,28 @@ pub async fn get_plugin_config(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePluginConfigRequest {
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
 }
 
 /// Update plugin configuration
+#[utoipa::path(
+    post,
+    path = "/{id}/config",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID")
+    ),
+    security(("bearer_auth" = [])),
+    request_body = UpdatePluginConfigRequest,
+    responses(
+        (status = 200, description = "Plugin configuration updated", body = PluginConfigResponse),
+        (status = 404, description = "Plugin not found"),
+    )
+)]
 pub async fn update_plugin_config(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -461,7 +573,7 @@ pub async fn update_plugin_config(
 // =========================================================================
 
 /// Request to install a plugin from Git
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct InstallFromGitRequest {
     /// Git repository URL
     pub url: String,
@@ -471,7 +583,7 @@ pub struct InstallFromGitRequest {
 }
 
 /// Response for plugin installation
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PluginInstallResponse {
     pub plugin_id: Uuid,
     pub name: String,
@@ -481,6 +593,17 @@ pub struct PluginInstallResponse {
 }
 
 /// Install a plugin from a Git repository (T021)
+#[utoipa::path(
+    post,
+    path = "/install/git",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    security(("bearer_auth" = [])),
+    request_body = InstallFromGitRequest,
+    responses(
+        (status = 200, description = "Plugin installed from Git", body = PluginInstallResponse),
+    )
+)]
 pub async fn install_from_git(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -500,6 +623,18 @@ pub async fn install_from_git(
 }
 
 /// Install a plugin from a ZIP file (T034)
+#[utoipa::path(
+    post,
+    path = "/install/zip",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    security(("bearer_auth" = [])),
+    request_body(content_type = "multipart/form-data", description = "ZIP file containing plugin package"),
+    responses(
+        (status = 200, description = "Plugin installed from ZIP", body = PluginInstallResponse),
+        (status = 400, description = "Missing or invalid ZIP file"),
+    )
+)]
 pub async fn install_from_zip(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -539,6 +674,19 @@ pub async fn install_from_zip(
 }
 
 /// Get plugin events (T026)
+#[utoipa::path(
+    get,
+    path = "/{id}/events",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID"),
+        EventsQuery,
+    ),
+    responses(
+        (status = 200, description = "Plugin events", body = Vec<serde_json::Value>),
+    )
+)]
 pub async fn get_plugin_events(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -551,12 +699,25 @@ pub async fn get_plugin_events(
     Ok(Json(events))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct EventsQuery {
     pub limit: Option<i64>,
 }
 
 /// Reload a plugin (hot-reload) (T048)
+#[utoipa::path(
+    post,
+    path = "/{id}/reload",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    params(
+        ("id" = Uuid, Path, description = "Plugin ID")
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Plugin reloaded successfully", body = WasmPluginResponse),
+    )
+)]
 pub async fn reload_plugin(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -568,13 +729,13 @@ pub async fn reload_plugin(
 }
 
 /// Request for uninstalling a plugin
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UninstallQuery {
     pub force: Option<bool>,
 }
 
 /// WASM plugin response with extended fields
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct WasmPluginResponse {
     pub id: Uuid,
     pub name: String,
@@ -589,7 +750,9 @@ pub struct WasmPluginResponse {
     pub source_type: String,
     pub source_url: Option<String>,
     pub source_ref: Option<String>,
+    #[schema(value_type = Object)]
     pub capabilities: Option<serde_json::Value>,
+    #[schema(value_type = Object)]
     pub resource_limits: Option<serde_json::Value>,
     pub installed_at: chrono::DateTime<chrono::Utc>,
     pub enabled_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -625,7 +788,7 @@ impl From<crate::models::plugin::Plugin> for WasmPluginResponse {
 // T039-T043: Format Handler Endpoints
 // =========================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListFormatsQuery {
     #[serde(rename = "type")]
     pub handler_type: Option<String>,
@@ -633,6 +796,16 @@ pub struct ListFormatsQuery {
 }
 
 /// List all format handlers (T039)
+#[utoipa::path(
+    get,
+    path = "/",
+    context_path = "/api/v1/formats",
+    tag = "plugins",
+    params(ListFormatsQuery),
+    responses(
+        (status = 200, description = "List of format handlers", body = Vec<FormatHandlerResponse>),
+    )
+)]
 pub async fn list_format_handlers(
     State(state): State<SharedState>,
     Query(query): Query<ListFormatsQuery>,
@@ -656,6 +829,19 @@ pub async fn list_format_handlers(
 }
 
 /// Get a format handler by key (T040)
+#[utoipa::path(
+    get,
+    path = "/{format_key}",
+    context_path = "/api/v1/formats",
+    tag = "plugins",
+    params(
+        ("format_key" = String, Path, description = "Format handler key")
+    ),
+    responses(
+        (status = 200, description = "Format handler details", body = FormatHandlerResponse),
+        (status = 404, description = "Format handler not found"),
+    )
+)]
 pub async fn get_format_handler(
     State(state): State<SharedState>,
     Path(format_key): Path<String>,
@@ -668,6 +854,19 @@ pub async fn get_format_handler(
 }
 
 /// Enable a format handler (T041)
+#[utoipa::path(
+    post,
+    path = "/{format_key}/enable",
+    context_path = "/api/v1/formats",
+    tag = "plugins",
+    params(
+        ("format_key" = String, Path, description = "Format handler key")
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Format handler enabled", body = FormatHandlerResponse),
+    )
+)]
 pub async fn enable_format_handler(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -681,6 +880,19 @@ pub async fn enable_format_handler(
 }
 
 /// Disable a format handler (T042)
+#[utoipa::path(
+    post,
+    path = "/{format_key}/disable",
+    context_path = "/api/v1/formats",
+    tag = "plugins",
+    params(
+        ("format_key" = String, Path, description = "Format handler key")
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Format handler disabled", body = FormatHandlerResponse),
+    )
+)]
 pub async fn disable_format_handler(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -698,7 +910,7 @@ pub async fn disable_format_handler(
 // =========================================================================
 
 /// Request for testing a format handler
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TestFormatRequest {
     /// Path to simulate for the artifact
     pub path: String,
@@ -710,7 +922,7 @@ pub struct TestFormatRequest {
 }
 
 /// Response from format handler test
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TestFormatResponse {
     /// Whether validation passed
     pub valid: bool,
@@ -723,7 +935,7 @@ pub struct TestFormatResponse {
 }
 
 /// Metadata returned from testing
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TestMetadata {
     pub path: String,
     pub version: Option<String>,
@@ -732,6 +944,20 @@ pub struct TestMetadata {
 }
 
 /// Test a format handler with sample content (T062)
+#[utoipa::path(
+    post,
+    path = "/{format_key}/test",
+    context_path = "/api/v1/formats",
+    tag = "plugins",
+    params(
+        ("format_key" = String, Path, description = "Format handler key")
+    ),
+    security(("bearer_auth" = [])),
+    request_body = TestFormatRequest,
+    responses(
+        (status = 200, description = "Format handler test results", body = TestFormatResponse),
+    )
+)]
 pub async fn test_format_handler(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -790,7 +1016,7 @@ pub async fn test_format_handler(
 // =========================================================================
 
 /// Request for installing from local file path
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct InstallFromLocalRequest {
     /// Local filesystem path to plugin directory
     pub path: String,
@@ -798,6 +1024,18 @@ pub struct InstallFromLocalRequest {
 
 /// Install a plugin from local filesystem path (T063)
 /// This endpoint is intended for development use only.
+#[utoipa::path(
+    post,
+    path = "/install/local",
+    context_path = "/api/v1/plugins",
+    tag = "plugins",
+    security(("bearer_auth" = [])),
+    request_body = InstallFromLocalRequest,
+    responses(
+        (status = 200, description = "Plugin installed from local path", body = PluginInstallResponse),
+        (status = 400, description = "Invalid path"),
+    )
+)]
 pub async fn install_from_local(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -830,3 +1068,47 @@ pub async fn install_from_local(
         message: "Plugin installed from local path".to_string(),
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_plugins,
+        install_plugin,
+        get_plugin,
+        uninstall_plugin,
+        enable_plugin,
+        disable_plugin,
+        get_plugin_config,
+        update_plugin_config,
+        get_plugin_events,
+        install_from_git,
+        install_from_zip,
+        reload_plugin,
+        install_from_local,
+        list_format_handlers,
+        get_format_handler,
+        enable_format_handler,
+        disable_format_handler,
+        test_format_handler,
+    ),
+    components(schemas(
+        PluginStatus,
+        PluginType,
+        ListPluginsQuery,
+        PluginResponse,
+        PluginListResponse,
+        PluginConfigResponse,
+        UpdatePluginConfigRequest,
+        InstallFromGitRequest,
+        PluginInstallResponse,
+        EventsQuery,
+        WasmPluginResponse,
+        UninstallQuery,
+        ListFormatsQuery,
+        TestFormatRequest,
+        TestFormatResponse,
+        TestMetadata,
+        InstallFromLocalRequest,
+    ))
+)]
+pub struct PluginsApiDoc;

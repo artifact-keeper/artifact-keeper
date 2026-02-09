@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Source connection authentication type
@@ -103,7 +104,7 @@ impl std::fmt::Display for MigrationJobType {
 }
 
 /// Migration job configuration
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct MigrationConfig {
     #[serde(default)]
     pub include_repos: Vec<String>,

@@ -4,10 +4,11 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use reqwest::Client;
 use serde::Serialize;
 use std::time::Duration;
+use utoipa::{OpenApi, ToSchema};
 
 use crate::api::SharedState;
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
@@ -15,7 +16,7 @@ pub struct HealthResponse {
     pub checks: HealthChecks,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HealthChecks {
     pub database: CheckStatus,
     pub storage: CheckStatus,
@@ -25,7 +26,7 @@ pub struct HealthChecks {
     pub meilisearch: Option<CheckStatus>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct CheckStatus {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +65,16 @@ async fn check_service_health(
 }
 
 /// Health check endpoint - basic liveness check
+#[utoipa::path(
+    get,
+    path = "/health",
+    context_path = "",
+    tag = "health",
+    responses(
+        (status = 200, description = "Service is healthy", body = HealthResponse),
+        (status = 503, description = "Service is unhealthy", body = HealthResponse),
+    )
+)]
 pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse {
     let db_check = match sqlx::query("SELECT 1").fetch_one(&state.db).await {
         Ok(_) => CheckStatus {
@@ -117,6 +128,16 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
 }
 
 /// Readiness check endpoint - is the service ready to accept traffic?
+#[utoipa::path(
+    get,
+    path = "/ready",
+    context_path = "",
+    tag = "health",
+    responses(
+        (status = 200, description = "Service is ready to accept traffic"),
+        (status = 503, description = "Service is not ready"),
+    )
+)]
 pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoResponse {
     // Check database connectivity
     match sqlx::query("SELECT 1").fetch_one(&state.db).await {
@@ -127,6 +148,15 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
 
 /// Prometheus metrics endpoint.
 /// Renders all registered metrics from the metrics-exporter-prometheus recorder.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    context_path = "/api/v1/admin",
+    tag = "health",
+    responses(
+        (status = 200, description = "Prometheus metrics in text format", content_type = "text/plain"),
+    )
+)]
 pub async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     let output = if let Some(ref handle) = state.metrics_handle {
         handle.render()
@@ -140,6 +170,13 @@ pub async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
         output,
     )
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(health_check, readiness_check, metrics),
+    components(schemas(HealthResponse, HealthChecks, CheckStatus))
+)]
+pub struct HealthApiDoc;
 
 #[cfg(test)]
 mod tests {

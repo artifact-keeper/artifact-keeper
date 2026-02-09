@@ -10,6 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use totp_rs::{Algorithm, Secret, TOTP};
+use utoipa::{OpenApi, ToSchema};
 
 use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::middleware::auth::AuthExtension;
@@ -53,12 +54,24 @@ pub fn protected_router() -> Router<SharedState> {
 
 // --- Setup ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TotpSetupResponse {
     pub secret: String,
     pub qr_code_url: String,
 }
 
+/// Generate a new TOTP secret and QR code URL for the authenticated user
+#[utoipa::path(
+    post,
+    path = "/setup",
+    context_path = "/api/v1/auth/totp",
+    tag = "auth",
+    responses(
+        (status = 200, description = "TOTP setup details with secret and QR code URL", body = TotpSetupResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn setup_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -97,16 +110,29 @@ pub async fn setup_totp(
 
 // --- Enable ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TotpCodeRequest {
     pub code: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TotpEnableResponse {
     pub backup_codes: Vec<String>,
 }
 
+/// Enable TOTP by verifying the initial code and generating backup codes
+#[utoipa::path(
+    post,
+    path = "/enable",
+    context_path = "/api/v1/auth/totp",
+    tag = "auth",
+    request_body = TotpCodeRequest,
+    responses(
+        (status = 200, description = "TOTP enabled with backup codes", body = TotpEnableResponse),
+        (status = 401, description = "Unauthorized or invalid TOTP code", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn enable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -183,12 +209,24 @@ pub async fn enable_totp(
 
 // --- Verify (during login) ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TotpVerifyRequest {
     pub totp_token: String,
     pub code: String,
 }
 
+/// Verify TOTP code during login (exchanges totp_token + code for full auth tokens)
+#[utoipa::path(
+    post,
+    path = "/verify",
+    context_path = "/api/v1/auth/totp",
+    tag = "auth",
+    request_body = TotpVerifyRequest,
+    responses(
+        (status = 200, description = "TOTP verified, authentication tokens returned", body = super::auth::LoginResponse),
+        (status = 401, description = "Invalid TOTP code or token", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn verify_totp(
     State(state): State<SharedState>,
     Json(payload): Json<TotpVerifyRequest>,
@@ -311,12 +349,25 @@ pub async fn verify_totp(
 
 // --- Disable ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TotpDisableRequest {
     pub password: String,
     pub code: String,
 }
 
+/// Disable TOTP for the authenticated user (requires password and current TOTP code)
+#[utoipa::path(
+    post,
+    path = "/disable",
+    context_path = "/api/v1/auth/totp",
+    tag = "auth",
+    request_body = TotpDisableRequest,
+    responses(
+        (status = 200, description = "TOTP disabled successfully"),
+        (status = 401, description = "Invalid password or TOTP code", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn disable_totp(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -370,3 +421,16 @@ pub async fn disable_totp(
 
     Ok(())
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(setup_totp, enable_totp, verify_totp, disable_totp,),
+    components(schemas(
+        TotpSetupResponse,
+        TotpCodeRequest,
+        TotpEnableResponse,
+        TotpVerifyRequest,
+        TotpDisableRequest,
+    ))
+)]
+pub struct TotpApiDoc;

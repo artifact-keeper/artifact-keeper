@@ -7,6 +7,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use utoipa::OpenApi;
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -62,7 +63,19 @@ fn require_admin(auth: &AuthExtension) -> Result<()> {
 // OIDC
 // ---------------------------------------------------------------------------
 
-async fn list_oidc(
+/// List all OIDC provider configurations
+#[utoipa::path(
+    get,
+    path = "/oidc",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    responses(
+        (status = 200, description = "List of OIDC configurations", body = Vec<OidcConfigResponse>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_oidc(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<OidcConfigResponse>>> {
@@ -71,7 +84,23 @@ async fn list_oidc(
     Ok(Json(result))
 }
 
-async fn get_oidc(
+/// Get OIDC provider configuration by ID
+#[utoipa::path(
+    get,
+    path = "/oidc/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "OIDC configuration ID")
+    ),
+    responses(
+        (status = 200, description = "OIDC configuration details", body = OidcConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_oidc(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -81,7 +110,20 @@ async fn get_oidc(
     Ok(Json(result))
 }
 
-async fn create_oidc(
+/// Create a new OIDC provider configuration
+#[utoipa::path(
+    post,
+    path = "/oidc",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    request_body = CreateOidcConfigRequest,
+    responses(
+        (status = 200, description = "OIDC configuration created", body = OidcConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_oidc(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateOidcConfigRequest>,
@@ -91,7 +133,24 @@ async fn create_oidc(
     Ok(Json(result))
 }
 
-async fn update_oidc(
+/// Update an OIDC provider configuration
+#[utoipa::path(
+    put,
+    path = "/oidc/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "OIDC configuration ID")
+    ),
+    request_body = UpdateOidcConfigRequest,
+    responses(
+        (status = 200, description = "OIDC configuration updated", body = OidcConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_oidc(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -102,7 +161,23 @@ async fn update_oidc(
     Ok(Json(result))
 }
 
-async fn delete_oidc(
+/// Delete an OIDC provider configuration
+#[utoipa::path(
+    delete,
+    path = "/oidc/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "OIDC configuration ID")
+    ),
+    responses(
+        (status = 200, description = "OIDC configuration deleted"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_oidc(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -112,7 +187,24 @@ async fn delete_oidc(
     Ok(())
 }
 
-async fn toggle_oidc(
+/// Toggle an OIDC provider enabled/disabled
+#[utoipa::path(
+    patch,
+    path = "/oidc/{id}/toggle",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "OIDC configuration ID")
+    ),
+    request_body = ToggleRequest,
+    responses(
+        (status = 200, description = "OIDC configuration toggled"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn toggle_oidc(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -127,7 +219,19 @@ async fn toggle_oidc(
 // LDAP
 // ---------------------------------------------------------------------------
 
-async fn list_ldap(
+/// List all LDAP provider configurations
+#[utoipa::path(
+    get,
+    path = "/ldap",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    responses(
+        (status = 200, description = "List of LDAP configurations", body = Vec<LdapConfigResponse>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<LdapConfigResponse>>> {
@@ -136,7 +240,23 @@ async fn list_ldap(
     Ok(Json(result))
 }
 
-async fn get_ldap(
+/// Get LDAP provider configuration by ID
+#[utoipa::path(
+    get,
+    path = "/ldap/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "LDAP configuration ID")
+    ),
+    responses(
+        (status = 200, description = "LDAP configuration details", body = LdapConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -146,7 +266,20 @@ async fn get_ldap(
     Ok(Json(result))
 }
 
-async fn create_ldap(
+/// Create a new LDAP provider configuration
+#[utoipa::path(
+    post,
+    path = "/ldap",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    request_body = CreateLdapConfigRequest,
+    responses(
+        (status = 200, description = "LDAP configuration created", body = LdapConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateLdapConfigRequest>,
@@ -156,7 +289,24 @@ async fn create_ldap(
     Ok(Json(result))
 }
 
-async fn update_ldap(
+/// Update an LDAP provider configuration
+#[utoipa::path(
+    put,
+    path = "/ldap/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "LDAP configuration ID")
+    ),
+    request_body = UpdateLdapConfigRequest,
+    responses(
+        (status = 200, description = "LDAP configuration updated", body = LdapConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -167,7 +317,23 @@ async fn update_ldap(
     Ok(Json(result))
 }
 
-async fn delete_ldap(
+/// Delete an LDAP provider configuration
+#[utoipa::path(
+    delete,
+    path = "/ldap/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "LDAP configuration ID")
+    ),
+    responses(
+        (status = 200, description = "LDAP configuration deleted"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -177,7 +343,24 @@ async fn delete_ldap(
     Ok(())
 }
 
-async fn toggle_ldap(
+/// Toggle an LDAP provider enabled/disabled
+#[utoipa::path(
+    patch,
+    path = "/ldap/{id}/toggle",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "LDAP configuration ID")
+    ),
+    request_body = ToggleRequest,
+    responses(
+        (status = 200, description = "LDAP configuration toggled"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn toggle_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -188,7 +371,23 @@ async fn toggle_ldap(
     Ok(())
 }
 
-async fn test_ldap(
+/// Test an LDAP provider connection
+#[utoipa::path(
+    post,
+    path = "/ldap/{id}/test",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "LDAP configuration ID")
+    ),
+    responses(
+        (status = 200, description = "LDAP connection test result", body = LdapTestResult),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn test_ldap(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -202,7 +401,19 @@ async fn test_ldap(
 // SAML
 // ---------------------------------------------------------------------------
 
-async fn list_saml(
+/// List all SAML provider configurations
+#[utoipa::path(
+    get,
+    path = "/saml",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    responses(
+        (status = 200, description = "List of SAML configurations", body = Vec<SamlConfigResponse>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_saml(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<SamlConfigResponse>>> {
@@ -211,7 +422,23 @@ async fn list_saml(
     Ok(Json(result))
 }
 
-async fn get_saml(
+/// Get SAML provider configuration by ID
+#[utoipa::path(
+    get,
+    path = "/saml/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "SAML configuration ID")
+    ),
+    responses(
+        (status = 200, description = "SAML configuration details", body = SamlConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_saml(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -221,7 +448,20 @@ async fn get_saml(
     Ok(Json(result))
 }
 
-async fn create_saml(
+/// Create a new SAML provider configuration
+#[utoipa::path(
+    post,
+    path = "/saml",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    request_body = CreateSamlConfigRequest,
+    responses(
+        (status = 200, description = "SAML configuration created", body = SamlConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_saml(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateSamlConfigRequest>,
@@ -231,7 +471,24 @@ async fn create_saml(
     Ok(Json(result))
 }
 
-async fn update_saml(
+/// Update a SAML provider configuration
+#[utoipa::path(
+    put,
+    path = "/saml/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "SAML configuration ID")
+    ),
+    request_body = UpdateSamlConfigRequest,
+    responses(
+        (status = 200, description = "SAML configuration updated", body = SamlConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_saml(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -242,7 +499,23 @@ async fn update_saml(
     Ok(Json(result))
 }
 
-async fn delete_saml(
+/// Delete a SAML provider configuration
+#[utoipa::path(
+    delete,
+    path = "/saml/{id}",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "SAML configuration ID")
+    ),
+    responses(
+        (status = 200, description = "SAML configuration deleted"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_saml(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -252,7 +525,24 @@ async fn delete_saml(
     Ok(())
 }
 
-async fn toggle_saml(
+/// Toggle a SAML provider enabled/disabled
+#[utoipa::path(
+    patch,
+    path = "/saml/{id}/toggle",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "SAML configuration ID")
+    ),
+    request_body = ToggleRequest,
+    responses(
+        (status = 200, description = "SAML configuration toggled"),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Configuration not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn toggle_saml(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
@@ -267,7 +557,19 @@ async fn toggle_saml(
 // All providers
 // ---------------------------------------------------------------------------
 
-async fn list_providers(
+/// List all enabled SSO providers (admin view)
+#[utoipa::path(
+    get,
+    path = "/providers",
+    context_path = "/api/v1/admin/sso",
+    tag = "sso",
+    responses(
+        (status = 200, description = "List of enabled SSO providers", body = Vec<SsoProviderInfo>),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_providers(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<SsoProviderInfo>>> {
@@ -275,3 +577,44 @@ async fn list_providers(
     let result = AuthConfigService::list_enabled_providers(&state.db).await?;
     Ok(Json(result))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_oidc,
+        get_oidc,
+        create_oidc,
+        update_oidc,
+        delete_oidc,
+        toggle_oidc,
+        list_ldap,
+        get_ldap,
+        create_ldap,
+        update_ldap,
+        delete_ldap,
+        toggle_ldap,
+        test_ldap,
+        list_saml,
+        get_saml,
+        create_saml,
+        update_saml,
+        delete_saml,
+        toggle_saml,
+        list_providers,
+    ),
+    components(schemas(
+        OidcConfigResponse,
+        LdapConfigResponse,
+        SamlConfigResponse,
+        CreateOidcConfigRequest,
+        UpdateOidcConfigRequest,
+        CreateLdapConfigRequest,
+        UpdateLdapConfigRequest,
+        CreateSamlConfigRequest,
+        UpdateSamlConfigRequest,
+        ToggleRequest,
+        LdapTestResult,
+        SsoProviderInfo,
+    ))
+)]
+pub struct SsoAdminApiDoc;

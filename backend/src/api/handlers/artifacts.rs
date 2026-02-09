@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -22,7 +23,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/stats", get(get_artifact_stats))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactResponse {
     pub id: Uuid,
     pub repository_id: Uuid,
@@ -39,7 +40,7 @@ pub struct ArtifactResponse {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactMetadataResponse {
     pub artifact_id: Uuid,
     pub format: String,
@@ -47,7 +48,7 @@ pub struct ArtifactMetadataResponse {
     pub properties: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactStatsResponse {
     pub artifact_id: Uuid,
     pub download_count: i64,
@@ -56,6 +57,19 @@ pub struct ArtifactStatsResponse {
 }
 
 /// Get artifact by ID
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/artifacts",
+    tag = "artifacts",
+    params(
+        ("id" = Uuid, Path, description = "Artifact ID")
+    ),
+    responses(
+        (status = 200, description = "Artifact details", body = ArtifactResponse),
+        (status = 404, description = "Artifact not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn get_artifact(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -96,6 +110,19 @@ pub async fn get_artifact(
 }
 
 /// Get artifact metadata by artifact ID
+#[utoipa::path(
+    get,
+    path = "/{id}/metadata",
+    context_path = "/api/v1/artifacts",
+    tag = "artifacts",
+    params(
+        ("id" = Uuid, Path, description = "Artifact ID")
+    ),
+    responses(
+        (status = 200, description = "Artifact metadata", body = ArtifactMetadataResponse),
+        (status = 404, description = "Artifact or metadata not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -134,6 +161,19 @@ pub async fn get_artifact_metadata(
 }
 
 /// Get artifact download statistics
+#[utoipa::path(
+    get,
+    path = "/{id}/stats",
+    context_path = "/api/v1/artifacts",
+    tag = "artifacts",
+    params(
+        ("id" = Uuid, Path, description = "Artifact ID")
+    ),
+    responses(
+        (status = 200, description = "Artifact download statistics", body = ArtifactStatsResponse),
+        (status = 404, description = "Artifact not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
 pub async fn get_artifact_stats(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -172,3 +212,10 @@ pub async fn get_artifact_stats(
         last_downloaded: stats.last_downloaded,
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(get_artifact, get_artifact_metadata, get_artifact_stats,),
+    components(schemas(ArtifactResponse, ArtifactMetadataResponse, ArtifactStatsResponse,))
+)]
+pub struct ArtifactsApiDoc;

@@ -18,12 +18,13 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
 /// Pagination metadata for list responses.
 ///
 /// Used consistently across all paginated API endpoints to provide
 /// standard pagination information to clients.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Pagination {
     /// Current page number (1-indexed)
     pub page: u32,
@@ -70,7 +71,7 @@ impl Pagination {
 ///
 /// Provides optional page and per_page parameters with sensible defaults.
 /// Can be used with `#[serde(flatten)]` in handler-specific query structs.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
 pub struct PaginationQuery {
     /// Requested page number (default: 1)
     pub page: Option<u32>,

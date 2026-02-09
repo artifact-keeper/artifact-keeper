@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -28,13 +29,13 @@ pub fn router() -> Router<SharedState> {
         .route("/:session_id/fail", post(fail_session))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct InitTransferBody {
     pub artifact_id: Uuid,
     pub chunk_size: Option<i32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TransferSessionResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
@@ -48,13 +49,13 @@ pub struct TransferSessionResponse {
     pub status: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChunkManifestResponse {
     pub session_id: Uuid,
     pub chunks: Vec<ChunkEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChunkEntry {
     pub chunk_index: i32,
     pub byte_offset: i64,
@@ -64,18 +65,32 @@ pub struct ChunkEntry {
     pub source_peer_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CompleteChunkBody {
     pub checksum: String,
     pub source_peer_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct FailBody {
     pub error: String,
 }
 
 /// POST /api/v1/peers/:id/transfer/init
+#[utoipa::path(
+    post,
+    path = "/{id}/transfer/init",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+    ),
+    request_body = InitTransferBody,
+    responses(
+        (status = 200, description = "Transfer session initialized", body = TransferSessionResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn init_transfer(
     State(state): State<SharedState>,
     Path(peer_id): Path<Uuid>,
@@ -106,6 +121,20 @@ async fn init_transfer(
 }
 
 /// GET /api/v1/peers/:id/transfer/:session_id/chunks
+#[utoipa::path(
+    get,
+    path = "/{id}/transfer/{session_id}/chunks",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("session_id" = Uuid, Path, description = "Transfer session ID"),
+    ),
+    responses(
+        (status = 200, description = "Chunk manifest for the transfer session", body = ChunkManifestResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_chunk_manifest(
     State(state): State<SharedState>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
@@ -130,6 +159,20 @@ async fn get_chunk_manifest(
 }
 
 /// GET /api/v1/peers/:id/transfer/:session_id
+#[utoipa::path(
+    get,
+    path = "/{id}/transfer/{session_id}",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("session_id" = Uuid, Path, description = "Transfer session ID"),
+    ),
+    responses(
+        (status = 200, description = "Transfer session details", body = TransferSessionResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_session(
     State(state): State<SharedState>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
@@ -152,6 +195,22 @@ async fn get_session(
 }
 
 /// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/complete
+#[utoipa::path(
+    post,
+    path = "/{id}/transfer/{session_id}/chunk/{chunk_index}/complete",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("session_id" = Uuid, Path, description = "Transfer session ID"),
+        ("chunk_index" = i32, Path, description = "Chunk index"),
+    ),
+    request_body = CompleteChunkBody,
+    responses(
+        (status = 200, description = "Chunk marked as complete"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn complete_chunk(
     State(state): State<SharedState>,
     Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
@@ -164,6 +223,22 @@ async fn complete_chunk(
 }
 
 /// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/fail
+#[utoipa::path(
+    post,
+    path = "/{id}/transfer/{session_id}/chunk/{chunk_index}/fail",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("session_id" = Uuid, Path, description = "Transfer session ID"),
+        ("chunk_index" = i32, Path, description = "Chunk index"),
+    ),
+    request_body = FailBody,
+    responses(
+        (status = 200, description = "Chunk marked as failed"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn fail_chunk(
     State(state): State<SharedState>,
     Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
@@ -176,6 +251,21 @@ async fn fail_chunk(
 }
 
 /// POST /api/v1/peers/:id/transfer/:session_id/chunk/:chunk_index/retry
+#[utoipa::path(
+    post,
+    path = "/{id}/transfer/{session_id}/chunk/{chunk_index}/retry",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("session_id" = Uuid, Path, description = "Transfer session ID"),
+        ("chunk_index" = i32, Path, description = "Chunk index"),
+    ),
+    responses(
+        (status = 200, description = "Chunk queued for retry"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn retry_chunk(
     State(state): State<SharedState>,
     Path((_peer_id, session_id, chunk_index)): Path<(Uuid, Uuid, i32)>,
@@ -185,6 +275,20 @@ async fn retry_chunk(
 }
 
 /// POST /api/v1/peers/:id/transfer/:session_id/complete
+#[utoipa::path(
+    post,
+    path = "/{id}/transfer/{session_id}/complete",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("session_id" = Uuid, Path, description = "Transfer session ID"),
+    ),
+    responses(
+        (status = 200, description = "Transfer session marked as complete"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn complete_session(
     State(state): State<SharedState>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
@@ -194,6 +298,21 @@ async fn complete_session(
 }
 
 /// POST /api/v1/peers/:id/transfer/:session_id/fail
+#[utoipa::path(
+    post,
+    path = "/{id}/transfer/{session_id}/fail",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("session_id" = Uuid, Path, description = "Transfer session ID"),
+    ),
+    request_body = FailBody,
+    responses(
+        (status = 200, description = "Transfer session marked as failed"),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn fail_session(
     State(state): State<SharedState>,
     Path((_peer_id, session_id)): Path<(Uuid, Uuid)>,
@@ -202,3 +321,26 @@ async fn fail_session(
     let service = TransferService::new(state.db.clone());
     service.fail_session(session_id, &body.error).await
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        init_transfer,
+        get_chunk_manifest,
+        get_session,
+        complete_chunk,
+        fail_chunk,
+        retry_chunk,
+        complete_session,
+        fail_session,
+    ),
+    components(schemas(
+        InitTransferBody,
+        TransferSessionResponse,
+        ChunkManifestResponse,
+        ChunkEntry,
+        CompleteChunkBody,
+        FailBody,
+    ))
+)]
+pub struct TransferApiDoc;

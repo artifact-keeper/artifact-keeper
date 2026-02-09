@@ -6,6 +6,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -16,7 +17,7 @@ pub struct AnalyticsService {
 }
 
 /// A single day's storage metrics snapshot.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct StorageSnapshot {
     pub snapshot_date: NaiveDate,
     pub total_repositories: i64,
@@ -27,7 +28,7 @@ pub struct StorageSnapshot {
 }
 
 /// Per-repository metrics snapshot.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct RepositorySnapshot {
     pub repository_id: Uuid,
     pub repository_name: Option<String>,
@@ -39,7 +40,7 @@ pub struct RepositorySnapshot {
 }
 
 /// Current per-repository storage breakdown.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct RepositoryStorageBreakdown {
     pub repository_id: Uuid,
     pub repository_key: String,
@@ -52,7 +53,7 @@ pub struct RepositoryStorageBreakdown {
 }
 
 /// Artifact aging report entry.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct StaleArtifact {
     pub artifact_id: Uuid,
     pub repository_key: String,
@@ -66,7 +67,7 @@ pub struct StaleArtifact {
 }
 
 /// Growth summary for a time range.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GrowthSummary {
     pub period_start: NaiveDate,
     pub period_end: NaiveDate,
@@ -81,7 +82,7 @@ pub struct GrowthSummary {
 }
 
 /// Download trend data point.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct DownloadTrend {
     pub date: NaiveDate,
     pub download_count: i64,

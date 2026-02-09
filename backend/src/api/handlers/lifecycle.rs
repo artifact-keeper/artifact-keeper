@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use utoipa::{IntoParams, OpenApi};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -15,6 +16,28 @@ use crate::services::lifecycle_service::{
     CreatePolicyRequest, LifecyclePolicy, LifecycleService, PolicyExecutionResult,
     UpdatePolicyRequest,
 };
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_policies,
+        create_policy,
+        get_policy,
+        update_policy,
+        delete_policy,
+        execute_policy,
+        preview_policy,
+        execute_all_policies,
+    ),
+    components(schemas(
+        LifecyclePolicy,
+        CreatePolicyRequest,
+        UpdatePolicyRequest,
+        PolicyExecutionResult,
+    )),
+    tags((name = "lifecycle", description = "Lifecycle policy management")),
+)]
+pub struct LifecycleApiDoc;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -28,12 +51,23 @@ pub fn router() -> Router<SharedState> {
         .route("/execute-all", post(execute_all_policies))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListPoliciesQuery {
     pub repository_id: Option<Uuid>,
 }
 
 /// GET /api/v1/admin/lifecycle
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    params(ListPoliciesQuery),
+    responses(
+        (status = 200, description = "List lifecycle policies", body = Vec<LifecyclePolicy>),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn list_policies(
     State(state): State<SharedState>,
     Query(query): Query<ListPoliciesQuery>,
@@ -44,6 +78,17 @@ pub async fn list_policies(
 }
 
 /// POST /api/v1/admin/lifecycle
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    request_body = CreatePolicyRequest,
+    responses(
+        (status = 200, description = "Policy created successfully", body = LifecyclePolicy),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn create_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -55,6 +100,19 @@ pub async fn create_policy(
 }
 
 /// GET /api/v1/admin/lifecycle/:id
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID"),
+    ),
+    responses(
+        (status = 200, description = "Lifecycle policy details", body = LifecyclePolicy),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn get_policy(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -65,6 +123,20 @@ pub async fn get_policy(
 }
 
 /// PATCH /api/v1/admin/lifecycle/:id
+#[utoipa::path(
+    patch,
+    path = "/{id}",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID"),
+    ),
+    request_body = UpdatePolicyRequest,
+    responses(
+        (status = 200, description = "Policy updated successfully", body = LifecyclePolicy),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn update_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -77,6 +149,19 @@ pub async fn update_policy(
 }
 
 /// DELETE /api/v1/admin/lifecycle/:id
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID"),
+    ),
+    responses(
+        (status = 200, description = "Policy deleted"),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn delete_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -88,6 +173,19 @@ pub async fn delete_policy(
 }
 
 /// POST /api/v1/admin/lifecycle/:id/execute
+#[utoipa::path(
+    post,
+    path = "/{id}/execute",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID"),
+    ),
+    responses(
+        (status = 200, description = "Policy executed", body = PolicyExecutionResult),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn execute_policy(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -104,6 +202,19 @@ pub async fn execute_policy(
 }
 
 /// POST /api/v1/admin/lifecycle/:id/preview - dry-run
+#[utoipa::path(
+    post,
+    path = "/{id}/preview",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID"),
+    ),
+    responses(
+        (status = 200, description = "Policy preview (dry-run)", body = PolicyExecutionResult),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn preview_policy(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -114,6 +225,16 @@ pub async fn preview_policy(
 }
 
 /// POST /api/v1/admin/lifecycle/execute-all
+#[utoipa::path(
+    post,
+    path = "/execute-all",
+    context_path = "/api/v1/admin/lifecycle",
+    tag = "lifecycle",
+    responses(
+        (status = 200, description = "All enabled policies executed", body = Vec<PolicyExecutionResult>),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn execute_all_policies(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,

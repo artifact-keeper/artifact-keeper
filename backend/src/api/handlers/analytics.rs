@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::NaiveDate;
 use serde::Deserialize;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -24,7 +25,7 @@ pub fn router() -> Router<SharedState> {
         .route("/snapshot", axum::routing::post(capture_snapshot))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct DateRangeQuery {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -46,13 +47,24 @@ impl DateRangeQuery {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct StaleQuery {
     pub days: Option<i32>,
     pub limit: Option<i64>,
 }
 
 /// GET /api/v1/admin/analytics/storage/trend
+#[utoipa::path(
+    get,
+    path = "/storage/trend",
+    context_path = "/api/v1/admin/analytics",
+    tag = "analytics",
+    params(DateRangeQuery),
+    responses(
+        (status = 200, description = "Storage trend over date range", body = Vec<crate::services::analytics_service::StorageSnapshot>),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_storage_trend(
     State(state): State<SharedState>,
     Query(query): Query<DateRangeQuery>,
@@ -64,6 +76,16 @@ pub async fn get_storage_trend(
 }
 
 /// GET /api/v1/admin/analytics/storage/breakdown
+#[utoipa::path(
+    get,
+    path = "/storage/breakdown",
+    context_path = "/api/v1/admin/analytics",
+    tag = "analytics",
+    responses(
+        (status = 200, description = "Per-repository storage breakdown", body = Vec<crate::services::analytics_service::RepositoryStorageBreakdown>),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_storage_breakdown(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<crate::services::analytics_service::RepositoryStorageBreakdown>>> {
@@ -73,6 +95,17 @@ pub async fn get_storage_breakdown(
 }
 
 /// GET /api/v1/admin/analytics/storage/growth
+#[utoipa::path(
+    get,
+    path = "/storage/growth",
+    context_path = "/api/v1/admin/analytics",
+    tag = "analytics",
+    params(DateRangeQuery),
+    responses(
+        (status = 200, description = "Growth summary for date range", body = crate::services::analytics_service::GrowthSummary),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_growth_summary(
     State(state): State<SharedState>,
     Query(query): Query<DateRangeQuery>,
@@ -84,6 +117,17 @@ pub async fn get_growth_summary(
 }
 
 /// GET /api/v1/admin/analytics/artifacts/stale
+#[utoipa::path(
+    get,
+    path = "/artifacts/stale",
+    context_path = "/api/v1/admin/analytics",
+    tag = "analytics",
+    params(StaleQuery),
+    responses(
+        (status = 200, description = "List of stale artifacts", body = Vec<crate::services::analytics_service::StaleArtifact>),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_stale_artifacts(
     State(state): State<SharedState>,
     Query(query): Query<StaleQuery>,
@@ -96,6 +140,17 @@ pub async fn get_stale_artifacts(
 }
 
 /// GET /api/v1/admin/analytics/downloads/trend
+#[utoipa::path(
+    get,
+    path = "/downloads/trend",
+    context_path = "/api/v1/admin/analytics",
+    tag = "analytics",
+    params(DateRangeQuery),
+    responses(
+        (status = 200, description = "Download trends over date range", body = Vec<crate::services::analytics_service::DownloadTrend>),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_download_trends(
     State(state): State<SharedState>,
     Query(query): Query<DateRangeQuery>,
@@ -106,7 +161,21 @@ pub async fn get_download_trends(
     Ok(Json(trends))
 }
 
-/// GET /api/v1/admin/analytics/repositories/:id/trend
+/// GET /api/v1/admin/analytics/repositories/{id}/trend
+#[utoipa::path(
+    get,
+    path = "/repositories/{id}/trend",
+    context_path = "/api/v1/admin/analytics",
+    tag = "analytics",
+    params(
+        ("id" = Uuid, Path, description = "Repository ID"),
+        DateRangeQuery,
+    ),
+    responses(
+        (status = 200, description = "Repository storage trend over date range", body = Vec<crate::services::analytics_service::RepositorySnapshot>),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_repository_trend(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -119,6 +188,16 @@ pub async fn get_repository_trend(
 }
 
 /// POST /api/v1/admin/analytics/snapshot - manually trigger a snapshot
+#[utoipa::path(
+    post,
+    path = "/snapshot",
+    context_path = "/api/v1/admin/analytics",
+    tag = "analytics",
+    responses(
+        (status = 200, description = "Snapshot captured successfully", body = crate::services::analytics_service::StorageSnapshot),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn capture_snapshot(
     State(state): State<SharedState>,
 ) -> Result<Json<crate::services::analytics_service::StorageSnapshot>> {
@@ -127,3 +206,27 @@ pub async fn capture_snapshot(
     let _ = service.capture_repository_snapshots().await;
     Ok(Json(snapshot))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        get_storage_trend,
+        get_storage_breakdown,
+        get_growth_summary,
+        get_stale_artifacts,
+        get_download_trends,
+        get_repository_trend,
+        capture_snapshot,
+    ),
+    components(schemas(
+        DateRangeQuery,
+        StaleQuery,
+        crate::services::analytics_service::StorageSnapshot,
+        crate::services::analytics_service::RepositorySnapshot,
+        crate::services::analytics_service::RepositoryStorageBreakdown,
+        crate::services::analytics_service::GrowthSummary,
+        crate::services::analytics_service::StaleArtifact,
+        crate::services::analytics_service::DownloadTrend,
+    ))
+)]
+pub struct AnalyticsApiDoc;

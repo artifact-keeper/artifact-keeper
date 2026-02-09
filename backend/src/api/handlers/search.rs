@@ -11,6 +11,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -37,7 +38,7 @@ pub fn router() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 
 /// A unified search result matching the frontend `SearchResult` interface.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResultItem {
     pub id: Uuid,
     #[serde(rename = "type")]
@@ -57,7 +58,7 @@ pub struct SearchResultItem {
     pub highlights: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PaginationInfo {
     pub page: u32,
     pub per_page: u32,
@@ -65,13 +66,13 @@ pub struct PaginationInfo {
     pub total_pages: u32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct FacetValue {
     pub value: String,
     pub count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct FacetsResponse {
     pub formats: Vec<FacetValue>,
     pub repositories: Vec<FacetValue>,
@@ -82,18 +83,28 @@ pub struct FacetsResponse {
 // GET /search/quick?q=&limit=
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct QuickSearchQuery {
     pub q: Option<String>,
     pub limit: Option<i64>,
     pub types: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct QuickSearchResponse {
     pub results: Vec<SearchResultItem>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/quick",
+    context_path = "/api/v1/search",
+    tag = "search",
+    params(QuickSearchQuery),
+    responses(
+        (status = 200, description = "Quick search results", body = QuickSearchResponse),
+    ),
+)]
 pub async fn quick_search(
     State(state): State<SharedState>,
     Query(params): Query<QuickSearchQuery>,
@@ -142,7 +153,7 @@ pub async fn quick_search(
 // GET /search/advanced
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct AdvancedSearchQuery {
     pub query: Option<String>,
     pub format: Option<String>,
@@ -160,13 +171,23 @@ pub struct AdvancedSearchQuery {
     pub sort_order: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct AdvancedSearchResponse {
     pub items: Vec<SearchResultItem>,
     pub pagination: PaginationInfo,
     pub facets: FacetsResponse,
 }
 
+#[utoipa::path(
+    get,
+    path = "/advanced",
+    context_path = "/api/v1/search",
+    tag = "search",
+    params(AdvancedSearchQuery),
+    responses(
+        (status = 200, description = "Advanced search results with pagination and facets", body = AdvancedSearchResponse),
+    ),
+)]
 pub async fn advanced_search(
     State(state): State<SharedState>,
     Query(params): Query<AdvancedSearchQuery>,
@@ -252,13 +273,13 @@ pub async fn advanced_search(
 // GET /search/checksum?checksum=&algorithm=sha256
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ChecksumQuery {
     pub checksum: String,
     pub algorithm: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChecksumArtifact {
     pub id: Uuid,
     pub repository_key: String,
@@ -272,11 +293,22 @@ pub struct ChecksumArtifact {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChecksumSearchResponse {
     pub artifacts: Vec<ChecksumArtifact>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/checksum",
+    context_path = "/api/v1/search",
+    tag = "search",
+    params(ChecksumQuery),
+    responses(
+        (status = 200, description = "Artifacts matching the given checksum", body = ChecksumSearchResponse),
+        (status = 422, description = "Unsupported checksum algorithm"),
+    ),
+)]
 pub async fn checksum_search(
     State(state): State<SharedState>,
     Query(params): Query<ChecksumQuery>,
@@ -419,17 +451,27 @@ struct ChecksumRow {
 // GET /search/suggest?prefix=&limit=
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct SuggestQuery {
     pub prefix: String,
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SuggestResponse {
     pub suggestions: Vec<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/suggest",
+    context_path = "/api/v1/search",
+    tag = "search",
+    params(SuggestQuery),
+    responses(
+        (status = 200, description = "Autocomplete suggestions for the given prefix", body = SuggestResponse),
+    ),
+)]
 pub async fn suggest(
     State(state): State<SharedState>,
     Query(params): Query<SuggestQuery>,
@@ -446,12 +488,22 @@ pub async fn suggest(
 // GET /search/trending?days=&limit=
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct TrendingQuery {
     pub days: Option<i32>,
     pub limit: Option<i64>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/trending",
+    context_path = "/api/v1/search",
+    tag = "search",
+    params(TrendingQuery),
+    responses(
+        (status = 200, description = "Trending artifacts by download count", body = Vec<SearchResultItem>),
+    ),
+)]
 pub async fn trending(
     State(state): State<SharedState>,
     Query(params): Query<TrendingQuery>,
@@ -485,11 +537,21 @@ pub async fn trending(
 // GET /search/recent?limit=
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct RecentQuery {
     pub limit: Option<i64>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/recent",
+    context_path = "/api/v1/search",
+    tag = "search",
+    params(RecentQuery),
+    responses(
+        (status = 200, description = "Recently uploaded artifacts", body = Vec<SearchResultItem>),
+    ),
+)]
 pub async fn recent(
     State(state): State<SharedState>,
     Query(params): Query<RecentQuery>,
@@ -517,3 +579,27 @@ pub async fn recent(
 
     Ok(Json(items))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        quick_search,
+        advanced_search,
+        checksum_search,
+        suggest,
+        trending,
+        recent,
+    ),
+    components(schemas(
+        SearchResultItem,
+        PaginationInfo,
+        FacetValue,
+        FacetsResponse,
+        QuickSearchResponse,
+        AdvancedSearchResponse,
+        ChecksumArtifact,
+        ChecksumSearchResponse,
+        SuggestResponse,
+    ))
+)]
+pub struct SearchApiDoc;

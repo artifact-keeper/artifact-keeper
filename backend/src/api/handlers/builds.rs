@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
@@ -31,7 +32,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/artifacts", post(add_build_artifacts))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListBuildsQuery {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
@@ -41,7 +42,7 @@ pub struct ListBuildsQuery {
     pub sort_order: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildArtifact {
     pub name: String,
     pub path: String,
@@ -49,14 +50,14 @@ pub struct BuildArtifact {
     pub size_bytes: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildModule {
     pub id: Uuid,
     pub name: String,
     pub artifacts: Vec<BuildArtifact>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct BuildRow {
     pub id: Uuid,
     pub name: String,
@@ -71,7 +72,7 @@ pub struct BuildRow {
     pub artifact_count: Option<i32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildResponse {
     pub id: Uuid,
     pub name: String,
@@ -94,6 +95,7 @@ pub struct BuildResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vcs_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -145,13 +147,23 @@ impl From<crate::services::build_service::Build> for BuildResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildListResponse {
     pub items: Vec<BuildResponse>,
     pub pagination: Pagination,
 }
 
 /// List builds
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    params(ListBuildsQuery),
+    responses(
+        (status = 200, description = "List of builds", body = BuildListResponse),
+    )
+)]
 pub async fn list_builds(
     State(state): State<SharedState>,
     Query(query): Query<ListBuildsQuery>,
@@ -241,6 +253,19 @@ pub async fn list_builds(
 }
 
 /// Get a build by ID
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    params(
+        ("id" = Uuid, Path, description = "Build ID"),
+    ),
+    responses(
+        (status = 200, description = "Build details", body = BuildResponse),
+        (status = 404, description = "Build not found"),
+    )
+)]
 pub async fn get_build(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -274,13 +299,13 @@ pub async fn get_build(
     Ok(Json(BuildResponse::from(build)))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct BuildDiffQuery {
     pub build_a: Uuid,
     pub build_b: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildArtifactDiff {
     pub name: String,
     pub path: String,
@@ -290,7 +315,7 @@ pub struct BuildArtifactDiff {
     pub new_size_bytes: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildDiffResponse {
     pub build_a: Uuid,
     pub build_b: Uuid,
@@ -300,6 +325,16 @@ pub struct BuildDiffResponse {
 }
 
 /// Get diff between two builds
+#[utoipa::path(
+    get,
+    path = "/diff",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    params(BuildDiffQuery),
+    responses(
+        (status = 200, description = "Diff between two builds", body = BuildDiffResponse),
+    )
+)]
 pub async fn get_build_diff(
     State(_state): State<SharedState>,
     Query(query): Query<BuildDiffQuery>,
@@ -316,7 +351,7 @@ pub async fn get_build_diff(
 
 // --- Write endpoints ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateBuildRequest {
     pub name: String,
     pub build_number: i32,
@@ -326,10 +361,23 @@ pub struct CreateBuildRequest {
     pub vcs_revision: Option<String>,
     pub vcs_branch: Option<String>,
     pub vcs_message: Option<String>,
+    #[schema(value_type = Object)]
     pub metadata: Option<serde_json::Value>,
 }
 
 /// Create a new build (POST /api/v1/builds)
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    request_body = CreateBuildRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Build created successfully", body = BuildResponse),
+        (status = 401, description = "Authentication required"),
+    )
+)]
 pub async fn create_build(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -355,13 +403,29 @@ pub async fn create_build(
     Ok(Json(BuildResponse::from(build)))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateBuildRequest {
     pub status: String,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Update build status (PUT /api/v1/builds/:id)
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    params(
+        ("id" = Uuid, Path, description = "Build ID"),
+    ),
+    request_body = UpdateBuildRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Build updated successfully", body = BuildResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Build not found"),
+    )
+)]
 pub async fn update_build(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -384,12 +448,12 @@ pub async fn update_build(
     Ok(Json(BuildResponse::from(build)))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AddBuildArtifactsRequest {
     pub artifacts: Vec<BuildArtifactInputPayload>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct BuildArtifactInputPayload {
     pub module_name: Option<String>,
     pub name: String,
@@ -398,7 +462,7 @@ pub struct BuildArtifactInputPayload {
     pub size_bytes: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BuildArtifactResponse {
     pub id: Uuid,
     pub build_id: Uuid,
@@ -410,12 +474,28 @@ pub struct BuildArtifactResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct AddBuildArtifactsResponse {
     pub artifacts: Vec<BuildArtifactResponse>,
 }
 
 /// Attach artifacts to a build (POST /api/v1/builds/:id/artifacts)
+#[utoipa::path(
+    post,
+    path = "/{id}/artifacts",
+    context_path = "/api/v1/builds",
+    tag = "builds",
+    params(
+        ("id" = Uuid, Path, description = "Build ID"),
+    ),
+    request_body = AddBuildArtifactsRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Artifacts added to build", body = AddBuildArtifactsResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Build not found"),
+    )
+)]
 pub async fn add_build_artifacts(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -457,3 +537,33 @@ pub async fn add_build_artifacts(
         artifacts: response_artifacts,
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_builds,
+        get_build,
+        get_build_diff,
+        create_build,
+        update_build,
+        add_build_artifacts,
+    ),
+    components(schemas(
+        ListBuildsQuery,
+        BuildArtifact,
+        BuildModule,
+        BuildRow,
+        BuildResponse,
+        BuildListResponse,
+        BuildDiffQuery,
+        BuildArtifactDiff,
+        BuildDiffResponse,
+        CreateBuildRequest,
+        UpdateBuildRequest,
+        AddBuildArtifactsRequest,
+        BuildArtifactInputPayload,
+        BuildArtifactResponse,
+        AddBuildArtifactsResponse,
+    ))
+)]
+pub struct BuildsApiDoc;

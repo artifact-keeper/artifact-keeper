@@ -82,6 +82,11 @@ wasmtime-wasi = "24.0"
 git2 = "0.19"
 meilisearch-sdk = "0.27"
 
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.1"
+utoipa-swagger-ui = { version = "8", features = ["axum"] }
+
 # gRPC
 tonic = "0.12"
 tonic-reflection = "0.12"

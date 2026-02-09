@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -57,7 +58,7 @@ pub fn repo_security_router() -> Router<SharedState> {
 // Request / Response types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DashboardResponse {
     pub repos_with_scanning: i64,
     pub total_scans: i64,
@@ -69,7 +70,7 @@ pub struct DashboardResponse {
     pub repos_grade_f: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScoreResponse {
     pub id: Uuid,
     pub repository_id: Uuid,
@@ -85,19 +86,19 @@ pub struct ScoreResponse {
     pub calculated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct TriggerScanRequest {
     pub artifact_id: Option<Uuid>,
     pub repository_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TriggerScanResponse {
     pub message: String,
     pub artifacts_queued: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListScansQuery {
     pub repository_id: Option<Uuid>,
     pub artifact_id: Option<Uuid>,
@@ -106,13 +107,13 @@ pub struct ListScansQuery {
     pub per_page: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScanListResponse {
     pub items: Vec<ScanResponse>,
     pub total: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScanResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
@@ -273,19 +274,19 @@ async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanRes
         .collect())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListFindingsQuery {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct FindingListResponse {
     pub items: Vec<FindingResponse>,
     pub total: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct FindingResponse {
     pub id: Uuid,
     pub scan_result_id: Uuid,
@@ -306,12 +307,12 @@ pub struct FindingResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AcknowledgeRequest {
     pub reason: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePolicyRequest {
     pub name: String,
     pub repository_id: Option<Uuid>,
@@ -320,7 +321,7 @@ pub struct CreatePolicyRequest {
     pub block_on_fail: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePolicyRequest {
     pub name: String,
     pub max_severity: String,
@@ -329,7 +330,7 @@ pub struct UpdatePolicyRequest {
     pub is_enabled: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PolicyResponse {
     pub id: Uuid,
     pub name: String,
@@ -342,13 +343,13 @@ pub struct PolicyResponse {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RepoSecurityResponse {
     pub config: Option<ScanConfigResponse>,
     pub score: Option<ScoreResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ScanConfigResponse {
     pub id: Uuid,
     pub repository_id: Uuid,
@@ -365,6 +366,16 @@ pub struct ScanConfigResponse {
 // Dashboard
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/dashboard",
+    context_path = "/api/v1/security",
+    tag = "security",
+    responses(
+        (status = 200, description = "Security dashboard summary", body = DashboardResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_dashboard(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -388,6 +399,16 @@ async fn get_dashboard(
 // Scores
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/scores",
+    context_path = "/api/v1/security",
+    tag = "security",
+    responses(
+        (status = 200, description = "All repository security scores", body = Vec<ScoreResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_all_scores(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -398,6 +419,16 @@ async fn get_all_scores(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get,
+    path = "/configs",
+    context_path = "/api/v1/security",
+    tag = "security",
+    responses(
+        (status = 200, description = "List of scan configurations", body = Vec<ScanConfigResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_scan_configs(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -413,6 +444,19 @@ async fn list_scan_configs(
 // Scan operations
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    post,
+    path = "/scan",
+    context_path = "/api/v1/security",
+    tag = "security",
+    request_body = TriggerScanRequest,
+    responses(
+        (status = 200, description = "Scan triggered successfully", body = TriggerScanResponse),
+        (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 500, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn trigger_scan(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -465,6 +509,17 @@ async fn trigger_scan(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/scans",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(ListScansQuery),
+    responses(
+        (status = 200, description = "Paginated list of scans", body = ScanListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_scans(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -489,6 +544,20 @@ async fn list_scans(
     Ok(Json(ScanListResponse { items, total }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/scans/{id}",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Scan result ID")
+    ),
+    responses(
+        (status = 200, description = "Scan details", body = ScanResponse),
+        (status = 404, description = "Scan not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_scan(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -505,6 +574,21 @@ async fn get_scan(
 // Findings
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/scans/{id}/findings",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Scan result ID"),
+        ListFindingsQuery,
+    ),
+    responses(
+        (status = 200, description = "Paginated list of findings for a scan", body = FindingListResponse),
+        (status = 404, description = "Scan not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_findings(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -522,6 +606,21 @@ async fn list_findings(
     Ok(Json(FindingListResponse { items, total }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/findings/{id}/acknowledge",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Finding ID")
+    ),
+    request_body = AcknowledgeRequest,
+    responses(
+        (status = 200, description = "Finding acknowledged", body = FindingResponse),
+        (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn acknowledge_finding(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -538,6 +637,20 @@ async fn acknowledge_finding(
     Ok(Json(FindingResponse::from(f)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/findings/{id}/acknowledge",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Finding ID")
+    ),
+    responses(
+        (status = 200, description = "Acknowledgment revoked", body = FindingResponse),
+        (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn revoke_acknowledgment(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -553,6 +666,16 @@ async fn revoke_acknowledgment(
 // Policies
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/policies",
+    context_path = "/api/v1/security",
+    tag = "security",
+    responses(
+        (status = 200, description = "List of security policies", body = Vec<PolicyResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_policies(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -563,6 +686,18 @@ async fn list_policies(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    post,
+    path = "/policies",
+    context_path = "/api/v1/security",
+    tag = "security",
+    request_body = CreatePolicyRequest,
+    responses(
+        (status = 200, description = "Policy created", body = PolicyResponse),
+        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn create_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -582,6 +717,20 @@ async fn create_policy(
     Ok(Json(PolicyResponse::from(p)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/policies/{id}",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID")
+    ),
+    responses(
+        (status = 200, description = "Policy details", body = PolicyResponse),
+        (status = 404, description = "Policy not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -593,6 +742,21 @@ async fn get_policy(
     Ok(Json(PolicyResponse::from(p)))
 }
 
+#[utoipa::path(
+    put,
+    path = "/policies/{id}",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID")
+    ),
+    request_body = UpdatePolicyRequest,
+    responses(
+        (status = 200, description = "Policy updated", body = PolicyResponse),
+        (status = 404, description = "Policy not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn update_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -614,6 +778,20 @@ async fn update_policy(
     Ok(Json(PolicyResponse::from(p)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/policies/{id}",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Policy ID")
+    ),
+    responses(
+        (status = 200, description = "Policy deleted", body = Object),
+        (status = 404, description = "Policy not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn delete_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -628,6 +806,20 @@ async fn delete_policy(
 // Repo-scoped security
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/{key}/security",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(
+        ("key" = String, Path, description = "Repository key")
+    ),
+    responses(
+        (status = 200, description = "Repository security config and score", body = RepoSecurityResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_repo_security(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -654,6 +846,21 @@ async fn get_repo_security(
     }))
 }
 
+#[utoipa::path(
+    put,
+    path = "/{key}/security",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(
+        ("key" = String, Path, description = "Repository key")
+    ),
+    request_body = UpsertScanConfigRequest,
+    responses(
+        (status = 200, description = "Repository security config updated", body = ScanConfigResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn update_repo_security(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -674,6 +881,20 @@ async fn update_repo_security(
     Ok(Json(ScanConfigResponse::from(c)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/artifacts/{artifact_id}/scans",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact ID"),
+        ListScansQuery,
+    ),
+    responses(
+        (status = 200, description = "Paginated list of scans for an artifact", body = ScanListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_artifact_scans(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -699,6 +920,21 @@ async fn list_artifact_scans(
     Ok(Json(ScanListResponse { items, total }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/{key}/security/scans",
+    context_path = "/api/v1/repositories",
+    tag = "security",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ListScansQuery,
+    ),
+    responses(
+        (status = 200, description = "Paginated list of scans for a repository", body = ScanListResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_repo_scans(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -725,3 +961,44 @@ async fn list_repo_scans(
     let items = enrich_scans(&state.db, scans).await?;
     Ok(Json(ScanListResponse { items, total }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        get_dashboard,
+        get_all_scores,
+        list_scan_configs,
+        trigger_scan,
+        list_scans,
+        get_scan,
+        list_findings,
+        acknowledge_finding,
+        revoke_acknowledgment,
+        list_policies,
+        create_policy,
+        get_policy,
+        update_policy,
+        delete_policy,
+        get_repo_security,
+        update_repo_security,
+        list_artifact_scans,
+        list_repo_scans,
+    ),
+    components(schemas(
+        DashboardResponse,
+        ScoreResponse,
+        TriggerScanRequest,
+        TriggerScanResponse,
+        ScanListResponse,
+        ScanResponse,
+        FindingListResponse,
+        FindingResponse,
+        AcknowledgeRequest,
+        CreatePolicyRequest,
+        UpdatePolicyRequest,
+        PolicyResponse,
+        RepoSecurityResponse,
+        ScanConfigResponse,
+    ))
+)]
+pub struct SecurityApiDoc;

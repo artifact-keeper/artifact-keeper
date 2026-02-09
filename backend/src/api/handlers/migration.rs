@@ -19,6 +19,7 @@ use sqlx::FromRow;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
@@ -67,7 +68,7 @@ pub fn router() -> Router<SharedState> {
 
 // ============ Database Row Types ============
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, ToSchema)]
 pub struct SourceConnectionRow {
     pub id: Uuid,
     pub name: String,
@@ -80,12 +81,13 @@ pub struct SourceConnectionRow {
     pub verified_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, ToSchema)]
 pub struct MigrationJobRow {
     pub id: Uuid,
     pub source_connection_id: Uuid,
     pub status: String,
     pub job_type: String,
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
     pub total_items: i32,
     pub completed_items: i32,
@@ -100,7 +102,7 @@ pub struct MigrationJobRow {
     pub error_summary: Option<String>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, ToSchema)]
 pub struct MigrationItemRow {
     pub id: Uuid,
     pub job_id: Uuid,
@@ -111,6 +113,7 @@ pub struct MigrationItemRow {
     pub size_bytes: i64,
     pub checksum_source: Option<String>,
     pub checksum_target: Option<String>,
+    #[schema(value_type = Object)]
     pub metadata: Option<serde_json::Value>,
     pub error_message: Option<String>,
     pub retry_count: i32,
@@ -118,20 +121,24 @@ pub struct MigrationItemRow {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, ToSchema)]
 pub struct MigrationReportRow {
     pub id: Uuid,
     pub job_id: Uuid,
     pub generated_at: chrono::DateTime<chrono::Utc>,
+    #[schema(value_type = Object)]
     pub summary: serde_json::Value,
+    #[schema(value_type = Object)]
     pub warnings: serde_json::Value,
+    #[schema(value_type = Object)]
     pub errors: serde_json::Value,
+    #[schema(value_type = Object)]
     pub recommendations: serde_json::Value,
 }
 
 // ============ Request/Response DTOs ============
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateConnectionRequest {
     pub name: String,
     pub url: String,
@@ -141,14 +148,14 @@ pub struct CreateConnectionRequest {
     pub source_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct ConnectionCredentials {
     pub token: Option<String>,
     pub username: Option<String>,
     pub password: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ConnectionResponse {
     pub id: Uuid,
     pub name: String,
@@ -173,7 +180,7 @@ impl From<SourceConnectionRow> for ConnectionResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ConnectionTestResult {
     pub success: bool,
     pub message: String,
@@ -181,7 +188,7 @@ pub struct ConnectionTestResult {
     pub license_type: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SourceRepository {
     pub key: String,
     #[serde(rename = "type")]
@@ -191,21 +198,22 @@ pub struct SourceRepository {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateMigrationRequest {
     pub source_connection_id: Uuid,
     pub job_type: Option<String>,
+    #[schema(value_type = Object)]
     pub config: MigrationConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListMigrationsQuery {
     pub status: Option<String>,
     pub page: Option<i64>,
     pub per_page: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListItemsQuery {
     pub status: Option<String>,
     pub item_type: Option<String>,
@@ -213,7 +221,7 @@ pub struct ListItemsQuery {
     pub per_page: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ReportQuery {
     pub format: Option<String>,
 }
@@ -224,7 +232,7 @@ pub struct ListResponse<T> {
     pub pagination: Option<PaginationInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PaginationInfo {
     pub page: i64,
     pub per_page: i64,
@@ -232,12 +240,13 @@ pub struct PaginationInfo {
     pub total_pages: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MigrationJobResponse {
     pub id: Uuid,
     pub source_connection_id: Uuid,
     pub status: String,
     pub job_type: String,
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
     pub total_items: i32,
     pub completed_items: i32,
@@ -285,7 +294,7 @@ impl From<MigrationJobRow> for MigrationJobResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MigrationItemResponse {
     pub id: Uuid,
     pub job_id: Uuid,
@@ -322,14 +331,18 @@ impl From<MigrationItemRow> for MigrationItemResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MigrationReportResponse {
     pub id: Uuid,
     pub job_id: Uuid,
     pub generated_at: chrono::DateTime<chrono::Utc>,
+    #[schema(value_type = Object)]
     pub summary: serde_json::Value,
+    #[schema(value_type = Object)]
     pub warnings: serde_json::Value,
+    #[schema(value_type = Object)]
     pub errors: serde_json::Value,
+    #[schema(value_type = Object)]
     pub recommendations: serde_json::Value,
 }
 
@@ -347,7 +360,7 @@ impl From<MigrationReportRow> for MigrationReportResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct AssessmentResult {
     pub job_id: Uuid,
     pub status: String,
@@ -362,7 +375,7 @@ pub struct AssessmentResult {
     pub blockers: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryAssessment {
     pub key: String,
     #[serde(rename = "type")]
@@ -377,6 +390,17 @@ pub struct RepositoryAssessment {
 // ============ Handler Implementations ============
 
 /// List all source connections for the current user
+#[utoipa::path(
+    get,
+    path = "/connections",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    responses(
+        (status = 200, description = "List of source connections", body = Vec<ConnectionResponse>),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_connections(
     State(state): State<SharedState>,
 ) -> Result<Json<ListResponse<ConnectionResponse>>> {
@@ -414,6 +438,18 @@ async fn list_connections(
 }
 
 /// Create a new source connection
+#[utoipa::path(
+    post,
+    path = "/connections",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    request_body = CreateConnectionRequest,
+    responses(
+        (status = 201, description = "Connection created successfully", body = ConnectionResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn create_connection(
     State(state): State<SharedState>,
     Json(req): Json<CreateConnectionRequest>,
@@ -443,6 +479,21 @@ async fn create_connection(
 }
 
 /// Get a specific source connection
+#[utoipa::path(
+    get,
+    path = "/connections/{id}",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Connection ID")
+    ),
+    responses(
+        (status = 200, description = "Connection details", body = ConnectionResponse),
+        (status = 404, description = "Connection not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_connection(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -463,6 +514,21 @@ async fn get_connection(
 }
 
 /// Delete a source connection
+#[utoipa::path(
+    delete,
+    path = "/connections/{id}",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Connection ID")
+    ),
+    responses(
+        (status = 204, description = "Connection deleted successfully"),
+        (status = 404, description = "Connection not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn delete_connection(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -480,6 +546,21 @@ async fn delete_connection(
 }
 
 /// Test connection to Artifactory
+#[utoipa::path(
+    post,
+    path = "/connections/{id}/test",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Connection ID")
+    ),
+    responses(
+        (status = 200, description = "Connection test result", body = ConnectionTestResult),
+        (status = 404, description = "Connection not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn test_connection(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -632,6 +713,21 @@ fn create_artifactory_client(
 }
 
 /// List repositories from Artifactory source
+#[utoipa::path(
+    get,
+    path = "/connections/{id}/repositories",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Connection ID")
+    ),
+    responses(
+        (status = 200, description = "List of source repositories", body = Vec<SourceRepository>),
+        (status = 404, description = "Connection not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_source_repositories(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -677,6 +773,18 @@ async fn list_source_repositories(
 }
 
 /// List migration jobs
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(ListMigrationsQuery),
+    responses(
+        (status = 200, description = "List of migration jobs", body = Vec<MigrationJobResponse>),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_migrations(
     State(state): State<SharedState>,
     Query(query): Query<ListMigrationsQuery>,
@@ -756,6 +864,18 @@ async fn list_migrations(
 }
 
 /// Create a new migration job
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    request_body = CreateMigrationRequest,
+    responses(
+        (status = 201, description = "Migration job created successfully", body = MigrationJobResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn create_migration(
     State(state): State<SharedState>,
     Json(req): Json<CreateMigrationRequest>,
@@ -782,6 +902,21 @@ async fn create_migration(
 }
 
 /// Get a specific migration job
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 200, description = "Migration job details", body = MigrationJobResponse),
+        (status = 404, description = "Migration job not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_migration(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -804,6 +939,21 @@ async fn get_migration(
 }
 
 /// Delete a migration job
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 204, description = "Migration job deleted successfully"),
+        (status = 404, description = "Migration job not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn delete_migration(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -821,6 +971,22 @@ async fn delete_migration(
 }
 
 /// Start a migration job
+#[utoipa::path(
+    post,
+    path = "/{id}/start",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 200, description = "Migration job started", body = MigrationJobResponse),
+        (status = 404, description = "Migration job not found"),
+        (status = 409, description = "Migration cannot be started (wrong state)"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn start_migration(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -897,6 +1063,21 @@ async fn start_migration(
 }
 
 /// Pause a migration job
+#[utoipa::path(
+    post,
+    path = "/{id}/pause",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 200, description = "Migration job paused", body = MigrationJobResponse),
+        (status = 409, description = "Migration cannot be paused (wrong state)"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn pause_migration(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -922,6 +1103,21 @@ async fn pause_migration(
 }
 
 /// Resume a paused migration job
+#[utoipa::path(
+    post,
+    path = "/{id}/resume",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 200, description = "Migration job resumed", body = MigrationJobResponse),
+        (status = 409, description = "Migration cannot be resumed (wrong state)"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn resume_migration(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -993,6 +1189,21 @@ async fn resume_migration(
 }
 
 /// Cancel a migration job
+#[utoipa::path(
+    post,
+    path = "/{id}/cancel",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 200, description = "Migration job cancelled", body = MigrationJobResponse),
+        (status = 409, description = "Migration cannot be cancelled (wrong state)"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn cancel_migration(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -1018,6 +1229,21 @@ async fn cancel_migration(
 }
 
 /// Stream migration progress via Server-Sent Events
+#[utoipa::path(
+    get,
+    path = "/{id}/stream",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 200, description = "SSE stream of migration progress"),
+        (status = 404, description = "Migration job not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn stream_migration_progress(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -1114,6 +1340,21 @@ async fn stream_migration_progress(
 }
 
 /// List migration items for a job
+#[utoipa::path(
+    get,
+    path = "/{id}/items",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID"),
+        ListItemsQuery,
+    ),
+    responses(
+        (status = 200, description = "List of migration items", body = Vec<MigrationItemResponse>),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_migration_items(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -1158,6 +1399,22 @@ async fn list_migration_items(
 }
 
 /// Get migration report
+#[utoipa::path(
+    get,
+    path = "/{id}/report",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID"),
+        ReportQuery,
+    ),
+    responses(
+        (status = 200, description = "Migration report", body = MigrationReportResponse),
+        (status = 404, description = "Migration report not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_migration_report(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -1193,6 +1450,21 @@ async fn get_migration_report(
 }
 
 /// Run pre-migration assessment
+#[utoipa::path(
+    post,
+    path = "/{id}/assess",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 202, description = "Assessment started", body = MigrationJobResponse),
+        (status = 409, description = "Cannot start assessment (wrong state)"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn run_assessment(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -1220,6 +1492,21 @@ async fn run_assessment(
 }
 
 /// Get assessment results
+#[utoipa::path(
+    get,
+    path = "/{id}/assessment",
+    context_path = "/api/v1/migrations",
+    tag = "migration",
+    params(
+        ("id" = Uuid, Path, description = "Migration job ID")
+    ),
+    responses(
+        (status = 200, description = "Assessment results", body = AssessmentResult),
+        (status = 404, description = "Migration job not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_assessment(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -1254,3 +1541,47 @@ async fn get_assessment(
         blockers: vec![],
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_connections,
+        create_connection,
+        get_connection,
+        delete_connection,
+        test_connection,
+        list_source_repositories,
+        list_migrations,
+        create_migration,
+        get_migration,
+        delete_migration,
+        start_migration,
+        pause_migration,
+        resume_migration,
+        cancel_migration,
+        stream_migration_progress,
+        list_migration_items,
+        get_migration_report,
+        run_assessment,
+        get_assessment,
+    ),
+    components(schemas(
+        SourceConnectionRow,
+        MigrationJobRow,
+        MigrationItemRow,
+        MigrationReportRow,
+        CreateConnectionRequest,
+        ConnectionCredentials,
+        ConnectionResponse,
+        ConnectionTestResult,
+        SourceRepository,
+        CreateMigrationRequest,
+        PaginationInfo,
+        MigrationJobResponse,
+        MigrationItemResponse,
+        MigrationReportResponse,
+        AssessmentResult,
+        RepositoryAssessment,
+    ))
+)]
+pub struct MigrationApiDoc;

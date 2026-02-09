@@ -8,12 +8,13 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
+use utoipa::ToSchema;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
 
 /// A health check result for a single service.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct ServiceHealthEntry {
     pub service_name: String,
     pub status: String,
@@ -24,7 +25,7 @@ pub struct ServiceHealthEntry {
 }
 
 /// Alert state for a service.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct AlertState {
     pub service_name: String,
     pub current_status: String,

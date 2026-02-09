@@ -11,12 +11,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
 /// A lifecycle policy attached to a repository (or global if repository_id is NULL).
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct LifecyclePolicy {
     pub id: Uuid,
     pub repository_id: Option<Uuid>,
@@ -24,6 +25,7 @@ pub struct LifecyclePolicy {
     pub description: Option<String>,
     pub enabled: bool,
     pub policy_type: String,
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
     pub priority: i32,
     pub last_run_at: Option<DateTime<Utc>>,
@@ -33,28 +35,30 @@ pub struct LifecyclePolicy {
 }
 
 /// Request to create a lifecycle policy.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePolicyRequest {
     pub repository_id: Option<Uuid>,
     pub name: String,
     pub description: Option<String>,
     pub policy_type: String,
+    #[schema(value_type = Object)]
     pub config: serde_json::Value,
     pub priority: Option<i32>,
 }
 
 /// Request to update a lifecycle policy.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePolicyRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub enabled: Option<bool>,
+    #[schema(value_type = Option<Object>)]
     pub config: Option<serde_json::Value>,
     pub priority: Option<i32>,
 }
 
 /// Result of a lifecycle policy dry-run or execution.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PolicyExecutionResult {
     pub policy_id: Uuid,
     pub policy_name: String,

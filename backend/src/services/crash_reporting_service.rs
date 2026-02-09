@@ -8,12 +8,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
 /// A stored crash report.
-#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct CrashReport {
     pub id: Uuid,
     pub error_type: String,
@@ -24,6 +25,7 @@ pub struct CrashReport {
     pub app_version: String,
     pub os_info: Option<String>,
     pub uptime_seconds: Option<i64>,
+    #[schema(value_type = Object)]
     pub context: serde_json::Value,
     pub submitted: bool,
     pub submitted_at: Option<DateTime<Utc>>,
@@ -365,7 +367,7 @@ impl CrashReportingService {
 }
 
 /// Telemetry configuration.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TelemetrySettings {
     pub enabled: bool,
     pub review_before_send: bool,

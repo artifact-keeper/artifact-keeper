@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
@@ -30,7 +31,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/password/reset", post(reset_password))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListUsersQuery {
     pub search: Option<String>,
     pub is_active: Option<bool>,
@@ -39,7 +40,7 @@ pub struct ListUsersQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateUserRequest {
     pub username: String,
     pub email: String,
@@ -61,7 +62,7 @@ fn generate_password() -> String {
         .collect()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateUserRequest {
     pub email: Option<String>,
     pub display_name: Option<String>,
@@ -69,7 +70,7 @@ pub struct UpdateUserRequest {
     pub is_admin: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UserResponse {
     pub id: Uuid,
     pub username: String,
@@ -83,13 +84,13 @@ pub struct UserResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CreateUserResponse {
     pub user: UserResponse,
     pub generated_password: Option<String>, // Only returned if password was auto-generated
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UserListResponse {
     pub items: Vec<UserResponse>,
     pub pagination: Pagination,
@@ -111,6 +112,17 @@ fn user_to_response(user: User) -> UserResponse {
 }
 
 /// List users
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(ListUsersQuery),
+    responses(
+        (status = 200, description = "List of users", body = UserListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_users(
     State(state): State<SharedState>,
     Query(query): Query<ListUsersQuery>,
@@ -178,6 +190,19 @@ pub async fn list_users(
 }
 
 /// Create user
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/users",
+    tag = "users",
+    request_body = CreateUserRequest,
+    responses(
+        (status = 200, description = "User created successfully", body = CreateUserResponse),
+        (status = 409, description = "User already exists"),
+        (status = 422, description = "Validation error"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_user(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -240,6 +265,20 @@ pub async fn create_user(
 }
 
 /// Get user details
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 200, description = "User details", body = UserResponse),
+        (status = 404, description = "User not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_user(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -267,6 +306,21 @@ pub async fn get_user(
 }
 
 /// Update user
+#[utoipa::path(
+    patch,
+    path = "/{id}",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    request_body = UpdateUserRequest,
+    responses(
+        (status = 200, description = "User updated successfully", body = UserResponse),
+        (status = 404, description = "User not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn update_user(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -306,6 +360,21 @@ pub async fn update_user(
 }
 
 /// Delete user
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 200, description = "User deleted successfully"),
+        (status = 404, description = "User not found"),
+        (status = 422, description = "Cannot delete yourself"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn delete_user(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -328,7 +397,7 @@ pub async fn delete_user(
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RoleResponse {
     pub id: Uuid,
     pub name: String,
@@ -336,12 +405,25 @@ pub struct RoleResponse {
     pub permissions: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RoleListResponse {
     pub items: Vec<RoleResponse>,
 }
 
 /// Get user roles
+#[utoipa::path(
+    get,
+    path = "/{id}/roles",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 200, description = "List of user roles", body = RoleListResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_user_roles(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -373,12 +455,26 @@ pub async fn get_user_roles(
     Ok(Json(RoleListResponse { items }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AssignRoleRequest {
     pub role_id: Uuid,
 }
 
 /// Assign role to user
+#[utoipa::path(
+    post,
+    path = "/{id}/roles",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    request_body = AssignRoleRequest,
+    responses(
+        (status = 200, description = "Role assigned successfully"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn assign_role(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -402,6 +498,21 @@ pub async fn assign_role(
 }
 
 /// Revoke role from user
+#[utoipa::path(
+    delete,
+    path = "/{id}/roles/{role_id}",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+        ("role_id" = Uuid, Path, description = "Role ID"),
+    ),
+    responses(
+        (status = 200, description = "Role revoked successfully"),
+        (status = 404, description = "Role assignment not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn revoke_role(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -423,14 +534,14 @@ pub async fn revoke_role(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ApiTokenResponse {
     pub id: Uuid,
     pub name: String,
@@ -441,19 +552,33 @@ pub struct ApiTokenResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ApiTokenCreatedResponse {
     pub id: Uuid,
     pub name: String,
     pub token: String, // Only shown once at creation
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ApiTokenListResponse {
     pub items: Vec<ApiTokenResponse>,
 }
 
 /// List user's API tokens
+#[utoipa::path(
+    get,
+    path = "/{id}/tokens",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 200, description = "List of API tokens", body = ApiTokenListResponse),
+        (status = 403, description = "Cannot view other users' tokens"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_user_tokens(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -496,6 +621,21 @@ pub async fn list_user_tokens(
 }
 
 /// Create API token
+#[utoipa::path(
+    post,
+    path = "/{id}/tokens",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    request_body = CreateApiTokenRequest,
+    responses(
+        (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
+        (status = 403, description = "Cannot create tokens for other users"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -522,6 +662,21 @@ pub async fn create_api_token(
 }
 
 /// Revoke API token
+#[utoipa::path(
+    delete,
+    path = "/{id}/tokens/{token_id}",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+        ("token_id" = Uuid, Path, description = "API token ID"),
+    ),
+    responses(
+        (status = 200, description = "API token revoked successfully"),
+        (status = 403, description = "Cannot revoke other users' tokens"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn revoke_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -540,13 +695,31 @@ pub async fn revoke_api_token(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ChangePasswordRequest {
     pub current_password: Option<String>, // Required for non-admins
     pub new_password: String,
 }
 
 /// Change user password
+#[utoipa::path(
+    post,
+    path = "/{id}/password",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    request_body = ChangePasswordRequest,
+    responses(
+        (status = 200, description = "Password changed successfully"),
+        (status = 401, description = "Current password is incorrect"),
+        (status = 403, description = "Cannot change other users' passwords"),
+        (status = 404, description = "User not found"),
+        (status = 422, description = "Validation error"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn change_password(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -634,13 +807,29 @@ pub async fn change_password(
 }
 
 /// Response for password reset
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ResetPasswordResponse {
     pub temporary_password: String,
 }
 
 /// Reset user password (admin only)
 /// Generates a new temporary password and sets must_change_password=true
+#[utoipa::path(
+    post,
+    path = "/{id}/password/reset",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 200, description = "Password reset successfully", body = ResetPasswordResponse),
+        (status = 403, description = "Only administrators can reset passwords"),
+        (status = 404, description = "User not found"),
+        (status = 422, description = "Validation error"),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn reset_password(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -690,3 +879,40 @@ pub async fn reset_password(
         temporary_password: temp_password,
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_users,
+        create_user,
+        get_user,
+        update_user,
+        delete_user,
+        get_user_roles,
+        assign_role,
+        revoke_role,
+        list_user_tokens,
+        create_api_token,
+        revoke_api_token,
+        change_password,
+        reset_password,
+    ),
+    components(schemas(
+        ListUsersQuery,
+        CreateUserRequest,
+        UpdateUserRequest,
+        UserResponse,
+        CreateUserResponse,
+        UserListResponse,
+        RoleResponse,
+        RoleListResponse,
+        AssignRoleRequest,
+        CreateApiTokenRequest,
+        ApiTokenResponse,
+        ApiTokenCreatedResponse,
+        ApiTokenListResponse,
+        ChangePasswordRequest,
+        ResetPasswordResponse,
+    ))
+)]
+pub struct UsersApiDoc;

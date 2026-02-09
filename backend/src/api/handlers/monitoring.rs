@@ -7,6 +7,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -14,6 +15,23 @@ use crate::error::{AppError, Result};
 use crate::services::health_monitor_service::{
     AlertState, HealthMonitorService, MonitorConfig, ServiceHealthEntry,
 };
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        get_health_log,
+        get_alert_states,
+        suppress_alert,
+        run_health_check,
+    ),
+    components(schemas(
+        SuppressRequest,
+        ServiceHealthEntry,
+        AlertState,
+    )),
+    tags((name = "monitoring", description = "Health monitoring and alerts")),
+)]
+pub struct MonitoringApiDoc;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -23,13 +41,24 @@ pub fn router() -> Router<SharedState> {
         .route("/check", post(run_health_check))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct HealthLogQuery {
     pub service: Option<String>,
     pub limit: Option<i64>,
 }
 
 /// GET /api/v1/admin/monitoring/health-log
+#[utoipa::path(
+    get,
+    path = "/health-log",
+    context_path = "/api/v1/admin/monitoring",
+    tag = "monitoring",
+    params(HealthLogQuery),
+    responses(
+        (status = 200, description = "Health log entries", body = Vec<ServiceHealthEntry>),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn get_health_log(
     State(state): State<SharedState>,
     Query(query): Query<HealthLogQuery>,
@@ -43,19 +72,40 @@ pub async fn get_health_log(
 }
 
 /// GET /api/v1/admin/monitoring/alerts
+#[utoipa::path(
+    get,
+    path = "/alerts",
+    context_path = "/api/v1/admin/monitoring",
+    tag = "monitoring",
+    responses(
+        (status = 200, description = "Current alert states", body = Vec<AlertState>),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn get_alert_states(State(state): State<SharedState>) -> Result<Json<Vec<AlertState>>> {
     let monitor = HealthMonitorService::new(state.db.clone(), MonitorConfig::default());
     let states = monitor.get_alert_states().await?;
     Ok(Json(states))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SuppressRequest {
     pub service_name: String,
     pub until: DateTime<Utc>,
 }
 
 /// POST /api/v1/admin/monitoring/alerts/suppress
+#[utoipa::path(
+    post,
+    path = "/alerts/suppress",
+    context_path = "/api/v1/admin/monitoring",
+    tag = "monitoring",
+    request_body = SuppressRequest,
+    responses(
+        (status = 200, description = "Alert suppressed"),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn suppress_alert(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -74,6 +124,16 @@ pub async fn suppress_alert(
 }
 
 /// POST /api/v1/admin/monitoring/check - manually trigger health checks
+#[utoipa::path(
+    post,
+    path = "/check",
+    context_path = "/api/v1/admin/monitoring",
+    tag = "monitoring",
+    responses(
+        (status = 200, description = "Health check results", body = Vec<ServiceHealthEntry>),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn run_health_check(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,

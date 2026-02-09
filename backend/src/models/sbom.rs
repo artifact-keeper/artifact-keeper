@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// SBOM format types.
@@ -101,7 +102,7 @@ pub struct SbomComponent {
 }
 
 /// CVE history entry for tracking vulnerability timeline.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct CveHistoryEntry {
     pub id: Uuid,
     pub artifact_id: Uuid,
@@ -132,7 +133,7 @@ pub struct CveHistoryEntry {
 }
 
 /// CVE status for tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CveStatus {
     Open,
@@ -264,7 +265,7 @@ fn default_sbom_format() -> String {
 }
 
 /// CVE timeline entry for trending.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CveTimelineEntry {
     pub cve_id: String,
     pub severity: String,
@@ -276,7 +277,7 @@ pub struct CveTimelineEntry {
 }
 
 /// CVE trends summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CveTrends {
     pub total_cves: i64,
     pub open_cves: i64,

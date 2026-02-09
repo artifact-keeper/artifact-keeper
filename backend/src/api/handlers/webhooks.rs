@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use std::net::IpAddr;
@@ -27,7 +28,7 @@ pub fn router() -> Router<SharedState> {
 }
 
 /// Webhook event types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebhookEvent {
     ArtifactUploaded,
@@ -57,7 +58,7 @@ impl std::fmt::Display for WebhookEvent {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListWebhooksQuery {
     pub repository_id: Option<Uuid>,
     pub enabled: Option<bool>,
@@ -65,17 +66,18 @@ pub struct ListWebhooksQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateWebhookRequest {
     pub name: String,
     pub url: String,
     pub events: Vec<String>,
     pub secret: Option<String>,
     pub repository_id: Option<Uuid>,
+    #[schema(value_type = Option<Object>)]
     pub headers: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct WebhookResponse {
     pub id: Uuid,
     pub name: String,
@@ -83,18 +85,31 @@ pub struct WebhookResponse {
     pub events: Vec<String>,
     pub is_enabled: bool,
     pub repository_id: Option<Uuid>,
+    #[schema(value_type = Option<Object>)]
     pub headers: Option<serde_json::Value>,
     pub last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct WebhookListResponse {
     pub items: Vec<WebhookResponse>,
     pub total: i64,
 }
 
 /// List webhooks
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(ListWebhooksQuery),
+    responses(
+        (status = 200, description = "List of webhooks", body = WebhookListResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_webhooks(
     State(state): State<SharedState>,
     Query(query): Query<ListWebhooksQuery>,
@@ -155,6 +170,19 @@ pub async fn list_webhooks(
 }
 
 /// Create webhook
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    request_body = CreateWebhookRequest,
+    responses(
+        (status = 200, description = "Webhook created successfully", body = WebhookResponse),
+        (status = 422, description = "Validation error"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_webhook(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -210,6 +238,20 @@ pub async fn create_webhook(
 }
 
 /// Get webhook by ID
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID")
+    ),
+    responses(
+        (status = 200, description = "Webhook details", body = WebhookResponse),
+        (status = 404, description = "Webhook not found")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_webhook(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -241,6 +283,20 @@ pub async fn get_webhook(
 }
 
 /// Delete webhook
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID")
+    ),
+    responses(
+        (status = 200, description = "Webhook deleted successfully"),
+        (status = 404, description = "Webhook not found")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn delete_webhook(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -275,6 +331,20 @@ async fn set_webhook_enabled(state: &SharedState, id: Uuid, enabled: bool) -> Re
 }
 
 /// Enable webhook
+#[utoipa::path(
+    post,
+    path = "/{id}/enable",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID")
+    ),
+    responses(
+        (status = 200, description = "Webhook enabled successfully"),
+        (status = 404, description = "Webhook not found")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn enable_webhook(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -284,6 +354,20 @@ pub async fn enable_webhook(
 }
 
 /// Disable webhook
+#[utoipa::path(
+    post,
+    path = "/{id}/disable",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID")
+    ),
+    responses(
+        (status = 200, description = "Webhook disabled successfully"),
+        (status = 404, description = "Webhook not found")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn disable_webhook(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -292,7 +376,7 @@ pub async fn disable_webhook(
     set_webhook_enabled(&state, id, false).await
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TestWebhookResponse {
     pub success: bool,
     pub status_code: Option<u16>,
@@ -301,6 +385,20 @@ pub struct TestWebhookResponse {
 }
 
 /// Test webhook by sending a test payload
+#[utoipa::path(
+    post,
+    path = "/{id}/test",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID")
+    ),
+    responses(
+        (status = 200, description = "Test delivery result", body = TestWebhookResponse),
+        (status = 404, description = "Webhook not found")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn test_webhook(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -369,18 +467,19 @@ pub async fn test_webhook(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListDeliveriesQuery {
     pub status: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DeliveryResponse {
     pub id: Uuid,
     pub webhook_id: Uuid,
     pub event: String,
+    #[schema(value_type = Object)]
     pub payload: serde_json::Value,
     pub response_status: Option<i32>,
     pub response_body: Option<String>,
@@ -390,13 +489,28 @@ pub struct DeliveryResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct DeliveryListResponse {
     pub items: Vec<DeliveryResponse>,
     pub total: i64,
 }
 
 /// List webhook deliveries
+#[utoipa::path(
+    get,
+    path = "/{id}/deliveries",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID"),
+        ListDeliveriesQuery,
+    ),
+    responses(
+        (status = 200, description = "List of webhook deliveries", body = DeliveryListResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_deliveries(
     State(state): State<SharedState>,
     Path(webhook_id): Path<Uuid>,
@@ -461,6 +575,21 @@ pub async fn list_deliveries(
 }
 
 /// Redeliver a failed webhook
+#[utoipa::path(
+    post,
+    path = "/{id}/deliveries/{delivery_id}/redeliver",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID"),
+        ("delivery_id" = Uuid, Path, description = "Delivery ID"),
+    ),
+    responses(
+        (status = 200, description = "Redelivery result", body = DeliveryResponse),
+        (status = 404, description = "Webhook or delivery not found")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn redeliver(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -618,3 +747,28 @@ fn validate_webhook_url(url_str: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_webhooks,
+        create_webhook,
+        get_webhook,
+        delete_webhook,
+        enable_webhook,
+        disable_webhook,
+        test_webhook,
+        list_deliveries,
+        redeliver,
+    ),
+    components(schemas(
+        WebhookEvent,
+        CreateWebhookRequest,
+        WebhookResponse,
+        WebhookListResponse,
+        TestWebhookResponse,
+        DeliveryResponse,
+        DeliveryListResponse,
+    ))
+)]
+pub struct WebhooksApiDoc;

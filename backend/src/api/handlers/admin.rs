@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -32,7 +33,7 @@ pub fn router() -> Router<SharedState> {
         .route("/reindex", post(trigger_reindex))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListBackupsQuery {
     pub status: Option<String>,
     #[serde(rename = "type")]
@@ -41,14 +42,14 @@ pub struct ListBackupsQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateBackupRequest {
     #[serde(rename = "type")]
     pub backup_type: Option<String>,
     pub repository_ids: Option<Vec<Uuid>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BackupResponse {
     pub id: Uuid,
     #[serde(rename = "type")]
@@ -64,7 +65,7 @@ pub struct BackupResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BackupListResponse {
     pub items: Vec<BackupResponse>,
     pub total: i64,
@@ -91,6 +92,18 @@ fn parse_backup_status(s: &str) -> Option<BackupStatus> {
 }
 
 /// List backups
+#[utoipa::path(
+    get,
+    path = "/backups",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(ListBackupsQuery),
+    responses(
+        (status = 200, description = "List of backups", body = BackupListResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_backups(
     State(state): State<SharedState>,
     Query(query): Query<ListBackupsQuery>,
@@ -132,6 +145,21 @@ pub async fn list_backups(
 }
 
 /// Get backup by ID
+#[utoipa::path(
+    get,
+    path = "/backups/{id}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Backup ID")
+    ),
+    responses(
+        (status = 200, description = "Backup details", body = BackupResponse),
+        (status = 404, description = "Backup not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_backup(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -156,6 +184,18 @@ pub async fn get_backup(
 }
 
 /// Create backup
+#[utoipa::path(
+    post,
+    path = "/backups",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = CreateBackupRequest,
+    responses(
+        (status = 200, description = "Backup created", body = BackupResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_backup(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -194,6 +234,21 @@ pub async fn create_backup(
 }
 
 /// Execute a pending backup
+#[utoipa::path(
+    post,
+    path = "/backups/{id}/execute",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Backup ID")
+    ),
+    responses(
+        (status = 200, description = "Backup executed", body = BackupResponse),
+        (status = 404, description = "Backup not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn execute_backup(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -219,14 +274,14 @@ pub async fn execute_backup(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RestoreRequest {
     pub restore_database: Option<bool>,
     pub restore_artifacts: Option<bool>,
     pub target_repository_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RestoreResponse {
     pub tables_restored: Vec<String>,
     pub artifacts_restored: i32,
@@ -234,6 +289,22 @@ pub struct RestoreResponse {
 }
 
 /// Restore from backup
+#[utoipa::path(
+    post,
+    path = "/backups/{id}/restore",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Backup ID")
+    ),
+    request_body = RestoreRequest,
+    responses(
+        (status = 200, description = "Backup restored", body = RestoreResponse),
+        (status = 404, description = "Backup not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn restore_backup(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -262,6 +333,21 @@ pub async fn restore_backup(
 }
 
 /// Cancel a running backup
+#[utoipa::path(
+    post,
+    path = "/backups/{id}/cancel",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Backup ID")
+    ),
+    responses(
+        (status = 200, description = "Backup cancelled"),
+        (status = 404, description = "Backup not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn cancel_backup(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -275,6 +361,21 @@ pub async fn cancel_backup(
 }
 
 /// Delete a backup
+#[utoipa::path(
+    delete,
+    path = "/backups/{id}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Backup ID")
+    ),
+    responses(
+        (status = 200, description = "Backup deleted"),
+        (status = 404, description = "Backup not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn delete_backup(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -287,7 +388,7 @@ pub async fn delete_backup(
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SystemSettings {
     pub allow_anonymous_download: bool,
     pub max_upload_size_bytes: i64,
@@ -298,6 +399,17 @@ pub struct SystemSettings {
 }
 
 /// Get system settings
+#[utoipa::path(
+    get,
+    path = "/settings",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "System settings", body = SystemSettings),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<SystemSettings>> {
     let settings = sqlx::query_as!(
         SystemSettingsRow,
@@ -372,6 +484,18 @@ struct SystemSettingsRow {
 }
 
 /// Update system settings
+#[utoipa::path(
+    post,
+    path = "/settings",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = SystemSettings,
+    responses(
+        (status = 200, description = "Settings updated", body = SystemSettings),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn update_settings(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -420,7 +544,7 @@ pub async fn update_settings(
     Ok(Json(settings))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SystemStats {
     pub total_repositories: i64,
     pub total_artifacts: i64,
@@ -432,6 +556,17 @@ pub struct SystemStats {
 }
 
 /// Get system statistics
+#[utoipa::path(
+    get,
+    path = "/stats",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "System statistics", body = SystemStats),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<SystemStats>> {
     let repo_count = sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM repositories")
         .fetch_one(&state.db)
@@ -487,14 +622,14 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CleanupRequest {
     pub cleanup_audit_logs: Option<bool>,
     pub cleanup_old_backups: Option<bool>,
     pub cleanup_stale_peers: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CleanupResponse {
     pub audit_logs_deleted: i64,
     pub backups_deleted: i64,
@@ -502,6 +637,18 @@ pub struct CleanupResponse {
 }
 
 /// Run cleanup tasks
+#[utoipa::path(
+    post,
+    path = "/cleanup",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    request_body = CleanupRequest,
+    responses(
+        (status = 200, description = "Cleanup completed", body = CleanupResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn run_cleanup(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -542,7 +689,7 @@ pub async fn run_cleanup(
     Ok(Json(result))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ReindexResponse {
     pub message: String,
     pub artifacts_indexed: i64,
@@ -552,6 +699,18 @@ pub struct ReindexResponse {
 /// Trigger a full Meilisearch reindex of all artifacts and repositories.
 ///
 /// Requires admin privileges and Meilisearch to be configured.
+#[utoipa::path(
+    post,
+    path = "/reindex",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Reindex completed", body = ReindexResponse),
+        (status = 401, description = "Admin privileges required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn trigger_reindex(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -594,3 +753,35 @@ pub async fn trigger_reindex(
         repositories_indexed: repo_count,
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_backups,
+        get_backup,
+        create_backup,
+        execute_backup,
+        restore_backup,
+        cancel_backup,
+        delete_backup,
+        get_settings,
+        update_settings,
+        get_system_stats,
+        run_cleanup,
+        trigger_reindex,
+    ),
+    components(schemas(
+        ListBackupsQuery,
+        CreateBackupRequest,
+        BackupResponse,
+        BackupListResponse,
+        RestoreRequest,
+        RestoreResponse,
+        SystemSettings,
+        SystemStats,
+        CleanupRequest,
+        CleanupResponse,
+        ReindexResponse,
+    ))
+)]
+pub struct AdminApiDoc;

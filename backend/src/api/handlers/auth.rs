@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -33,7 +34,23 @@ pub fn setup_router() -> Router<SharedState> {
     Router::new().route("/status", get(setup_status))
 }
 
+/// Response body for the setup status endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetupStatusResponse {
+    /// Whether the initial admin password change is still required.
+    pub setup_required: bool,
+}
+
 /// Returns whether initial setup (password change) is required.
+#[utoipa::path(
+    get,
+    path = "/status",
+    context_path = "/api/v1/setup",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Setup status retrieved", body = SetupStatusResponse),
+    )
+)]
 pub async fn setup_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "setup_required": state.setup_required.load(Ordering::Relaxed)
@@ -47,13 +64,13 @@ pub fn protected_router() -> Router<SharedState> {
         .route("/ticket", post(create_download_ticket))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
@@ -66,12 +83,12 @@ pub struct LoginResponse {
     pub totp_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshTokenRequest {
     pub refresh_token: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UserResponse {
     pub id: Uuid,
     pub username: String,
@@ -82,6 +99,17 @@ pub struct UserResponse {
 }
 
 /// Login with credentials
+#[utoipa::path(
+    post,
+    path = "/login",
+    context_path = "/api/v1/auth",
+    tag = "auth",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Login successful", body = LoginResponse),
+        (status = 401, description = "Invalid credentials", body = super::super::openapi::ErrorResponse),
+    )
+)]
 pub async fn login(
     State(state): State<SharedState>,
     Json(payload): Json<LoginRequest>,
@@ -128,6 +156,15 @@ pub async fn login(
 }
 
 /// Logout current session
+#[utoipa::path(
+    post,
+    path = "/logout",
+    context_path = "/api/v1/auth",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Logout successful, auth cookies cleared"),
+    )
+)]
 pub async fn logout(State(_state): State<SharedState>) -> Result<Response> {
     let mut response = ().into_response();
     clear_auth_cookies(response.headers_mut());
@@ -135,6 +172,17 @@ pub async fn logout(State(_state): State<SharedState>) -> Result<Response> {
 }
 
 /// Refresh access token
+#[utoipa::path(
+    post,
+    path = "/refresh",
+    context_path = "/api/v1/auth",
+    tag = "auth",
+    request_body = RefreshTokenRequest,
+    responses(
+        (status = 200, description = "Token refreshed successfully", body = LoginResponse),
+        (status = 401, description = "Invalid or expired refresh token", body = super::super::openapi::ErrorResponse),
+    )
+)]
 pub async fn refresh_token(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -171,6 +219,18 @@ pub async fn refresh_token(
 }
 
 /// Get current user info
+#[utoipa::path(
+    get,
+    path = "/me",
+    context_path = "/api/v1/auth",
+    tag = "auth",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Current user info", body = UserResponse),
+        (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
+        (status = 404, description = "User not found", body = super::super::openapi::ErrorResponse),
+    )
+)]
 pub async fn get_current_user(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -199,7 +259,7 @@ pub async fn get_current_user(
 }
 
 /// Create API token request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
@@ -207,7 +267,7 @@ pub struct CreateApiTokenRequest {
 }
 
 /// Create API token response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CreateApiTokenResponse {
     pub id: Uuid,
     pub token: String,
@@ -215,6 +275,18 @@ pub struct CreateApiTokenResponse {
 }
 
 /// Create a new API token for the current user
+#[utoipa::path(
+    post,
+    path = "/tokens",
+    context_path = "/api/v1/auth",
+    tag = "auth",
+    security(("bearer_auth" = [])),
+    request_body = CreateApiTokenRequest,
+    responses(
+        (status = 200, description = "API token created", body = CreateApiTokenResponse),
+        (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
+    )
+)]
 pub async fn create_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -298,6 +370,21 @@ fn clear_auth_cookies(headers: &mut HeaderMap) {
 }
 
 /// Revoke an API token
+#[utoipa::path(
+    delete,
+    path = "/tokens/{token_id}",
+    context_path = "/api/v1/auth",
+    tag = "auth",
+    security(("bearer_auth" = [])),
+    params(
+        ("token_id" = Uuid, Path, description = "ID of the API token to revoke"),
+    ),
+    responses(
+        (status = 200, description = "API token revoked"),
+        (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
+        (status = 404, description = "Token not found", body = super::super::openapi::ErrorResponse),
+    )
+)]
 pub async fn revoke_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -316,13 +403,13 @@ pub async fn revoke_api_token(
 // Download tickets
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTicketRequest {
     pub purpose: String,
     pub resource_path: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct TicketResponse {
     pub ticket: String,
     pub expires_in: u64,
@@ -331,6 +418,18 @@ pub struct TicketResponse {
 /// Create a short-lived, single-use download/stream ticket for the current user.
 /// The ticket can be passed as a `?ticket=` query parameter on endpoints that
 /// cannot use `Authorization` headers (e.g. `<a>` downloads, `EventSource` SSE).
+#[utoipa::path(
+    post,
+    path = "/ticket",
+    context_path = "/api/v1/auth",
+    tag = "auth",
+    security(("bearer_auth" = [])),
+    request_body = CreateTicketRequest,
+    responses(
+        (status = 200, description = "Download ticket created", body = TicketResponse),
+        (status = 401, description = "Not authenticated", body = super::super::openapi::ErrorResponse),
+    )
+)]
 pub async fn create_download_ticket(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -349,3 +448,33 @@ pub async fn create_download_ticket(
         expires_in: 30,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// OpenAPI documentation
+// ---------------------------------------------------------------------------
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        setup_status,
+        login,
+        logout,
+        refresh_token,
+        get_current_user,
+        create_api_token,
+        revoke_api_token,
+        create_download_ticket,
+    ),
+    components(schemas(
+        SetupStatusResponse,
+        LoginRequest,
+        LoginResponse,
+        RefreshTokenRequest,
+        UserResponse,
+        CreateApiTokenRequest,
+        CreateApiTokenResponse,
+        CreateTicketRequest,
+        TicketResponse,
+    ))
+)]
+pub struct AuthApiDoc;

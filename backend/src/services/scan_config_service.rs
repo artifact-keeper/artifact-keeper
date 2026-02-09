@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::models::security::ScanConfig;
 
 /// Request to create or update a scan configuration.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
 pub struct UpsertScanConfigRequest {
     pub scan_enabled: bool,
     pub scan_on_upload: bool,

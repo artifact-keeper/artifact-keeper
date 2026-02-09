@@ -3,12 +3,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Format handler type enum.
 ///
 /// Indicates whether the handler is compiled-in (core) or loaded from WASM.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "format_handler_type", rename_all = "lowercase")]
 pub enum FormatHandlerType {
     /// Compiled-in Rust handler
@@ -68,7 +69,7 @@ pub struct UpdateFormatHandler {
 }
 
 /// Format handler response with additional computed fields.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FormatHandlerResponse {
     pub id: Uuid,
     pub format_key: String,
@@ -82,6 +83,7 @@ pub struct FormatHandlerResponse {
     /// Number of repositories using this format (computed)
     pub repository_count: Option<i64>,
     /// Plugin capabilities if this is a WASM handler
+    #[schema(value_type = Option<Object>)]
     pub capabilities: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

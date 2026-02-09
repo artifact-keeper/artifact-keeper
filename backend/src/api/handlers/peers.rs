@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -34,7 +35,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/repositories/:repo_id", delete(unassign_repo))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListPeersQuery {
     pub status: Option<String>,
     pub region: Option<String>,
@@ -42,17 +43,18 @@ pub struct ListPeersQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RegisterPeerRequest {
     pub name: String,
     pub endpoint_url: String,
     pub region: Option<String>,
     pub cache_size_bytes: Option<i64>,
+    #[schema(value_type = Object)]
     pub sync_filter: Option<serde_json::Value>,
     pub api_key: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PeerInstanceResponse {
     pub id: Uuid,
     pub name: String,
@@ -70,19 +72,19 @@ pub struct PeerInstanceResponse {
     pub is_local: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PeerInstanceListResponse {
     pub items: Vec<PeerInstanceResponse>,
     pub total: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct HeartbeatRequest {
     pub cache_used_bytes: i64,
     pub status: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AssignRepoRequest {
     pub repository_id: Uuid,
     pub sync_enabled: Option<bool>,
@@ -90,7 +92,7 @@ pub struct AssignRepoRequest {
     pub replication_schedule: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SyncTaskResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
@@ -99,7 +101,7 @@ pub struct SyncTaskResponse {
     pub priority: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AnnouncePeerRequest {
     pub peer_id: Uuid,
     pub name: String,
@@ -107,7 +109,7 @@ pub struct AnnouncePeerRequest {
     pub api_key: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct IdentityResponse {
     pub peer_id: Uuid,
     pub name: String,
@@ -126,6 +128,18 @@ fn parse_status(s: &str) -> Option<InstanceStatus> {
 }
 
 /// List peer instances
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(ListPeersQuery),
+    responses(
+        (status = 200, description = "List of peer instances", body = PeerInstanceListResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_peers(
     State(state): State<SharedState>,
     Query(query): Query<ListPeersQuery>,
@@ -176,6 +190,18 @@ pub async fn list_peers(
 }
 
 /// Register new peer instance
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    request_body = RegisterPeerRequest,
+    responses(
+        (status = 200, description = "Peer instance registered successfully", body = PeerInstanceResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn register_peer(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -218,6 +244,21 @@ pub async fn register_peer(
 }
 
 /// Get peer instance details
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID")
+    ),
+    responses(
+        (status = 200, description = "Peer instance details", body = PeerInstanceResponse),
+        (status = 404, description = "Peer instance not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_peer(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -249,6 +290,21 @@ pub async fn get_peer(
 }
 
 /// Unregister peer instance
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID")
+    ),
+    responses(
+        (status = 200, description = "Peer instance unregistered successfully"),
+        (status = 404, description = "Peer instance not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn unregister_peer(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -260,6 +316,22 @@ pub async fn unregister_peer(
 }
 
 /// Heartbeat from peer instance
+#[utoipa::path(
+    post,
+    path = "/{id}/heartbeat",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID")
+    ),
+    request_body = HeartbeatRequest,
+    responses(
+        (status = 200, description = "Heartbeat recorded successfully"),
+        (status = 404, description = "Peer instance not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn heartbeat(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -274,6 +346,21 @@ pub async fn heartbeat(
 }
 
 /// Trigger sync for peer instance
+#[utoipa::path(
+    post,
+    path = "/{id}/sync",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID")
+    ),
+    responses(
+        (status = 200, description = "Sync triggered successfully"),
+        (status = 404, description = "Peer instance not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn trigger_sync(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -285,6 +372,22 @@ pub async fn trigger_sync(
 }
 
 /// Get pending sync tasks for peer instance
+#[utoipa::path(
+    get,
+    path = "/{id}/sync/tasks",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ListPeersQuery,
+    ),
+    responses(
+        (status = 200, description = "List of pending sync tasks", body = Vec<SyncTaskResponse>),
+        (status = 404, description = "Peer instance not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_sync_tasks(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -309,6 +412,21 @@ pub async fn get_sync_tasks(
 }
 
 /// Get assigned repositories for peer instance
+#[utoipa::path(
+    get,
+    path = "/{id}/repositories",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID")
+    ),
+    responses(
+        (status = 200, description = "List of assigned repository IDs", body = Vec<Uuid>),
+        (status = 404, description = "Peer instance not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_assigned_repos(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -319,6 +437,22 @@ pub async fn get_assigned_repos(
 }
 
 /// Assign repository to peer instance
+#[utoipa::path(
+    post,
+    path = "/{id}/repositories",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID")
+    ),
+    request_body = AssignRepoRequest,
+    responses(
+        (status = 200, description = "Repository assigned successfully"),
+        (status = 404, description = "Peer instance not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn assign_repo(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -351,6 +485,22 @@ pub async fn assign_repo(
 }
 
 /// Unassign repository from peer instance
+#[utoipa::path(
+    delete,
+    path = "/{id}/repositories/{repo_id}",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    params(
+        ("id" = Uuid, Path, description = "Peer instance ID"),
+        ("repo_id" = Uuid, Path, description = "Repository ID")
+    ),
+    responses(
+        (status = 200, description = "Repository unassigned successfully"),
+        (status = 404, description = "Peer instance or repository not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn unassign_repo(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -362,6 +512,18 @@ pub async fn unassign_repo(
 }
 
 /// POST /api/v1/peers/announce
+#[utoipa::path(
+    post,
+    path = "/announce",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    request_body = AnnouncePeerRequest,
+    responses(
+        (status = 200, description = "Peer announcement accepted", body = Object),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn announce_peer(
     State(state): State<SharedState>,
     Json(body): Json<AnnouncePeerRequest>,
@@ -386,6 +548,17 @@ async fn announce_peer(
 }
 
 /// GET /api/v1/peers/identity
+#[utoipa::path(
+    get,
+    path = "/identity",
+    context_path = "/api/v1/peers",
+    tag = "peers",
+    responses(
+        (status = 200, description = "Local peer identity", body = IdentityResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_identity(State(state): State<SharedState>) -> Result<Json<IdentityResponse>> {
     let svc = PeerInstanceService::new(state.db.clone());
     let local = svc.get_local_instance().await?;
@@ -397,3 +570,32 @@ async fn get_identity(State(state): State<SharedState>) -> Result<Json<IdentityR
         api_key: local.api_key,
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_peers,
+        register_peer,
+        get_peer,
+        unregister_peer,
+        heartbeat,
+        trigger_sync,
+        get_sync_tasks,
+        get_assigned_repos,
+        assign_repo,
+        unassign_repo,
+        announce_peer,
+        get_identity,
+    ),
+    components(schemas(
+        RegisterPeerRequest,
+        PeerInstanceResponse,
+        PeerInstanceListResponse,
+        HeartbeatRequest,
+        AssignRepoRequest,
+        SyncTaskResponse,
+        AnnouncePeerRequest,
+        IdentityResponse,
+    ))
+)]
+pub struct PeersApiDoc;

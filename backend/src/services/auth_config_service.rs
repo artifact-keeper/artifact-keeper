@@ -7,6 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -88,7 +89,7 @@ pub struct SsoSession {
 // API response structs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OidcConfigResponse {
     pub id: Uuid,
     pub name: String,
@@ -96,6 +97,7 @@ pub struct OidcConfigResponse {
     pub client_id: String,
     pub has_secret: bool,
     pub scopes: Vec<String>,
+    #[schema(value_type = Object)]
     pub attribute_mapping: serde_json::Value,
     pub is_enabled: bool,
     pub auto_create_users: bool,
@@ -103,7 +105,7 @@ pub struct OidcConfigResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LdapConfigResponse {
     pub id: Uuid,
     pub name: String,
@@ -126,7 +128,7 @@ pub struct LdapConfigResponse {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SamlConfigResponse {
     pub id: Uuid,
     pub name: String,
@@ -135,6 +137,7 @@ pub struct SamlConfigResponse {
     pub slo_url: Option<String>,
     pub has_certificate: bool,
     pub name_id_format: String,
+    #[schema(value_type = Object)]
     pub attribute_mapping: serde_json::Value,
     pub sp_entity_id: String,
     pub sign_requests: bool,
@@ -149,31 +152,33 @@ pub struct SamlConfigResponse {
 // Request structs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateOidcConfigRequest {
     pub name: String,
     pub issuer_url: String,
     pub client_id: String,
     pub client_secret: String,
     pub scopes: Option<Vec<String>>,
+    #[schema(value_type = Option<Object>)]
     pub attribute_mapping: Option<serde_json::Value>,
     pub is_enabled: Option<bool>,
     pub auto_create_users: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateOidcConfigRequest {
     pub name: Option<String>,
     pub issuer_url: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub scopes: Option<Vec<String>>,
+    #[schema(value_type = Option<Object>)]
     pub attribute_mapping: Option<serde_json::Value>,
     pub is_enabled: Option<bool>,
     pub auto_create_users: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateLdapConfigRequest {
     pub name: String,
     pub server_url: String,
@@ -193,7 +198,7 @@ pub struct CreateLdapConfigRequest {
     pub priority: Option<i32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateLdapConfigRequest {
     pub name: Option<String>,
     pub server_url: Option<String>,
@@ -213,7 +218,7 @@ pub struct UpdateLdapConfigRequest {
     pub priority: Option<i32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateSamlConfigRequest {
     pub name: String,
     pub entity_id: String,
@@ -221,6 +226,7 @@ pub struct CreateSamlConfigRequest {
     pub slo_url: Option<String>,
     pub certificate: String,
     pub name_id_format: Option<String>,
+    #[schema(value_type = Option<Object>)]
     pub attribute_mapping: Option<serde_json::Value>,
     pub sp_entity_id: Option<String>,
     pub sign_requests: Option<bool>,
@@ -229,7 +235,7 @@ pub struct CreateSamlConfigRequest {
     pub is_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateSamlConfigRequest {
     pub name: Option<String>,
     pub entity_id: Option<String>,
@@ -237,6 +243,7 @@ pub struct UpdateSamlConfigRequest {
     pub slo_url: Option<String>,
     pub certificate: Option<String>,
     pub name_id_format: Option<String>,
+    #[schema(value_type = Option<Object>)]
     pub attribute_mapping: Option<serde_json::Value>,
     pub sp_entity_id: Option<String>,
     pub sign_requests: Option<bool>,
@@ -245,7 +252,7 @@ pub struct UpdateSamlConfigRequest {
     pub is_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SsoProviderInfo {
     pub id: Uuid,
     pub name: String,
@@ -253,12 +260,12 @@ pub struct SsoProviderInfo {
     pub login_url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ToggleRequest {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LdapTestResult {
     pub success: bool,
     pub message: String,

@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
@@ -21,7 +22,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/versions", get(get_package_versions))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListPackagesQuery {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
@@ -30,7 +31,7 @@ pub struct ListPackagesQuery {
     pub search: Option<String>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct PackageRow {
     pub id: Uuid,
     pub repository_key: String,
@@ -42,10 +43,11 @@ pub struct PackageRow {
     pub download_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[schema(value_type = Object)]
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PackageResponse {
     pub id: Uuid,
     pub repository_key: String,
@@ -57,6 +59,7 @@ pub struct PackageResponse {
     pub download_count: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[schema(value_type = Object)]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -78,13 +81,25 @@ impl From<PackageRow> for PackageResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PackageListResponse {
     pub items: Vec<PackageResponse>,
     pub pagination: Pagination,
 }
 
 /// List packages
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/packages",
+    tag = "packages",
+    params(ListPackagesQuery),
+    responses(
+        (status = 200, description = "Paginated list of packages", body = PackageListResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_packages(
     State(state): State<SharedState>,
     Query(query): Query<ListPackagesQuery>,
@@ -170,6 +185,21 @@ pub async fn list_packages(
 }
 
 /// Get a package by ID
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/packages",
+    tag = "packages",
+    params(
+        ("id" = Uuid, Path, description = "Package ID")
+    ),
+    responses(
+        (status = 200, description = "Package details", body = PackageResponse),
+        (status = 404, description = "Package not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_package(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -205,7 +235,7 @@ pub async fn get_package(
     Ok(Json(PackageResponse::from(package)))
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct PackageVersionRow {
     pub version: String,
     pub size_bytes: i64,
@@ -214,7 +244,7 @@ pub struct PackageVersionRow {
     pub checksum_sha256: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PackageVersionResponse {
     pub version: String,
     pub size_bytes: i64,
@@ -235,12 +265,27 @@ impl From<PackageVersionRow> for PackageVersionResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PackageVersionsResponse {
     pub versions: Vec<PackageVersionResponse>,
 }
 
 /// Get package versions
+#[utoipa::path(
+    get,
+    path = "/{id}/versions",
+    context_path = "/api/v1/packages",
+    tag = "packages",
+    params(
+        ("id" = Uuid, Path, description = "Package ID")
+    ),
+    responses(
+        (status = 200, description = "List of package versions", body = PackageVersionsResponse),
+        (status = 404, description = "Package not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_package_versions(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -301,3 +346,17 @@ pub async fn get_package_versions(
             .collect(),
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(list_packages, get_package, get_package_versions),
+    components(schemas(
+        PackageRow,
+        PackageResponse,
+        PackageListResponse,
+        PackageVersionRow,
+        PackageVersionResponse,
+        PackageVersionsResponse,
+    ))
+)]
+pub struct PackagesApiDoc;

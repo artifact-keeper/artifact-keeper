@@ -6,6 +6,7 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -43,7 +44,7 @@ pub fn router() -> Router<SharedState> {
 
 // === Request/Response types ===
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct GenerateSbomRequest {
     pub artifact_id: Uuid,
     #[serde(default = "default_format")]
@@ -56,37 +57,37 @@ fn default_format() -> String {
     "cyclonedx".to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct ListSbomsQuery {
     pub artifact_id: Option<Uuid>,
     pub repository_id: Option<Uuid>,
     pub format: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ConvertSbomRequest {
     pub target_format: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateCveStatusRequest {
     pub status: String,
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
 pub struct GetCveTrendsQuery {
     pub repository_id: Option<Uuid>,
     pub days: Option<i32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CheckLicenseComplianceRequest {
     pub licenses: Vec<String>,
     pub repository_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SbomResponse {
     pub id: Uuid,
     pub artifact_id: Uuid,
@@ -127,10 +128,11 @@ impl From<SbomDocument> for SbomResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SbomContentResponse {
     #[serde(flatten)]
     pub metadata: SbomResponse,
+    #[schema(value_type = Object)]
     pub content: serde_json::Value,
 }
 
@@ -144,7 +146,7 @@ impl From<SbomDocument> for SbomContentResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ComponentResponse {
     pub id: Uuid,
     pub sbom_id: Uuid,
@@ -181,7 +183,7 @@ impl From<SbomComponent> for ComponentResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct LicensePolicyResponse {
     pub id: Uuid,
     pub repository_id: Option<Uuid>,
@@ -214,7 +216,7 @@ impl From<LicensePolicy> for LicensePolicyResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpsertLicensePolicyRequest {
     pub repository_id: Option<Uuid>,
     pub name: String,
@@ -239,6 +241,20 @@ fn default_action() -> String {
 
 // === Handlers ===
 
+/// Generate an SBOM for an artifact
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    request_body = GenerateSbomRequest,
+    responses(
+        (status = 200, description = "Generated SBOM", body = SbomResponse),
+        (status = 404, description = "Artifact not found", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn generate_sbom(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -277,6 +293,18 @@ async fn generate_sbom(
     Ok(Json(SbomResponse::from(doc)))
 }
 
+/// List SBOMs with optional filters
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(ListSbomsQuery),
+    responses(
+        (status = 200, description = "List of SBOMs", body = Vec<SbomResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_sboms(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -348,6 +376,21 @@ async fn list_sboms(
     Ok(Json(sboms))
 }
 
+/// Get SBOM by ID with full content
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("id" = Uuid, Path, description = "SBOM ID")
+    ),
+    responses(
+        (status = 200, description = "SBOM with content", body = SbomContentResponse),
+        (status = 404, description = "SBOM not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_sbom(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -362,6 +405,21 @@ async fn get_sbom(
     Ok(Json(SbomContentResponse::from(doc)))
 }
 
+/// Get SBOM by artifact ID
+#[utoipa::path(
+    get,
+    path = "/by-artifact/{artifact_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact ID")
+    ),
+    responses(
+        (status = 200, description = "SBOM for the artifact", body = SbomContentResponse),
+        (status = 404, description = "SBOM not found for artifact", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_sbom_by_artifact(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -383,6 +441,21 @@ async fn get_sbom_by_artifact(
     Ok(Json(SbomContentResponse::from(doc)))
 }
 
+/// Delete an SBOM
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("id" = Uuid, Path, description = "SBOM ID")
+    ),
+    responses(
+        (status = 200, description = "SBOM deleted", body = Object),
+        (status = 404, description = "SBOM not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn delete_sbom(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -393,6 +466,21 @@ async fn delete_sbom(
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
+/// Get components of an SBOM
+#[utoipa::path(
+    get,
+    path = "/{id}/components",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("id" = Uuid, Path, description = "SBOM ID")
+    ),
+    responses(
+        (status = 200, description = "List of SBOM components", body = Vec<ComponentResponse>),
+        (status = 404, description = "SBOM not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_sbom_components(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -407,6 +495,23 @@ async fn get_sbom_components(
     Ok(Json(responses))
 }
 
+/// Convert an SBOM to a different format
+#[utoipa::path(
+    post,
+    path = "/{id}/convert",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("id" = Uuid, Path, description = "SBOM ID")
+    ),
+    request_body = ConvertSbomRequest,
+    responses(
+        (status = 200, description = "Converted SBOM", body = SbomResponse),
+        (status = 404, description = "SBOM not found", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn convert_sbom(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -423,6 +528,20 @@ async fn convert_sbom(
 
 // === CVE History ===
 
+/// Get CVE history for an artifact
+#[utoipa::path(
+    get,
+    path = "/cve/history/{artifact_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact ID")
+    ),
+    responses(
+        (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_cve_history(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -433,6 +552,22 @@ async fn get_cve_history(
     Ok(Json(entries))
 }
 
+/// Update CVE status
+#[utoipa::path(
+    post,
+    path = "/cve/status/{id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("id" = Uuid, Path, description = "CVE history entry ID")
+    ),
+    request_body = UpdateCveStatusRequest,
+    responses(
+        (status = 200, description = "Updated CVE entry", body = crate::models::sbom::CveHistoryEntry),
+        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn update_cve_status(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -450,6 +585,18 @@ async fn update_cve_status(
     Ok(Json(entry))
 }
 
+/// Get CVE trends and statistics
+#[utoipa::path(
+    get,
+    path = "/cve/trends",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(GetCveTrendsQuery),
+    responses(
+        (status = 200, description = "CVE trends", body = CveTrends),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_cve_trends(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -462,6 +609,17 @@ async fn get_cve_trends(
 
 // === License Policies ===
 
+/// List all license policies
+#[utoipa::path(
+    get,
+    path = "/license-policies",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    responses(
+        (status = 200, description = "List of license policies", body = Vec<LicensePolicyResponse>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_license_policies(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -478,6 +636,21 @@ async fn list_license_policies(
     Ok(Json(responses))
 }
 
+/// Get a license policy by ID
+#[utoipa::path(
+    get,
+    path = "/license-policies/{id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("id" = Uuid, Path, description = "License policy ID")
+    ),
+    responses(
+        (status = 200, description = "License policy details", body = LicensePolicyResponse),
+        (status = 404, description = "License policy not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_license_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -492,6 +665,19 @@ async fn get_license_policy(
     Ok(Json(LicensePolicyResponse::from(policy)))
 }
 
+/// Create or update a license policy
+#[utoipa::path(
+    post,
+    path = "/license-policies",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    request_body = UpsertLicensePolicyRequest,
+    responses(
+        (status = 200, description = "Created or updated license policy", body = LicensePolicyResponse),
+        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn upsert_license_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -533,6 +719,21 @@ async fn upsert_license_policy(
     Ok(Json(LicensePolicyResponse::from(policy)))
 }
 
+/// Delete a license policy
+#[utoipa::path(
+    delete,
+    path = "/license-policies/{id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("id" = Uuid, Path, description = "License policy ID")
+    ),
+    responses(
+        (status = 200, description = "License policy deleted", body = Object),
+        (status = 404, description = "License policy not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn delete_license_policy(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -545,6 +746,19 @@ async fn delete_license_policy(
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
+/// Check license compliance against policies
+#[utoipa::path(
+    post,
+    path = "/check-compliance",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    request_body = CheckLicenseComplianceRequest,
+    responses(
+        (status = 200, description = "License compliance result", body = LicenseCheckResult),
+        (status = 404, description = "No license policy configured", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn check_license_compliance(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -605,3 +819,38 @@ async fn extract_dependencies_for_artifact(
 
     Ok(deps)
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        generate_sbom,
+        list_sboms,
+        get_sbom,
+        get_sbom_by_artifact,
+        delete_sbom,
+        get_sbom_components,
+        convert_sbom,
+        get_cve_history,
+        update_cve_status,
+        get_cve_trends,
+        list_license_policies,
+        get_license_policy,
+        upsert_license_policy,
+        delete_license_policy,
+        check_license_compliance,
+    ),
+    components(schemas(
+        GenerateSbomRequest,
+        ListSbomsQuery,
+        ConvertSbomRequest,
+        UpdateCveStatusRequest,
+        GetCveTrendsQuery,
+        CheckLicenseComplianceRequest,
+        SbomResponse,
+        SbomContentResponse,
+        ComponentResponse,
+        LicensePolicyResponse,
+        UpsertLicensePolicyRequest,
+    ))
+)]
+pub struct SbomApiDoc;

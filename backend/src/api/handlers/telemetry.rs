@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -14,6 +15,28 @@ use crate::error::{AppError, Result};
 use crate::services::crash_reporting_service::{
     CrashReport, CrashReportingService, TelemetrySettings,
 };
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        get_settings,
+        update_settings,
+        list_crashes,
+        list_pending_crashes,
+        get_crash,
+        delete_crash,
+        submit_crashes,
+    ),
+    components(schemas(
+        SubmitCrashesRequest,
+        CrashListResponse,
+        SubmitResponse,
+        TelemetrySettings,
+        CrashReport,
+    )),
+    tags((name = "telemetry", description = "Telemetry and crash reporting")),
+)]
+pub struct TelemetryApiDoc;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -25,6 +48,16 @@ pub fn router() -> Router<SharedState> {
 }
 
 /// GET /api/v1/admin/telemetry/settings
+#[utoipa::path(
+    get,
+    path = "/settings",
+    context_path = "/api/v1/admin/telemetry",
+    tag = "telemetry",
+    responses(
+        (status = 200, description = "Current telemetry settings", body = TelemetrySettings),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<TelemetrySettings>> {
     let service = CrashReportingService::new(state.db.clone());
     let settings = service.get_settings().await?;
@@ -32,6 +65,17 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Telem
 }
 
 /// POST /api/v1/admin/telemetry/settings
+#[utoipa::path(
+    post,
+    path = "/settings",
+    context_path = "/api/v1/admin/telemetry",
+    tag = "telemetry",
+    request_body = TelemetrySettings,
+    responses(
+        (status = 200, description = "Settings updated", body = TelemetrySettings),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn update_settings(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -47,13 +91,24 @@ pub async fn update_settings(
     Ok(Json(settings))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListCrashesQuery {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
 
 /// GET /api/v1/admin/telemetry/crashes
+#[utoipa::path(
+    get,
+    path = "/crashes",
+    context_path = "/api/v1/admin/telemetry",
+    tag = "telemetry",
+    params(ListCrashesQuery),
+    responses(
+        (status = 200, description = "Paginated crash reports", body = CrashListResponse),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn list_crashes(
     State(state): State<SharedState>,
     Query(query): Query<ListCrashesQuery>,
@@ -72,6 +127,16 @@ pub async fn list_crashes(
 }
 
 /// GET /api/v1/admin/telemetry/crashes/pending
+#[utoipa::path(
+    get,
+    path = "/crashes/pending",
+    context_path = "/api/v1/admin/telemetry",
+    tag = "telemetry",
+    responses(
+        (status = 200, description = "Pending crash reports", body = Vec<CrashReport>),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn list_pending_crashes(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<CrashReport>>> {
@@ -81,6 +146,19 @@ pub async fn list_pending_crashes(
 }
 
 /// GET /api/v1/admin/telemetry/crashes/:id
+#[utoipa::path(
+    get,
+    path = "/crashes/{id}",
+    context_path = "/api/v1/admin/telemetry",
+    tag = "telemetry",
+    params(
+        ("id" = Uuid, Path, description = "Crash report ID"),
+    ),
+    responses(
+        (status = 200, description = "Crash report details", body = CrashReport),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn get_crash(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -91,6 +169,19 @@ pub async fn get_crash(
 }
 
 /// DELETE /api/v1/admin/telemetry/crashes/:id
+#[utoipa::path(
+    delete,
+    path = "/crashes/{id}",
+    context_path = "/api/v1/admin/telemetry",
+    tag = "telemetry",
+    params(
+        ("id" = Uuid, Path, description = "Crash report ID"),
+    ),
+    responses(
+        (status = 200, description = "Crash report deleted"),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn delete_crash(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -106,12 +197,23 @@ pub async fn delete_crash(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SubmitCrashesRequest {
     pub ids: Vec<Uuid>,
 }
 
 /// POST /api/v1/admin/telemetry/crashes/submit
+#[utoipa::path(
+    post,
+    path = "/crashes/submit",
+    context_path = "/api/v1/admin/telemetry",
+    tag = "telemetry",
+    request_body = SubmitCrashesRequest,
+    responses(
+        (status = 200, description = "Crashes submitted", body = SubmitResponse),
+    ),
+    security(("bearer_auth" = [])),
+)]
 pub async fn submit_crashes(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -129,13 +231,13 @@ pub async fn submit_crashes(
     }))
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, ToSchema)]
 pub struct CrashListResponse {
     pub items: Vec<CrashReport>,
     pub total: i64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, ToSchema)]
 pub struct SubmitResponse {
     pub marked_submitted: u64,
 }

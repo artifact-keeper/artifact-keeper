@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
@@ -24,14 +25,14 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/members", post(add_members).delete(remove_members))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListGroupsQuery {
     pub search: Option<String>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct GroupRow {
     pub id: Uuid,
     pub name: String,
@@ -41,7 +42,7 @@ pub struct GroupRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GroupResponse {
     pub id: Uuid,
     pub name: String,
@@ -64,13 +65,25 @@ impl From<GroupRow> for GroupResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GroupListResponse {
     pub items: Vec<GroupResponse>,
     pub pagination: Pagination,
 }
 
 /// List groups
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    params(ListGroupsQuery),
+    responses(
+        (status = 200, description = "List of groups", body = GroupListResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_groups(
     State(state): State<SharedState>,
     Query(query): Query<ListGroupsQuery>,
@@ -146,13 +159,13 @@ pub async fn list_groups(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateGroupRequest {
     pub name: String,
     pub description: Option<String>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, ToSchema)]
 pub struct CreatedGroupRow {
     pub id: Uuid,
     pub name: String,
@@ -162,6 +175,19 @@ pub struct CreatedGroupRow {
 }
 
 /// Create a group
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    request_body = CreateGroupRequest,
+    responses(
+        (status = 200, description = "Group created successfully", body = GroupResponse),
+        (status = 409, description = "Group name already exists"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_group(
     State(state): State<SharedState>,
     Json(payload): Json<CreateGroupRequest>,
@@ -197,6 +223,21 @@ pub async fn create_group(
 }
 
 /// Get a group by ID
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    params(
+        ("id" = Uuid, Path, description = "Group ID")
+    ),
+    responses(
+        (status = 200, description = "Group details", body = GroupResponse),
+        (status = 404, description = "Group not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_group(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -233,6 +274,22 @@ pub async fn get_group(
 }
 
 /// Update a group
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    params(
+        ("id" = Uuid, Path, description = "Group ID")
+    ),
+    request_body = CreateGroupRequest,
+    responses(
+        (status = 200, description = "Group updated successfully", body = GroupResponse),
+        (status = 404, description = "Group not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn update_group(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -272,6 +329,21 @@ pub async fn update_group(
 }
 
 /// Delete a group
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    params(
+        ("id" = Uuid, Path, description = "Group ID")
+    ),
+    responses(
+        (status = 200, description = "Group deleted successfully"),
+        (status = 404, description = "Group not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn delete_group(State(state): State<SharedState>, Path(id): Path<Uuid>) -> Result<()> {
     let result = sqlx::query("DELETE FROM groups WHERE id = $1")
         .bind(id)
@@ -286,12 +358,28 @@ pub async fn delete_group(State(state): State<SharedState>, Path(id): Path<Uuid>
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct MembersRequest {
     pub user_ids: Vec<Uuid>,
 }
 
 /// Add members to a group
+#[utoipa::path(
+    post,
+    path = "/{id}/members",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    params(
+        ("id" = Uuid, Path, description = "Group ID")
+    ),
+    request_body = MembersRequest,
+    responses(
+        (status = 200, description = "Members added successfully"),
+        (status = 404, description = "Group not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn add_members(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -316,6 +404,22 @@ pub async fn add_members(
 }
 
 /// Remove members from a group
+#[utoipa::path(
+    delete,
+    path = "/{id}/members",
+    context_path = "/api/v1/groups",
+    tag = "groups",
+    params(
+        ("id" = Uuid, Path, description = "Group ID")
+    ),
+    request_body = MembersRequest,
+    responses(
+        (status = 200, description = "Members removed successfully"),
+        (status = 404, description = "Group not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn remove_members(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -332,3 +436,25 @@ pub async fn remove_members(
 
     Ok(())
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_groups,
+        create_group,
+        get_group,
+        update_group,
+        delete_group,
+        add_members,
+        remove_members,
+    ),
+    components(schemas(
+        GroupRow,
+        GroupResponse,
+        GroupListResponse,
+        CreateGroupRequest,
+        CreatedGroupRow,
+        MembersRequest,
+    ))
+)]
+pub struct GroupsApiDoc;

@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
@@ -25,7 +26,7 @@ pub fn router() -> Router<SharedState> {
         )
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListPermissionsQuery {
     pub principal_type: Option<String>,
     pub principal_id: Option<Uuid>,
@@ -35,7 +36,7 @@ pub struct ListPermissionsQuery {
     pub per_page: Option<u32>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct PermissionRow {
     pub id: Uuid,
     pub principal_type: String,
@@ -49,7 +50,7 @@ pub struct PermissionRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PermissionResponse {
     pub id: Uuid,
     pub principal_type: String,
@@ -80,13 +81,25 @@ impl From<PermissionRow> for PermissionResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PermissionListResponse {
     pub items: Vec<PermissionResponse>,
     pub pagination: Pagination,
 }
 
 /// List permissions
+#[utoipa::path(
+    get,
+    path = "",
+    context_path = "/api/v1/permissions",
+    tag = "permissions",
+    params(ListPermissionsQuery),
+    responses(
+        (status = 200, description = "List of permissions", body = PermissionListResponse),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_permissions(
     State(state): State<SharedState>,
     Query(query): Query<ListPermissionsQuery>,
@@ -183,7 +196,7 @@ pub async fn list_permissions(
     }))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePermissionRequest {
     pub principal_type: String,
     pub principal_id: Uuid,
@@ -192,7 +205,7 @@ pub struct CreatePermissionRequest {
     pub actions: Vec<String>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, ToSchema)]
 pub struct CreatedPermissionRow {
     pub id: Uuid,
     pub principal_type: String,
@@ -205,6 +218,19 @@ pub struct CreatedPermissionRow {
 }
 
 /// Create a permission
+#[utoipa::path(
+    post,
+    path = "",
+    context_path = "/api/v1/permissions",
+    tag = "permissions",
+    request_body = CreatePermissionRequest,
+    responses(
+        (status = 200, description = "Permission created successfully", body = PermissionResponse),
+        (status = 409, description = "Permission already exists"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_permission(
     State(state): State<SharedState>,
     Json(payload): Json<CreatePermissionRequest>,
@@ -247,6 +273,21 @@ pub async fn create_permission(
 }
 
 /// Get a permission by ID
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    context_path = "/api/v1/permissions",
+    tag = "permissions",
+    params(
+        ("id" = Uuid, Path, description = "Permission ID")
+    ),
+    responses(
+        (status = 200, description = "Permission details", body = PermissionResponse),
+        (status = 404, description = "Permission not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn get_permission(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -291,6 +332,22 @@ pub async fn get_permission(
 }
 
 /// Update a permission
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    context_path = "/api/v1/permissions",
+    tag = "permissions",
+    params(
+        ("id" = Uuid, Path, description = "Permission ID")
+    ),
+    request_body = CreatePermissionRequest,
+    responses(
+        (status = 200, description = "Permission updated successfully", body = PermissionResponse),
+        (status = 404, description = "Permission not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn update_permission(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -331,6 +388,21 @@ pub async fn update_permission(
 }
 
 /// Delete a permission
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    context_path = "/api/v1/permissions",
+    tag = "permissions",
+    params(
+        ("id" = Uuid, Path, description = "Permission ID")
+    ),
+    responses(
+        (status = 200, description = "Permission deleted successfully"),
+        (status = 404, description = "Permission not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn delete_permission(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
@@ -347,3 +419,22 @@ pub async fn delete_permission(
 
     Ok(())
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_permissions,
+        create_permission,
+        get_permission,
+        update_permission,
+        delete_permission,
+    ),
+    components(schemas(
+        PermissionRow,
+        PermissionResponse,
+        PermissionListResponse,
+        CreatePermissionRequest,
+        CreatedPermissionRow,
+    ))
+)]
+pub struct PermissionsApiDoc;

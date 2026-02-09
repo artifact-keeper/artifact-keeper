@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
@@ -36,12 +37,12 @@ pub fn router() -> Router<SharedState> {
 
 // --- Request/Response DTOs ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct ListKeysQuery {
     pub repository_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateKeyPayload {
     pub repository_id: Option<Uuid>,
     pub name: String,
@@ -51,7 +52,7 @@ pub struct CreateKeyPayload {
     pub uid_email: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateSigningConfigPayload {
     pub signing_key_id: Option<Uuid>,
     pub sign_metadata: Option<bool>,
@@ -59,13 +60,13 @@ pub struct UpdateSigningConfigPayload {
     pub require_signatures: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct KeyListResponse {
     pub keys: Vec<SigningKeyPublic>,
     pub total: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SigningConfigResponse {
     pub repository_id: Uuid,
     pub signing_key_id: Option<Uuid>,
@@ -78,6 +79,20 @@ pub struct SigningConfigResponse {
 // --- Handlers ---
 
 /// List all signing keys, optionally filtered by repository.
+#[utoipa::path(
+    get,
+    path = "/keys",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("repository_id" = Option<Uuid>, Query, description = "Filter by repository ID")
+    ),
+    responses(
+        (status = 200, description = "List of signing keys", body = KeyListResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_keys(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -90,6 +105,18 @@ async fn list_keys(
 }
 
 /// Create a new signing key.
+#[utoipa::path(
+    post,
+    path = "/keys",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    request_body = CreateKeyPayload,
+    responses(
+        (status = 200, description = "Created signing key", body = SigningKeyPublic),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn create_key(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -111,6 +138,21 @@ async fn create_key(
 }
 
 /// Get a signing key by ID.
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Signing key details", body = SigningKeyPublic),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_key(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -122,6 +164,21 @@ async fn get_key(
 }
 
 /// Delete a signing key.
+#[utoipa::path(
+    delete,
+    path = "/keys/{key_id}",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Key deleted", body = Object),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn delete_key(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -133,6 +190,21 @@ async fn delete_key(
 }
 
 /// Revoke (deactivate) a signing key.
+#[utoipa::path(
+    post,
+    path = "/keys/{key_id}/revoke",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Key revoked", body = Object),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn revoke_key(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -144,6 +216,21 @@ async fn revoke_key(
 }
 
 /// Rotate a signing key — generates new key, deactivates old one.
+#[utoipa::path(
+    post,
+    path = "/keys/{key_id}/rotate",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID to rotate")
+    ),
+    responses(
+        (status = 200, description = "Newly generated signing key", body = SigningKeyPublic),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn rotate_key(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -155,6 +242,20 @@ async fn rotate_key(
 }
 
 /// Get the public key in PEM format (for client import).
+#[utoipa::path(
+    get,
+    path = "/keys/{key_id}/public",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("key_id" = Uuid, Path, description = "Signing key ID")
+    ),
+    responses(
+        (status = 200, description = "Public key in PEM format", body = String),
+        (status = 404, description = "Key not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_public_key(
     State(state): State<SharedState>,
     Path(key_id): Path<Uuid>,
@@ -165,6 +266,21 @@ async fn get_public_key(
 }
 
 /// Get signing configuration for a repository.
+#[utoipa::path(
+    get,
+    path = "/repositories/{repo_id}/config",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("repo_id" = Uuid, Path, description = "Repository ID")
+    ),
+    responses(
+        (status = 200, description = "Repository signing configuration", body = SigningConfigResponse),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_repo_signing_config(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -202,6 +318,22 @@ async fn get_repo_signing_config(
 }
 
 /// Update signing configuration for a repository.
+#[utoipa::path(
+    post,
+    path = "/repositories/{repo_id}/config",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("repo_id" = Uuid, Path, description = "Repository ID")
+    ),
+    request_body = UpdateSigningConfigPayload,
+    responses(
+        (status = 200, description = "Updated signing configuration", body = RepositorySigningConfig),
+        (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn update_repo_signing_config(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -236,6 +368,20 @@ async fn update_repo_signing_config(
 }
 
 /// Get the public key for a repository (convenience endpoint).
+#[utoipa::path(
+    get,
+    path = "/repositories/{repo_id}/public-key",
+    context_path = "/api/v1/signing",
+    tag = "signing",
+    params(
+        ("repo_id" = Uuid, Path, description = "Repository ID")
+    ),
+    responses(
+        (status = 200, description = "Public key in PEM format", body = String),
+        (status = 404, description = "No active signing key for repository", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_repo_public_key(
     State(state): State<SharedState>,
     Path(repo_id): Path<Uuid>,
@@ -250,3 +396,27 @@ async fn get_repo_public_key(
 fn signing_service(state: &SharedState) -> SigningService {
     SigningService::new(state.db.clone(), &state.config.jwt_secret)
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_keys,
+        create_key,
+        get_key,
+        delete_key,
+        revoke_key,
+        rotate_key,
+        get_public_key,
+        get_repo_signing_config,
+        update_repo_signing_config,
+        get_repo_public_key,
+    ),
+    components(schemas(
+        ListKeysQuery,
+        CreateKeyPayload,
+        UpdateSigningConfigPayload,
+        KeyListResponse,
+        SigningConfigResponse,
+    ))
+)]
+pub struct SigningApiDoc;

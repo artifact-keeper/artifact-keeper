@@ -9,6 +9,7 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -56,14 +57,14 @@ pub fn router() -> Router<SharedState> {
 
 // === Request/Response types ===
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct DtStatusResponse {
     enabled: bool,
     healthy: bool,
     url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 struct MetricsHistoryQuery {
     #[serde(default = "default_days")]
     days: u32,
@@ -73,7 +74,7 @@ fn default_days() -> u32 {
     30
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct UpdateAnalysisBody {
     project_uuid: String,
     component_uuid: String,
@@ -101,6 +102,17 @@ fn get_dt_service(
 
 // === Handlers ===
 
+/// Get Dependency-Track integration status
+#[utoipa::path(
+    get,
+    path = "/status",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    responses(
+        (status = 200, description = "Dependency-Track status", body = DtStatusResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn dt_status(State(state): State<SharedState>) -> Result<Json<DtStatusResponse>> {
     match &state.dependency_track {
         Some(dt) => {
@@ -119,6 +131,17 @@ async fn dt_status(State(state): State<SharedState>) -> Result<Json<DtStatusResp
     }
 }
 
+/// List all Dependency-Track projects
+#[utoipa::path(
+    get,
+    path = "/projects",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    responses(
+        (status = 200, description = "List of projects", body = Vec<DtProject>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_projects(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -128,6 +151,20 @@ async fn list_projects(
     Ok(Json(projects))
 }
 
+/// Get project findings by project UUID
+#[utoipa::path(
+    get,
+    path = "/projects/{project_uuid}",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    params(
+        ("project_uuid" = String, Path, description = "Project UUID"),
+    ),
+    responses(
+        (status = 200, description = "Project findings", body = Vec<DtFinding>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_project(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -138,6 +175,20 @@ async fn get_project(
     Ok(Json(findings))
 }
 
+/// Get vulnerability findings for a project
+#[utoipa::path(
+    get,
+    path = "/projects/{project_uuid}/findings",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    params(
+        ("project_uuid" = String, Path, description = "Project UUID"),
+    ),
+    responses(
+        (status = 200, description = "Project vulnerability findings", body = Vec<DtFinding>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_project_findings(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -148,6 +199,20 @@ async fn get_project_findings(
     Ok(Json(findings))
 }
 
+/// Get components for a project
+#[utoipa::path(
+    get,
+    path = "/projects/{project_uuid}/components",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    params(
+        ("project_uuid" = String, Path, description = "Project UUID"),
+    ),
+    responses(
+        (status = 200, description = "Project components", body = Vec<DtComponentFull>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_project_components(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -158,6 +223,20 @@ async fn get_project_components(
     Ok(Json(components))
 }
 
+/// Get metrics for a project
+#[utoipa::path(
+    get,
+    path = "/projects/{project_uuid}/metrics",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    params(
+        ("project_uuid" = String, Path, description = "Project UUID"),
+    ),
+    responses(
+        (status = 200, description = "Project metrics", body = DtProjectMetrics),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_project_metrics(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -168,6 +247,21 @@ async fn get_project_metrics(
     Ok(Json(metrics))
 }
 
+/// Get metrics history for a project
+#[utoipa::path(
+    get,
+    path = "/projects/{project_uuid}/metrics/history",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    params(
+        ("project_uuid" = String, Path, description = "Project UUID"),
+        MetricsHistoryQuery,
+    ),
+    responses(
+        (status = 200, description = "Project metrics history", body = Vec<DtProjectMetrics>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_project_metrics_history(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -181,6 +275,17 @@ async fn get_project_metrics_history(
     Ok(Json(history))
 }
 
+/// Get portfolio-level metrics
+#[utoipa::path(
+    get,
+    path = "/metrics/portfolio",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    responses(
+        (status = 200, description = "Portfolio metrics", body = DtPortfolioMetrics),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_portfolio_metrics(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -190,6 +295,20 @@ async fn get_portfolio_metrics(
     Ok(Json(metrics))
 }
 
+/// Get policy violations for a project
+#[utoipa::path(
+    get,
+    path = "/projects/{project_uuid}/violations",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    params(
+        ("project_uuid" = String, Path, description = "Project UUID"),
+    ),
+    responses(
+        (status = 200, description = "Project policy violations", body = Vec<DtPolicyViolation>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_project_violations(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -200,6 +319,18 @@ async fn get_project_violations(
     Ok(Json(violations))
 }
 
+/// Update analysis (triage) for a finding
+#[utoipa::path(
+    put,
+    path = "/analysis",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    request_body = UpdateAnalysisBody,
+    responses(
+        (status = 200, description = "Updated analysis", body = DtAnalysisResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn update_analysis(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -220,6 +351,17 @@ async fn update_analysis(
     Ok(Json(result))
 }
 
+/// List all policies
+#[utoipa::path(
+    get,
+    path = "/policies",
+    context_path = "/api/v1/dependency-track",
+    tag = "security",
+    responses(
+        (status = 200, description = "List of policies", body = Vec<DtPolicyFull>),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn list_policies(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
@@ -228,3 +370,33 @@ async fn list_policies(
     let policies = dt.get_policies().await?;
     Ok(Json(policies))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        dt_status,
+        list_projects,
+        get_project,
+        get_project_findings,
+        get_project_components,
+        get_project_metrics,
+        get_project_metrics_history,
+        get_portfolio_metrics,
+        get_project_violations,
+        update_analysis,
+        list_policies,
+    ),
+    components(schemas(
+        DtStatusResponse,
+        UpdateAnalysisBody,
+        DtProject,
+        DtFinding,
+        DtComponentFull,
+        DtProjectMetrics,
+        DtPortfolioMetrics,
+        DtPolicyViolation,
+        DtAnalysisResponse,
+        DtPolicyFull,
+    ))
+)]
+pub struct DependencyTrackApiDoc;

@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// A signing key used for repository metadata (GPG/RSA/Ed25519).
@@ -29,7 +30,7 @@ pub struct SigningKey {
 }
 
 /// Public view of a signing key (no private material).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SigningKeyPublic {
     pub id: Uuid,
     pub repository_id: Option<Uuid>,
@@ -69,7 +70,7 @@ impl From<SigningKey> for SigningKeyPublic {
 }
 
 /// Repository signing configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct RepositorySigningConfig {
     pub id: Uuid,
     pub repository_id: Uuid,

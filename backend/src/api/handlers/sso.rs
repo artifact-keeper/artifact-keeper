@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::auth::set_auth_cookies;
@@ -40,7 +41,19 @@ pub fn router() -> Router<SharedState> {
 // List enabled providers (public)
 // ---------------------------------------------------------------------------
 
-async fn list_providers(State(state): State<SharedState>) -> Result<Json<Vec<SsoProviderInfo>>> {
+/// List all enabled SSO providers
+#[utoipa::path(
+    get,
+    path = "/providers",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    responses(
+        (status = 200, description = "List of enabled SSO providers", body = Vec<SsoProviderInfo>),
+    )
+)]
+pub async fn list_providers(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<SsoProviderInfo>>> {
     let result = AuthConfigService::list_enabled_providers(&state.db).await?;
     Ok(Json(result))
 }
@@ -49,7 +62,24 @@ async fn list_providers(State(state): State<SharedState>) -> Result<Json<Vec<Sso
 // OIDC login redirect
 // ---------------------------------------------------------------------------
 
-async fn oidc_login(State(state): State<SharedState>, Path(id): Path<Uuid>) -> Result<Redirect> {
+/// Initiate OIDC login redirect
+#[utoipa::path(
+    get,
+    path = "/oidc/{id}/login",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "OIDC provider configuration ID")
+    ),
+    responses(
+        (status = 307, description = "Redirect to OIDC authorization endpoint"),
+        (status = 404, description = "OIDC provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn oidc_login(
+    State(state): State<SharedState>,
+    Path(id): Path<Uuid>,
+) -> Result<Redirect> {
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
 
@@ -107,13 +137,28 @@ async fn oidc_login(State(state): State<SharedState>, Path(id): Path<Uuid>) -> R
 // OIDC callback
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct OidcCallbackQuery {
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct OidcCallbackQuery {
     code: String,
     state: String,
 }
 
-async fn oidc_callback(
+/// Handle OIDC authorization callback
+#[utoipa::path(
+    get,
+    path = "/oidc/{id}/callback",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "OIDC provider configuration ID"),
+        OidcCallbackQuery,
+    ),
+    responses(
+        (status = 307, description = "Redirect to frontend with exchange code"),
+        (status = 400, description = "Invalid callback parameters", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn oidc_callback(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
@@ -232,13 +277,29 @@ async fn oidc_callback(
 // LDAP login
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct LdapLoginRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LdapLoginRequest {
     username: String,
     password: String,
 }
 
-async fn ldap_login(
+/// Authenticate via LDAP
+#[utoipa::path(
+    post,
+    path = "/ldap/{id}/login",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "LDAP provider configuration ID")
+    ),
+    request_body = LdapLoginRequest,
+    responses(
+        (status = 200, description = "Authentication successful with tokens"),
+        (status = 401, description = "Invalid credentials", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "LDAP provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn ldap_login(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     Json(req): Json<LdapLoginRequest>,
@@ -302,7 +363,24 @@ async fn ldap_login(
 // SAML login + ACS
 // ---------------------------------------------------------------------------
 
-async fn saml_login(State(state): State<SharedState>, Path(id): Path<Uuid>) -> Result<Redirect> {
+/// Initiate SAML login redirect
+#[utoipa::path(
+    get,
+    path = "/saml/{id}/login",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "SAML provider configuration ID")
+    ),
+    responses(
+        (status = 307, description = "Redirect to SAML IdP SSO endpoint"),
+        (status = 404, description = "SAML provider not found", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn saml_login(
+    State(state): State<SharedState>,
+    Path(id): Path<Uuid>,
+) -> Result<Redirect> {
     // Get SAML config from DB
     let row = AuthConfigService::get_saml_decrypted(&state.db, id).await?;
 
@@ -334,8 +412,8 @@ async fn saml_login(State(state): State<SharedState>, Path(id): Path<Uuid>) -> R
     Ok(Redirect::temporary(&authn_request.redirect_url))
 }
 
-#[derive(Debug, Deserialize)]
-struct SamlAcsForm {
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SamlAcsForm {
     #[serde(rename = "SAMLResponse")]
     saml_response: String,
     #[serde(rename = "RelayState")]
@@ -343,7 +421,21 @@ struct SamlAcsForm {
     relay_state: Option<String>,
 }
 
-async fn saml_acs(
+/// Handle SAML Assertion Consumer Service (ACS) callback
+#[utoipa::path(
+    post,
+    path = "/saml/{id}/acs",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    params(
+        ("id" = Uuid, Path, description = "SAML provider configuration ID")
+    ),
+    responses(
+        (status = 307, description = "Redirect to frontend with exchange code"),
+        (status = 400, description = "Invalid SAML response", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn saml_acs(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
     axum::extract::Form(form): axum::extract::Form<SamlAcsForm>,
@@ -408,19 +500,31 @@ async fn saml_acs(
 // Exchange code endpoint
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct ExchangeCodeRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExchangeCodeRequest {
     code: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ExchangeCodeResponse {
     access_token: String,
     refresh_token: String,
     token_type: String,
 }
 
-async fn exchange_code(
+/// Exchange a short-lived code for access and refresh tokens
+#[utoipa::path(
+    post,
+    path = "/exchange",
+    context_path = "/api/v1/auth/sso",
+    tag = "sso",
+    request_body = ExchangeCodeRequest,
+    responses(
+        (status = 200, description = "Token exchange successful", body = ExchangeCodeResponse),
+        (status = 400, description = "Invalid or expired exchange code", body = crate::api::openapi::ErrorResponse),
+    )
+)]
+pub async fn exchange_code(
     State(state): State<SharedState>,
     Json(req): Json<ExchangeCodeRequest>,
 ) -> Result<Response> {
@@ -438,6 +542,27 @@ async fn exchange_code(
     set_auth_cookies(response.headers_mut(), &access_token, &refresh_token, 3600);
     Ok(response)
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        list_providers,
+        oidc_login,
+        oidc_callback,
+        ldap_login,
+        saml_login,
+        saml_acs,
+        exchange_code,
+    ),
+    components(schemas(
+        LdapLoginRequest,
+        SamlAcsForm,
+        ExchangeCodeRequest,
+        ExchangeCodeResponse,
+        crate::services::auth_config_service::SsoProviderInfo,
+    ))
+)]
+pub struct SsoApiDoc;
 
 // ---------------------------------------------------------------------------
 // Helpers

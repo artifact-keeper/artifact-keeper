@@ -19,6 +19,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+use utoipa::ToSchema;
 
 use crate::error::{AppError, Result};
 
@@ -62,7 +63,7 @@ pub struct DependencyTrackService {
 }
 
 /// Dependency-Track project representation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtProject {
     pub uuid: String,
     pub name: String,
@@ -95,7 +96,7 @@ pub struct BomProcessingStatus {
 }
 
 /// Vulnerability finding from Dependency-Track
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtFinding {
     pub component: DtComponent,
     pub vulnerability: DtVulnerability,
@@ -104,7 +105,7 @@ pub struct DtFinding {
 }
 
 /// Component affected by a vulnerability
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtComponent {
     pub uuid: String,
     pub name: String,
@@ -114,7 +115,7 @@ pub struct DtComponent {
 }
 
 /// Vulnerability details
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtVulnerability {
     pub uuid: String,
     #[serde(rename = "vulnId")]
@@ -129,7 +130,7 @@ pub struct DtVulnerability {
 }
 
 /// CWE reference
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtCwe {
     #[serde(rename = "cweId")]
     pub cwe_id: i32,
@@ -137,7 +138,7 @@ pub struct DtCwe {
 }
 
 /// Analysis state for a finding
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtAnalysis {
     pub state: Option<String>,
     pub justification: Option<String>,
@@ -148,7 +149,7 @@ pub struct DtAnalysis {
 }
 
 /// Attribution info
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtAttribution {
     #[serde(rename = "analyzerIdentity")]
     pub analyzer_identity: Option<String>,
@@ -157,7 +158,7 @@ pub struct DtAttribution {
 }
 
 /// Policy violation from Dependency-Track
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtPolicyViolation {
     pub uuid: String,
     #[serde(rename = "type")]
@@ -168,7 +169,7 @@ pub struct DtPolicyViolation {
 }
 
 /// Policy condition that was violated
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtPolicyCondition {
     pub uuid: String,
     pub subject: String,
@@ -178,7 +179,7 @@ pub struct DtPolicyCondition {
 }
 
 /// Policy definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtPolicy {
     pub uuid: String,
     pub name: String,
@@ -187,7 +188,7 @@ pub struct DtPolicy {
 }
 
 /// Project-level metrics from Dependency-Track
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtProjectMetrics {
     pub critical: i64,
     pub high: i64,
@@ -219,7 +220,7 @@ pub struct DtProjectMetrics {
 }
 
 /// Portfolio-level metrics from Dependency-Track
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtPortfolioMetrics {
     pub critical: i64,
     pub high: i64,
@@ -248,7 +249,7 @@ pub struct DtPortfolioMetrics {
 }
 
 /// Full component representation from Dependency-Track
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtComponentFull {
     pub uuid: String,
     pub name: String,
@@ -263,7 +264,7 @@ pub struct DtComponentFull {
 }
 
 /// License information from Dependency-Track
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtLicense {
     pub uuid: Option<String>,
     #[serde(rename = "licenseId")]
@@ -272,7 +273,7 @@ pub struct DtLicense {
 }
 
 /// Full policy representation with conditions and projects
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtPolicyFull {
     pub uuid: String,
     pub name: String,
@@ -283,11 +284,12 @@ pub struct DtPolicyFull {
     #[serde(rename = "policyConditions")]
     pub policy_conditions: Vec<DtPolicyConditionFull>,
     pub projects: Vec<DtProject>,
+    #[schema(value_type = Vec<Object>)]
     pub tags: Vec<serde_json::Value>,
 }
 
 /// Full policy condition with all fields
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtPolicyConditionFull {
     pub uuid: String,
     pub subject: String,
@@ -296,7 +298,7 @@ pub struct DtPolicyConditionFull {
 }
 
 /// Request to update analysis state for a finding
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UpdateAnalysisRequest {
     pub project: String,
     pub component: String,
@@ -315,7 +317,7 @@ pub struct UpdateAnalysisRequest {
 }
 
 /// Response from analysis update
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct DtAnalysisResponse {
     #[serde(rename = "analysisState")]
     pub analysis_state: String,

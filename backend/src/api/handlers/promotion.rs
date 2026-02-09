@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
@@ -34,7 +35,7 @@ pub fn router() -> Router<SharedState> {
         )
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PromoteArtifactRequest {
     pub target_repository: String,
     #[serde(default)]
@@ -42,7 +43,7 @@ pub struct PromoteArtifactRequest {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct BulkPromoteRequest {
     pub target_repository: String,
     pub artifact_ids: Vec<Uuid>,
@@ -51,7 +52,7 @@ pub struct BulkPromoteRequest {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PromotionResponse {
     pub promoted: bool,
     pub source: String,
@@ -61,14 +62,14 @@ pub struct PromotionResponse {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PolicyViolation {
     pub rule: String,
     pub severity: String,
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BulkPromotionResponse {
     pub total: usize,
     pub promoted: usize,
@@ -76,14 +77,14 @@ pub struct BulkPromotionResponse {
     pub results: Vec<PromotionResponse>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PromotionHistoryQuery {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
     pub artifact_id: Option<Uuid>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PromotionHistoryEntry {
     pub id: Uuid,
     pub artifact_id: Uuid,
@@ -92,12 +93,13 @@ pub struct PromotionHistoryEntry {
     pub target_repo_key: String,
     pub promoted_by: Option<Uuid>,
     pub promoted_by_username: Option<String>,
+    #[schema(value_type = Option<Object>)]
     pub policy_result: Option<serde_json::Value>,
     pub notes: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PromotionHistoryResponse {
     pub items: Vec<PromotionHistoryEntry>,
     pub pagination: Pagination,
@@ -138,6 +140,24 @@ fn failed_response(source: String, target: String, message: String) -> Promotion
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/repositories/{key}/artifacts/{artifact_id}/promote",
+    context_path = "/api/v1/promotion",
+    tag = "promotion",
+    params(
+        ("key" = String, Path, description = "Source repository key"),
+        ("artifact_id" = Uuid, Path, description = "Artifact ID to promote"),
+    ),
+    request_body = PromoteArtifactRequest,
+    responses(
+        (status = 200, description = "Artifact promotion result", body = PromotionResponse),
+        (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Artifact already exists in target", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn promote_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -295,6 +315,22 @@ pub async fn promote_artifact(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/repositories/{key}/promote",
+    context_path = "/api/v1/promotion",
+    tag = "promotion",
+    params(
+        ("key" = String, Path, description = "Source repository key"),
+    ),
+    request_body = BulkPromoteRequest,
+    responses(
+        (status = 200, description = "Bulk promotion results", body = BulkPromotionResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "Validation error (repo type/format mismatch)", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn promote_artifacts_bulk(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -466,6 +502,23 @@ pub async fn promote_artifacts_bulk(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/repositories/{key}/promotion-history",
+    context_path = "/api/v1/promotion",
+    tag = "promotion",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (max 100)"),
+        ("artifact_id" = Option<Uuid>, Query, description = "Filter by artifact ID"),
+    ),
+    responses(
+        (status = 200, description = "Promotion history for repository", body = PromotionHistoryResponse),
+        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn promotion_history(
     State(state): State<SharedState>,
     Path(repo_key): Path<String>,
@@ -558,3 +611,19 @@ pub async fn promotion_history(
         },
     }))
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(promote_artifact, promote_artifacts_bulk, promotion_history,),
+    components(schemas(
+        PromoteArtifactRequest,
+        BulkPromoteRequest,
+        PromotionResponse,
+        PolicyViolation,
+        BulkPromotionResponse,
+        PromotionHistoryQuery,
+        PromotionHistoryEntry,
+        PromotionHistoryResponse,
+    ))
+)]
+pub struct PromotionApiDoc;
