@@ -1,6 +1,6 @@
 //! Route definitions for the API.
 
-use axum::{middleware, routing::get, Json, Router};
+use axum::{middleware, routing::get, Router};
 use std::sync::Arc;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -21,14 +21,7 @@ pub fn create_router(state: SharedState) -> Router {
         // Health endpoints (no auth required)
         .route("/health", get(handlers::health::health_check))
         .route("/ready", get(handlers::health::readiness_check))
-        // OpenAPI spec and Swagger UI
-        .route(
-            "/api/v1/openapi.json",
-            get({
-                let spec = openapi.clone();
-                move || async { Json(spec) }
-            }),
-        )
+        // OpenAPI spec (served by SwaggerUi at /api/v1/openapi.json) and Swagger UI
         .merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", openapi))
         // API v1 routes
         .nest("/api/v1", api_v1_routes(state.clone()))
