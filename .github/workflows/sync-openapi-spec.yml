@@ -100,56 +100,46 @@ jobs:
             openapi.json
             openapi.yaml
 
-      - name: Setup SSH for API repo
+      - name: Push spec to API repo
         if: ${{ !inputs.dry_run }}
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.API_REPO_DEPLOY_KEY }}
-
-      - name: Checkout API repo
-        if: ${{ !inputs.dry_run }}
-        run: |
-          git clone git@github.com:artifact-keeper/artifact-keeper-api.git api-repo
-
-      - name: Update spec in API repo
-        if: ${{ !inputs.dry_run }}
-        run: |
-          cp openapi.json api-repo/openapi.json
-          cp openapi.yaml api-repo/openapi.yaml
-
-          cd api-repo
-          if git diff --quiet; then
-            echo "No spec changes detected"
-            echo "no_changes=true" >> $GITHUB_ENV
-          else
-            echo "Spec changes detected"
-            echo "no_changes=false" >> $GITHUB_ENV
-          fi
-
-      - name: Create PR in API repo
-        if: ${{ !inputs.dry_run && env.no_changes == 'false' }}
         env:
-          GH_TOKEN: ${{ secrets.API_REPO_TOKEN }}
+          DEPLOY_KEY: ${{ secrets.API_REPO_DEPLOY_KEY }}
         run: |
-          cd api-repo
-
           VERSION="${{ github.event.release.tag_name || 'manual' }}"
-          BRANCH="chore/sync-spec-${VERSION}"
 
+          # Set up SSH deploy key
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/api-repo-deploy
+          chmod 600 ~/.ssh/api-repo-deploy
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/api-repo-deploy -o IdentitiesOnly=yes"
+
+          git clone git@github.com:artifact-keeper/artifact-keeper-api.git /tmp/api-repo
+
+          cp openapi.json /tmp/api-repo/openapi.json
+          cp openapi.yaml /tmp/api-repo/openapi.yaml
+
+          cd /tmp/api-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add openapi.json openapi.yaml
-          git commit -m "chore: sync OpenAPI spec from backend ${VERSION}"
-          git push -u origin "$BRANCH"
 
-          gh pr create \
-            --title "chore: sync OpenAPI spec from backend ${VERSION}" \
-            --body "$(cat <<EOF
-          ## Summary
-          - Auto-synced OpenAPI spec from backend release ${VERSION}
-          - Generated from utoipa annotations in the Rust backend
+          if git diff --quiet; then
+            echo "No spec changes detected"
+          else
+            git add openapi.json openapi.yaml
+            git commit -m "chore: sync OpenAPI spec from backend ${VERSION}"
+            git push origin main
+          fi
 
-          This PR was created automatically by the backend's sync-openapi-spec workflow.
-          EOF
-          )"
+          # Tag with the same version as the backend release.
+          # This triggers the generate.yml workflow which publishes SDKs
+          # with a matching version, keeping backend + SDKs in lockstep.
+          if [ "$VERSION" != "manual" ]; then
+            git tag "$VERSION"
+            git push origin "$VERSION"
+            echo "Tagged API repo with ${VERSION} — SDK generation will start automatically"
+            echo "- **Tagged:** \`${VERSION}\` → SDK generation triggered" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Clean up key
+          rm -f ~/.ssh/api-repo-deploy

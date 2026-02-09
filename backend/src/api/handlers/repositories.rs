@@ -735,13 +735,7 @@ async fn upload_artifact_multipart(
     multipart: Multipart,
 ) -> Result<Json<ArtifactResponse>> {
     let (body, filename) = extract_multipart_file(multipart).await?;
-    upload_artifact(
-        State(state),
-        Extension(auth),
-        Path((key, filename)),
-        body,
-    )
-    .await
+    upload_artifact(State(state), Extension(auth), Path((key, filename)), body).await
 }
 
 /// Extract the first file field from a multipart form.
