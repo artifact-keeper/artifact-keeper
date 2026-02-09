@@ -89,9 +89,8 @@ AGENTS.md
 # Test asset generation output (generated packages)
 .assets/generated/
 
-# PKI keys (generated for testing)
-.pki/*.key
-.pki/gpg-signing.key
+# PKI (generated for testing — run scripts/pki/generate-certs.sh)
+.pki/
 docker-compose.override.yml
 
 # SSO E2E test generated files

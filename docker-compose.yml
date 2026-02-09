@@ -1,7 +1,46 @@
 services:
+  # Generate self-signed TLS certificates for PostgreSQL.
+  # Writes certs to the shared pg_certs volume; postgres waits for this.
+  pg-certs:
+    image: alpine:3.20
+    container_name: artifact-keeper-pg-certs
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -f /certs/server.crt ]; then
+          echo "pg-certs: certificates already exist, skipping"
+          exit 0
+        fi
+        apk add --no-cache openssl >/dev/null 2>&1
+        echo "pg-certs: generating self-signed certificates..."
+        openssl genrsa -out /certs/ca.key 4096
+        openssl req -x509 -new -nodes -key /certs/ca.key -sha256 -days 365 \
+          -out /certs/ca.crt -subj "/CN=Artifact Keeper CA/O=Artifact Keeper/C=US"
+        openssl genrsa -out /certs/server.key 2048
+        openssl req -new -key /certs/server.key \
+          -out /certs/server.csr -subj "/CN=postgres/O=Artifact Keeper/C=US"
+        cat > /certs/server.ext <<EOF
+        authorityKeyIdentifier=keyid,issuer
+        basicConstraints=CA:FALSE
+        keyUsage=digitalSignature,nonRepudiation,keyEncipherment,dataEncipherment
+        subjectAltName=DNS:localhost,DNS:postgres,IP:127.0.0.1
+        EOF
+        openssl x509 -req -in /certs/server.csr -CA /certs/ca.crt -CAkey /certs/ca.key \
+          -CAcreateserial -out /certs/server.crt -days 365 -sha256 -extfile /certs/server.ext
+        rm -f /certs/server.csr /certs/server.ext /certs/ca.srl
+        chmod 600 /certs/server.key /certs/ca.key
+        chmod 644 /certs/server.crt /certs/ca.crt
+        echo "pg-certs: done"
+    volumes:
+      - pg_certs:/certs
+    restart: "no"
+
   postgres:
     image: postgres:16-alpine
     container_name: artifact-keeper-db
+    depends_on:
+      pg-certs:
+        condition: service_completed_successfully
     environment:
       POSTGRES_USER: registry
       POSTGRES_PASSWORD: registry
@@ -10,9 +49,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
       - ./docker/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro
-      - ./.pki/server.crt:/var/lib/postgresql/certs/server.crt:ro
-      - ./.pki/server.key:/var/lib/postgresql/certs/server.key:ro
-      - ./.pki/ca.crt:/var/lib/postgresql/certs/ca.crt:ro
+      - pg_certs:/var/lib/postgresql/certs:ro
     ports:
       - "30432:5432"
     healthcheck:
@@ -234,6 +271,8 @@ volumes:
   dtrack_data:
     driver: local
   shared_config:
+    driver: local
+  pg_certs:
     driver: local
 
 networks:
