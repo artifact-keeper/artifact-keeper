@@ -228,8 +228,7 @@ mod tests {
         let spec = build_openapi();
         let json = serde_json::to_string_pretty(&spec).expect("Failed to serialize to JSON");
 
-        let out_dir =
-            std::env::var("EXPORT_OPENAPI_DIR").unwrap_or_else(|_| ".".to_string());
+        let out_dir = std::env::var("EXPORT_OPENAPI_DIR").unwrap_or_else(|_| ".".to_string());
 
         let json_path = format!("{}/openapi.json", out_dir);
         std::fs::write(&json_path, &json).expect("Failed to write openapi.json");
