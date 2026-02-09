@@ -213,4 +213,31 @@ mod tests {
             "Expected at least 250 operations, got {op_count}. Handler annotations may be missing."
         );
     }
+
+    /// Export OpenAPI spec to files when EXPORT_OPENAPI_SPEC env var is set.
+    /// Used by CI to generate the spec without starting the server.
+    ///
+    /// Usage: EXPORT_OPENAPI_SPEC=1 cargo test --lib export_openapi_spec -- --ignored
+    #[test]
+    #[ignore]
+    fn export_openapi_spec() {
+        if std::env::var("EXPORT_OPENAPI_SPEC").is_err() {
+            return;
+        }
+
+        let spec = build_openapi();
+        let json = serde_json::to_string_pretty(&spec).expect("Failed to serialize to JSON");
+
+        let out_dir = std::env::var("EXPORT_OPENAPI_DIR").unwrap_or_else(|_| ".".to_string());
+
+        let json_path = format!("{}/openapi.json", out_dir);
+        std::fs::write(&json_path, &json).expect("Failed to write openapi.json");
+
+        eprintln!(
+            "Exported OpenAPI spec: {} paths, {} schemas → {}",
+            spec.paths.paths.len(),
+            spec.components.as_ref().map_or(0, |c| c.schemas.len()),
+            json_path
+        );
+    }
 }

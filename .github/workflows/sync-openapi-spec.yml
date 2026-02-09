@@ -35,58 +35,27 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Build backend
+      - name: Export OpenAPI spec
         env:
           SQLX_OFFLINE: true
-        run: cargo build --release
-
-      - name: Export OpenAPI spec
+          EXPORT_OPENAPI_SPEC: "1"
+          EXPORT_OPENAPI_DIR: ${{ github.workspace }}
         run: |
-          # Start backend briefly to export the spec
-          export DATABASE_URL="postgresql://unused:unused@localhost/unused"
-          export JWT_SECRET="ci-export-only"
-          export STORAGE_PATH="/tmp/ak-storage"
-          export BIND_ADDRESS="127.0.0.1:18080"
-          mkdir -p /tmp/ak-storage
+          # Build the spec via test harness — no database or server needed
+          cargo test --lib export_openapi_spec -- --ignored
 
-          # The spec is built at startup, we just need to GET it
-          ./target/release/artifact-keeper &
-          SERVER_PID=$!
+          # Verify export succeeded
+          python3 -c "import json; spec=json.load(open('openapi.json')); print(f'Paths: {len(spec[\"paths\"])}, Schemas: {len(spec.get(\"components\",{}).get(\"schemas\",{}))}')"
 
-          # Wait for server to start (it will fail DB connection but spec is served before that)
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:18080/api/v1/openapi.json -o /dev/null 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-
-          # Export spec
-          curl -sf http://127.0.0.1:18080/api/v1/openapi.json | python3 -m json.tool > openapi.json
+          # Convert to YAML
+          pip3 -q install pyyaml
           python3 -c "
-          import json, sys
-          try:
-              import yaml
-              with open('openapi.json') as f:
-                  spec = json.load(f)
-              with open('openapi.yaml', 'w') as f:
-                  yaml.dump(spec, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-          except ImportError:
-              print('PyYAML not available, installing...')
-              sys.exit(1)
-          "
-          if [ $? -ne 0 ]; then
-            pip3 install pyyaml
-            python3 -c "
           import json, yaml
           with open('openapi.json') as f:
               spec = json.load(f)
           with open('openapi.yaml', 'w') as f:
-              yaml.dump(spec, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+              yaml.dump(spec, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=120)
           "
-          fi
-
-          kill $SERVER_PID 2>/dev/null || true
 
           echo "## Exported spec summary" >> $GITHUB_STEP_SUMMARY
           echo "- Paths: $(python3 -c "import json; print(len(json.load(open('openapi.json'))['paths']))")" >> $GITHUB_STEP_SUMMARY
