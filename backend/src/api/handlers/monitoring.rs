@@ -29,7 +29,6 @@ use crate::services::health_monitor_service::{
         ServiceHealthEntry,
         AlertState,
     )),
-    tags((name = "monitoring", description = "Health monitoring and alerts")),
 )]
 pub struct MonitoringApiDoc;
 

@@ -34,7 +34,6 @@ use crate::services::crash_reporting_service::{
         TelemetrySettings,
         CrashReport,
     )),
-    tags((name = "telemetry", description = "Telemetry and crash reporting")),
 )]
 pub struct TelemetryApiDoc;
 
