@@ -191,14 +191,35 @@ async fn main() -> Result<()> {
             // credentials + same-origin work without an explicit allow-origin.
             // In development the Next.js dev server runs on a different port,
             // so we must whitelist that origin and enable credentials.
+            // Private-network origins (192.168.x.x, 10.x.x.x, 172.16-31.x.x,
+            // 127.x.x.x) are always allowed in development mode.
             if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" {
-                let origins: Vec<_> = std::env::var("CORS_ORIGINS")
+                let explicit_origins: Vec<String> = std::env::var("CORS_ORIGINS")
                     .unwrap_or_else(|_| "http://localhost:3000".into())
                     .split(',')
-                    .map(|s| s.trim().parse().expect("invalid CORS origin"))
+                    .map(|s| s.trim().to_owned())
                     .collect();
                 CorsLayer::new()
-                    .allow_origin(AllowOrigin::list(origins))
+                    .allow_origin(AllowOrigin::predicate(
+                        move |origin: &axum::http::HeaderValue, _req| {
+                            let origin_str = origin.to_str().unwrap_or("");
+                            if explicit_origins.iter().any(|o| o == origin_str) {
+                                return true;
+                            }
+                            // Allow any private-network / loopback origin
+                            if let Some(host) = origin_str
+                                .strip_prefix("http://")
+                                .or_else(|| origin_str.strip_prefix("https://"))
+                            {
+                                let host = host.split(':').next().unwrap_or("");
+                                if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                                    return ip.is_private() || ip.is_loopback();
+                                }
+                                return host == "localhost";
+                            }
+                            false
+                        },
+                    ))
                     .allow_methods([
                         Method::GET,
                         Method::POST,
