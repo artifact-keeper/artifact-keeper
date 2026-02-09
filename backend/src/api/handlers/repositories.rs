@@ -2,7 +2,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Multipart, Path, Query, State},
     http::header,
     response::IntoResponse,
     routing::get,
@@ -55,11 +55,15 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/:key/members/:member_key", delete(remove_virtual_member))
         // Artifact routes nested under repository
-        .route("/:key/artifacts", get(list_artifacts))
+        .route(
+            "/:key/artifacts",
+            get(list_artifacts).post(upload_artifact_multipart),
+        )
         .route(
             "/:key/artifacts/*path",
             get(get_artifact_metadata)
                 .put(upload_artifact)
+                .post(upload_artifact_multipart_with_path)
                 .delete(delete_artifact),
         )
         // Download uses a separate route prefix to avoid wildcard conflict
@@ -578,6 +582,73 @@ pub async fn upload_artifact(
         created_at: artifact.created_at,
         metadata: None,
     }))
+}
+
+/// Upload artifact via multipart/form-data POST (with path in URL).
+///
+/// Accepts a multipart form with a `file` field. The URL path is used as the
+/// artifact path, falling back to the uploaded filename.
+async fn upload_artifact_multipart_with_path(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, path)): Path<(String, String)>,
+    multipart: Multipart,
+) -> Result<Json<ArtifactResponse>> {
+    let (body, filename) = extract_multipart_file(multipart).await?;
+    // Prefer the URL path; fall back to the filename from the form field
+    let artifact_path = if path.is_empty() || path == "/" {
+        filename
+    } else {
+        path
+    };
+    upload_artifact(
+        State(state),
+        Extension(auth),
+        Path((key, artifact_path)),
+        body,
+    )
+    .await
+}
+
+/// Upload artifact via multipart/form-data POST (no path in URL).
+///
+/// The artifact path comes from the `file` field's filename.
+async fn upload_artifact_multipart(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<ArtifactResponse>> {
+    let (body, filename) = extract_multipart_file(multipart).await?;
+    upload_artifact(
+        State(state),
+        Extension(auth),
+        Path((key, filename)),
+        body,
+    )
+    .await
+}
+
+/// Extract the first file field from a multipart form.
+async fn extract_multipart_file(mut multipart: Multipart) -> Result<(Bytes, String)> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")))?
+    {
+        // Accept any field that has a filename (i.e. a file upload)
+        let filename = field.file_name().map(|s| s.to_string());
+        if let Some(filename) = filename {
+            let data: Bytes = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::Validation(format!("Failed to read file: {e}")))?;
+            return Ok((data, filename));
+        }
+    }
+    Err(AppError::Validation(
+        "No file field found in multipart form".to_string(),
+    ))
 }
 
 /// Download artifact

@@ -189,28 +189,35 @@ pub struct DtPolicy {
 /// Project-level metrics from Dependency-Track
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DtProjectMetrics {
+    #[serde(default)]
     pub critical: i64,
+    #[serde(default)]
     pub high: i64,
+    #[serde(default)]
     pub medium: i64,
+    #[serde(default)]
     pub low: i64,
+    #[serde(default)]
     pub unassigned: i64,
+    #[serde(default)]
     pub vulnerabilities: Option<i64>,
-    #[serde(rename = "findingsTotal")]
+    #[serde(default, rename = "findingsTotal")]
     pub findings_total: i64,
-    #[serde(rename = "findingsAudited")]
+    #[serde(default, rename = "findingsAudited")]
     pub findings_audited: i64,
-    #[serde(rename = "findingsUnaudited")]
+    #[serde(default, rename = "findingsUnaudited")]
     pub findings_unaudited: i64,
+    #[serde(default)]
     pub suppressions: i64,
-    #[serde(rename = "inheritedRiskScore")]
+    #[serde(default, rename = "inheritedRiskScore")]
     pub inherited_risk_score: f64,
-    #[serde(rename = "policyViolationsFail")]
+    #[serde(default, rename = "policyViolationsFail")]
     pub policy_violations_fail: i64,
-    #[serde(rename = "policyViolationsWarn")]
+    #[serde(default, rename = "policyViolationsWarn")]
     pub policy_violations_warn: i64,
-    #[serde(rename = "policyViolationsInfo")]
+    #[serde(default, rename = "policyViolationsInfo")]
     pub policy_violations_info: i64,
-    #[serde(rename = "policyViolationsTotal")]
+    #[serde(default, rename = "policyViolationsTotal")]
     pub policy_violations_total: i64,
     #[serde(rename = "firstOccurrence")]
     pub first_occurrence: Option<i64>,
@@ -221,29 +228,37 @@ pub struct DtProjectMetrics {
 /// Portfolio-level metrics from Dependency-Track
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DtPortfolioMetrics {
+    #[serde(default)]
     pub critical: i64,
+    #[serde(default)]
     pub high: i64,
+    #[serde(default)]
     pub medium: i64,
+    #[serde(default)]
     pub low: i64,
+    #[serde(default)]
     pub unassigned: i64,
+    #[serde(default)]
     pub vulnerabilities: Option<i64>,
-    #[serde(rename = "findingsTotal")]
+    #[serde(default, rename = "findingsTotal")]
     pub findings_total: i64,
-    #[serde(rename = "findingsAudited")]
+    #[serde(default, rename = "findingsAudited")]
     pub findings_audited: i64,
-    #[serde(rename = "findingsUnaudited")]
+    #[serde(default, rename = "findingsUnaudited")]
     pub findings_unaudited: i64,
+    #[serde(default)]
     pub suppressions: i64,
-    #[serde(rename = "inheritedRiskScore")]
+    #[serde(default, rename = "inheritedRiskScore")]
     pub inherited_risk_score: f64,
-    #[serde(rename = "policyViolationsFail")]
+    #[serde(default, rename = "policyViolationsFail")]
     pub policy_violations_fail: i64,
-    #[serde(rename = "policyViolationsWarn")]
+    #[serde(default, rename = "policyViolationsWarn")]
     pub policy_violations_warn: i64,
-    #[serde(rename = "policyViolationsInfo")]
+    #[serde(default, rename = "policyViolationsInfo")]
     pub policy_violations_info: i64,
-    #[serde(rename = "policyViolationsTotal")]
+    #[serde(default, rename = "policyViolationsTotal")]
     pub policy_violations_total: i64,
+    #[serde(default)]
     pub projects: i64,
 }
 

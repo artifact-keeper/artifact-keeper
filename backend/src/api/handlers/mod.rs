@@ -36,6 +36,7 @@ pub mod peer;
 pub mod peers;
 pub mod permissions;
 pub mod plugins;
+pub mod profile;
 pub mod promotion;
 pub mod pub_registry;
 pub mod puppet;

@@ -155,6 +155,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Profile routes (authenticated user context) with auth middleware
+        .nest(
+            "/profile",
+            handlers::profile::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Group routes with auth middleware
         .nest(
             "/groups",
