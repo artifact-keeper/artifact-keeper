@@ -1,24 +1,24 @@
 ---
-// Pre-release warning banner
+// Pre-release announcement banner
 ---
 
 <div class="prerelease-banner">
   <div class="banner-content">
-    <span class="banner-icon">🚧</span>
+    <span class="banner-icon">🚀</span>
     <span class="banner-text">
-      <strong>Pre-Release:</strong> Please wait for <code>v1.0.0-rc2</code> before testing.
-      We're incorporating feedback from the community to ensure a great first-use experience.
+      <strong>Alpha Release:</strong> <code>v1.0.0-a2</code> is now available for testing.
+      Check the <a href="https://github.com/artifact-keeper/artifact-keeper/releases/tag/v1.0.0-a2" class="banner-link">release notes</a> to get started.
     </span>
-    <span class="banner-icon">🚧</span>
+    <span class="banner-icon">🚀</span>
   </div>
 </div>
 
 <style>
   .prerelease-banner {
-    background: linear-gradient(135deg, #f59e0b 0%, #d97706 50%, #f59e0b 100%);
+    background: linear-gradient(135deg, #10b981 0%, #059669 50%, #10b981 100%);
     background-size: 200% 200%;
     animation: gradient-shift 3s ease infinite;
-    color: #1a1a1a;
+    color: #fff;
     padding: 0.75rem 1.5rem;
     text-align: center;
     font-size: 0.9rem;
@@ -28,7 +28,7 @@
     left: 0;
     right: 0;
     z-index: 60;
-    box-shadow: 0 2px 8px rgba(245, 158, 11, 0.3);
+    box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
   }
 
   @keyframes gradient-shift {
@@ -67,11 +67,21 @@
     border-radius: 4px;
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     font-weight: 700;
-    color: #7c2d12;
+    color: #064e3b;
   }
 
   .banner-text strong {
     font-weight: 700;
+  }
+
+  .banner-link {
+    color: #fff;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .banner-link:hover {
+    text-decoration-thickness: 2px;
   }
 
   @media (max-width: 640px) {

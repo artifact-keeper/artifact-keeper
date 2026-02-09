@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-a2] - 2026-02-08
+
+Second alpha release with staging promotion workflow, Dependency-Track monitoring, red team security hardening, and landing page refresh.
+
+### Added
+- **Staging Promotion Workflow**
+  - New staging repository type for promotion-based artifact lifecycle
+  - Promotion API endpoints for staging → release workflow
+  - Policy gate integration for automated promotion decisions
+  - Simplified promotion policy and handler code (#49)
+- **Dependency-Track Monitoring** (#57)
+  - Backend API for Dependency-Track integration
+  - OpenSCAP and Dependency-Track added to health monitoring dashboard
+- **Red Team Security Testing Suite** (#52)
+- **STS Credential Rotation E2E Tests** (#56)
+- **Pre-release banner** on landing page and README
+
+### Changed
+- Updated landing page to LCARS color scheme with new brand colors
+- Pre-release banner changed from warning to release announcement
+
+### Fixed
+- Refresh credentials before presigned URL generation (#55)
+- Calculate storage_used_bytes for repository list view (#58)
+- Position banner above navbar without overlap
+- CI fixes: fmt, clippy, and broken migration (#48)
+- CI fixes: PKI file handling in E2E tests (tar archive, explicit patterns)
+
+### Security
+- Hardened 7 vulnerabilities identified by red team scan (#53)
+
 ## [1.0.0-a1] - 2026-02-06
 
 First public alpha release, announced on Hacker News.
