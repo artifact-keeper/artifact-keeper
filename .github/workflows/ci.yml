@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: [main, master, develop, 'release/**']
     paths-ignore:
       - 'site/**'
       - '*.md'
@@ -10,7 +10,7 @@ on:
       - '.beads/**'
       - 'LICENSE'
   pull_request:
-    branches: [main, master, develop]
+    branches: [main, master, develop, 'release/**']
     paths-ignore:
       - 'site/**'
       - '*.md'
@@ -80,7 +80,7 @@ jobs:
     name: 🔗 Backend Integration Tests
     runs-on: ubuntu-latest
     needs: lint-rust
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.event_name == 'push'
     services:
       postgres:
         image: postgres:16-alpine

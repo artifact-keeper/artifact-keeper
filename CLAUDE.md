@@ -25,7 +25,7 @@ cargo clippy --workspace
 cargo test --workspace --lib
 ```
 
-### Integration Tests (Tier 2) - Main Branch Only
+### Integration Tests (Tier 2) - Main & Release Branches Only
 ```bash
 # Backend integration tests (requires PostgreSQL)
 cargo test --workspace
@@ -146,6 +146,36 @@ Branch naming conventions:
 - `fix/` — bug fixes
 - `chore/` — maintenance, dependencies, CI
 - `docs/` — documentation only
+
+### Maintenance Branches
+
+Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older release series:
+
+- **`release/1.0.x`** — maintenance branch for the 1.0 series (created from `v1.0.0-rc.5`)
+- **`main`** — continues with 1.1.x (and beyond) development
+
+**Bug fix workflow for maintenance branches:**
+1. Create a fix branch from the maintenance branch:
+   ```bash
+   git checkout release/1.0.x && git pull
+   git checkout -b fix/short-description
+   ```
+2. Push and create a PR **targeting `release/1.0.x`** (not main):
+   ```bash
+   git push -u origin fix/short-description
+   gh pr create --base release/1.0.x --fill
+   ```
+3. Tag releases from the maintenance branch:
+   ```bash
+   git checkout release/1.0.x && git pull
+   git tag v1.0.1 && git push origin v1.0.1
+   ```
+4. Cherry-pick to the maintenance branch when a fix on `main` also applies to 1.0.x.
+
+**Docker image tags:**
+- `:latest` is only set for stable releases (no `-rc`, `-beta`, etc.)
+- `:1.0`, `:1.1` series tags are set automatically via semver parsing
+- `:dev` is only set for `main` branch pushes
 
 ### Other Git Rules
 
