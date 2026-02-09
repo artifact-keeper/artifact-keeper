@@ -1,8 +1,5 @@
 # Artifact Keeper
 
-> [!NOTE]
-> **v1.0.0-a2 is now available for testing!** See the [release notes](https://github.com/artifact-keeper/artifact-keeper/releases/tag/v1.0.0-a2) to get started.
-
 [![CI](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml/badge.svg)](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
