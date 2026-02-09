@@ -1,0 +1,212 @@
+---
+title: "Staging & Promotion"
+description: "Staging repositories and artifact promotion workflow with policy gates"
+---
+
+Artifact Keeper supports a staging-to-release promotion workflow. Upload artifacts to a staging repository, then promote them to a release repository after security and license policy checks pass.
+
+## How It Works
+
+```text
+Upload          Policy Gate         Release
+  |                 |                 |
+  v                 v                 v
+[Staging Repo] --> [CVE + License] --> [Local Repo]
+                    Check
+```
+
+1. Upload artifacts to a **staging** repository
+2. Promote artifacts to a **local** (release) repository via API
+3. Policy gates evaluate CVE severity and license compliance before allowing promotion
+4. Promotion history is recorded for audit
+
+## Creating a Staging Repository
+
+```bash
+curl -X POST https://registry.example.com/api/v1/repositories \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key": "maven-staging",
+    "name": "Maven Staging",
+    "format": "maven",
+    "repo_type": "staging"
+  }'
+```
+
+Staging repositories accept uploads just like local repositories, but are intended as a holding area before promotion.
+
+## Promoting Artifacts
+
+### Single Artifact
+
+```bash
+curl -X POST https://registry.example.com/api/v1/repositories/maven-staging/artifacts/{artifact_id}/promote \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_repository": "maven-release",
+    "notes": "Approved for release after QA sign-off"
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "promoted": true,
+  "source": "maven-staging/com/example/app-1.0.jar",
+  "target": "maven-release/com/example/app-1.0.jar",
+  "promotion_id": "550e8400-e29b-41d4-a716-446655440000",
+  "policy_violations": [],
+  "message": null
+}
+```
+
+### Bulk Promotion
+
+Promote multiple artifacts at once:
+
+```bash
+curl -X POST https://registry.example.com/api/v1/repositories/maven-staging/promote \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_repository": "maven-release",
+    "artifact_ids": [
+      "550e8400-e29b-41d4-a716-446655440001",
+      "550e8400-e29b-41d4-a716-446655440002"
+    ],
+    "notes": "Sprint 42 release batch"
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "total": 2,
+  "promoted": 2,
+  "failed": 0,
+  "results": [...]
+}
+```
+
+Bulk promotion is not transactional -- partial success is possible. Check individual results.
+
+## Policy Gates
+
+When promoting, Artifact Keeper evaluates security and license policies against each artifact. If any policy check fails with a **Block** action, the promotion is rejected.
+
+### CVE Security Policies
+
+Configure maximum CVE severity thresholds per repository:
+
+- **Critical CVEs** always block promotion
+- **High/Medium/Low** blocked based on your configured `max_severity`
+- **Unscanned artifacts** can optionally be blocked with `block_unscanned`
+
+When blocked, the response includes violation details:
+
+```json
+{
+  "promoted": false,
+  "policy_violations": [
+    {
+      "rule": "cve-severity-threshold",
+      "severity": "critical",
+      "message": "3 critical CVEs found: CVE-2024-1234, CVE-2024-5678, CVE-2024-9012"
+    }
+  ],
+  "message": "Promotion blocked by policy violations"
+}
+```
+
+### License Compliance Policies
+
+Control which open-source licenses are acceptable:
+
+- **Denied licenses** (e.g., GPL-3.0) block promotion immediately
+- **Allowed licenses** can be configured as an allowlist
+- **Unknown licenses** can be allowed or blocked via `allow_unknown`
+
+### Skipping Policy Checks
+
+For emergency releases, you can bypass policy evaluation:
+
+```bash
+curl -X POST .../artifacts/{id}/promote \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{
+    "target_repository": "maven-release",
+    "skip_policy_check": true,
+    "notes": "Emergency hotfix - policy override approved by security team"
+  }'
+```
+
+The policy skip is recorded in the promotion history for audit purposes.
+
+## Promotion History
+
+View the audit trail of all promotions for a repository:
+
+```bash
+curl "https://registry.example.com/api/v1/repositories/maven-staging/promotion-history?per_page=20" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Response:**
+
+```json
+{
+  "items": [
+    {
+      "id": "...",
+      "artifact_path": "com/example/app-1.0.jar",
+      "source_repo_key": "maven-staging",
+      "target_repo_key": "maven-release",
+      "promoted_by_username": "admin",
+      "policy_result": { "passed": true, "action": "allow", "violations": [] },
+      "notes": "Sprint 42 release",
+      "created_at": "2026-02-08T12:00:00Z"
+    }
+  ],
+  "pagination": { "page": 1, "per_page": 20, "total": 1 }
+}
+```
+
+Filter by artifact:
+
+```bash
+curl ".../promotion-history?artifact_id=550e8400-..." \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Validation Rules
+
+The promotion handler enforces:
+
+1. **Source must be a staging repository** -- local, remote, and virtual repos cannot promote
+2. **Target must be a local repository** -- you can only promote into release repos
+3. **Format must match** -- a Maven staging repo can only promote to a Maven release repo
+4. **Authentication required** -- all promotion endpoints require a valid token
+
+## Typical Workflow
+
+```bash
+# 1. Create staging and release repos
+curl -X POST .../repositories -d '{"key":"npm-staging","format":"npm","repo_type":"staging"}'
+curl -X POST .../repositories -d '{"key":"npm-release","format":"npm","repo_type":"local"}'
+
+# 2. Upload to staging (use native npm client)
+npm publish --registry https://registry.example.com/api/v1/npm/npm-staging/
+
+# 3. Run scans (automatic on upload)
+
+# 4. Promote when ready
+curl -X POST .../repositories/npm-staging/artifacts/{id}/promote \
+  -d '{"target_repository":"npm-release"}'
+
+# 5. Consumers pull from release repo
+npm install my-package --registry https://registry.example.com/api/v1/npm/npm-release/
+```

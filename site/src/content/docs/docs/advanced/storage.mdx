@@ -1,6 +1,6 @@
 ---
 title: "Storage Backends"
-description: "Filesystem and S3-compatible storage options for artifact data"
+description: "Filesystem, S3, Azure Blob, and Google Cloud Storage backends for artifact data"
 ---
 
 Artifact Keeper supports multiple storage backends to accommodate different deployment scenarios and scale requirements.
@@ -302,6 +302,99 @@ S3_REDIRECT_DOWNLOADS=false
 ```
 
 All downloads will stream through the backend with `X-Artifact-Storage: proxy`.
+
+### Azure Blob Storage
+
+Use Azure Blob Storage for Azure-native deployments.
+
+#### Configuration
+
+```bash
+STORAGE_BACKEND=azure
+AZURE_STORAGE_ACCOUNT=myaccount
+AZURE_STORAGE_CONTAINER=artifacts
+AZURE_STORAGE_ACCESS_KEY=base64-encoded-account-key
+```
+
+#### Optional Settings
+
+```bash
+AZURE_STORAGE_ENDPOINT=https://custom.endpoint.com   # Azure Government/China clouds
+AZURE_REDIRECT_DOWNLOADS=true                        # Enable SAS URL redirects
+AZURE_SAS_EXPIRY=3600                               # SAS token lifetime in seconds (default: 1 hour)
+STORAGE_PATH_FORMAT=native                           # native, artifactory, or migration
+```
+
+#### Direct Downloads with SAS URLs
+
+When `AZURE_REDIRECT_DOWNLOADS=true`, artifact downloads redirect to a Shared Access Signature (SAS) URL:
+
+```http
+HTTP/1.1 302 Found
+Location: https://myaccount.blob.core.windows.net/artifacts/path?sv=2021-06-08&st=...&se=...&sr=b&sp=r&sig=...
+X-Artifact-Storage: redirect-azure
+```
+
+SAS tokens are read-only and expire after `AZURE_SAS_EXPIRY` seconds.
+
+### Google Cloud Storage (GCS)
+
+Use GCS for Google Cloud deployments.
+
+#### Configuration
+
+```bash
+STORAGE_BACKEND=gcs
+GCS_BUCKET=my-bucket
+GCS_PROJECT_ID=my-project
+GCS_SERVICE_ACCOUNT_EMAIL=sa@my-project.iam.gserviceaccount.com
+```
+
+Provide the service account private key via file or inline:
+
+```bash
+# Option A: Key file path
+GCS_PRIVATE_KEY_PATH=/path/to/service-account-key.pem
+
+# Option B: Inline (escaped newlines)
+GCS_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEv..."
+```
+
+#### Optional Settings
+
+```bash
+GCS_REDIRECT_DOWNLOADS=true        # Enable signed URL redirects
+GCS_SIGNED_URL_EXPIRY=3600         # Signed URL lifetime in seconds (default: 1 hour, max: 7 days)
+STORAGE_PATH_FORMAT=native         # native, artifactory, or migration
+```
+
+#### Direct Downloads with V4 Signed URLs
+
+When `GCS_REDIRECT_DOWNLOADS=true`, artifact downloads redirect to a GCS V4 signed URL:
+
+```http
+HTTP/1.1 302 Found
+Location: https://storage.googleapis.com/my-bucket/path?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=...&X-Goog-Signature=...
+X-Artifact-Storage: redirect-gcs
+```
+
+GCS enforces a maximum signed URL lifetime of 7 days (604800 seconds).
+
+### Artifactory Migration Mode
+
+All cloud backends (S3, Azure, GCS) support a migration mode for zero-downtime migration from Artifactory:
+
+```bash
+STORAGE_PATH_FORMAT=migration
+```
+
+| Mode | Write Path | Read Path | Use Case |
+|------|-----------|-----------|----------|
+| `native` | `{sha[0:2]}/{sha[2:4]}/{sha}` | Native only | New deployments |
+| `artifactory` | `{sha[0:2]}/{sha}` | Artifactory only | Post-migration |
+| `migration` | Native format | Both native + artifactory fallback | During migration |
+
+Start with `migration` mode, then switch to `native` after confirming all artifacts are accessible.
 
 ## MinIO as S3 Alternative
 

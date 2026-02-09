@@ -1,0 +1,103 @@
+---
+title: "Security Testing"
+description: "Red team security testing suite for validating Artifact Keeper hardening"
+---
+
+Artifact Keeper includes a comprehensive red team testing suite with 15 automated security tests covering OWASP Top 10 vulnerabilities and enterprise security concerns.
+
+## Running the Tests
+
+```bash
+# Run all 15 tests
+./scripts/redteam/run-all.sh
+
+# Run a specific test
+./scripts/redteam/run-all.sh --test 04-auth
+
+# Filter by severity
+./scripts/redteam/run-all.sh --severity HIGH
+```
+
+The test suite expects a running Artifact Keeper instance (default: `http://backend:8080`). Configure the target via environment variables:
+
+```bash
+REGISTRY_URL="http://localhost:8080"
+GRPC_URL="localhost:9090"
+ADMIN_USER="admin"
+ADMIN_PASS="admin123"
+```
+
+## Test Suite
+
+| # | Test | What It Checks |
+|---|------|---------------|
+| 01 | Service Discovery | Only expected ports (8080, 9090) are exposed |
+| 02 | Security Headers | X-Frame-Options, CSP, HSTS, X-Content-Type-Options |
+| 03 | CORS Policy | Cross-origin resource sharing is properly restricted |
+| 04 | Auth Bypass | Protected endpoints enforce authentication; format-specific uploads require auth |
+| 05 | Default Credentials | No hardcoded or weak default admin credentials |
+| 06 | gRPC Unauth | gRPC service (port 9090) requires authentication |
+| 07 | OCI DoS | Resistance to denial-of-service via oversized OCI layer uploads |
+| 08 | Path Traversal | Artifact download cannot escape repository root (URL-encoded, Unicode, double-encoded variants) |
+| 09 | SQL Injection | Parameterized queries prevent injection in search and filter parameters |
+| 10 | Rate Limiting | Brute force and DoS protection on login and API endpoints |
+| 11 | WASM Plugin Security | Plugin sandboxing and capability restrictions |
+| 12 | Info Disclosure | No stack traces, internal paths, or version numbers leaked |
+| 13 | SSRF Prevention | Webhook URL validation blocks private IPs, cloud metadata endpoints, and internal services |
+| 14 | API Key Exposure | Sensitive fields (api_key, password_hash, totp_secret) never appear in API responses |
+| 15 | Metrics Auth | Prometheus/metrics endpoints require authentication |
+
+## Report Output
+
+Tests generate a JSON report at `results/redteam-report.json`:
+
+```json
+{
+  "timestamp": "2026-02-08T12:34:56Z",
+  "target": "http://backend:8080",
+  "findings": [
+    {
+      "severity": "HIGH",
+      "test": "auth-bypass/pypi-upload-noauth",
+      "description": "PyPI artifact upload accepted without authentication",
+      "evidence": "POST /api/v1/pypi/test-pypi/ returned 200"
+    }
+  ],
+  "summary": {
+    "pass": 42,
+    "fail": 0,
+    "warn": 5,
+    "info": 8
+  }
+}
+```
+
+## Severity Levels
+
+| Level | Meaning |
+|-------|---------|
+| CRITICAL | Immediate security risk -- path traversal, secret exposure, auth bypass |
+| HIGH | Significant vulnerability -- SQL injection, unauthenticated uploads, SSRF |
+| MEDIUM | Defense-in-depth gap -- missing security headers, unexpected ports |
+| LOW | Information disclosure -- version numbers, technology hints |
+| INFO | Informational -- port mapping, connectivity status |
+
+## CI/CD Integration
+
+The test runner exits with non-zero status if any findings are detected, making it suitable as a CI gate:
+
+```yaml
+# GitHub Actions example
+- name: Red Team Security Tests
+  run: |
+    docker compose up -d
+    ./scripts/redteam/run-all.sh
+```
+
+## Vulnerabilities Found and Fixed
+
+The v1.0.0-a2 red team scan identified and hardened 7 vulnerabilities, including:
+
+- **Peer API key exposure** -- `GET /api/v1/peers` previously returned plaintext `api_key` field. Now redacted from all API responses.
+- **SSRF via webhook URLs** -- webhook creation now validates URLs against private IP ranges and cloud metadata endpoints.
+- Test 14 includes regression tests to ensure these fixes are not accidentally reverted.

@@ -241,6 +241,172 @@ OIDC_NAME_CLAIM=name
 OIDC_GROUPS_CLAIM=groups
 ```
 
+## SAML 2.0 SSO
+
+Integrate with enterprise identity providers (Okta, Azure AD, ADFS, Shibboleth) using SAML 2.0.
+
+### Configuration
+
+SAML providers are managed via the admin API:
+
+```bash
+# Create a SAML provider
+curl -X POST https://registry.example.com/api/v1/admin/sso/saml \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Okta",
+    "entity_id": "https://www.okta.com/exk1234567890",
+    "sso_url": "https://yourcompany.okta.com/app/artifact-keeper/sso/saml",
+    "certificate": "-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----",
+    "sp_entity_id": "artifact-keeper",
+    "attribute_mapping": {
+      "username": "NameID",
+      "email": "email",
+      "display_name": "displayName",
+      "groups": "groups"
+    }
+  }'
+```
+
+Or configure via environment variables:
+
+```bash
+SAML_IDP_SSO_URL=https://yourcompany.okta.com/app/artifact-keeper/sso/saml
+SAML_IDP_ISSUER=https://www.okta.com/exk1234567890
+SAML_IDP_CERTIFICATE="-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----"
+SAML_SP_ENTITY_ID=artifact-keeper
+SAML_ACS_URL=https://registry.example.com/auth/saml/acs
+SAML_SIGN_REQUESTS=false
+SAML_REQUIRE_SIGNED_ASSERTIONS=true
+```
+
+### SAML Login Flow
+
+1. User clicks "Login with SAML" in the web UI
+2. Artifact Keeper generates an AuthnRequest and redirects to the IdP
+3. User authenticates with the IdP
+4. IdP POSTs a SAML Response to the Assertion Consumer Service (ACS)
+5. Artifact Keeper validates the assertion, creates/updates the user
+6. A short-lived exchange code redirects the user back to the web UI with tokens
+
+### Attribute Mapping
+
+Map SAML assertion attributes to user fields:
+
+```bash
+SAML_USERNAME_ATTR=NameID          # Or a custom attribute name
+SAML_EMAIL_ATTR=email
+SAML_DISPLAY_NAME_ATTR=displayName
+SAML_GROUPS_ATTR=groups
+```
+
+### Group-to-Role Mapping
+
+Map IdP groups to Artifact Keeper roles:
+
+```bash
+SAML_ADMIN_GROUP=ArtifactKeeper-Admins    # Members get admin role
+SAML_GROUP_ROLE_MAP="Developers:developer;QA:viewer"
+```
+
+### Managing SAML Providers
+
+```bash
+# List all SAML providers
+curl https://registry.example.com/api/v1/admin/sso/saml \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Enable/disable a provider
+curl -X PATCH https://registry.example.com/api/v1/admin/sso/saml/{id}/toggle \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Delete a provider
+curl -X DELETE https://registry.example.com/api/v1/admin/sso/saml/{id} \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+## Two-Factor Authentication (TOTP)
+
+Artifact Keeper supports time-based one-time passwords (TOTP) for two-factor authentication, compatible with any authenticator app (Google Authenticator, Authy, 1Password, etc.).
+
+### Enabling 2FA
+
+#### Step 1: Generate TOTP Secret
+
+```bash
+curl -X POST https://registry.example.com/api/v1/auth/totp/setup \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Response:
+
+```json
+{
+  "secret": "JBSWY3DPEBLW64TMMQ======",
+  "qr_code_url": "otpauth://totp/ArtifactKeeper:user@example.com?secret=JBSWY3DPEBLW64TMMQ&issuer=ArtifactKeeper"
+}
+```
+
+Scan the `qr_code_url` with your authenticator app, or manually enter the `secret`.
+
+#### Step 2: Verify and Enable
+
+Enter a code from your authenticator to confirm setup:
+
+```bash
+curl -X POST https://registry.example.com/api/v1/auth/totp/enable \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "123456"}'
+```
+
+Response includes 10 backup codes -- **save these securely**:
+
+```json
+{
+  "backup_codes": [
+    "AAAA-BBBB",
+    "CCCC-DDDD",
+    "..."
+  ]
+}
+```
+
+### Login with 2FA
+
+When TOTP is enabled, the login flow adds a verification step:
+
+```bash
+# Step 1: Normal login (returns totp_required)
+curl -X POST https://registry.example.com/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "user", "password": "pass"}'
+
+# Response:
+# { "totp_required": true, "totp_token": "eyJ..." }
+
+# Step 2: Verify TOTP code
+curl -X POST https://registry.example.com/api/v1/auth/totp/verify \
+  -H "Content-Type: application/json" \
+  -d '{"totp_token": "eyJ...", "code": "123456"}'
+
+# Response: Normal login response with access_token and refresh_token
+```
+
+### Backup Codes
+
+If you lose access to your authenticator app, use a backup code in place of the TOTP code. Each backup code can only be used once.
+
+### Disabling 2FA
+
+```bash
+curl -X POST https://registry.example.com/api/v1/auth/totp/disable \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"password": "your-password", "code": "123456"}'
+```
+
 ## Security Best Practices
 
 ### Strong JWT Secrets

@@ -1,0 +1,103 @@
+---
+title: "OpenSCAP Compliance"
+description: "SCAP compliance scanning for container images and system packages"
+---
+
+Artifact Keeper integrates [OpenSCAP](https://www.open-scap.org/) for XCCDF compliance evaluation against industry-standard SCAP security content. This complements Trivy and Grype vulnerability scanning with configuration compliance checks.
+
+## What OpenSCAP Scans
+
+OpenSCAP evaluates artifacts against Security Content Automation Protocol (SCAP) profiles:
+
+- **Container images** (OCI manifests) -- checks filesystem configuration inside images
+- **RPM packages** (.rpm) -- evaluates against RHEL/Fedora security baselines
+- **Debian packages** (.deb) -- evaluates against Debian/Ubuntu security baselines
+
+Other artifact types (JAR, NPM, PyPI wheels, etc.) are not applicable and are skipped.
+
+## Architecture
+
+```text
+Upload                   Artifact Keeper              OpenSCAP Container
+  |                           |                              |
+  |-- Upload artifact ------> |                              |
+  |                           |-- Write to scan workspace -> |
+  |                           |-- POST /scan ------------->  |
+  |                           |                     oscap xccdf eval
+  |                           |<-- Findings JSON ----------  |
+  |                           |-- Store in scan_results      |
+```
+
+The OpenSCAP container runs the `oscap` CLI wrapped in a Python HTTP service on port 8091. Artifacts are shared via a Docker volume (`scan_workspace`).
+
+## Configuration
+
+OpenSCAP runs as a Docker service alongside the backend:
+
+```yaml
+# docker-compose.yml (already included)
+openscap:
+  image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest
+  ports:
+    - "8091:8091"
+  volumes:
+    - scan_workspace:/scan-workspace:ro
+```
+
+Backend configuration:
+
+```bash
+OPENSCAP_URL=http://openscap:8091   # Set automatically in docker compose
+```
+
+No additional configuration is needed -- the default docker compose stack includes OpenSCAP.
+
+## SCAP Profiles
+
+OpenSCAP ships with the [SCAP Security Guide (SSG)](https://github.com/ComplianceAsCode/content) which provides profiles for:
+
+| Profile | Target OS | Description |
+|---------|-----------|-------------|
+| `standard` | Fedora/RHEL | Basic security baseline |
+| `cis` | RHEL/CentOS | CIS Benchmark compliance |
+| `stig` | RHEL | DISA STIG compliance |
+| `pci-dss` | RHEL | PCI DSS requirements |
+| `hipaa` | RHEL | HIPAA security controls |
+
+The scanner auto-detects the appropriate SCAP content based on the artifact's OS family (RHEL, Fedora, CentOS, Rocky, Alma, Oracle Linux, Debian, Ubuntu).
+
+## Scan Results
+
+OpenSCAP findings appear alongside Trivy and Grype results in the security scan view. Each finding includes:
+
+- **Rule ID** -- the XCCDF rule identifier (e.g., `xccdf_org.ssgproject.content_rule_no_empty_passwords`)
+- **Result** -- fail, error, or unknown (passing rules are filtered out)
+- **Severity** -- high, medium, low, or info
+- **Title** -- human-readable rule description
+- **References** -- CCE identifiers and other references from the SCAP content
+
+## Health Monitoring
+
+OpenSCAP health is checked via the system health dashboard:
+
+```bash
+curl https://registry.example.com/api/v1/admin/health
+```
+
+The response includes OpenSCAP status:
+
+```json
+{
+  "services": {
+    "openscap": {
+      "status": "ok",
+      "version": "openscap 1.4.0",
+      "content_files": ["rhel9", "fedora", "centos8"]
+    }
+  }
+}
+```
+
+## Disabling OpenSCAP
+
+If you don't need compliance scanning, remove the `openscap` service from your docker compose file, or unset `OPENSCAP_URL`. The backend will skip OpenSCAP scans when the service is unavailable.

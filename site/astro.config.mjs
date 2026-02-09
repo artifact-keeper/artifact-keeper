@@ -56,8 +56,11 @@ export default defineConfig({
           label: 'Security',
           items: [
             { label: 'Vulnerability Scanning', slug: 'docs/security/scanning' },
+            { label: 'OpenSCAP Compliance', slug: 'docs/security/openscap' },
+            { label: 'SBOM & Dependency-Track', slug: 'docs/security/sbom' },
             { label: 'Security Policies', slug: 'docs/security/policies' },
             { label: 'Artifact Signing', slug: 'docs/security/signing' },
+            { label: 'Security Testing', slug: 'docs/security/red-team' },
           ],
         },
         {
@@ -70,6 +73,7 @@ export default defineConfig({
           label: 'Advanced',
           items: [
             { label: 'Authentication & RBAC', slug: 'docs/advanced/auth' },
+            { label: 'Staging & Promotion', slug: 'docs/advanced/staging-promotion' },
             { label: 'Storage Backends', slug: 'docs/advanced/storage' },
             { label: 'Edge Nodes', slug: 'docs/advanced/edge-nodes' },
             { label: 'WASM Plugins', slug: 'docs/advanced/plugins' },
