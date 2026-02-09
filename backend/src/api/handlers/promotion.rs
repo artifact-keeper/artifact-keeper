@@ -19,9 +19,7 @@ use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
 
-fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
-    auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
-}
+
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -142,11 +140,10 @@ fn failed_response(source: String, target: String, message: String) -> Promotion
 
 pub async fn promote_artifact(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    Extension(auth): Extension<AuthExtension>,
     Path((repo_key, artifact_id)): Path<(String, Uuid)>,
     Json(req): Json<PromoteArtifactRequest>,
 ) -> Result<Json<PromotionResponse>> {
-    let auth = require_auth(auth)?;
     let repo_service = RepositoryService::new(state.db.clone());
 
     let source_repo = repo_service.get_by_key(&repo_key).await?;
@@ -309,11 +306,10 @@ pub async fn promote_artifact(
 
 pub async fn promote_artifacts_bulk(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    Extension(auth): Extension<AuthExtension>,
     Path(repo_key): Path<String>,
     Json(req): Json<BulkPromoteRequest>,
 ) -> Result<Json<BulkPromotionResponse>> {
-    let auth = require_auth(auth)?;
     let repo_service = RepositoryService::new(state.db.clone());
 
     let source_repo = repo_service.get_by_key(&repo_key).await?;
