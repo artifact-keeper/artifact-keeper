@@ -888,7 +888,9 @@ async fn update_repo_security(
     tag = "security",
     params(
         ("artifact_id" = Uuid, Path, description = "Artifact ID"),
-        ListScansQuery,
+        ("status" = Option<String>, Query, description = "Filter by scan status"),
+        ("page" = Option<i64>, Query, description = "Page number (default: 1)"),
+        ("per_page" = Option<i64>, Query, description = "Items per page (default: 20, max: 100)"),
     ),
     responses(
         (status = 200, description = "Paginated list of scans for an artifact", body = ScanListResponse),
