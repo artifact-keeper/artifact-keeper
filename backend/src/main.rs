@@ -269,7 +269,7 @@ async fn main() -> Result<()> {
 
     // Include file descriptor for gRPC reflection
     let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(include_bytes!("grpc/generated/sbom_descriptor.bin"))
+        .register_encoded_file_descriptor_set(include_bytes!(concat!(env!("OUT_DIR"), "/sbom_descriptor.bin")))
         .build_v1()
         .expect("Failed to build reflection service");
 
