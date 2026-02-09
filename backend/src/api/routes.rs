@@ -98,9 +98,9 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         Arc::new(state.config.clone()),
     ));
 
-    // Rate limiters: strict for auth (10 req/min), general for API (100 req/min)
-    let auth_rate_limiter = Arc::new(RateLimiter::new(10, 60));
-    let api_rate_limiter = Arc::new(RateLimiter::new(100, 60));
+    // Rate limiters: strict for auth (30 req/min), general for API (1000 req/min)
+    let auth_rate_limiter = Arc::new(RateLimiter::new(30, 60));
+    let api_rate_limiter = Arc::new(RateLimiter::new(1000, 60));
 
     Router::new()
         // Setup status (public, no auth)
