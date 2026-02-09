@@ -9,6 +9,10 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - ./docker/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro
+      - ./.pki/server.crt:/var/lib/postgresql/certs/server.crt:ro
+      - ./.pki/server.key:/var/lib/postgresql/certs/server.key:ro
+      - ./.pki/ca.crt:/var/lib/postgresql/certs/ca.crt:ro
     ports:
       - "30432:5432"
     healthcheck:
@@ -51,7 +55,7 @@ services:
         fi
         exec artifact-keeper
     environment:
-      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry?sslmode=require
       STORAGE_PATH: /data/storage
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins

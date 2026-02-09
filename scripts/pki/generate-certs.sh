@@ -41,7 +41,8 @@ subjectAltName = @alt_names
 DNS.1 = localhost
 DNS.2 = backend
 DNS.3 = registry
-DNS.4 = *.test.local
+DNS.4 = postgres
+DNS.5 = *.test.local
 IP.1 = 127.0.0.1
 EOF
 
