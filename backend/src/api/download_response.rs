@@ -14,7 +14,7 @@ use std::time::Duration;
 use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend};
 
 /// Header to indicate how the artifact was served
-pub const X_ARTIFACT_STORAGE: &str = "X-Artifact-Storage";
+pub const X_ARTIFACT_STORAGE: &str = "x-artifact-storage";
 
 /// Download response that can be either a redirect or streamed content
 pub enum DownloadResponse {

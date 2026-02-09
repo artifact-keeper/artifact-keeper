@@ -35,6 +35,7 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
 
 /// Create repository routes
 pub fn router() -> Router<SharedState> {
+    use axum::extract::DefaultBodyLimit;
     use axum::routing::delete;
 
     Router::new()
@@ -65,6 +66,8 @@ pub fn router() -> Router<SharedState> {
         .route("/:key/download/*path", get(download_artifact))
         // Security routes nested under repository
         .merge(super::security::repo_security_router())
+        // Allow up to 512MB uploads (matches format-specific handlers)
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +139,34 @@ fn repo_to_response(
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
+}
+
+/// Validate that a repository key is safe and well-formed.
+fn validate_repository_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 128 {
+        return Err(AppError::Validation(
+            "Repository key must be between 1 and 128 characters".to_string(),
+        ));
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AppError::Validation(
+            "Repository key must contain only alphanumeric characters, hyphens, underscores, and dots".to_string(),
+        ));
+    }
+    if key.starts_with('.') || key.starts_with('-') {
+        return Err(AppError::Validation(
+            "Repository key must not start with a dot or hyphen".to_string(),
+        ));
+    }
+    if key.contains("..") {
+        return Err(AppError::Validation(
+            "Repository key must not contain consecutive dots".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
@@ -280,6 +311,7 @@ pub async fn create_repository(
     Json(payload): Json<CreateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
     let _auth = require_auth(auth)?;
+    validate_repository_key(&payload.key)?;
     let format = parse_format(&payload.format)?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
 

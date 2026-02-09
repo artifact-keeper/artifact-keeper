@@ -18,6 +18,8 @@ use crate::models::repository::RepositoryType;
 use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
+use crate::storage::filesystem::FilesystemStorage;
+use crate::storage::StorageBackend;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -207,26 +209,17 @@ pub async fn promote_artifact(
     }
 
     let new_artifact_id = Uuid::new_v4();
-    let dest_path = format!(
-        "{}/{}",
-        target_repo.storage_path.trim_end_matches('/'),
-        artifact.path
-    );
-    let source_path = format!(
-        "{}/{}",
-        source_repo.storage_path.trim_end_matches('/'),
-        artifact.storage_key
-    );
+    let source_storage = FilesystemStorage::new(&source_repo.storage_path);
+    let target_storage = FilesystemStorage::new(&target_repo.storage_path);
 
-    if let Some(parent) = std::path::Path::new(&dest_path).parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to create directories: {}", e)))?;
-    }
-
-    tokio::fs::copy(&source_path, &dest_path)
+    let content = source_storage
+        .get(&artifact.storage_key)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to copy artifact: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to read source artifact: {}", e)))?;
+    target_storage
+        .put(&artifact.storage_key, content)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to write promoted artifact: {}", e)))?;
 
     sqlx::query!(
         r#"
@@ -247,7 +240,7 @@ pub async fn promote_artifact(
         artifact.checksum_md5,
         artifact.checksum_sha1,
         artifact.content_type,
-        artifact.path,
+        artifact.storage_key,
         auth.user_id
     )
     .execute(&state.db)
@@ -357,37 +350,31 @@ pub async fn promote_artifacts_bulk(
             }
         };
 
-        let source_path = format!(
-            "{}/{}",
-            source_repo.storage_path.trim_end_matches('/'),
-            artifact.storage_key
-        );
-        let dest_path = format!(
-            "{}/{}",
-            target_repo.storage_path.trim_end_matches('/'),
-            artifact.path
-        );
         let source_display = format!("{}/{}", repo_key, artifact.path);
         let target_display = format!("{}/{}", req.target_repository, artifact.path);
 
-        if let Some(parent) = std::path::Path::new(&dest_path).parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+        let source_storage = FilesystemStorage::new(&source_repo.storage_path);
+        let target_storage = FilesystemStorage::new(&target_repo.storage_path);
+
+        let content = match source_storage.get(&artifact.storage_key).await {
+            Ok(c) => c,
+            Err(e) => {
                 failed += 1;
                 results.push(failed_response(
                     source_display,
                     target_display,
-                    format!("Failed to create directories: {}", e),
+                    format!("Failed to read source artifact: {}", e),
                 ));
                 continue;
             }
-        }
+        };
 
-        if let Err(e) = tokio::fs::copy(&source_path, &dest_path).await {
+        if let Err(e) = target_storage.put(&artifact.storage_key, content).await {
             failed += 1;
             results.push(failed_response(
                 source_display,
                 target_display,
-                format!("Failed to copy artifact: {}", e),
+                format!("Failed to write promoted artifact: {}", e),
             ));
             continue;
         }
@@ -412,7 +399,7 @@ pub async fn promote_artifacts_bulk(
             artifact.checksum_md5,
             artifact.checksum_sha1,
             artifact.content_type,
-            artifact.path,
+            artifact.storage_key,
             auth.user_id
         )
         .execute(&state.db)
