@@ -84,10 +84,11 @@ pub fn create_router(state: SharedState) -> Router {
         // VS Code Extension Marketplace API
         .nest("/vscode", handlers::vscode::router());
 
-    // Global body limit: 512 MB. Individual format handlers can override this
-    // (e.g. OCI disables limits entirely). Without this, Axum's 2 MB default
-    // silently truncates uploads on routes that lack an explicit limit.
-    router = router.layer(DefaultBodyLimit::max(512 * 1024 * 1024));
+    // Disable the global body limit. This is an artifact registry — uploads
+    // can be multiple GB. Without this, Axum's 2 MB default silently truncates
+    // uploads on routes that lack an explicit limit. Individual format handlers
+    // set their own limits where appropriate (e.g. 512 MB for most formats).
+    router = router.layer(DefaultBodyLimit::disable());
 
     // Apply setup guard (locks API until admin password is changed)
     router = router.layer(middleware::from_fn_with_state(state.clone(), setup_guard));
