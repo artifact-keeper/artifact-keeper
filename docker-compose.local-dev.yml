@@ -100,6 +100,12 @@ services:
       ALPINE_ENFORCE_AUTHENTICATION: "true"
       ALPINE_CORS_ENABLED: "true"
       ALPINE_CORS_ALLOW_ORIGIN: "*"
+      # Proxy configuration (required for NVD mirroring behind corporate proxies)
+      ALPINE_HTTP_PROXY_ADDRESS: ${DTRACK_HTTP_PROXY_ADDRESS:-}
+      ALPINE_HTTP_PROXY_PORT: ${DTRACK_HTTP_PROXY_PORT:-}
+      ALPINE_HTTP_PROXY_USERNAME: ${DTRACK_HTTP_PROXY_USERNAME:-}
+      ALPINE_HTTP_PROXY_PASSWORD: ${DTRACK_HTTP_PROXY_PASSWORD:-}
+      ALPINE_NO_PROXY: ${DTRACK_NO_PROXY:-localhost,127.0.0.1}
     volumes:
       - dev_dtrack_data:/data
     ports:
