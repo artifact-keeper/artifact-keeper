@@ -77,4 +77,18 @@ fi
 
 echo "$API_KEY" > "$API_KEY_FILE"
 echo "[dtrack-init] API key written to $API_KEY_FILE"
+
+# Enable NVD API 2.0 mirroring (NIST retired legacy feeds; DTrack 4.10.0+ supports API 2.0)
+echo "[dtrack-init] Enabling NVD API 2.0 vulnerability source..."
+NVD_RESULT=$(curl -sf -o /dev/null -w "%{http_code}" \
+  -X POST "$DT_URL/api/v1/configProperty" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"groupName":"vuln-source","propertyName":"nvd.feeds.url","propertyValue":"https://services.nvd.nist.gov/rest/json/cves/2.0"}')
+if [ "$NVD_RESULT" = "200" ]; then
+  echo "[dtrack-init] NVD API 2.0 source configured"
+else
+  echo "[dtrack-init] WARNING: NVD config returned HTTP $NVD_RESULT (may already be set or unsupported)"
+fi
+
 echo "[dtrack-init] Done"
