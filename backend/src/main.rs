@@ -521,8 +521,27 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     if must_change {
-        // Write password to a file so users can retrieve it
-        if let Err(e) = std::fs::write(&password_file, format!("{}\n", password)) {
+        // Write password + setup instructions to the file
+        let file_contents = format!(
+            "{}\n\n\
+            # ONE-TIME SETUP — this password must be changed before the API unlocks.\n\
+            #\n\
+            # Step 1: Login to get a JWT token:\n\
+            #   curl -s -X POST http://localhost:8080/api/v1/auth/login \\\n\
+            #     -H 'Content-Type: application/json' \\\n\
+            #     -d '{{\"username\":\"admin\",\"password\":\"<password-above>\"}}'\n\
+            #\n\
+            # Step 2: Change the password (use the access_token from step 1):\n\
+            #   curl -s -X POST http://localhost:8080/api/v1/users/me/password \\\n\
+            #     -H 'Authorization: Bearer <access_token>' \\\n\
+            #     -H 'Content-Type: application/json' \\\n\
+            #     -d '{{\"current_password\":\"<password-above>\",\"new_password\":\"<your-new-password>\"}}'\n\
+            #\n\
+            # The API is LOCKED until you complete these steps.\n\
+            # Do NOT use this password directly in API calls — you must login first.\n",
+            password
+        );
+        if let Err(e) = std::fs::write(&password_file, &file_contents) {
             tracing::error!("Failed to write admin password file: {}", e);
             // Fall back to logging the password directly
             tracing::info!("Generated admin password: {}", password);
@@ -541,7 +560,9 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
               Read it:   docker exec artifact-keeper-backend cat {}\n\
             \n\
               The API is LOCKED until you change this password.\n\
-              Login and call POST /api/v1/users/<id>/password to unlock.\n\
+              You MUST login first (POST /api/v1/auth/login) to get\n\
+              a token, then change the password. See the file for\n\
+              full curl examples.\n\
             \n\
             ===========================================================",
             password_file.display(),
