@@ -5,8 +5,8 @@
 //! - S3_BUCKET: Bucket name (required)
 //! - S3_REGION: AWS region (default: us-east-1)
 //! - S3_ENDPOINT: Custom endpoint URL for S3-compatible services
-//! - AWS_ACCESS_KEY_ID: Access key (required)
-//! - AWS_SECRET_ACCESS_KEY: Secret key (required)
+//! - AWS_ACCESS_KEY_ID: Access key (optional if using instance roles/IRSA)
+//! - AWS_SECRET_ACCESS_KEY: Secret key (optional if using instance roles/IRSA)
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -219,8 +219,9 @@ pub struct S3Backend {
 impl S3Backend {
     /// Create new S3 backend from configuration
     pub async fn new(config: S3Config) -> Result<Self> {
-        // Get credentials from environment
-        let credentials = Credentials::from_env()
+        // Load credentials using the default credential chain:
+        // env vars -> ~/.aws/credentials -> container credentials -> instance metadata (IRSA/EC2)
+        let credentials = Credentials::default()
             .map_err(|e| AppError::Config(format!("Failed to load AWS credentials: {}", e)))?;
 
         // Create region (with optional custom endpoint)
@@ -503,11 +504,11 @@ impl super::StorageBackend for S3Backend {
             // Option B: use dedicated signing credentials (long-lived, no STS expiry concern)
             sb.presign_get(&full_key, expiry_secs, None).await
         } else {
-            // Option A: refresh credentials from env/metadata before signing
-            // This ensures STS credentials are current, so the presigned URL
+            // Option A: refresh credentials from default chain before signing
+            // This ensures STS/IRSA credentials are current, so the presigned URL
             // gets the full requested lifetime instead of being limited by
             // the remaining TTL of stale credentials.
-            match Credentials::from_env() {
+            match Credentials::default() {
                 Ok(fresh_creds) => {
                     match Bucket::new(&self.bucket_name, self.region.clone(), fresh_creds) {
                         Ok(fresh_bucket) => {
