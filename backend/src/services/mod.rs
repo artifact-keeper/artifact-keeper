@@ -28,6 +28,7 @@ pub mod policy_service;
 pub mod promotion_policy_service;
 pub mod proxy_service;
 pub mod remote_instance_service;
+pub mod repository_label_service;
 pub mod repository_service;
 pub mod saml_service;
 pub mod sbom_service;

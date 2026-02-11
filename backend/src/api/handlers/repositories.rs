@@ -71,6 +71,8 @@ pub fn router() -> Router<SharedState> {
         .route("/:key/download/*path", get(download_artifact))
         // Security routes nested under repository
         .merge(super::security::repo_security_router())
+        // Label routes nested under repository
+        .merge(super::repository_labels::repo_labels_router())
         // Allow up to 512MB uploads (matches format-specific handlers)
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
 }

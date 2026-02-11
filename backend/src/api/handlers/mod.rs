@@ -43,6 +43,7 @@ pub mod puppet;
 pub mod pypi;
 pub mod remote_instances;
 pub mod repositories;
+pub mod repository_labels;
 pub mod rpm;
 pub mod rubygems;
 pub mod sbom;

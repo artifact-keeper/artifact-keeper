@@ -116,6 +116,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::peer::PeerApiDoc::openapi());
     doc.merge(super::handlers::transfer::TransferApiDoc::openapi());
     doc.merge(super::handlers::tree::TreeApiDoc::openapi());
+    doc.merge(super::handlers::repository_labels::RepositoryLabelsApiDoc::openapi());
 
     doc
 }
@@ -212,6 +213,83 @@ mod tests {
             op_count >= 250,
             "Expected at least 250 operations, got {op_count}. Handler annotations may be missing."
         );
+    }
+
+    #[test]
+    fn test_repository_labels_endpoints_in_spec() {
+        let spec = build_openapi();
+
+        // Verify the label endpoints are registered in the OpenAPI spec
+        let paths: Vec<&str> = spec.paths.paths.keys().map(|k| k.as_str()).collect();
+
+        // GET/PUT /{key}/labels
+        let labels_path = paths
+            .iter()
+            .find(|p| p.contains("/labels") && !p.contains("{label_key}"));
+        assert!(
+            labels_path.is_some(),
+            "Missing /{{key}}/labels path in OpenAPI spec. Registered paths: {:?}",
+            paths
+                .iter()
+                .filter(|p| p.contains("label"))
+                .collect::<Vec<_>>()
+        );
+
+        // POST/DELETE /{key}/labels/{label_key}
+        let label_key_path = paths
+            .iter()
+            .find(|p| p.contains("/labels/") && p.contains("{label_key}"));
+        assert!(
+            label_key_path.is_some(),
+            "Missing /{{key}}/labels/{{label_key}} path in OpenAPI spec"
+        );
+
+        // Verify the label paths have the correct HTTP methods
+        if let Some(path) = labels_path {
+            let item = &spec.paths.paths[*path];
+            assert!(item.get.is_some(), "GET /{{key}}/labels should exist");
+            assert!(item.put.is_some(), "PUT /{{key}}/labels should exist");
+        }
+
+        if let Some(path) = label_key_path {
+            let item = &spec.paths.paths[*path];
+            assert!(
+                item.post.is_some(),
+                "POST /{{key}}/labels/{{label_key}} should exist"
+            );
+            assert!(
+                item.delete.is_some(),
+                "DELETE /{{key}}/labels/{{label_key}} should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn test_repository_labels_schemas_in_spec() {
+        let spec = build_openapi();
+
+        let schema_names: Vec<&str> = spec
+            .components
+            .as_ref()
+            .map_or(vec![], |c| c.schemas.keys().map(|k| k.as_str()).collect());
+
+        // Verify our label schemas are registered
+        for expected_schema in [
+            "LabelResponse",
+            "LabelsListResponse",
+            "SetLabelsRequest",
+            "LabelEntrySchema",
+            "AddLabelRequest",
+        ] {
+            assert!(
+                schema_names.contains(&expected_schema),
+                "Missing schema '{expected_schema}' in OpenAPI spec. Available: {:?}",
+                schema_names
+                    .iter()
+                    .filter(|s| s.to_lowercase().contains("label"))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     /// Export OpenAPI spec to files when EXPORT_OPENAPI_SPEC env var is set.
