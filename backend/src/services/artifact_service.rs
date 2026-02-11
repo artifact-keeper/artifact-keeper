@@ -262,6 +262,62 @@ impl ArtifactService {
         self.trigger_hook_non_blocking(PluginEventType::AfterUpload, &artifact_info)
             .await;
 
+        // Queue sync tasks for peer replication (non-blocking)
+        {
+            let db = self.db.clone();
+            let artifact_id = artifact.id;
+            let repository_id = artifact.repository_id;
+            tokio::spawn(async move {
+                // Find peers with push/mirror subscriptions for this repo
+                let subscriptions: std::result::Result<Vec<(uuid::Uuid,)>, _> = sqlx::query_as(
+                    r#"
+                    SELECT peer_instance_id
+                    FROM peer_repo_subscriptions
+                    WHERE repository_id = $1
+                      AND sync_enabled = true
+                      AND replication_mode::text IN ('push', 'mirror')
+                    "#,
+                )
+                .bind(repository_id)
+                .fetch_all(&db)
+                .await;
+
+                match subscriptions {
+                    Ok(subs) if !subs.is_empty() => {
+                        let peer_service =
+                            crate::services::peer_instance_service::PeerInstanceService::new(db);
+                        let count = subs.len();
+                        for (peer_instance_id,) in &subs {
+                            if let Err(e) = peer_service
+                                .queue_sync_task(*peer_instance_id, artifact_id, 0)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to queue sync task for peer {} artifact {}: {}",
+                                    peer_instance_id,
+                                    artifact_id,
+                                    e
+                                );
+                            }
+                        }
+                        tracing::info!(
+                            "Queued sync tasks for artifact {} to {} peer(s)",
+                            artifact_id,
+                            count
+                        );
+                    }
+                    Ok(_) => {} // No push/mirror subscriptions
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to query peer subscriptions for repo {}: {}",
+                            repository_id,
+                            e
+                        );
+                    }
+                }
+            });
+        }
+
         // Trigger scan-on-upload if scanner service is configured
         if let Some(ref scanner) = self.scanner_service {
             let scanner = scanner.clone();
