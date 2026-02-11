@@ -37,8 +37,9 @@ use crate::storage::StorageBackend;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        // Registry config
+        // Registry config (served at both root and index/ for sparse protocol compatibility)
         .route("/:repo_key/config.json", get(config_json))
+        .route("/:repo_key/index/config.json", get(config_json))
         // Search
         .route("/:repo_key/api/v1/crates", get(search_crates))
         // Publish

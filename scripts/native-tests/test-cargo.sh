@@ -52,8 +52,9 @@ EOF
 
 # Configure cargo registry (sparse protocol)
 echo "==> Configuring cargo registry..."
-mkdir -p ~/.cargo
-cat >> ~/.cargo/config.toml << EOF
+CARGO_CONFIG_DIR="${CARGO_HOME:-$HOME/.cargo}"
+mkdir -p "$CARGO_CONFIG_DIR"
+cat > "$CARGO_CONFIG_DIR/config.toml" << EOF
 [registries.test-registry]
 index = "sparse+$CARGO_REGISTRY_URL/index/"
 
