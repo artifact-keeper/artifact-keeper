@@ -66,6 +66,8 @@ services:
     image: alpine:3.20
     container_name: artifact-keeper-dtrack-init
     depends_on:
+      postgres:
+        condition: service_healthy
       dependency-track-apiserver:
         condition: service_healthy
     volumes:

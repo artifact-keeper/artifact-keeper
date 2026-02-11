@@ -474,6 +474,16 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     if let Some((must_change,)) = admin_row {
+        // Ensure existing admin user always has auth_provider = 'local' so
+        // password-based login works.  This is a no-op when the column is
+        // already correct but fixes installs that ended up with a wrong value.
+        sqlx::query(
+            "UPDATE users SET auth_provider = 'local' WHERE username = 'admin' AND auth_provider != 'local'"
+        )
+        .execute(db)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
         // Admin already exists — determine if setup lock is needed
         if must_change {
             tracing::warn!(
@@ -509,9 +519,12 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
     sqlx::query(
         r#"
-        INSERT INTO users (username, email, password_hash, is_admin, must_change_password)
-        VALUES ('admin', 'admin@localhost', $1, true, $2)
-        ON CONFLICT (username) DO NOTHING
+        INSERT INTO users (username, email, password_hash, is_admin, must_change_password, auth_provider)
+        VALUES ('admin', 'admin@localhost', $1, true, $2, 'local')
+        ON CONFLICT (username) DO UPDATE
+            SET password_hash = EXCLUDED.password_hash,
+                must_change_password = EXCLUDED.must_change_password,
+                auth_provider = 'local'
         "#,
     )
     .bind(&password_hash)
