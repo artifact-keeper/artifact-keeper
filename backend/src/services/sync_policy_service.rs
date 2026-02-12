@@ -558,7 +558,7 @@ impl SyncPolicyService {
                     sqlx::query(
                         r#"
                         UPDATE peer_repo_subscriptions
-                        SET replication_mode = $3, sync_enabled = true
+                        SET replication_mode = $3::replication_mode, sync_enabled = true
                         WHERE peer_instance_id = $1 AND repository_id = $2 AND policy_id = $4
                         "#,
                     )
@@ -576,7 +576,7 @@ impl SyncPolicyService {
                     sqlx::query(
                         r#"
                         UPDATE peer_repo_subscriptions
-                        SET policy_id = $3, replication_mode = $4, sync_enabled = true
+                        SET policy_id = $3, replication_mode = $4::replication_mode, sync_enabled = true
                         WHERE peer_instance_id = $1 AND repository_id = $2 AND policy_id IS NOT NULL
                         "#,
                     )
@@ -597,7 +597,7 @@ impl SyncPolicyService {
                         r#"
                         INSERT INTO peer_repo_subscriptions
                             (peer_instance_id, repository_id, sync_enabled, replication_mode, policy_id)
-                        VALUES ($1, $2, true, $3, $4)
+                        VALUES ($1, $2, true, $3::replication_mode, $4)
                         ON CONFLICT (peer_instance_id, repository_id) DO NOTHING
                         "#,
                     )
@@ -721,7 +721,7 @@ impl SyncPolicyService {
                 r#"
                 INSERT INTO peer_repo_subscriptions
                     (peer_instance_id, repository_id, sync_enabled, replication_mode, policy_id)
-                VALUES ($1, $2, true, $3, $4)
+                VALUES ($1, $2, true, $3::replication_mode, $4)
                 ON CONFLICT (peer_instance_id, repository_id) DO NOTHING
                 "#,
             )
@@ -802,7 +802,7 @@ impl SyncPolicyService {
                 r#"
                 INSERT INTO peer_repo_subscriptions
                     (peer_instance_id, repository_id, sync_enabled, replication_mode, policy_id)
-                VALUES ($1, $2, true, $3, $4)
+                VALUES ($1, $2, true, $3::replication_mode, $4)
                 ON CONFLICT (peer_instance_id, repository_id) DO NOTHING
                 "#,
             )
