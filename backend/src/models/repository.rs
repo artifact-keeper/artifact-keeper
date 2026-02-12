@@ -72,6 +72,8 @@ pub enum RepositoryFormat {
     Opkg,
     P2,
     Bazel,
+    // Schema registries
+    Protobuf,
 }
 
 /// Repository type enum

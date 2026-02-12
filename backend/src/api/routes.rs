@@ -82,7 +82,9 @@ pub fn create_router(state: SharedState) -> Router {
         // SBT/Ivy Repository API (Scala/Java packages)
         .nest("/ivy", handlers::sbt::router())
         // VS Code Extension Marketplace API
-        .nest("/vscode", handlers::vscode::router());
+        .nest("/vscode", handlers::vscode::router())
+        // Protobuf / Buf Schema Registry (Connect RPC)
+        .nest("/proto", handlers::protobuf::router());
 
     // Disable the global body limit. This is an artifact registry — uploads
     // can be multiple GB. Without this, Axum's 2 MB default silently truncates

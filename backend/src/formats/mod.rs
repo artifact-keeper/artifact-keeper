@@ -25,6 +25,7 @@ pub mod nuget;
 pub mod oci;
 pub mod opkg;
 pub mod p2;
+pub mod protobuf;
 pub mod r#pub;
 pub mod puppet;
 pub mod pypi;
@@ -113,6 +114,7 @@ pub trait FormatHandler: Send + Sync {
             RepositoryFormat::Opkg => "opkg",
             RepositoryFormat::P2 => "p2",
             RepositoryFormat::Bazel => "bazel",
+            RepositoryFormat::Protobuf => "protobuf",
         }
     }
 
@@ -179,6 +181,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "opkg" => Some(Box::new(opkg::OpkgHandler::new())),
         "p2" => Some(Box::new(p2::P2Handler::new())),
         "bazel" => Some(Box::new(bazel::BazelHandler::new())),
+        "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
         _ => None,
     }
 }
@@ -235,6 +238,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Opkg => Box::new(opkg::OpkgHandler::new()),
         RepositoryFormat::P2 => Box::new(p2::P2Handler::new()),
         RepositoryFormat::Bazel => Box::new(bazel::BazelHandler::new()),
+        RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
     }
 }
 
@@ -289,5 +293,6 @@ pub fn list_core_formats() -> Vec<&'static str> {
         "opkg",
         "p2",
         "bazel",
+        "protobuf",
     ]
 }
