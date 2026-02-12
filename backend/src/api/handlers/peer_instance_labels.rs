@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::services::peer_instance_label_service::{PeerInstanceLabel, PeerInstanceLabelService};
 use crate::services::peer_instance_service::PeerInstanceService;
 use crate::services::repository_label_service::LabelEntry;
@@ -76,10 +76,6 @@ pub struct AddPeerLabelRequest {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
-    auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
-}
-
 fn label_to_response(label: PeerInstanceLabel) -> PeerLabelResponse {
     PeerLabelResponse {
         id: label.id,
@@ -129,11 +125,9 @@ async fn trigger_peer_policy_evaluation(db: &sqlx::PgPool, peer_id: Uuid) {
 )]
 async fn list_labels(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PeerLabelsListResponse>> {
-    let _auth = require_auth(auth)?;
-
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 
@@ -161,12 +155,10 @@ async fn list_labels(
 )]
 async fn set_labels(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<SetPeerLabelsRequest>,
 ) -> Result<Json<PeerLabelsListResponse>> {
-    let _auth = require_auth(auth)?;
-
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 
@@ -206,12 +198,10 @@ async fn set_labels(
 )]
 async fn add_label(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    Extension(_auth): Extension<AuthExtension>,
     Path((id, label_key)): Path<(Uuid, String)>,
     Json(payload): Json<AddPeerLabelRequest>,
 ) -> Result<Json<PeerLabelResponse>> {
-    let _auth = require_auth(auth)?;
-
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 
@@ -243,11 +233,9 @@ async fn add_label(
 )]
 async fn delete_label(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    Extension(_auth): Extension<AuthExtension>,
     Path((id, label_key)): Path<(Uuid, String)>,
 ) -> Result<axum::http::StatusCode> {
-    let _auth = require_auth(auth)?;
-
     let peer_service = PeerInstanceService::new(state.db.clone());
     let _peer = peer_service.get_by_id(id).await?;
 
