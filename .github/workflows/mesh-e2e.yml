@@ -1,0 +1,109 @@
+name: Mesh Replication E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Backend image tag to test'
+        type: string
+        default: 'dev'
+      skip_deploy:
+        description: 'Skip ArgoCD sync (use existing cluster state)'
+        type: boolean
+        default: false
+
+  workflow_call:
+    inputs:
+      image_tag:
+        type: string
+        default: 'dev'
+
+concurrency:
+  group: mesh-e2e
+  cancel-in-progress: false
+
+jobs:
+  mesh-e2e:
+    name: Mesh Replication E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.MESH_KUBECONFIG }}" | base64 -d > ~/.kube/config
+
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Sync mesh applications
+        if: ${{ !inputs.skip_deploy }}
+        run: |
+          argocd login --core
+
+          for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
+            echo "Syncing $app with image tag ${{ inputs.image_tag || 'dev' }}..."
+            argocd app sync "$app" \
+              --parameter "backend.image.tag=${{ inputs.image_tag || 'dev' }}" \
+              --timeout 300
+          done
+
+      - name: Wait for healthy
+        run: |
+          argocd login --core
+
+          for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
+            echo "Waiting for $app to be healthy..."
+            argocd app wait "$app" --health --timeout 300
+          done
+
+      - name: Checkout IaC repo
+        uses: actions/checkout@v6
+        with:
+          repository: artifact-keeper/artifact-keeper-iac
+          path: iac
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run E2E test Job
+        run: |
+          # Clean up any previous run
+          kubectl delete job mesh-e2e-test -n ak-mesh-main --ignore-not-found
+
+          # Apply test resources
+          kubectl apply -f iac/e2e/mesh/rbac.yaml
+          kubectl apply -f iac/e2e/mesh/configmap-test-script.yaml
+          kubectl apply -f iac/e2e/mesh/job.yaml
+
+          # Wait for Job completion (10 min timeout)
+          echo "Waiting for mesh E2E test Job to complete..."
+          kubectl wait --for=condition=complete job/mesh-e2e-test \
+            -n ak-mesh-main \
+            --timeout=600s || {
+            echo "::error::Mesh E2E test Job failed or timed out"
+            kubectl logs job/mesh-e2e-test -n ak-mesh-main 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Collect results
+        if: always()
+        run: |
+          echo "## Mesh Replication E2E Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl logs job/mesh-e2e-test -n ak-mesh-main 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "No logs available"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup test Job
+        if: always()
+        run: |
+          kubectl delete job mesh-e2e-test -n ak-mesh-main --ignore-not-found

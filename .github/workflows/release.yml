@@ -30,6 +30,14 @@ jobs:
       include_stress: true
       include_failure: true
 
+  mesh-e2e-gate:
+    name: Mesh Replication E2E (optional)
+    uses: ./.github/workflows/mesh-e2e.yml
+    with:
+      image_tag: dev
+    secrets: inherit
+    continue-on-error: true
+
   # ════════════════════════════════════════════════════════════════════════════
   # BUILD BINARIES
   # ════════════════════════════════════════════════════════════════════════════
