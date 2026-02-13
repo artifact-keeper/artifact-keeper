@@ -8,10 +8,6 @@ use serde_json::{json, Value};
 
 use crate::models::quality::{QualityCheckOutput, RawQualityIssue};
 
-// ---------------------------------------------------------------------------
-// Point allocations
-// ---------------------------------------------------------------------------
-
 const POINTS_VERSION: i32 = 20;
 const POINTS_DESCRIPTION: i32 = 20;
 const POINTS_LICENSE: i32 = 30;
@@ -19,10 +15,6 @@ const POINTS_AUTHOR: i32 = 15;
 const POINTS_DOCS: i32 = 15;
 
 const PASSING_THRESHOLD: i32 = 50;
-
-// ---------------------------------------------------------------------------
-// MetadataCompletenessChecker
-// ---------------------------------------------------------------------------
 
 /// Quality checker that scores an artifact based on the completeness of its
 /// metadata fields. Designed to work across all 45+ package formats without
@@ -61,7 +53,7 @@ impl MetadataCompletenessChecker {
         let mut issues: Vec<RawQualityIssue> = Vec::new();
 
         // 1. Version present (20 pts)
-        let has_version = artifact_version.is_some() && !artifact_version.unwrap().is_empty();
+        let has_version = artifact_version.is_some_and(|v| !v.is_empty());
         if has_version {
             score += POINTS_VERSION;
         } else {
@@ -184,10 +176,6 @@ impl MetadataCompletenessChecker {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 /// Returns `true` if `val` is a non-empty JSON string.
 fn is_non_empty_string(val: &Value) -> bool {
     match val {
@@ -210,10 +198,6 @@ fn has_non_empty_field(obj: &Value, key: &str) -> bool {
         Some(Value::Bool(_)) | Some(Value::Number(_)) => true,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

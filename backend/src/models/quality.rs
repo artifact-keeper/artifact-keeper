@@ -5,10 +5,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// Database row structs
-// ---------------------------------------------------------------------------
-
 /// A single quality check execution record for an artifact.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct QualityCheckResult {
@@ -111,27 +107,9 @@ pub struct QualityGate {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A persisted record of a quality gate evaluation against an artifact.
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct QualityGateEvaluationRecord {
-    pub id: Uuid,
-    pub artifact_id: Uuid,
-    pub quality_gate_id: Uuid,
-    pub passed: bool,
-    pub action: String,
-    pub health_score: Option<i32>,
-    pub details: Option<serde_json::Value>,
-    pub evaluated_at: DateTime<Utc>,
-}
-
-// ---------------------------------------------------------------------------
-// Non-persisted types used by the quality check service
-// ---------------------------------------------------------------------------
-
 /// A raw issue produced by a quality checker before it is persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawQualityIssue {
-    /// Severity level: "critical", "high", "medium", "low", or "info".
     pub severity: String,
     pub category: String,
     pub title: String,

@@ -39,12 +39,6 @@ pub fn router() -> Router<SharedState> {
         .route("/gates/evaluate/:artifact_id", post(evaluate_gate))
 }
 
-// ---------------------------------------------------------------------------
-// Request / Response types
-// ---------------------------------------------------------------------------
-
-// --- Health responses ---
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactHealthResponse {
     pub artifact_id: Uuid,
@@ -101,8 +95,6 @@ pub struct HealthDashboardResponse {
     pub repositories: Vec<RepoHealthResponse>,
 }
 
-// --- Check responses ---
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CheckResponse {
     pub id: Uuid,
@@ -144,8 +136,6 @@ pub struct IssueResponse {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-// --- Request types ---
-
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TriggerChecksRequest {
     pub artifact_id: Option<Uuid>,
@@ -168,8 +158,6 @@ pub struct ListChecksQuery {
 pub struct SuppressIssueRequest {
     pub reason: String,
 }
-
-// --- Gate types ---
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateGateRequest {
@@ -265,10 +253,6 @@ pub struct EvaluateGateQuery {
     pub repository_id: Option<Uuid>,
 }
 
-// ---------------------------------------------------------------------------
-// Model-to-response conversions
-// ---------------------------------------------------------------------------
-
 impl From<crate::models::quality::QualityCheckResult> for CheckResponse {
     fn from(c: crate::models::quality::QualityCheckResult) -> Self {
         Self {
@@ -350,10 +334,6 @@ impl From<crate::models::quality::QualityGateViolation> for GateViolationRespons
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Health score handlers
-// ---------------------------------------------------------------------------
 
 #[utoipa::path(
     get,
@@ -507,26 +487,22 @@ async fn get_health_dashboard(
         0
     };
 
-    let repos_grade_a = all_repo_scores
-        .iter()
-        .filter(|r| r.health_grade == "A")
-        .count() as i64;
-    let repos_grade_b = all_repo_scores
-        .iter()
-        .filter(|r| r.health_grade == "B")
-        .count() as i64;
-    let repos_grade_c = all_repo_scores
-        .iter()
-        .filter(|r| r.health_grade == "C")
-        .count() as i64;
-    let repos_grade_d = all_repo_scores
-        .iter()
-        .filter(|r| r.health_grade == "D")
-        .count() as i64;
-    let repos_grade_f = all_repo_scores
-        .iter()
-        .filter(|r| r.health_grade == "F")
-        .count() as i64;
+    let (
+        mut repos_grade_a,
+        mut repos_grade_b,
+        mut repos_grade_c,
+        mut repos_grade_d,
+        mut repos_grade_f,
+    ) = (0i64, 0i64, 0i64, 0i64, 0i64);
+    for r in &all_repo_scores {
+        match r.health_grade.as_str() {
+            "A" => repos_grade_a += 1,
+            "B" => repos_grade_b += 1,
+            "C" => repos_grade_c += 1,
+            "D" => repos_grade_d += 1,
+            _ => repos_grade_f += 1,
+        }
+    }
 
     let repositories: Vec<RepoHealthResponse> = all_repo_scores
         .into_iter()
@@ -561,10 +537,6 @@ async fn get_health_dashboard(
         repositories,
     }))
 }
-
-// ---------------------------------------------------------------------------
-// Quality check handlers
-// ---------------------------------------------------------------------------
 
 #[utoipa::path(
     post,
@@ -704,10 +676,6 @@ async fn list_check_issues(
     Ok(Json(response))
 }
 
-// ---------------------------------------------------------------------------
-// Issue suppression handlers
-// ---------------------------------------------------------------------------
-
 #[utoipa::path(
     post,
     path = "/issues/{id}/suppress",
@@ -760,10 +728,6 @@ async fn unsuppress_issue(
     qc_service.unsuppress_issue(issue_id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
-
-// ---------------------------------------------------------------------------
-// Quality gate CRUD handlers
-// ---------------------------------------------------------------------------
 
 #[utoipa::path(
     get,
@@ -913,10 +877,6 @@ async fn delete_gate(
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
-// ---------------------------------------------------------------------------
-// Gate evaluation handler
-// ---------------------------------------------------------------------------
-
 #[utoipa::path(
     post,
     path = "/gates/evaluate/{artifact_id}",
@@ -971,10 +931,6 @@ async fn evaluate_gate(
         component_scores: serde_json::to_value(&evaluation.component_scores).unwrap_or_default(),
     }))
 }
-
-// ---------------------------------------------------------------------------
-// OpenAPI doc
-// ---------------------------------------------------------------------------
 
 #[derive(OpenApi)]
 #[openapi(

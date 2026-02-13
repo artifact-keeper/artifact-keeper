@@ -20,10 +20,6 @@ use crate::services::metadata_checker::MetadataCompletenessChecker;
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::StorageBackend;
 
-// ---------------------------------------------------------------------------
-// Input structs for quality gate CRUD
-// ---------------------------------------------------------------------------
-
 pub struct CreateQualityGateInput {
     pub repository_id: Option<Uuid>,
     pub name: String,
@@ -58,18 +54,10 @@ pub struct UpdateQualityGateInput {
     pub is_enabled: Option<bool>,
 }
 
-// ---------------------------------------------------------------------------
-// Health score weight constants
-// ---------------------------------------------------------------------------
-
 const WEIGHT_SECURITY: i32 = 40;
 const WEIGHT_LICENSE: i32 = 20;
 const WEIGHT_QUALITY: i32 = 25;
 const WEIGHT_METADATA: i32 = 15;
-
-// ---------------------------------------------------------------------------
-// QualityCheckService
-// ---------------------------------------------------------------------------
 
 pub struct QualityCheckService {
     db: PgPool,
@@ -79,10 +67,6 @@ impl QualityCheckService {
     pub fn new(db: PgPool) -> Self {
         Self { db }
     }
-
-    // -----------------------------------------------------------------------
-    // Main orchestrator
-    // -----------------------------------------------------------------------
 
     /// Run all applicable quality checks against an artifact, persist results,
     /// and recalculate the artifact health score.
@@ -208,10 +192,6 @@ impl QualityCheckService {
         Ok(count)
     }
 
-    // -----------------------------------------------------------------------
-    // Persist check result + issues
-    // -----------------------------------------------------------------------
-
     /// Insert a completed quality check result and its associated issues.
     async fn persist_check_result(
         &self,
@@ -301,10 +281,6 @@ impl QualityCheckService {
 
         Ok(check_result_id)
     }
-
-    // -----------------------------------------------------------------------
-    // Health score recalculation
-    // -----------------------------------------------------------------------
 
     /// Recalculate the composite health score for a single artifact.
     pub async fn recalculate_artifact_health(&self, artifact_id: Uuid) -> Result<()> {
@@ -516,10 +492,6 @@ impl QualityCheckService {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Quality gate evaluation
-    // -----------------------------------------------------------------------
-
     /// Evaluate an artifact against the applicable quality gate.
     pub async fn evaluate_quality_gate(
         &self,
@@ -572,95 +544,56 @@ impl QualityCheckService {
         // 3. Check each gate condition, collecting violations
         let mut violations: Vec<QualityGateViolation> = Vec::new();
 
-        if let Some(min) = gate.min_health_score {
-            if health.health_score < min {
-                violations.push(QualityGateViolation {
-                    rule: "min_health_score".to_string(),
-                    expected: format!(">= {}", min),
-                    actual: health.health_score.to_string(),
-                    message: format!(
-                        "Health score {} is below minimum {}",
-                        health.health_score, min
-                    ),
-                });
-            }
-        }
+        check_min_score(
+            &mut violations,
+            "min_health_score",
+            "Health",
+            gate.min_health_score,
+            health.health_score,
+        );
+        check_min_score(
+            &mut violations,
+            "min_security_score",
+            "Security",
+            gate.min_security_score,
+            health.security_score.unwrap_or(0),
+        );
+        check_min_score(
+            &mut violations,
+            "min_quality_score",
+            "Quality",
+            gate.min_quality_score,
+            health.quality_score.unwrap_or(0),
+        );
+        check_min_score(
+            &mut violations,
+            "min_metadata_score",
+            "Metadata",
+            gate.min_metadata_score,
+            health.metadata_score.unwrap_or(0),
+        );
 
-        if let Some(min) = gate.min_security_score {
-            let actual = health.security_score.unwrap_or(0);
-            if actual < min {
-                violations.push(QualityGateViolation {
-                    rule: "min_security_score".to_string(),
-                    expected: format!(">= {}", min),
-                    actual: actual.to_string(),
-                    message: format!("Security score {} is below minimum {}", actual, min),
-                });
-            }
-        }
-
-        if let Some(min) = gate.min_quality_score {
-            let actual = health.quality_score.unwrap_or(0);
-            if actual < min {
-                violations.push(QualityGateViolation {
-                    rule: "min_quality_score".to_string(),
-                    expected: format!(">= {}", min),
-                    actual: actual.to_string(),
-                    message: format!("Quality score {} is below minimum {}", actual, min),
-                });
-            }
-        }
-
-        if let Some(min) = gate.min_metadata_score {
-            let actual = health.metadata_score.unwrap_or(0);
-            if actual < min {
-                violations.push(QualityGateViolation {
-                    rule: "min_metadata_score".to_string(),
-                    expected: format!(">= {}", min),
-                    actual: actual.to_string(),
-                    message: format!("Metadata score {} is below minimum {}", actual, min),
-                });
-            }
-        }
-
-        if let Some(max) = gate.max_critical_issues {
-            if health.critical_issues > max {
-                violations.push(QualityGateViolation {
-                    rule: "max_critical_issues".to_string(),
-                    expected: format!("<= {}", max),
-                    actual: health.critical_issues.to_string(),
-                    message: format!(
-                        "Critical issues count {} exceeds maximum {}",
-                        health.critical_issues, max
-                    ),
-                });
-            }
-        }
-
-        if let Some(max) = gate.max_high_issues {
-            let high_issues = health.total_issues - health.critical_issues;
-            if high_issues > max {
-                violations.push(QualityGateViolation {
-                    rule: "max_high_issues".to_string(),
-                    expected: format!("<= {}", max),
-                    actual: high_issues.to_string(),
-                    message: format!("High issues count {} exceeds maximum {}", high_issues, max),
-                });
-            }
-        }
-
-        if let Some(max) = gate.max_medium_issues {
-            if health.total_issues > max {
-                violations.push(QualityGateViolation {
-                    rule: "max_medium_issues".to_string(),
-                    expected: format!("<= {}", max),
-                    actual: health.total_issues.to_string(),
-                    message: format!(
-                        "Total issues count {} exceeds maximum {}",
-                        health.total_issues, max
-                    ),
-                });
-            }
-        }
+        check_max_issues(
+            &mut violations,
+            "max_critical_issues",
+            "Critical",
+            gate.max_critical_issues,
+            health.critical_issues,
+        );
+        check_max_issues(
+            &mut violations,
+            "max_high_issues",
+            "High",
+            gate.max_high_issues,
+            health.total_issues - health.critical_issues,
+        );
+        check_max_issues(
+            &mut violations,
+            "max_medium_issues",
+            "Total",
+            gate.max_medium_issues,
+            health.total_issues,
+        );
 
         // Check required_checks: verify each check_type exists in completed results
         if !gate.required_checks.is_empty() {
@@ -740,10 +673,6 @@ impl QualityCheckService {
         Ok(evaluation)
     }
 
-    // -----------------------------------------------------------------------
-    // Storage helper
-    // -----------------------------------------------------------------------
-
     /// Fetch artifact content from filesystem storage.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
         let storage_path: String =
@@ -766,10 +695,6 @@ impl QualityCheckService {
             ))
         })
     }
-
-    // -----------------------------------------------------------------------
-    // Query methods for API handlers
-    // -----------------------------------------------------------------------
 
     /// Get artifact health score by artifact ID.
     pub async fn get_artifact_health(
@@ -943,10 +868,6 @@ impl QualityCheckService {
         info!(issue_id = %issue_id, "Quality issue unsuppressed");
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Quality gate CRUD
-    // -----------------------------------------------------------------------
 
     /// List quality gates, optionally filtered by repository.
     pub async fn list_gates(&self, repository_id: Option<Uuid>) -> Result<Vec<QualityGate>> {
@@ -1137,10 +1058,6 @@ impl QualityCheckService {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Internal row types for query_as
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, sqlx::FromRow)]
 struct CheckScoreRow {
     check_type: String,
@@ -1164,9 +1081,45 @@ struct RepoAggregateRow {
     failing: i32,
 }
 
-// ---------------------------------------------------------------------------
-// Weighted health score computation (pure function, testable)
-// ---------------------------------------------------------------------------
+/// Push a violation if `actual` is below `threshold`.
+fn check_min_score(
+    violations: &mut Vec<QualityGateViolation>,
+    rule: &str,
+    label: &str,
+    threshold: Option<i32>,
+    actual: i32,
+) {
+    if let Some(min) = threshold {
+        if actual < min {
+            violations.push(QualityGateViolation {
+                rule: rule.to_string(),
+                expected: format!(">= {min}"),
+                actual: actual.to_string(),
+                message: format!("{label} score {actual} is below minimum {min}"),
+            });
+        }
+    }
+}
+
+/// Push a violation if `actual` exceeds `threshold`.
+fn check_max_issues(
+    violations: &mut Vec<QualityGateViolation>,
+    rule: &str,
+    label: &str,
+    threshold: Option<i32>,
+    actual: i32,
+) {
+    if let Some(max) = threshold {
+        if actual > max {
+            violations.push(QualityGateViolation {
+                rule: rule.to_string(),
+                expected: format!("<= {max}"),
+                actual: actual.to_string(),
+                message: format!("{label} issues count {actual} exceeds maximum {max}"),
+            });
+        }
+    }
+}
 
 /// Compute a weighted composite health score from component scores.
 ///
@@ -1174,25 +1127,20 @@ struct RepoAggregateRow {
 /// Components with no data (None) are excluded and the denominator is reduced
 /// accordingly. If all components are None, returns 100 (no data = healthy).
 fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
-    let mut weighted_sum: i32 = 0;
-    let mut weight_sum: i32 = 0;
+    let components: [(Option<i32>, i32); 4] = [
+        (scores.security, WEIGHT_SECURITY),
+        (scores.license, WEIGHT_LICENSE),
+        (scores.quality, WEIGHT_QUALITY),
+        (scores.metadata, WEIGHT_METADATA),
+    ];
 
-    if let Some(s) = scores.security {
-        weighted_sum += s * WEIGHT_SECURITY;
-        weight_sum += WEIGHT_SECURITY;
-    }
-    if let Some(s) = scores.license {
-        weighted_sum += s * WEIGHT_LICENSE;
-        weight_sum += WEIGHT_LICENSE;
-    }
-    if let Some(s) = scores.quality {
-        weighted_sum += s * WEIGHT_QUALITY;
-        weight_sum += WEIGHT_QUALITY;
-    }
-    if let Some(s) = scores.metadata {
-        weighted_sum += s * WEIGHT_METADATA;
-        weight_sum += WEIGHT_METADATA;
-    }
+    let (weighted_sum, weight_sum) =
+        components
+            .iter()
+            .fold((0, 0), |(ws, wt), (score, weight)| match score {
+                Some(s) => (ws + s * weight, wt + weight),
+                None => (ws, wt),
+            });
 
     if weight_sum == 0 {
         return 100;
@@ -1200,10 +1148,6 @@ fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
 
     weighted_sum / weight_sum
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

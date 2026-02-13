@@ -168,10 +168,7 @@ impl HelmLintChecker {
         if let Some(ref doc) = chart_yaml {
             let map = doc.as_mapping();
 
-            // --- apiVersion --------------------------------------------------
-            let api_version = map
-                .and_then(|m| m.get(serde_yaml::Value::String("apiVersion".to_string())))
-                .and_then(|v| v.as_str());
+            let api_version = yaml_str_field(map, "apiVersion");
 
             if let Some(av) = api_version {
                 score += 5; // has apiVersion
@@ -202,10 +199,7 @@ impl HelmLintChecker {
                 details["api_version"] = json!(null);
             }
 
-            // --- name --------------------------------------------------------
-            let name = map
-                .and_then(|m| m.get(serde_yaml::Value::String("name".to_string())))
-                .and_then(|v| v.as_str());
+            let name = yaml_str_field(map, "name");
 
             if let Some(n) = name {
                 if n.is_empty() {
@@ -232,10 +226,7 @@ impl HelmLintChecker {
                 details["name"] = json!(null);
             }
 
-            // --- version (valid semver) --------------------------------------
-            let version = map
-                .and_then(|m| m.get(serde_yaml::Value::String("version".to_string())))
-                .and_then(|v| v.as_str());
+            let version = yaml_str_field(map, "version");
 
             if let Some(ver) = version {
                 if is_valid_semver(ver) {
@@ -266,10 +257,7 @@ impl HelmLintChecker {
                 details["version"] = json!(null);
             }
 
-            // --- description -------------------------------------------------
-            let description = map
-                .and_then(|m| m.get(serde_yaml::Value::String("description".to_string())))
-                .and_then(|v| v.as_str());
+            let description = yaml_str_field(map, "description");
 
             if description.is_some() {
                 score += 5; // has description
@@ -285,10 +273,7 @@ impl HelmLintChecker {
                 details["has_description"] = json!(false);
             }
 
-            // --- appVersion --------------------------------------------------
-            let app_version = map
-                .and_then(|m| m.get(serde_yaml::Value::String("appVersion".to_string())))
-                .and_then(|v| v.as_str());
+            let app_version = yaml_str_field(map, "appVersion");
 
             if app_version.is_some() {
                 score += 5; // has appVersion
@@ -306,7 +291,6 @@ impl HelmLintChecker {
                 details["has_app_version"] = json!(false);
             }
 
-            // --- maintainers -------------------------------------------------
             let maintainers = map
                 .and_then(|m| m.get(serde_yaml::Value::String("maintainers".to_string())))
                 .and_then(|v| v.as_sequence());
@@ -390,6 +374,12 @@ impl HelmLintChecker {
     }
 }
 
+/// Look up a string field in a YAML mapping by key name.
+fn yaml_str_field<'a>(map: Option<&'a serde_yaml::Mapping>, key: &str) -> Option<&'a str> {
+    map.and_then(|m| m.get(serde_yaml::Value::String(key.to_string())))
+        .and_then(|v| v.as_str())
+}
+
 /// Validate that a string looks like a semver version: MAJOR.MINOR.PATCH with
 /// optional pre-release and build metadata segments.
 ///
@@ -405,17 +395,11 @@ fn is_valid_semver(version: &str) -> bool {
     // Strip optional leading 'v' which is common but not strict semver.
     let v = version.strip_prefix('v').unwrap_or(version);
 
-    // Split off build metadata first (everything after '+')
-    let (before_build, _build_meta) = match v.split_once('+') {
-        Some((before, after)) => (before, Some(after)),
-        None => (v, None),
-    };
-
-    // Split off pre-release (everything after first '-' in the remaining part)
-    let (core, _prerelease) = match before_build.split_once('-') {
-        Some((core, pre)) => (core, Some(pre)),
-        None => (before_build, None),
-    };
+    // Strip build metadata (+...) then pre-release (-...) to isolate MAJOR.MINOR.PATCH
+    let before_build = v.split_once('+').map_or(v, |(before, _)| before);
+    let core = before_build
+        .split_once('-')
+        .map_or(before_build, |(c, _)| c);
 
     // Core must be exactly three dot-separated non-negative integers
     let parts: Vec<&str> = core.split('.').collect();
@@ -438,10 +422,6 @@ fn is_valid_semver(version: &str) -> bool {
 
     true
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
