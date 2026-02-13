@@ -55,7 +55,33 @@ impl MavenHandler {
     ) -> Result<(Option<String>, String)> {
         let expected_prefix = format!("{}-{}", artifact_id, version);
 
-        if !filename.starts_with(&expected_prefix) {
+        // For SNAPSHOT versions, Maven resolves the filename to a timestamp like:
+        // artifact-1.0.0-20260211.124623-1.jar instead of artifact-1.0.0-SNAPSHOT.jar
+        // Accept either the exact version or the timestamp-resolved form.
+        let snapshot_prefix = version
+            .strip_suffix("-SNAPSHOT")
+            .map(|base_version| format!("{}-{}", artifact_id, base_version));
+
+        let remainder = if filename.starts_with(&expected_prefix) {
+            &filename[expected_prefix.len()..]
+        } else if let Some(ref snap) = snapshot_prefix {
+            if filename.starts_with(snap) {
+                &filename[snap.len()..]
+            } else {
+                // Could be metadata file
+                if filename == "maven-metadata.xml"
+                    || filename.ends_with(".md5")
+                    || filename.ends_with(".sha1")
+                    || filename.ends_with(".sha256")
+                {
+                    return Ok((None, filename.to_string()));
+                }
+                return Err(AppError::Validation(format!(
+                    "Invalid Maven filename: expected to start with {}",
+                    expected_prefix
+                )));
+            }
+        } else {
             // Could be metadata file
             if filename == "maven-metadata.xml"
                 || filename.ends_with(".md5")
@@ -68,9 +94,7 @@ impl MavenHandler {
                 "Invalid Maven filename: expected to start with {}",
                 expected_prefix
             )));
-        }
-
-        let remainder = &filename[expected_prefix.len()..];
+        };
 
         if remainder.is_empty() {
             return Err(AppError::Validation(
@@ -360,6 +384,66 @@ mod tests {
             coords.to_path("mylib-1.0.0.jar"),
             "com/example/mylib/1.0.0/mylib-1.0.0.jar"
         );
+    }
+
+    #[test]
+    fn test_parse_snapshot_coordinates() {
+        // SNAPSHOT version with exact -SNAPSHOT filename
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/test/1.0.0-SNAPSHOT/test-1.0.0-SNAPSHOT.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.group_id, "com.example");
+        assert_eq!(coords.artifact_id, "test");
+        assert_eq!(coords.version, "1.0.0-SNAPSHOT");
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_snapshot_timestamp_coordinates() {
+        // SNAPSHOT version with timestamp-resolved filename (Maven deploy format)
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/test/1.0.0-SNAPSHOT/test-1.0.0-20260211.124623-1.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.group_id, "com.example");
+        assert_eq!(coords.artifact_id, "test");
+        assert_eq!(coords.version, "1.0.0-SNAPSHOT");
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_snapshot_timestamp_with_classifier() {
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/test/1.2.3-SNAPSHOT/test-1.2.3-20260211.124623-1-sources.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.artifact_id, "test");
+        assert_eq!(coords.version, "1.2.3-SNAPSHOT");
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_snapshot_pom() {
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/test/1.0.0-SNAPSHOT/test-1.0.0-20260211.124623-1.pom",
+        )
+        .unwrap();
+        assert_eq!(coords.artifact_id, "test");
+        assert_eq!(coords.version, "1.0.0-SNAPSHOT");
+        assert_eq!(coords.extension, "pom");
+    }
+
+    #[test]
+    fn test_parse_snapshot_metadata() {
+        // maven-metadata.xml in a SNAPSHOT version directory should still work
+        let coords =
+            MavenHandler::parse_coordinates("com/example/test/1.0.0-SNAPSHOT/maven-metadata.xml")
+                .unwrap();
+        assert_eq!(coords.artifact_id, "test");
+        assert_eq!(coords.version, "1.0.0-SNAPSHOT");
+        assert_eq!(coords.extension, "maven-metadata.xml");
     }
 
     #[test]
