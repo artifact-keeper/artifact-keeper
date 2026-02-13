@@ -14,6 +14,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::meili_service::{ArtifactDocument, MeiliService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
+use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
 use crate::storage::StorageBackend;
@@ -25,6 +26,7 @@ pub struct ArtifactService {
     repo_service: RepositoryService,
     plugin_service: Option<Arc<PluginService>>,
     scanner_service: Option<Arc<ScannerService>>,
+    quality_check_service: Option<Arc<QualityCheckService>>,
     meili_service: Option<Arc<MeiliService>>,
 }
 
@@ -38,6 +40,7 @@ impl ArtifactService {
             repo_service,
             plugin_service: None,
             scanner_service: None,
+            quality_check_service: None,
             meili_service: None,
         }
     }
@@ -55,6 +58,7 @@ impl ArtifactService {
             repo_service,
             plugin_service: None,
             scanner_service: None,
+            quality_check_service: None,
             meili_service,
         }
     }
@@ -72,6 +76,7 @@ impl ArtifactService {
             repo_service,
             plugin_service: Some(plugin_service),
             scanner_service: None,
+            quality_check_service: None,
             meili_service: None,
         }
     }
@@ -84,6 +89,11 @@ impl ArtifactService {
     /// Set the scanner service for scan-on-upload.
     pub fn set_scanner_service(&mut self, scanner_service: Arc<ScannerService>) {
         self.scanner_service = Some(scanner_service);
+    }
+
+    /// Set the quality check service for quality-on-upload.
+    pub fn set_quality_check_service(&mut self, qc_service: Arc<QualityCheckService>) {
+        self.quality_check_service = Some(qc_service);
     }
 
     /// Set the Meilisearch service for search indexing.
@@ -340,6 +350,21 @@ impl ArtifactService {
                     if let Err(e) = scanner.scan_artifact(artifact_id).await {
                         tracing::warn!("Auto-scan failed for artifact {}: {}", artifact_id, e);
                     }
+                }
+            });
+        }
+
+        // Trigger quality checks on upload (non-blocking)
+        if let Some(ref qc) = self.quality_check_service {
+            let qc = qc.clone();
+            let artifact_id = artifact.id;
+            tokio::spawn(async move {
+                if let Err(e) = qc.check_artifact(artifact_id).await {
+                    tracing::warn!(
+                        "Auto quality check failed for artifact {}: {}",
+                        artifact_id,
+                        e
+                    );
                 }
             });
         }

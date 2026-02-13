@@ -44,6 +44,7 @@ pub mod proxy_helpers;
 pub mod pub_registry;
 pub mod puppet;
 pub mod pypi;
+pub mod quality_gates;
 pub mod remote_instances;
 pub mod repositories;
 pub mod repository_labels;

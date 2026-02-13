@@ -318,6 +318,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Quality gates and health scoring routes with auth middleware
+        .nest(
+            "/quality",
+            handlers::quality_gates::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Dependency-Track proxy routes with auth middleware
         .nest(
             "/dependency-track",

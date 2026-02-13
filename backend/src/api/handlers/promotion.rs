@@ -226,6 +226,53 @@ pub async fn promote_artifact(
                 message: Some("Promotion blocked by policy violations".to_string()),
             }));
         }
+
+        // Evaluate quality gates (if quality check service is available)
+        if let Some(ref qc) = state.quality_check_service {
+            match qc.evaluate_quality_gate(artifact_id, source_repo.id).await {
+                Ok(gate_eval) => {
+                    if !gate_eval.passed && gate_eval.action == "block" {
+                        let gate_violations: Vec<PolicyViolation> = gate_eval
+                            .violations
+                            .iter()
+                            .map(|v| PolicyViolation {
+                                rule: v.rule.clone(),
+                                severity: "high".to_string(),
+                                message: v.message.clone(),
+                            })
+                            .collect();
+                        return Ok(Json(PromotionResponse {
+                            promoted: false,
+                            source: format!("{}/{}", repo_key, artifact.path),
+                            target: format!("{}/{}", req.target_repository, artifact.path),
+                            promotion_id: None,
+                            policy_violations: gate_violations,
+                            message: Some(format!(
+                                "Promotion blocked by quality gate '{}' (health score: {}, grade: {})",
+                                gate_eval.gate_name, gate_eval.health_score, gate_eval.health_grade
+                            )),
+                        }));
+                    }
+                    // Warn violations get appended but don't block
+                    if !gate_eval.passed {
+                        for v in &gate_eval.violations {
+                            policy_violations.push(PolicyViolation {
+                                rule: v.rule.clone(),
+                                severity: "medium".to_string(),
+                                message: v.message.clone(),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Quality gate evaluation failed for artifact {}: {}",
+                        artifact_id,
+                        e
+                    );
+                }
+            }
+        }
     }
 
     let new_artifact_id = Uuid::new_v4();

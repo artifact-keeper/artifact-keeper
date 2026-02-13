@@ -45,6 +45,7 @@ use utoipa::{Modify, OpenApi};
         (name = "telemetry", description = "Crash reporting and telemetry"),
         (name = "sso", description = "Single sign-on configuration"),
         (name = "migration", description = "Data migration and import"),
+        (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "health", description = "Health and readiness checks"),
     ),
     components(schemas(ErrorResponse))
@@ -119,6 +120,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::repository_labels::RepositoryLabelsApiDoc::openapi());
     doc.merge(super::handlers::sync_policies::SyncPoliciesApiDoc::openapi());
     doc.merge(super::handlers::peer_instance_labels::PeerInstanceLabelsApiDoc::openapi());
+    doc.merge(super::handlers::quality_gates::QualityGatesApiDoc::openapi());
 
     doc
 }
