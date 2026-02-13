@@ -157,6 +157,14 @@ async fn main() -> Result<()> {
         wasm_plugin_service,
     );
     app_state.set_scanner_service(scanner_service);
+
+    // Initialize quality check service for health scoring and quality gates
+    let quality_check_service = Arc::new(
+        artifact_keeper_backend::services::quality_check_service::QualityCheckService::new(
+            db_pool.clone(),
+        ),
+    );
+    app_state.set_quality_check_service(quality_check_service);
     if let Some(meili) = meili_service {
         app_state.set_meili_service(meili);
     }
