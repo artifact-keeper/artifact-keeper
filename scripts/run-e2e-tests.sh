@@ -11,6 +11,7 @@
 #   ./scripts/run-e2e-tests.sh --clean          # Clean up after tests
 #   ./scripts/run-e2e-tests.sh --stress         # Include stress tests
 #   ./scripts/run-e2e-tests.sh --failure        # Include failure injection tests
+#   ./scripts/run-e2e-tests.sh --mesh           # Run P2P mesh replication tests
 #
 # Profiles:
 #   smoke  - Quick tests: Playwright E2E + PyPI, NPM, Cargo native clients (default)
@@ -37,6 +38,7 @@ CLEAN_AFTER=false
 PROFILE="smoke"
 RUN_STRESS=false
 RUN_FAILURE=false
+RUN_MESH=false
 TEST_TAG=""
 
 # Parse arguments
@@ -62,6 +64,10 @@ while [[ $# -gt 0 ]]; do
             RUN_FAILURE=true
             shift
             ;;
+        --mesh)
+            RUN_MESH=true
+            shift
+            ;;
         --tag)
             TEST_TAG="$2"
             shift 2
@@ -75,6 +81,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --clean            Clean up containers and volumes after tests"
             echo "  --stress           Run stress tests after E2E tests"
             echo "  --failure          Run failure injection tests after E2E tests"
+            echo "  --mesh             Run P2P mesh replication tests"
             echo "  --tag TAG          Filter Playwright tests by tag (@smoke, @full)"
             echo "  --help             Show this help message"
             echo ""
@@ -100,6 +107,7 @@ echo ""
 echo -e "${BLUE}Profile: ${NC}$PROFILE"
 echo -e "${BLUE}Stress tests: ${NC}$RUN_STRESS"
 echo -e "${BLUE}Failure tests: ${NC}$RUN_FAILURE"
+echo -e "${BLUE}Mesh tests: ${NC}$RUN_MESH"
 [ -n "$TEST_TAG" ] && echo -e "${BLUE}Test tag filter: ${NC}$TEST_TAG"
 echo ""
 
@@ -192,12 +200,23 @@ if [ "$RUN_FAILURE" = true ]; then
     fi
 fi
 
+# Run P2P mesh replication tests if requested
+MESH_EXIT=0
+if [ "$RUN_MESH" = true ]; then
+    echo ""
+    echo -e "${BLUE}Running P2P mesh replication tests...${NC}"
+    docker compose -f docker-compose.mesh-e2e.yml up --abort-on-container-exit --exit-code-from mesh-test
+    MESH_EXIT=$?
+    docker compose -f docker-compose.mesh-e2e.yml down -v
+fi
+
 # Calculate overall exit code
 EXIT_CODE=0
 [ $PLAYWRIGHT_EXIT -ne 0 ] && EXIT_CODE=1
 [ $NATIVE_EXIT -ne 0 ] && EXIT_CODE=1
 [ $STRESS_EXIT -ne 0 ] && EXIT_CODE=1
 [ $FAILURE_EXIT -ne 0 ] && EXIT_CODE=1
+[ $MESH_EXIT -ne 0 ] && EXIT_CODE=1
 
 # Report results
 echo ""
@@ -237,6 +256,15 @@ if [ "$RUN_FAILURE" = true ]; then
         echo -e "${GREEN}  ✅ Failure Tests: PASSED${NC}"
     else
         echo -e "${RED}  ❌ Failure Tests: FAILED${NC}"
+    fi
+fi
+
+# Mesh test results
+if [ "$RUN_MESH" = true ]; then
+    if [ $MESH_EXIT -eq 0 ]; then
+        echo -e "${GREEN}  ✅ Mesh Replication Tests: PASSED${NC}"
+    else
+        echo -e "${RED}  ❌ Mesh Replication Tests: FAILED${NC}"
     fi
 fi
 

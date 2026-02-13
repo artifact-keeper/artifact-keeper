@@ -1,0 +1,153 @@
+# Docker Compose configuration for P2P Mesh Replication E2E Tests
+#
+# Usage:
+#   docker compose -f docker-compose.mesh-e2e.yml up --abort-on-container-exit --exit-code-from mesh-test
+#   docker compose -f docker-compose.mesh-e2e.yml down -v
+#
+# Spins up two independent backend peers (each with its own Postgres) and runs
+# mesh replication tests that verify peer registration, sync policies, artifact
+# replication, and heartbeat functionality.
+
+services:
+  # ==========================================================================
+  # PEER A - Database
+  # ==========================================================================
+
+  postgres-peer-a:
+    image: docker.io/postgres:16-alpine
+    container_name: mesh-e2e-db-peer-a
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mesh-e2e-network
+
+  # ==========================================================================
+  # PEER B - Database
+  # ==========================================================================
+
+  postgres-peer-b:
+    image: docker.io/postgres:16-alpine
+    container_name: mesh-e2e-db-peer-b
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mesh-e2e-network
+
+  # ==========================================================================
+  # PEER A - Backend
+  # ==========================================================================
+
+  backend-peer-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: mesh-e2e-backend-peer-a
+    depends_on:
+      postgres-peer-a:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres-peer-a:5432/artifact_registry
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      JWT_SECRET: mesh-e2e-secret-key-32-bytes-long
+      ADMIN_PASSWORD: admin123
+      RUST_LOG: info,artifact_keeper=debug
+      HOST: 0.0.0.0
+      PORT: 8080
+      GRPC_PORT: 9090
+      PEER_INSTANCE_NAME: peer-a
+      PEER_INSTANCE_ENDPOINT: http://backend-peer-a:8080
+      PEER_INSTANCE_REGION: us-east-1
+    volumes:
+      - mesh-peer-a-storage:/data/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 10s
+      start_period: 30s
+      retries: 10
+    networks:
+      - mesh-e2e-network
+
+  # ==========================================================================
+  # PEER B - Backend
+  # ==========================================================================
+
+  backend-peer-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: mesh-e2e-backend-peer-b
+    depends_on:
+      postgres-peer-b:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres-peer-b:5432/artifact_registry
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      JWT_SECRET: mesh-e2e-secret-key-32-bytes-long
+      ADMIN_PASSWORD: admin123
+      RUST_LOG: info,artifact_keeper=debug
+      HOST: 0.0.0.0
+      PORT: 8080
+      GRPC_PORT: 9090
+      PEER_INSTANCE_NAME: peer-b
+      PEER_INSTANCE_ENDPOINT: http://backend-peer-b:8080
+      PEER_INSTANCE_REGION: us-west-2
+    volumes:
+      - mesh-peer-b-storage:/data/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 10s
+      start_period: 30s
+      retries: 10
+    networks:
+      - mesh-e2e-network
+
+  # ==========================================================================
+  # TEST RUNNER
+  # ==========================================================================
+
+  mesh-test:
+    image: docker.io/alpine:3.19
+    container_name: mesh-e2e-test
+    depends_on:
+      backend-peer-a:
+        condition: service_healthy
+      backend-peer-b:
+        condition: service_healthy
+    volumes:
+      - ./scripts/mesh-e2e:/scripts:ro
+    command: sh /scripts/run-all-mesh-tests.sh
+    networks:
+      - mesh-e2e-network
+
+networks:
+  mesh-e2e-network:
+    name: mesh-e2e-network
+    driver: bridge
+
+volumes:
+  mesh-peer-a-storage:
+  mesh-peer-b-storage:
