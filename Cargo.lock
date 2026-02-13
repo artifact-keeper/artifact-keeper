@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "artifact-keeper-backend"
-version = "1.0.0-rc.5"
+version = "1.1.0-rc.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "artifact-keeper-edge"
-version = "1.0.0-rc.5"
+version = "1.1.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",

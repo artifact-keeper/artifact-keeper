@@ -229,6 +229,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "opkg" => Ok(RepositoryFormat::Opkg),
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
+        "protobuf" => Ok(RepositoryFormat::Protobuf),
         _ => Err(AppError::Validation(format!("Invalid format: {}", s))),
     }
 }
