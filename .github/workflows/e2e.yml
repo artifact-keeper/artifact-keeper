@@ -110,6 +110,16 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Build backend image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          load: true
+          tags: artifact-keeper-backend:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Download PKI assets
         uses: actions/download-artifact@v4
         with:
@@ -132,11 +142,9 @@ jobs:
           if [ "$PROFILE" = "smoke" ] || [ -z "$PROFILE" ]; then
             # Default smoke tests run without a profile flag
             docker compose -f docker-compose.test.yml --profile smoke up \
-              --build \
               --abort-on-container-exit
           else
             docker compose -f docker-compose.test.yml --profile "$PROFILE" up \
-              --build \
               --abort-on-container-exit
           fi
 

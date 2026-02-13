@@ -126,10 +126,19 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Build backend image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          load: true
+          tags: artifact-keeper-backend:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Run smoke E2E tests (PyPI, npm, Cargo)
         run: |
           docker compose -f docker-compose.test.yml --profile smoke up \
-            --build \
             --abort-on-container-exit
 
       - name: Cleanup

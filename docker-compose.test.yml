@@ -44,6 +44,7 @@ services:
       - e2e-test-network
 
   backend:
+    image: artifact-keeper-backend:test
     build:
       context: .
       dockerfile: Dockerfile.backend
