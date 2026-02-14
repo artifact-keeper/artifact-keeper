@@ -6,7 +6,13 @@ RUN dnf install -y --nodocs \
     openssl-devel zlib-devel xz-devel bzip2-devel \
     unzip \
     && dnf clean all && \
-    curl -sSfL https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip \
+    ARCH=$(uname -m) && \
+    case "$ARCH" in \
+      x86_64)  PROTOC_ARCH="linux-x86_64" ;; \
+      aarch64) PROTOC_ARCH="linux-aarch_64" ;; \
+      *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
+    esac && \
+    curl -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip" \
       -o /tmp/protoc.zip && \
     unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 && \
