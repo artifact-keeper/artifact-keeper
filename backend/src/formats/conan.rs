@@ -1009,7 +1009,7 @@ CMakeDeps
 
     #[test]
     fn test_conan_handler_default() {
-        let handler = ConanHandler::default();
+        let handler = ConanHandler;
         assert_eq!(handler.format(), RepositoryFormat::Conan);
     }
 

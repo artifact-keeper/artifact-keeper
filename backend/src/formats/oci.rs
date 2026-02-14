@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn test_oci_handler_default() {
-        let handler = OciHandler::default();
+        let handler = OciHandler;
         assert_eq!(handler.format(), RepositoryFormat::Docker);
     }
 

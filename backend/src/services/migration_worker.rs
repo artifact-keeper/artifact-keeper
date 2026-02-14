@@ -1251,7 +1251,7 @@ mod tests {
                 skipped: 0,
                 transferred_bytes: 0,
                 current_item: None,
-                status: status.clone(),
+                status: *status,
             };
             let _ = format!("{:?}", update);
         }

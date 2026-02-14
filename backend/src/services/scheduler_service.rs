@@ -318,6 +318,28 @@ fn compute_next_run(cron_expr: &str) -> Option<chrono::DateTime<Utc>> {
     }
 }
 
+/// Update Prometheus gauge metrics from database state.
+async fn update_gauge_metrics(db: &PgPool) -> crate::error::Result<()> {
+    let stats = sqlx::query_as::<_, GaugeStats>(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM repositories) as repos,
+            (SELECT COUNT(*) FROM artifacts WHERE is_deleted = false) as artifacts,
+            (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM artifacts WHERE is_deleted = false) as storage,
+            (SELECT COUNT(*) FROM users) as users
+        "#,
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+
+    metrics_service::set_storage_gauge(stats.storage, stats.artifacts, stats.repos);
+    metrics_service::set_user_gauge(stats.users);
+    metrics_service::set_db_pool_gauges(db);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,26 +589,4 @@ mod tests {
         assert!(next.is_some());
         assert!(next.unwrap() > Utc::now());
     }
-}
-
-/// Update Prometheus gauge metrics from database state.
-async fn update_gauge_metrics(db: &PgPool) -> crate::error::Result<()> {
-    let stats = sqlx::query_as::<_, GaugeStats>(
-        r#"
-        SELECT
-            (SELECT COUNT(*) FROM repositories) as repos,
-            (SELECT COUNT(*) FROM artifacts WHERE is_deleted = false) as artifacts,
-            (SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM artifacts WHERE is_deleted = false) as storage,
-            (SELECT COUNT(*) FROM users) as users
-        "#,
-    )
-    .fetch_one(db)
-    .await
-    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
-
-    metrics_service::set_storage_gauge(stats.storage, stats.artifacts, stats.repos);
-    metrics_service::set_user_gauge(stats.users);
-    metrics_service::set_db_pool_gauges(db);
-
-    Ok(())
 }

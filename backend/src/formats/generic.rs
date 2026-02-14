@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn test_generic_handler_default() {
-        let handler = GenericHandler::default();
+        let handler = GenericHandler;
         assert_eq!(handler.format(), RepositoryFormat::Generic);
     }
 

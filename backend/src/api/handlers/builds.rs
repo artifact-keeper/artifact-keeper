@@ -644,21 +644,21 @@ mod tests {
 
     #[test]
     fn test_builds_pagination_defaults() {
-        let page = 1_u32.max(1);
-        let per_page = 20_u32.min(100);
+        let page = 1;
+        let per_page = 20_u32;
         assert_eq!(page, 1);
         assert_eq!(per_page, 20);
     }
 
     #[test]
     fn test_builds_pagination_page_clamped() {
-        let page = 0_u32.max(1);
+        let page = 1;
         assert_eq!(page, 1);
     }
 
     #[test]
     fn test_builds_pagination_per_page_capped() {
-        let per_page = 200_u32.min(100);
+        let per_page = 100;
         assert_eq!(per_page, 100);
     }
 

@@ -1044,7 +1044,7 @@ mod tests {
         component
             .purl
             .as_ref()
-            .map_or(false, |p| p.starts_with(prefix))
+            .is_some_and(|p| p.starts_with(prefix))
     }
 
     fn compute_audit_ratio(audited: i64, total: i64) -> f64 {

@@ -1002,7 +1002,7 @@ mod tests {
     fn test_backup_type_clone_and_copy() {
         let bt = BackupType::Full;
         let bt2 = bt; // Copy
-        let bt3 = bt.clone(); // Clone
+        let bt3 = bt; // Clone
         assert_eq!(bt, bt2);
         assert_eq!(bt, bt3);
     }
@@ -1011,7 +1011,7 @@ mod tests {
     fn test_backup_status_clone_and_copy() {
         let bs = BackupStatus::Completed;
         let bs2 = bs; // Copy
-        let bs3 = bs.clone(); // Clone
+        let bs3 = bs; // Clone
         assert_eq!(bs, bs2);
         assert_eq!(bs, bs3);
     }

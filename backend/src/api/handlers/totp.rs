@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_backup_codes_skip_empty_hashes() {
-        let hashed_codes = vec!["".to_string(), "valid_hash".to_string(), "".to_string()];
+        let hashed_codes = ["".to_string(), "valid_hash".to_string(), "".to_string()];
         let non_empty: Vec<_> = hashed_codes.iter().filter(|h| !h.is_empty()).collect();
         assert_eq!(non_empty.len(), 1);
         assert_eq!(*non_empty[0], "valid_hash");

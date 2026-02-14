@@ -383,7 +383,7 @@ mod tests {
         let deserialized: ScanPolicy = serde_json::from_str(&json_str).unwrap();
         assert_eq!(deserialized.name, "test-policy");
         assert_eq!(deserialized.max_severity, "medium");
-        assert_eq!(deserialized.block_unscanned, true);
+        assert!(deserialized.block_unscanned);
         assert_eq!(deserialized.min_staging_hours, Some(48));
         assert!(deserialized.max_artifact_age_days.is_none());
     }

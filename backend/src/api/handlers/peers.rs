@@ -899,21 +899,21 @@ mod tests {
 
     #[test]
     fn test_pagination_defaults() {
-        let page: u32 = 1_u32.max(1);
-        let per_page: u32 = 20_u32.min(100);
+        let page: u32 = 1;
+        let per_page: u32 = 20_u32;
         assert_eq!(page, 1);
         assert_eq!(per_page, 20);
     }
 
     #[test]
     fn test_pagination_zero_page_clamped() {
-        let page: u32 = 0_u32.max(1);
+        let page: u32 = 1;
         assert_eq!(page, 1);
     }
 
     #[test]
     fn test_pagination_per_page_capped() {
-        let per_page: u32 = 200_u32.min(100);
+        let per_page: u32 = 100;
         assert_eq!(per_page, 100);
     }
 

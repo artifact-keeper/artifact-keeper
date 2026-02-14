@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_advanced_search_page_defaults() {
-        let page = 1_u32.max(1);
+        let page = 1;
         let per_page = 20_u32.clamp(1, 100);
         assert_eq!(page, 1);
         assert_eq!(per_page, 20);
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_advanced_search_page_zero_clamped() {
-        let page = 0_u32.max(1);
+        let page = 1;
         assert_eq!(page, 1);
     }
 

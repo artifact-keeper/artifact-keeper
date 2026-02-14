@@ -744,7 +744,7 @@ mod tests {
     }
 
     fn is_in_backoff(backoff_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-        backoff_until.map_or(false, |bu| now < bu)
+        backoff_until.is_some_and(|bu| now < bu)
     }
 
     fn has_transfer_capacity(
@@ -828,7 +828,7 @@ mod tests {
     fn test_instance_status_clone_copy() {
         let s = InstanceStatus::Syncing;
         let s2 = s;
-        let s3 = s.clone();
+        let s3 = s;
         assert_eq!(s, s2);
         assert_eq!(s, s3);
     }

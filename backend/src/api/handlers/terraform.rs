@@ -998,6 +998,159 @@ async fn download_provider(
         .unwrap())
 }
 
+async fn upload_provider(
+    State(state): State<SharedState>,
+    Path((repo_key, namespace, type_name, version, os, arch)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+    let provider_name = format!("{}/{}", namespace, type_name);
+    let platform = format!("{}_{}", os, arch);
+
+    let artifact_path = format!("{}/{}/{}/{}", namespace, type_name, version, platform);
+
+    // Check for duplicate
+    let existing = sqlx::query_scalar!(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 AND path = $4 AND is_deleted = false",
+        repo.id,
+        provider_name,
+        version,
+        artifact_path,
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    if existing.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Provider {} version {} for {} already exists",
+                provider_name, version, platform
+            ),
+        )
+            .into_response());
+    }
+
+    // Compute SHA256
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    let checksum = format!("{:x}", hasher.finalize());
+
+    let size_bytes = body.len() as i64;
+    let storage_key = format!(
+        "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
+        namespace, type_name, version, type_name, platform
+    );
+
+    // Store the file
+    let storage = FilesystemStorage::new(&repo.storage_path);
+    storage.put(&storage_key, body).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    // Insert artifact record
+    let artifact_id = sqlx::query_scalar!(
+        r#"
+        INSERT INTO artifacts (
+            repository_id, path, name, version, size_bytes,
+            checksum_sha256, content_type, storage_key, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        "#,
+        repo.id,
+        artifact_path,
+        provider_name,
+        version,
+        size_bytes,
+        checksum,
+        "application/zip",
+        storage_key,
+        user_id,
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    // Store metadata
+    let metadata = serde_json::json!({
+        "kind": "provider",
+        "namespace": namespace,
+        "type": type_name,
+        "version": version,
+        "os": os,
+        "arch": arch,
+    });
+
+    let _ = sqlx::query!(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'terraform', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+        artifact_id,
+        metadata,
+    )
+    .execute(&state.db)
+    .await;
+
+    // Update repository timestamp
+    let _ = sqlx::query!(
+        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
+        repo.id,
+    )
+    .execute(&state.db)
+    .await;
+
+    info!(
+        "Terraform provider upload: {}/{} v{} ({}) to repo {}",
+        namespace, type_name, version, platform, repo_key
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::CREATED)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_string(&serde_json::json!({
+                "namespace": namespace,
+                "type": type_name,
+                "version": version,
+                "os": os,
+                "arch": arch,
+                "checksum": checksum,
+            }))
+            .unwrap(),
+        ))
+        .unwrap())
+}
+
 // ---------------------------------------------------------------------------
 // PUT /v1/modules/{namespace}/{name}/{provider}/{version} — Upload module
 // (handled above)
@@ -1929,157 +2082,4 @@ mod tests {
     fn test_build_search_pattern_special_chars() {
         assert_eq!(build_search_pattern("my-module"), "%my-module%");
     }
-}
-
-async fn upload_provider(
-    State(state): State<SharedState>,
-    Path((repo_key, namespace, type_name, version, os, arch)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, Response> {
-    let user_id = authenticate(&state.db, &state.config, &headers).await?;
-    let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
-    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
-    let provider_name = format!("{}/{}", namespace, type_name);
-    let platform = format!("{}_{}", os, arch);
-
-    let artifact_path = format!("{}/{}/{}/{}", namespace, type_name, version, platform);
-
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND name = $2 AND version = $3 AND path = $4 AND is_deleted = false",
-        repo.id,
-        provider_name,
-        version,
-        artifact_path,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Provider {} version {} for {} already exists",
-                provider_name, version, platform
-            ),
-        )
-            .into_response());
-    }
-
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum = format!("{:x}", hasher.finalize());
-
-    let size_bytes = body.len() as i64;
-    let storage_key = format!(
-        "terraform/providers/{}/{}/{}/terraform-provider-{}_{}.zip",
-        namespace, type_name, version, type_name, platform
-    );
-
-    // Store the file
-    let storage = FilesystemStorage::new(&repo.storage_path);
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        provider_name,
-        version,
-        size_bytes,
-        checksum,
-        "application/zip",
-        storage_key,
-        user_id,
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Store metadata
-    let metadata = serde_json::json!({
-        "kind": "provider",
-        "namespace": namespace,
-        "type": type_name,
-        "version": version,
-        "os": os,
-        "arch": arch,
-    });
-
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'terraform', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
-
-    info!(
-        "Terraform provider upload: {}/{} v{} ({}) to repo {}",
-        namespace, type_name, version, platform, repo_key
-    );
-
-    Ok(Response::builder()
-        .status(StatusCode::CREATED)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({
-                "namespace": namespace,
-                "type": type_name,
-                "version": version,
-                "os": os,
-                "arch": arch,
-                "checksum": checksum,
-            }))
-            .unwrap(),
-        ))
-        .unwrap())
 }
