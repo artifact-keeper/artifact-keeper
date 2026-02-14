@@ -123,6 +123,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::peer_instance_labels::PeerInstanceLabelsApiDoc::openapi());
     doc.merge(super::handlers::quality_gates::QualityGatesApiDoc::openapi());
     doc.merge(super::handlers::approval::ApprovalApiDoc::openapi());
+    doc.merge(super::handlers::promotion_rules::PromotionRulesApiDoc::openapi());
 
     doc
 }

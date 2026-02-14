@@ -40,6 +40,7 @@ pub mod permissions;
 pub mod plugins;
 pub mod profile;
 pub mod promotion;
+pub mod promotion_rules;
 pub mod protobuf;
 pub mod proxy_helpers;
 pub mod pub_registry;

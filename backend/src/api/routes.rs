@@ -321,6 +321,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Auto-promotion rules with auth middleware
+        .nest(
+            "/promotion-rules",
+            handlers::promotion_rules::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Promotion approval workflow routes with auth middleware
         .nest(
             "/approval",

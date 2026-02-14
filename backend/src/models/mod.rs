@@ -10,6 +10,7 @@ pub mod peer_connection;
 pub mod peer_instance;
 pub mod plugin;
 pub mod plugin_manifest;
+pub mod promotion;
 pub mod quality;
 pub mod repository;
 pub mod role;
