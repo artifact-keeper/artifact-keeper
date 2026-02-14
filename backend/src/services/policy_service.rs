@@ -23,18 +23,18 @@ impl PolicyService {
         repository_id: Uuid,
     ) -> Result<PolicyResult> {
         // Find applicable policies: repo-specific + global (repository_id IS NULL)
-        let policies = sqlx::query_as!(
-            ScanPolicy,
+        let policies: Vec<ScanPolicy> = sqlx::query_as(
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
-                   block_on_fail, is_enabled, created_at, updated_at
+                   block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                   require_signature, created_at, updated_at
             FROM scan_policies
             WHERE is_enabled = true
               AND (repository_id = $1 OR repository_id IS NULL)
             ORDER BY repository_id NULLS LAST
             "#,
-            repository_id,
         )
+        .bind(repository_id)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -49,7 +49,22 @@ impl PolicyService {
         let mut violations = Vec::new();
 
         // Check for completed scans on this artifact
-        let latest_scan = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct ScanRow {
+            status: String,
+            #[allow(dead_code)]
+            findings_count: i32,
+            #[allow(dead_code)]
+            critical_count: i32,
+            #[allow(dead_code)]
+            high_count: i32,
+            #[allow(dead_code)]
+            medium_count: i32,
+            #[allow(dead_code)]
+            low_count: i32,
+        }
+
+        let latest_scan: Option<ScanRow> = sqlx::query_as(
             r#"
             SELECT status, findings_count, critical_count, high_count, medium_count, low_count
             FROM scan_results
@@ -57,8 +72,8 @@ impl PolicyService {
             ORDER BY created_at DESC
             LIMIT 1
             "#,
-            artifact_id,
         )
+        .bind(artifact_id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -86,9 +101,9 @@ impl PolicyService {
                         .unwrap_or(Severity::Critical);
 
                     // Count non-acknowledged findings at or above the threshold
-                    let violating_count = sqlx::query_scalar!(
+                    let violating_count: i64 = sqlx::query_scalar(
                         r#"
-                        SELECT COUNT(*) as "count!"
+                        SELECT COUNT(*)
                         FROM scan_findings
                         WHERE artifact_id = $1
                           AND NOT is_acknowledged
@@ -101,9 +116,9 @@ impl PolicyService {
                               END)
                           )
                         "#,
-                        artifact_id,
-                        policy.max_severity,
                     )
+                    .bind(artifact_id)
+                    .bind(&policy.max_severity)
                     .fetch_one(&self.db)
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -128,6 +143,7 @@ impl PolicyService {
     // CRUD
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_policy(
         &self,
         name: &str,
@@ -135,21 +151,28 @@ impl PolicyService {
         max_severity: &str,
         block_unscanned: bool,
         block_on_fail: bool,
+        min_staging_hours: Option<i32>,
+        max_artifact_age_days: Option<i32>,
+        require_signature: bool,
     ) -> Result<ScanPolicy> {
-        let policy = sqlx::query_as!(
-            ScanPolicy,
+        let policy: ScanPolicy = sqlx::query_as(
             r#"
-            INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, block_on_fail)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, block_on_fail,
+                                       min_staging_hours, max_artifact_age_days, require_signature)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id, name, repository_id, max_severity, block_unscanned,
-                      block_on_fail, is_enabled, created_at, updated_at
+                      block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                      require_signature, created_at, updated_at
             "#,
-            name,
-            repository_id,
-            max_severity,
-            block_unscanned,
-            block_on_fail,
         )
+        .bind(name)
+        .bind(repository_id)
+        .bind(max_severity)
+        .bind(block_unscanned)
+        .bind(block_on_fail)
+        .bind(min_staging_hours)
+        .bind(max_artifact_age_days)
+        .bind(require_signature)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -158,11 +181,11 @@ impl PolicyService {
     }
 
     pub async fn list_policies(&self) -> Result<Vec<ScanPolicy>> {
-        let policies = sqlx::query_as!(
-            ScanPolicy,
+        let policies: Vec<ScanPolicy> = sqlx::query_as(
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
-                   block_on_fail, is_enabled, created_at, updated_at
+                   block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                   require_signature, created_at, updated_at
             FROM scan_policies
             ORDER BY created_at DESC
             "#,
@@ -175,22 +198,23 @@ impl PolicyService {
     }
 
     pub async fn get_policy(&self, id: Uuid) -> Result<ScanPolicy> {
-        sqlx::query_as!(
-            ScanPolicy,
+        sqlx::query_as::<_, ScanPolicy>(
             r#"
             SELECT id, name, repository_id, max_severity, block_unscanned,
-                   block_on_fail, is_enabled, created_at, updated_at
+                   block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                   require_signature, created_at, updated_at
             FROM scan_policies
             WHERE id = $1
             "#,
-            id,
         )
+        .bind(id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Policy not found".to_string()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_policy(
         &self,
         id: Uuid,
@@ -199,24 +223,31 @@ impl PolicyService {
         block_unscanned: bool,
         block_on_fail: bool,
         is_enabled: bool,
+        min_staging_hours: Option<i32>,
+        max_artifact_age_days: Option<i32>,
+        require_signature: bool,
     ) -> Result<ScanPolicy> {
-        let policy = sqlx::query_as!(
-            ScanPolicy,
+        let policy: ScanPolicy = sqlx::query_as(
             r#"
             UPDATE scan_policies
             SET name = $2, max_severity = $3, block_unscanned = $4,
-                block_on_fail = $5, is_enabled = $6, updated_at = NOW()
+                block_on_fail = $5, is_enabled = $6, min_staging_hours = $7,
+                max_artifact_age_days = $8, require_signature = $9, updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, repository_id, max_severity, block_unscanned,
-                      block_on_fail, is_enabled, created_at, updated_at
+                      block_on_fail, is_enabled, min_staging_hours, max_artifact_age_days,
+                      require_signature, created_at, updated_at
             "#,
-            id,
-            name,
-            max_severity,
-            block_unscanned,
-            block_on_fail,
-            is_enabled,
         )
+        .bind(id)
+        .bind(name)
+        .bind(max_severity)
+        .bind(block_unscanned)
+        .bind(block_on_fail)
+        .bind(is_enabled)
+        .bind(min_staging_hours)
+        .bind(max_artifact_age_days)
+        .bind(require_signature)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -226,7 +257,8 @@ impl PolicyService {
     }
 
     pub async fn delete_policy(&self, id: Uuid) -> Result<()> {
-        let result = sqlx::query!("DELETE FROM scan_policies WHERE id = $1", id)
+        let result = sqlx::query("DELETE FROM scan_policies WHERE id = $1")
+            .bind(id)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;

@@ -202,6 +202,9 @@ impl From<crate::models::security::ScanPolicy> for PolicyResponse {
             block_unscanned: p.block_unscanned,
             block_on_fail: p.block_on_fail,
             is_enabled: p.is_enabled,
+            min_staging_hours: p.min_staging_hours,
+            max_artifact_age_days: p.max_artifact_age_days,
+            require_signature: p.require_signature,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -319,6 +322,10 @@ pub struct CreatePolicyRequest {
     pub max_severity: String,
     pub block_unscanned: bool,
     pub block_on_fail: bool,
+    pub min_staging_hours: Option<i32>,
+    pub max_artifact_age_days: Option<i32>,
+    #[serde(default)]
+    pub require_signature: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -328,6 +335,10 @@ pub struct UpdatePolicyRequest {
     pub block_unscanned: bool,
     pub block_on_fail: bool,
     pub is_enabled: bool,
+    pub min_staging_hours: Option<i32>,
+    pub max_artifact_age_days: Option<i32>,
+    #[serde(default)]
+    pub require_signature: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -339,6 +350,9 @@ pub struct PolicyResponse {
     pub block_unscanned: bool,
     pub block_on_fail: bool,
     pub is_enabled: bool,
+    pub min_staging_hours: Option<i32>,
+    pub max_artifact_age_days: Option<i32>,
+    pub require_signature: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -711,6 +725,9 @@ async fn create_policy(
             &body.max_severity,
             body.block_unscanned,
             body.block_on_fail,
+            body.min_staging_hours,
+            body.max_artifact_age_days,
+            body.require_signature,
         )
         .await?;
 
@@ -772,6 +789,9 @@ async fn update_policy(
             body.block_unscanned,
             body.block_on_fail,
             body.is_enabled,
+            body.min_staging_hours,
+            body.max_artifact_age_days,
+            body.require_signature,
         )
         .await?;
 

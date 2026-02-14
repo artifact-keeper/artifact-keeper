@@ -212,6 +212,9 @@ pub struct ScanPolicy {
     pub block_unscanned: bool,
     pub block_on_fail: bool,
     pub is_enabled: bool,
+    pub min_staging_hours: Option<i32>,
+    pub max_artifact_age_days: Option<i32>,
+    pub require_signature: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
