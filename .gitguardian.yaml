@@ -2,7 +2,7 @@ version: 2
 
 secret:
   # Paths to ignore (test files with intentional test credentials)
-  ignored-paths:
+  ignored_paths:
     - "**/tests/**"
     - "**/test_*.rs"
     - "**/test-*.sh"
@@ -21,35 +21,35 @@ secret:
     - "backend/src/api/middleware/*.rs"
 
   # Specific patterns to ignore
-  ignored-matches:
+  ignored_matches:
     # Test RSA keys for unit testing (GCS, CloudFront backends)
-    - match: "BEGIN PRIVATE KEY"
-      name: "Test RSA key for unit tests"
-    - match: "BEGIN RSA PRIVATE KEY"
-      name: "Test RSA key for unit tests"
-    - match: "END PRIVATE KEY"
-      name: "Test RSA key for unit tests"
+    - name: "Test RSA key for unit tests"
+      match: "BEGIN PRIVATE KEY"
+    - name: "Test RSA key for unit tests"
+      match: "BEGIN RSA PRIVATE KEY"
+    - name: "Test RSA key for unit tests"
+      match: "END PRIVATE KEY"
 
-    # Default test password used in examples and integration tests
-    - match: "admin123"
-      name: "Default test password"
-    - match: "secret123"
-      name: "Test password in unit tests"
-    - match: "password123"
-      name: "Test password in unit tests"
-    - match: "test-secret"
-      name: "Test secret in unit tests"
-    - match: "test-key"
-      name: "Test key in unit tests"
-    - match: "test-api-key"
-      name: "Test API key in unit tests"
-    - match: "my-secret-key"
-      name: "Test webhook secret in unit tests"
+    # Default test passwords used in examples and unit tests
+    - name: "Default test password"
+      match: "admin123"
+    - name: "Test password in unit tests"
+      match: "secret123"
+    - name: "Test password in unit tests"
+      match: "password123"
+    - name: "Test secret in unit tests"
+      match: "test-secret"
+    - name: "Test key in unit tests"
+      match: "test-key"
+    - name: "Test API key in unit tests"
+      match: "test-api-key"
+    - name: "Test webhook secret in unit tests"
+      match: "my-secret-key"
 
     # GCS test service account
-    - match: "iam.gserviceaccount.com"
-      name: "Test GCS service account email"
+    - name: "Test GCS service account email"
+      match: "iam.gserviceaccount.com"
 
     # Astro build cache hashes
-    - match: "data-store.json"
-      name: "Astro build cache"
+    - name: "Astro build cache"
+      match: "data-store.json"

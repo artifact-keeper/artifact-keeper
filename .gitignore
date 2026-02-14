@@ -67,6 +67,8 @@ data/
 *.key
 secrets/
 credentials/
+# Allow test fixture keys (generated, not real credentials)
+!backend/test_fixtures/*.pem
 
 # Backup files
 *.bak
