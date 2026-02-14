@@ -88,6 +88,69 @@ fn evaluate_cve_thresholds(
         .collect()
 }
 
+/// Evaluate age-based promotion gates, returning violations when the artifact
+/// hasn't been in staging long enough or is too old.
+fn evaluate_age_gates(
+    artifact_created_at: chrono::DateTime<chrono::Utc>,
+    min_staging_hours: Option<i32>,
+    max_artifact_age_days: Option<i32>,
+) -> Vec<PolicyViolation> {
+    let now = chrono::Utc::now();
+    let mut violations = Vec::new();
+
+    if let Some(min_hours) = min_staging_hours {
+        let hours_in_staging = (now - artifact_created_at).num_hours();
+        if hours_in_staging < min_hours as i64 {
+            violations.push(PolicyViolation {
+                rule: "min-staging-time".to_string(),
+                severity: "high".to_string(),
+                message: format!(
+                    "Artifact has only been in staging for {} hours (minimum: {} hours)",
+                    hours_in_staging, min_hours
+                ),
+                details: Some(serde_json::json!({
+                    "hours_in_staging": hours_in_staging,
+                    "min_staging_hours": min_hours
+                })),
+            });
+        }
+    }
+
+    if let Some(max_days) = max_artifact_age_days {
+        let age_days = (now - artifact_created_at).num_days();
+        if age_days > max_days as i64 {
+            violations.push(PolicyViolation {
+                rule: "max-artifact-age".to_string(),
+                severity: "medium".to_string(),
+                message: format!(
+                    "Artifact is {} days old (maximum: {} days)",
+                    age_days, max_days
+                ),
+                details: Some(serde_json::json!({
+                    "age_days": age_days,
+                    "max_artifact_age_days": max_days
+                })),
+            });
+        }
+    }
+
+    violations
+}
+
+/// Evaluate whether an artifact meets the signature requirement.
+fn evaluate_signature_requirement(has_signature: bool) -> Vec<PolicyViolation> {
+    if has_signature {
+        return vec![];
+    }
+
+    vec![PolicyViolation {
+        rule: "require-signature".to_string(),
+        severity: "high".to_string(),
+        message: "Artifact does not have a valid signature".to_string(),
+        details: None,
+    }]
+}
+
 /// Evaluate licenses found in an SBOM against a license policy, returning
 /// violations for denied or unrecognized licenses.
 fn evaluate_license_policy(
@@ -229,6 +292,40 @@ impl PromotionPolicyService {
             }
         }
 
+        // Evaluate age-based gates
+        if let Some(ref policy) = scan_policy {
+            if policy.min_staging_hours.is_some() || policy.max_artifact_age_days.is_some() {
+                if let Some(artifact_created_at) = self.get_artifact_created_at(artifact_id).await?
+                {
+                    let age_violations = evaluate_age_gates(
+                        artifact_created_at,
+                        policy.min_staging_hours,
+                        policy.max_artifact_age_days,
+                    );
+                    for v in age_violations {
+                        if v.severity == "high" {
+                            action = PolicyAction::Block;
+                        } else if action != PolicyAction::Block {
+                            action = PolicyAction::Warn;
+                        }
+                        violations.push(v);
+                    }
+                }
+            }
+
+            // Evaluate signature requirement
+            if policy.require_signature {
+                let has_signature = self
+                    .check_artifact_signature(artifact_id, repository_id)
+                    .await?;
+                let sig_violations = evaluate_signature_requirement(has_signature);
+                for v in sig_violations {
+                    action = PolicyAction::Block;
+                    violations.push(v);
+                }
+            }
+        }
+
         let passed = violations.is_empty();
 
         Ok(PolicyEvaluationResult {
@@ -241,17 +338,25 @@ impl PromotionPolicyService {
     }
 
     async fn get_cve_summary(&self, artifact_id: Uuid) -> Result<Option<CveSummary>> {
-        let scan = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct ScanRow {
+            critical_count: i32,
+            high_count: i32,
+            medium_count: i32,
+            low_count: i32,
+            findings_count: i32,
+        }
+
+        let scan: Option<ScanRow> = sqlx::query_as(
             r#"
-            SELECT
-                critical_count, high_count, medium_count, low_count, findings_count
+            SELECT critical_count, high_count, medium_count, low_count, findings_count
             FROM scan_results
             WHERE artifact_id = $1 AND status = 'completed'
             ORDER BY created_at DESC
             LIMIT 1
             "#,
-            artifact_id
         )
+        .bind(artifact_id)
         .fetch_optional(&self.db)
         .await?;
 
@@ -259,10 +364,10 @@ impl PromotionPolicyService {
             return Ok(None);
         };
 
-        let cves: Vec<String> = sqlx::query_scalar!(
-            r#"SELECT DISTINCT cve_id as "cve_id!" FROM cve_history WHERE artifact_id = $1 AND status = 'open' AND cve_id IS NOT NULL"#,
-            artifact_id
+        let cves: Vec<String> = sqlx::query_scalar(
+            r#"SELECT DISTINCT cve_id FROM cve_history WHERE artifact_id = $1 AND status = 'open' AND cve_id IS NOT NULL"#,
         )
+        .bind(artifact_id)
         .fetch_all(&self.db)
         .await?;
 
@@ -277,7 +382,12 @@ impl PromotionPolicyService {
     }
 
     async fn get_license_summary(&self, artifact_id: Uuid) -> Result<Option<LicenseSummary>> {
-        let sbom = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct SbomRow {
+            licenses: Option<Vec<String>>,
+        }
+
+        let sbom: Option<SbomRow> = sqlx::query_as(
             r#"
             SELECT licenses
             FROM sbom_documents
@@ -285,8 +395,8 @@ impl PromotionPolicyService {
             ORDER BY created_at DESC
             LIMIT 1
             "#,
-            artifact_id
         )
+        .bind(artifact_id)
         .fetch_optional(&self.db)
         .await?;
 
@@ -297,45 +407,104 @@ impl PromotionPolicyService {
         }))
     }
 
-    async fn get_scan_policy(&self, repository_id: Uuid) -> Result<Option<ScanPolicyConfig>> {
-        let policy = sqlx::query!(
+    async fn get_artifact_created_at(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        Ok(
+            sqlx::query_scalar(r#"SELECT created_at FROM artifacts WHERE id = $1"#)
+                .bind(artifact_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn check_artifact_signature(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+    ) -> Result<bool> {
+        // Check if the repository has a signing config with active signing
+        let has_sig: bool = sqlx::query_scalar(
             r#"
-            SELECT id, name, max_severity, block_unscanned, block_on_fail, is_enabled
+            SELECT EXISTS(
+                SELECT 1 FROM repository_signing_config rsc
+                JOIN signing_keys sk ON sk.id = rsc.signing_key_id
+                WHERE rsc.repository_id = $1 AND sk.is_active = true
+            )
+            "#,
+        )
+        .bind(repository_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        if !has_sig {
+            // No signing config means we can't verify — treat as unsigned
+            return Ok(false);
+        }
+
+        // Check if the artifact has been signed (has a signing audit entry)
+        let signed: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM signing_key_audit ska
+                JOIN signing_keys sk ON sk.id = ska.signing_key_id
+                WHERE sk.repository_id = $2
+                  AND ska.action = 'used_for_signing'
+                  AND ska.details->>'artifact_id' = $1::TEXT
+            )
+            "#,
+        )
+        .bind(artifact_id)
+        .bind(repository_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok(signed)
+    }
+
+    async fn get_scan_policy(&self, repository_id: Uuid) -> Result<Option<ScanPolicyConfig>> {
+        let policy: Option<ScanPolicyConfig> = sqlx::query_as(
+            r#"
+            SELECT max_severity, block_on_fail,
+                   min_staging_hours, max_artifact_age_days, require_signature
             FROM scan_policies
             WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true
             ORDER BY repository_id DESC NULLS LAST
             LIMIT 1
             "#,
-            repository_id
         )
+        .bind(repository_id)
         .fetch_optional(&self.db)
         .await?;
 
-        Ok(policy.map(|p| ScanPolicyConfig {
-            _id: p.id,
-            _name: p.name,
-            max_severity: p.max_severity,
-            _block_unscanned: p.block_unscanned,
-            block_on_fail: p.block_on_fail,
-        }))
+        Ok(policy)
     }
 
     async fn get_license_policy(&self, repository_id: Uuid) -> Result<Option<LicensePolicyConfig>> {
-        let policy = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct LicensePolicyRow {
+            name: String,
+            allowed_licenses: Option<Vec<String>>,
+            denied_licenses: Option<Vec<String>>,
+            allow_unknown: bool,
+            action: String,
+        }
+
+        let policy: Option<LicensePolicyRow> = sqlx::query_as(
             r#"
-            SELECT id, name, allowed_licenses, denied_licenses, allow_unknown, action, is_enabled
+            SELECT name, allowed_licenses, denied_licenses, allow_unknown, action
             FROM license_policies
             WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true
             ORDER BY repository_id DESC NULLS LAST
             LIMIT 1
             "#,
-            repository_id
         )
+        .bind(repository_id)
         .fetch_optional(&self.db)
         .await?;
 
         Ok(policy.map(|p| LicensePolicyConfig {
-            _id: p.id,
             name: p.name,
             allowed_licenses: p.allowed_licenses.unwrap_or_default(),
             denied_licenses: p.denied_licenses.unwrap_or_default(),
@@ -345,18 +514,17 @@ impl PromotionPolicyService {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct ScanPolicyConfig {
-    _id: Uuid,
-    _name: String,
     max_severity: String,
-    _block_unscanned: bool,
     block_on_fail: bool,
+    min_staging_hours: Option<i32>,
+    max_artifact_age_days: Option<i32>,
+    require_signature: bool,
 }
 
 #[derive(Debug, Clone)]
 struct LicensePolicyConfig {
-    _id: Uuid,
     name: String,
     allowed_licenses: Vec<String>,
     denied_licenses: Vec<String>,
@@ -597,7 +765,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "test-policy".to_string(),
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -619,7 +786,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "permissive".to_string(),
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             denied_licenses: vec![],
@@ -641,7 +807,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "contradictory".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["MIT".to_string()],
@@ -664,7 +829,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "strict".to_string(),
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             denied_licenses: vec![],
@@ -688,7 +852,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "lenient".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec![],
@@ -712,7 +875,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "no-allowed-list".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec![],
@@ -733,7 +895,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "case-test".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -757,7 +918,6 @@ mod tests {
 
         // Block action => "critical" severity
         let policy_block = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "block-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["AGPL-3.0".to_string()],
@@ -769,7 +929,6 @@ mod tests {
 
         // Warn action => "medium" severity
         let policy_warn = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "warn-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["AGPL-3.0".to_string()],
@@ -781,7 +940,6 @@ mod tests {
 
         // Allow action => "low" severity
         let policy_allow = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "allow-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["AGPL-3.0".to_string()],
@@ -801,7 +959,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "corporate-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -832,7 +989,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "multi".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()],
@@ -861,7 +1017,6 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
             name: "empty".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -999,5 +1154,114 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         // PolicyAction should serialize to its string form
         assert!(json["action"].is_string());
+    }
+
+    // =======================================================================
+    // evaluate_age_gates tests
+    // =======================================================================
+
+    #[test]
+    fn test_age_gates_no_constraints() {
+        let created = chrono::Utc::now() - chrono::Duration::hours(1);
+        let violations = evaluate_age_gates(created, None, None);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_age_gates_min_staging_hours_passes() {
+        let created = chrono::Utc::now() - chrono::Duration::hours(25);
+        let violations = evaluate_age_gates(created, Some(24), None);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_age_gates_min_staging_hours_fails() {
+        let created = chrono::Utc::now() - chrono::Duration::hours(2);
+        let violations = evaluate_age_gates(created, Some(24), None);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "min-staging-time");
+        assert_eq!(violations[0].severity, "high");
+        assert!(violations[0].message.contains("minimum: 24 hours"));
+    }
+
+    #[test]
+    fn test_age_gates_max_artifact_age_passes() {
+        let created = chrono::Utc::now() - chrono::Duration::days(5);
+        let violations = evaluate_age_gates(created, None, Some(30));
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_age_gates_max_artifact_age_fails() {
+        let created = chrono::Utc::now() - chrono::Duration::days(60);
+        let violations = evaluate_age_gates(created, None, Some(30));
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "max-artifact-age");
+        assert_eq!(violations[0].severity, "medium");
+        assert!(violations[0].message.contains("maximum: 30 days"));
+    }
+
+    #[test]
+    fn test_age_gates_both_constraints_both_fail() {
+        let created = chrono::Utc::now() - chrono::Duration::days(60);
+        let violations = evaluate_age_gates(created, Some(2000), Some(30));
+        // Too old (60 > 30 days) but also not in staging long enough (60 days < 2000 hours)
+        assert_eq!(violations.len(), 2);
+        let rules: Vec<&str> = violations.iter().map(|v| v.rule.as_str()).collect();
+        assert!(rules.contains(&"min-staging-time"));
+        assert!(rules.contains(&"max-artifact-age"));
+    }
+
+    #[test]
+    fn test_age_gates_both_constraints_pass() {
+        let created = chrono::Utc::now() - chrono::Duration::days(5);
+        let violations = evaluate_age_gates(created, Some(24), Some(30));
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_age_gates_min_staging_boundary() {
+        // Exactly at the boundary should pass (>= not >)
+        let created = chrono::Utc::now() - chrono::Duration::hours(24);
+        let violations = evaluate_age_gates(created, Some(24), None);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_age_gates_max_age_boundary() {
+        // Exactly at the boundary should pass (<= not <)
+        let created = chrono::Utc::now() - chrono::Duration::days(30);
+        let violations = evaluate_age_gates(created, None, Some(30));
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_age_gates_details_include_values() {
+        let created = chrono::Utc::now() - chrono::Duration::hours(2);
+        let violations = evaluate_age_gates(created, Some(24), None);
+        let details = violations[0].details.as_ref().unwrap();
+        assert_eq!(details["min_staging_hours"], 24);
+        assert!(details["hours_in_staging"].as_i64().unwrap() < 24);
+    }
+
+    // =======================================================================
+    // evaluate_signature_requirement tests
+    // =======================================================================
+
+    #[test]
+    fn test_signature_requirement_has_signature() {
+        let violations = evaluate_signature_requirement(true);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_signature_requirement_no_signature() {
+        let violations = evaluate_signature_requirement(false);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "require-signature");
+        assert_eq!(violations[0].severity, "high");
+        assert!(violations[0]
+            .message
+            .contains("does not have a valid signature"));
     }
 }

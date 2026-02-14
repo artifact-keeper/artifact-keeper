@@ -32,6 +32,7 @@ use utoipa::{Modify, OpenApi};
         (name = "packages", description = "Package discovery and version listing"),
         (name = "search", description = "Full-text search and filtering"),
         (name = "promotion", description = "Staging-to-release artifact promotion"),
+        (name = "approval", description = "Promotion approval workflow"),
         (name = "security", description = "Security policies and scanning"),
         (name = "sbom", description = "Software Bill of Materials"),
         (name = "signing", description = "Signing key management"),
@@ -121,6 +122,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::sync_policies::SyncPoliciesApiDoc::openapi());
     doc.merge(super::handlers::peer_instance_labels::PeerInstanceLabelsApiDoc::openapi());
     doc.merge(super::handlers::quality_gates::QualityGatesApiDoc::openapi());
+    doc.merge(super::handlers::approval::ApprovalApiDoc::openapi());
 
     doc
 }

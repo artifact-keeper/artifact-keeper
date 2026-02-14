@@ -30,6 +30,10 @@ pub fn router() -> Router<SharedState> {
             post(promote_artifact),
         )
         .route(
+            "/repositories/:key/artifacts/:artifact_id/reject",
+            post(reject_artifact),
+        )
+        .route(
             "/repositories/:key/promotion-history",
             get(promotion_history),
         )
@@ -78,10 +82,26 @@ pub struct BulkPromotionResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct RejectArtifactRequest {
+    pub reason: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RejectionResponse {
+    pub rejected: bool,
+    pub artifact_id: Uuid,
+    pub source: String,
+    pub reason: String,
+    pub rejection_id: Uuid,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PromotionHistoryQuery {
     pub page: Option<u32>,
     pub per_page: Option<u32>,
     pub artifact_id: Option<Uuid>,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -91,6 +111,8 @@ pub struct PromotionHistoryEntry {
     pub artifact_path: String,
     pub source_repo_key: String,
     pub target_repo_key: String,
+    pub status: String,
+    pub rejection_reason: Option<String>,
     pub promoted_by: Option<Uuid>,
     pub promoted_by_username: Option<String>,
     #[schema(value_type = Option<Object>)]
@@ -106,7 +128,7 @@ pub struct PromotionHistoryResponse {
 }
 
 /// Validate that source is staging and target is local, with matching formats.
-fn validate_promotion_repos(
+pub fn validate_promotion_repos(
     source: &crate::models::repository::Repository,
     target: &crate::models::repository::Repository,
 ) -> Result<()> {
@@ -169,6 +191,21 @@ pub async fn promote_artifact(
     let source_repo = repo_service.get_by_key(&repo_key).await?;
     let target_repo = repo_service.get_by_key(&req.target_repository).await?;
     validate_promotion_repos(&source_repo, &target_repo)?;
+
+    if super::approval::check_approval_required(&state.db, source_repo.id).await? {
+        return Ok(Json(PromotionResponse {
+            promoted: false,
+            source: format!("{}/{}", repo_key, artifact_id),
+            target: req.target_repository.clone(),
+            promotion_id: None,
+            policy_violations: vec![],
+            message: Some(
+                "This repository requires approval for promotions. \
+                 Use POST /api/v1/approval/request to submit an approval request."
+                    .to_string(),
+            ),
+        }));
+    }
 
     let artifact = sqlx::query_as!(
         crate::models::artifact::Artifact,
@@ -550,6 +587,91 @@ pub async fn promote_artifacts_bulk(
 }
 
 #[utoipa::path(
+    post,
+    path = "/repositories/{key}/artifacts/{artifact_id}/reject",
+    context_path = "/api/v1/promotion",
+    tag = "promotion",
+    params(
+        ("key" = String, Path, description = "Source repository key"),
+        ("artifact_id" = Uuid, Path, description = "Artifact ID to reject"),
+    ),
+    request_body = RejectArtifactRequest,
+    responses(
+        (status = 200, description = "Artifact rejection result", body = RejectionResponse),
+        (status = 404, description = "Artifact or repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 422, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reject_artifact(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path((repo_key, artifact_id)): Path<(String, Uuid)>,
+    Json(req): Json<RejectArtifactRequest>,
+) -> Result<Json<RejectionResponse>> {
+    let repo_service = RepositoryService::new(state.db.clone());
+    let source_repo = repo_service.get_by_key(&repo_key).await?;
+
+    if source_repo.repo_type != RepositoryType::Staging {
+        return Err(AppError::Validation(
+            "Artifacts can only be rejected from staging repositories".to_string(),
+        ));
+    }
+
+    // Verify artifact exists
+    let artifact_exists: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS(SELECT 1 FROM artifacts WHERE id = $1 AND repository_id = $2 AND is_deleted = false)"#,
+    )
+    .bind(artifact_id)
+    .bind(source_repo.id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
+
+    if !artifact_exists {
+        return Err(AppError::NotFound(
+            "Artifact not found in staging repository".to_string(),
+        ));
+    }
+
+    let rejection_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO promotion_history (
+            id, artifact_id, source_repo_id, target_repo_id,
+            promoted_by, status, rejection_reason, notes
+        )
+        VALUES ($1, $2, $3, $3, $4, 'rejected', $5, $6)
+        "#,
+    )
+    .bind(rejection_id)
+    .bind(artifact_id)
+    .bind(source_repo.id)
+    .bind(auth.user_id)
+    .bind(&req.reason)
+    .bind(&req.notes)
+    .execute(&state.db)
+    .await
+    .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
+
+    tracing::info!(
+        source_repo = %repo_key,
+        artifact_id = %artifact_id,
+        rejected_by = %auth.user_id,
+        reason = %req.reason,
+        "Artifact rejected"
+    );
+
+    Ok(Json(RejectionResponse {
+        rejected: true,
+        artifact_id,
+        source: repo_key,
+        reason: req.reason,
+        rejection_id,
+    }))
+}
+
+#[utoipa::path(
     get,
     path = "/repositories/{key}/promotion-history",
     context_path = "/api/v1/promotion",
@@ -559,6 +681,7 @@ pub async fn promote_artifacts_bulk(
         ("page" = Option<u32>, Query, description = "Page number (1-indexed)"),
         ("per_page" = Option<u32>, Query, description = "Items per page (max 100)"),
         ("artifact_id" = Option<Uuid>, Query, description = "Filter by artifact ID"),
+        ("status" = Option<String>, Query, description = "Filter by status (promoted, rejected, pending_approval)"),
     ),
     responses(
         (status = 200, description = "Promotion history for repository", body = PromotionHistoryResponse),
@@ -585,12 +708,16 @@ pub async fn promotion_history(
         artifact_path: Option<String>,
         source_repo_key: Option<String>,
         target_repo_key: Option<String>,
+        status: String,
+        rejection_reason: Option<String>,
         promoted_by: Option<Uuid>,
         promoted_by_username: Option<String>,
         policy_result: Option<serde_json::Value>,
         notes: Option<String>,
         created_at: chrono::DateTime<chrono::Utc>,
     }
+
+    let status_filter = query.status.as_deref();
 
     let rows: Vec<HistoryRow> = sqlx::query_as(
         r#"
@@ -600,6 +727,8 @@ pub async fn promotion_history(
             a.path as artifact_path,
             sr.key as source_repo_key,
             tr.key as target_repo_key,
+            ph.status,
+            ph.rejection_reason,
             ph.promoted_by,
             u.username as promoted_by_username,
             ph.policy_result,
@@ -610,7 +739,8 @@ pub async fn promotion_history(
         LEFT JOIN repositories sr ON sr.id = ph.source_repo_id
         LEFT JOIN repositories tr ON tr.id = ph.target_repo_id
         LEFT JOIN users u ON u.id = ph.promoted_by
-        WHERE ph.source_repo_id = $1 OR ph.target_repo_id = $1
+        WHERE (ph.source_repo_id = $1 OR ph.target_repo_id = $1)
+          AND ($4::TEXT IS NULL OR ph.status = $4)
         ORDER BY ph.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -618,14 +748,18 @@ pub async fn promotion_history(
     .bind(repo.id)
     .bind(per_page as i64)
     .bind(offset)
+    .bind(status_filter)
     .fetch_all(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
-    let total: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(*)::BIGINT as "count!" FROM promotion_history WHERE source_repo_id = $1 OR target_repo_id = $1"#,
-        repo.id
+    let total: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)::BIGINT FROM promotion_history
+           WHERE (source_repo_id = $1 OR target_repo_id = $1)
+             AND ($2::TEXT IS NULL OR status = $2)"#,
     )
+    .bind(repo.id)
+    .bind(status_filter)
     .fetch_one(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
@@ -640,6 +774,8 @@ pub async fn promotion_history(
             artifact_path: row.artifact_path.unwrap_or_default(),
             source_repo_key: row.source_repo_key.unwrap_or_default(),
             target_repo_key: row.target_repo_key.unwrap_or_default(),
+            status: row.status,
+            rejection_reason: row.rejection_reason,
             promoted_by: row.promoted_by,
             promoted_by_username: row.promoted_by_username,
             policy_result: row.policy_result,
@@ -661,13 +797,20 @@ pub async fn promotion_history(
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(promote_artifact, promote_artifacts_bulk, promotion_history,),
+    paths(
+        promote_artifact,
+        promote_artifacts_bulk,
+        reject_artifact,
+        promotion_history,
+    ),
     components(schemas(
         PromoteArtifactRequest,
         BulkPromoteRequest,
         PromotionResponse,
         PolicyViolation,
         BulkPromotionResponse,
+        RejectArtifactRequest,
+        RejectionResponse,
         PromotionHistoryQuery,
         PromotionHistoryEntry,
         PromotionHistoryResponse,

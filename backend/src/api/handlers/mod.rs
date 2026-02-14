@@ -4,6 +4,7 @@ pub mod admin;
 pub mod alpine;
 pub mod analytics;
 pub mod ansible;
+pub mod approval;
 pub mod artifacts;
 pub mod auth;
 pub mod builds;
