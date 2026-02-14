@@ -47,7 +47,7 @@ services:
     image: artifact-keeper-backend:test
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: docker/Dockerfile.backend
     container_name: e2e-test-backend
     depends_on:
       postgres:
@@ -393,7 +393,7 @@ services:
   redteam:
     build:
       context: .
-      dockerfile: Dockerfile.redteam
+      dockerfile: docker/Dockerfile.redteam
     container_name: e2e-test-redteam
     depends_on:
       setup:

@@ -114,7 +114,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.backend
+          file: docker/Dockerfile.backend
           load: true
           tags: artifact-keeper-backend:test
           cache-from: type=gha

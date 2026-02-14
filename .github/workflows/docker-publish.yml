@@ -60,7 +60,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.backend
+          file: ./docker/Dockerfile.backend
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
@@ -124,7 +124,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.openscap
+          file: ./docker/Dockerfile.openscap
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }},push-by-digest=true,name-canonical=true,push=true

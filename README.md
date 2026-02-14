@@ -239,7 +239,7 @@ Extend Artifact Keeper with custom format handlers compiled to WebAssembly.
 ```bash
 mkdir artifact-keeper && cd artifact-keeper
 curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker-compose.yml
-curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/Caddyfile
+curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker/Caddyfile
 docker compose up -d
 ```
 

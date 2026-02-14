@@ -149,7 +149,7 @@ services:
   backend:
     build:
       context: .
-      dockerfile: Dockerfile.backend.dev
+      dockerfile: docker/Dockerfile.backend.dev
     container_name: artifact-keeper-dev-backend
     depends_on:
       postgres:

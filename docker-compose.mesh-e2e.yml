@@ -58,7 +58,7 @@ services:
   backend-peer-a:
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: docker/Dockerfile.backend
     container_name: mesh-e2e-backend-peer-a
     depends_on:
       postgres-peer-a:
@@ -95,7 +95,7 @@ services:
   backend-peer-b:
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: docker/Dockerfile.backend
     container_name: mesh-e2e-backend-peer-b
     depends_on:
       postgres-peer-b:
