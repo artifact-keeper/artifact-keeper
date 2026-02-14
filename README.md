@@ -19,6 +19,7 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 - **45+ Package Formats** - Native protocol support for Maven, PyPI, NPM, Docker/OCI, Cargo, Go, Helm, and 38 more
 - **WASM Plugin System** - Extend with custom format handlers via WebAssembly (WIT-based, Wasmtime runtime)
 - **Security Scanning** - Automated vulnerability detection with Trivy and Grype, policy engine, quarantine workflow
+- **Hardened Containers** - All images built on [DISA STIG](https://www.cyber.mil/stigs/)-approved Red Hat UBI 9 base images, non-root execution, no shell or package manager in runtime
 - **Borg Replication** - Recursive peer mesh with swarm-based artifact distribution and P2P transfers
 - **Full-Text Search** - Meilisearch-powered search across all repositories and artifacts
 - **Multi-Auth** - JWT, OpenID Connect, LDAP, SAML 2.0, and API token support
