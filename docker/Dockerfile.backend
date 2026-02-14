@@ -1,95 +1,104 @@
+# ---------- Base: Rust toolchain on UBI 9 ----------
+FROM registry.access.redhat.com/ubi9/ubi AS rust-base
+RUN dnf install -y --nodocs \
+    gcc gcc-c++ make pkg-config perl-core \
+    openssl-devel zlib-devel xz-devel bzip2-devel \
+    protobuf-compiler curl \
+    && dnf clean all && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 && \
+    . "$HOME/.cargo/env" && \
+    cargo install cargo-chef --locked
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # ---------- Stage 1: Plan dependencies ----------
-FROM lukemathwalker/cargo-chef:latest-rust-1.93-bookworm AS planner
+FROM rust-base AS planner
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY backend ./backend
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ---------- Stage 2: Build dependencies (cached) ----------
-FROM lukemathwalker/cargo-chef:latest-rust-1.93-bookworm AS deps
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    zlib1g-dev \
-    liblzma-dev \
-    protobuf-compiler \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM rust-base AS deps
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
-# This layer is cached as long as Cargo.toml/Cargo.lock don't change
 ENV SQLX_OFFLINE=true
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # ---------- Stage 3: Build binary ----------
-FROM rust:1.93-slim-bookworm AS builder
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    zlib1g-dev \
-    liblzma-dev \
-    protobuf-compiler \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+FROM rust-base AS builder
 WORKDIR /app
-# Re-use cached dependency artifacts
 COPY --from=deps /app/target target
-COPY --from=deps /usr/local/cargo /usr/local/cargo
+COPY --from=deps /root/.cargo/registry /root/.cargo/registry
 COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
 ENV SQLX_OFFLINE=true
-# Ensure proto files are available for tonic-build
 RUN cargo build --release --bin artifact-keeper
 
-# Runtime stage
-FROM debian:bookworm-slim
+# ---------- Stage 4: Build minimal rootfs ----------
+FROM registry.access.redhat.com/ubi9/ubi AS rootfs-builder
 
-WORKDIR /app
+# Install only essential runtime libraries into a clean rootfs
+RUN mkdir -p /mnt/rootfs && \
+    dnf install --installroot /mnt/rootfs --releasever 9 \
+        --setopt install_weak_deps=0 --nodocs -y \
+        glibc-minimal-langpack \
+        ca-certificates \
+        openssl-libs \
+        zlib \
+        xz-libs \
+        bzip2-libs \
+        curl-minimal \
+    && dnf --installroot /mnt/rootfs clean all \
+    && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
-# Install runtime dependencies and scanner CLIs
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    curl \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
+# Create non-root user and required directories in the rootfs
+RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
+    echo 'artifact:x:1001:' >> /mnt/rootfs/etc/group && \
+    mkdir -p /mnt/rootfs/app \
+             /mnt/rootfs/data/storage \
+             /mnt/rootfs/data/backups \
+             /mnt/rootfs/data/plugins \
+             /mnt/rootfs/scan-workspace \
+             /mnt/rootfs/home/artifact/.cache/grype \
+             /mnt/rootfs/home/artifact/.cache/trivy \
+             /mnt/rootfs/usr/local/bin && \
+    chown -R 1001:0 /mnt/rootfs/data /mnt/rootfs/scan-workspace \
+                     /mnt/rootfs/home/artifact /mnt/rootfs/app
 
-# Install Trivy CLI
-RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+# ---------- Stage 5: Download scanner CLIs ----------
+FROM registry.access.redhat.com/ubi9/ubi-minimal AS scanners
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 curl tar gzip && \
+    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin && \
+    curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin && \
+    microdnf clean all
 
-# Install Grype CLI
-RUN curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+# ---------- Stage 6: UBI 9 Micro runtime ----------
+FROM registry.access.redhat.com/ubi9/ubi-micro
 
-# Create non-root user
-RUN useradd -r -s /bin/false artifact
+# Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
+COPY --from=rootfs-builder /mnt/rootfs /
 
-# Copy binary from builder
+# Copy scanner CLIs (statically linked Go binaries)
+COPY --from=scanners /opt/bin/trivy /usr/local/bin/
+COPY --from=scanners /opt/bin/grype /usr/local/bin/
+
+# Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
 
-# Create data directories (storage, backups, plugins, scan workspace, caches)
-RUN mkdir -p /data/storage /data/backups /data/plugins /scan-workspace \
-    /home/artifact/.cache/grype /home/artifact/.cache/trivy && \
-    chown -R artifact:artifact /data /scan-workspace /home/artifact
+WORKDIR /app
+USER 1001
 
-# Switch to non-root user
-USER artifact
+ENV RUST_LOG=info \
+    DATABASE_URL=postgresql://registry:registry@postgres:5432/artifact_registry \
+    STORAGE_PATH=/data/storage \
+    BACKUP_PATH=/data/backups \
+    HOST=0.0.0.0 \
+    PORT=8080
 
-# Default environment variables
-ENV RUST_LOG=info
-ENV DATABASE_URL=postgresql://registry:registry@postgres:5432/artifact_registry
-ENV STORAGE_PATH=/data/storage
-ENV BACKUP_PATH=/data/backups
-ENV HOST=0.0.0.0
-ENV PORT=8080
+EXPOSE 8080 9090
 
-# Expose ports (HTTP and gRPC)
-EXPOSE 8080
-EXPOSE 9090
-
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD ["curl", "-sf", "http://localhost:8080/health"]
 
-# Run the application
 CMD ["artifact-keeper"]

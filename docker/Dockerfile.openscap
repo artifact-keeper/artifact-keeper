@@ -1,13 +1,37 @@
-FROM fedora:41
+# ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
+FROM registry.access.redhat.com/ubi9/ubi AS rootfs-builder
 
-RUN dnf install -y openscap-scanner scap-security-guide python3 && \
-    dnf clean all
+# Install OpenSCAP, SCAP content, and Python into a clean rootfs
+RUN mkdir -p /mnt/rootfs && \
+    dnf install --installroot /mnt/rootfs --releasever 9 \
+        --setopt install_weak_deps=0 --nodocs -y \
+        glibc-minimal-langpack \
+        ca-certificates \
+        openscap-scanner \
+        scap-security-guide \
+        python3 \
+    && dnf --installroot /mnt/rootfs clean all \
+    && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
+
+# Create non-root user and scan workspace
+RUN echo 'oscap:x:1001:0:OpenSCAP Scanner:/home/oscap:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
+    echo 'oscap:x:1001:' >> /mnt/rootfs/etc/group && \
+    mkdir -p /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace /mnt/rootfs/usr/local/bin && \
+    chown -R 1001:0 /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace
+
+# ---------- Stage 2: UBI 9 Micro runtime ----------
+FROM registry.access.redhat.com/ubi9/ubi-micro
+
+# Copy minimal rootfs (oscap, scap-security-guide, python3, libs)
+COPY --from=rootfs-builder /mnt/rootfs /
 
 COPY scripts/openscap-wrapper.py /usr/local/bin/openscap-wrapper.py
+
+USER 1001
 
 EXPOSE 8091
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')" || exit 1
+    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health')"]
 
 CMD ["python3", "/usr/local/bin/openscap-wrapper.py"]
