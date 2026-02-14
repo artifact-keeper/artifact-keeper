@@ -1357,33 +1357,22 @@ mod tests {
 
     #[test]
     fn test_page_defaults_and_clamping() {
-        // Simulating the logic from list_users
-        let page_none: Option<u32> = None;
-        let page = page_none.unwrap_or(1).max(1);
-        assert_eq!(page, 1);
-
-        let page_zero: Option<u32> = Some(0);
-        let page = page_zero.unwrap_or(1).max(1);
-        assert_eq!(page, 1);
-
-        let page_five: Option<u32> = Some(5);
-        let page = page_five.unwrap_or(1).max(1);
-        assert_eq!(page, 5);
+        fn resolve_page(page: Option<u32>) -> u32 {
+            page.unwrap_or(1).max(1)
+        }
+        assert_eq!(resolve_page(None), 1);
+        assert_eq!(resolve_page(Some(0)), 1);
+        assert_eq!(resolve_page(Some(5)), 5);
     }
 
     #[test]
     fn test_per_page_defaults_and_clamping() {
-        let pp_none: Option<u32> = None;
-        let per_page = pp_none.unwrap_or(20).min(100);
-        assert_eq!(per_page, 20);
-
-        let pp_200: Option<u32> = Some(200);
-        let per_page = pp_200.unwrap_or(20).min(100);
-        assert_eq!(per_page, 100);
-
-        let pp_50: Option<u32> = Some(50);
-        let per_page = pp_50.unwrap_or(20).min(100);
-        assert_eq!(per_page, 50);
+        fn resolve_per_page(pp: Option<u32>) -> u32 {
+            pp.unwrap_or(20).min(100)
+        }
+        assert_eq!(resolve_per_page(None), 20);
+        assert_eq!(resolve_per_page(Some(200)), 100);
+        assert_eq!(resolve_per_page(Some(50)), 50);
     }
 
     #[test]

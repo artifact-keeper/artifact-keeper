@@ -231,19 +231,25 @@ mod tests {
 
     #[test]
     fn test_scan_enabled_default_when_no_config() {
-        let result: Option<bool> = None;
-        assert!(!result.unwrap_or(false));
+        fn is_scan_enabled(opt: Option<bool>) -> bool {
+            opt.unwrap_or(false)
+        }
+        assert!(!is_scan_enabled(None));
     }
 
     #[test]
     fn test_scan_enabled_when_config_true() {
-        let result: Option<bool> = Some(true);
-        assert!(result.unwrap_or(false));
+        fn is_scan_enabled(opt: Option<bool>) -> bool {
+            opt.unwrap_or(false)
+        }
+        assert!(is_scan_enabled(Some(true)));
     }
 
     #[test]
     fn test_scan_enabled_when_config_false() {
-        let result: Option<bool> = Some(false);
-        assert!(!result.unwrap_or(false));
+        fn is_scan_enabled(opt: Option<bool>) -> bool {
+            opt.unwrap_or(false)
+        }
+        assert!(!is_scan_enabled(Some(false)));
     }
 }

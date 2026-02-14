@@ -137,13 +137,11 @@ mod tests {
 
     #[test]
     fn test_metadata_json_value_some() {
-        let metadata: Option<JsonValue> = Some(serde_json::json!({
+        let val = serde_json::json!({
             "license": "MIT",
             "homepage": "https://example.com",
             "keywords": ["rust", "crate"]
-        }));
-        assert!(metadata.is_some());
-        let val = metadata.unwrap();
+        });
         assert_eq!(val["license"], "MIT");
         assert_eq!(val["keywords"][0], "rust");
     }
@@ -175,8 +173,8 @@ mod tests {
         let description: Option<&str> = None;
         assert!(description.is_none());
 
-        let description: Option<&str> = Some("A useful library");
-        assert_eq!(description.unwrap(), "A useful library");
+        let description: &str = "A useful library";
+        assert_eq!(description, "A useful library");
     }
 
     #[test]

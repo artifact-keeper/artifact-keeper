@@ -1284,7 +1284,7 @@ mod tests {
     }
 
     fn normalize_pagination(page: Option<i64>, per_page: Option<i64>) -> (i64, i64) {
-        let limit = per_page.unwrap_or(20).max(1).min(100);
+        let limit = per_page.unwrap_or(20).clamp(1, 100);
         let page = page.unwrap_or(1).max(1);
         let offset = (page - 1) * limit;
         (offset, limit)
