@@ -1,6 +1,10 @@
 # Artifact Keeper
 
 [![CI](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml/badge.svg)](https://github.com/artifact-keeper/artifact-keeper/actions/workflows/ci.yml)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=artifact-keeper_artifact-keeper&metric=alert_status)](https://sonarcloud.io/dashboard?id=artifact-keeper_artifact-keeper)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=artifact-keeper_artifact-keeper&metric=security_rating)](https://sonarcloud.io/dashboard?id=artifact-keeper_artifact-keeper)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=artifact-keeper_artifact-keeper&metric=vulnerabilities)](https://sonarcloud.io/dashboard?id=artifact-keeper_artifact-keeper)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=artifact-keeper_artifact-keeper&metric=ncloc)](https://sonarcloud.io/dashboard?id=artifact-keeper_artifact-keeper)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io/artifact-keeper/artifact-keeper-backend)
