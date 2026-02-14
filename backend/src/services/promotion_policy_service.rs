@@ -409,14 +409,10 @@ impl PromotionPolicyService {
         &self,
         artifact_id: Uuid,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let row: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            r#"SELECT created_at FROM artifacts WHERE id = $1"#,
-        )
-        .bind(artifact_id)
-        .fetch_optional(&self.db)
-        .await?;
-
-        Ok(row)
+        Ok(sqlx::query_scalar(r#"SELECT created_at FROM artifacts WHERE id = $1"#)
+            .bind(artifact_id)
+            .fetch_optional(&self.db)
+            .await?)
     }
 
     async fn check_artifact_signature(
@@ -464,21 +460,9 @@ impl PromotionPolicyService {
     }
 
     async fn get_scan_policy(&self, repository_id: Uuid) -> Result<Option<ScanPolicyConfig>> {
-        #[derive(sqlx::FromRow)]
-        struct PolicyRow {
-            id: Uuid,
-            name: String,
-            max_severity: String,
-            block_unscanned: bool,
-            block_on_fail: bool,
-            min_staging_hours: Option<i32>,
-            max_artifact_age_days: Option<i32>,
-            require_signature: bool,
-        }
-
-        let policy: Option<PolicyRow> = sqlx::query_as(
+        let policy: Option<ScanPolicyConfig> = sqlx::query_as(
             r#"
-            SELECT id, name, max_severity, block_unscanned, block_on_fail,
+            SELECT max_severity, block_on_fail,
                    min_staging_hours, max_artifact_age_days, require_signature
             FROM scan_policies
             WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true
@@ -490,22 +474,12 @@ impl PromotionPolicyService {
         .fetch_optional(&self.db)
         .await?;
 
-        Ok(policy.map(|p| ScanPolicyConfig {
-            _id: p.id,
-            _name: p.name,
-            max_severity: p.max_severity,
-            _block_unscanned: p.block_unscanned,
-            block_on_fail: p.block_on_fail,
-            min_staging_hours: p.min_staging_hours,
-            max_artifact_age_days: p.max_artifact_age_days,
-            require_signature: p.require_signature,
-        }))
+        Ok(policy)
     }
 
     async fn get_license_policy(&self, repository_id: Uuid) -> Result<Option<LicensePolicyConfig>> {
         #[derive(sqlx::FromRow)]
         struct LicensePolicyRow {
-            id: Uuid,
             name: String,
             allowed_licenses: Option<Vec<String>>,
             denied_licenses: Option<Vec<String>>,
@@ -515,7 +489,7 @@ impl PromotionPolicyService {
 
         let policy: Option<LicensePolicyRow> = sqlx::query_as(
             r#"
-            SELECT id, name, allowed_licenses, denied_licenses, allow_unknown, action
+            SELECT name, allowed_licenses, denied_licenses, allow_unknown, action
             FROM license_policies
             WHERE (repository_id = $1 OR repository_id IS NULL) AND is_enabled = true
             ORDER BY repository_id DESC NULLS LAST
@@ -527,7 +501,6 @@ impl PromotionPolicyService {
         .await?;
 
         Ok(policy.map(|p| LicensePolicyConfig {
-            _id: p.id,
             name: p.name,
             allowed_licenses: p.allowed_licenses.unwrap_or_default(),
             denied_licenses: p.denied_licenses.unwrap_or_default(),
@@ -537,12 +510,9 @@ impl PromotionPolicyService {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct ScanPolicyConfig {
-    _id: Uuid,
-    _name: String,
     max_severity: String,
-    _block_unscanned: bool,
     block_on_fail: bool,
     min_staging_hours: Option<i32>,
     max_artifact_age_days: Option<i32>,
@@ -551,7 +521,6 @@ struct ScanPolicyConfig {
 
 #[derive(Debug, Clone)]
 struct LicensePolicyConfig {
-    _id: Uuid,
     name: String,
     allowed_licenses: Vec<String>,
     denied_licenses: Vec<String>,
@@ -792,7 +761,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "test-policy".to_string(),
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -814,7 +783,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "permissive".to_string(),
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             denied_licenses: vec![],
@@ -836,7 +805,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "contradictory".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["MIT".to_string()],
@@ -859,7 +828,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "strict".to_string(),
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             denied_licenses: vec![],
@@ -883,7 +852,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "lenient".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec![],
@@ -907,7 +876,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "no-allowed-list".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec![],
@@ -928,7 +897,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "case-test".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -952,7 +921,7 @@ mod tests {
 
         // Block action => "critical" severity
         let policy_block = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "block-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["AGPL-3.0".to_string()],
@@ -964,7 +933,7 @@ mod tests {
 
         // Warn action => "medium" severity
         let policy_warn = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "warn-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["AGPL-3.0".to_string()],
@@ -976,7 +945,7 @@ mod tests {
 
         // Allow action => "low" severity
         let policy_allow = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "allow-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["AGPL-3.0".to_string()],
@@ -996,7 +965,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "corporate-policy".to_string(),
             allowed_licenses: vec![],
             denied_licenses: vec!["GPL-3.0".to_string()],
@@ -1027,7 +996,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "multi".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()],
@@ -1056,7 +1025,7 @@ mod tests {
         };
 
         let policy = LicensePolicyConfig {
-            _id: Uuid::new_v4(),
+
             name: "empty".to_string(),
             allowed_licenses: vec!["MIT".to_string()],
             denied_licenses: vec!["GPL-3.0".to_string()],

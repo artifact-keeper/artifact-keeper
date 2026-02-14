@@ -16,10 +16,10 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::handlers::promotion::validate_promotion_repos;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::models::repository::RepositoryType;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
 use crate::storage::filesystem::FilesystemStorage;
@@ -163,29 +163,6 @@ pub async fn check_approval_required(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(row.map(|(v,)| v).unwrap_or(false))
-}
-
-fn validate_promotion_repos(
-    source: &crate::models::repository::Repository,
-    target: &crate::models::repository::Repository,
-) -> Result<()> {
-    if source.repo_type != RepositoryType::Staging {
-        return Err(AppError::Validation(
-            "Source repository must be a staging repository".to_string(),
-        ));
-    }
-    if target.repo_type != RepositoryType::Local {
-        return Err(AppError::Validation(
-            "Target repository must be a local (release) repository".to_string(),
-        ));
-    }
-    if source.format != target.format {
-        return Err(AppError::Validation(format!(
-            "Repository format mismatch: source is {:?}, target is {:?}",
-            source.format, target.format
-        )));
-    }
-    Ok(())
 }
 
 const SELECT_APPROVAL: &str = r#"

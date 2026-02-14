@@ -128,7 +128,7 @@ pub struct PromotionHistoryResponse {
 }
 
 /// Validate that source is staging and target is local, with matching formats.
-fn validate_promotion_repos(
+pub fn validate_promotion_repos(
     source: &crate::models::repository::Repository,
     target: &crate::models::repository::Repository,
 ) -> Result<()> {
@@ -192,16 +192,7 @@ pub async fn promote_artifact(
     let target_repo = repo_service.get_by_key(&req.target_repository).await?;
     validate_promotion_repos(&source_repo, &target_repo)?;
 
-    // Check if this repository requires approval before direct promotion
-    let requires_approval: Option<(bool,)> = sqlx::query_as(
-        "SELECT COALESCE(require_approval, false) FROM repositories WHERE id = $1",
-    )
-    .bind(source_repo.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if requires_approval.map(|(v,)| v).unwrap_or(false) {
+    if super::approval::check_approval_required(&state.db, source_repo.id).await? {
         return Ok(Json(PromotionResponse {
             promoted: false,
             source: format!("{}/{}", repo_key, artifact_id),
@@ -762,24 +753,16 @@ pub async fn promotion_history(
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
-    let total: i64 = if let Some(status) = status_filter {
-        sqlx::query_scalar(
-            r#"SELECT COUNT(*)::BIGINT FROM promotion_history WHERE (source_repo_id = $1 OR target_repo_id = $1) AND status = $2"#,
-        )
-        .bind(repo.id)
-        .bind(status)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-    } else {
-        sqlx::query_scalar(
-            r#"SELECT COUNT(*)::BIGINT FROM promotion_history WHERE source_repo_id = $1 OR target_repo_id = $1"#,
-        )
-        .bind(repo.id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?
-    };
+    let total: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)::BIGINT FROM promotion_history
+           WHERE (source_repo_id = $1 OR target_repo_id = $1)
+             AND ($2::TEXT IS NULL OR status = $2)"#,
+    )
+    .bind(repo.id)
+    .bind(status_filter)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
