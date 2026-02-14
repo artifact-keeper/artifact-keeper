@@ -253,7 +253,7 @@ services:
       - "${HTTP_PORT:-30080}:80"
       - "${HTTPS_PORT:-30443}:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     restart: unless-stopped
