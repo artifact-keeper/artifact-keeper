@@ -1,5 +1,5 @@
 # ---------- Base: Rust toolchain on UBI 9 ----------
-FROM registry.access.redhat.com/ubi9/ubi AS rust-base
+FROM registry.access.redhat.com/ubi9/ubi:9.5 AS rust-base
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
@@ -36,7 +36,7 @@ ENV SQLX_OFFLINE=true
 RUN cargo build --release --bin artifact-keeper
 
 # ---------- Stage 4: Build minimal rootfs ----------
-FROM registry.access.redhat.com/ubi9/ubi AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.5 AS rootfs-builder
 
 # Install only essential runtime libraries into a clean rootfs
 RUN mkdir -p /mnt/rootfs && \
@@ -67,14 +67,14 @@ RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mn
                      /mnt/rootfs/home/artifact /mnt/rootfs/app
 
 # ---------- Stage 5: Download scanner CLIs ----------
-FROM registry.access.redhat.com/ubi9/ubi-minimal AS scanners
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.5 AS scanners
 RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 curl tar gzip && \
     curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin && \
     curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin && \
     microdnf clean all
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.5
 
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /

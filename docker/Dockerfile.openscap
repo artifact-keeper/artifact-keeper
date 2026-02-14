@@ -1,5 +1,5 @@
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
-FROM registry.access.redhat.com/ubi9/ubi AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.5 AS rootfs-builder
 
 # Install OpenSCAP, SCAP content, and Python into a clean rootfs
 RUN mkdir -p /mnt/rootfs && \
@@ -20,7 +20,7 @@ RUN echo 'oscap:x:1001:0:OpenSCAP Scanner:/home/oscap:/sbin/nologin' >> /mnt/roo
     chown -R 1001:0 /mnt/rootfs/home/oscap /mnt/rootfs/scan-workspace
 
 # ---------- Stage 2: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.5
 
 # Copy minimal rootfs (oscap, scap-security-guide, python3, libs)
 COPY --from=rootfs-builder /mnt/rootfs /
