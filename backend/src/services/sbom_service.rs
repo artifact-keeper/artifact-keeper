@@ -12,6 +12,153 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+/// Get the format version string for a given SBOM format.
+pub(crate) fn format_version(format: SbomFormat) -> &'static str {
+    match format {
+        SbomFormat::CycloneDX => "1.5",
+        SbomFormat::SPDX => "2.3",
+    }
+}
+
+/// Get the full spec version string for a given SBOM format.
+pub(crate) fn spec_version(format: SbomFormat) -> &'static str {
+    match format {
+        SbomFormat::CycloneDX => "CycloneDX 1.5",
+        SbomFormat::SPDX => "SPDX-2.3",
+    }
+}
+
+/// Build a CycloneDX component JSON value from a DependencyInfo.
+pub(crate) fn build_cyclonedx_component(dep: &DependencyInfo) -> serde_json::Value {
+    let mut comp = serde_json::json!({
+        "type": "library",
+        "name": dep.name,
+    });
+    if let Some(v) = &dep.version {
+        comp["version"] = serde_json::json!(v);
+    }
+    if let Some(p) = &dep.purl {
+        comp["purl"] = serde_json::json!(p);
+    }
+    if let Some(l) = &dep.license {
+        comp["licenses"] = serde_json::json!([{"license": {"id": l}}]);
+    }
+    if let Some(h) = &dep.sha256 {
+        comp["hashes"] = serde_json::json!([{"alg": "SHA-256", "content": h}]);
+    }
+    comp
+}
+
+/// Build an SPDX package JSON value from a DependencyInfo and its index.
+pub(crate) fn build_spdx_package(dep: &DependencyInfo, idx: usize) -> serde_json::Value {
+    let spdx_id = format!("SPDXRef-Package-{}", idx);
+    let mut pkg = serde_json::json!({
+        "SPDXID": spdx_id,
+        "name": dep.name,
+        "downloadLocation": "NOASSERTION"
+    });
+    if let Some(v) = &dep.version {
+        pkg["versionInfo"] = serde_json::json!(v);
+    }
+    if let Some(l) = &dep.license {
+        pkg["licenseConcluded"] = serde_json::json!(l);
+        pkg["licenseDeclared"] = serde_json::json!(l);
+    } else {
+        pkg["licenseConcluded"] = serde_json::json!("NOASSERTION");
+        pkg["licenseDeclared"] = serde_json::json!("NOASSERTION");
+    }
+    if let Some(h) = &dep.sha256 {
+        pkg["checksums"] = serde_json::json!([{
+            "algorithm": "SHA256",
+            "checksumValue": h
+        }]);
+    }
+    if let Some(p) = &dep.purl {
+        pkg["externalRefs"] = serde_json::json!([{
+            "referenceCategory": "PACKAGE-MANAGER",
+            "referenceType": "purl",
+            "referenceLocator": p
+        }]);
+    }
+    pkg
+}
+
+/// Build a ComponentInfo from a DependencyInfo.
+pub(crate) fn build_component_info(dep: &DependencyInfo) -> ComponentInfo {
+    ComponentInfo {
+        name: dep.name.clone(),
+        version: dep.version.clone(),
+        purl: dep.purl.clone(),
+        component_type: Some("library".to_string()),
+        licenses: dep.license.clone().into_iter().collect(),
+        sha256: dep.sha256.clone(),
+        supplier: None,
+    }
+}
+
+/// Extract unique licenses from a slice of dependencies.
+pub(crate) fn extract_unique_licenses(dependencies: &[DependencyInfo]) -> Vec<String> {
+    dependencies
+        .iter()
+        .filter_map(|d| d.license.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Check licenses against a policy (standalone, no &self needed).
+pub(crate) fn check_license_compliance_pure(
+    policy: &LicensePolicy,
+    licenses: &[String],
+) -> LicenseCheckResult {
+    let mut violations = Vec::new();
+    let mut warnings = Vec::new();
+
+    for license in licenses {
+        let normalized = license.to_uppercase();
+
+        // Check denylist first (takes precedence)
+        if policy
+            .denied_licenses
+            .iter()
+            .any(|d| d.to_uppercase() == normalized)
+        {
+            violations.push(format!("License '{}' is denied by policy", license));
+            continue;
+        }
+
+        // Check allowlist if not empty
+        if !policy.allowed_licenses.is_empty()
+            && !policy
+                .allowed_licenses
+                .iter()
+                .any(|a| a.to_uppercase() == normalized)
+        {
+            if policy.allow_unknown {
+                warnings.push(format!("License '{}' is not in approved list", license));
+            } else {
+                violations.push(format!("License '{}' is not in approved list", license));
+            }
+        }
+    }
+
+    LicenseCheckResult {
+        compliant: violations.is_empty(),
+        violations,
+        warnings,
+    }
+}
+
+/// Calculate the SHA-256 content hash of a string.
+pub(crate) fn content_hash(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+/// Compute the number of days a CVE has been exposed.
+pub(crate) fn days_exposed(first_detected_at: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> i64 {
+    (now - first_detected_at).num_days()
+}
+
 /// SBOM service for generating and managing SBOMs.
 #[derive(Clone)]
 pub struct SbomService {
@@ -666,6 +813,302 @@ pub struct LicenseCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===================================================================
+    // format_version
+    // ===================================================================
+
+    #[test]
+    fn test_format_version_cyclonedx() {
+        assert_eq!(format_version(SbomFormat::CycloneDX), "1.5");
+    }
+
+    #[test]
+    fn test_format_version_spdx() {
+        assert_eq!(format_version(SbomFormat::SPDX), "2.3");
+    }
+
+    // ===================================================================
+    // spec_version
+    // ===================================================================
+
+    #[test]
+    fn test_spec_version_cyclonedx() {
+        assert_eq!(spec_version(SbomFormat::CycloneDX), "CycloneDX 1.5");
+    }
+
+    #[test]
+    fn test_spec_version_spdx() {
+        assert_eq!(spec_version(SbomFormat::SPDX), "SPDX-2.3");
+    }
+
+    // ===================================================================
+    // build_cyclonedx_component
+    // ===================================================================
+
+    #[test]
+    fn test_build_cyclonedx_component_all_fields() {
+        let dep = DependencyInfo {
+            name: "serde".to_string(),
+            version: Some("1.0.195".to_string()),
+            purl: Some("pkg:cargo/serde@1.0.195".to_string()),
+            license: Some("MIT".to_string()),
+            sha256: Some("abcdef".to_string()),
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(comp["type"], "library");
+        assert_eq!(comp["name"], "serde");
+        assert_eq!(comp["version"], "1.0.195");
+        assert_eq!(comp["purl"], "pkg:cargo/serde@1.0.195");
+        assert_eq!(comp["licenses"][0]["license"]["id"], "MIT");
+        assert_eq!(comp["hashes"][0]["alg"], "SHA-256");
+        assert_eq!(comp["hashes"][0]["content"], "abcdef");
+    }
+
+    #[test]
+    fn test_build_cyclonedx_component_minimal() {
+        let dep = DependencyInfo {
+            name: "minimal".to_string(),
+            version: None,
+            purl: None,
+            license: None,
+            sha256: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(comp["type"], "library");
+        assert_eq!(comp["name"], "minimal");
+        assert!(comp.get("version").is_none());
+        assert!(comp.get("purl").is_none());
+        assert!(comp.get("licenses").is_none());
+        assert!(comp.get("hashes").is_none());
+    }
+
+    #[test]
+    fn test_build_cyclonedx_component_version_only() {
+        let dep = DependencyInfo {
+            name: "pkg".to_string(),
+            version: Some("2.0".to_string()),
+            purl: None,
+            license: None,
+            sha256: None,
+        };
+        let comp = build_cyclonedx_component(&dep);
+        assert_eq!(comp["version"], "2.0");
+        assert!(comp.get("purl").is_none());
+    }
+
+    // ===================================================================
+    // build_spdx_package
+    // ===================================================================
+
+    #[test]
+    fn test_build_spdx_package_all_fields() {
+        let dep = DependencyInfo {
+            name: "express".to_string(),
+            version: Some("4.18.2".to_string()),
+            purl: Some("pkg:npm/express@4.18.2".to_string()),
+            license: Some("MIT".to_string()),
+            sha256: Some("abc123".to_string()),
+        };
+        let pkg = build_spdx_package(&dep, 0);
+        assert_eq!(pkg["SPDXID"], "SPDXRef-Package-0");
+        assert_eq!(pkg["name"], "express");
+        assert_eq!(pkg["versionInfo"], "4.18.2");
+        assert_eq!(pkg["licenseConcluded"], "MIT");
+        assert_eq!(pkg["licenseDeclared"], "MIT");
+        assert_eq!(pkg["checksums"][0]["algorithm"], "SHA256");
+        assert_eq!(pkg["externalRefs"][0]["referenceLocator"], "pkg:npm/express@4.18.2");
+        assert_eq!(pkg["downloadLocation"], "NOASSERTION");
+    }
+
+    #[test]
+    fn test_build_spdx_package_minimal() {
+        let dep = DependencyInfo {
+            name: "minimal".to_string(),
+            version: None,
+            purl: None,
+            license: None,
+            sha256: None,
+        };
+        let pkg = build_spdx_package(&dep, 5);
+        assert_eq!(pkg["SPDXID"], "SPDXRef-Package-5");
+        assert_eq!(pkg["licenseConcluded"], "NOASSERTION");
+        assert_eq!(pkg["licenseDeclared"], "NOASSERTION");
+    }
+
+    #[test]
+    fn test_build_spdx_package_index_numbering() {
+        let dep = DependencyInfo {
+            name: "pkg".to_string(),
+            version: None, purl: None, license: None, sha256: None,
+        };
+        assert_eq!(build_spdx_package(&dep, 0)["SPDXID"], "SPDXRef-Package-0");
+        assert_eq!(build_spdx_package(&dep, 42)["SPDXID"], "SPDXRef-Package-42");
+    }
+
+    // ===================================================================
+    // build_component_info
+    // ===================================================================
+
+    #[test]
+    fn test_build_component_info_full() {
+        let dep = DependencyInfo {
+            name: "react".to_string(),
+            version: Some("18.2.0".to_string()),
+            purl: Some("pkg:npm/react@18.2.0".to_string()),
+            license: Some("MIT".to_string()),
+            sha256: Some("hash".to_string()),
+        };
+        let comp = build_component_info(&dep);
+        assert_eq!(comp.name, "react");
+        assert_eq!(comp.version.as_deref(), Some("18.2.0"));
+        assert_eq!(comp.component_type.as_deref(), Some("library"));
+        assert_eq!(comp.licenses, vec!["MIT".to_string()]);
+        assert!(comp.supplier.is_none());
+    }
+
+    #[test]
+    fn test_build_component_info_minimal() {
+        let dep = DependencyInfo {
+            name: "pkg".to_string(),
+            version: None, purl: None, license: None, sha256: None,
+        };
+        let comp = build_component_info(&dep);
+        assert!(comp.licenses.is_empty());
+        assert!(comp.version.is_none());
+    }
+
+    // ===================================================================
+    // extract_unique_licenses
+    // ===================================================================
+
+    #[test]
+    fn test_extract_unique_licenses_empty() {
+        assert!(extract_unique_licenses(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_extract_unique_licenses_dedup() {
+        let deps = vec![
+            DependencyInfo { name: "a".to_string(), version: None, purl: None, license: Some("MIT".to_string()), sha256: None },
+            DependencyInfo { name: "b".to_string(), version: None, purl: None, license: Some("MIT".to_string()), sha256: None },
+            DependencyInfo { name: "c".to_string(), version: None, purl: None, license: Some("Apache-2.0".to_string()), sha256: None },
+        ];
+        let licenses = extract_unique_licenses(&deps);
+        assert_eq!(licenses.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_unique_licenses_skips_none() {
+        let deps = vec![
+            DependencyInfo { name: "a".to_string(), version: None, purl: None, license: Some("MIT".to_string()), sha256: None },
+            DependencyInfo { name: "b".to_string(), version: None, purl: None, license: None, sha256: None },
+        ];
+        let licenses = extract_unique_licenses(&deps);
+        assert_eq!(licenses.len(), 1);
+    }
+
+    // ===================================================================
+    // check_license_compliance_pure
+    // ===================================================================
+
+    fn make_test_policy(allowed: Vec<&str>, denied: Vec<&str>, allow_unknown: bool) -> LicensePolicy {
+        LicensePolicy {
+            id: Uuid::new_v4(),
+            repository_id: None,
+            name: "test".to_string(),
+            description: None,
+            allowed_licenses: allowed.into_iter().map(String::from).collect(),
+            denied_licenses: denied.into_iter().map(String::from).collect(),
+            allow_unknown,
+            action: crate::models::sbom::PolicyAction::Block,
+            is_enabled: true,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn test_check_license_compliance_pure_allowed() {
+        let policy = make_test_policy(vec!["MIT"], vec![], false);
+        let result = check_license_compliance_pure(&policy, &["MIT".to_string()]);
+        assert!(result.compliant);
+    }
+
+    #[test]
+    fn test_check_license_compliance_pure_denied() {
+        let policy = make_test_policy(vec!["MIT"], vec!["GPL-3.0"], false);
+        let result = check_license_compliance_pure(&policy, &["GPL-3.0".to_string()]);
+        assert!(!result.compliant);
+    }
+
+    #[test]
+    fn test_check_license_compliance_pure_case_insensitive() {
+        let policy = make_test_policy(vec!["MIT"], vec!["gpl-3.0"], false);
+        assert!(check_license_compliance_pure(&policy, &["mit".to_string()]).compliant);
+        assert!(!check_license_compliance_pure(&policy, &["GPL-3.0".to_string()]).compliant);
+    }
+
+    // ===================================================================
+    // content_hash
+    // ===================================================================
+
+    #[test]
+    fn test_content_hash_deterministic() {
+        assert_eq!(content_hash("hello"), content_hash("hello"));
+    }
+
+    #[test]
+    fn test_content_hash_different_inputs() {
+        assert_ne!(content_hash("hello"), content_hash("world"));
+    }
+
+    #[test]
+    fn test_content_hash_empty_known_value() {
+        assert_eq!(
+            content_hash(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_content_hash_is_64_hex_chars() {
+        let h = content_hash("test");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ===================================================================
+    // days_exposed
+    // ===================================================================
+
+    #[test]
+    fn test_days_exposed_same_day() {
+        let now = Utc::now();
+        assert_eq!(days_exposed(now, now), 0);
+    }
+
+    #[test]
+    fn test_days_exposed_one_day() {
+        let now = Utc::now();
+        assert_eq!(days_exposed(now - chrono::Duration::days(1), now), 1);
+    }
+
+    #[test]
+    fn test_days_exposed_thirty_days() {
+        let now = Utc::now();
+        assert_eq!(days_exposed(now - chrono::Duration::days(30), now), 30);
+    }
+
+    #[test]
+    fn test_days_exposed_future_negative() {
+        let now = Utc::now();
+        assert_eq!(days_exposed(now + chrono::Duration::days(5), now), -5);
+    }
+
+    // ===================================================================
+    // Existing tests below (kept for backward compat)
+    // ===================================================================
 
     /// Helper to create a mock SbomService for testing SBOM generation
     /// without a database connection.

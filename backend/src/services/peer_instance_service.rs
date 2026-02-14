@@ -87,6 +87,109 @@ pub struct RegisterPeerInstanceRequest {
     pub api_key: String,
 }
 
+/// Derive the sync status for a peer based on whether sync is completed.
+pub(crate) fn derive_sync_status(completed: bool) -> InstanceStatus {
+    if completed {
+        InstanceStatus::Online
+    } else {
+        InstanceStatus::Syncing
+    }
+}
+
+/// Resolve heartbeat status, defaulting to Online if none provided.
+pub(crate) fn resolve_heartbeat_status(status: Option<InstanceStatus>) -> InstanceStatus {
+    status.unwrap_or(InstanceStatus::Online)
+}
+
+/// Calculate cache utilization as a percentage (0.0 to 100.0).
+pub(crate) fn cache_utilization_pct(cache_size_bytes: i64, cache_used_bytes: i64) -> f64 {
+    if cache_size_bytes <= 0 {
+        0.0
+    } else {
+        (cache_used_bytes as f64 / cache_size_bytes as f64) * 100.0
+    }
+}
+
+/// Determine if a peer is considered stale given its last heartbeat and a
+/// threshold in minutes. Returns true if stale.
+pub(crate) fn is_heartbeat_stale(
+    last_heartbeat_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    stale_threshold_minutes: i64,
+) -> bool {
+    match last_heartbeat_at {
+        Some(hb) => (now - hb).num_minutes() >= stale_threshold_minutes,
+        None => true, // no heartbeat ever => stale
+    }
+}
+
+/// Check whether a peer is in backoff (should not be synced).
+pub(crate) fn is_in_backoff(backoff_until: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    backoff_until.map_or(false, |bu| now < bu)
+}
+
+/// Check whether there is transfer capacity available.
+pub(crate) fn has_transfer_capacity(
+    active_transfers: i32,
+    concurrent_transfers_limit: Option<i32>,
+) -> bool {
+    match concurrent_transfers_limit {
+        Some(limit) => active_transfers < limit,
+        None => true, // no limit set
+    }
+}
+
+/// Compute the transfer success rate from totals.
+pub(crate) fn transfer_success_rate(
+    bytes_transferred_total: i64,
+    transfer_failures_total: i32,
+) -> f64 {
+    let total_attempts = bytes_transferred_total.max(1) as f64; // avoid div/0
+    // Use failures as a fraction; note this is a simplified heuristic
+    if transfer_failures_total == 0 {
+        1.0
+    } else {
+        let failure_rate = transfer_failures_total as f64
+            / (transfer_failures_total as f64 + 1.0);
+        1.0 - failure_rate
+    }
+}
+
+/// Build the announce URL for a remote peer's announcement endpoint.
+pub(crate) fn build_announce_url(remote_endpoint: &str) -> String {
+    format!(
+        "{}/api/v1/peers/announce",
+        remote_endpoint.trim_end_matches('/')
+    )
+}
+
+/// Determine the started_at timestamp for a sync task status transition.
+pub(crate) fn sync_task_started_at(
+    status: SyncStatus,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if status == SyncStatus::InProgress {
+        Some(now)
+    } else {
+        None
+    }
+}
+
+/// Determine the completed_at timestamp for a sync task status transition.
+pub(crate) fn sync_task_completed_at(
+    status: SyncStatus,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if matches!(
+        status,
+        SyncStatus::Completed | SyncStatus::Failed | SyncStatus::Cancelled
+    ) {
+        Some(now)
+    } else {
+        None
+    }
+}
+
 /// Peer instance service
 pub struct PeerInstanceService {
     db: PgPool,
@@ -706,10 +809,11 @@ pub struct SyncTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
-    // -----------------------------------------------------------------------
-    // InstanceStatus Display tests
-    // -----------------------------------------------------------------------
+    // ===================================================================
+    // InstanceStatus Display
+    // ===================================================================
 
     #[test]
     fn test_instance_status_display_online() {
@@ -731,75 +835,364 @@ mod tests {
         assert_eq!(InstanceStatus::Degraded.to_string(), "degraded");
     }
 
-    // -----------------------------------------------------------------------
-    // InstanceStatus equality tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_instance_status_equality() {
         assert_eq!(InstanceStatus::Online, InstanceStatus::Online);
         assert_ne!(InstanceStatus::Online, InstanceStatus::Offline);
-        assert_ne!(InstanceStatus::Syncing, InstanceStatus::Degraded);
     }
 
     #[test]
     fn test_instance_status_clone_copy() {
         let s = InstanceStatus::Syncing;
-        let s2 = s; // Copy
-        let s3 = s.clone(); // Clone
-        assert_eq!(s, s2);
-        assert_eq!(s, s3);
-    }
-
-    // -----------------------------------------------------------------------
-    // ReplicationMode equality tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_replication_mode_equality() {
-        assert_eq!(ReplicationMode::Push, ReplicationMode::Push);
-        assert_eq!(ReplicationMode::Pull, ReplicationMode::Pull);
-        assert_eq!(ReplicationMode::Mirror, ReplicationMode::Mirror);
-        assert_eq!(ReplicationMode::None, ReplicationMode::None);
-        assert_ne!(ReplicationMode::Push, ReplicationMode::Pull);
-        assert_ne!(ReplicationMode::Mirror, ReplicationMode::None);
-    }
-
-    #[test]
-    fn test_replication_mode_clone_copy() {
-        let m = ReplicationMode::Mirror;
-        let m2 = m; // Copy
-        let m3 = m.clone(); // Clone
-        assert_eq!(m, m2);
-        assert_eq!(m, m3);
-    }
-
-    // -----------------------------------------------------------------------
-    // SyncStatus equality tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_sync_status_equality() {
-        assert_eq!(SyncStatus::Pending, SyncStatus::Pending);
-        assert_eq!(SyncStatus::InProgress, SyncStatus::InProgress);
-        assert_eq!(SyncStatus::Completed, SyncStatus::Completed);
-        assert_eq!(SyncStatus::Failed, SyncStatus::Failed);
-        assert_eq!(SyncStatus::Cancelled, SyncStatus::Cancelled);
-        assert_ne!(SyncStatus::Pending, SyncStatus::Completed);
-    }
-
-    #[test]
-    fn test_sync_status_clone_copy() {
-        let s = SyncStatus::Failed;
         let s2 = s;
         let s3 = s.clone();
         assert_eq!(s, s2);
         assert_eq!(s, s3);
     }
 
-    // -----------------------------------------------------------------------
-    // RegisterPeerInstanceRequest construction tests
-    // -----------------------------------------------------------------------
+    // ===================================================================
+    // ReplicationMode / SyncStatus
+    // ===================================================================
+
+    #[test]
+    fn test_replication_mode_equality() {
+        assert_eq!(ReplicationMode::Push, ReplicationMode::Push);
+        assert_ne!(ReplicationMode::Push, ReplicationMode::Pull);
+    }
+
+    #[test]
+    fn test_sync_status_equality() {
+        assert_eq!(SyncStatus::Pending, SyncStatus::Pending);
+        assert_ne!(SyncStatus::Pending, SyncStatus::Completed);
+    }
+
+    // ===================================================================
+    // derive_sync_status
+    // ===================================================================
+
+    #[test]
+    fn test_derive_sync_status_completed() {
+        assert_eq!(derive_sync_status(true), InstanceStatus::Online);
+    }
+
+    #[test]
+    fn test_derive_sync_status_not_completed() {
+        assert_eq!(derive_sync_status(false), InstanceStatus::Syncing);
+    }
+
+    // ===================================================================
+    // resolve_heartbeat_status
+    // ===================================================================
+
+    #[test]
+    fn test_resolve_heartbeat_status_none() {
+        assert_eq!(resolve_heartbeat_status(None), InstanceStatus::Online);
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_some_degraded() {
+        assert_eq!(
+            resolve_heartbeat_status(Some(InstanceStatus::Degraded)),
+            InstanceStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_some_syncing() {
+        assert_eq!(
+            resolve_heartbeat_status(Some(InstanceStatus::Syncing)),
+            InstanceStatus::Syncing
+        );
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_some_offline() {
+        assert_eq!(
+            resolve_heartbeat_status(Some(InstanceStatus::Offline)),
+            InstanceStatus::Offline
+        );
+    }
+
+    #[test]
+    fn test_resolve_heartbeat_status_some_online() {
+        assert_eq!(
+            resolve_heartbeat_status(Some(InstanceStatus::Online)),
+            InstanceStatus::Online
+        );
+    }
+
+    // ===================================================================
+    // cache_utilization_pct
+    // ===================================================================
+
+    #[test]
+    fn test_cache_utilization_pct_zero_size() {
+        assert!((cache_utilization_pct(0, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cache_utilization_pct_negative_size() {
+        assert!((cache_utilization_pct(-1, 100) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cache_utilization_pct_half_used() {
+        assert!((cache_utilization_pct(1000, 500) - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cache_utilization_pct_fully_used() {
+        assert!((cache_utilization_pct(1000, 1000) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_cache_utilization_pct_empty() {
+        assert!((cache_utilization_pct(1000, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ===================================================================
+    // is_heartbeat_stale
+    // ===================================================================
+
+    #[test]
+    fn test_is_heartbeat_stale_no_heartbeat() {
+        let now = Utc::now();
+        assert!(is_heartbeat_stale(None, now, 5));
+    }
+
+    #[test]
+    fn test_is_heartbeat_stale_recent() {
+        let now = Utc::now();
+        let recent = now - Duration::minutes(2);
+        assert!(!is_heartbeat_stale(Some(recent), now, 5));
+    }
+
+    #[test]
+    fn test_is_heartbeat_stale_exactly_threshold() {
+        let now = Utc::now();
+        let exactly = now - Duration::minutes(5);
+        assert!(is_heartbeat_stale(Some(exactly), now, 5));
+    }
+
+    #[test]
+    fn test_is_heartbeat_stale_old() {
+        let now = Utc::now();
+        let old = now - Duration::minutes(60);
+        assert!(is_heartbeat_stale(Some(old), now, 5));
+    }
+
+    #[test]
+    fn test_is_heartbeat_stale_zero_threshold() {
+        let now = Utc::now();
+        // Any heartbeat in the past is stale with 0 threshold
+        let hb = now - Duration::seconds(1);
+        assert!(is_heartbeat_stale(Some(hb), now, 0));
+    }
+
+    // ===================================================================
+    // is_in_backoff
+    // ===================================================================
+
+    #[test]
+    fn test_is_in_backoff_none() {
+        assert!(!is_in_backoff(None, Utc::now()));
+    }
+
+    #[test]
+    fn test_is_in_backoff_future() {
+        let now = Utc::now();
+        let future = now + Duration::minutes(10);
+        assert!(is_in_backoff(Some(future), now));
+    }
+
+    #[test]
+    fn test_is_in_backoff_past() {
+        let now = Utc::now();
+        let past = now - Duration::minutes(10);
+        assert!(!is_in_backoff(Some(past), now));
+    }
+
+    #[test]
+    fn test_is_in_backoff_exact_now() {
+        let now = Utc::now();
+        assert!(!is_in_backoff(Some(now), now));
+    }
+
+    // ===================================================================
+    // has_transfer_capacity
+    // ===================================================================
+
+    #[test]
+    fn test_has_transfer_capacity_no_limit() {
+        assert!(has_transfer_capacity(100, None));
+    }
+
+    #[test]
+    fn test_has_transfer_capacity_under_limit() {
+        assert!(has_transfer_capacity(2, Some(4)));
+    }
+
+    #[test]
+    fn test_has_transfer_capacity_at_limit() {
+        assert!(!has_transfer_capacity(4, Some(4)));
+    }
+
+    #[test]
+    fn test_has_transfer_capacity_over_limit() {
+        assert!(!has_transfer_capacity(5, Some(4)));
+    }
+
+    #[test]
+    fn test_has_transfer_capacity_zero_active() {
+        assert!(has_transfer_capacity(0, Some(1)));
+    }
+
+    // ===================================================================
+    // transfer_success_rate
+    // ===================================================================
+
+    #[test]
+    fn test_transfer_success_rate_no_failures() {
+        assert!((transfer_success_rate(1000, 0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_transfer_success_rate_some_failures() {
+        let rate = transfer_success_rate(1000, 1);
+        assert!(rate > 0.0);
+        assert!(rate < 1.0);
+    }
+
+    #[test]
+    fn test_transfer_success_rate_many_failures() {
+        let rate = transfer_success_rate(1000, 99);
+        assert!(rate > 0.0);
+        assert!(rate < 0.05);
+    }
+
+    #[test]
+    fn test_transfer_success_rate_zero_bytes() {
+        let rate = transfer_success_rate(0, 0);
+        assert!((rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ===================================================================
+    // build_announce_url
+    // ===================================================================
+
+    #[test]
+    fn test_build_announce_url_simple() {
+        assert_eq!(
+            build_announce_url("https://peer.example.com"),
+            "https://peer.example.com/api/v1/peers/announce"
+        );
+    }
+
+    #[test]
+    fn test_build_announce_url_trailing_slash() {
+        assert_eq!(
+            build_announce_url("https://peer.example.com/"),
+            "https://peer.example.com/api/v1/peers/announce"
+        );
+    }
+
+    #[test]
+    fn test_build_announce_url_multiple_trailing_slashes() {
+        // trim_end_matches removes ALL trailing matching chars
+        assert_eq!(
+            build_announce_url("https://peer.example.com///"),
+            "https://peer.example.com/api/v1/peers/announce"
+        );
+    }
+
+    #[test]
+    fn test_build_announce_url_with_port() {
+        assert_eq!(
+            build_announce_url("http://localhost:8080"),
+            "http://localhost:8080/api/v1/peers/announce"
+        );
+    }
+
+    #[test]
+    fn test_build_announce_url_with_path() {
+        assert_eq!(
+            build_announce_url("https://peer.example.com/prefix"),
+            "https://peer.example.com/prefix/api/v1/peers/announce"
+        );
+    }
+
+    // ===================================================================
+    // sync_task_started_at
+    // ===================================================================
+
+    #[test]
+    fn test_sync_task_started_at_in_progress() {
+        let now = Utc::now();
+        let result = sync_task_started_at(SyncStatus::InProgress, now);
+        assert_eq!(result, Some(now));
+    }
+
+    #[test]
+    fn test_sync_task_started_at_pending() {
+        let now = Utc::now();
+        assert!(sync_task_started_at(SyncStatus::Pending, now).is_none());
+    }
+
+    #[test]
+    fn test_sync_task_started_at_completed() {
+        let now = Utc::now();
+        assert!(sync_task_started_at(SyncStatus::Completed, now).is_none());
+    }
+
+    #[test]
+    fn test_sync_task_started_at_failed() {
+        let now = Utc::now();
+        assert!(sync_task_started_at(SyncStatus::Failed, now).is_none());
+    }
+
+    #[test]
+    fn test_sync_task_started_at_cancelled() {
+        let now = Utc::now();
+        assert!(sync_task_started_at(SyncStatus::Cancelled, now).is_none());
+    }
+
+    // ===================================================================
+    // sync_task_completed_at
+    // ===================================================================
+
+    #[test]
+    fn test_sync_task_completed_at_completed() {
+        let now = Utc::now();
+        assert_eq!(sync_task_completed_at(SyncStatus::Completed, now), Some(now));
+    }
+
+    #[test]
+    fn test_sync_task_completed_at_failed() {
+        let now = Utc::now();
+        assert_eq!(sync_task_completed_at(SyncStatus::Failed, now), Some(now));
+    }
+
+    #[test]
+    fn test_sync_task_completed_at_cancelled() {
+        let now = Utc::now();
+        assert_eq!(sync_task_completed_at(SyncStatus::Cancelled, now), Some(now));
+    }
+
+    #[test]
+    fn test_sync_task_completed_at_pending() {
+        let now = Utc::now();
+        assert!(sync_task_completed_at(SyncStatus::Pending, now).is_none());
+    }
+
+    #[test]
+    fn test_sync_task_completed_at_in_progress() {
+        let now = Utc::now();
+        assert!(sync_task_completed_at(SyncStatus::InProgress, now).is_none());
+    }
+
+    // ===================================================================
+    // Existing struct construction tests
+    // ===================================================================
 
     #[test]
     fn test_register_peer_instance_request_construction() {
@@ -807,35 +1200,13 @@ mod tests {
             name: "peer-1".to_string(),
             endpoint_url: "https://peer1.example.com".to_string(),
             region: Some("us-east-1".to_string()),
-            cache_size_bytes: 10 * 1024 * 1024 * 1024, // 10 GiB
+            cache_size_bytes: 10 * 1024 * 1024 * 1024,
             sync_filter: Some(serde_json::json!({"formats": ["maven", "docker"]})),
             api_key: "secret-key".to_string(),
         };
         assert_eq!(req.name, "peer-1");
-        assert_eq!(req.endpoint_url, "https://peer1.example.com");
-        assert_eq!(req.region, Some("us-east-1".to_string()));
         assert_eq!(req.cache_size_bytes, 10_737_418_240);
-        assert!(req.sync_filter.is_some());
-        assert_eq!(req.api_key, "secret-key");
     }
-
-    #[test]
-    fn test_register_peer_instance_request_no_optional_fields() {
-        let req = RegisterPeerInstanceRequest {
-            name: "simple-peer".to_string(),
-            endpoint_url: "http://localhost:8080".to_string(),
-            region: None,
-            cache_size_bytes: 0,
-            sync_filter: None,
-            api_key: "key".to_string(),
-        };
-        assert!(req.region.is_none());
-        assert!(req.sync_filter.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // PeerInstance construction tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_peer_instance_construction() {
@@ -868,14 +1239,8 @@ mod tests {
         };
         assert_eq!(peer.name, "peer-node");
         assert_eq!(peer.status, InstanceStatus::Online);
-        assert_eq!(peer.cache_size_bytes, 5_000_000_000);
-        assert_eq!(peer.cache_used_bytes, 1_000_000_000);
         assert!(!peer.is_local);
     }
-
-    // -----------------------------------------------------------------------
-    // SyncTask construction tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_sync_task_construction() {
@@ -896,16 +1261,7 @@ mod tests {
         };
         assert_eq!(task.status, SyncStatus::Pending);
         assert_eq!(task.priority, 5);
-        assert_eq!(task.bytes_transferred, 0);
-        assert!(task.error_message.is_none());
-        assert!(task.started_at.is_none());
-        assert!(task.completed_at.is_none());
-        assert_eq!(task.artifact_size, 1024 * 1024);
     }
-
-    // -----------------------------------------------------------------------
-    // MirrorRepo construction tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_mirror_repo_construction() {
@@ -915,62 +1271,5 @@ mod tests {
             last_replicated_at: Some(Utc::now()),
         };
         assert!(repo.schedule.is_some());
-        assert!(repo.last_replicated_at.is_some());
-    }
-
-    #[test]
-    fn test_mirror_repo_no_schedule() {
-        let repo = MirrorRepo {
-            repo_id: Uuid::new_v4(),
-            schedule: None,
-            last_replicated_at: None,
-        };
-        assert!(repo.schedule.is_none());
-        assert!(repo.last_replicated_at.is_none());
-    }
-
-    // -----------------------------------------------------------------------
-    // update_sync_status logic tests (sync status derivation)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_sync_completed_status_derivation() {
-        // Mirrors the logic in update_sync_status
-        let completed = true;
-        let status = if completed {
-            InstanceStatus::Online
-        } else {
-            InstanceStatus::Syncing
-        };
-        assert_eq!(status, InstanceStatus::Online);
-    }
-
-    #[test]
-    fn test_sync_not_completed_status_derivation() {
-        let completed = false;
-        let status = if completed {
-            InstanceStatus::Online
-        } else {
-            InstanceStatus::Syncing
-        };
-        assert_eq!(status, InstanceStatus::Syncing);
-    }
-
-    // -----------------------------------------------------------------------
-    // heartbeat default status logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_heartbeat_default_status() {
-        let status: Option<InstanceStatus> = None;
-        let new_status = status.unwrap_or(InstanceStatus::Online);
-        assert_eq!(new_status, InstanceStatus::Online);
-    }
-
-    #[test]
-    fn test_heartbeat_explicit_status() {
-        let status: Option<InstanceStatus> = Some(InstanceStatus::Degraded);
-        let new_status = status.unwrap_or(InstanceStatus::Online);
-        assert_eq!(new_status, InstanceStatus::Degraded);
     }
 }

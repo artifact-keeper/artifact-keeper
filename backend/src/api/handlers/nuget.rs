@@ -995,6 +995,128 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     Some(content[..end_pos].trim().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Extracted pure functions for testability
+// ---------------------------------------------------------------------------
+
+/// Build the base URL for NuGet service index resources.
+pub(crate) fn build_nuget_base_url(scheme: &str, host: &str, repo_key: &str) -> String {
+    format!("{}://{}/nuget/{}", scheme, host, repo_key)
+}
+
+/// Build the NuGet service index JSON (v3/index.json).
+pub(crate) fn build_nuget_service_index(base: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": "3.0.0",
+        "resources": [
+            {
+                "@id": format!("{}/v3/search", base),
+                "@type": "SearchQueryService",
+                "comment": "Search packages"
+            },
+            {
+                "@id": format!("{}/v3/search", base),
+                "@type": "SearchQueryService/3.0.0-beta",
+                "comment": "Search packages"
+            },
+            {
+                "@id": format!("{}/v3/search", base),
+                "@type": "SearchQueryService/3.0.0-rc",
+                "comment": "Search packages"
+            },
+            {
+                "@id": format!("{}/v3/registration/", base),
+                "@type": "RegistrationsBaseUrl",
+                "comment": "Package registrations"
+            },
+            {
+                "@id": format!("{}/v3/registration/", base),
+                "@type": "RegistrationsBaseUrl/3.0.0-beta",
+                "comment": "Package registrations"
+            },
+            {
+                "@id": format!("{}/v3/registration/", base),
+                "@type": "RegistrationsBaseUrl/3.0.0-rc",
+                "comment": "Package registrations"
+            },
+            {
+                "@id": format!("{}/v3/flatcontainer/", base),
+                "@type": "PackageBaseAddress/3.0.0",
+                "comment": "Package content"
+            },
+            {
+                "@id": format!("{}/api/v2/package", base),
+                "@type": "PackagePublish/2.0.0",
+                "comment": "Push packages"
+            }
+        ]
+    })
+}
+
+/// Build a single registration item JSON for a NuGet package version.
+pub(crate) fn build_registration_item(
+    base: &str,
+    package_id: &str,
+    version: &str,
+    description: &str,
+    authors: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "@id": format!("{}/v3/registration/{}/{}.json", base, package_id, version),
+        "catalogEntry": {
+            "@id": format!("{}/v3/registration/{}/{}.json", base, package_id, version),
+            "id": package_id,
+            "version": version,
+            "description": description,
+            "authors": authors,
+            "packageContent": format!(
+                "{}/v3/flatcontainer/{}/{}/{}.{}.nupkg",
+                base, package_id, version, package_id, version
+            ),
+            "listed": true,
+        },
+        "packageContent": format!(
+            "{}/v3/flatcontainer/{}/{}/{}.{}.nupkg",
+            base, package_id, version, package_id, version
+        ),
+    })
+}
+
+/// Build the flatcontainer versions JSON response.
+pub(crate) fn build_flatcontainer_versions_json(versions: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "versions": versions
+    })
+}
+
+/// Build the NuGet artifact path for a .nupkg.
+pub(crate) fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
+    let filename = format!("{}.{}.nupkg", package_id, version);
+    format!("{}/{}/{}", package_id, version, filename)
+}
+
+/// Build the NuGet storage key for a .nupkg.
+pub(crate) fn build_nuget_storage_key(package_id: &str, version: &str) -> String {
+    let filename = format!("{}.{}.nupkg", package_id, version);
+    format!("nuget/{}/{}/{}", package_id, version, filename)
+}
+
+/// Build the NuGet push metadata JSON.
+pub(crate) fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": info.id,
+        "version": info.version,
+        "description": info.description,
+        "authors": info.authors,
+        "filename": format!("{}.{}.nupkg", info.id.to_lowercase(), info.version),
+    })
+}
+
+/// Build the search pattern for NuGet package queries.
+pub(crate) fn build_nuget_search_pattern(query_term: &str) -> String {
+    format!("%{}%", query_term.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,5 +1565,258 @@ mod tests {
         let repo_key = "main";
         let base = format!("{}://{}/nuget/{}", scheme, host, repo_key);
         assert_eq!(base, "http://localhost/nuget/main");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_nuget_base_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_nuget_base_url_https() {
+        assert_eq!(
+            build_nuget_base_url("https", "registry.example.com", "nuget-hosted"),
+            "https://registry.example.com/nuget/nuget-hosted"
+        );
+    }
+
+    #[test]
+    fn test_build_nuget_base_url_http_localhost() {
+        assert_eq!(
+            build_nuget_base_url("http", "localhost", "main"),
+            "http://localhost/nuget/main"
+        );
+    }
+
+    #[test]
+    fn test_build_nuget_base_url_with_port() {
+        assert_eq!(
+            build_nuget_base_url("http", "localhost:8080", "nuget-local"),
+            "http://localhost:8080/nuget/nuget-local"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_nuget_service_index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_nuget_service_index_structure() {
+        let base = "https://example.com/nuget/main";
+        let index = build_nuget_service_index(base);
+        assert_eq!(index["version"], "3.0.0");
+        let resources = index["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 8);
+    }
+
+    #[test]
+    fn test_build_nuget_service_index_search_url() {
+        let base = "https://example.com/nuget/repo";
+        let index = build_nuget_service_index(base);
+        let resources = index["resources"].as_array().unwrap();
+        let search = &resources[0];
+        assert_eq!(
+            search["@id"],
+            "https://example.com/nuget/repo/v3/search"
+        );
+        assert_eq!(search["@type"], "SearchQueryService");
+    }
+
+    #[test]
+    fn test_build_nuget_service_index_push_url() {
+        let base = "https://example.com/nuget/repo";
+        let index = build_nuget_service_index(base);
+        let resources = index["resources"].as_array().unwrap();
+        let push = &resources[7];
+        assert_eq!(
+            push["@id"],
+            "https://example.com/nuget/repo/api/v2/package"
+        );
+        assert_eq!(push["@type"], "PackagePublish/2.0.0");
+    }
+
+    #[test]
+    fn test_build_nuget_service_index_registration_url() {
+        let base = "https://example.com/nuget/repo";
+        let index = build_nuget_service_index(base);
+        let resources = index["resources"].as_array().unwrap();
+        let reg = &resources[3];
+        assert_eq!(
+            reg["@id"],
+            "https://example.com/nuget/repo/v3/registration/"
+        );
+        assert_eq!(reg["@type"], "RegistrationsBaseUrl");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_registration_item
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_registration_item_basic() {
+        let item = build_registration_item(
+            "https://example.com/nuget/repo",
+            "newtonsoft.json",
+            "13.0.1",
+            "Popular JSON framework",
+            "James Newton-King",
+        );
+        assert_eq!(item["catalogEntry"]["id"], "newtonsoft.json");
+        assert_eq!(item["catalogEntry"]["version"], "13.0.1");
+        assert_eq!(item["catalogEntry"]["description"], "Popular JSON framework");
+        assert_eq!(item["catalogEntry"]["authors"], "James Newton-King");
+        assert_eq!(item["catalogEntry"]["listed"], true);
+    }
+
+    #[test]
+    fn test_build_registration_item_package_content_url() {
+        let item = build_registration_item(
+            "https://example.com/nuget/repo",
+            "mypackage",
+            "1.0.0",
+            "",
+            "",
+        );
+        let url = item["packageContent"].as_str().unwrap();
+        assert_eq!(
+            url,
+            "https://example.com/nuget/repo/v3/flatcontainer/mypackage/1.0.0/mypackage.1.0.0.nupkg"
+        );
+    }
+
+    #[test]
+    fn test_build_registration_item_empty_metadata() {
+        let item = build_registration_item(
+            "http://localhost/nuget/local",
+            "pkg",
+            "0.1.0",
+            "",
+            "",
+        );
+        assert_eq!(item["catalogEntry"]["description"], "");
+        assert_eq!(item["catalogEntry"]["authors"], "");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_flatcontainer_versions_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_flatcontainer_versions_json_basic() {
+        let versions = vec!["1.0.0".to_string(), "2.0.0".to_string(), "3.0.0".to_string()];
+        let json = build_flatcontainer_versions_json(&versions);
+        let arr = json["versions"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0], "1.0.0");
+        assert_eq!(arr[2], "3.0.0");
+    }
+
+    #[test]
+    fn test_build_flatcontainer_versions_json_empty() {
+        let versions: Vec<String> = vec![];
+        let json = build_flatcontainer_versions_json(&versions);
+        assert!(json["versions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_flatcontainer_versions_json_single() {
+        let versions = vec!["1.0.0-beta".to_string()];
+        let json = build_flatcontainer_versions_json(&versions);
+        let arr = json["versions"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], "1.0.0-beta");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_nuget_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_nuget_artifact_path_basic() {
+        assert_eq!(
+            build_nuget_artifact_path("newtonsoft.json", "13.0.1"),
+            "newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg"
+        );
+    }
+
+    #[test]
+    fn test_build_nuget_artifact_path_prerelease() {
+        assert_eq!(
+            build_nuget_artifact_path("mypackage", "1.0.0-beta.1"),
+            "mypackage/1.0.0-beta.1/mypackage.1.0.0-beta.1.nupkg"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_nuget_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_nuget_storage_key_basic() {
+        assert_eq!(
+            build_nuget_storage_key("newtonsoft.json", "13.0.1"),
+            "nuget/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_nuget_push_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_nuget_push_metadata_basic() {
+        let info = NuspecInfo {
+            id: "TestPackage".to_string(),
+            version: "2.0.0".to_string(),
+            description: "A test package".to_string(),
+            authors: "Author".to_string(),
+        };
+        let meta = build_nuget_push_metadata(&info);
+        assert_eq!(meta["id"], "TestPackage");
+        assert_eq!(meta["version"], "2.0.0");
+        assert_eq!(meta["description"], "A test package");
+        assert_eq!(meta["authors"], "Author");
+        assert_eq!(meta["filename"], "testpackage.2.0.0.nupkg");
+    }
+
+    #[test]
+    fn test_build_nuget_push_metadata_preserves_original_id() {
+        let info = NuspecInfo {
+            id: "Newtonsoft.Json".to_string(),
+            version: "13.0.1".to_string(),
+            description: "JSON framework".to_string(),
+            authors: "James NK".to_string(),
+        };
+        let meta = build_nuget_push_metadata(&info);
+        // id is preserved as-is (with original casing)
+        assert_eq!(meta["id"], "Newtonsoft.Json");
+        // filename is lowercased
+        assert_eq!(meta["filename"], "newtonsoft.json.13.0.1.nupkg");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_nuget_search_pattern
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_nuget_search_pattern_basic() {
+        assert_eq!(build_nuget_search_pattern("json"), "%json%");
+    }
+
+    #[test]
+    fn test_build_nuget_search_pattern_case_insensitive() {
+        assert_eq!(build_nuget_search_pattern("Newton"), "%newton%");
+    }
+
+    #[test]
+    fn test_build_nuget_search_pattern_empty() {
+        assert_eq!(build_nuget_search_pattern(""), "%%");
+    }
+
+    #[test]
+    fn test_build_nuget_search_pattern_with_dots() {
+        assert_eq!(
+            build_nuget_search_pattern("Newtonsoft.Json"),
+            "%newtonsoft.json%"
+        );
     }
 }

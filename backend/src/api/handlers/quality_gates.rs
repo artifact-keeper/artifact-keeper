@@ -253,6 +253,168 @@ pub struct EvaluateGateQuery {
     pub repository_id: Option<Uuid>,
 }
 
+// ---------------------------------------------------------------------------
+// Pure (non-async, no-DB) helper functions for unit testing
+// ---------------------------------------------------------------------------
+
+/// Map a numeric health score to a letter grade.
+pub(crate) fn health_grade_from_score(score: i32) -> &'static str {
+    match score {
+        90..=i32::MAX => "A",
+        80..=89 => "B",
+        70..=79 => "C",
+        60..=69 => "D",
+        _ => "F",
+    }
+}
+
+/// Count how many grades fall into each bucket (A, B, C, D, F).
+pub(crate) fn count_grade_distribution(grades: &[&str]) -> (i64, i64, i64, i64, i64) {
+    let mut a = 0i64;
+    let mut b = 0i64;
+    let mut c = 0i64;
+    let mut d = 0i64;
+    let mut f = 0i64;
+    for &g in grades {
+        match g {
+            "A" => a += 1,
+            "B" => b += 1,
+            "C" => c += 1,
+            "D" => d += 1,
+            _ => f += 1,
+        }
+    }
+    (a, b, c, d, f)
+}
+
+/// Compute the average health score from a slice. Returns 0 for empty input.
+pub(crate) fn compute_avg_health_score(scores: &[i32]) -> i32 {
+    if scores.is_empty() {
+        return 0;
+    }
+    let sum: i64 = scores.iter().map(|&s| s as i64).sum();
+    (sum / scores.len() as i64) as i32
+}
+
+/// Check a minimum-threshold rule. Returns a violation if `actual < min`.
+pub(crate) fn check_min_threshold(
+    rule_name: &str,
+    actual: i32,
+    min: Option<i32>,
+) -> Option<GateViolationResponse> {
+    let min = min?;
+    if actual < min {
+        Some(GateViolationResponse {
+            rule: rule_name.to_string(),
+            expected: format!(">= {}", min),
+            actual: actual.to_string(),
+            message: format!("{} is {} (minimum {})", rule_name, actual, min),
+        })
+    } else {
+        None
+    }
+}
+
+/// Check a maximum-threshold rule. Returns a violation if `actual > max`.
+pub(crate) fn check_max_threshold(
+    rule_name: &str,
+    actual: i32,
+    max: Option<i32>,
+) -> Option<GateViolationResponse> {
+    let max = max?;
+    if actual > max {
+        Some(GateViolationResponse {
+            rule: rule_name.to_string(),
+            expected: format!("<= {}", max),
+            actual: actual.to_string(),
+            message: format!("{} is {} (maximum {})", rule_name, actual, max),
+        })
+    } else {
+        None
+    }
+}
+
+/// Evaluate all gate threshold rules and return a list of violations.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_gate_thresholds(
+    health_score: i32,
+    security_score: Option<i32>,
+    quality_score: Option<i32>,
+    metadata_score: Option<i32>,
+    critical_issues: i32,
+    high_issues: i32,
+    medium_issues: i32,
+    min_health: Option<i32>,
+    min_security: Option<i32>,
+    min_quality: Option<i32>,
+    min_metadata: Option<i32>,
+    max_critical: Option<i32>,
+    max_high: Option<i32>,
+    max_medium: Option<i32>,
+) -> Vec<GateViolationResponse> {
+    let mut violations = Vec::new();
+    if let Some(v) = check_min_threshold("min_health_score", health_score, min_health) {
+        violations.push(v);
+    }
+    if let Some(v) = check_min_threshold(
+        "min_security_score",
+        security_score.unwrap_or(0),
+        min_security,
+    ) {
+        violations.push(v);
+    }
+    if let Some(v) = check_min_threshold(
+        "min_quality_score",
+        quality_score.unwrap_or(0),
+        min_quality,
+    ) {
+        violations.push(v);
+    }
+    if let Some(v) = check_min_threshold(
+        "min_metadata_score",
+        metadata_score.unwrap_or(0),
+        min_metadata,
+    ) {
+        violations.push(v);
+    }
+    if let Some(v) = check_max_threshold("max_critical_issues", critical_issues, max_critical) {
+        violations.push(v);
+    }
+    if let Some(v) = check_max_threshold("max_high_issues", high_issues, max_high) {
+        violations.push(v);
+    }
+    if let Some(v) = check_max_threshold("max_medium_issues", medium_issues, max_medium) {
+        violations.push(v);
+    }
+    violations
+}
+
+/// Compute total pages for pagination.
+pub(crate) fn compute_total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil() as u32
+}
+
+/// Normalize pagination parameters with defaults and clamping.
+pub(crate) fn normalize_pagination(
+    page: Option<u32>,
+    per_page: Option<u32>,
+) -> (u32, u32) {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page.unwrap_or(20).min(100);
+    (page, per_page)
+}
+
+/// Validate that a status string is one of the recognized values.
+pub(crate) fn validate_status(status: &str) -> std::result::Result<(), String> {
+    if !["pending", "approved", "rejected"].contains(&status) {
+        return Err(format!(
+            "Invalid status '{}'. Must be one of: pending, approved, rejected",
+            status
+        ));
+    }
+    Ok(())
+}
+
 impl From<crate::models::quality::QualityCheckResult> for CheckResponse {
     fn from(c: crate::models::quality::QualityCheckResult) -> Self {
         Self {
@@ -1250,5 +1412,300 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"total_repositories\":3"));
         assert!(json.contains("\"avg_health_score\":75"));
+    }
+
+    // -----------------------------------------------------------------------
+    // health_grade_from_score
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_health_grade_a() {
+        assert_eq!(health_grade_from_score(100), "A");
+        assert_eq!(health_grade_from_score(95), "A");
+        assert_eq!(health_grade_from_score(90), "A");
+    }
+
+    #[test]
+    fn test_health_grade_b() {
+        assert_eq!(health_grade_from_score(89), "B");
+        assert_eq!(health_grade_from_score(85), "B");
+        assert_eq!(health_grade_from_score(80), "B");
+    }
+
+    #[test]
+    fn test_health_grade_c() {
+        assert_eq!(health_grade_from_score(79), "C");
+        assert_eq!(health_grade_from_score(70), "C");
+    }
+
+    #[test]
+    fn test_health_grade_d() {
+        assert_eq!(health_grade_from_score(69), "D");
+        assert_eq!(health_grade_from_score(60), "D");
+    }
+
+    #[test]
+    fn test_health_grade_f() {
+        assert_eq!(health_grade_from_score(59), "F");
+        assert_eq!(health_grade_from_score(0), "F");
+        assert_eq!(health_grade_from_score(-1), "F");
+    }
+
+    // -----------------------------------------------------------------------
+    // count_grade_distribution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_grade_distribution_mixed() {
+        let grades = vec!["A", "A", "B", "C", "F", "A"];
+        let (a, b, c, d, f) = count_grade_distribution(&grades);
+        assert_eq!(a, 3);
+        assert_eq!(b, 1);
+        assert_eq!(c, 1);
+        assert_eq!(d, 0);
+        assert_eq!(f, 1);
+    }
+
+    #[test]
+    fn test_count_grade_distribution_empty() {
+        let (a, b, c, d, f) = count_grade_distribution(&[]);
+        assert_eq!((a, b, c, d, f), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_count_grade_distribution_all_same() {
+        let grades = vec!["B", "B", "B"];
+        let (a, b, _, _, _) = count_grade_distribution(&grades);
+        assert_eq!(a, 0);
+        assert_eq!(b, 3);
+    }
+
+    #[test]
+    fn test_count_grade_distribution_unknown_mapped_to_f() {
+        let grades = vec!["X", "Z", ""];
+        let (_, _, _, _, f) = count_grade_distribution(&grades);
+        assert_eq!(f, 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_avg_health_score
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_avg_health_score_basic() {
+        assert_eq!(compute_avg_health_score(&[80, 90, 70, 100]), 85);
+    }
+
+    #[test]
+    fn test_compute_avg_health_score_empty() {
+        assert_eq!(compute_avg_health_score(&[]), 0);
+    }
+
+    #[test]
+    fn test_compute_avg_health_score_single() {
+        assert_eq!(compute_avg_health_score(&[75]), 75);
+    }
+
+    #[test]
+    fn test_compute_avg_health_score_zeros() {
+        assert_eq!(compute_avg_health_score(&[0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn test_compute_avg_health_score_rounding() {
+        assert_eq!(compute_avg_health_score(&[33, 33, 34]), 33);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_min_threshold
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_min_threshold_passes() {
+        assert!(check_min_threshold("min_health_score", 80, Some(80)).is_none());
+        assert!(check_min_threshold("min_health_score", 90, Some(80)).is_none());
+    }
+
+    #[test]
+    fn test_check_min_threshold_fails() {
+        let v = check_min_threshold("min_health_score", 65, Some(80)).unwrap();
+        assert_eq!(v.rule, "min_health_score");
+        assert_eq!(v.expected, ">= 80");
+        assert_eq!(v.actual, "65");
+        assert!(v.message.contains("65"));
+    }
+
+    #[test]
+    fn test_check_min_threshold_none_threshold() {
+        assert!(check_min_threshold("any_rule", 0, None).is_none());
+    }
+
+    #[test]
+    fn test_check_min_threshold_boundary() {
+        assert!(check_min_threshold("score", 79, Some(80)).is_some());
+        assert!(check_min_threshold("score", 80, Some(80)).is_none());
+        assert!(check_min_threshold("score", 81, Some(80)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // check_max_threshold
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_max_threshold_passes() {
+        assert!(check_max_threshold("max_critical_issues", 0, Some(0)).is_none());
+        assert!(check_max_threshold("max_critical_issues", 3, Some(5)).is_none());
+    }
+
+    #[test]
+    fn test_check_max_threshold_fails() {
+        let v = check_max_threshold("max_critical_issues", 3, Some(0)).unwrap();
+        assert_eq!(v.rule, "max_critical_issues");
+        assert_eq!(v.expected, "<= 0");
+        assert_eq!(v.actual, "3");
+    }
+
+    #[test]
+    fn test_check_max_threshold_none_threshold() {
+        assert!(check_max_threshold("any_rule", 999, None).is_none());
+    }
+
+    #[test]
+    fn test_check_max_threshold_boundary() {
+        assert!(check_max_threshold("issues", 5, Some(5)).is_none());
+        assert!(check_max_threshold("issues", 6, Some(5)).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_gate_thresholds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_evaluate_gate_thresholds_all_pass() {
+        let violations = evaluate_gate_thresholds(
+            90, Some(95), Some(85), Some(80),
+            0, 2, 5,
+            Some(80), Some(90), Some(70), Some(60),
+            Some(0), Some(5), Some(10),
+        );
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_gate_thresholds_health_fails() {
+        let violations = evaluate_gate_thresholds(
+            65, None, None, None, 0, 0, 0,
+            Some(80), None, None, None, None, None, None,
+        );
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].rule, "min_health_score");
+    }
+
+    #[test]
+    fn test_evaluate_gate_thresholds_multiple_failures() {
+        let violations = evaluate_gate_thresholds(
+            50, Some(40), Some(30), Some(20),
+            5, 10, 20,
+            Some(80), Some(90), Some(70), Some(60),
+            Some(0), Some(5), Some(10),
+        );
+        assert_eq!(violations.len(), 7);
+    }
+
+    #[test]
+    fn test_evaluate_gate_thresholds_no_thresholds() {
+        let violations = evaluate_gate_thresholds(
+            10, Some(10), Some(10), Some(10), 100, 100, 100,
+            None, None, None, None, None, None, None,
+        );
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_gate_thresholds_issue_counts_only() {
+        let violations = evaluate_gate_thresholds(
+            100, None, None, None, 5, 10, 20,
+            None, None, None, None, Some(0), Some(5), Some(10),
+        );
+        assert_eq!(violations.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_total_pages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_total_pages_exact() {
+        assert_eq!(compute_total_pages(100, 20), 5);
+    }
+
+    #[test]
+    fn test_compute_total_pages_remainder() {
+        assert_eq!(compute_total_pages(101, 20), 6);
+    }
+
+    #[test]
+    fn test_compute_total_pages_zero() {
+        assert_eq!(compute_total_pages(0, 20), 0);
+    }
+
+    #[test]
+    fn test_compute_total_pages_one_item() {
+        assert_eq!(compute_total_pages(1, 20), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_pagination
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_pagination_defaults() {
+        let (page, per_page) = normalize_pagination(None, None);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, 20);
+    }
+
+    #[test]
+    fn test_normalize_pagination_custom() {
+        let (page, per_page) = normalize_pagination(Some(3), Some(50));
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 50);
+    }
+
+    #[test]
+    fn test_normalize_pagination_page_zero_clamps() {
+        let (page, _) = normalize_pagination(Some(0), None);
+        assert_eq!(page, 1);
+    }
+
+    #[test]
+    fn test_normalize_pagination_per_page_exceeds_max() {
+        let (_, per_page) = normalize_pagination(None, Some(200));
+        assert_eq!(per_page, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_status_valid() {
+        assert!(validate_status("pending").is_ok());
+        assert!(validate_status("approved").is_ok());
+        assert!(validate_status("rejected").is_ok());
+    }
+
+    #[test]
+    fn test_validate_status_invalid() {
+        assert!(validate_status("unknown").is_err());
+        assert!(validate_status("").is_err());
+        assert!(validate_status("PENDING").is_err());
+    }
+
+    #[test]
+    fn test_validate_status_error_message() {
+        let err = validate_status("bad").unwrap_err();
+        assert!(err.contains("bad"));
+        assert!(err.contains("pending"));
     }
 }

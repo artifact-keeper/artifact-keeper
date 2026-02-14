@@ -1006,6 +1006,86 @@ async fn upload_mod(
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Extracted pure functions for testability
+// ---------------------------------------------------------------------------
+
+/// Build a version info JSON string (used by .info and @latest endpoints).
+pub(crate) fn build_version_info_json(version: &str, time_str: &str) -> String {
+    serde_json::json!({
+        "Version": version,
+        "Time": time_str,
+    })
+    .to_string()
+}
+
+/// Format a chrono DateTime into Go-compatible timestamp string.
+pub(crate) fn format_go_timestamp(dt: &chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Build a newline-separated version list from a vec of optional version strings.
+pub(crate) fn build_version_list(versions: &[Option<String>]) -> String {
+    versions
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build the artifact path for a Go module zip.
+pub(crate) fn build_go_zip_artifact_path(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("{}/{}/{}.zip", encoded_module, version, version)
+}
+
+/// Build the storage key for a Go module zip.
+pub(crate) fn build_go_zip_storage_key(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("go/{}/{}/{}.zip", encoded_module, version, version)
+}
+
+/// Build the artifact path for a Go go.mod file.
+pub(crate) fn build_go_mod_artifact_path(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("{}/{}/go.mod", encoded_module, version)
+}
+
+/// Build the storage key for a Go go.mod file.
+pub(crate) fn build_go_mod_storage_key(module: &str, version: &str) -> String {
+    let encoded_module = encode_module_path(module);
+    format!("go/{}/{}/go.mod", encoded_module, version)
+}
+
+/// Build Go module metadata JSON for storage.
+pub(crate) fn build_go_artifact_metadata(
+    module: &str,
+    version: &str,
+    file_type: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "module": module,
+        "version": version,
+        "type": file_type,
+    })
+}
+
+/// Build Content-Disposition header for Go zip downloads.
+pub(crate) fn build_go_zip_content_disposition(module: &str, version: &str) -> String {
+    format!(
+        "attachment; filename=\"{}@{}.zip\"",
+        encode_module_path(module),
+        version
+    )
+}
+
+/// Build the upstream path for a Go module request (used by remote/virtual repos).
+pub(crate) fn build_go_upstream_path(module: &str, version: &str, ext: &str) -> String {
+    let encoded = encode_module_path(module);
+    format!("{}/@v/{}.{}", encoded, version, ext)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1122,5 +1202,302 @@ mod tests {
     #[test]
     fn test_parse_path_invalid() {
         assert!(parse_path("github.com/user/repo/invalid").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_version_info_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_version_info_json_basic() {
+        let json = build_version_info_json("v1.2.3", "2024-01-15T10:30:00Z");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["Version"], "v1.2.3");
+        assert_eq!(parsed["Time"], "2024-01-15T10:30:00Z");
+    }
+
+    #[test]
+    fn test_build_version_info_json_prerelease() {
+        let json = build_version_info_json("v0.1.0-alpha.1", "2024-06-01T00:00:00Z");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["Version"], "v0.1.0-alpha.1");
+    }
+
+    #[test]
+    fn test_build_version_info_json_valid_json() {
+        let json = build_version_info_json("v2.0.0", "2025-12-25T12:00:00Z");
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // format_go_timestamp
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_go_timestamp() {
+        use chrono::TimeZone;
+        let dt = chrono::Utc.with_ymd_and_hms(2024, 3, 15, 9, 30, 0).unwrap();
+        assert_eq!(format_go_timestamp(&dt), "2024-03-15T09:30:00Z");
+    }
+
+    #[test]
+    fn test_format_go_timestamp_midnight() {
+        use chrono::TimeZone;
+        let dt = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(format_go_timestamp(&dt), "2025-01-01T00:00:00Z");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_version_list
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_version_list_basic() {
+        let versions = vec![
+            Some("v1.0.0".to_string()),
+            Some("v1.1.0".to_string()),
+            Some("v2.0.0".to_string()),
+        ];
+        assert_eq!(build_version_list(&versions), "v1.0.0\nv1.1.0\nv2.0.0");
+    }
+
+    #[test]
+    fn test_build_version_list_with_nones() {
+        let versions = vec![
+            Some("v1.0.0".to_string()),
+            None,
+            Some("v2.0.0".to_string()),
+            None,
+        ];
+        assert_eq!(build_version_list(&versions), "v1.0.0\nv2.0.0");
+    }
+
+    #[test]
+    fn test_build_version_list_empty() {
+        let versions: Vec<Option<String>> = vec![];
+        assert_eq!(build_version_list(&versions), "");
+    }
+
+    #[test]
+    fn test_build_version_list_all_none() {
+        let versions: Vec<Option<String>> = vec![None, None, None];
+        assert_eq!(build_version_list(&versions), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_go_zip_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_go_zip_artifact_path_simple() {
+        assert_eq!(
+            build_go_zip_artifact_path("github.com/user/repo", "v1.0.0"),
+            "github.com/user/repo/v1.0.0/v1.0.0.zip"
+        );
+    }
+
+    #[test]
+    fn test_build_go_zip_artifact_path_uppercase() {
+        assert_eq!(
+            build_go_zip_artifact_path("github.com/Azure/go-sdk", "v2.0.0"),
+            "github.com/!azure/go-sdk/v2.0.0/v2.0.0.zip"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_go_zip_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_go_zip_storage_key_simple() {
+        assert_eq!(
+            build_go_zip_storage_key("github.com/user/repo", "v1.0.0"),
+            "go/github.com/user/repo/v1.0.0/v1.0.0.zip"
+        );
+    }
+
+    #[test]
+    fn test_build_go_zip_storage_key_encoded() {
+        assert_eq!(
+            build_go_zip_storage_key("github.com/Azure/SDK", "v3.0.0"),
+            "go/github.com/!azure/!s!d!k/v3.0.0/v3.0.0.zip"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_go_mod_artifact_path / storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_go_mod_artifact_path() {
+        assert_eq!(
+            build_go_mod_artifact_path("github.com/user/repo", "v1.0.0"),
+            "github.com/user/repo/v1.0.0/go.mod"
+        );
+    }
+
+    #[test]
+    fn test_build_go_mod_storage_key() {
+        assert_eq!(
+            build_go_mod_storage_key("github.com/user/repo", "v1.0.0"),
+            "go/github.com/user/repo/v1.0.0/go.mod"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_go_artifact_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_go_artifact_metadata_zip() {
+        let meta = build_go_artifact_metadata("github.com/user/repo", "v1.0.0", "zip");
+        assert_eq!(meta["module"], "github.com/user/repo");
+        assert_eq!(meta["version"], "v1.0.0");
+        assert_eq!(meta["type"], "zip");
+    }
+
+    #[test]
+    fn test_build_go_artifact_metadata_mod() {
+        let meta = build_go_artifact_metadata("github.com/user/repo", "v2.0.0", "mod");
+        assert_eq!(meta["type"], "mod");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_go_zip_content_disposition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_go_zip_content_disposition_simple() {
+        assert_eq!(
+            build_go_zip_content_disposition("github.com/user/repo", "v1.0.0"),
+            "attachment; filename=\"github.com/user/repo@v1.0.0.zip\""
+        );
+    }
+
+    #[test]
+    fn test_build_go_zip_content_disposition_encoded() {
+        assert_eq!(
+            build_go_zip_content_disposition("github.com/Azure/go-sdk", "v2.0.0"),
+            "attachment; filename=\"github.com/!azure/go-sdk@v2.0.0.zip\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_go_upstream_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_go_upstream_path_zip() {
+        assert_eq!(
+            build_go_upstream_path("github.com/user/repo", "v1.0.0", "zip"),
+            "github.com/user/repo/@v/v1.0.0.zip"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_path_mod() {
+        assert_eq!(
+            build_go_upstream_path("github.com/user/repo", "v1.0.0", "mod"),
+            "github.com/user/repo/@v/v1.0.0.mod"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_path_info() {
+        assert_eq!(
+            build_go_upstream_path("github.com/user/repo", "v1.0.0", "info"),
+            "github.com/user/repo/@v/v1.0.0.info"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_path_encoded() {
+        assert_eq!(
+            build_go_upstream_path("github.com/Azure/go-sdk", "v2.0.0", "zip"),
+            "github.com/!azure/go-sdk/@v/v2.0.0.zip"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // encode_module_path round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let original = "github.com/Azure/Go-SDK";
+        let encoded = encode_module_path(original);
+        let decoded = decode_module_path(&encoded);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_no_uppercase() {
+        let original = "github.com/user/repo";
+        let encoded = encode_module_path(original);
+        assert_eq!(encoded, original); // no change
+        assert_eq!(decode_module_path(&encoded), original);
+    }
+
+    #[test]
+    fn test_decode_multiple_consecutive_bangs() {
+        // Two consecutive capital letters: AB -> !a!b
+        assert_eq!(
+            decode_module_path("github.com/!a!b/pkg"),
+            "github.com/AB/pkg"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_basic_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_basic_credentials_valid() {
+        use axum::http::HeaderValue;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("gouser:gopass");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
+        );
+        let result = extract_basic_credentials(&headers);
+        assert_eq!(
+            result,
+            Some(("gouser".to_string(), "gopass".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_missing() {
+        assert!(extract_basic_credentials(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_bearer_ignored() {
+        use axum::http::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer some-token"),
+        );
+        assert!(extract_basic_credentials(&headers).is_none());
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_colon_in_password() {
+        use axum::http::HeaderValue;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("user:p:a:s:s");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
+        );
+        let result = extract_basic_credentials(&headers);
+        assert_eq!(
+            result,
+            Some(("user".to_string(), "p:a:s:s".to_string()))
+        );
     }
 }

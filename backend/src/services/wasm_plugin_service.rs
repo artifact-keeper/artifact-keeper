@@ -1765,6 +1765,157 @@ impl WasmPluginService {
     }
 }
 
+// =========================================================================
+// Extracted pure functions (testable without DB or async)
+// =========================================================================
+
+/// Build the filesystem path where a plugin's WASM binary should be stored.
+pub(crate) fn build_wasm_path(plugins_dir: &Path, plugin_name: &str) -> PathBuf {
+    plugins_dir.join(format!("{}.wasm", plugin_name))
+}
+
+/// Return the ordered list of candidate paths where a WASM binary might
+/// be found inside a cloned/extracted plugin repository.
+pub(crate) fn wasm_binary_candidates(repo_path: &Path) -> Vec<PathBuf> {
+    vec![
+        repo_path.join("target/wasm32-wasi/release/plugin.wasm"),
+        repo_path.join("target/wasm32-wasip1/release/plugin.wasm"),
+        repo_path.join("plugin.wasm"),
+        repo_path.join("out/plugin.wasm"),
+        repo_path.join("dist/plugin.wasm"),
+    ]
+}
+
+/// Error classification for Git clone failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GitCloneErrorKind {
+    NotFound,
+    Timeout,
+    Unauthorized,
+    Other,
+}
+
+/// Classify a Git clone error message into a broad category.
+pub(crate) fn classify_git_clone_error(error_msg: &str) -> GitCloneErrorKind {
+    if error_msg.contains("not found") || error_msg.contains("404") {
+        GitCloneErrorKind::NotFound
+    } else if error_msg.contains("timeout") {
+        GitCloneErrorKind::Timeout
+    } else if error_msg.contains("authentication") || error_msg.contains("401") {
+        GitCloneErrorKind::Unauthorized
+    } else {
+        GitCloneErrorKind::Other
+    }
+}
+
+/// Map a `ManifestValidationError` to a human-readable error message.
+pub(crate) fn manifest_validation_error_message(e: &ManifestValidationError) -> String {
+    match e {
+        ManifestValidationError::InvalidPluginName(name) => {
+            format!("Invalid plugin name '{}': must be lowercase letters, numbers, and hyphens, starting with a letter", name)
+        }
+        ManifestValidationError::InvalidVersion(version) => {
+            format!("Invalid version '{}': must be semantic version (e.g., 1.0.0)", version)
+        }
+        ManifestValidationError::InvalidFormatKey(key) => {
+            format!("Invalid format key '{}': must be lowercase letters, numbers, and hyphens, starting with a letter", key)
+        }
+        ManifestValidationError::MissingDisplayName => {
+            "Missing display_name in [format] section".to_string()
+        }
+        ManifestValidationError::InvalidMemoryLimits { min, max } => {
+            format!("Invalid memory limits: min ({} MB) must be <= max ({} MB)", min, max)
+        }
+        ManifestValidationError::InvalidTimeout(secs) => {
+            format!("Invalid timeout {}: must be between 1 and 300 seconds", secs)
+        }
+    }
+}
+
+/// Extract the format key from a parsed `PluginManifest`.
+pub(crate) fn extract_format_key(manifest: &PluginManifest) -> Option<String> {
+    manifest.format.as_ref().map(|f| f.key.clone())
+}
+
+/// Extract the format key from a `serde_json::Value` representation of a manifest.
+/// This mirrors the pattern used when reading manifest JSON from the database.
+pub(crate) fn extract_format_key_from_json(manifest_json: &serde_json::Value) -> Option<String> {
+    manifest_json
+        .get("format")
+        .and_then(|f| f.get("key"))
+        .and_then(|k| k.as_str())
+        .map(String::from)
+}
+
+/// Classify a database error for plugin creation.
+/// Returns an appropriate user-facing error message.
+pub(crate) fn classify_db_error_for_create(error_msg: &str, entity_name: &str) -> String {
+    if error_msg.contains("duplicate key") {
+        format!("Plugin '{}' already exists", entity_name)
+    } else {
+        error_msg.to_string()
+    }
+}
+
+/// Build the "installed" event log message.
+pub(crate) fn build_installed_event_message(name: &str, version: &str, source: &str) -> String {
+    format!("Plugin {} v{} installed from {}", name, version, source)
+}
+
+/// Build the "reloaded" event log message.
+pub(crate) fn build_reloaded_event_message(
+    name: &str,
+    old_version: &str,
+    new_version: &str,
+) -> String {
+    format!(
+        "Plugin {} reloaded from v{} to v{}",
+        name, old_version, new_version
+    )
+}
+
+/// Build the "error" event log message.
+pub(crate) fn build_error_event_message(name: &str, error: &str) -> String {
+    format!("Plugin {} error: {}", name, error)
+}
+
+/// Validate that a plugin's source type supports reload.
+/// Returns `None` if reloadable, or `Some(error_message)` if not.
+pub(crate) fn validate_reload_source_type(source_type: PluginSourceType) -> Option<&'static str> {
+    match source_type {
+        PluginSourceType::WasmGit => None, // reloadable
+        PluginSourceType::WasmZip | PluginSourceType::WasmLocal => {
+            Some("Cannot reload ZIP or local plugins. Re-upload to update.")
+        }
+        PluginSourceType::Core => Some("Cannot reload core plugins"),
+    }
+}
+
+/// Check that the plugin name in a newly-fetched manifest matches the expected name.
+/// Returns `None` if they match, or `Some(error_message)` if they differ.
+pub(crate) fn validate_plugin_name_match(expected: &str, actual: &str) -> Option<String> {
+    if expected != actual {
+        Some(format!(
+            "Plugin name mismatch: expected '{}', got '{}'",
+            expected, actual
+        ))
+    } else {
+        None
+    }
+}
+
+/// Check whether a format handler can be deleted (only WASM handlers can).
+pub(crate) fn can_delete_handler(handler_type: FormatHandlerType) -> bool {
+    handler_type != FormatHandlerType::Core
+}
+
+/// Check whether disabling one more handler would leave zero enabled handlers.
+/// `enabled_count` is the current number of enabled handlers.
+/// `target_is_enabled` indicates whether the handler we want to disable is currently enabled.
+pub(crate) fn would_disable_last_handler(enabled_count: i64, target_is_enabled: bool) -> bool {
+    enabled_count == 1 && target_is_enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

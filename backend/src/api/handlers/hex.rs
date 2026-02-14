@@ -708,6 +708,71 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Extracted pure helpers (testable without DB)
+// ---------------------------------------------------------------------------
+
+/// Build the standard hex tarball filename: `{name}-{version}.tar`
+pub(crate) fn build_hex_filename(name: &str, version: &str) -> String {
+    format!("{}-{}.tar", name, version)
+}
+
+/// Build the artifact storage path: `{name}/{version}/{name}-{version}.tar`
+pub(crate) fn build_hex_artifact_path(name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("{}/{}/{}", name, version, filename)
+}
+
+/// Build the storage key: `hex/{name}/{version}/{name}-{version}.tar`
+pub(crate) fn build_hex_storage_key(name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("hex/{}/{}/{}", name, version, filename)
+}
+
+/// Build a tarball download URL: `/hex/{repo_key}/tarballs/{name}-{version}.tar`
+pub(crate) fn build_hex_tarball_url(repo_key: &str, name: &str, version: &str) -> String {
+    let filename = build_hex_filename(name, version);
+    format!("/hex/{}/tarballs/{}", repo_key, filename)
+}
+
+/// Build hex metadata JSON for a package.
+pub(crate) fn build_hex_metadata(name: &str, version: &str) -> serde_json::Value {
+    let filename = build_hex_filename(name, version);
+    serde_json::json!({
+        "format": "hex",
+        "name": name,
+        "version": version,
+        "filename": filename,
+    })
+}
+
+/// Build the JSON publish response.
+pub(crate) fn build_hex_publish_response(
+    repo_key: &str,
+    name: &str,
+    version: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "url": build_hex_tarball_url(repo_key, name, version),
+    })
+}
+
+/// Build a release entry for the package info endpoint.
+pub(crate) fn build_hex_release_entry(
+    repo_key: &str,
+    name: &str,
+    version: &str,
+    checksum: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "url": build_hex_tarball_url(repo_key, name, version),
+        "checksum": checksum,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,43 +976,189 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Format-specific logic: filename, artifact_path, storage_key
+    // build_hex_filename
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_hex_filename_format() {
-        let name = "plug";
-        let version = "1.15.0";
-        let filename = format!("{}-{}.tar", name, version);
-        assert_eq!(filename, "plug-1.15.0.tar");
+    fn test_build_hex_filename() {
+        assert_eq!(build_hex_filename("plug", "1.15.0"), "plug-1.15.0.tar");
     }
 
     #[test]
-    fn test_hex_artifact_path_format() {
-        let name = "ecto";
-        let version = "3.11.0";
-        let filename = format!("{}-{}.tar", name, version);
-        let artifact_path = format!("{}/{}/{}", name, version, filename);
-        assert_eq!(artifact_path, "ecto/3.11.0/ecto-3.11.0.tar");
+    fn test_build_hex_filename_hyphenated_name() {
+        assert_eq!(
+            build_hex_filename("my-elixir-lib", "0.1.0"),
+            "my-elixir-lib-0.1.0.tar"
+        );
     }
 
     #[test]
-    fn test_hex_storage_key_format() {
-        let name = "jason";
-        let version = "1.4.0";
-        let filename = format!("{}-{}.tar", name, version);
-        let storage_key = format!("hex/{}/{}/{}", name, version, filename);
-        assert_eq!(storage_key, "hex/jason/1.4.0/jason-1.4.0.tar");
+    fn test_build_hex_filename_underscore_name() {
+        assert_eq!(
+            build_hex_filename("ecto_sql", "3.11.0"),
+            "ecto_sql-3.11.0.tar"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_hex_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_hex_artifact_path() {
+        assert_eq!(
+            build_hex_artifact_path("ecto", "3.11.0"),
+            "ecto/3.11.0/ecto-3.11.0.tar"
+        );
     }
 
     #[test]
-    fn test_hex_tarball_url() {
-        let repo_key = "hex-local";
-        let name = "plug";
-        let version = "1.15.0";
-        let url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
-        assert_eq!(url, "/hex/hex-local/tarballs/plug-1.15.0.tar");
+    fn test_build_hex_artifact_path_prerelease() {
+        assert_eq!(
+            build_hex_artifact_path("phoenix", "1.8.0-rc.1"),
+            "phoenix/1.8.0-rc.1/phoenix-1.8.0-rc.1.tar"
+        );
     }
+
+    #[test]
+    fn test_build_hex_artifact_path_simple() {
+        assert_eq!(
+            build_hex_artifact_path("jason", "1.4.0"),
+            "jason/1.4.0/jason-1.4.0.tar"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_hex_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_hex_storage_key() {
+        assert_eq!(
+            build_hex_storage_key("jason", "1.4.0"),
+            "hex/jason/1.4.0/jason-1.4.0.tar"
+        );
+    }
+
+    #[test]
+    fn test_build_hex_storage_key_starts_with_hex() {
+        let key = build_hex_storage_key("plug", "2.0.0");
+        assert!(key.starts_with("hex/"));
+    }
+
+    #[test]
+    fn test_build_hex_storage_key_contains_filename() {
+        let key = build_hex_storage_key("ecto", "3.11.0");
+        assert!(key.ends_with("ecto-3.11.0.tar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_hex_tarball_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_hex_tarball_url() {
+        assert_eq!(
+            build_hex_tarball_url("hex-local", "plug", "1.15.0"),
+            "/hex/hex-local/tarballs/plug-1.15.0.tar"
+        );
+    }
+
+    #[test]
+    fn test_build_hex_tarball_url_starts_with_hex() {
+        let url = build_hex_tarball_url("my-repo", "phoenix", "1.7.0");
+        assert!(url.starts_with("/hex/"));
+    }
+
+    #[test]
+    fn test_build_hex_tarball_url_contains_tarballs() {
+        let url = build_hex_tarball_url("repo", "ecto", "3.0.0");
+        assert!(url.contains("/tarballs/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_hex_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_hex_metadata() {
+        let meta = build_hex_metadata("phoenix", "1.7.0");
+        assert_eq!(meta["format"], "hex");
+        assert_eq!(meta["name"], "phoenix");
+        assert_eq!(meta["version"], "1.7.0");
+        assert_eq!(meta["filename"], "phoenix-1.7.0.tar");
+    }
+
+    #[test]
+    fn test_build_hex_metadata_has_all_keys() {
+        let meta = build_hex_metadata("ecto", "3.11.0");
+        let obj = meta.as_object().unwrap();
+        assert!(obj.contains_key("format"));
+        assert!(obj.contains_key("name"));
+        assert!(obj.contains_key("version"));
+        assert!(obj.contains_key("filename"));
+    }
+
+    #[test]
+    fn test_build_hex_metadata_four_keys() {
+        let meta = build_hex_metadata("plug", "1.0.0");
+        assert_eq!(meta.as_object().unwrap().len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_hex_publish_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_hex_publish_response() {
+        let resp = build_hex_publish_response("hex-local", "phoenix", "1.7.0");
+        assert_eq!(resp["name"], "phoenix");
+        assert_eq!(resp["version"], "1.7.0");
+        assert_eq!(resp["url"], "/hex/hex-local/tarballs/phoenix-1.7.0.tar");
+    }
+
+    #[test]
+    fn test_build_hex_publish_response_has_url() {
+        let resp = build_hex_publish_response("repo", "ecto", "3.0.0");
+        let url = resp["url"].as_str().unwrap();
+        assert!(url.starts_with("/hex/"));
+        assert!(url.contains("ecto-3.0.0.tar"));
+    }
+
+    #[test]
+    fn test_build_hex_publish_response_three_keys() {
+        let resp = build_hex_publish_response("r", "p", "1.0.0");
+        assert_eq!(resp.as_object().unwrap().len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_hex_release_entry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_hex_release_entry() {
+        let entry = build_hex_release_entry("hex-local", "plug", "1.15.0", Some("abc123"));
+        assert_eq!(entry["version"], "1.15.0");
+        assert_eq!(entry["checksum"], "abc123");
+        assert!(entry["url"].as_str().unwrap().contains("plug-1.15.0.tar"));
+    }
+
+    #[test]
+    fn test_build_hex_release_entry_no_checksum() {
+        let entry = build_hex_release_entry("repo", "ecto", "3.11.0", None);
+        assert_eq!(entry["version"], "3.11.0");
+        assert!(entry["checksum"].is_null());
+    }
+
+    #[test]
+    fn test_build_hex_release_entry_url_format() {
+        let entry = build_hex_release_entry("my-repo", "phoenix", "1.7.0", None);
+        assert_eq!(entry["url"], "/hex/my-repo/tarballs/phoenix-1.7.0.tar");
+    }
+
+    // -----------------------------------------------------------------------
+    // SHA256 computation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_sha256_computation() {

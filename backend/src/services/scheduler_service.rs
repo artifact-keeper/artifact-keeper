@@ -287,24 +287,31 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
     Ok(())
 }
 
-/// Parse a cron expression and compute the next run time.
-fn compute_next_run(cron_expr: &str) -> Option<chrono::DateTime<Utc>> {
-    // The cron crate expects 7-field expressions (sec min hour dom month dow year)
-    // but users typically write 5-field (min hour dom month dow).
-    // Prepend "0 " for seconds if we detect a 5-field expression.
-    let normalized = if cron_expr.split_whitespace().count() == 5 {
+/// Normalize a cron expression: if 5-field, prepend "0 " for the seconds field.
+pub(crate) fn normalize_cron_expression(cron_expr: &str) -> String {
+    if cron_expr.split_whitespace().count() == 5 {
         format!("0 {}", cron_expr)
     } else {
         cron_expr.to_string()
-    };
+    }
+}
 
-    match Schedule::from_str(&normalized) {
-        Ok(schedule) => schedule.upcoming(Utc).next(),
-        Err(e) => {
+/// Parse a (possibly already normalized) cron expression into a Schedule.
+/// Returns None if the expression is invalid.
+pub(crate) fn parse_cron_schedule(normalized: &str) -> Option<Schedule> {
+    Schedule::from_str(normalized).ok()
+}
+
+/// Parse a cron expression and compute the next run time.
+fn compute_next_run(cron_expr: &str) -> Option<chrono::DateTime<Utc>> {
+    let normalized = normalize_cron_expression(cron_expr);
+
+    match parse_cron_schedule(&normalized) {
+        Some(schedule) => schedule.upcoming(Utc).next(),
+        None => {
             tracing::warn!(
-                "Invalid cron expression '{}': {}. Falling back to 24h from now.",
+                "Invalid cron expression '{}'. Falling back to 24h from now.",
                 cron_expr,
-                e
             );
             Some(Utc::now() + chrono::Duration::hours(24))
         }
@@ -473,12 +480,32 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Cron normalization logic
+    // normalize_cron_expression (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_normalize_cron_5_field() {
+        assert_eq!(normalize_cron_expression("0 0 * * *"), "0 0 0 * * *");
+    }
+
+    #[test]
+    fn test_normalize_cron_6_field_unchanged() {
+        assert_eq!(normalize_cron_expression("0 0 0 * * *"), "0 0 0 * * *");
+    }
+
+    #[test]
+    fn test_normalize_cron_7_field_unchanged() {
+        assert_eq!(normalize_cron_expression("0 30 9 * * * *"), "0 30 9 * * * *");
+    }
+
+    #[test]
+    fn test_normalize_cron_1_field_unchanged() {
+        // Less than 5 fields, not modified
+        assert_eq!(normalize_cron_expression("invalid"), "invalid");
+    }
+
+    #[test]
     fn test_cron_5_field_detection() {
-        // Verify the detection logic: count whitespace-separated tokens
         let five = "0 0 * * *";
         assert_eq!(five.split_whitespace().count(), 5);
 
@@ -487,6 +514,43 @@ mod tests {
 
         let seven = "0 0 0 * * * *";
         assert_eq!(seven.split_whitespace().count(), 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_cron_schedule (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_cron_schedule_valid() {
+        let schedule = parse_cron_schedule("0 0 0 * * *");
+        assert!(schedule.is_some());
+    }
+
+    #[test]
+    fn test_parse_cron_schedule_invalid() {
+        let schedule = parse_cron_schedule("not valid cron");
+        assert!(schedule.is_none());
+    }
+
+    #[test]
+    fn test_parse_cron_schedule_empty() {
+        let schedule = parse_cron_schedule("");
+        assert!(schedule.is_none());
+    }
+
+    #[test]
+    fn test_parse_cron_schedule_every_minute() {
+        // "0 * * * * *" = every minute (with seconds field)
+        let schedule = parse_cron_schedule("0 * * * * *");
+        assert!(schedule.is_some());
+    }
+
+    #[test]
+    fn test_parse_cron_schedule_yields_future_times() {
+        let schedule = parse_cron_schedule("0 * * * * *").unwrap();
+        let next = schedule.upcoming(Utc).next();
+        assert!(next.is_some());
+        assert!(next.unwrap() > Utc::now());
     }
 }
 

@@ -609,6 +609,36 @@ async fn all_specs(
 
 use crate::formats::cocoapods::PodSpec;
 
+/// Build the filename for a CocoaPods archive.
+pub(crate) fn build_cocoapods_filename(name: &str, version: &str) -> String {
+    format!("{}-{}.tar.gz", name, version)
+}
+
+/// Build the artifact path for a CocoaPods package.
+pub(crate) fn build_cocoapods_artifact_path(name: &str, version: &str) -> String {
+    let filename = build_cocoapods_filename(name, version);
+    format!("{}/{}/{}", name, version, filename)
+}
+
+/// Build the storage key for a CocoaPods archive.
+pub(crate) fn build_cocoapods_storage_key(name: &str, version: &str) -> String {
+    let filename = build_cocoapods_filename(name, version);
+    format!("cocoapods/{}/{}/{}", name, version, filename)
+}
+
+/// Build the storage key for a CocoaPods podspec JSON file.
+pub(crate) fn build_cocoapods_podspec_key(name: &str, version: &str) -> String {
+    format!("cocoapods/{}/{}/{}.podspec.json", name, version, name)
+}
+
+/// Build the metadata JSON for a published pod.
+pub(crate) fn build_cocoapods_metadata(podspec: &PodSpec, filename: &str) -> serde_json::Value {
+    serde_json::json!({
+        "podspec": serde_json::to_value(podspec).unwrap_or_default(),
+        "filename": filename,
+    })
+}
+
 /// Extract a podspec.json from a tar.gz archive.
 ///
 /// Scans the archive entries for any file ending in `.podspec.json` and
@@ -798,45 +828,171 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Format-specific logic
+    // build_cocoapods_filename
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_cocoapods_filename_format() {
-        let name = "Alamofire";
-        let version = "5.8.0";
-        let filename = format!("{}-{}.tar.gz", name, version);
-        assert_eq!(filename, "Alamofire-5.8.0.tar.gz");
-    }
-
-    #[test]
-    fn test_cocoapods_artifact_path_format() {
-        let name = "Moya";
-        let version = "15.0.0";
-        let filename = format!("{}-{}.tar.gz", name, version);
-        let path = format!("{}/{}/{}", name, version, filename);
-        assert_eq!(path, "Moya/15.0.0/Moya-15.0.0.tar.gz");
-    }
-
-    #[test]
-    fn test_cocoapods_storage_key_format() {
-        let name = "SnapKit";
-        let version = "5.7.1";
-        let filename = format!("{}-{}.tar.gz", name, version);
-        let key = format!("cocoapods/{}/{}/{}", name, version, filename);
-        assert_eq!(key, "cocoapods/SnapKit/5.7.1/SnapKit-5.7.1.tar.gz");
-    }
-
-    #[test]
-    fn test_cocoapods_podspec_key_format() {
-        let name = "AFNetworking";
-        let version = "4.0.0";
-        let key = format!("cocoapods/{}/{}/{}.podspec.json", name, version, name);
+    fn test_build_cocoapods_filename() {
         assert_eq!(
-            key,
+            build_cocoapods_filename("Alamofire", "5.8.0"),
+            "Alamofire-5.8.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_build_cocoapods_filename_prerelease() {
+        assert_eq!(
+            build_cocoapods_filename("Moya", "15.0.0-beta.1"),
+            "Moya-15.0.0-beta.1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_build_cocoapods_filename_ends_with_tar_gz() {
+        let f = build_cocoapods_filename("SnapKit", "5.7.1");
+        assert!(f.ends_with(".tar.gz"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_cocoapods_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_cocoapods_artifact_path() {
+        assert_eq!(
+            build_cocoapods_artifact_path("Moya", "15.0.0"),
+            "Moya/15.0.0/Moya-15.0.0.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_build_cocoapods_artifact_path_simple() {
+        assert_eq!(
+            build_cocoapods_artifact_path("SnapKit", "5.7.1"),
+            "SnapKit/5.7.1/SnapKit-5.7.1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_build_cocoapods_artifact_path_contains_name() {
+        let path = build_cocoapods_artifact_path("AFNetworking", "4.0.0");
+        assert!(path.starts_with("AFNetworking/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_cocoapods_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_cocoapods_storage_key() {
+        assert_eq!(
+            build_cocoapods_storage_key("SnapKit", "5.7.1"),
+            "cocoapods/SnapKit/5.7.1/SnapKit-5.7.1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_build_cocoapods_storage_key_starts_with_cocoapods() {
+        let key = build_cocoapods_storage_key("Alamofire", "5.8.0");
+        assert!(key.starts_with("cocoapods/"));
+    }
+
+    #[test]
+    fn test_build_cocoapods_storage_key_ends_with_tar_gz() {
+        let key = build_cocoapods_storage_key("Moya", "15.0.0");
+        assert!(key.ends_with(".tar.gz"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_cocoapods_podspec_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_cocoapods_podspec_key() {
+        assert_eq!(
+            build_cocoapods_podspec_key("AFNetworking", "4.0.0"),
             "cocoapods/AFNetworking/4.0.0/AFNetworking.podspec.json"
         );
     }
+
+    #[test]
+    fn test_build_cocoapods_podspec_key_ends_with_podspec_json() {
+        let key = build_cocoapods_podspec_key("Alamofire", "5.8.0");
+        assert!(key.ends_with(".podspec.json"));
+    }
+
+    #[test]
+    fn test_build_cocoapods_podspec_key_contains_name_twice() {
+        let key = build_cocoapods_podspec_key("SnapKit", "5.7.1");
+        // The name appears in both the directory path and the filename
+        assert_eq!(key.matches("SnapKit").count(), 2); // cocoapods/SnapKit/5.7.1/SnapKit.podspec.json
+    }
+
+    // -----------------------------------------------------------------------
+    // build_cocoapods_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_cocoapods_metadata() {
+        let podspec = PodSpec {
+            name: "Alamofire".to_string(),
+            version: "5.8.0".to_string(),
+            summary: Some("HTTP Networking in Swift".to_string()),
+            homepage: Some("https://github.com/Alamofire/Alamofire".to_string()),
+            license: None,
+            authors: None,
+            source: None,
+            platforms: None,
+            dependencies: None,
+        };
+        let meta = build_cocoapods_metadata(&podspec, "Alamofire-5.8.0.tar.gz");
+        assert_eq!(meta["filename"], "Alamofire-5.8.0.tar.gz");
+        assert!(meta["podspec"].is_object());
+        assert_eq!(meta["podspec"]["name"], "Alamofire");
+        assert_eq!(meta["podspec"]["version"], "5.8.0");
+    }
+
+    #[test]
+    fn test_build_cocoapods_metadata_has_two_keys() {
+        let podspec = PodSpec {
+            name: "Moya".to_string(),
+            version: "15.0.0".to_string(),
+            summary: Some("Network abstraction layer".to_string()),
+            homepage: Some("https://github.com/Moya/Moya".to_string()),
+            license: None,
+            authors: None,
+            source: None,
+            platforms: None,
+            dependencies: None,
+        };
+        let meta = build_cocoapods_metadata(&podspec, "Moya-15.0.0.tar.gz");
+        assert_eq!(meta.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_build_cocoapods_metadata_podspec_fields() {
+        let podspec = PodSpec {
+            name: "RxSwift".to_string(),
+            version: "6.6.0".to_string(),
+            summary: Some("Reactive Programming in Swift".to_string()),
+            homepage: Some("https://github.com/ReactiveX/RxSwift".to_string()),
+            license: None,
+            authors: None,
+            source: None,
+            platforms: None,
+            dependencies: None,
+        };
+        let meta = build_cocoapods_metadata(&podspec, "RxSwift-6.6.0.tar.gz");
+        assert_eq!(meta["podspec"]["summary"], "Reactive Programming in Swift");
+        assert_eq!(
+            meta["podspec"]["homepage"],
+            "https://github.com/ReactiveX/RxSwift"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SHA256 computation
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_sha256_computation() {

@@ -58,10 +58,7 @@ pub struct TokenInfo {
 
 impl From<ApiToken> for TokenInfo {
     fn from(token: ApiToken) -> Self {
-        let is_expired = token
-            .expires_at
-            .map(|exp| exp < Utc::now())
-            .unwrap_or(false);
+        let is_expired = is_token_expired(token.expires_at);
 
         Self {
             id: token.id,
@@ -75,6 +72,67 @@ impl From<ApiToken> for TokenInfo {
             is_expired,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helper functions (no DB, testable in isolation)
+// ---------------------------------------------------------------------------
+
+/// The canonical list of allowed API token scopes.
+pub(crate) const ALLOWED_SCOPES: &[&str] = &[
+    "read:artifacts",
+    "write:artifacts",
+    "delete:artifacts",
+    "read:repositories",
+    "write:repositories",
+    "delete:repositories",
+    "read:users",
+    "write:users",
+    "admin",
+    "*",
+];
+
+/// Validate token scopes against the allowed scope list.
+/// Returns Ok(()) if all scopes are valid, Err(message) otherwise.
+pub(crate) fn validate_scopes_pure(scopes: &[String]) -> std::result::Result<(), String> {
+    for scope in scopes {
+        if !ALLOWED_SCOPES.contains(&scope.as_str()) {
+            return Err(format!(
+                "Invalid scope: '{}'. Allowed scopes: {:?}",
+                scope, ALLOWED_SCOPES
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate that an expiration day count is within the allowed range (1..=365).
+/// Returns Ok(()) if valid or None, Err(message) if out of range.
+pub(crate) fn validate_expiration_days(days: Option<i64>) -> std::result::Result<(), String> {
+    if let Some(d) = days {
+        if !(1..=365).contains(&d) {
+            return Err("Token expiration must be between 1 and 365 days".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Compute expiration timestamp from a day count.
+pub(crate) fn compute_expiry(days: Option<i64>) -> Option<DateTime<Utc>> {
+    days.map(|d| Utc::now() + Duration::days(d))
+}
+
+/// Determine if a token is expired given an optional expiration timestamp.
+pub(crate) fn is_token_expired(expires_at: Option<DateTime<Utc>>) -> bool {
+    expires_at.map(|exp| exp < Utc::now()).unwrap_or(false)
+}
+
+/// Check if a set of scopes grants access for a required scope.
+/// Scopes match if the exact scope is present, or `*` or `admin` is present.
+pub(crate) fn scopes_grant_access(scopes: &[String], required_scope: &str) -> bool {
+    scopes.contains(&required_scope.to_string())
+        || scopes.contains(&"*".to_string())
+        || scopes.contains(&"admin".to_string())
 }
 
 /// API Token Service for managing programmatic access tokens.
@@ -151,30 +209,7 @@ impl TokenService {
 
     /// Validate token scopes against allowed scopes.
     fn validate_scopes(&self, scopes: &[String]) -> Result<()> {
-        // Define allowed scopes
-        let allowed_scopes = [
-            "read:artifacts",
-            "write:artifacts",
-            "delete:artifacts",
-            "read:repositories",
-            "write:repositories",
-            "delete:repositories",
-            "read:users",
-            "write:users",
-            "admin",
-            "*", // Full access
-        ];
-
-        for scope in scopes {
-            if !allowed_scopes.contains(&scope.as_str()) {
-                return Err(AppError::Validation(format!(
-                    "Invalid scope: '{}'. Allowed scopes: {:?}",
-                    scope, allowed_scopes
-                )));
-            }
-        }
-
-        Ok(())
+        validate_scopes_pure(scopes).map_err(AppError::Validation)
     }
 
     /// List all tokens for a user.
@@ -344,9 +379,7 @@ impl TokenService {
         .ok_or_else(|| AppError::Authentication("Invalid token".to_string()))?;
 
         // Check if token has the required scope or wildcard
-        Ok(token_info.scopes.contains(&required_scope.to_string())
-            || token_info.scopes.contains(&"*".to_string())
-            || token_info.scopes.contains(&"admin".to_string()))
+        Ok(scopes_grant_access(&token_info.scopes, required_scope))
     }
 
     /// Clean up expired tokens.
@@ -538,38 +571,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validate_scopes (needs &self but only reads a constant list)
-    //
-    // NOTE: We cannot construct TokenService without PgPool+Config, so we
-    // test the scope validation logic directly by duplicating it. This is a
-    // testability blocker: the engineering expert should extract
-    // validate_scopes into a free function or associated function that does
-    // not require &self.
+    // validate_scopes_pure (extracted pure function)
     // -----------------------------------------------------------------------
-
-    /// Duplicated logic from TokenService::validate_scopes for testing.
-    /// This validates the pure logic without needing a TokenService instance.
-    fn validate_scopes_standalone(scopes: &[String]) -> std::result::Result<(), String> {
-        let allowed_scopes = [
-            "read:artifacts",
-            "write:artifacts",
-            "delete:artifacts",
-            "read:repositories",
-            "write:repositories",
-            "delete:repositories",
-            "read:users",
-            "write:users",
-            "admin",
-            "*",
-        ];
-
-        for scope in scopes {
-            if !allowed_scopes.contains(&scope.as_str()) {
-                return Err(format!("Invalid scope: '{}'", scope));
-            }
-        }
-        Ok(())
-    }
 
     #[test]
     fn test_validate_scopes_all_valid() {
@@ -578,19 +581,19 @@ mod tests {
             "write:artifacts".to_string(),
             "admin".to_string(),
         ];
-        assert!(validate_scopes_standalone(&scopes).is_ok());
+        assert!(validate_scopes_pure(&scopes).is_ok());
     }
 
     #[test]
     fn test_validate_scopes_wildcard() {
         let scopes = vec!["*".to_string()];
-        assert!(validate_scopes_standalone(&scopes).is_ok());
+        assert!(validate_scopes_pure(&scopes).is_ok());
     }
 
     #[test]
     fn test_validate_scopes_invalid_scope() {
         let scopes = vec!["read:artifacts".to_string(), "hack:system".to_string()];
-        let result = validate_scopes_standalone(&scopes);
+        let result = validate_scopes_pure(&scopes);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("hack:system"));
     }
@@ -598,51 +601,125 @@ mod tests {
     #[test]
     fn test_validate_scopes_empty() {
         let scopes: Vec<String> = vec![];
-        assert!(validate_scopes_standalone(&scopes).is_ok());
+        assert!(validate_scopes_pure(&scopes).is_ok());
     }
 
     #[test]
     fn test_validate_scopes_all_allowed_scopes() {
-        let all = vec![
-            "read:artifacts",
-            "write:artifacts",
-            "delete:artifacts",
-            "read:repositories",
-            "write:repositories",
-            "delete:repositories",
-            "read:users",
-            "write:users",
-            "admin",
-            "*",
-        ];
-        let scopes: Vec<String> = all.into_iter().map(String::from).collect();
-        assert!(validate_scopes_standalone(&scopes).is_ok());
+        let all: Vec<String> = ALLOWED_SCOPES.iter().map(|s| s.to_string()).collect();
+        assert!(validate_scopes_pure(&all).is_ok());
     }
 
     #[test]
     fn test_validate_scopes_case_sensitive() {
-        // Scopes should be case-sensitive; "Admin" != "admin"
         let scopes = vec!["Admin".to_string()];
-        let result = validate_scopes_standalone(&scopes);
-        assert!(result.is_err());
+        assert!(validate_scopes_pure(&scopes).is_err());
+    }
+
+    #[test]
+    fn test_validate_scopes_partial_match_fails() {
+        let scopes = vec!["read:artifact".to_string()]; // missing 's'
+        assert!(validate_scopes_pure(&scopes).is_err());
     }
 
     // -----------------------------------------------------------------------
-    // CreateTokenRequest expiration validation logic
+    // validate_expiration_days (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_expiration_validation_range() {
-        // The actual validation: days must be 1..=365
-        let valid_cases = vec![1, 30, 90, 180, 365];
-        let invalid_cases = vec![0, -1, 366, 1000];
+    fn test_validate_expiration_days_valid() {
+        assert!(validate_expiration_days(Some(1)).is_ok());
+        assert!(validate_expiration_days(Some(30)).is_ok());
+        assert!(validate_expiration_days(Some(365)).is_ok());
+    }
 
-        for days in valid_cases {
-            assert!((1..=365).contains(&days), "Day {} should be valid", days);
-        }
-        for days in invalid_cases {
-            assert!(!(1..=365).contains(&days), "Day {} should be invalid", days);
-        }
+    #[test]
+    fn test_validate_expiration_days_invalid() {
+        assert!(validate_expiration_days(Some(0)).is_err());
+        assert!(validate_expiration_days(Some(-1)).is_err());
+        assert!(validate_expiration_days(Some(366)).is_err());
+        assert!(validate_expiration_days(Some(1000)).is_err());
+    }
+
+    #[test]
+    fn test_validate_expiration_days_none_is_valid() {
+        assert!(validate_expiration_days(None).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_token_expired (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_token_expired_future() {
+        assert!(!is_token_expired(Some(Utc::now() + Duration::days(30))));
+    }
+
+    #[test]
+    fn test_is_token_expired_past() {
+        assert!(is_token_expired(Some(Utc::now() - Duration::days(1))));
+    }
+
+    #[test]
+    fn test_is_token_expired_none() {
+        assert!(!is_token_expired(None));
+    }
+
+    #[test]
+    fn test_is_token_expired_just_expired() {
+        assert!(is_token_expired(Some(Utc::now() - Duration::seconds(1))));
+    }
+
+    // -----------------------------------------------------------------------
+    // scopes_grant_access (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scopes_grant_access_exact_match() {
+        let scopes = vec!["read:artifacts".to_string()];
+        assert!(scopes_grant_access(&scopes, "read:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_wildcard() {
+        let scopes = vec!["*".to_string()];
+        assert!(scopes_grant_access(&scopes, "read:artifacts"));
+        assert!(scopes_grant_access(&scopes, "write:repositories"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_admin() {
+        let scopes = vec!["admin".to_string()];
+        assert!(scopes_grant_access(&scopes, "delete:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_no_match() {
+        let scopes = vec!["read:artifacts".to_string()];
+        assert!(!scopes_grant_access(&scopes, "write:artifacts"));
+    }
+
+    #[test]
+    fn test_scopes_grant_access_empty_scopes() {
+        let scopes: Vec<String> = vec![];
+        assert!(!scopes_grant_access(&scopes, "read:artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_expiry (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_expiry_some() {
+        let expiry = compute_expiry(Some(30));
+        assert!(expiry.is_some());
+        let diff = expiry.unwrap() - Utc::now();
+        assert!(diff.num_days() >= 29 && diff.num_days() <= 30);
+    }
+
+    #[test]
+    fn test_compute_expiry_none() {
+        assert!(compute_expiry(None).is_none());
     }
 
     // -----------------------------------------------------------------------

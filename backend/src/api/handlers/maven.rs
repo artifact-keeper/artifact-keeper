@@ -138,6 +138,15 @@ async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 // Path helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pure (non-async) helper functions for testability
+// ---------------------------------------------------------------------------
+
+/// Build the Maven storage key from a raw path.
+pub(crate) fn build_maven_storage_key(path: &str) -> String {
+    format!("maven/{}", path)
+}
+
 /// Determine if a Maven path is for metadata (groupId/artifactId level, no version).
 /// Returns (groupId, artifactId) if the path ends with maven-metadata.xml
 fn parse_metadata_path(path: &str) -> Option<(String, String)> {
@@ -975,6 +984,52 @@ mod tests {
     // RepoInfo
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // build_maven_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_maven_storage_key_jar() {
+        assert_eq!(
+            build_maven_storage_key("com/example/lib/1.0/lib-1.0.jar"),
+            "maven/com/example/lib/1.0/lib-1.0.jar"
+        );
+    }
+
+    #[test]
+    fn test_build_maven_storage_key_pom() {
+        assert_eq!(
+            build_maven_storage_key("org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"),
+            "maven/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"
+        );
+    }
+
+    #[test]
+    fn test_build_maven_storage_key_starts_with_maven() {
+        let key = build_maven_storage_key("com/example/lib.jar");
+        assert!(key.starts_with("maven/"));
+    }
+
+    #[test]
+    fn test_build_maven_storage_key_metadata() {
+        assert_eq!(
+            build_maven_storage_key("com/example/lib/maven-metadata.xml"),
+            "maven/com/example/lib/maven-metadata.xml"
+        );
+    }
+
+    #[test]
+    fn test_build_maven_storage_key_checksum() {
+        assert_eq!(
+            build_maven_storage_key("com/example/lib/1.0/lib-1.0.jar.sha1"),
+            "maven/com/example/lib/1.0/lib-1.0.jar.sha1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // RepoInfo
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_repo_info_construction() {
         let id = uuid::Uuid::new_v4();
@@ -989,12 +1044,17 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_key_format() {
-        let path = "com/example/lib/1.0/lib-1.0.jar";
-        let storage_key = format!("maven/{}", path);
+    fn test_repo_info_remote() {
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            storage_path: "/cache/maven".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: Some("https://repo1.maven.org/maven2".to_string()),
+        };
+        assert_eq!(repo.repo_type, "remote");
         assert_eq!(
-            storage_key,
-            "maven/com/example/lib/1.0/lib-1.0.jar"
+            repo.upstream_url.as_deref(),
+            Some("https://repo1.maven.org/maven2")
         );
     }
 }

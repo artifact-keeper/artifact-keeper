@@ -157,6 +157,80 @@ async fn resolve_vscode_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Re
 }
 
 // ---------------------------------------------------------------------------
+// Pure (non-async) helper functions for testability
+// ---------------------------------------------------------------------------
+
+/// Build a VS Code extension ID from publisher and name.
+pub(crate) fn build_extension_id(publisher: &str, name: &str) -> String {
+    format!("{}.{}", publisher, name)
+}
+
+/// Build a VSIX filename from publisher, name, and version.
+pub(crate) fn build_vsix_filename(publisher: &str, name: &str, version: &str) -> String {
+    let extension_id = build_extension_id(publisher, name);
+    format!("{}-{}.vsix", extension_id, version)
+}
+
+/// Build the artifact path for a VS Code extension.
+pub(crate) fn build_vscode_artifact_path(publisher: &str, name: &str, version: &str) -> String {
+    let filename = build_vsix_filename(publisher, name, version);
+    format!("{}/{}/{}", publisher, name, filename)
+}
+
+/// Build the storage key for a VS Code extension.
+pub(crate) fn build_vscode_storage_key(publisher: &str, name: &str, version: &str) -> String {
+    let filename = build_vsix_filename(publisher, name, version);
+    format!("vscode/{}/{}/{}", publisher, name, filename)
+}
+
+/// Build the download URL for a VS Code extension.
+pub(crate) fn build_vscode_download_url(
+    repo_key: &str,
+    publisher: &str,
+    name: &str,
+    version: &str,
+) -> String {
+    format!(
+        "/vscode/{}/extensions/{}/{}/{}/download",
+        repo_key, publisher, name, version
+    )
+}
+
+/// Build the Content-Disposition filename for a VSIX download.
+pub(crate) fn build_vsix_download_filename(publisher: &str, name: &str, version: &str) -> String {
+    format!("{}.{}-{}.vsix", publisher, name, version)
+}
+
+/// Build the metadata JSON for a published VS Code extension.
+pub(crate) fn build_vscode_metadata(
+    publisher: &str,
+    name: &str,
+    version: &str,
+) -> serde_json::Value {
+    let filename = build_vsix_filename(publisher, name, version);
+    serde_json::json!({
+        "publisher": publisher,
+        "extension_name": name,
+        "version": version,
+        "filename": filename,
+    })
+}
+
+/// Build the publish success response JSON.
+pub(crate) fn build_vscode_publish_response(
+    publisher: &str,
+    name: &str,
+    version: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "publisher": publisher,
+        "name": name,
+        "version": version,
+        "message": "Successfully published extension",
+    })
+}
+
+// ---------------------------------------------------------------------------
 // GET /vscode/{repo_key}/api/extensionquery — Query extensions
 // ---------------------------------------------------------------------------
 
@@ -713,77 +787,205 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Extension ID format (publisher.name pattern)
+    // build_extension_id
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_extension_id_format() {
-        let publisher = "ms-python";
-        let name = "python";
-        let extension_id = format!("{}.{}", publisher, name);
-        assert_eq!(extension_id, "ms-python.python");
+    fn test_build_extension_id() {
+        assert_eq!(build_extension_id("ms-python", "python"), "ms-python.python");
     }
 
     #[test]
-    fn test_extension_id_format_complex() {
-        let publisher = "esbenp";
-        let name = "prettier-vscode";
-        let extension_id = format!("{}.{}", publisher, name);
-        assert_eq!(extension_id, "esbenp.prettier-vscode");
-    }
-
-    // -----------------------------------------------------------------------
-    // Filename format (publisher.name-version.vsix)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_filename_format() {
-        let publisher = "ms-python";
-        let name = "python";
-        let version = "2024.1.0";
-        let extension_id = format!("{}.{}", publisher, name);
-        let filename = format!("{}-{}.vsix", extension_id, version);
-        assert_eq!(filename, "ms-python.python-2024.1.0.vsix");
-    }
-
-    // -----------------------------------------------------------------------
-    // Artifact path format
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_artifact_path_format() {
-        let publisher = "ms-python";
-        let ext_name = "python";
-        let ext_version = "2024.1.0";
-        let extension_id = format!("{}.{}", publisher, ext_name);
-        let filename = format!("{}-{}.vsix", extension_id, ext_version);
-        let artifact_path = format!("{}/{}/{}", publisher, ext_name, filename);
+    fn test_build_extension_id_complex() {
         assert_eq!(
-            artifact_path,
+            build_extension_id("esbenp", "prettier-vscode"),
+            "esbenp.prettier-vscode"
+        );
+    }
+
+    #[test]
+    fn test_build_extension_id_single_char() {
+        assert_eq!(build_extension_id("a", "b"), "a.b");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_vsix_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_vsix_filename() {
+        assert_eq!(
+            build_vsix_filename("ms-python", "python", "2024.1.0"),
+            "ms-python.python-2024.1.0.vsix"
+        );
+    }
+
+    #[test]
+    fn test_build_vsix_filename_prerelease() {
+        assert_eq!(
+            build_vsix_filename("ms-vscode", "cpptools", "1.18.0-insiders"),
+            "ms-vscode.cpptools-1.18.0-insiders.vsix"
+        );
+    }
+
+    #[test]
+    fn test_build_vsix_filename_ends_with_vsix() {
+        let f = build_vsix_filename("a", "b", "1.0.0");
+        assert!(f.ends_with(".vsix"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_vscode_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_vscode_artifact_path() {
+        assert_eq!(
+            build_vscode_artifact_path("ms-python", "python", "2024.1.0"),
             "ms-python/python/ms-python.python-2024.1.0.vsix"
         );
     }
 
+    #[test]
+    fn test_build_vscode_artifact_path_contains_publisher() {
+        let path = build_vscode_artifact_path("esbenp", "prettier-vscode", "10.1.0");
+        assert!(path.starts_with("esbenp/"));
+    }
+
+    #[test]
+    fn test_build_vscode_artifact_path_contains_name() {
+        let path = build_vscode_artifact_path("redhat", "vscode-yaml", "1.14.0");
+        assert!(path.contains("/vscode-yaml/"));
+    }
+
     // -----------------------------------------------------------------------
-    // Storage key format
+    // build_vscode_storage_key
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_storage_key_format() {
-        let publisher = "esbenp";
-        let ext_name = "prettier-vscode";
-        let ext_version = "10.1.0";
-        let extension_id = format!("{}.{}", publisher, ext_name);
-        let filename = format!("{}-{}.vsix", extension_id, ext_version);
-        let storage_key = format!("vscode/{}/{}/{}", publisher, ext_name, filename);
+    fn test_build_vscode_storage_key() {
         assert_eq!(
-            storage_key,
+            build_vscode_storage_key("esbenp", "prettier-vscode", "10.1.0"),
             "vscode/esbenp/prettier-vscode/esbenp.prettier-vscode-10.1.0.vsix"
         );
     }
 
+    #[test]
+    fn test_build_vscode_storage_key_starts_with_vscode() {
+        let key = build_vscode_storage_key("ms-python", "python", "1.0.0");
+        assert!(key.starts_with("vscode/"));
+    }
+
+    #[test]
+    fn test_build_vscode_storage_key_ends_with_vsix() {
+        let key = build_vscode_storage_key("ms-vscode", "cpptools", "1.18.0");
+        assert!(key.ends_with(".vsix"));
+    }
+
     // -----------------------------------------------------------------------
-    // SHA256 computation (same pattern used in publish_extension)
+    // build_vscode_download_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_vscode_download_url() {
+        assert_eq!(
+            build_vscode_download_url("vscode-local", "ms-vscode", "cpptools", "1.18.0"),
+            "/vscode/vscode-local/extensions/ms-vscode/cpptools/1.18.0/download"
+        );
+    }
+
+    #[test]
+    fn test_build_vscode_download_url_starts_with_vscode() {
+        let url = build_vscode_download_url("repo", "pub", "ext", "1.0.0");
+        assert!(url.starts_with("/vscode/"));
+    }
+
+    #[test]
+    fn test_build_vscode_download_url_ends_with_download() {
+        let url = build_vscode_download_url("repo", "pub", "ext", "1.0.0");
+        assert!(url.ends_with("/download"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_vsix_download_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_vsix_download_filename() {
+        assert_eq!(
+            build_vsix_download_filename("redhat", "vscode-yaml", "1.14.0"),
+            "redhat.vscode-yaml-1.14.0.vsix"
+        );
+    }
+
+    #[test]
+    fn test_build_vsix_download_filename_contains_publisher() {
+        let f = build_vsix_download_filename("ms-python", "python", "2024.1.0");
+        assert!(f.starts_with("ms-python."));
+    }
+
+    #[test]
+    fn test_build_vsix_download_filename_ends_with_vsix() {
+        let f = build_vsix_download_filename("a", "b", "1.0.0");
+        assert!(f.ends_with(".vsix"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_vscode_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_vscode_metadata() {
+        let meta = build_vscode_metadata("ms-python", "python", "2024.1.0");
+        assert_eq!(meta["publisher"], "ms-python");
+        assert_eq!(meta["extension_name"], "python");
+        assert_eq!(meta["version"], "2024.1.0");
+        assert_eq!(meta["filename"], "ms-python.python-2024.1.0.vsix");
+    }
+
+    #[test]
+    fn test_build_vscode_metadata_has_four_keys() {
+        let meta = build_vscode_metadata("a", "b", "1.0.0");
+        assert_eq!(meta.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_build_vscode_metadata_has_all_keys() {
+        let meta = build_vscode_metadata("pub", "ext", "1.0.0");
+        let obj = meta.as_object().unwrap();
+        assert!(obj.contains_key("publisher"));
+        assert!(obj.contains_key("extension_name"));
+        assert!(obj.contains_key("version"));
+        assert!(obj.contains_key("filename"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_vscode_publish_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_vscode_publish_response() {
+        let resp = build_vscode_publish_response("ms-python", "python", "2024.1.0");
+        assert_eq!(resp["publisher"], "ms-python");
+        assert_eq!(resp["name"], "python");
+        assert_eq!(resp["version"], "2024.1.0");
+        assert_eq!(resp["message"], "Successfully published extension");
+    }
+
+    #[test]
+    fn test_build_vscode_publish_response_has_message() {
+        let resp = build_vscode_publish_response("a", "b", "1.0.0");
+        assert!(resp["message"].as_str().unwrap().contains("published"));
+    }
+
+    #[test]
+    fn test_build_vscode_publish_response_four_keys() {
+        let resp = build_vscode_publish_response("a", "b", "1.0.0");
+        assert_eq!(resp.as_object().unwrap().len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // SHA256 computation
     // -----------------------------------------------------------------------
 
     #[test]
@@ -800,51 +1002,6 @@ mod tests {
         hasher2.update(data);
         let hash2 = format!("{:x}", hasher2.finalize());
         assert_eq!(hash, hash2);
-    }
-
-    // -----------------------------------------------------------------------
-    // Metadata JSON format
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_vscode_metadata_json() {
-        let publisher = "ms-python";
-        let ext_name = "python";
-        let ext_version = "2024.1.0";
-        let extension_id = format!("{}.{}", publisher, ext_name);
-        let filename = format!("{}-{}.vsix", extension_id, ext_version);
-
-        let metadata = serde_json::json!({
-            "publisher": publisher,
-            "extension_name": ext_name,
-            "version": ext_version,
-            "filename": filename,
-        });
-
-        assert_eq!(metadata["publisher"], "ms-python");
-        assert_eq!(metadata["extension_name"], "python");
-        assert_eq!(metadata["version"], "2024.1.0");
-        assert_eq!(metadata["filename"], "ms-python.python-2024.1.0.vsix");
-    }
-
-    // -----------------------------------------------------------------------
-    // Download URL format
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_download_url_format() {
-        let repo_key = "vscode-local";
-        let publisher = "ms-vscode";
-        let ext_name = "cpptools";
-        let version = "1.18.0";
-        let url = format!(
-            "/vscode/{}/extensions/{}/{}/{}/download",
-            repo_key, publisher, ext_name, version
-        );
-        assert_eq!(
-            url,
-            "/vscode/vscode-local/extensions/ms-vscode/cpptools/1.18.0/download"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -876,22 +1033,5 @@ mod tests {
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_some());
-    }
-
-    // -----------------------------------------------------------------------
-    // Content-Disposition header format for downloads
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_download_content_disposition() {
-        let publisher = "redhat";
-        let name = "vscode-yaml";
-        let version = "1.14.0";
-        let filename = format!("{}.{}-{}.vsix", publisher, name, version);
-        let header = format!("attachment; filename=\"{}\"", filename);
-        assert_eq!(
-            header,
-            "attachment; filename=\"redhat.vscode-yaml-1.14.0.vsix\""
-        );
     }
 }

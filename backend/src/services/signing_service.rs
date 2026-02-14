@@ -15,6 +15,39 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+// ---------------------------------------------------------------------------
+// Pure helper functions (no DB, testable in isolation)
+// ---------------------------------------------------------------------------
+
+/// Map an algorithm string to the RSA key size in bits.
+/// Returns `Ok(bits)` for valid RSA algorithms, `Err(message)` for unsupported ones.
+pub(crate) fn algorithm_to_bits(algorithm: &str) -> std::result::Result<usize, String> {
+    match algorithm {
+        "rsa2048" => Ok(2048),
+        "rsa4096" | "rsa" => Ok(4096),
+        other => Err(format!(
+            "Unsupported algorithm: {}. Use rsa2048 or rsa4096.",
+            other
+        )),
+    }
+}
+
+/// Compute the SHA-256 fingerprint of a DER-encoded public key.
+/// Returns the full hex-encoded fingerprint.
+pub(crate) fn compute_fingerprint(public_key_der: &[u8]) -> String {
+    hex::encode(Sha256::digest(public_key_der))
+}
+
+/// Derive the short key ID (last 16 hex chars) from a full fingerprint.
+pub(crate) fn derive_key_id(fingerprint: &str) -> String {
+    fingerprint[fingerprint.len().saturating_sub(16)..].to_string()
+}
+
+/// Build a rotated key name from an existing key name.
+pub(crate) fn build_rotated_key_name(original_name: &str) -> String {
+    format!("{} (rotated)", original_name)
+}
+
 /// Service for managing signing keys and signing operations.
 pub struct SigningService {
     db: PgPool,
@@ -42,16 +75,7 @@ impl SigningService {
 
     /// Generate a new RSA key pair and store it.
     pub async fn create_key(&self, req: CreateKeyRequest) -> Result<SigningKeyPublic> {
-        let bits = match req.algorithm.as_str() {
-            "rsa2048" => 2048,
-            "rsa4096" | "rsa" => 4096,
-            other => {
-                return Err(AppError::Validation(format!(
-                    "Unsupported algorithm: {}. Use rsa2048 or rsa4096.",
-                    other
-                )))
-            }
-        };
+        let bits = algorithm_to_bits(&req.algorithm).map_err(AppError::Validation)?;
 
         // Generate RSA key pair (use OsRng from rsa's rand_core to avoid version mismatch)
         let mut rng = rsa::rand_core::OsRng;
@@ -76,8 +100,8 @@ impl SigningService {
         let public_der = public_key
             .to_public_key_der()
             .map_err(|e| AppError::Internal(format!("Failed to encode public key DER: {}", e)))?;
-        let fingerprint = hex::encode(Sha256::digest(public_der.as_ref()));
-        let key_id = fingerprint[fingerprint.len() - 16..].to_string();
+        let fingerprint = compute_fingerprint(public_der.as_ref());
+        let key_id = derive_key_id(&fingerprint);
 
         // Build GPG-style armored public key if key_type is gpg
         let public_key_out = if req.key_type == "gpg" {
@@ -332,7 +356,7 @@ impl SigningService {
         let new_key = self
             .create_key(CreateKeyRequest {
                 repository_id: old_key.repository_id,
-                name: format!("{} (rotated)", old_key.name),
+                name: build_rotated_key_name(&old_key.name),
                 key_type: old_key.key_type.clone(),
                 algorithm: old_key.algorithm.clone(),
                 uid_name: old_key.uid_name.clone(),
@@ -571,31 +595,121 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Algorithm-to-bits mapping validation
+    // algorithm_to_bits (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_algorithm_to_bits_mapping() {
-        let test_cases = vec![
-            ("rsa2048", Some(2048usize)),
-            ("rsa4096", Some(4096)),
-            ("rsa", Some(4096)),
-            ("ed25519", None),
-            ("unknown", None),
-        ];
+    fn test_algorithm_to_bits_rsa2048() {
+        assert_eq!(algorithm_to_bits("rsa2048").unwrap(), 2048);
+    }
 
-        for (algo, expected_bits) in test_cases {
-            let bits: Option<usize> = match algo {
-                "rsa2048" => Some(2048),
-                "rsa4096" | "rsa" => Some(4096),
-                _ => None,
-            };
-            assert_eq!(
-                bits, expected_bits,
-                "Algorithm '{}' should map to {:?} bits",
-                algo, expected_bits
-            );
-        }
+    #[test]
+    fn test_algorithm_to_bits_rsa4096() {
+        assert_eq!(algorithm_to_bits("rsa4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn test_algorithm_to_bits_rsa_alias() {
+        assert_eq!(algorithm_to_bits("rsa").unwrap(), 4096);
+    }
+
+    #[test]
+    fn test_algorithm_to_bits_unsupported() {
+        let result = algorithm_to_bits("ed25519");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported algorithm"));
+    }
+
+    #[test]
+    fn test_algorithm_to_bits_unknown() {
+        assert!(algorithm_to_bits("unknown").is_err());
+    }
+
+    #[test]
+    fn test_algorithm_to_bits_empty() {
+        assert!(algorithm_to_bits("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_fingerprint (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_fingerprint_is_valid_hex() {
+        let data = b"test public key data";
+        let fp = compute_fingerprint(data);
+        assert_eq!(fp.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_compute_fingerprint_deterministic() {
+        let data = b"same data";
+        let fp1 = compute_fingerprint(data);
+        let fp2 = compute_fingerprint(data);
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_compute_fingerprint_different_data() {
+        let fp1 = compute_fingerprint(b"data A");
+        let fp2 = compute_fingerprint(b"data B");
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_compute_fingerprint_empty() {
+        let fp = compute_fingerprint(b"");
+        assert_eq!(fp.len(), 64);
+    }
+
+    // -----------------------------------------------------------------------
+    // derive_key_id (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_key_id_from_fingerprint() {
+        let fp = "a".repeat(64);
+        let kid = derive_key_id(&fp);
+        assert_eq!(kid.len(), 16);
+        assert_eq!(kid, "a".repeat(16));
+    }
+
+    #[test]
+    fn test_derive_key_id_is_suffix() {
+        let fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let kid = derive_key_id(fp);
+        assert_eq!(kid, &fp[48..]);
+    }
+
+    #[test]
+    fn test_derive_key_id_short_fingerprint() {
+        // Edge case: fingerprint shorter than 16
+        let fp = "abcdef";
+        let kid = derive_key_id(fp);
+        assert_eq!(kid, "abcdef");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rotated_key_name (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rotated_key_name() {
+        assert_eq!(build_rotated_key_name("my-key"), "my-key (rotated)");
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_already_rotated() {
+        assert_eq!(
+            build_rotated_key_name("my-key (rotated)"),
+            "my-key (rotated) (rotated)"
+        );
+    }
+
+    #[test]
+    fn test_build_rotated_key_name_empty() {
+        assert_eq!(build_rotated_key_name(""), " (rotated)");
     }
 
     // -----------------------------------------------------------------------

@@ -1365,6 +1365,53 @@ pub async fn update_virtual_members(
 )]
 pub struct RepositoriesApiDoc;
 
+// ---------------------------------------------------------------------------
+// Extracted pure functions for testability
+// ---------------------------------------------------------------------------
+
+/// Compute pagination offset from page number and per_page size.
+pub(crate) fn compute_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32, i64) {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page.unwrap_or(20).min(100);
+    let offset = ((page - 1) * per_page) as i64;
+    (page, per_page, offset)
+}
+
+/// Compute total number of pages given total items and per_page size.
+pub(crate) fn compute_total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil() as u32
+}
+
+/// Extract the filename from a slash-delimited path.
+pub(crate) fn extract_name_from_path(path: &str) -> String {
+    path.split('/').next_back().unwrap_or(path).to_string()
+}
+
+/// Build a storage path from a base dir and repository key.
+pub(crate) fn build_storage_path(storage_base: &str, repo_key: &str) -> String {
+    format!("{}/{}", storage_base, repo_key)
+}
+
+/// Build a Content-Disposition attachment header value.
+pub(crate) fn content_disposition_attachment(filename: &str) -> String {
+    format!("attachment; filename=\"{}\"", filename)
+}
+
+/// Extract the download filename from an artifact path.
+pub(crate) fn extract_download_filename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Parse a client IP address from an X-Forwarded-For header value.
+pub(crate) fn parse_client_ip(xff_value: Option<&str>) -> std::net::IpAddr {
+    xff_value
+        .and_then(|s| s.split(',').next())
+        .unwrap_or("127.0.0.1")
+        .trim()
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1828,5 +1875,337 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"member_repo_key\":\"upstream\""));
         assert!(json.contains("\"priority\":1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_pagination
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_pagination_defaults() {
+        let (page, per_page, offset) = compute_pagination(None, None);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, 20);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_compute_pagination_custom_values() {
+        let (page, per_page, offset) = compute_pagination(Some(3), Some(50));
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 50);
+        assert_eq!(offset, 100);
+    }
+
+    #[test]
+    fn test_compute_pagination_page_zero_becomes_one() {
+        let (page, _, offset) = compute_pagination(Some(0), Some(10));
+        assert_eq!(page, 1);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_compute_pagination_per_page_capped_at_100() {
+        let (_, per_page, _) = compute_pagination(Some(1), Some(200));
+        assert_eq!(per_page, 100);
+    }
+
+    #[test]
+    fn test_compute_pagination_large_page() {
+        let (page, per_page, offset) = compute_pagination(Some(100), Some(25));
+        assert_eq!(page, 100);
+        assert_eq!(per_page, 25);
+        assert_eq!(offset, 2475);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_total_pages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_total_pages_exact() {
+        assert_eq!(compute_total_pages(100, 20), 5);
+    }
+
+    #[test]
+    fn test_compute_total_pages_remainder() {
+        assert_eq!(compute_total_pages(101, 20), 6);
+    }
+
+    #[test]
+    fn test_compute_total_pages_zero_total() {
+        assert_eq!(compute_total_pages(0, 20), 0);
+    }
+
+    #[test]
+    fn test_compute_total_pages_single_item() {
+        assert_eq!(compute_total_pages(1, 20), 1);
+    }
+
+    #[test]
+    fn test_compute_total_pages_one_per_page() {
+        assert_eq!(compute_total_pages(5, 1), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_name_from_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_name_from_path_nested() {
+        assert_eq!(
+            extract_name_from_path("org/example/1.0/example-1.0.jar"),
+            "example-1.0.jar"
+        );
+    }
+
+    #[test]
+    fn test_extract_name_from_path_simple() {
+        assert_eq!(extract_name_from_path("myfile.txt"), "myfile.txt");
+    }
+
+    #[test]
+    fn test_extract_name_from_path_trailing_slash() {
+        // rsplit next_back gives empty string after trailing slash
+        assert_eq!(extract_name_from_path("some/path/"), "");
+    }
+
+    #[test]
+    fn test_extract_name_from_path_deep() {
+        assert_eq!(
+            extract_name_from_path("a/b/c/d/e/file.bin"),
+            "file.bin"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_storage_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_storage_path_basic() {
+        assert_eq!(
+            build_storage_path("/var/data", "my-repo"),
+            "/var/data/my-repo"
+        );
+    }
+
+    #[test]
+    fn test_build_storage_path_relative() {
+        assert_eq!(
+            build_storage_path("./storage", "repo-1"),
+            "./storage/repo-1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // content_disposition_attachment
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_content_disposition_attachment_simple() {
+        assert_eq!(
+            content_disposition_attachment("file.jar"),
+            "attachment; filename=\"file.jar\""
+        );
+    }
+
+    #[test]
+    fn test_content_disposition_attachment_spaces() {
+        assert_eq!(
+            content_disposition_attachment("my file.zip"),
+            "attachment; filename=\"my file.zip\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_download_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_download_filename_path() {
+        assert_eq!(
+            extract_download_filename("org/example/1.0/example.jar"),
+            "example.jar"
+        );
+    }
+
+    #[test]
+    fn test_extract_download_filename_no_slash() {
+        assert_eq!(extract_download_filename("single-file.txt"), "single-file.txt");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_client_ip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_client_ip_single() {
+        let ip = parse_client_ip(Some("10.0.0.1"));
+        assert_eq!(ip.to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_client_ip_chain() {
+        let ip = parse_client_ip(Some("10.0.0.1, 192.168.1.1, 172.16.0.1"));
+        assert_eq!(ip.to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_client_ip_none() {
+        let ip = parse_client_ip(None);
+        assert_eq!(ip.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_client_ip_invalid() {
+        let ip = parse_client_ip(Some("not-an-ip"));
+        assert_eq!(ip.to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_client_ip_ipv6() {
+        let ip = parse_client_ip(Some("::1"));
+        assert_eq!(ip.to_string(), "::1");
+    }
+
+    #[test]
+    fn test_parse_client_ip_empty() {
+        let ip = parse_client_ip(Some(""));
+        assert_eq!(ip.to_string(), "127.0.0.1");
+    }
+
+    // -----------------------------------------------------------------------
+    // repo_to_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_to_response_basic() {
+        use crate::models::repository::{ReplicationPriority, Repository};
+
+        let now = chrono::Utc::now();
+        let repo = Repository {
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            key: "maven-central".to_string(),
+            name: "Maven Central".to_string(),
+            description: Some("Central Maven repo".to_string()),
+            format: RepositoryFormat::Maven,
+            repo_type: RepositoryType::Local,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/maven".to_string(),
+            upstream_url: None,
+            is_public: true,
+            quota_bytes: Some(1073741824),
+            replication_priority: ReplicationPriority::Immediate,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let response = repo_to_response(repo, 5000);
+        assert_eq!(response.key, "maven-central");
+        assert_eq!(response.name, "Maven Central");
+        assert_eq!(response.format, "maven");
+        assert_eq!(response.repo_type, "local");
+        assert_eq!(response.is_public, true);
+        assert_eq!(response.storage_used_bytes, 5000);
+        assert_eq!(response.quota_bytes, Some(1073741824));
+    }
+
+    #[test]
+    fn test_repo_to_response_zero_storage() {
+        use crate::models::repository::{ReplicationPriority, Repository};
+
+        let now = chrono::Utc::now();
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "npm-hosted".to_string(),
+            name: "NPM Local".to_string(),
+            description: None,
+            format: RepositoryFormat::Npm,
+            repo_type: RepositoryType::Remote,
+            storage_backend: "s3".to_string(),
+            storage_path: "/data/npm".to_string(),
+            upstream_url: Some("https://registry.npmjs.org".to_string()),
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let response = repo_to_response(repo, 0);
+        assert_eq!(response.format, "npm");
+        assert_eq!(response.repo_type, "remote");
+        assert_eq!(response.is_public, false);
+        assert_eq!(response.storage_used_bytes, 0);
+        assert!(response.quota_bytes.is_none());
+        assert!(response.description.is_none());
+    }
+
+    #[test]
+    fn test_repo_to_response_virtual() {
+        use crate::models::repository::{ReplicationPriority, Repository};
+
+        let now = chrono::Utc::now();
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "docker-all".to_string(),
+            name: "Docker Virtual".to_string(),
+            description: Some("Aggregated Docker".to_string()),
+            format: RepositoryFormat::Docker,
+            repo_type: RepositoryType::Virtual,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/docker".to_string(),
+            upstream_url: None,
+            is_public: true,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::LocalOnly,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let response = repo_to_response(repo, 1024 * 1024);
+        assert_eq!(response.format, "docker");
+        assert_eq!(response.repo_type, "virtual");
+        assert_eq!(response.storage_used_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_repo_to_response_staging_with_promotion() {
+        use crate::models::repository::{ReplicationPriority, Repository};
+
+        let now = chrono::Utc::now();
+        let target_id = Uuid::new_v4();
+        let policy_id = Uuid::new_v4();
+        let repo = Repository {
+            id: Uuid::new_v4(),
+            key: "cargo-staging".to_string(),
+            name: "Cargo Staging".to_string(),
+            description: None,
+            format: RepositoryFormat::Cargo,
+            repo_type: RepositoryType::Staging,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/cargo-staging".to_string(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: Some(5_000_000_000),
+            replication_priority: ReplicationPriority::Scheduled,
+            promotion_target_id: Some(target_id),
+            promotion_policy_id: Some(policy_id),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let response = repo_to_response(repo, 42);
+        assert_eq!(response.format, "cargo");
+        assert_eq!(response.repo_type, "staging");
+        assert_eq!(response.storage_used_bytes, 42);
+        assert_eq!(response.quota_bytes, Some(5_000_000_000));
     }
 }

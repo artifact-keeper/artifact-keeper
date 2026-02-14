@@ -116,14 +116,16 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
         }
 
         // ── Concurrency check ───────────────────────────────────────────
-        let max_concurrent = peer.concurrent_transfers_limit.unwrap_or(5);
-        let available_slots = max_concurrent - peer.active_transfers;
+        let available_slots = compute_available_slots(
+            peer.concurrent_transfers_limit,
+            peer.active_transfers,
+        );
         if available_slots <= 0 {
             tracing::debug!(
                 "Peer '{}' at concurrency limit ({}/{}), skipping",
                 peer.name,
                 peer.active_transfers,
-                max_concurrent
+                peer.concurrent_transfers_limit.unwrap_or(5)
             );
             continue;
         }
@@ -240,11 +242,7 @@ async fn execute_transfer(
     let bytes_len = file_bytes.len() as i64;
 
     // 3. POST the artifact to the remote peer.
-    let url = format!(
-        "{}/api/v1/repositories/{}/artifacts",
-        peer_endpoint.trim_end_matches('/'),
-        task.repository_key
-    );
+    let url = build_transfer_url(peer_endpoint, &task.repository_key);
 
     let result = client
         .post(&url)
@@ -396,6 +394,25 @@ async fn handle_transfer_failure(db: &PgPool, task: &TaskRow, error_message: &st
     .bind(format!("{} seconds", backoff.as_secs()))
     .execute(db)
     .await;
+}
+
+/// Build the full URL for posting an artifact to a remote peer.
+pub(crate) fn build_transfer_url(peer_endpoint: &str, repository_key: &str) -> String {
+    format!(
+        "{}/api/v1/repositories/{}/artifacts",
+        peer_endpoint.trim_end_matches('/'),
+        repository_key
+    )
+}
+
+/// Compute the number of available transfer slots for a peer.
+/// Returns 0 or negative if the peer is at or over capacity.
+pub(crate) fn compute_available_slots(
+    concurrent_transfers_limit: Option<i32>,
+    active_transfers: i32,
+) -> i32 {
+    let max_concurrent = concurrent_transfers_limit.unwrap_or(5);
+    max_concurrent - active_transfers
 }
 
 // ── Pure helper functions ───────────────────────────────────────────────────
@@ -670,40 +687,79 @@ mod tests {
         assert_eq!(parse_utc_offset_secs("INVALID"), 0);
     }
 
-    // ── Concurrent transfer slot logic ──────────────────────────────────
+    // ── build_transfer_url (extracted pure function) ─────────────────────
 
     #[test]
-    fn test_available_slots_calculation() {
-        // Simulates the check in process_pending_tasks.
-        let max: i32 = 3;
-        let active: i32 = 2;
-        let available = max - active;
-        assert_eq!(available, 1);
+    fn test_build_transfer_url_basic() {
+        assert_eq!(
+            build_transfer_url("https://peer.example.com", "maven-releases"),
+            "https://peer.example.com/api/v1/repositories/maven-releases/artifacts"
+        );
     }
 
     #[test]
-    fn test_available_slots_at_limit() {
-        let max: i32 = 3;
-        let active: i32 = 3;
-        let available = max - active;
-        assert_eq!(available, 0);
+    fn test_build_transfer_url_trailing_slash() {
+        assert_eq!(
+            build_transfer_url("https://peer.example.com/", "npm-proxy"),
+            "https://peer.example.com/api/v1/repositories/npm-proxy/artifacts"
+        );
     }
 
     #[test]
-    fn test_available_slots_over_limit() {
-        // Edge case: active somehow exceeded limit.
-        let max: i32 = 3;
-        let active: i32 = 5;
-        let available = max - active;
-        assert!(available < 0);
+    fn test_build_transfer_url_multiple_trailing_slashes() {
+        assert_eq!(
+            build_transfer_url("https://peer.example.com///", "cargo-local"),
+            "https://peer.example.com/api/v1/repositories/cargo-local/artifacts"
+        );
     }
 
     #[test]
-    fn test_available_slots_default_limit() {
-        let max: i32 = 5; // default when no limit is configured
-        let active: i32 = 2;
-        let available = max - active;
-        assert_eq!(available, 3);
+    fn test_build_transfer_url_with_port() {
+        assert_eq!(
+            build_transfer_url("http://localhost:8080", "docker-hub"),
+            "http://localhost:8080/api/v1/repositories/docker-hub/artifacts"
+        );
+    }
+
+    #[test]
+    fn test_build_transfer_url_with_path_prefix() {
+        assert_eq!(
+            build_transfer_url("https://peer.example.com/v2", "pypi-local"),
+            "https://peer.example.com/v2/api/v1/repositories/pypi-local/artifacts"
+        );
+    }
+
+    // ── compute_available_slots (extracted pure function) ─────────────────
+
+    #[test]
+    fn test_compute_available_slots_basic() {
+        assert_eq!(compute_available_slots(Some(3), 2), 1);
+    }
+
+    #[test]
+    fn test_compute_available_slots_at_limit() {
+        assert_eq!(compute_available_slots(Some(3), 3), 0);
+    }
+
+    #[test]
+    fn test_compute_available_slots_over_limit() {
+        assert_eq!(compute_available_slots(Some(3), 5), -2);
+    }
+
+    #[test]
+    fn test_compute_available_slots_default_limit() {
+        // None defaults to 5
+        assert_eq!(compute_available_slots(None, 2), 3);
+    }
+
+    #[test]
+    fn test_compute_available_slots_default_limit_at_capacity() {
+        assert_eq!(compute_available_slots(None, 5), 0);
+    }
+
+    #[test]
+    fn test_compute_available_slots_zero_active() {
+        assert_eq!(compute_available_slots(Some(10), 0), 10);
     }
 
     // ── Edge cases: no peers, no tasks ──────────────────────────────────
@@ -718,7 +774,6 @@ mod tests {
     fn test_empty_tasks_no_dispatch() {
         let tasks: Vec<TaskRow> = vec![];
         assert!(tasks.is_empty());
-        // The worker should simply skip when there are no tasks.
     }
 
     // ── Sync window with timezone offset ────────────────────────────────

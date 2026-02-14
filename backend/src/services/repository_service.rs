@@ -40,6 +40,39 @@ pub struct UpdateRepositoryRequest {
     pub upstream_url: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Pure helper functions (no DB, testable in isolation)
+// ---------------------------------------------------------------------------
+
+/// Validate that a remote repository has an upstream URL.
+/// Returns an error message if validation fails, None if ok.
+pub(crate) fn validate_remote_upstream(
+    repo_type: &RepositoryType,
+    upstream_url: &Option<String>,
+) -> Option<String> {
+    if *repo_type == RepositoryType::Remote && upstream_url.is_none() {
+        Some("Remote repository must have an upstream URL".to_string())
+    } else {
+        None
+    }
+}
+
+/// Derive a format key string from a RepositoryFormat enum.
+pub(crate) fn derive_format_key(format: &RepositoryFormat) -> String {
+    format!("{:?}", format).to_lowercase()
+}
+
+/// Build a SQL LIKE search pattern from a user query string.
+pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
+    query.map(|q| format!("%{}%", q.to_lowercase()))
+}
+
+/// Check whether a format_enabled value should cause repo creation to be rejected.
+/// Returns true if the format handler is explicitly disabled.
+pub(crate) fn should_reject_disabled_format(format_enabled: Option<bool>) -> bool {
+    format_enabled == Some(false)
+}
+
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
@@ -68,14 +101,12 @@ impl RepositoryService {
     /// Create a new repository
     pub async fn create(&self, req: CreateRepositoryRequest) -> Result<Repository> {
         // Validate remote repository has upstream URL
-        if req.repo_type == RepositoryType::Remote && req.upstream_url.is_none() {
-            return Err(AppError::Validation(
-                "Remote repository must have an upstream URL".to_string(),
-            ));
+        if let Some(msg) = validate_remote_upstream(&req.repo_type, &req.upstream_url) {
+            return Err(AppError::Validation(msg));
         }
 
         // Check if format handler is enabled (T044)
-        let format_key = format!("{:?}", req.format).to_lowercase();
+        let format_key = derive_format_key(&req.format);
         let format_enabled: Option<bool> =
             sqlx::query_scalar("SELECT is_enabled FROM format_handlers WHERE format_key = $1")
                 .bind(&format_key)
@@ -84,7 +115,7 @@ impl RepositoryService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
 
         // If format handler exists and is disabled, reject repository creation
-        if format_enabled == Some(false) {
+        if should_reject_disabled_format(format_enabled) {
             return Err(AppError::Validation(format!(
                 "Format handler '{}' is disabled. Enable it before creating repositories.",
                 format_key
@@ -213,7 +244,7 @@ impl RepositoryService {
         public_only: bool,
         search_query: Option<&str>,
     ) -> Result<(Vec<Repository>, i64)> {
-        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+        let search_pattern = build_search_pattern(search_query);
 
         let repos = sqlx::query_as!(
             Repository,
@@ -723,121 +754,143 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Validation logic tests (mirrors create method validation)
+    // validate_remote_upstream (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_remote_repo_without_upstream_should_fail() {
-        // Validates the logic: remote repos must have upstream_url
-        let repo_type = RepositoryType::Remote;
-        let upstream_url: Option<String> = None;
-        let should_fail = repo_type == RepositoryType::Remote && upstream_url.is_none();
-        assert!(should_fail);
+    fn test_validate_remote_upstream_remote_without_url_fails() {
+        let result = validate_remote_upstream(&RepositoryType::Remote, &None);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("upstream URL"));
     }
 
     #[test]
-    fn test_remote_repo_with_upstream_should_pass() {
-        let repo_type = RepositoryType::Remote;
-        let upstream_url: Option<String> = Some("https://upstream.example.com".to_string());
-        let should_fail = repo_type == RepositoryType::Remote && upstream_url.is_none();
-        assert!(!should_fail);
+    fn test_validate_remote_upstream_remote_with_url_passes() {
+        let result = validate_remote_upstream(
+            &RepositoryType::Remote,
+            &Some("https://upstream.example.com".to_string()),
+        );
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_local_repo_without_upstream_should_pass() {
-        let repo_type = RepositoryType::Local;
-        let upstream_url: Option<String> = None;
-        let should_fail = repo_type == RepositoryType::Remote && upstream_url.is_none();
-        assert!(!should_fail);
-    }
-
-    // -----------------------------------------------------------------------
-    // search_pattern generation logic
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_search_pattern_generation() {
-        let query = Some("maven");
-        let search_pattern = query.map(|q| format!("%{}%", q.to_lowercase()));
-        assert_eq!(search_pattern, Some("%maven%".to_string()));
+    fn test_validate_remote_upstream_local_without_url_passes() {
+        let result = validate_remote_upstream(&RepositoryType::Local, &None);
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_search_pattern_generation_mixed_case() {
-        let query = Some("MyRepo");
-        let search_pattern = query.map(|q| format!("%{}%", q.to_lowercase()));
-        assert_eq!(search_pattern, Some("%myrepo%".to_string()));
+    fn test_validate_remote_upstream_virtual_without_url_passes() {
+        let result = validate_remote_upstream(&RepositoryType::Virtual, &None);
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_search_pattern_generation_none() {
-        let query: Option<&str> = None;
-        let search_pattern = query.map(|q| format!("%{}%", q.to_lowercase()));
-        assert!(search_pattern.is_none());
+    fn test_validate_remote_upstream_staging_without_url_passes() {
+        let result = validate_remote_upstream(&RepositoryType::Staging, &None);
+        assert!(result.is_none());
     }
 
     // -----------------------------------------------------------------------
-    // format_enabled validation logic
+    // build_search_pattern (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_format_enabled_check_disabled() {
-        let format_enabled: Option<bool> = Some(false);
-        let should_reject = format_enabled == Some(false);
-        assert!(should_reject);
+    fn test_build_search_pattern_basic() {
+        assert_eq!(build_search_pattern(Some("maven")), Some("%maven%".to_string()));
     }
 
     #[test]
-    fn test_format_enabled_check_enabled() {
-        let format_enabled: Option<bool> = Some(true);
-        let should_reject = format_enabled == Some(false);
-        assert!(!should_reject);
+    fn test_build_search_pattern_mixed_case() {
+        assert_eq!(build_search_pattern(Some("MyRepo")), Some("%myrepo%".to_string()));
     }
 
     #[test]
-    fn test_format_enabled_check_not_found() {
-        // If format handler doesn't exist in DB, don't reject
-        let format_enabled: Option<bool> = None;
-        let should_reject = format_enabled == Some(false);
-        assert!(!should_reject);
+    fn test_build_search_pattern_none() {
+        assert!(build_search_pattern(None).is_none());
+    }
+
+    #[test]
+    fn test_build_search_pattern_empty_string() {
+        assert_eq!(build_search_pattern(Some("")), Some("%%".to_string()));
+    }
+
+    #[test]
+    fn test_build_search_pattern_with_spaces() {
+        assert_eq!(
+            build_search_pattern(Some("my repo")),
+            Some("%my repo%".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
-    // format_key derivation logic
+    // should_reject_disabled_format (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_format_key_derivation() {
-        let format = RepositoryFormat::Maven;
-        let format_key = format!("{:?}", format).to_lowercase();
-        assert_eq!(format_key, "maven");
+    fn test_should_reject_disabled_format_disabled() {
+        assert!(should_reject_disabled_format(Some(false)));
     }
 
     #[test]
-    fn test_format_key_derivation_docker() {
-        let format = RepositoryFormat::Docker;
-        let format_key = format!("{:?}", format).to_lowercase();
-        assert_eq!(format_key, "docker");
+    fn test_should_reject_disabled_format_enabled() {
+        assert!(!should_reject_disabled_format(Some(true)));
     }
 
     #[test]
-    fn test_format_key_derivation_wasm_oci() {
-        let format = RepositoryFormat::WasmOci;
-        let format_key = format!("{:?}", format).to_lowercase();
-        assert_eq!(format_key, "wasmoci");
+    fn test_should_reject_disabled_format_not_found() {
+        assert!(!should_reject_disabled_format(None));
+    }
+
+    // -----------------------------------------------------------------------
+    // derive_format_key (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_derive_format_key_maven() {
+        assert_eq!(derive_format_key(&RepositoryFormat::Maven), "maven");
     }
 
     #[test]
-    fn test_format_key_derivation_helm_oci() {
-        let format = RepositoryFormat::HelmOci;
-        let format_key = format!("{:?}", format).to_lowercase();
-        assert_eq!(format_key, "helmoci");
+    fn test_derive_format_key_docker() {
+        assert_eq!(derive_format_key(&RepositoryFormat::Docker), "docker");
     }
 
     #[test]
-    fn test_format_key_derivation_conda_native() {
-        let format = RepositoryFormat::CondaNative;
-        let format_key = format!("{:?}", format).to_lowercase();
-        assert_eq!(format_key, "condanative");
+    fn test_derive_format_key_npm() {
+        assert_eq!(derive_format_key(&RepositoryFormat::Npm), "npm");
+    }
+
+    #[test]
+    fn test_derive_format_key_wasm_oci() {
+        assert_eq!(derive_format_key(&RepositoryFormat::WasmOci), "wasmoci");
+    }
+
+    #[test]
+    fn test_derive_format_key_helm_oci() {
+        assert_eq!(derive_format_key(&RepositoryFormat::HelmOci), "helmoci");
+    }
+
+    #[test]
+    fn test_derive_format_key_conda_native() {
+        assert_eq!(derive_format_key(&RepositoryFormat::CondaNative), "condanative");
+    }
+
+    #[test]
+    fn test_derive_format_key_various_formats() {
+        let cases: Vec<(RepositoryFormat, &str)> = vec![
+            (RepositoryFormat::Cargo, "cargo"),
+            (RepositoryFormat::Nuget, "nuget"),
+            (RepositoryFormat::Go, "go"),
+            (RepositoryFormat::Rubygems, "rubygems"),
+            (RepositoryFormat::Helm, "helm"),
+            (RepositoryFormat::Rpm, "rpm"),
+            (RepositoryFormat::Debian, "debian"),
+            (RepositoryFormat::Pypi, "pypi"),
+            (RepositoryFormat::Generic, "generic"),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(derive_format_key(&format), expected, "Format {:?}", format);
+        }
     }
 }

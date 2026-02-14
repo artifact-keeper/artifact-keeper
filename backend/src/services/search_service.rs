@@ -66,6 +66,44 @@ pub struct FacetCount {
     pub count: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Pure helper functions (no DB, testable in isolation)
+// ---------------------------------------------------------------------------
+
+/// Build a PostgreSQL full-text search query from a free-text input.
+///
+/// Each whitespace-separated word gets a `:*` prefix-match suffix and words
+/// are joined with `&` (AND).  Returns None if the input is None.
+pub(crate) fn build_tsquery_filter(q: Option<&str>) -> Option<String> {
+    q.map(|q| {
+        q.split_whitespace()
+            .map(|w| format!("{}:*", w))
+            .collect::<Vec<_>>()
+            .join(" & ")
+    })
+}
+
+/// Convert a user-facing wildcard name filter (using `*`) to a SQL ILIKE
+/// pattern (using `%`).  Returns None if the input is None.
+pub(crate) fn build_name_filter(name: Option<&str>) -> Option<String> {
+    name.map(|n| n.replace('*', "%"))
+}
+
+/// Normalize pagination offset: default 0, clamp to non-negative.
+pub(crate) fn normalize_offset(offset: Option<i64>) -> i64 {
+    offset.unwrap_or(0).max(0)
+}
+
+/// Normalize pagination limit: default 20, clamp to `[1, 100]`.
+pub(crate) fn normalize_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(20).clamp(1, 100)
+}
+
+/// Build the ILIKE pattern for suggest completions.
+pub(crate) fn build_suggest_pattern(prefix: &str) -> String {
+    format!("{}%", prefix)
+}
+
 /// Search service
 pub struct SearchService {
     db: PgPool,
@@ -78,8 +116,8 @@ impl SearchService {
 
     /// Execute a search query
     pub async fn search(&self, query: SearchQuery) -> Result<SearchResponse> {
-        let offset = query.offset.unwrap_or(0).max(0);
-        let limit = query.limit.unwrap_or(20).clamp(1, 100);
+        let offset = normalize_offset(query.offset);
+        let limit = normalize_limit(query.limit);
 
         let items = self.execute_search(&query, offset, limit).await?;
         let total = self.count_results(&query).await?;
@@ -100,14 +138,9 @@ impl SearchService {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<SearchResult>> {
-        let q_filter = query.q.as_ref().map(|q| {
-            q.split_whitespace()
-                .map(|w| format!("{}:*", w))
-                .collect::<Vec<_>>()
-                .join(" & ")
-        });
+        let q_filter = build_tsquery_filter(query.q.as_deref());
 
-        let name_filter = query.name.as_ref().map(|n| n.replace('*', "%"));
+        let name_filter = build_name_filter(query.name.as_deref());
 
         let results = sqlx::query!(
             r#"
@@ -164,14 +197,9 @@ impl SearchService {
     }
 
     async fn count_results(&self, query: &SearchQuery) -> Result<i64> {
-        let q_filter = query.q.as_ref().map(|q| {
-            q.split_whitespace()
-                .map(|w| format!("{}:*", w))
-                .collect::<Vec<_>>()
-                .join(" & ")
-        });
+        let q_filter = build_tsquery_filter(query.q.as_deref());
 
-        let name_filter = query.name.as_ref().map(|n| n.replace('*', "%"));
+        let name_filter = build_name_filter(query.name.as_deref());
 
         let count = sqlx::query_scalar!(
             r#"
@@ -269,7 +297,7 @@ impl SearchService {
 
     /// Suggest completions for search terms
     pub async fn suggest(&self, prefix: &str, limit: i64) -> Result<Vec<String>> {
-        let pattern = format!("{}%", prefix);
+        let pattern = build_suggest_pattern(prefix);
 
         let suggestions = sqlx::query_scalar!(
             r#"
@@ -442,100 +470,145 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SearchQuery pagination value normalization (tested via logic extraction)
+    // normalize_offset (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_pagination_offset_normalization() {
-        // The search method normalizes: offset = query.offset.unwrap_or(0).max(0)
-        let offset_none: Option<i64> = None;
-        assert_eq!(offset_none.unwrap_or(0).max(0), 0);
-
-        let offset_negative: Option<i64> = Some(-5);
-        assert_eq!(offset_negative.unwrap_or(0).max(0), 0);
-
-        let offset_positive: Option<i64> = Some(20);
-        assert_eq!(offset_positive.unwrap_or(0).max(0), 20);
+    fn test_normalize_offset_none() {
+        assert_eq!(normalize_offset(None), 0);
     }
 
     #[test]
-    fn test_pagination_limit_normalization() {
-        // The search method normalizes: limit = query.limit.unwrap_or(20).clamp(1, 100)
-        let limit_none: Option<i64> = None;
-        assert_eq!(limit_none.unwrap_or(20).clamp(1, 100), 20);
+    fn test_normalize_offset_negative() {
+        assert_eq!(normalize_offset(Some(-5)), 0);
+    }
 
-        let limit_zero: Option<i64> = Some(0);
-        assert_eq!(limit_zero.unwrap_or(20).clamp(1, 100), 1);
+    #[test]
+    fn test_normalize_offset_positive() {
+        assert_eq!(normalize_offset(Some(20)), 20);
+    }
 
-        let limit_over: Option<i64> = Some(500);
-        assert_eq!(limit_over.unwrap_or(20).clamp(1, 100), 100);
-
-        let limit_normal: Option<i64> = Some(50);
-        assert_eq!(limit_normal.unwrap_or(20).clamp(1, 100), 50);
-
-        let limit_negative: Option<i64> = Some(-10);
-        assert_eq!(limit_negative.unwrap_or(20).clamp(1, 100), 1);
+    #[test]
+    fn test_normalize_offset_zero() {
+        assert_eq!(normalize_offset(Some(0)), 0);
     }
 
     // -----------------------------------------------------------------------
-    // Query filter building logic (replicated from execute_search/count_results)
+    // normalize_limit (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_q_filter_construction_single_word() {
-        let q = Some("artifact".to_string());
-        let q_filter = q.as_ref().map(|q| {
-            q.split_whitespace()
-                .map(|w| format!("{}:*", w))
-                .collect::<Vec<_>>()
-                .join(" & ")
-        });
-        assert_eq!(q_filter.as_deref(), Some("artifact:*"));
+    fn test_normalize_limit_none() {
+        assert_eq!(normalize_limit(None), 20);
     }
 
     #[test]
-    fn test_q_filter_construction_multiple_words() {
-        let q = Some("my awesome artifact".to_string());
-        let q_filter = q.as_ref().map(|q| {
-            q.split_whitespace()
-                .map(|w| format!("{}:*", w))
-                .collect::<Vec<_>>()
-                .join(" & ")
-        });
-        assert_eq!(q_filter.as_deref(), Some("my:* & awesome:* & artifact:*"));
+    fn test_normalize_limit_zero() {
+        assert_eq!(normalize_limit(Some(0)), 1);
     }
 
     #[test]
-    fn test_q_filter_construction_none() {
-        let q: Option<String> = None;
-        let q_filter = q.as_ref().map(|q| {
-            q.split_whitespace()
-                .map(|w| format!("{}:*", w))
-                .collect::<Vec<_>>()
-                .join(" & ")
-        });
-        assert!(q_filter.is_none());
+    fn test_normalize_limit_over_max() {
+        assert_eq!(normalize_limit(Some(500)), 100);
     }
 
     #[test]
-    fn test_name_filter_wildcard_replacement() {
-        let name = Some("my-lib*".to_string());
-        let name_filter = name.as_ref().map(|n| n.replace('*', "%"));
-        assert_eq!(name_filter.as_deref(), Some("my-lib%"));
+    fn test_normalize_limit_normal() {
+        assert_eq!(normalize_limit(Some(50)), 50);
     }
 
     #[test]
-    fn test_name_filter_multiple_wildcards() {
-        let name = Some("*my*lib*".to_string());
-        let name_filter = name.as_ref().map(|n| n.replace('*', "%"));
-        assert_eq!(name_filter.as_deref(), Some("%my%lib%"));
+    fn test_normalize_limit_negative() {
+        assert_eq!(normalize_limit(Some(-10)), 1);
     }
 
     #[test]
-    fn test_name_filter_none() {
-        let name: Option<String> = None;
-        let name_filter = name.as_ref().map(|n| n.replace('*', "%"));
-        assert!(name_filter.is_none());
+    fn test_normalize_limit_boundary_one() {
+        assert_eq!(normalize_limit(Some(1)), 1);
+    }
+
+    #[test]
+    fn test_normalize_limit_boundary_hundred() {
+        assert_eq!(normalize_limit(Some(100)), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_tsquery_filter (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_tsquery_filter_single_word() {
+        assert_eq!(build_tsquery_filter(Some("artifact")).as_deref(), Some("artifact:*"));
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_multiple_words() {
+        assert_eq!(
+            build_tsquery_filter(Some("my awesome artifact")).as_deref(),
+            Some("my:* & awesome:* & artifact:*")
+        );
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_none() {
+        assert!(build_tsquery_filter(None).is_none());
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_empty_string() {
+        // Empty string split by whitespace yields no tokens
+        assert_eq!(build_tsquery_filter(Some("")).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_build_tsquery_filter_extra_whitespace() {
+        assert_eq!(
+            build_tsquery_filter(Some("  foo   bar  ")).as_deref(),
+            Some("foo:* & bar:*")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_name_filter (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_name_filter_wildcard() {
+        assert_eq!(build_name_filter(Some("my-lib*")).as_deref(), Some("my-lib%"));
+    }
+
+    #[test]
+    fn test_build_name_filter_multiple_wildcards() {
+        assert_eq!(build_name_filter(Some("*my*lib*")).as_deref(), Some("%my%lib%"));
+    }
+
+    #[test]
+    fn test_build_name_filter_none() {
+        assert!(build_name_filter(None).is_none());
+    }
+
+    #[test]
+    fn test_build_name_filter_no_wildcard() {
+        assert_eq!(build_name_filter(Some("exact-name")).as_deref(), Some("exact-name"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_suggest_pattern (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_suggest_pattern_basic() {
+        assert_eq!(build_suggest_pattern("my-lib"), "my-lib%");
+    }
+
+    #[test]
+    fn test_build_suggest_pattern_empty() {
+        assert_eq!(build_suggest_pattern(""), "%");
+    }
+
+    #[test]
+    fn test_build_suggest_pattern_with_special_chars() {
+        assert_eq!(build_suggest_pattern("@scope/pkg"), "@scope/pkg%");
     }
 
     // -----------------------------------------------------------------------

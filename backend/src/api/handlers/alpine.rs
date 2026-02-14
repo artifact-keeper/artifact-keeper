@@ -917,6 +917,78 @@ fn sha256_hex(data: &[u8]) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Extracted pure functions for testability
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for an Alpine package.
+pub(crate) fn build_alpine_artifact_path(
+    branch: &str,
+    repository: &str,
+    arch: &str,
+    filename: &str,
+) -> String {
+    format!("{}/{}/{}/{}", branch, repository, arch, filename)
+}
+
+/// Build the storage key for an Alpine package.
+pub(crate) fn build_alpine_storage_key(repo_id: uuid::Uuid, artifact_path: &str) -> String {
+    format!("alpine/{}/{}", repo_id, artifact_path)
+}
+
+/// Build Alpine-specific metadata JSON.
+pub(crate) fn build_alpine_metadata(
+    pkg_name: &str,
+    pkg_version: &str,
+    arch: &str,
+    branch: &str,
+    repository: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": pkg_name,
+        "version": pkg_version,
+        "arch": arch,
+        "branch": branch,
+        "repository": repository,
+        "filename": filename,
+    })
+}
+
+/// Build the JSON upload response for an Alpine package.
+pub(crate) fn build_alpine_upload_response(
+    pkg_name: &str,
+    pkg_version: &str,
+    arch: &str,
+    branch: &str,
+    repository: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": pkg_name,
+        "version": pkg_version,
+        "arch": arch,
+        "branch": branch,
+        "repository": repository,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Build the path prefix used for listing Alpine artifacts.
+pub(crate) fn build_alpine_path_prefix(branch: &str, repository: &str, arch: &str) -> String {
+    format!("{}/{}/{}/", branch, repository, arch)
+}
+
+/// Extract filename from a Content-Disposition header value.
+pub(crate) fn extract_filename_from_content_disposition(value: &str) -> Option<String> {
+    value
+        .split("filename=")
+        .nth(1)
+        .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1008,5 +1080,340 @@ mod tests {
         assert_eq!(entry_names.len(), 2);
         assert_eq!(entry_names[0], ".SIGN.RSA.artifact-keeper.rsa.pub");
         assert_eq!(entry_names[1], "APKINDEX");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_alpine_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_alpine_artifact_path_basic() {
+        assert_eq!(
+            build_alpine_artifact_path("edge", "main", "x86_64", "curl-8.5.0-r0.apk"),
+            "edge/main/x86_64/curl-8.5.0-r0.apk"
+        );
+    }
+
+    #[test]
+    fn test_build_alpine_artifact_path_v3() {
+        assert_eq!(
+            build_alpine_artifact_path("v3.18", "community", "aarch64", "nginx-1.25.4-r0.apk"),
+            "v3.18/community/aarch64/nginx-1.25.4-r0.apk"
+        );
+    }
+
+    #[test]
+    fn test_build_alpine_artifact_path_testing() {
+        assert_eq!(
+            build_alpine_artifact_path("edge", "testing", "x86_64", "zsh-5.9-r0.apk"),
+            "edge/testing/x86_64/zsh-5.9-r0.apk"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_alpine_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_alpine_storage_key_basic() {
+        let repo_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            build_alpine_storage_key(repo_id, "edge/main/x86_64/curl-8.5.0-r0.apk"),
+            "alpine/550e8400-e29b-41d4-a716-446655440000/edge/main/x86_64/curl-8.5.0-r0.apk"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_alpine_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_alpine_metadata_basic() {
+        let meta = build_alpine_metadata("curl", "8.5.0-r0", "x86_64", "edge", "main", "curl-8.5.0-r0.apk");
+        assert_eq!(meta["name"], "curl");
+        assert_eq!(meta["version"], "8.5.0-r0");
+        assert_eq!(meta["arch"], "x86_64");
+        assert_eq!(meta["branch"], "edge");
+        assert_eq!(meta["repository"], "main");
+        assert_eq!(meta["filename"], "curl-8.5.0-r0.apk");
+    }
+
+    #[test]
+    fn test_build_alpine_metadata_different_arch() {
+        let meta = build_alpine_metadata("nginx", "1.25.4-r0", "aarch64", "v3.19", "community", "nginx-1.25.4-r0.apk");
+        assert_eq!(meta["arch"], "aarch64");
+        assert_eq!(meta["branch"], "v3.19");
+        assert_eq!(meta["repository"], "community");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_alpine_upload_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_alpine_upload_response_basic() {
+        let resp = build_alpine_upload_response(
+            "curl",
+            "8.5.0-r0",
+            "x86_64",
+            "edge",
+            "main",
+            "abc123def456",
+            1024,
+        );
+        assert_eq!(resp["name"], "curl");
+        assert_eq!(resp["version"], "8.5.0-r0");
+        assert_eq!(resp["arch"], "x86_64");
+        assert_eq!(resp["branch"], "edge");
+        assert_eq!(resp["repository"], "main");
+        assert_eq!(resp["sha256"], "abc123def456");
+        assert_eq!(resp["size"], 1024);
+    }
+
+    #[test]
+    fn test_build_alpine_upload_response_zero_size() {
+        let resp = build_alpine_upload_response("pkg", "1.0", "x86", "edge", "main", "hash", 0);
+        assert_eq!(resp["size"], 0);
+    }
+
+    #[test]
+    fn test_build_alpine_upload_response_large_size() {
+        let resp = build_alpine_upload_response("big-pkg", "2.0", "x86_64", "edge", "main", "hash", 1_073_741_824);
+        assert_eq!(resp["size"], 1_073_741_824);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_alpine_path_prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_alpine_path_prefix_basic() {
+        assert_eq!(
+            build_alpine_path_prefix("edge", "main", "x86_64"),
+            "edge/main/x86_64/"
+        );
+    }
+
+    #[test]
+    fn test_build_alpine_path_prefix_versioned() {
+        assert_eq!(
+            build_alpine_path_prefix("v3.18", "community", "aarch64"),
+            "v3.18/community/aarch64/"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_filename_from_content_disposition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_filename_from_cd_basic() {
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename=curl-8.5.0-r0.apk"),
+            Some("curl-8.5.0-r0.apk".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_from_cd_quoted() {
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename=\"my-pkg-1.0.apk\""),
+            Some("my-pkg-1.0.apk".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_from_cd_single_quoted() {
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment; filename='test.apk'"),
+            Some("test.apk".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_from_cd_no_filename() {
+        assert_eq!(
+            extract_filename_from_content_disposition("attachment"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_filename_from_cd_inline() {
+        assert_eq!(
+            extract_filename_from_content_disposition("inline; filename=data.apk"),
+            Some("data.apk".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_apkindex_text with artifacts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_apkindex_text_single_artifact() {
+        let artifacts = vec![AlpineArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "edge/main/x86_64/curl-8.5.0-r0.apk".to_string(),
+            name: "curl".to_string(),
+            version: Some("8.5.0-r0".to_string()),
+            size_bytes: 1234,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "alpine/xxx/edge/main/x86_64/curl-8.5.0-r0.apk".to_string(),
+            metadata: Some(serde_json::json!({
+                "name": "curl",
+                "version": "8.5.0-r0",
+                "description": "URL retrieval utility",
+                "url": "https://curl.se",
+                "license": "MIT",
+                "depends": "libc",
+                "installed_size": 5678
+            })),
+        }];
+        let text = generate_apkindex_text(&artifacts, "x86_64");
+        assert!(text.contains("P:curl"));
+        assert!(text.contains("V:8.5.0-r0"));
+        assert!(text.contains("A:x86_64"));
+        assert!(text.contains("S:1234"));
+        assert!(text.contains("I:5678"));
+        assert!(text.contains("T:URL retrieval utility"));
+        assert!(text.contains("U:https://curl.se"));
+        assert!(text.contains("L:MIT"));
+        assert!(text.contains("D:libc"));
+        assert!(text.contains("C:abc123"));
+    }
+
+    #[test]
+    fn test_generate_apkindex_text_multiple_artifacts() {
+        let artifacts = vec![
+            AlpineArtifact {
+                id: uuid::Uuid::new_v4(),
+                path: "edge/main/x86_64/curl-8.5.0-r0.apk".to_string(),
+                name: "curl".to_string(),
+                version: Some("8.5.0-r0".to_string()),
+                size_bytes: 1234,
+                checksum_sha256: "hash1".to_string(),
+                storage_key: "key1".to_string(),
+                metadata: None,
+            },
+            AlpineArtifact {
+                id: uuid::Uuid::new_v4(),
+                path: "edge/main/x86_64/nginx-1.25.4-r0.apk".to_string(),
+                name: "nginx".to_string(),
+                version: Some("1.25.4-r0".to_string()),
+                size_bytes: 5678,
+                checksum_sha256: "hash2".to_string(),
+                storage_key: "key2".to_string(),
+                metadata: None,
+            },
+        ];
+        let text = generate_apkindex_text(&artifacts, "x86_64");
+        assert!(text.contains("P:curl"));
+        assert!(text.contains("P:nginx"));
+        // Should have two blank-line-terminated entries
+        let entries: Vec<&str> = text.split("\n\n").filter(|s| !s.is_empty()).collect();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_generate_apkindex_text_no_depends() {
+        let artifacts = vec![AlpineArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "edge/main/x86_64/busybox-1.36.apk".to_string(),
+            name: "busybox".to_string(),
+            version: Some("1.36".to_string()),
+            size_bytes: 100,
+            checksum_sha256: "hash".to_string(),
+            storage_key: "key".to_string(),
+            metadata: Some(serde_json::json!({
+                "name": "busybox",
+                "version": "1.36",
+            })),
+        }];
+        let text = generate_apkindex_text(&artifacts, "x86_64");
+        // depends is empty, D: line should NOT be present
+        assert!(!text.contains("D:"));
+        assert!(text.contains("P:busybox"));
+    }
+
+    // -----------------------------------------------------------------------
+    // sha256_hex with different inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_empty() {
+        let hash = sha256_hex(b"");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_sha256_hex_deterministic() {
+        let h1 = sha256_hex(b"alpine package");
+        let h2 = sha256_hex(b"alpine package");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_sha256_hex_different_inputs() {
+        let h1 = sha256_hex(b"data1");
+        let h2 = sha256_hex(b"data2");
+        assert_ne!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_apk_filename edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_apk_filename_leading_digit() {
+        // Package name starts with number but has no hyphen-digit boundary
+        assert_eq!(parse_apk_filename("123pkg.apk"), None);
+    }
+
+    #[test]
+    fn test_parse_apk_filename_just_dash_digit() {
+        let result = parse_apk_filename("a-1.apk");
+        assert_eq!(result, Some(("a".to_string(), "1".to_string())));
+    }
+
+    #[test]
+    fn test_parse_apk_filename_multiple_dashes() {
+        let result = parse_apk_filename("my-cool-app-2.0.0-r0.apk");
+        assert_eq!(
+            result,
+            Some(("my-cool-app".to_string(), "2.0.0-r0".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_apk_filename_no_apk_extension() {
+        assert_eq!(parse_apk_filename("curl-8.5.0-r0.tar.gz"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_basic_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_basic_credentials_valid() {
+        use axum::http::HeaderValue;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
+        );
+        assert_eq!(
+            extract_basic_credentials(&headers),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_missing() {
+        assert!(extract_basic_credentials(&HeaderMap::new()).is_none());
     }
 }

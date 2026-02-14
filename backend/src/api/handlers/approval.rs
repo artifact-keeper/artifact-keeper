@@ -103,6 +103,105 @@ pub struct PendingQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Pure business logic functions (no DB, no async)
+// ---------------------------------------------------------------------------
+
+/// Normalize pagination parameters with defaults and bounds.
+pub(crate) fn normalize_approval_pagination(
+    page: Option<u32>,
+    per_page: Option<u32>,
+) -> (u32, u32, i64) {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page.unwrap_or(20).min(100);
+    let offset = ((page - 1) * per_page) as i64;
+    (page, per_page, offset)
+}
+
+/// Compute total pages from total items and per_page.
+pub(crate) fn compute_approval_total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil() as u32
+}
+
+/// Validate that a status filter is valid for approval queries.
+pub(crate) fn validate_approval_status(status: &str) -> std::result::Result<(), String> {
+    if !["pending", "approved", "rejected"].contains(&status) {
+        return Err(format!(
+            "Invalid status '{}'. Must be one of: pending, approved, rejected",
+            status
+        ));
+    }
+    Ok(())
+}
+
+/// Check if an approval is in a reviewable state (must be "pending").
+pub(crate) fn check_reviewable(current_status: &str) -> std::result::Result<(), String> {
+    if current_status != "pending" {
+        return Err(format!(
+            "Approval request has already been {}",
+            current_status
+        ));
+    }
+    Ok(())
+}
+
+/// Build the policy result JSON from an evaluation result.
+pub(crate) fn build_policy_result_json(
+    passed: bool,
+    action: &str,
+    violations: &[String],
+    cve_summary: &serde_json::Value,
+    license_summary: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "passed": passed,
+        "action": action,
+        "violations": violations,
+        "cve_summary": cve_summary,
+        "license_summary": license_summary,
+    })
+}
+
+/// Build the promotion history metadata JSON for an approved promotion.
+pub(crate) fn build_promotion_history_metadata(approval_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "approved_via": "approval_workflow",
+        "approval_id": approval_id,
+    })
+}
+
+/// Build dynamic WHERE clauses for the approval history query.
+/// Returns (conditions, bind_index_after).
+pub(crate) fn build_history_where_clauses(
+    status: &Option<String>,
+    has_source_repo: bool,
+    start_bind_idx: u32,
+) -> (Vec<String>, u32) {
+    let mut conditions = Vec::new();
+    let mut bind_idx = start_bind_idx;
+
+    if status.is_some() {
+        conditions.push(format!("pa.status = ${}", bind_idx));
+        bind_idx += 1;
+    }
+
+    if has_source_repo {
+        conditions.push(format!("pa.source_repo_id = ${}", bind_idx));
+        bind_idx += 1;
+    }
+
+    (conditions, bind_idx)
+}
+
+/// Combine conditions into a SQL WHERE clause string.
+pub(crate) fn build_where_clause(conditions: &[String]) -> String {
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal row type for SQL mapping
 // ---------------------------------------------------------------------------
 
@@ -1220,5 +1319,278 @@ mod tests {
         assert_eq!(json["pagination"]["per_page"], 25);
         assert_eq!(json["pagination"]["total"], 100);
         assert_eq!(json["pagination"]["total_pages"], 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_approval_pagination
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_approval_pagination_defaults() {
+        let (page, per_page, offset) = normalize_approval_pagination(None, None);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, 20);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_custom() {
+        let (page, per_page, offset) = normalize_approval_pagination(Some(3), Some(50));
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 50);
+        assert_eq!(offset, 100);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_zero_page_clamps() {
+        let (page, _, offset) = normalize_approval_pagination(Some(0), None);
+        assert_eq!(page, 1);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_per_page_capped() {
+        let (_, per_page, _) = normalize_approval_pagination(None, Some(200));
+        assert_eq!(per_page, 100);
+    }
+
+    #[test]
+    fn test_normalize_approval_pagination_offset_computation() {
+        let (_, _, offset) = normalize_approval_pagination(Some(5), Some(10));
+        assert_eq!(offset, 40);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_approval_total_pages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_approval_total_pages_exact() {
+        assert_eq!(compute_approval_total_pages(100, 20), 5);
+    }
+
+    #[test]
+    fn test_compute_approval_total_pages_remainder() {
+        assert_eq!(compute_approval_total_pages(101, 20), 6);
+    }
+
+    #[test]
+    fn test_compute_approval_total_pages_zero() {
+        assert_eq!(compute_approval_total_pages(0, 20), 0);
+    }
+
+    #[test]
+    fn test_compute_approval_total_pages_one_item() {
+        assert_eq!(compute_approval_total_pages(1, 100), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_approval_status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_approval_status_pending() {
+        assert!(validate_approval_status("pending").is_ok());
+    }
+
+    #[test]
+    fn test_validate_approval_status_approved() {
+        assert!(validate_approval_status("approved").is_ok());
+    }
+
+    #[test]
+    fn test_validate_approval_status_rejected() {
+        assert!(validate_approval_status("rejected").is_ok());
+    }
+
+    #[test]
+    fn test_validate_approval_status_invalid() {
+        assert!(validate_approval_status("unknown").is_err());
+        assert!(validate_approval_status("").is_err());
+        assert!(validate_approval_status("PENDING").is_err());
+    }
+
+    #[test]
+    fn test_validate_approval_status_error_contains_value() {
+        let err = validate_approval_status("bad").unwrap_err();
+        assert!(err.contains("bad"));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_reviewable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_check_reviewable_pending() {
+        assert!(check_reviewable("pending").is_ok());
+    }
+
+    #[test]
+    fn test_check_reviewable_approved() {
+        let err = check_reviewable("approved").unwrap_err();
+        assert!(err.contains("approved"));
+    }
+
+    #[test]
+    fn test_check_reviewable_rejected() {
+        let err = check_reviewable("rejected").unwrap_err();
+        assert!(err.contains("rejected"));
+    }
+
+    #[test]
+    fn test_check_reviewable_unknown_status() {
+        assert!(check_reviewable("unknown").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_policy_result_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_policy_result_json_passed() {
+        let json = build_policy_result_json(
+            true,
+            "allow",
+            &[],
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        );
+        assert_eq!(json["passed"], true);
+        assert_eq!(json["action"], "allow");
+        assert!(json["violations"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_policy_result_json_failed() {
+        let violations = vec!["CVE-2024-1234: critical".to_string()];
+        let json = build_policy_result_json(
+            false,
+            "block",
+            &violations,
+            &serde_json::json!({"total": 1, "critical": 1}),
+            &serde_json::json!({"allowed": ["MIT"]}),
+        );
+        assert_eq!(json["passed"], false);
+        assert_eq!(json["action"], "block");
+        assert_eq!(json["violations"].as_array().unwrap().len(), 1);
+        assert_eq!(json["cve_summary"]["critical"], 1);
+    }
+
+    #[test]
+    fn test_build_policy_result_json_all_fields_present() {
+        let json = build_policy_result_json(
+            true, "warn", &[], &serde_json::json!(null), &serde_json::json!(null),
+        );
+        assert!(json.get("passed").is_some());
+        assert!(json.get("action").is_some());
+        assert!(json.get("violations").is_some());
+        assert!(json.get("cve_summary").is_some());
+        assert!(json.get("license_summary").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_promotion_history_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_promotion_history_metadata() {
+        let json = build_promotion_history_metadata("abc-123");
+        assert_eq!(json["approved_via"], "approval_workflow");
+        assert_eq!(json["approval_id"], "abc-123");
+    }
+
+    #[test]
+    fn test_build_promotion_history_metadata_uuid() {
+        let id = Uuid::new_v4().to_string();
+        let json = build_promotion_history_metadata(&id);
+        assert_eq!(json["approval_id"].as_str().unwrap(), id);
+    }
+
+    #[test]
+    fn test_build_promotion_history_metadata_has_both_fields() {
+        let json = build_promotion_history_metadata("x");
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_history_where_clauses
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_history_where_clauses_none() {
+        let (conditions, bind_idx) = build_history_where_clauses(&None, false, 1);
+        assert!(conditions.is_empty());
+        assert_eq!(bind_idx, 1);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_status_only() {
+        let (conditions, bind_idx) =
+            build_history_where_clauses(&Some("approved".to_string()), false, 1);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0], "pa.status = $1");
+        assert_eq!(bind_idx, 2);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_repo_only() {
+        let (conditions, bind_idx) = build_history_where_clauses(&None, true, 1);
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0], "pa.source_repo_id = $1");
+        assert_eq!(bind_idx, 2);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_both() {
+        let (conditions, bind_idx) =
+            build_history_where_clauses(&Some("pending".to_string()), true, 1);
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0], "pa.status = $1");
+        assert_eq!(conditions[1], "pa.source_repo_id = $2");
+        assert_eq!(bind_idx, 3);
+    }
+
+    #[test]
+    fn test_build_history_where_clauses_custom_start_idx() {
+        let (conditions, bind_idx) =
+            build_history_where_clauses(&Some("rejected".to_string()), true, 5);
+        assert_eq!(conditions[0], "pa.status = $5");
+        assert_eq!(conditions[1], "pa.source_repo_id = $6");
+        assert_eq!(bind_idx, 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_where_clause
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_where_clause_empty() {
+        assert_eq!(build_where_clause(&[]), "");
+    }
+
+    #[test]
+    fn test_build_where_clause_single() {
+        let conditions = vec!["pa.status = $1".to_string()];
+        assert_eq!(build_where_clause(&conditions), " WHERE pa.status = $1");
+    }
+
+    #[test]
+    fn test_build_where_clause_multiple() {
+        let conditions = vec![
+            "pa.status = $1".to_string(),
+            "pa.source_repo_id = $2".to_string(),
+        ];
+        assert_eq!(
+            build_where_clause(&conditions),
+            " WHERE pa.status = $1 AND pa.source_repo_id = $2"
+        );
+    }
+
+    #[test]
+    fn test_build_where_clause_starts_with_space() {
+        let conditions = vec!["x = 1".to_string()];
+        let clause = build_where_clause(&conditions);
+        assert!(clause.starts_with(" WHERE"));
     }
 }
