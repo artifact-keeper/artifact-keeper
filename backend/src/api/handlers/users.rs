@@ -50,7 +50,7 @@ pub struct CreateUserRequest {
 }
 
 /// Generate a secure random password
-fn generate_password() -> String {
+pub(crate) fn generate_password() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*";
     let mut rng = rand::rng();
@@ -96,7 +96,7 @@ pub struct UserListResponse {
     pub pagination: Pagination,
 }
 
-fn user_to_response(user: User) -> UserResponse {
+pub(crate) fn user_to_response(user: User) -> UserResponse {
     UserResponse {
         id: user.id,
         username: user.username,
@@ -918,3 +918,487 @@ pub async fn reset_password(
     ))
 )]
 pub struct UsersApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    // -----------------------------------------------------------------------
+    // generate_password
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_password_length() {
+        let pwd = generate_password();
+        assert_eq!(pwd.len(), 16);
+    }
+
+    #[test]
+    fn test_generate_password_unique() {
+        let p1 = generate_password();
+        let p2 = generate_password();
+        // Two random passwords should differ (astronomically unlikely to collide)
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn test_generate_password_valid_charset() {
+        let charset = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*";
+        for _ in 0..20 {
+            let pwd = generate_password();
+            for ch in pwd.chars() {
+                assert!(
+                    charset.contains(ch),
+                    "Character '{}' not in allowed charset",
+                    ch
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_password_excludes_ambiguous_chars() {
+        // Charset excludes 0, 1, O, l, I to avoid ambiguity
+        for _ in 0..50 {
+            let pwd = generate_password();
+            assert!(!pwd.contains('0'), "Should not contain '0'");
+            assert!(!pwd.contains('1'), "Should not contain '1'");
+            assert!(!pwd.contains('O'), "Should not contain 'O'");
+            assert!(!pwd.contains('l'), "Should not contain 'l'");
+            assert!(!pwd.contains('I'), "Should not contain 'I'");
+            assert!(!pwd.contains('i'), "Should not contain 'i'");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // user_to_response
+    // -----------------------------------------------------------------------
+
+    fn make_test_user() -> User {
+        let now = Utc::now();
+        User {
+            id: Uuid::new_v4(),
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed".to_string()),
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: Some("Test User".to_string()),
+            is_active: true,
+            is_admin: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            last_login_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn test_user_to_response_basic_fields() {
+        let user = make_test_user();
+        let uid = user.id;
+        let resp = user_to_response(user);
+        assert_eq!(resp.id, uid);
+        assert_eq!(resp.username, "testuser");
+        assert_eq!(resp.email, "test@example.com");
+        assert_eq!(resp.display_name, Some("Test User".to_string()));
+        assert!(!resp.is_admin);
+        assert!(resp.is_active);
+        assert!(!resp.must_change_password);
+    }
+
+    #[test]
+    fn test_user_to_response_auth_provider_local() {
+        let user = make_test_user();
+        let resp = user_to_response(user);
+        assert_eq!(resp.auth_provider, "local");
+    }
+
+    #[test]
+    fn test_user_to_response_auth_provider_ldap() {
+        let mut user = make_test_user();
+        user.auth_provider = AuthProvider::Ldap;
+        let resp = user_to_response(user);
+        assert_eq!(resp.auth_provider, "ldap");
+    }
+
+    #[test]
+    fn test_user_to_response_auth_provider_saml() {
+        let mut user = make_test_user();
+        user.auth_provider = AuthProvider::Saml;
+        let resp = user_to_response(user);
+        assert_eq!(resp.auth_provider, "saml");
+    }
+
+    #[test]
+    fn test_user_to_response_auth_provider_oidc() {
+        let mut user = make_test_user();
+        user.auth_provider = AuthProvider::Oidc;
+        let resp = user_to_response(user);
+        assert_eq!(resp.auth_provider, "oidc");
+    }
+
+    #[test]
+    fn test_user_to_response_last_login_at() {
+        let user = make_test_user();
+        assert!(user_to_response(user).last_login_at.is_some());
+    }
+
+    #[test]
+    fn test_user_to_response_no_last_login() {
+        let mut user = make_test_user();
+        user.last_login_at = None;
+        assert!(user_to_response(user).last_login_at.is_none());
+    }
+
+    #[test]
+    fn test_user_to_response_display_name_none() {
+        let mut user = make_test_user();
+        user.display_name = None;
+        let resp = user_to_response(user);
+        assert!(resp.display_name.is_none());
+    }
+
+    #[test]
+    fn test_user_to_response_admin_user() {
+        let mut user = make_test_user();
+        user.is_admin = true;
+        let resp = user_to_response(user);
+        assert!(resp.is_admin);
+    }
+
+    #[test]
+    fn test_user_to_response_inactive_user() {
+        let mut user = make_test_user();
+        user.is_active = false;
+        let resp = user_to_response(user);
+        assert!(!resp.is_active);
+    }
+
+    #[test]
+    fn test_user_to_response_must_change_password() {
+        let mut user = make_test_user();
+        user.must_change_password = true;
+        let resp = user_to_response(user);
+        assert!(resp.must_change_password);
+    }
+
+    // -----------------------------------------------------------------------
+    // Request/Response serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_user_request_deserialize_full() {
+        let json = r#"{"username":"alice","email":"alice@example.com","password":"secret123","display_name":"Alice","is_admin":true}"#;
+        let req: CreateUserRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "alice");
+        assert_eq!(req.email, "alice@example.com");
+        assert_eq!(req.password.as_deref(), Some("secret123"));
+        assert_eq!(req.display_name.as_deref(), Some("Alice"));
+        assert_eq!(req.is_admin, Some(true));
+    }
+
+    #[test]
+    fn test_create_user_request_deserialize_minimal() {
+        let json = r#"{"username":"bob","email":"bob@example.com"}"#;
+        let req: CreateUserRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "bob");
+        assert!(req.password.is_none());
+        assert!(req.display_name.is_none());
+        assert!(req.is_admin.is_none());
+    }
+
+    #[test]
+    fn test_update_user_request_deserialize() {
+        let json = r#"{"email":"new@example.com","is_active":false}"#;
+        let req: UpdateUserRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.email.as_deref(), Some("new@example.com"));
+        assert!(req.display_name.is_none());
+        assert_eq!(req.is_active, Some(false));
+        assert!(req.is_admin.is_none());
+    }
+
+    #[test]
+    fn test_update_user_request_all_none() {
+        let json = r#"{}"#;
+        let req: UpdateUserRequest = serde_json::from_str(json).unwrap();
+        assert!(req.email.is_none());
+        assert!(req.display_name.is_none());
+        assert!(req.is_active.is_none());
+        assert!(req.is_admin.is_none());
+    }
+
+    #[test]
+    fn test_user_response_serialize() {
+        let now = Utc::now();
+        let resp = UserResponse {
+            id: Uuid::nil(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            display_name: None,
+            auth_provider: "local".to_string(),
+            is_active: true,
+            is_admin: true,
+            must_change_password: false,
+            last_login_at: None,
+            created_at: now,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["username"], "admin");
+        assert_eq!(json["is_admin"], true);
+        assert_eq!(json["auth_provider"], "local");
+        assert!(json["last_login_at"].is_null());
+    }
+
+    #[test]
+    fn test_create_user_response_serialize_with_generated_password() {
+        let now = Utc::now();
+        let resp = CreateUserResponse {
+            user: UserResponse {
+                id: Uuid::nil(),
+                username: "new_user".to_string(),
+                email: "new@example.com".to_string(),
+                display_name: None,
+                auth_provider: "local".to_string(),
+                is_active: true,
+                is_admin: false,
+                must_change_password: true,
+                last_login_at: None,
+                created_at: now,
+            },
+            generated_password: Some("temp_pass_123!".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["generated_password"], "temp_pass_123!");
+        assert_eq!(json["user"]["must_change_password"], true);
+    }
+
+    #[test]
+    fn test_create_user_response_serialize_without_generated_password() {
+        let now = Utc::now();
+        let resp = CreateUserResponse {
+            user: UserResponse {
+                id: Uuid::nil(),
+                username: "user".to_string(),
+                email: "user@example.com".to_string(),
+                display_name: None,
+                auth_provider: "local".to_string(),
+                is_active: true,
+                is_admin: false,
+                must_change_password: false,
+                last_login_at: None,
+                created_at: now,
+            },
+            generated_password: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["generated_password"].is_null());
+    }
+
+    #[test]
+    fn test_user_list_response_serialize() {
+        let resp = UserListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 0,
+                total_pages: 0,
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+        assert_eq!(json["pagination"]["page"], 1);
+        assert_eq!(json["pagination"]["per_page"], 20);
+    }
+
+    #[test]
+    fn test_list_users_query_deserialize() {
+        let json = r#"{"search":"admin","is_active":true,"is_admin":true,"page":2,"per_page":50}"#;
+        let q: ListUsersQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.search.as_deref(), Some("admin"));
+        assert_eq!(q.is_active, Some(true));
+        assert_eq!(q.is_admin, Some(true));
+        assert_eq!(q.page, Some(2));
+        assert_eq!(q.per_page, Some(50));
+    }
+
+    #[test]
+    fn test_change_password_request_deserialize() {
+        let json = r#"{"current_password":"old","new_password":"newpassword123"}"#;
+        let req: ChangePasswordRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.current_password.as_deref(), Some("old"));
+        assert_eq!(req.new_password, "newpassword123");
+    }
+
+    #[test]
+    fn test_change_password_request_no_current() {
+        let json = r#"{"new_password":"newpassword123"}"#;
+        let req: ChangePasswordRequest = serde_json::from_str(json).unwrap();
+        assert!(req.current_password.is_none());
+    }
+
+    #[test]
+    fn test_role_response_serialize() {
+        let resp = RoleResponse {
+            id: Uuid::nil(),
+            name: "admin".to_string(),
+            description: Some("Administrator role".to_string()),
+            permissions: vec!["read".to_string(), "write".to_string()],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["name"], "admin");
+        assert_eq!(json["permissions"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_assign_role_request_deserialize() {
+        let uid = Uuid::new_v4();
+        let json = format!(r#"{{"role_id":"{}"}}"#, uid);
+        let req: AssignRoleRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.role_id, uid);
+    }
+
+    #[test]
+    fn test_create_api_token_request_deserialize() {
+        let json = r#"{"name":"CI token","scopes":["read","deploy"],"expires_in_days":90}"#;
+        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "CI token");
+        assert_eq!(req.scopes, vec!["read", "deploy"]);
+        assert_eq!(req.expires_in_days, Some(90));
+    }
+
+    #[test]
+    fn test_create_api_token_request_no_expiry() {
+        let json = r#"{"name":"permanent","scopes":["*"]}"#;
+        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        assert!(req.expires_in_days.is_none());
+    }
+
+    #[test]
+    fn test_api_token_response_serialize() {
+        let now = Utc::now();
+        let resp = ApiTokenResponse {
+            id: Uuid::nil(),
+            name: "test_token".to_string(),
+            token_prefix: "ak_".to_string(),
+            scopes: vec!["read".to_string()],
+            expires_at: Some(now),
+            last_used_at: None,
+            created_at: now,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["name"], "test_token");
+        assert_eq!(json["token_prefix"], "ak_");
+        assert!(json["last_used_at"].is_null());
+    }
+
+    #[test]
+    fn test_api_token_created_response_serialize() {
+        let resp = ApiTokenCreatedResponse {
+            id: Uuid::nil(),
+            name: "deploy".to_string(),
+            token: "ak_secret_token_value".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["token"], "ak_secret_token_value");
+    }
+
+    #[test]
+    fn test_reset_password_response_serialize() {
+        let resp = ResetPasswordResponse {
+            temporary_password: "TempP@ss123!".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["temporary_password"], "TempP@ss123!");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pagination logic (from list_users handler)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pagination_total_pages_calculation() {
+        // Simulating the logic: total_pages = ceil(total / per_page)
+        let total: i64 = 45;
+        let per_page: u32 = 20;
+        let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+        assert_eq!(total_pages, 3);
+    }
+
+    #[test]
+    fn test_pagination_total_pages_exact_division() {
+        let total: i64 = 40;
+        let per_page: u32 = 20;
+        let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+        assert_eq!(total_pages, 2);
+    }
+
+    #[test]
+    fn test_pagination_total_pages_zero_total() {
+        let total: i64 = 0;
+        let per_page: u32 = 20;
+        let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+        assert_eq!(total_pages, 0);
+    }
+
+    #[test]
+    fn test_pagination_total_pages_single_item() {
+        let total: i64 = 1;
+        let per_page: u32 = 20;
+        let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+        assert_eq!(total_pages, 1);
+    }
+
+    #[test]
+    fn test_page_defaults_and_clamping() {
+        // Simulating the logic from list_users
+        let page_none: Option<u32> = None;
+        let page = page_none.unwrap_or(1).max(1);
+        assert_eq!(page, 1);
+
+        let page_zero: Option<u32> = Some(0);
+        let page = page_zero.unwrap_or(1).max(1);
+        assert_eq!(page, 1);
+
+        let page_five: Option<u32> = Some(5);
+        let page = page_five.unwrap_or(1).max(1);
+        assert_eq!(page, 5);
+    }
+
+    #[test]
+    fn test_per_page_defaults_and_clamping() {
+        let pp_none: Option<u32> = None;
+        let per_page = pp_none.unwrap_or(20).min(100);
+        assert_eq!(per_page, 20);
+
+        let pp_200: Option<u32> = Some(200);
+        let per_page = pp_200.unwrap_or(20).min(100);
+        assert_eq!(per_page, 100);
+
+        let pp_50: Option<u32> = Some(50);
+        let per_page = pp_50.unwrap_or(20).min(100);
+        assert_eq!(per_page, 50);
+    }
+
+    #[test]
+    fn test_offset_calculation() {
+        let page: u32 = 3;
+        let per_page: u32 = 20;
+        let offset = ((page - 1) * per_page) as i64;
+        assert_eq!(offset, 40);
+    }
+
+    #[test]
+    fn test_offset_first_page() {
+        let page: u32 = 1;
+        let per_page: u32 = 20;
+        let offset = ((page - 1) * per_page) as i64;
+        assert_eq!(offset, 0);
+    }
+}

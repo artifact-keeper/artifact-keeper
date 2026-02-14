@@ -876,8 +876,8 @@ mod tests {
 
     #[test]
     fn test_artifact_info_from_artifact_all_fields() {
-        use crate::services::plugin_service::ArtifactInfo;
         use crate::models::artifact::Artifact;
+        use crate::services::plugin_service::ArtifactInfo;
         use chrono::Utc;
 
         let user_id = Uuid::new_v4();
@@ -913,8 +913,8 @@ mod tests {
 
     #[test]
     fn test_artifact_info_from_artifact_no_version_no_uploader() {
-        use crate::services::plugin_service::ArtifactInfo;
         use crate::models::artifact::Artifact;
+        use crate::services::plugin_service::ArtifactInfo;
         use chrono::Utc;
 
         let artifact = Artifact {

@@ -407,11 +407,7 @@ pub(crate) fn risk_level_from_score(score: f64) -> &'static str {
 pub(crate) fn filter_unsuppressed_findings(findings: &[DtFinding]) -> Vec<&DtFinding> {
     findings
         .iter()
-        .filter(|f| {
-            f.analysis
-                .as_ref()
-                .map_or(true, |a| !a.is_suppressed)
-        })
+        .filter(|f| f.analysis.as_ref().map_or(true, |a| !a.is_suppressed))
         .collect()
 }
 
@@ -1175,10 +1171,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_vulnerabilities_unknown_severity() {
-        let findings = vec![
-            make_finding("UNKNOWN", false),
-            make_finding("", false),
-        ];
+        let findings = vec![make_finding("UNKNOWN", false), make_finding("", false)];
         let agg = aggregate_vulnerabilities(&findings);
         assert_eq!(agg.unassigned, 2);
         assert_eq!(agg.total, 2);
@@ -1201,10 +1194,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_vulnerabilities_includes_suppressed() {
-        let findings = vec![
-            make_finding("CRITICAL", true),
-            make_finding("HIGH", false),
-        ];
+        let findings = vec![make_finding("CRITICAL", true), make_finding("HIGH", false)];
         let agg = aggregate_vulnerabilities(&findings);
         assert_eq!(agg.total, 2);
         assert_eq!(agg.critical, 1);
@@ -1292,20 +1282,14 @@ mod tests {
 
     #[test]
     fn test_filter_unsuppressed_all_active() {
-        let findings = vec![
-            make_finding("HIGH", false),
-            make_finding("MEDIUM", false),
-        ];
+        let findings = vec![make_finding("HIGH", false), make_finding("MEDIUM", false)];
         let result = filter_unsuppressed_findings(&findings);
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_filter_unsuppressed_all_suppressed() {
-        let findings = vec![
-            make_finding("HIGH", true),
-            make_finding("CRITICAL", true),
-        ];
+        let findings = vec![make_finding("HIGH", true), make_finding("CRITICAL", true)];
         let result = filter_unsuppressed_findings(&findings);
         assert!(result.is_empty());
     }

@@ -727,10 +727,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("dev".to_string(), "pw".to_string()))
-        );
+        assert_eq!(result, Some(("dev".to_string(), "pw".to_string())));
     }
 
     #[test]

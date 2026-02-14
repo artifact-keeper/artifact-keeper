@@ -363,11 +363,9 @@ pub(crate) fn evaluate_gate_thresholds(
     ) {
         violations.push(v);
     }
-    if let Some(v) = check_min_threshold(
-        "min_quality_score",
-        quality_score.unwrap_or(0),
-        min_quality,
-    ) {
+    if let Some(v) =
+        check_min_threshold("min_quality_score", quality_score.unwrap_or(0), min_quality)
+    {
         violations.push(v);
     }
     if let Some(v) = check_min_threshold(
@@ -395,10 +393,7 @@ pub(crate) fn compute_total_pages(total: i64, per_page: u32) -> u32 {
 }
 
 /// Normalize pagination parameters with defaults and clamping.
-pub(crate) fn normalize_pagination(
-    page: Option<u32>,
-    per_page: Option<u32>,
-) -> (u32, u32) {
+pub(crate) fn normalize_pagination(page: Option<u32>, per_page: Option<u32>) -> (u32, u32) {
     let page = page.unwrap_or(1).max(1);
     let per_page = per_page.unwrap_or(20).min(100);
     (page, per_page)
@@ -1583,10 +1578,20 @@ mod tests {
     #[test]
     fn test_evaluate_gate_thresholds_all_pass() {
         let violations = evaluate_gate_thresholds(
-            90, Some(95), Some(85), Some(80),
-            0, 2, 5,
-            Some(80), Some(90), Some(70), Some(60),
-            Some(0), Some(5), Some(10),
+            90,
+            Some(95),
+            Some(85),
+            Some(80),
+            0,
+            2,
+            5,
+            Some(80),
+            Some(90),
+            Some(70),
+            Some(60),
+            Some(0),
+            Some(5),
+            Some(10),
         );
         assert!(violations.is_empty());
     }
@@ -1594,8 +1599,20 @@ mod tests {
     #[test]
     fn test_evaluate_gate_thresholds_health_fails() {
         let violations = evaluate_gate_thresholds(
-            65, None, None, None, 0, 0, 0,
-            Some(80), None, None, None, None, None, None,
+            65,
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            Some(80),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule, "min_health_score");
@@ -1604,10 +1621,20 @@ mod tests {
     #[test]
     fn test_evaluate_gate_thresholds_multiple_failures() {
         let violations = evaluate_gate_thresholds(
-            50, Some(40), Some(30), Some(20),
-            5, 10, 20,
-            Some(80), Some(90), Some(70), Some(60),
-            Some(0), Some(5), Some(10),
+            50,
+            Some(40),
+            Some(30),
+            Some(20),
+            5,
+            10,
+            20,
+            Some(80),
+            Some(90),
+            Some(70),
+            Some(60),
+            Some(0),
+            Some(5),
+            Some(10),
         );
         assert_eq!(violations.len(), 7);
     }
@@ -1615,8 +1642,20 @@ mod tests {
     #[test]
     fn test_evaluate_gate_thresholds_no_thresholds() {
         let violations = evaluate_gate_thresholds(
-            10, Some(10), Some(10), Some(10), 100, 100, 100,
-            None, None, None, None, None, None, None,
+            10,
+            Some(10),
+            Some(10),
+            Some(10),
+            100,
+            100,
+            100,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         assert!(violations.is_empty());
     }
@@ -1624,8 +1663,20 @@ mod tests {
     #[test]
     fn test_evaluate_gate_thresholds_issue_counts_only() {
         let violations = evaluate_gate_thresholds(
-            100, None, None, None, 5, 10, 20,
-            None, None, None, None, Some(0), Some(5), Some(10),
+            100,
+            None,
+            None,
+            None,
+            5,
+            10,
+            20,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            Some(5),
+            Some(10),
         );
         assert_eq!(violations.len(), 3);
     }

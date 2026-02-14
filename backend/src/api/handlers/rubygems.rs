@@ -862,10 +862,7 @@ mod tests {
             HeaderValue::from_static("bearer my-token"),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "my-token".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "my-token".to_string())));
     }
 
     #[test]
@@ -880,8 +877,7 @@ mod tests {
 
     #[test]
     fn test_extract_credentials_basic_lowercase() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -970,8 +966,7 @@ mod tests {
 
     #[test]
     fn test_dependency_query_with_gems() {
-        let q: DependencyQuery =
-            serde_json::from_str(r#"{"gems":"rails,sinatra,rack"}"#).unwrap();
+        let q: DependencyQuery = serde_json::from_str(r#"{"gems":"rails,sinatra,rack"}"#).unwrap();
         assert_eq!(q.gems, Some("rails,sinatra,rack".to_string()));
     }
 
@@ -1042,10 +1037,7 @@ mod tests {
         let gem_version = "3.0.0";
         let filename = format!("{}-{}.gem", gem_name, gem_version);
         let storage_key = format!("rubygems/{}/{}/{}", gem_name, gem_version, filename);
-        assert_eq!(
-            storage_key,
-            "rubygems/sinatra/3.0.0/sinatra-3.0.0.gem"
-        );
+        assert_eq!(storage_key, "rubygems/sinatra/3.0.0/sinatra-3.0.0.gem");
     }
 
     // -----------------------------------------------------------------------
@@ -1063,10 +1055,7 @@ mod tests {
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");
-        assert_eq!(
-            info.upstream_url,
-            Some("https://rubygems.org".to_string())
-        );
+        assert_eq!(info.upstream_url, Some("https://rubygems.org".to_string()));
     }
 
     // -----------------------------------------------------------------------

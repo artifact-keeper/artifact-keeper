@@ -1156,17 +1156,26 @@ mod tests {
 
     #[test]
     fn test_parse_type_format_handler() {
-        assert_eq!(parse_type("format_handler"), Some(PluginType::FormatHandler));
+        assert_eq!(
+            parse_type("format_handler"),
+            Some(PluginType::FormatHandler)
+        );
     }
 
     #[test]
     fn test_parse_type_storage_backend() {
-        assert_eq!(parse_type("storage_backend"), Some(PluginType::StorageBackend));
+        assert_eq!(
+            parse_type("storage_backend"),
+            Some(PluginType::StorageBackend)
+        );
     }
 
     #[test]
     fn test_parse_type_authentication() {
-        assert_eq!(parse_type("authentication"), Some(PluginType::Authentication));
+        assert_eq!(
+            parse_type("authentication"),
+            Some(PluginType::Authentication)
+        );
     }
 
     #[test]
@@ -1186,8 +1195,14 @@ mod tests {
 
     #[test]
     fn test_parse_type_case_insensitive() {
-        assert_eq!(parse_type("FORMAT_HANDLER"), Some(PluginType::FormatHandler));
-        assert_eq!(parse_type("Storage_Backend"), Some(PluginType::StorageBackend));
+        assert_eq!(
+            parse_type("FORMAT_HANDLER"),
+            Some(PluginType::FormatHandler)
+        );
+        assert_eq!(
+            parse_type("Storage_Backend"),
+            Some(PluginType::StorageBackend)
+        );
         assert_eq!(parse_type("WEBHOOK"), Some(PluginType::Webhook));
     }
 
@@ -1296,10 +1311,8 @@ mod tests {
 
     #[test]
     fn test_list_plugins_query_deserialize_with_values() {
-        let q: ListPluginsQuery = serde_json::from_str(
-            r#"{"status": "active", "type": "webhook"}"#,
-        )
-        .unwrap();
+        let q: ListPluginsQuery =
+            serde_json::from_str(r#"{"status": "active", "type": "webhook"}"#).unwrap();
         assert_eq!(q.status.as_deref(), Some("active"));
         assert_eq!(q.plugin_type.as_deref(), Some("webhook"));
     }

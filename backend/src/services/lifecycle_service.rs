@@ -869,7 +869,9 @@ mod tests {
     async fn test_validate_no_downloads_days_valid() {
         let svc = make_service_for_validation();
         let config = json!({"days": 90});
-        assert!(svc.validate_policy_config("no_downloads_days", &config).is_ok());
+        assert!(svc
+            .validate_policy_config("no_downloads_days", &config)
+            .is_ok());
     }
 
     #[tokio::test]
@@ -896,14 +898,18 @@ mod tests {
     async fn test_validate_tag_pattern_keep_valid() {
         let svc = make_service_for_validation();
         let config = json!({"pattern": "^release-.*"});
-        assert!(svc.validate_policy_config("tag_pattern_keep", &config).is_ok());
+        assert!(svc
+            .validate_policy_config("tag_pattern_keep", &config)
+            .is_ok());
     }
 
     #[tokio::test]
     async fn test_validate_tag_pattern_delete_valid() {
         let svc = make_service_for_validation();
         let config = json!({"pattern": ".*-snapshot$"});
-        assert!(svc.validate_policy_config("tag_pattern_delete", &config).is_ok());
+        assert!(svc
+            .validate_policy_config("tag_pattern_delete", &config)
+            .is_ok());
     }
 
     #[tokio::test]
@@ -938,7 +944,9 @@ mod tests {
     async fn test_validate_size_quota_bytes_valid() {
         let svc = make_service_for_validation();
         let config = json!({"quota_bytes": 1073741824}); // 1 GiB
-        assert!(svc.validate_policy_config("size_quota_bytes", &config).is_ok());
+        assert!(svc
+            .validate_policy_config("size_quota_bytes", &config)
+            .is_ok());
     }
 
     #[tokio::test]

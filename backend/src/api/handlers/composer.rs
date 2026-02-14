@@ -963,16 +963,12 @@ mod tests {
     fn test_extract_basic_credentials_valid() {
         let headers = make_basic_header("composer", "secret");
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("composer".to_string(), "secret".to_string()))
-        );
+        assert_eq!(result, Some(("composer".to_string(), "secret".to_string())));
     }
 
     #[test]
     fn test_extract_basic_credentials_lowercase() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -1015,10 +1011,7 @@ mod tests {
         };
         assert_eq!(info.id, id);
         assert_eq!(info.repo_type, "hosted");
-        assert_eq!(
-            info.upstream_url,
-            Some("https://packagist.org".to_string())
-        );
+        assert_eq!(info.upstream_url, Some("https://packagist.org".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -1036,10 +1029,9 @@ mod tests {
 
     #[test]
     fn test_search_query_with_type() {
-        let q: SearchQuery = serde_json::from_str(
-            r#"{"q":"monolog","type":"library","per_page":30,"page":2}"#,
-        )
-        .unwrap();
+        let q: SearchQuery =
+            serde_json::from_str(r#"{"q":"monolog","type":"library","per_page":30,"page":2}"#)
+                .unwrap();
         assert_eq!(q.q, Some("monolog".to_string()));
         assert_eq!(q.package_type, Some("library".to_string()));
         assert_eq!(q.per_page, Some(30));
@@ -1185,10 +1177,7 @@ mod tests {
     fn test_metadata_url_pattern() {
         let repo_key = "composer-hosted";
         let metadata_url = format!("/composer/{}/p2/%package%.json", repo_key);
-        assert_eq!(
-            metadata_url,
-            "/composer/composer-hosted/p2/%package%.json"
-        );
+        assert_eq!(metadata_url, "/composer/composer-hosted/p2/%package%.json");
     }
 
     // -----------------------------------------------------------------------

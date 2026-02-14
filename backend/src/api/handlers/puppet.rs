@@ -806,7 +806,10 @@ mod tests {
     #[test]
     fn test_extract_credentials_basic() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNz"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
         let result = extract_credentials(&headers);
         assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
     }

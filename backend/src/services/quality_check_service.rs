@@ -1120,12 +1120,203 @@ fn check_max_issues(
     }
 }
 
+/// Count severity occurrences from a list of quality check issues.
+/// Returns (critical, high, medium, low, info) counts.
+///
+/// The matching is case-insensitive (using `to_lowercase()`). Any severity
+/// string that doesn't match critical/high/medium/low is counted as info.
+pub(crate) fn count_issue_severities(
+    issues: &[crate::models::quality::RawQualityIssue],
+) -> (i32, i32, i32, i32, i32) {
+    let mut critical: i32 = 0;
+    let mut high: i32 = 0;
+    let mut medium: i32 = 0;
+    let mut low: i32 = 0;
+    let mut info: i32 = 0;
+    for issue in issues {
+        match issue.severity.to_lowercase().as_str() {
+            "critical" => critical += 1,
+            "high" => high += 1,
+            "medium" => medium += 1,
+            "low" => low += 1,
+            _ => info += 1,
+        }
+    }
+    (critical, high, medium, low, info)
+}
+
+/// Compute the average quality score from a set of check score rows,
+/// excluding the "metadata_completeness" check (which has its own component).
+/// Returns `None` if there are no non-metadata checks with scores.
+pub(crate) fn compute_quality_score(rows: &[CheckScoreRow]) -> Option<i32> {
+    let scores: Vec<i32> = rows
+        .iter()
+        .filter(|r| r.check_type != "metadata_completeness")
+        .filter_map(|r| r.score)
+        .collect();
+    if scores.is_empty() {
+        None
+    } else {
+        Some(scores.iter().sum::<i32>() / scores.len() as i32)
+    }
+}
+
+/// Extract the metadata score from a set of check score rows.
+pub(crate) fn extract_metadata_score(rows: &[CheckScoreRow]) -> Option<i32> {
+    rows.iter()
+        .find(|r| r.check_type == "metadata_completeness")
+        .and_then(|r| r.score)
+}
+
+/// Aggregate total issues, critical issues, and checks passed from check score rows.
+/// Returns (total_issues, critical_issues, checks_passed, checks_total).
+pub(crate) fn aggregate_check_stats(rows: &[CheckScoreRow]) -> (i32, i32, i32, i32) {
+    let mut total_issues: i32 = 0;
+    let mut critical_issues: i32 = 0;
+    let mut checks_passed: i32 = 0;
+    let checks_total = rows.len() as i32;
+    for row in rows {
+        total_issues += row.critical_count + row.high_count + row.medium_count + row.low_count;
+        critical_issues += row.critical_count;
+        if row.passed.unwrap_or(false) {
+            checks_passed += 1;
+        }
+    }
+    (total_issues, critical_issues, checks_passed, checks_total)
+}
+
+/// Push a violation if `actual` exceeds `threshold`.
+pub(crate) fn evaluate_gate_thresholds(
+    violations: &mut Vec<QualityGateViolation>,
+    health: &ArtifactHealthScore,
+    gate: &QualityGate,
+) {
+    check_min_score(
+        violations,
+        "min_health_score",
+        "Health",
+        gate.min_health_score,
+        health.health_score,
+    );
+    check_min_score(
+        violations,
+        "min_security_score",
+        "Security",
+        gate.min_security_score,
+        health.security_score.unwrap_or(0),
+    );
+    check_min_score(
+        violations,
+        "min_quality_score",
+        "Quality",
+        gate.min_quality_score,
+        health.quality_score.unwrap_or(0),
+    );
+    check_min_score(
+        violations,
+        "min_metadata_score",
+        "Metadata",
+        gate.min_metadata_score,
+        health.metadata_score.unwrap_or(0),
+    );
+    check_max_issues(
+        violations,
+        "max_critical_issues",
+        "Critical",
+        gate.max_critical_issues,
+        health.critical_issues,
+    );
+    check_max_issues(
+        violations,
+        "max_high_issues",
+        "High",
+        gate.max_high_issues,
+        health.total_issues - health.critical_issues,
+    );
+    check_max_issues(
+        violations,
+        "max_medium_issues",
+        "Total",
+        gate.max_medium_issues,
+        health.total_issues,
+    );
+}
+
+/// Map a health score integer to a letter grade string.
+pub(crate) fn health_grade_from_score(score: i32) -> String {
+    Grade::from_score(score).as_char().to_string()
+}
+
+/// Validate a quality gate action string.
+pub(crate) fn validate_status(action: &str) -> bool {
+    matches!(action, "block" | "warn" | "allow")
+}
+
+/// Compute total pages for pagination given total items and page size.
+pub(crate) fn compute_total_pages(total: i64, page_size: i64) -> i64 {
+    if page_size <= 0 {
+        return 0;
+    }
+    (total + page_size - 1) / page_size
+}
+
+/// Normalize pagination parameters, returning (offset, limit).
+pub(crate) fn normalize_pagination(page: Option<i64>, per_page: Option<i64>) -> (i64, i64) {
+    let limit = per_page.unwrap_or(20).max(1).min(100);
+    let page = page.unwrap_or(1).max(1);
+    let offset = (page - 1) * limit;
+    (offset, limit)
+}
+
+/// Compute average health score from a list of scores.
+pub(crate) fn compute_avg_health_score(scores: &[i32]) -> i32 {
+    if scores.is_empty() {
+        return 100;
+    }
+    scores.iter().sum::<i32>() / scores.len() as i32
+}
+
+/// Count grade distribution from a list of health scores.
+pub(crate) fn count_grade_distribution(scores: &[i32]) -> (i32, i32, i32, i32, i32) {
+    let mut a = 0;
+    let mut b = 0;
+    let mut c = 0;
+    let mut d = 0;
+    let mut f = 0;
+    for &s in scores {
+        match Grade::from_score(s) {
+            Grade::A => a += 1,
+            Grade::B => b += 1,
+            Grade::C => c += 1,
+            Grade::D => d += 1,
+            Grade::F => f += 1,
+        }
+    }
+    (a, b, c, d, f)
+}
+
+/// Check a minimum score threshold (existing, kept for API compatibility).
+pub(crate) fn check_min_threshold(threshold: Option<i32>, actual: i32) -> bool {
+    match threshold {
+        Some(min) => actual >= min,
+        None => true,
+    }
+}
+
+/// Check a maximum issues threshold (existing, kept for API compatibility).
+pub(crate) fn check_max_threshold(threshold: Option<i32>, actual: i32) -> bool {
+    match threshold {
+        Some(max) => actual <= max,
+        None => true,
+    }
+}
+
 /// Compute a weighted composite health score from component scores.
 ///
 /// Weights: security=40, license=20, quality=25, metadata=15.
 /// Components with no data (None) are excluded and the denominator is reduced
 /// accordingly. If all components are None, returns 100 (no data = healthy).
-fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
+pub(crate) fn compute_weighted_health_score(scores: &ComponentScores) -> i32 {
     let components: [(Option<i32>, i32); 4] = [
         (scores.security, WEIGHT_SECURITY),
         (scores.license, WEIGHT_LICENSE),
@@ -2115,5 +2306,405 @@ mod tests {
                 score, expected_grade
             );
         }
+    }
+
+    // =======================================================================
+    // count_issue_severities
+    // =======================================================================
+
+    #[test]
+    fn test_count_issue_severities_empty() {
+        let (c, h, m, l, i) = count_issue_severities(&[]);
+        assert_eq!((c, h, m, l, i), (0, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_count_issue_severities_all_types() {
+        let issues = vec![
+            make_issue("critical"),
+            make_issue("critical"),
+            make_issue("high"),
+            make_issue("medium"),
+            make_issue("medium"),
+            make_issue("medium"),
+            make_issue("low"),
+            make_issue("info"),
+            make_issue("info"),
+        ];
+        let (c, h, m, l, i) = count_issue_severities(&issues);
+        assert_eq!((c, h, m, l, i), (2, 1, 3, 1, 2));
+    }
+
+    #[test]
+    fn test_count_issue_severities_unknown_maps_to_info() {
+        let issues = vec![
+            make_issue("unknown"),
+            make_issue("warning"),
+            make_issue("debug"),
+        ];
+        let (c, h, m, l, i) = count_issue_severities(&issues);
+        assert_eq!((c, h, m, l), (0, 0, 0, 0));
+        assert_eq!(i, 3);
+    }
+
+    #[test]
+    fn test_count_issue_severities_case_insensitive() {
+        let issues = vec![
+            make_issue("Critical"),
+            make_issue("HIGH"),
+            make_issue("Medium"),
+        ];
+        let (c, h, m, _l, _i) = count_issue_severities(&issues);
+        assert_eq!(c, 1);
+        assert_eq!(h, 1);
+        assert_eq!(m, 1);
+    }
+
+    // =======================================================================
+    // compute_quality_score
+    // =======================================================================
+
+    #[test]
+    fn test_compute_quality_score_from_mixed_rows() {
+        let rows = vec![
+            CheckScoreRow {
+                check_type: "metadata_completeness".to_string(),
+                score: Some(80),
+                passed: Some(true),
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+            },
+            CheckScoreRow {
+                check_type: "helm_lint".to_string(),
+                score: Some(60),
+                passed: Some(true),
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+            },
+            CheckScoreRow {
+                check_type: "docker_best_practices".to_string(),
+                score: Some(40),
+                passed: Some(false),
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+            },
+        ];
+        assert_eq!(compute_quality_score(&rows), Some(50));
+    }
+
+    #[test]
+    fn test_compute_quality_score_only_metadata() {
+        let rows = vec![CheckScoreRow {
+            check_type: "metadata_completeness".to_string(),
+            score: Some(80),
+            passed: Some(true),
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+        }];
+        assert_eq!(compute_quality_score(&rows), None);
+    }
+
+    #[test]
+    fn test_compute_quality_score_empty() {
+        assert_eq!(compute_quality_score(&[]), None);
+    }
+
+    #[test]
+    fn test_compute_quality_score_none_scores_filtered() {
+        let rows = vec![
+            CheckScoreRow {
+                check_type: "helm_lint".to_string(),
+                score: None,
+                passed: None,
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+            },
+            CheckScoreRow {
+                check_type: "docker_lint".to_string(),
+                score: Some(70),
+                passed: Some(true),
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+            },
+        ];
+        assert_eq!(compute_quality_score(&rows), Some(70));
+    }
+
+    // =======================================================================
+    // extract_metadata_score
+    // =======================================================================
+
+    #[test]
+    fn test_extract_metadata_score_present() {
+        let rows = vec![
+            CheckScoreRow {
+                check_type: "metadata_completeness".to_string(),
+                score: Some(85),
+                passed: Some(true),
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+            },
+            CheckScoreRow {
+                check_type: "helm_lint".to_string(),
+                score: Some(70),
+                passed: Some(true),
+                critical_count: 0,
+                high_count: 0,
+                medium_count: 0,
+                low_count: 0,
+            },
+        ];
+        assert_eq!(extract_metadata_score(&rows), Some(85));
+    }
+
+    #[test]
+    fn test_extract_metadata_score_absent() {
+        let rows = vec![CheckScoreRow {
+            check_type: "helm_lint".to_string(),
+            score: Some(70),
+            passed: Some(true),
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+        }];
+        assert_eq!(extract_metadata_score(&rows), None);
+    }
+
+    // =======================================================================
+    // aggregate_check_stats
+    // =======================================================================
+
+    #[test]
+    fn test_aggregate_check_stats_multiple_rows() {
+        let rows = vec![
+            CheckScoreRow {
+                check_type: "metadata_completeness".to_string(),
+                score: Some(80),
+                passed: Some(true),
+                critical_count: 0,
+                high_count: 1,
+                medium_count: 2,
+                low_count: 3,
+            },
+            CheckScoreRow {
+                check_type: "helm_lint".to_string(),
+                score: Some(60),
+                passed: Some(false),
+                critical_count: 1,
+                high_count: 2,
+                medium_count: 0,
+                low_count: 1,
+            },
+        ];
+        let (total, critical, passed, total_checks) = aggregate_check_stats(&rows);
+        assert_eq!(total, 10);
+        assert_eq!(critical, 1);
+        assert_eq!(passed, 1);
+        assert_eq!(total_checks, 2);
+    }
+
+    #[test]
+    fn test_aggregate_check_stats_empty() {
+        let (total, critical, passed, total_checks) = aggregate_check_stats(&[]);
+        assert_eq!((total, critical, passed, total_checks), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_aggregate_check_stats_passed_none_defaults_false() {
+        let rows = vec![CheckScoreRow {
+            check_type: "test".to_string(),
+            score: Some(50),
+            passed: None,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+        }];
+        let (_, _, passed, _) = aggregate_check_stats(&rows);
+        assert_eq!(passed, 0);
+    }
+
+    // =======================================================================
+    // health_grade_from_score
+    // =======================================================================
+
+    #[test]
+    fn test_health_grade_boundaries() {
+        assert_eq!(health_grade_from_score(100), "A");
+        assert_eq!(health_grade_from_score(90), "A");
+        assert_eq!(health_grade_from_score(89), "B");
+        assert_eq!(health_grade_from_score(75), "B");
+        assert_eq!(health_grade_from_score(74), "C");
+        assert_eq!(health_grade_from_score(50), "C");
+        assert_eq!(health_grade_from_score(49), "D");
+        assert_eq!(health_grade_from_score(25), "D");
+        assert_eq!(health_grade_from_score(24), "F");
+        assert_eq!(health_grade_from_score(0), "F");
+    }
+
+    // =======================================================================
+    // validate_status
+    // =======================================================================
+
+    #[test]
+    fn test_validate_status_valid() {
+        assert!(validate_status("block"));
+        assert!(validate_status("warn"));
+        assert!(validate_status("allow"));
+    }
+
+    #[test]
+    fn test_validate_status_invalid() {
+        assert!(!validate_status("deny"));
+        assert!(!validate_status(""));
+        assert!(!validate_status("BLOCK"));
+    }
+
+    // =======================================================================
+    // compute_total_pages
+    // =======================================================================
+
+    #[test]
+    fn test_compute_total_pages_exact() {
+        assert_eq!(compute_total_pages(100, 10), 10);
+    }
+
+    #[test]
+    fn test_compute_total_pages_remainder() {
+        assert_eq!(compute_total_pages(101, 10), 11);
+    }
+
+    #[test]
+    fn test_compute_total_pages_zero_items() {
+        assert_eq!(compute_total_pages(0, 10), 0);
+    }
+
+    #[test]
+    fn test_compute_total_pages_zero_page_size() {
+        assert_eq!(compute_total_pages(100, 0), 0);
+    }
+
+    #[test]
+    fn test_compute_total_pages_one_item() {
+        assert_eq!(compute_total_pages(1, 10), 1);
+    }
+
+    // =======================================================================
+    // normalize_pagination
+    // =======================================================================
+
+    #[test]
+    fn test_normalize_pagination_defaults() {
+        let (offset, limit) = normalize_pagination(None, None);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 20);
+    }
+
+    #[test]
+    fn test_normalize_pagination_page_2() {
+        let (offset, limit) = normalize_pagination(Some(2), Some(10));
+        assert_eq!(offset, 10);
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn test_normalize_pagination_clamp_max() {
+        let (_, limit) = normalize_pagination(Some(1), Some(500));
+        assert_eq!(limit, 100);
+    }
+
+    #[test]
+    fn test_normalize_pagination_clamp_min() {
+        let (_, limit) = normalize_pagination(Some(1), Some(0));
+        assert_eq!(limit, 1);
+    }
+
+    #[test]
+    fn test_normalize_pagination_negative_page() {
+        let (offset, _) = normalize_pagination(Some(-5), Some(10));
+        assert_eq!(offset, 0);
+    }
+
+    // =======================================================================
+    // compute_avg_health_score
+    // =======================================================================
+
+    #[test]
+    fn test_compute_avg_health_score_normal() {
+        assert_eq!(compute_avg_health_score(&[80, 60, 100]), 80);
+    }
+
+    #[test]
+    fn test_compute_avg_health_score_empty() {
+        assert_eq!(compute_avg_health_score(&[]), 100);
+    }
+
+    #[test]
+    fn test_compute_avg_health_score_single() {
+        assert_eq!(compute_avg_health_score(&[42]), 42);
+    }
+
+    // =======================================================================
+    // count_grade_distribution
+    // =======================================================================
+
+    #[test]
+    fn test_count_grade_distribution() {
+        let scores = vec![100, 95, 85, 80, 70, 60, 40, 30, 10, 5];
+        let (a, b, c, d, f) = count_grade_distribution(&scores);
+        assert_eq!(a, 2); // 100, 95
+        assert_eq!(b, 2); // 85, 80
+        assert_eq!(c, 2); // 70, 60
+        assert_eq!(d, 2); // 40, 30
+        assert_eq!(f, 2); // 10, 5
+    }
+
+    #[test]
+    fn test_count_grade_distribution_empty() {
+        let (a, b, c, d, f) = count_grade_distribution(&[]);
+        assert_eq!((a, b, c, d, f), (0, 0, 0, 0, 0));
+    }
+
+    // =======================================================================
+    // check_min_threshold / check_max_threshold
+    // =======================================================================
+
+    #[test]
+    fn test_check_min_threshold_passes() {
+        assert!(check_min_threshold(Some(70), 80));
+        assert!(check_min_threshold(Some(70), 70));
+        assert!(check_min_threshold(None, 0));
+    }
+
+    #[test]
+    fn test_check_min_threshold_fails() {
+        assert!(!check_min_threshold(Some(70), 69));
+    }
+
+    #[test]
+    fn test_check_max_threshold_passes() {
+        assert!(check_max_threshold(Some(5), 3));
+        assert!(check_max_threshold(Some(5), 5));
+        assert!(check_max_threshold(None, 100));
+    }
+
+    #[test]
+    fn test_check_max_threshold_fails() {
+        assert!(!check_max_threshold(Some(5), 6));
     }
 }

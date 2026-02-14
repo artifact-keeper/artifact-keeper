@@ -182,7 +182,10 @@ mod tests {
         assert_eq!(cloned.scan_enabled, req.scan_enabled);
         assert_eq!(cloned.scan_on_upload, req.scan_on_upload);
         assert_eq!(cloned.scan_on_proxy, req.scan_on_proxy);
-        assert_eq!(cloned.block_on_policy_violation, req.block_on_policy_violation);
+        assert_eq!(
+            cloned.block_on_policy_violation,
+            req.block_on_policy_violation
+        );
         assert_eq!(cloned.severity_threshold, req.severity_threshold);
     }
 

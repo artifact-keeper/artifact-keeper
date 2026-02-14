@@ -1096,10 +1096,7 @@ mod tests {
             ConflictResolution::from_str("unknown"),
             ConflictResolution::Skip
         );
-        assert_eq!(
-            ConflictResolution::from_str(""),
-            ConflictResolution::Skip
-        );
+        assert_eq!(ConflictResolution::from_str(""), ConflictResolution::Skip);
         assert_eq!(
             ConflictResolution::from_str("merge"),
             ConflictResolution::Skip

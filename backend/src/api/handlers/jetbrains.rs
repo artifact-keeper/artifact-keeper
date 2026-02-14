@@ -762,26 +762,19 @@ mod tests {
             HeaderValue::from_static("bearer my-token"),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "my-token".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "my-token".to_string())));
     }
 
     #[test]
     fn test_extract_credentials_basic() {
         let headers = make_basic_header("admin", "pass123");
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("admin".to_string(), "pass123".to_string()))
-        );
+        assert_eq!(result, Some(("admin".to_string(), "pass123".to_string())));
     }
 
     #[test]
     fn test_extract_credentials_basic_lowercase() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -807,10 +800,7 @@ mod tests {
             HeaderValue::from_static("Bearer my-token"),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "my-token".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "my-token".to_string())));
     }
 
     // -----------------------------------------------------------------------
@@ -1019,10 +1009,7 @@ mod tests {
             "/jetbrains/{}/plugin/download/{}/{}",
             repo_key, name, version
         );
-        assert_eq!(
-            url,
-            "/jetbrains/jb-hosted/plugin/download/my-plugin/1.0.0"
-        );
+        assert_eq!(url, "/jetbrains/jb-hosted/plugin/download/my-plugin/1.0.0");
     }
 
     // -----------------------------------------------------------------------

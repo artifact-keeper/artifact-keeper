@@ -1535,9 +1535,15 @@ mod tests {
         assert_eq!(resp.name, "Test SAML");
         assert_eq!(resp.entity_id, "https://idp.example.com/entity");
         assert_eq!(resp.sso_url, "https://idp.example.com/sso");
-        assert_eq!(resp.slo_url, Some("https://idp.example.com/slo".to_string()));
+        assert_eq!(
+            resp.slo_url,
+            Some("https://idp.example.com/slo".to_string())
+        );
         assert!(resp.has_certificate);
-        assert_eq!(resp.name_id_format, "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress");
+        assert_eq!(
+            resp.name_id_format,
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+        );
         assert_eq!(resp.sp_entity_id, "artifact-keeper");
         assert!(!resp.sign_requests);
         assert!(resp.require_signed_assertions);
@@ -1600,7 +1606,8 @@ mod tests {
 
     #[test]
     fn test_parse_ldap_url_with_trailing_path() {
-        let (host, port) = AuthConfigService::parse_ldap_url("ldap://myhost:389/dc=example").unwrap();
+        let (host, port) =
+            AuthConfigService::parse_ldap_url("ldap://myhost:389/dc=example").unwrap();
         assert_eq!(host, "myhost");
         assert_eq!(port, 389);
     }
@@ -1665,7 +1672,10 @@ mod tests {
             "auto_create_users": true
         }"#;
         let req: CreateOidcConfigRequest = serde_json::from_str(json_str).unwrap();
-        assert_eq!(req.scopes, Some(vec!["openid".to_string(), "profile".to_string()]));
+        assert_eq!(
+            req.scopes,
+            Some(vec!["openid".to_string(), "profile".to_string()])
+        );
         assert_eq!(req.attribute_mapping, Some(json!({"email": "mail"})));
         assert_eq!(req.is_enabled, Some(false));
         assert_eq!(req.auto_create_users, Some(true));

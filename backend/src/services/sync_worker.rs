@@ -116,10 +116,8 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
         }
 
         // ── Concurrency check ───────────────────────────────────────────
-        let available_slots = compute_available_slots(
-            peer.concurrent_transfers_limit,
-            peer.active_transfers,
-        );
+        let available_slots =
+            compute_available_slots(peer.concurrent_transfers_limit, peer.active_transfers);
         if available_slots <= 0 {
             tracing::debug!(
                 "Peer '{}' at concurrency limit ({}/{}), skipping",

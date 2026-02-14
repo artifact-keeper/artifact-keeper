@@ -1129,7 +1129,14 @@ mod tests {
 
     #[test]
     fn test_build_alpine_metadata_basic() {
-        let meta = build_alpine_metadata("curl", "8.5.0-r0", "x86_64", "edge", "main", "curl-8.5.0-r0.apk");
+        let meta = build_alpine_metadata(
+            "curl",
+            "8.5.0-r0",
+            "x86_64",
+            "edge",
+            "main",
+            "curl-8.5.0-r0.apk",
+        );
         assert_eq!(meta["name"], "curl");
         assert_eq!(meta["version"], "8.5.0-r0");
         assert_eq!(meta["arch"], "x86_64");
@@ -1140,7 +1147,14 @@ mod tests {
 
     #[test]
     fn test_build_alpine_metadata_different_arch() {
-        let meta = build_alpine_metadata("nginx", "1.25.4-r0", "aarch64", "v3.19", "community", "nginx-1.25.4-r0.apk");
+        let meta = build_alpine_metadata(
+            "nginx",
+            "1.25.4-r0",
+            "aarch64",
+            "v3.19",
+            "community",
+            "nginx-1.25.4-r0.apk",
+        );
         assert_eq!(meta["arch"], "aarch64");
         assert_eq!(meta["branch"], "v3.19");
         assert_eq!(meta["repository"], "community");
@@ -1178,7 +1192,15 @@ mod tests {
 
     #[test]
     fn test_build_alpine_upload_response_large_size() {
-        let resp = build_alpine_upload_response("big-pkg", "2.0", "x86_64", "edge", "main", "hash", 1_073_741_824);
+        let resp = build_alpine_upload_response(
+            "big-pkg",
+            "2.0",
+            "x86_64",
+            "edge",
+            "main",
+            "hash",
+            1_073_741_824,
+        );
         assert_eq!(resp["size"], 1_073_741_824);
     }
 

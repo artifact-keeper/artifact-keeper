@@ -811,11 +811,26 @@ mod tests {
 
     #[test]
     fn test_backup_status_serialization() {
-        assert_eq!(serde_json::to_string(&BackupStatus::Pending).unwrap(), "\"pending\"");
-        assert_eq!(serde_json::to_string(&BackupStatus::InProgress).unwrap(), "\"in_progress\"");
-        assert_eq!(serde_json::to_string(&BackupStatus::Completed).unwrap(), "\"completed\"");
-        assert_eq!(serde_json::to_string(&BackupStatus::Failed).unwrap(), "\"failed\"");
-        assert_eq!(serde_json::to_string(&BackupStatus::Cancelled).unwrap(), "\"cancelled\"");
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::InProgress).unwrap(),
+            "\"in_progress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackupStatus::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
     }
 
     #[test]
@@ -928,7 +943,10 @@ mod tests {
         let entries = BackupService::extract_entries(&tar_data).unwrap();
         assert_eq!(entries.len(), 3);
 
-        let paths: Vec<String> = entries.iter().map(|(p, _)| p.to_string_lossy().to_string()).collect();
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
         assert!(paths.contains(&"manifest.json".to_string()));
         assert!(paths.contains(&"database/users.json".to_string()));
         assert!(paths.contains(&"artifacts/key1".to_string()));
@@ -936,9 +954,7 @@ mod tests {
 
     #[test]
     fn test_extract_entries_preserves_content() {
-        let tar_data = create_test_tar_gz(&[
-            ("test.txt", b"hello world"),
-        ]);
+        let tar_data = create_test_tar_gz(&[("test.txt", b"hello world")]);
         let entries = BackupService::extract_entries(&tar_data).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1, b"hello world");

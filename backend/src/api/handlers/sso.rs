@@ -572,7 +572,7 @@ pub struct SsoApiDoc;
 ///
 /// This is safe here because we just received the token directly from the
 /// identity provider over a TLS-secured backchannel.
-fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
+pub(crate) fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
@@ -589,4 +589,206 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
         .map_err(|e| AppError::Internal(format!("Failed to parse JWT claims: {e}")))?;
 
     Ok(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    /// Helper: build a fake JWT token with the given payload JSON.
+    fn make_jwt(payload: &serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+        let signature = URL_SAFE_NO_PAD.encode(b"fake_signature");
+        format!("{}.{}.{}", header, payload_b64, signature)
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_jwt_payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_jwt_payload_valid() {
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "email": "user@example.com",
+            "name": "Test User"
+        });
+        let token = make_jwt(&claims);
+        let result = decode_jwt_payload(&token).unwrap();
+        assert_eq!(result["sub"], "user-123");
+        assert_eq!(result["email"], "user@example.com");
+        assert_eq!(result["name"], "Test User");
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_with_groups() {
+        let claims = serde_json::json!({
+            "sub": "user-456",
+            "groups": ["admin", "developers"]
+        });
+        let token = make_jwt(&claims);
+        let result = decode_jwt_payload(&token).unwrap();
+        let groups = result["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], "admin");
+        assert_eq!(groups[1], "developers");
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_empty_claims() {
+        let claims = serde_json::json!({});
+        let token = make_jwt(&claims);
+        let result = decode_jwt_payload(&token).unwrap();
+        assert!(result.is_object());
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_too_few_parts() {
+        let result = decode_jwt_payload("header.payload");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_too_many_parts() {
+        let result = decode_jwt_payload("a.b.c.d");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_empty_string() {
+        let result = decode_jwt_payload("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_single_segment() {
+        let result = decode_jwt_payload("only_one_segment");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_invalid_base64() {
+        let result = decode_jwt_payload("header.!!!invalid-base64!!!.signature");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_invalid_json() {
+        // Valid base64 but not valid JSON
+        let bad_payload = URL_SAFE_NO_PAD.encode(b"not json at all");
+        let token = format!("header.{}.signature", bad_payload);
+        let result = decode_jwt_payload(&token);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_numeric_claims() {
+        let claims = serde_json::json!({
+            "sub": "user-789",
+            "iat": 1700000000,
+            "exp": 1700003600,
+            "nbf": 1699999900
+        });
+        let token = make_jwt(&claims);
+        let result = decode_jwt_payload(&token).unwrap();
+        assert_eq!(result["iat"], 1700000000);
+        assert_eq!(result["exp"], 1700003600);
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_preferred_username() {
+        let claims = serde_json::json!({
+            "sub": "guid-abc",
+            "preferred_username": "alice",
+            "email": "alice@corp.com"
+        });
+        let token = make_jwt(&claims);
+        let result = decode_jwt_payload(&token).unwrap();
+        assert_eq!(result["preferred_username"], "alice");
+    }
+
+    // -----------------------------------------------------------------------
+    // Request/Response serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oidc_callback_query_deserialize() {
+        let json = r#"{"code":"auth_code_123","state":"csrf_state_456"}"#;
+        let q: OidcCallbackQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.code, "auth_code_123");
+        assert_eq!(q.state, "csrf_state_456");
+    }
+
+    #[test]
+    fn test_ldap_login_request_deserialize() {
+        let json = r#"{"username":"alice","password":"secret"}"#;
+        let req: LdapLoginRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.username, "alice");
+        assert_eq!(req.password, "secret");
+    }
+
+    #[test]
+    fn test_saml_acs_form_deserialize() {
+        let json = r#"{"SAMLResponse":"base64_encoded_response","RelayState":"some_state"}"#;
+        let form: SamlAcsForm = serde_json::from_str(json).unwrap();
+        assert_eq!(form.saml_response, "base64_encoded_response");
+        assert_eq!(form.relay_state, Some("some_state".to_string()));
+    }
+
+    #[test]
+    fn test_saml_acs_form_no_relay_state() {
+        let json = r#"{"SAMLResponse":"encoded_resp"}"#;
+        let form: SamlAcsForm = serde_json::from_str(json).unwrap();
+        assert_eq!(form.saml_response, "encoded_resp");
+        assert!(form.relay_state.is_none());
+    }
+
+    #[test]
+    fn test_exchange_code_request_deserialize() {
+        let json = r#"{"code":"exchange_code_abc"}"#;
+        let req: ExchangeCodeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.code, "exchange_code_abc");
+    }
+
+    #[test]
+    fn test_exchange_code_response_serialize() {
+        let resp = ExchangeCodeResponse {
+            access_token: "at_123".to_string(),
+            refresh_token: "rt_456".to_string(),
+            token_type: "Bearer".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["access_token"], "at_123");
+        assert_eq!(json["refresh_token"], "rt_456");
+        assert_eq!(json["token_type"], "Bearer");
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_with_nested_object() {
+        let claims = serde_json::json!({
+            "sub": "user-nested",
+            "realm_access": {
+                "roles": ["admin", "user"]
+            }
+        });
+        let token = make_jwt(&claims);
+        let result = decode_jwt_payload(&token).unwrap();
+        let roles = result["realm_access"]["roles"].as_array().unwrap();
+        assert_eq!(roles.len(), 2);
+    }
+
+    #[test]
+    fn test_decode_jwt_payload_unicode_claims() {
+        let claims = serde_json::json!({
+            "sub": "user-unicode",
+            "name": "Jean-Pierre Dupont"
+        });
+        let token = make_jwt(&claims);
+        let result = decode_jwt_payload(&token).unwrap();
+        assert_eq!(result["name"], "Jean-Pierre Dupont");
+    }
 }

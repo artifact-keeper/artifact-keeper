@@ -607,7 +607,10 @@ mod tests {
             HeaderValue::from_static("Bearer my-token-123"),
         );
         let creds = extract_credentials(&headers);
-        assert_eq!(creds, Some(("token".to_string(), "my-token-123".to_string())));
+        assert_eq!(
+            creds,
+            Some(("token".to_string(), "my-token-123".to_string()))
+        );
     }
 
     #[test]
@@ -635,10 +638,7 @@ mod tests {
             HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
         );
         let creds = extract_credentials(&headers);
-        assert_eq!(
-            creds,
-            Some(("alice".to_string(), "secret123".to_string()))
-        );
+        assert_eq!(creds, Some(("alice".to_string(), "secret123".to_string())));
     }
 
     #[test]
@@ -664,10 +664,7 @@ mod tests {
             HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
         );
         let creds = extract_credentials(&headers);
-        assert_eq!(
-            creds,
-            Some(("user".to_string(), "p:a:s:s".to_string()))
-        );
+        assert_eq!(creds, Some(("user".to_string(), "p:a:s:s".to_string())));
     }
 
     // -----------------------------------------------------------------------
@@ -733,8 +730,7 @@ mod tests {
     #[test]
     fn test_gzip_compress_large_input() {
         // A larger input to verify compression actually shrinks it
-        let data = "Package: test\nVersion: 1.0.0\nDepends: R (>= 3.5.0)\n\n"
-            .repeat(100);
+        let data = "Package: test\nVersion: 1.0.0\nDepends: R (>= 3.5.0)\n\n".repeat(100);
         let compressed = gzip_compress(data.as_bytes()).unwrap();
 
         // Compressed should be smaller than original for repetitive data

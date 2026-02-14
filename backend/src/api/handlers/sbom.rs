@@ -854,3 +854,480 @@ async fn extract_dependencies_for_artifact(
     ))
 )]
 pub struct SbomApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    // -----------------------------------------------------------------------
+    // Default functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_format() {
+        assert_eq!(default_format(), "cyclonedx");
+    }
+
+    #[test]
+    fn test_default_true() {
+        assert!(default_true());
+    }
+
+    #[test]
+    fn test_default_action() {
+        assert_eq!(default_action(), "warn");
+    }
+
+    // -----------------------------------------------------------------------
+    // SbomResponse From<SbomDocument>
+    // -----------------------------------------------------------------------
+
+    fn make_sbom_doc() -> SbomDocument {
+        let now = Utc::now();
+        SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "cyclonedx".to_string(),
+            format_version: "1.5".to_string(),
+            spec_version: Some("1.5".to_string()),
+            content: serde_json::json!({"components": []}),
+            component_count: 10,
+            dependency_count: 5,
+            license_count: 3,
+            licenses: vec![
+                "MIT".to_string(),
+                "Apache-2.0".to_string(),
+                "BSD-3-Clause".to_string(),
+            ],
+            content_hash: "sha256:abc123".to_string(),
+            generator: Some("syft".to_string()),
+            generator_version: Some("0.90.0".to_string()),
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn test_sbom_response_from_document() {
+        let doc = make_sbom_doc();
+        let doc_id = doc.id;
+        let doc_artifact = doc.artifact_id;
+        let doc_repo = doc.repository_id;
+        let resp = SbomResponse::from(doc);
+        assert_eq!(resp.id, doc_id);
+        assert_eq!(resp.artifact_id, doc_artifact);
+        assert_eq!(resp.repository_id, doc_repo);
+        assert_eq!(resp.format, "cyclonedx");
+        assert_eq!(resp.format_version, "1.5");
+        assert_eq!(resp.spec_version, Some("1.5".to_string()));
+        assert_eq!(resp.component_count, 10);
+        assert_eq!(resp.dependency_count, 5);
+        assert_eq!(resp.license_count, 3);
+        assert_eq!(resp.licenses.len(), 3);
+        assert_eq!(resp.content_hash, "sha256:abc123");
+        assert_eq!(resp.generator, Some("syft".to_string()));
+        assert_eq!(resp.generator_version, Some("0.90.0".to_string()));
+    }
+
+    #[test]
+    fn test_sbom_response_from_document_no_optionals() {
+        let now = Utc::now();
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "spdx".to_string(),
+            format_version: "2.3".to_string(),
+            spec_version: None,
+            content: serde_json::json!({}),
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "sha256:empty".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        let resp = SbomResponse::from(doc);
+        assert_eq!(resp.format, "spdx");
+        assert!(resp.spec_version.is_none());
+        assert!(resp.generator.is_none());
+        assert!(resp.generator_version.is_none());
+        assert!(resp.licenses.is_empty());
+    }
+
+    #[test]
+    fn test_sbom_response_serialize() {
+        let doc = make_sbom_doc();
+        let resp = SbomResponse::from(doc);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["format"], "cyclonedx");
+        assert_eq!(json["component_count"], 10);
+        assert!(json["licenses"].is_array());
+    }
+
+    // -----------------------------------------------------------------------
+    // SbomContentResponse From<SbomDocument>
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sbom_content_response_from_document() {
+        let doc = make_sbom_doc();
+        let resp = SbomContentResponse::from(doc);
+        assert_eq!(resp.metadata.format, "cyclonedx");
+        assert!(resp.content.is_object());
+    }
+
+    #[test]
+    fn test_sbom_content_response_preserves_content() {
+        let now = Utc::now();
+        let content = serde_json::json!({
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "components": [{"name": "serde", "version": "1.0"}]
+        });
+        let doc = SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "cyclonedx".to_string(),
+            format_version: "1.5".to_string(),
+            spec_version: Some("1.5".to_string()),
+            content: content.clone(),
+            component_count: 1,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "hash".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+        let resp = SbomContentResponse::from(doc);
+        assert_eq!(resp.content, content);
+        assert_eq!(resp.content["components"][0]["name"], "serde");
+    }
+
+    // -----------------------------------------------------------------------
+    // ComponentResponse From<SbomComponent>
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_component_response_from_sbom_component() {
+        let now = Utc::now();
+        let component = SbomComponent {
+            id: Uuid::new_v4(),
+            sbom_id: Uuid::new_v4(),
+            name: "serde".to_string(),
+            version: Some("1.0.195".to_string()),
+            purl: Some("pkg:cargo/serde@1.0.195".to_string()),
+            cpe: Some("cpe:2.3:a:serde:serde:1.0.195".to_string()),
+            component_type: Some("library".to_string()),
+            licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
+            sha256: Some("abc123".to_string()),
+            sha1: Some("def456".to_string()),
+            md5: Some("ghi789".to_string()),
+            supplier: Some("serde-rs".to_string()),
+            author: Some("David Tolnay".to_string()),
+            external_refs: serde_json::json!([]),
+            created_at: now,
+        };
+        let cid = component.id;
+        let sbom_id = component.sbom_id;
+        let resp = ComponentResponse::from(component);
+        assert_eq!(resp.id, cid);
+        assert_eq!(resp.sbom_id, sbom_id);
+        assert_eq!(resp.name, "serde");
+        assert_eq!(resp.version, Some("1.0.195".to_string()));
+        assert_eq!(resp.purl, Some("pkg:cargo/serde@1.0.195".to_string()));
+        assert_eq!(resp.cpe, Some("cpe:2.3:a:serde:serde:1.0.195".to_string()));
+        assert_eq!(resp.component_type, Some("library".to_string()));
+        assert_eq!(resp.licenses.len(), 2);
+        assert_eq!(resp.sha256, Some("abc123".to_string()));
+        assert_eq!(resp.sha1, Some("def456".to_string()));
+        assert_eq!(resp.md5, Some("ghi789".to_string()));
+        assert_eq!(resp.supplier, Some("serde-rs".to_string()));
+        assert_eq!(resp.author, Some("David Tolnay".to_string()));
+    }
+
+    #[test]
+    fn test_component_response_from_minimal_component() {
+        let now = Utc::now();
+        let component = SbomComponent {
+            id: Uuid::new_v4(),
+            sbom_id: Uuid::new_v4(),
+            name: "unknown-lib".to_string(),
+            version: None,
+            purl: None,
+            cpe: None,
+            component_type: None,
+            licenses: vec![],
+            sha256: None,
+            sha1: None,
+            md5: None,
+            supplier: None,
+            author: None,
+            external_refs: serde_json::json!(null),
+            created_at: now,
+        };
+        let resp = ComponentResponse::from(component);
+        assert_eq!(resp.name, "unknown-lib");
+        assert!(resp.version.is_none());
+        assert!(resp.purl.is_none());
+        assert!(resp.licenses.is_empty());
+    }
+
+    #[test]
+    fn test_component_response_serialize() {
+        let now = Utc::now();
+        let component = SbomComponent {
+            id: Uuid::nil(),
+            sbom_id: Uuid::nil(),
+            name: "tokio".to_string(),
+            version: Some("1.35.0".to_string()),
+            purl: None,
+            cpe: None,
+            component_type: Some("library".to_string()),
+            licenses: vec!["MIT".to_string()],
+            sha256: None,
+            sha1: None,
+            md5: None,
+            supplier: None,
+            author: None,
+            external_refs: serde_json::json!([]),
+            created_at: now,
+        };
+        let resp = ComponentResponse::from(component);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["name"], "tokio");
+        assert_eq!(json["version"], "1.35.0");
+        assert!(json["purl"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // LicensePolicyResponse From<LicensePolicy>
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_license_policy_response_from_policy() {
+        let now = Utc::now();
+        let repo_id = Uuid::new_v4();
+        let policy = LicensePolicy {
+            id: Uuid::new_v4(),
+            repository_id: Some(repo_id),
+            name: "strict-policy".to_string(),
+            description: Some("Block GPL licenses".to_string()),
+            allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
+            denied_licenses: vec!["GPL-3.0".to_string()],
+            allow_unknown: false,
+            action: PolicyAction::Block,
+            is_enabled: true,
+            created_at: now,
+            updated_at: Some(now),
+        };
+        let pid = policy.id;
+        let resp = LicensePolicyResponse::from(policy);
+        assert_eq!(resp.id, pid);
+        assert_eq!(resp.repository_id, Some(repo_id));
+        assert_eq!(resp.name, "strict-policy");
+        assert_eq!(resp.description, Some("Block GPL licenses".to_string()));
+        assert_eq!(resp.allowed_licenses, vec!["MIT", "Apache-2.0"]);
+        assert_eq!(resp.denied_licenses, vec!["GPL-3.0"]);
+        assert!(!resp.allow_unknown);
+        assert_eq!(resp.action, "block");
+        assert!(resp.is_enabled);
+        assert!(resp.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_license_policy_response_global_policy() {
+        let now = Utc::now();
+        let policy = LicensePolicy {
+            id: Uuid::new_v4(),
+            repository_id: None,
+            name: "global-warn".to_string(),
+            description: None,
+            allowed_licenses: vec![],
+            denied_licenses: vec![],
+            allow_unknown: true,
+            action: PolicyAction::Warn,
+            is_enabled: true,
+            created_at: now,
+            updated_at: None,
+        };
+        let resp = LicensePolicyResponse::from(policy);
+        assert!(resp.repository_id.is_none());
+        assert_eq!(resp.action, "warn");
+        assert!(resp.allow_unknown);
+        assert!(resp.updated_at.is_none());
+    }
+
+    #[test]
+    fn test_license_policy_response_allow_action() {
+        let now = Utc::now();
+        let policy = LicensePolicy {
+            id: Uuid::new_v4(),
+            repository_id: None,
+            name: "permissive".to_string(),
+            description: None,
+            allowed_licenses: vec![],
+            denied_licenses: vec![],
+            allow_unknown: true,
+            action: PolicyAction::Allow,
+            is_enabled: false,
+            created_at: now,
+            updated_at: None,
+        };
+        let resp = LicensePolicyResponse::from(policy);
+        assert_eq!(resp.action, "allow");
+        assert!(!resp.is_enabled);
+    }
+
+    #[test]
+    fn test_license_policy_response_serialize() {
+        let now = Utc::now();
+        let policy = LicensePolicy {
+            id: Uuid::nil(),
+            repository_id: None,
+            name: "test".to_string(),
+            description: None,
+            allowed_licenses: vec!["MIT".to_string()],
+            denied_licenses: vec![],
+            allow_unknown: true,
+            action: PolicyAction::Warn,
+            is_enabled: true,
+            created_at: now,
+            updated_at: None,
+        };
+        let resp = LicensePolicyResponse::from(policy);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["name"], "test");
+        assert_eq!(json["action"], "warn");
+        assert_eq!(json["allow_unknown"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Request deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_sbom_request_deserialize_full() {
+        let uid = Uuid::new_v4();
+        let json = format!(
+            r#"{{"artifact_id":"{}","format":"spdx","force_regenerate":true}}"#,
+            uid
+        );
+        let req: GenerateSbomRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.artifact_id, uid);
+        assert_eq!(req.format, "spdx");
+        assert!(req.force_regenerate);
+    }
+
+    #[test]
+    fn test_generate_sbom_request_defaults() {
+        let uid = Uuid::new_v4();
+        let json = format!(r#"{{"artifact_id":"{}"}}"#, uid);
+        let req: GenerateSbomRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.format, "cyclonedx");
+        assert!(!req.force_regenerate);
+    }
+
+    #[test]
+    fn test_convert_sbom_request_deserialize() {
+        let json = r#"{"target_format":"spdx"}"#;
+        let req: ConvertSbomRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.target_format, "spdx");
+    }
+
+    #[test]
+    fn test_update_cve_status_request_deserialize() {
+        let json = r#"{"status":"acknowledged","reason":"Won't fix - not exploitable"}"#;
+        let req: UpdateCveStatusRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.status, "acknowledged");
+        assert_eq!(req.reason, Some("Won't fix - not exploitable".to_string()));
+    }
+
+    #[test]
+    fn test_update_cve_status_request_no_reason() {
+        let json = r#"{"status":"fixed"}"#;
+        let req: UpdateCveStatusRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.status, "fixed");
+        assert!(req.reason.is_none());
+    }
+
+    #[test]
+    fn test_check_license_compliance_request_deserialize() {
+        let json = r#"{"licenses":["MIT","GPL-3.0"]}"#;
+        let req: CheckLicenseComplianceRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.licenses, vec!["MIT", "GPL-3.0"]);
+        assert!(req.repository_id.is_none());
+    }
+
+    #[test]
+    fn test_check_license_compliance_request_with_repo() {
+        let rid = Uuid::new_v4();
+        let json = format!(r#"{{"licenses":["Apache-2.0"],"repository_id":"{}"}}"#, rid);
+        let req: CheckLicenseComplianceRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.repository_id, Some(rid));
+    }
+
+    #[test]
+    fn test_upsert_license_policy_request_deserialize_full() {
+        let rid = Uuid::new_v4();
+        let json = format!(
+            r#"{{
+                "repository_id": "{}",
+                "name": "strict",
+                "description": "Strict policy",
+                "allowed_licenses": ["MIT"],
+                "denied_licenses": ["GPL-3.0"],
+                "allow_unknown": false,
+                "action": "block",
+                "is_enabled": true
+            }}"#,
+            rid
+        );
+        let req: UpsertLicensePolicyRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.repository_id, Some(rid));
+        assert_eq!(req.name, "strict");
+        assert!(!req.allow_unknown);
+        assert_eq!(req.action, "block");
+        assert!(req.is_enabled);
+    }
+
+    #[test]
+    fn test_upsert_license_policy_request_defaults() {
+        let json = r#"{"name":"default","allowed_licenses":[],"denied_licenses":[]}"#;
+        let req: UpsertLicensePolicyRequest = serde_json::from_str(json).unwrap();
+        assert!(req.repository_id.is_none());
+        assert!(req.description.is_none());
+        assert!(req.allow_unknown); // default_true
+        assert_eq!(req.action, "warn"); // default_action
+        assert!(req.is_enabled); // default_true
+    }
+
+    #[test]
+    fn test_list_sboms_query_deserialize() {
+        let json = r#"{"format":"cyclonedx"}"#;
+        let q: ListSbomsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.format, Some("cyclonedx".to_string()));
+        assert!(q.artifact_id.is_none());
+        assert!(q.repository_id.is_none());
+    }
+
+    #[test]
+    fn test_get_cve_trends_query_deserialize() {
+        let json = r#"{"days":30}"#;
+        let q: GetCveTrendsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(q.days, Some(30));
+        assert!(q.repository_id.is_none());
+    }
+}

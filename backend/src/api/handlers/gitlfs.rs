@@ -1063,8 +1063,7 @@ mod tests {
 
     #[test]
     fn test_extract_credentials_basic_lowercase() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -1096,10 +1095,7 @@ mod tests {
             HeaderValue::from_static("bearer my-token"),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "my-token".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "my-token".to_string())));
     }
 
     #[test]
@@ -1123,10 +1119,7 @@ mod tests {
     fn test_extract_credentials_basic_colon_in_password() {
         let headers = make_basic_header("user", "pa:ss:wd");
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pa:ss:wd".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "pa:ss:wd".to_string())));
     }
 
     // -----------------------------------------------------------------------
@@ -1135,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_validate_oid_valid() {
-        let oid = "a" .repeat(64);
+        let oid = "a".repeat(64);
         assert!(validate_oid(&oid).is_ok());
     }
 

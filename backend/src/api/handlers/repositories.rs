@@ -1587,7 +1587,10 @@ mod tests {
 
     #[test]
     fn test_parse_format_rubygems() {
-        assert_eq!(parse_format("rubygems").unwrap(), RepositoryFormat::Rubygems);
+        assert_eq!(
+            parse_format("rubygems").unwrap(),
+            RepositoryFormat::Rubygems
+        );
     }
 
     #[test]
@@ -1597,7 +1600,10 @@ mod tests {
 
     #[test]
     fn test_parse_format_protobuf() {
-        assert_eq!(parse_format("protobuf").unwrap(), RepositoryFormat::Protobuf);
+        assert_eq!(
+            parse_format("protobuf").unwrap(),
+            RepositoryFormat::Protobuf
+        );
     }
 
     #[test]
@@ -1621,21 +1627,59 @@ mod tests {
     fn test_parse_format_all_formats() {
         // Ensure all 45+ formats parse correctly
         let formats = vec![
-            "maven", "gradle", "npm", "pypi", "nuget", "go", "rubygems",
-            "docker", "helm", "rpm", "debian", "conan", "cargo", "generic",
-            "podman", "buildx", "oras", "wasm_oci", "helm_oci", "poetry",
-            "conda", "yarn", "bower", "pnpm", "chocolatey", "powershell",
-            "terraform", "opentofu", "alpine", "conda_native", "composer",
-            "hex", "cocoapods", "swift", "pub", "sbt", "chef", "puppet",
-            "ansible", "gitlfs", "vscode", "jetbrains", "huggingface",
-            "mlmodel", "cran", "vagrant", "opkg", "p2", "bazel", "protobuf",
+            "maven",
+            "gradle",
+            "npm",
+            "pypi",
+            "nuget",
+            "go",
+            "rubygems",
+            "docker",
+            "helm",
+            "rpm",
+            "debian",
+            "conan",
+            "cargo",
+            "generic",
+            "podman",
+            "buildx",
+            "oras",
+            "wasm_oci",
+            "helm_oci",
+            "poetry",
+            "conda",
+            "yarn",
+            "bower",
+            "pnpm",
+            "chocolatey",
+            "powershell",
+            "terraform",
+            "opentofu",
+            "alpine",
+            "conda_native",
+            "composer",
+            "hex",
+            "cocoapods",
+            "swift",
+            "pub",
+            "sbt",
+            "chef",
+            "puppet",
+            "ansible",
+            "gitlfs",
+            "vscode",
+            "jetbrains",
+            "huggingface",
+            "mlmodel",
+            "cran",
+            "vagrant",
+            "opkg",
+            "p2",
+            "bazel",
+            "protobuf",
         ];
         for f in formats {
-            assert!(
-                parse_format(f).is_ok(),
-                "parse_format failed for: {}",
-                f
-            );
+            assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);
         }
     }
 
@@ -1972,10 +2016,7 @@ mod tests {
 
     #[test]
     fn test_extract_name_from_path_deep() {
-        assert_eq!(
-            extract_name_from_path("a/b/c/d/e/file.bin"),
-            "file.bin"
-        );
+        assert_eq!(extract_name_from_path("a/b/c/d/e/file.bin"), "file.bin");
     }
 
     // -----------------------------------------------------------------------
@@ -2032,7 +2073,10 @@ mod tests {
 
     #[test]
     fn test_extract_download_filename_no_slash() {
-        assert_eq!(extract_download_filename("single-file.txt"), "single-file.txt");
+        assert_eq!(
+            extract_download_filename("single-file.txt"),
+            "single-file.txt"
+        );
     }
 
     // -----------------------------------------------------------------------

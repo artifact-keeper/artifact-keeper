@@ -1003,8 +1003,7 @@ mod tests {
 
     #[test]
     fn test_extract_basic_credentials_lowercase() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -1037,24 +1036,19 @@ mod tests {
 
     #[test]
     fn test_extract_bearer_credentials_valid() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("npmuser:npmpass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("npmuser:npmpass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", encoded)).unwrap(),
         );
         let result = extract_bearer_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("npmuser".to_string(), "npmpass".to_string()))
-        );
+        assert_eq!(result, Some(("npmuser".to_string(), "npmpass".to_string())));
     }
 
     #[test]
     fn test_extract_bearer_credentials_lowercase() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -1082,8 +1076,7 @@ mod tests {
 
     #[test]
     fn test_extract_bearer_credentials_no_colon() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("justtoken");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("justtoken");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -1392,7 +1385,10 @@ mod tests {
         let result = compute_npm_integrity(hex);
         assert!(result.starts_with("sha256-"));
         // All zeros base64-encoded
-        assert_eq!(result, "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert_eq!(
+            result,
+            "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
     }
 
     #[test]
@@ -1550,7 +1546,12 @@ mod tests {
     #[test]
     fn test_build_npm_tarball_url_basic() {
         assert_eq!(
-            build_npm_tarball_url("http://localhost:8080", "npm-hosted", "express", "express-4.18.2.tgz"),
+            build_npm_tarball_url(
+                "http://localhost:8080",
+                "npm-hosted",
+                "express",
+                "express-4.18.2.tgz"
+            ),
             "http://localhost:8080/npm/npm-hosted/express/-/express-4.18.2.tgz"
         );
     }
@@ -1558,7 +1559,12 @@ mod tests {
     #[test]
     fn test_build_npm_tarball_url_scoped() {
         assert_eq!(
-            build_npm_tarball_url("https://registry.example.com", "main", "@angular/core", "core-17.0.0.tgz"),
+            build_npm_tarball_url(
+                "https://registry.example.com",
+                "main",
+                "@angular/core",
+                "core-17.0.0.tgz"
+            ),
             "https://registry.example.com/npm/main/@angular/core/-/core-17.0.0.tgz"
         );
     }
@@ -1572,7 +1578,8 @@ mod tests {
         let info = NpmArtifactInfo {
             version: "1.0.0".to_string(),
             filename: "mylib-1.0.0.tgz".to_string(),
-            checksum_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            checksum_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             tarball_url: "http://localhost:8080/npm/repo/mylib/-/mylib-1.0.0.tgz".to_string(),
             version_metadata: None,
             package_name: "mylib".to_string(),
@@ -1580,8 +1587,14 @@ mod tests {
         let entry = build_npm_version_entry(&info);
         assert_eq!(entry["name"], "mylib");
         assert_eq!(entry["version"], "1.0.0");
-        assert!(entry["dist"]["tarball"].as_str().unwrap().contains("mylib-1.0.0.tgz"));
-        assert!(entry["dist"]["integrity"].as_str().unwrap().starts_with("sha256-"));
+        assert!(entry["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .contains("mylib-1.0.0.tgz"));
+        assert!(entry["dist"]["integrity"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256-"));
     }
 
     #[test]
@@ -1593,7 +1606,8 @@ mod tests {
         let info = NpmArtifactInfo {
             version: "2.0.0".to_string(),
             filename: "pkg-2.0.0.tgz".to_string(),
-            checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             tarball_url: "http://localhost/npm/r/pkg/-/pkg-2.0.0.tgz".to_string(),
             version_metadata: Some(meta),
             package_name: "pkg".to_string(),
@@ -1614,7 +1628,8 @@ mod tests {
         let info = NpmArtifactInfo {
             version: "1.0.0".to_string(),
             filename: "pkg-1.0.0.tgz".to_string(),
-            checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
             tarball_url: "http://localhost/npm/r/pkg/-/pkg-1.0.0.tgz".to_string(),
             version_metadata: Some(meta),
             package_name: "pkg".to_string(),

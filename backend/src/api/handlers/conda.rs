@@ -1048,6 +1048,158 @@ fn bzip2_compress(data: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Extracted pure functions for testability
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for a conda package.
+pub(crate) fn build_conda_artifact_path(subdir: &str, filename: &str) -> String {
+    format!("{}/{}", subdir, filename)
+}
+
+/// Build the storage key for a conda package.
+pub(crate) fn build_conda_storage_key(
+    repo_id: &uuid::Uuid,
+    subdir: &str,
+    filename: &str,
+) -> String {
+    format!("conda/{}/{}/{}", repo_id, subdir, filename)
+}
+
+/// Return the appropriate content type for a conda package filename.
+pub(crate) fn conda_content_type(filename: &str) -> &'static str {
+    if filename.ends_with(".conda") {
+        "application/octet-stream"
+    } else if filename.ends_with(".tar.bz2") {
+        "application/x-tar"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// Build conda-specific metadata JSON.
+pub(crate) fn build_conda_metadata(
+    name: &str,
+    version: &str,
+    build_string: &str,
+    subdir: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build": build_string,
+        "build_number": 0,
+        "subdir": subdir,
+        "package_format": if filename.ends_with(".conda") { "v2" } else { "v1" },
+        "depends": [],
+    })
+}
+
+/// Build the upload response JSON.
+pub(crate) fn build_conda_upload_response(
+    name: &str,
+    version: &str,
+    build_string: &str,
+    subdir: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build": build_string,
+        "subdir": subdir,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Build a single repodata entry for a package.
+pub(crate) fn build_repodata_entry(
+    name: &str,
+    version: &str,
+    build: &str,
+    build_number: u64,
+    depends: &serde_json::Value,
+    md5: &str,
+    sha256: &str,
+    size: i64,
+    subdir: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "build": build,
+        "build_number": build_number,
+        "depends": depends,
+        "md5": md5,
+        "sha256": sha256,
+        "size": size,
+        "subdir": subdir,
+    })
+}
+
+/// Build a channeldata package entry.
+pub(crate) fn build_channeldata_package_entry(
+    subdirs: &[String],
+    version: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "subdirs": subdirs,
+        "version": version,
+    })
+}
+
+/// Build the full channeldata.json response.
+pub(crate) fn build_channeldata_json(
+    packages: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "channeldata_version": 1,
+        "packages": packages,
+        "subdirs": KNOWN_SUBDIRS,
+    })
+}
+
+/// Build the full repodata.json response for a subdir.
+pub(crate) fn build_repodata_json(
+    subdir: &str,
+    packages: &serde_json::Map<String, serde_json::Value>,
+    packages_conda: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "info": { "subdir": subdir },
+        "packages": packages,
+        "packages.conda": packages_conda,
+    })
+}
+
+/// Extract the subdir from artifact metadata or path.
+pub(crate) fn extract_subdir(metadata: Option<&serde_json::Value>, path: &str) -> String {
+    metadata
+        .and_then(|m| m.get("subdir").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            path.split('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "noarch".to_string())
+}
+
+/// Extract the package name from artifact metadata or use the artifact name.
+pub(crate) fn extract_package_name(
+    metadata: Option<&serde_json::Value>,
+    artifact_name: &str,
+) -> String {
+    metadata
+        .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| artifact_name.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1055,25 +1207,570 @@ fn bzip2_compress(data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // is_conda_package / is_conda_v2
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_is_conda_package() {
+    fn test_is_conda_package_v2() {
         assert!(is_conda_package("numpy-1.26.4-py312h02b7e37_0.conda"));
+    }
+
+    #[test]
+    fn test_is_conda_package_v1() {
         assert!(is_conda_package("requests-2.31.0-pyhd8ed1ab_0.tar.bz2"));
+    }
+
+    #[test]
+    fn test_is_conda_package_not_whl() {
         assert!(!is_conda_package("foo.whl"));
+    }
+
+    #[test]
+    fn test_is_conda_package_not_rpm() {
         assert!(!is_conda_package("bar.rpm"));
     }
 
     #[test]
-    fn test_is_conda_v2() {
+    fn test_is_conda_package_empty() {
+        assert!(!is_conda_package(""));
+    }
+
+    #[test]
+    fn test_is_conda_v2_true() {
         assert!(is_conda_v2("numpy-1.26.4-py312h02b7e37_0.conda"));
+    }
+
+    #[test]
+    fn test_is_conda_v2_false_for_tar_bz2() {
         assert!(!is_conda_v2("requests-2.31.0-pyhd8ed1ab_0.tar.bz2"));
     }
 
     #[test]
-    fn test_bzip2_compress() {
+    fn test_is_conda_v2_false_for_other() {
+        assert!(!is_conda_v2("something.zip"));
+    }
+
+    // -----------------------------------------------------------------------
+    // bzip2_compress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bzip2_compress_non_empty() {
         let data = b"test data for bzip2 compression";
         let compressed = bzip2_compress(data);
         assert!(!compressed.is_empty());
         assert_ne!(compressed.as_slice(), data);
+    }
+
+    #[test]
+    fn test_bzip2_compress_starts_with_magic() {
+        let compressed = bzip2_compress(b"hello");
+        // BZ2 magic: "BZ"
+        assert!(compressed.len() >= 2);
+        assert_eq!(compressed[0], b'B');
+        assert_eq!(compressed[1], b'Z');
+    }
+
+    #[test]
+    fn test_bzip2_compress_empty() {
+        let compressed = bzip2_compress(b"");
+        assert!(!compressed.is_empty()); // still produces valid bz2 output
+    }
+
+    // -----------------------------------------------------------------------
+    // build_conda_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_conda_artifact_path_noarch() {
+        assert_eq!(
+            build_conda_artifact_path("noarch", "requests-2.31.0-pyhd8ed1ab_0.tar.bz2"),
+            "noarch/requests-2.31.0-pyhd8ed1ab_0.tar.bz2"
+        );
+    }
+
+    #[test]
+    fn test_build_conda_artifact_path_linux64() {
+        assert_eq!(
+            build_conda_artifact_path("linux-64", "numpy-1.26.4-py312h02b7e37_0.conda"),
+            "linux-64/numpy-1.26.4-py312h02b7e37_0.conda"
+        );
+    }
+
+    #[test]
+    fn test_build_conda_artifact_path_osx_arm64() {
+        assert_eq!(
+            build_conda_artifact_path("osx-arm64", "scipy-1.11.4-py312h2b1e342_0.conda"),
+            "osx-arm64/scipy-1.11.4-py312h2b1e342_0.conda"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_conda_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_conda_storage_key_basic() {
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        assert_eq!(
+            build_conda_storage_key(&id, "noarch", "test.conda"),
+            "conda/00000000-0000-0000-0000-000000000001/noarch/test.conda"
+        );
+    }
+
+    #[test]
+    fn test_build_conda_storage_key_linux() {
+        let id = uuid::Uuid::new_v4();
+        let key = build_conda_storage_key(&id, "linux-64", "numpy.conda");
+        assert!(key.starts_with("conda/"));
+        assert!(key.contains("linux-64"));
+        assert!(key.ends_with("/numpy.conda"));
+    }
+
+    #[test]
+    fn test_build_conda_storage_key_contains_repo_id() {
+        let id = uuid::Uuid::parse_str("12345678-1234-1234-1234-123456789012").unwrap();
+        let key = build_conda_storage_key(&id, "noarch", "pkg.tar.bz2");
+        assert!(key.contains("12345678-1234-1234-1234-123456789012"));
+    }
+
+    // -----------------------------------------------------------------------
+    // conda_content_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conda_content_type_v2() {
+        assert_eq!(
+            conda_content_type("numpy.conda"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_conda_content_type_v1() {
+        assert_eq!(conda_content_type("numpy.tar.bz2"), "application/x-tar");
+    }
+
+    #[test]
+    fn test_conda_content_type_other() {
+        assert_eq!(conda_content_type("file.zip"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_conda_content_type_empty() {
+        assert_eq!(conda_content_type(""), "application/octet-stream");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_conda_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_conda_metadata_v2() {
+        let meta = build_conda_metadata(
+            "numpy",
+            "1.26.4",
+            "py312h02b7e37_0",
+            "linux-64",
+            "numpy-1.26.4-py312h02b7e37_0.conda",
+        );
+        assert_eq!(meta["name"], "numpy");
+        assert_eq!(meta["version"], "1.26.4");
+        assert_eq!(meta["build"], "py312h02b7e37_0");
+        assert_eq!(meta["build_number"], 0);
+        assert_eq!(meta["subdir"], "linux-64");
+        assert_eq!(meta["package_format"], "v2");
+    }
+
+    #[test]
+    fn test_build_conda_metadata_v1() {
+        let meta = build_conda_metadata(
+            "requests",
+            "2.31.0",
+            "pyhd8ed1ab_0",
+            "noarch",
+            "requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+        );
+        assert_eq!(meta["package_format"], "v1");
+        assert_eq!(meta["subdir"], "noarch");
+    }
+
+    #[test]
+    fn test_build_conda_metadata_has_depends() {
+        let meta = build_conda_metadata("pkg", "1.0", "0", "noarch", "pkg.conda");
+        assert!(meta["depends"].is_array());
+        assert_eq!(meta["depends"].as_array().unwrap().len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_conda_upload_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_conda_upload_response_all_fields() {
+        let resp =
+            build_conda_upload_response("numpy", "1.26.4", "py312_0", "linux-64", "abc123", 4096);
+        assert_eq!(resp["name"], "numpy");
+        assert_eq!(resp["version"], "1.26.4");
+        assert_eq!(resp["build"], "py312_0");
+        assert_eq!(resp["subdir"], "linux-64");
+        assert_eq!(resp["sha256"], "abc123");
+        assert_eq!(resp["size"], 4096);
+    }
+
+    #[test]
+    fn test_build_conda_upload_response_noarch() {
+        let resp = build_conda_upload_response(
+            "requests",
+            "2.31.0",
+            "pyhd8ed1ab_0",
+            "noarch",
+            "def456",
+            1024,
+        );
+        assert_eq!(resp["subdir"], "noarch");
+    }
+
+    #[test]
+    fn test_build_conda_upload_response_zero_size() {
+        let resp = build_conda_upload_response("pkg", "1.0", "0", "noarch", "hash", 0);
+        assert_eq!(resp["size"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_repodata_entry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_repodata_entry_all_fields() {
+        let depends = serde_json::json!(["python >=3.12", "libcblas >=3.9"]);
+        let entry = build_repodata_entry(
+            "numpy",
+            "1.26.4",
+            "py312h02b7e37_0",
+            0,
+            &depends,
+            "md5hash",
+            "sha256hash",
+            8192,
+            "linux-64",
+        );
+        assert_eq!(entry["name"], "numpy");
+        assert_eq!(entry["version"], "1.26.4");
+        assert_eq!(entry["build"], "py312h02b7e37_0");
+        assert_eq!(entry["build_number"], 0);
+        assert_eq!(entry["md5"], "md5hash");
+        assert_eq!(entry["sha256"], "sha256hash");
+        assert_eq!(entry["size"], 8192);
+        assert_eq!(entry["subdir"], "linux-64");
+        let deps = entry["depends"].as_array().unwrap();
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn test_build_repodata_entry_no_depends() {
+        let depends = serde_json::json!([]);
+        let entry = build_repodata_entry("pkg", "1.0", "0", 0, &depends, "", "sha", 100, "noarch");
+        assert!(entry["depends"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_repodata_entry_with_build_number() {
+        let depends = serde_json::json!([]);
+        let entry = build_repodata_entry("pkg", "1.0", "0", 5, &depends, "", "sha", 100, "noarch");
+        assert_eq!(entry["build_number"], 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_channeldata_package_entry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_channeldata_package_entry_basic() {
+        let subdirs = vec!["linux-64".to_string(), "noarch".to_string()];
+        let entry = build_channeldata_package_entry(&subdirs, "1.26.4");
+        assert_eq!(entry["version"], "1.26.4");
+        let sds = entry["subdirs"].as_array().unwrap();
+        assert_eq!(sds.len(), 2);
+    }
+
+    #[test]
+    fn test_build_channeldata_package_entry_single_subdir() {
+        let subdirs = vec!["noarch".to_string()];
+        let entry = build_channeldata_package_entry(&subdirs, "2.0");
+        assert_eq!(entry["subdirs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_build_channeldata_package_entry_empty_subdirs() {
+        let subdirs: Vec<String> = vec![];
+        let entry = build_channeldata_package_entry(&subdirs, "1.0");
+        assert!(entry["subdirs"].as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_channeldata_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_channeldata_json_empty() {
+        let packages = serde_json::Map::new();
+        let cd = build_channeldata_json(&packages);
+        assert_eq!(cd["channeldata_version"], 1);
+        assert!(cd["packages"].as_object().unwrap().is_empty());
+        assert!(cd["subdirs"].as_array().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn test_build_channeldata_json_with_package() {
+        let mut packages = serde_json::Map::new();
+        packages.insert(
+            "numpy".to_string(),
+            serde_json::json!({
+                "subdirs": ["linux-64"],
+                "version": "1.26.4",
+            }),
+        );
+        let cd = build_channeldata_json(&packages);
+        assert!(cd["packages"]["numpy"].is_object());
+    }
+
+    #[test]
+    fn test_build_channeldata_json_has_known_subdirs() {
+        let packages = serde_json::Map::new();
+        let cd = build_channeldata_json(&packages);
+        let subdirs = cd["subdirs"].as_array().unwrap();
+        let noarch = subdirs.iter().any(|s| s.as_str() == Some("noarch"));
+        assert!(noarch, "Known subdirs should include 'noarch'");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_repodata_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_repodata_json_empty() {
+        let packages = serde_json::Map::new();
+        let packages_conda = serde_json::Map::new();
+        let rd = build_repodata_json("linux-64", &packages, &packages_conda);
+        assert_eq!(rd["info"]["subdir"], "linux-64");
+        assert!(rd["packages"].as_object().unwrap().is_empty());
+        assert!(rd["packages.conda"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_repodata_json_with_packages() {
+        let mut packages = serde_json::Map::new();
+        packages.insert(
+            "old.tar.bz2".to_string(),
+            serde_json::json!({"name": "old"}),
+        );
+        let mut packages_conda = serde_json::Map::new();
+        packages_conda.insert("new.conda".to_string(), serde_json::json!({"name": "new"}));
+        let rd = build_repodata_json("noarch", &packages, &packages_conda);
+        assert_eq!(rd["packages"]["old.tar.bz2"]["name"], "old");
+        assert_eq!(rd["packages.conda"]["new.conda"]["name"], "new");
+    }
+
+    #[test]
+    fn test_build_repodata_json_subdir() {
+        let packages = serde_json::Map::new();
+        let packages_conda = serde_json::Map::new();
+        let rd = build_repodata_json("osx-arm64", &packages, &packages_conda);
+        assert_eq!(rd["info"]["subdir"], "osx-arm64");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_subdir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_subdir_from_metadata() {
+        let meta = serde_json::json!({"subdir": "linux-64"});
+        assert_eq!(extract_subdir(Some(&meta), "noarch/pkg.conda"), "linux-64");
+    }
+
+    #[test]
+    fn test_extract_subdir_from_path() {
+        assert_eq!(extract_subdir(None, "osx-arm64/numpy.conda"), "osx-arm64");
+    }
+
+    #[test]
+    fn test_extract_subdir_no_info() {
+        // When path is empty, default to "noarch"
+        assert_eq!(extract_subdir(None, ""), "noarch");
+    }
+
+    #[test]
+    fn test_extract_subdir_metadata_takes_priority() {
+        let meta = serde_json::json!({"subdir": "linux-64"});
+        assert_eq!(
+            extract_subdir(Some(&meta), "osx-arm64/pkg.conda"),
+            "linux-64"
+        );
+    }
+
+    #[test]
+    fn test_extract_subdir_metadata_without_subdir_key() {
+        let meta = serde_json::json!({"name": "numpy"});
+        assert_eq!(extract_subdir(Some(&meta), "win-64/pkg.conda"), "win-64");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_package_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_package_name_from_metadata() {
+        let meta = serde_json::json!({"name": "numpy"});
+        assert_eq!(extract_package_name(Some(&meta), "fallback"), "numpy");
+    }
+
+    #[test]
+    fn test_extract_package_name_no_metadata() {
+        assert_eq!(extract_package_name(None, "artifact-name"), "artifact-name");
+    }
+
+    #[test]
+    fn test_extract_package_name_metadata_without_name() {
+        let meta = serde_json::json!({"version": "1.0"});
+        assert_eq!(
+            extract_package_name(Some(&meta), "fallback-name"),
+            "fallback-name"
+        );
+    }
+
+    #[test]
+    fn test_extract_package_name_empty_metadata() {
+        let meta = serde_json::json!({});
+        assert_eq!(extract_package_name(Some(&meta), "name"), "name");
+    }
+
+    // -----------------------------------------------------------------------
+    // artifacts_for_subdir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifacts_for_subdir_by_metadata() {
+        let artifacts = vec![
+            CondaArtifact {
+                id: uuid::Uuid::new_v4(),
+                path: "linux-64/numpy.conda".to_string(),
+                name: "numpy".to_string(),
+                version: Some("1.26.4".to_string()),
+                size_bytes: 1024,
+                checksum_sha256: "abc".to_string(),
+                storage_key: "key1".to_string(),
+                metadata: Some(serde_json::json!({"subdir": "linux-64"})),
+            },
+            CondaArtifact {
+                id: uuid::Uuid::new_v4(),
+                path: "noarch/requests.conda".to_string(),
+                name: "requests".to_string(),
+                version: Some("2.31.0".to_string()),
+                size_bytes: 512,
+                checksum_sha256: "def".to_string(),
+                storage_key: "key2".to_string(),
+                metadata: Some(serde_json::json!({"subdir": "noarch"})),
+            },
+        ];
+        let filtered = artifacts_for_subdir(&artifacts, "linux-64");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "numpy");
+    }
+
+    #[test]
+    fn test_artifacts_for_subdir_by_path_prefix() {
+        let artifacts = vec![CondaArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "osx-arm64/scipy.conda".to_string(),
+            name: "scipy".to_string(),
+            version: Some("1.0".to_string()),
+            size_bytes: 256,
+            checksum_sha256: "ghi".to_string(),
+            storage_key: "key3".to_string(),
+            metadata: None,
+        }];
+        let filtered = artifacts_for_subdir(&artifacts, "osx-arm64");
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_artifacts_for_subdir_empty() {
+        let artifacts: Vec<CondaArtifact> = vec![];
+        let filtered = artifacts_for_subdir(&artifacts, "noarch");
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_artifacts_for_subdir_no_match() {
+        let artifacts = vec![CondaArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "linux-64/pkg.conda".to_string(),
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            size_bytes: 100,
+            checksum_sha256: "x".to_string(),
+            storage_key: "k".to_string(),
+            metadata: Some(serde_json::json!({"subdir": "linux-64"})),
+        }];
+        let filtered = artifacts_for_subdir(&artifacts, "win-64");
+        assert!(filtered.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // KNOWN_SUBDIRS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_known_subdirs_contains_noarch() {
+        assert!(KNOWN_SUBDIRS.contains(&"noarch"));
+    }
+
+    #[test]
+    fn test_known_subdirs_contains_linux64() {
+        assert!(KNOWN_SUBDIRS.contains(&"linux-64"));
+    }
+
+    #[test]
+    fn test_known_subdirs_contains_osx_arm64() {
+        assert!(KNOWN_SUBDIRS.contains(&"osx-arm64"));
+    }
+
+    #[test]
+    fn test_known_subdirs_count() {
+        assert!(KNOWN_SUBDIRS.len() >= 9);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_basic_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_basic_credentials_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().unwrap(),
+        );
+        let result = extract_basic_credentials(&headers);
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_no_header() {
+        let headers = HeaderMap::new();
+        assert!(extract_basic_credentials(&headers).is_none());
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_bearer_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer token".parse().unwrap(),
+        );
+        assert!(extract_basic_credentials(&headers).is_none());
     }
 }

@@ -721,10 +721,7 @@ mod tests {
             HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
         );
         let creds = extract_credentials(&headers);
-        assert_eq!(
-            creds,
-            Some(("admin".to_string(), "secret".to_string()))
-        );
+        assert_eq!(creds, Some(("admin".to_string(), "secret".to_string())));
     }
 
     #[test]
@@ -792,7 +789,10 @@ mod tests {
 
     #[test]
     fn test_build_extension_id() {
-        assert_eq!(build_extension_id("ms-python", "python"), "ms-python.python");
+        assert_eq!(
+            build_extension_id("ms-python", "python"),
+            "ms-python.python"
+        );
     }
 
     #[test]

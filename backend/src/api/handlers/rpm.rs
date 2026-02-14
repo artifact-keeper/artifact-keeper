@@ -1089,12 +1089,104 @@ fn xml_escape(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Extracted pure functions for testability
+// ---------------------------------------------------------------------------
+
+/// Build the artifact path for an RPM package.
+pub(crate) fn build_rpm_artifact_path(filename: &str) -> String {
+    format!("packages/{}", filename)
+}
+
+/// Build the storage key for an RPM package.
+pub(crate) fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
+    format!("rpm/{}/{}", repo_id, filename)
+}
+
+/// Build the full version string from version and release.
+pub(crate) fn build_rpm_full_version(version: &str, release: &str) -> String {
+    format!("{}-{}", version, release)
+}
+
+/// Build RPM-specific metadata JSON.
+pub(crate) fn build_rpm_metadata(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    filename: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "filename": filename,
+    })
+}
+
+/// Build the upload response JSON.
+pub(crate) fn build_rpm_upload_response(
+    name: &str,
+    version: &str,
+    release: &str,
+    arch: &str,
+    sha256: &str,
+    size: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "release": release,
+        "arch": arch,
+        "sha256": sha256,
+        "size": size,
+    })
+}
+
+/// Extract RPM filename from headers, falling back to a hash-based name.
+pub(crate) fn extract_rpm_filename(headers: &HeaderMap, body_hash: &str) -> String {
+    headers
+        .get("Content-Disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split("filename=")
+                .nth(1)
+                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("X-Package-Filename")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| format!("{}.rpm", &body_hash[..16]))
+}
+
+/// Wrap a base64-encoded signature in PGP armor format.
+pub(crate) fn pgp_armor_signature(b64: &str) -> String {
+    let wrapped: Vec<&str> = b64
+        .as_bytes()
+        .chunks(76)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect();
+    format!(
+        "-----BEGIN PGP SIGNATURE-----\n\n{}\n-----END PGP SIGNATURE-----\n",
+        wrapped.join("\n"),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
+    // -----------------------------------------------------------------------
+    // parse_rpm_filename
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_parse_rpm_filename_standard() {
@@ -1146,7 +1238,30 @@ mod tests {
     }
 
     #[test]
-    fn test_xml_escape() {
+    fn test_parse_rpm_filename_src_rpm() {
+        // Source RPMs still have .rpm extension in this parser
+        let result = parse_rpm_filename("kernel-5.14.0-284.el9.src.rpm");
+        assert!(result.is_some());
+        let (name, version, release, arch) = result.unwrap();
+        assert_eq!(name, "kernel");
+        assert_eq!(version, "5.14.0");
+        assert_eq!(release, "284.el9");
+        assert_eq!(arch, "src");
+    }
+
+    #[test]
+    fn test_parse_rpm_filename_single_char_name() {
+        let result = parse_rpm_filename("a-1.0-1.x86_64.rpm");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "a");
+    }
+
+    // -----------------------------------------------------------------------
+    // xml_escape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xml_escape_all_entities() {
         assert_eq!(
             xml_escape("a<b>c&d\"e'f"),
             "a&lt;b&gt;c&amp;d&quot;e&apos;f"
@@ -1154,20 +1269,66 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_primary_xml_empty() {
-        let xml = generate_primary_xml(&[]);
-        assert!(xml.contains("packages=\"0\""));
-        assert!(xml.contains("</metadata>"));
+    fn test_xml_escape_no_special_chars() {
+        assert_eq!(xml_escape("hello world"), "hello world");
     }
 
     #[test]
-    fn test_sha256_hex() {
+    fn test_xml_escape_empty_string() {
+        assert_eq!(xml_escape(""), "");
+    }
+
+    #[test]
+    fn test_xml_escape_ampersand_first() {
+        // Verify & is escaped before other entities to avoid double-escaping
+        assert_eq!(xml_escape("&"), "&amp;");
+        assert_eq!(xml_escape("&&"), "&amp;&amp;");
+    }
+
+    #[test]
+    fn test_xml_escape_all_ampersands() {
+        assert_eq!(xml_escape("a&b&c"), "a&amp;b&amp;c");
+    }
+
+    // -----------------------------------------------------------------------
+    // sha256_hex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sha256_hex_known_value() {
         let hash = sha256_hex(b"hello");
         assert_eq!(
             hash,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
+
+    #[test]
+    fn test_sha256_hex_empty() {
+        let hash = sha256_hex(b"");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn test_sha256_hex_length() {
+        let hash = sha256_hex(b"anything");
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_sha256_hex_deterministic() {
+        let h1 = sha256_hex(b"test");
+        let h2 = sha256_hex(b"test");
+        assert_eq!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // gzip_bytes
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_gzip_roundtrip() {
@@ -1183,5 +1344,450 @@ mod tests {
         let mut decompressed = String::new();
         decoder.read_to_string(&mut decompressed).unwrap();
         assert_eq!(decompressed.as_bytes(), original);
+    }
+
+    #[test]
+    fn test_gzip_bytes_empty_input() {
+        let compressed = gzip_bytes(b"");
+        assert!(!compressed.is_empty()); // gzip header still present
+    }
+
+    #[test]
+    fn test_gzip_bytes_starts_with_gzip_magic() {
+        let compressed = gzip_bytes(b"hello");
+        assert!(compressed.len() >= 2);
+        assert_eq!(compressed[0], 0x1f);
+        assert_eq!(compressed[1], 0x8b);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rpm_artifact_path_basic() {
+        assert_eq!(
+            build_rpm_artifact_path("my-package-1.0.0-1.x86_64.rpm"),
+            "packages/my-package-1.0.0-1.x86_64.rpm"
+        );
+    }
+
+    #[test]
+    fn test_build_rpm_artifact_path_simple() {
+        assert_eq!(build_rpm_artifact_path("hello.rpm"), "packages/hello.rpm");
+    }
+
+    #[test]
+    fn test_build_rpm_artifact_path_complex() {
+        assert_eq!(
+            build_rpm_artifact_path("glibc-2.34-60.el9.aarch64.rpm"),
+            "packages/glibc-2.34-60.el9.aarch64.rpm"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_storage_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rpm_storage_key_basic() {
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        assert_eq!(
+            build_rpm_storage_key(&id, "pkg-1.0-1.x86_64.rpm"),
+            "rpm/00000000-0000-0000-0000-000000000001/pkg-1.0-1.x86_64.rpm"
+        );
+    }
+
+    #[test]
+    fn test_build_rpm_storage_key_different_uuid() {
+        let id = uuid::Uuid::new_v4();
+        let key = build_rpm_storage_key(&id, "test.rpm");
+        assert!(key.starts_with("rpm/"));
+        assert!(key.ends_with("/test.rpm"));
+        assert!(key.contains(&id.to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_full_version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rpm_full_version_basic() {
+        assert_eq!(build_rpm_full_version("1.0.0", "1"), "1.0.0-1");
+    }
+
+    #[test]
+    fn test_build_rpm_full_version_with_el() {
+        assert_eq!(build_rpm_full_version("2.10", "1.el8"), "2.10-1.el8");
+    }
+
+    #[test]
+    fn test_build_rpm_full_version_complex() {
+        assert_eq!(
+            build_rpm_full_version("5.14.0", "284.30.1.el9_2"),
+            "5.14.0-284.30.1.el9_2"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rpm_metadata_all_fields() {
+        let meta = build_rpm_metadata("my-pkg", "1.0", "1", "x86_64", "my-pkg-1.0-1.x86_64.rpm");
+        assert_eq!(meta["name"], "my-pkg");
+        assert_eq!(meta["version"], "1.0");
+        assert_eq!(meta["release"], "1");
+        assert_eq!(meta["arch"], "x86_64");
+        assert_eq!(meta["filename"], "my-pkg-1.0-1.x86_64.rpm");
+    }
+
+    #[test]
+    fn test_build_rpm_metadata_noarch() {
+        let meta = build_rpm_metadata(
+            "python-six",
+            "1.16.0",
+            "1.el9",
+            "noarch",
+            "python-six-1.16.0-1.el9.noarch.rpm",
+        );
+        assert_eq!(meta["arch"], "noarch");
+    }
+
+    #[test]
+    fn test_build_rpm_metadata_is_valid_json() {
+        let meta = build_rpm_metadata("a", "b", "c", "d", "e");
+        let s = serde_json::to_string(&meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(parsed.is_object());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rpm_upload_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rpm_upload_response_all_fields() {
+        let resp = build_rpm_upload_response("pkg", "1.0", "1", "x86_64", "abc123", 1024);
+        assert_eq!(resp["name"], "pkg");
+        assert_eq!(resp["version"], "1.0");
+        assert_eq!(resp["release"], "1");
+        assert_eq!(resp["arch"], "x86_64");
+        assert_eq!(resp["sha256"], "abc123");
+        assert_eq!(resp["size"], 1024);
+    }
+
+    #[test]
+    fn test_build_rpm_upload_response_zero_size() {
+        let resp = build_rpm_upload_response("pkg", "1.0", "1", "noarch", "def", 0);
+        assert_eq!(resp["size"], 0);
+    }
+
+    #[test]
+    fn test_build_rpm_upload_response_large_size() {
+        let resp = build_rpm_upload_response("big", "1.0", "1", "x86_64", "hash", 1_073_741_824);
+        assert_eq!(resp["size"], 1_073_741_824i64);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_rpm_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_rpm_filename_from_content_disposition() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Disposition",
+            HeaderValue::from_static("attachment; filename=my-pkg-1.0-1.x86_64.rpm"),
+        );
+        assert_eq!(
+            extract_rpm_filename(&headers, "somehash1234567890"),
+            "my-pkg-1.0-1.x86_64.rpm"
+        );
+    }
+
+    #[test]
+    fn test_extract_rpm_filename_from_x_package_filename() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Package-Filename",
+            HeaderValue::from_static("custom-name.rpm"),
+        );
+        assert_eq!(
+            extract_rpm_filename(&headers, "somehash1234567890"),
+            "custom-name.rpm"
+        );
+    }
+
+    #[test]
+    fn test_extract_rpm_filename_fallback_to_hash() {
+        let headers = HeaderMap::new();
+        let result = extract_rpm_filename(&headers, "abcdef1234567890abcdef");
+        assert_eq!(result, "abcdef1234567890.rpm");
+    }
+
+    #[test]
+    fn test_extract_rpm_filename_content_disposition_priority() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Disposition",
+            HeaderValue::from_static("attachment; filename=from-cd.rpm"),
+        );
+        headers.insert(
+            "X-Package-Filename",
+            HeaderValue::from_static("from-header.rpm"),
+        );
+        // Content-Disposition has priority
+        assert_eq!(extract_rpm_filename(&headers, "hash"), "from-cd.rpm");
+    }
+
+    #[test]
+    fn test_extract_rpm_filename_quoted_filename() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Disposition",
+            HeaderValue::from_static("attachment; filename=\"quoted.rpm\""),
+        );
+        assert_eq!(
+            extract_rpm_filename(&headers, "hash1234567890123456"),
+            "quoted.rpm"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // pgp_armor_signature
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pgp_armor_signature_basic() {
+        let armored = pgp_armor_signature("dGVzdA==");
+        assert!(armored.starts_with("-----BEGIN PGP SIGNATURE-----"));
+        assert!(armored.ends_with("-----END PGP SIGNATURE-----\n"));
+        assert!(armored.contains("dGVzdA=="));
+    }
+
+    #[test]
+    fn test_pgp_armor_signature_wrapping() {
+        // Create a long base64 string that exceeds 76 chars
+        let long_b64 = "A".repeat(200);
+        let armored = pgp_armor_signature(&long_b64);
+        // Each line in the body should be at most 76 characters
+        let body = armored
+            .strip_prefix("-----BEGIN PGP SIGNATURE-----\n\n")
+            .unwrap()
+            .strip_suffix("\n-----END PGP SIGNATURE-----\n")
+            .unwrap();
+        for line in body.lines() {
+            assert!(line.len() <= 76, "Line exceeds 76 chars: {}", line);
+        }
+    }
+
+    #[test]
+    fn test_pgp_armor_signature_empty() {
+        let armored = pgp_armor_signature("");
+        assert!(armored.contains("-----BEGIN PGP SIGNATURE-----"));
+        assert!(armored.contains("-----END PGP SIGNATURE-----"));
+    }
+
+    #[test]
+    fn test_pgp_armor_signature_short() {
+        let armored = pgp_armor_signature("YQ==");
+        assert!(armored.contains("YQ=="));
+    }
+
+    // -----------------------------------------------------------------------
+    // XML generation helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_primary_xml_empty() {
+        let xml = generate_primary_xml(&[]);
+        assert!(xml.contains("packages=\"0\""));
+        assert!(xml.contains("</metadata>"));
+        assert!(xml.contains("xmlns=\"http://linux.duke.edu/metadata/common\""));
+    }
+
+    #[test]
+    fn test_generate_primary_xml_with_artifact() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/test-1.0-1.x86_64.rpm".to_string(),
+            name: "test".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 1024,
+            checksum_sha256: "abc123".to_string(),
+            storage_key: "rpm/1/test-1.0-1.x86_64.rpm".to_string(),
+            metadata: Some(serde_json::json!({
+                "name": "test",
+                "version": "1.0",
+                "release": "1",
+                "arch": "x86_64",
+            })),
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(xml.contains("packages=\"1\""));
+        assert!(xml.contains("<name>test</name>"));
+        assert!(xml.contains("ver=\"1.0\""));
+        assert!(xml.contains("rel=\"1\""));
+        assert!(xml.contains("<arch>x86_64</arch>"));
+    }
+
+    #[test]
+    fn test_generate_primary_xml_escapes_special_chars() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/test-1.0-1.x86_64.rpm".to_string(),
+            name: "test<pkg>".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 512,
+            checksum_sha256: "def456".to_string(),
+            storage_key: "rpm/1/test.rpm".to_string(),
+            metadata: Some(serde_json::json!({
+                "name": "test<pkg>",
+                "version": "1.0",
+                "release": "1",
+                "arch": "x86_64",
+            })),
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        assert!(xml.contains("test&lt;pkg&gt;"));
+    }
+
+    #[test]
+    fn test_generate_filelists_xml_empty() {
+        let xml = generate_filelists_xml(&[]);
+        assert!(xml.contains("packages=\"0\""));
+        assert!(xml.contains("</filelists>"));
+    }
+
+    #[test]
+    fn test_generate_filelists_xml_with_artifact() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/hello-1.0-1.noarch.rpm".to_string(),
+            name: "hello".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: 256,
+            checksum_sha256: "sha256hash".to_string(),
+            storage_key: "rpm/1/hello.rpm".to_string(),
+            metadata: Some(serde_json::json!({
+                "name": "hello",
+                "version": "1.0",
+                "release": "1",
+                "arch": "noarch",
+            })),
+        }];
+        let xml = generate_filelists_xml(&artifacts);
+        assert!(xml.contains("packages=\"1\""));
+        assert!(xml.contains("name=\"hello\""));
+        assert!(xml.contains("arch=\"noarch\""));
+    }
+
+    #[test]
+    fn test_generate_other_xml_empty() {
+        let xml = generate_other_xml(&[]);
+        assert!(xml.contains("packages=\"0\""));
+        assert!(xml.contains("</otherdata>"));
+    }
+
+    #[test]
+    fn test_generate_other_xml_with_artifact() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/util-2.0-3.el9.x86_64.rpm".to_string(),
+            name: "util".to_string(),
+            version: Some("2.0-3".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "otherhash".to_string(),
+            storage_key: "rpm/1/util.rpm".to_string(),
+            metadata: Some(serde_json::json!({
+                "name": "util",
+                "version": "2.0",
+                "release": "3.el9",
+                "arch": "x86_64",
+            })),
+        }];
+        let xml = generate_other_xml(&artifacts);
+        assert!(xml.contains("packages=\"1\""));
+        assert!(xml.contains("name=\"util\""));
+    }
+
+    #[test]
+    fn test_generate_updateinfo_xml() {
+        let xml = generate_updateinfo_xml();
+        assert!(xml.contains("<updates></updates>"));
+        assert!(xml.contains("<?xml version=\"1.0\""));
+    }
+
+    #[test]
+    fn test_generate_repomd_xml_content_empty() {
+        let xml = generate_repomd_xml_content(&[]);
+        assert!(xml.contains("<repomd"));
+        assert!(xml.contains("</repomd>"));
+        assert!(xml.contains("type=\"primary\""));
+        assert!(xml.contains("type=\"filelists\""));
+        assert!(xml.contains("type=\"other\""));
+        assert!(xml.contains("type=\"updateinfo\""));
+        assert!(xml.contains("checksum type=\"sha256\""));
+    }
+
+    #[test]
+    fn test_generate_repomd_xml_content_has_sizes() {
+        let xml = generate_repomd_xml_content(&[]);
+        assert!(xml.contains("<size>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Primary XML with no metadata falls back to filename parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_primary_xml_no_metadata_fallback() {
+        let artifacts = vec![RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: "packages/curl-7.88.1-8.el9.x86_64.rpm".to_string(),
+            name: "curl".to_string(),
+            version: Some("7.88.1-8".to_string()),
+            size_bytes: 2048,
+            checksum_sha256: "fallbackhash".to_string(),
+            storage_key: "rpm/1/curl.rpm".to_string(),
+            metadata: None,
+        }];
+        let xml = generate_primary_xml(&artifacts);
+        // Falls back to parse_rpm_filename from the path
+        assert!(xml.contains("<name>curl</name>"));
+        assert!(xml.contains("ver=\"7.88.1\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_basic_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_basic_credentials_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        let result = extract_basic_credentials(&headers);
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_no_header() {
+        let headers = HeaderMap::new();
+        assert!(extract_basic_credentials(&headers).is_none());
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_bearer_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token123"),
+        );
+        assert!(extract_basic_credentials(&headers).is_none());
     }
 }

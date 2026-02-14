@@ -1107,10 +1107,7 @@ mod tests {
             HeaderValue::from_static("bearer my-token"),
         );
         let result = extract_token(&headers);
-        assert_eq!(
-            result,
-            Some(("cargo".to_string(), "my-token".to_string()))
-        );
+        assert_eq!(result, Some(("cargo".to_string(), "my-token".to_string())));
     }
 
     #[test]
@@ -1137,10 +1134,7 @@ mod tests {
             HeaderValue::from_static("Bearer "),
         );
         let result = extract_token(&headers);
-        assert_eq!(
-            result,
-            Some(("cargo".to_string(), "".to_string()))
-        );
+        assert_eq!(result, Some(("cargo".to_string(), "".to_string())));
     }
 
     // -----------------------------------------------------------------------
@@ -1168,8 +1162,7 @@ mod tests {
 
         let body = Bytes::from(payload);
 
-        let json_len_parsed =
-            u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        let json_len_parsed = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
         assert_eq!(json_len_parsed, 7);
 
         let json_bytes = &body[4..4 + json_len_parsed];
@@ -1218,8 +1211,7 @@ mod tests {
         let jl = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
         assert!(body.len() >= 4 + jl + 4);
 
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&body[4..4 + jl]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body[4..4 + jl]).unwrap();
         assert_eq!(parsed["name"], "my-crate");
         assert_eq!(parsed["vers"], "0.1.0");
 

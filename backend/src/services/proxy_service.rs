@@ -907,7 +907,10 @@ mod tests {
 
     #[test]
     fn test_parse_cache_ttl_invalid() {
-        assert_eq!(parse_cache_ttl(Some("not-a-number")), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(
+            parse_cache_ttl(Some("not-a-number")),
+            DEFAULT_CACHE_TTL_SECS
+        );
     }
 
     #[test]

@@ -1009,6 +1009,160 @@ impl PluginService {
     }
 }
 
+// =========================================================================
+// Extracted pure functions (testable without DB or async)
+// =========================================================================
+
+/// Extract webhook URL from plugin config and hook handler name.
+/// Checks in order: handler-specific URL, global webhook_url, global url.
+pub(crate) fn resolve_webhook_url(
+    config: Option<&serde_json::Value>,
+    handler_name: &str,
+) -> Option<String> {
+    let config = config?;
+
+    // Try handler-specific URL: { "hooks": { "handler_name": { "url": "..." } } }
+    if let Some(url) = config
+        .get("hooks")
+        .and_then(|h| h.get(handler_name))
+        .and_then(|h| h.get("url"))
+        .and_then(|u| u.as_str())
+    {
+        return Some(url.to_string());
+    }
+
+    // Try global webhook URL: { "webhook_url": "..." }
+    if let Some(url) = config.get("webhook_url").and_then(|u| u.as_str()) {
+        return Some(url.to_string());
+    }
+
+    // Try just "url": { "url": "..." }
+    config
+        .get("url")
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Extract validator URL from plugin config and hook handler name.
+/// Checks handler-specific validator_url first, then global validator_url.
+pub(crate) fn resolve_validator_url(
+    config: Option<&serde_json::Value>,
+    handler_name: &str,
+) -> Option<String> {
+    let config = config?;
+
+    // Try handler-specific validator URL
+    if let Some(url) = config
+        .get("hooks")
+        .and_then(|h| h.get(handler_name))
+        .and_then(|h| h.get("validator_url"))
+        .and_then(|u| u.as_str())
+    {
+        return Some(url.to_string());
+    }
+
+    // Try global validator URL
+    config
+        .get("validator_url")
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Run config-based validation rules against artifact info.
+/// Returns `None` if all rules pass, or `Some(ValidatorResult)` with rejection details.
+pub(crate) fn evaluate_config_rules(
+    config: Option<&serde_json::Value>,
+    artifact_info: &ArtifactInfo,
+) -> Option<ValidatorResult> {
+    let config = config?;
+    let rules = config.get("rules")?;
+
+    // Check max file size rule
+    if let Some(max_size) = rules.get("max_size_bytes").and_then(|v| v.as_i64()) {
+        if artifact_info.size_bytes > max_size {
+            return Some(ValidatorResult {
+                accept: false,
+                reason: Some(format!(
+                    "File size {} exceeds maximum allowed {}",
+                    artifact_info.size_bytes, max_size
+                )),
+            });
+        }
+    }
+
+    // Check allowed content types
+    if let Some(allowed_types) = rules
+        .get("allowed_content_types")
+        .and_then(|v| v.as_array())
+    {
+        let types: Vec<&str> = allowed_types.iter().filter_map(|v| v.as_str()).collect();
+        if !types.is_empty()
+            && !types
+                .iter()
+                .any(|t| artifact_info.content_type.starts_with(t))
+        {
+            return Some(ValidatorResult {
+                accept: false,
+                reason: Some(format!(
+                    "Content type '{}' not allowed. Allowed: {:?}",
+                    artifact_info.content_type, types
+                )),
+            });
+        }
+    }
+
+    // Check blocked content types
+    if let Some(blocked_types) = rules
+        .get("blocked_content_types")
+        .and_then(|v| v.as_array())
+    {
+        let types: Vec<&str> = blocked_types.iter().filter_map(|v| v.as_str()).collect();
+        if types
+            .iter()
+            .any(|t| artifact_info.content_type.starts_with(t))
+        {
+            return Some(ValidatorResult {
+                accept: false,
+                reason: Some(format!(
+                    "Content type '{}' is blocked",
+                    artifact_info.content_type
+                )),
+            });
+        }
+    }
+
+    // Check path patterns (blocked paths)
+    if let Some(blocked_paths) = rules
+        .get("blocked_path_patterns")
+        .and_then(|v| v.as_array())
+    {
+        for pattern in blocked_paths.iter().filter_map(|v| v.as_str()) {
+            if artifact_info.path.contains(pattern) {
+                return Some(ValidatorResult {
+                    accept: false,
+                    reason: Some(format!(
+                        "Path '{}' matches blocked pattern '{}'",
+                        artifact_info.path, pattern
+                    )),
+                });
+            }
+        }
+    }
+
+    // All rules passed
+    None
+}
+
+/// Check if a plugin event type is a "before" event (should block on failure).
+pub(crate) fn is_blocking_event(event: PluginEventType) -> bool {
+    matches!(
+        event,
+        PluginEventType::BeforeUpload
+            | PluginEventType::BeforeDownload
+            | PluginEventType::BeforeDelete
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1267,24 +1421,6 @@ mod tests {
     // run_config_rules: test the config-based validation logic
     // -----------------------------------------------------------------------
 
-    fn make_test_plugin_service() -> PluginService {
-        use std::collections::HashMap;
-        // We can't create a real PluginService without a PgPool,
-        // but we can test run_config_rules by using with_client + a fake pool.
-        // However, run_config_rules doesn't use db, so we test the logic directly
-        // by constructing the necessary structures.
-        // We only need &self, which is just for method dispatch.
-        // For testing, we'll use a workaround.
-
-        // Actually, since run_config_rules is &self and only reads plugin.config,
-        // we can't call it without an instance. But we CAN test the pure logic
-        // by constructing a Plugin and ArtifactInfo and calling the method.
-
-        // We need a PgPool - but we can create a mock approach.
-        // Instead, let's test the config rules logic inline.
-        unreachable!("Helper not directly usable; see individual tests below")
-    }
-
     fn make_artifact_info(size: i64, content_type: &str, path: &str) -> ArtifactInfo {
         ArtifactInfo {
             id: Uuid::new_v4(),
@@ -1340,265 +1476,131 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // get_webhook_url: logic tests
+    // resolve_webhook_url (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_get_webhook_url_no_config() {
-        // Test the logic of webhook URL extraction from config directly.
-        let plugin = make_plugin_with_config(serde_json::json!({}));
-        assert!(plugin.config.is_some());
-
-        // Test config parsing for webhook URL extraction
-        let config = plugin.config.as_ref().unwrap();
-        let url = config.get("webhook_url").and_then(|u| u.as_str());
-        assert!(url.is_none());
+    fn test_resolve_webhook_url_none_config() {
+        assert_eq!(resolve_webhook_url(None, "handler"), None);
     }
 
     #[test]
-    fn test_webhook_url_from_config_global() {
+    fn test_resolve_webhook_url_empty_config() {
+        let config = serde_json::json!({});
+        assert_eq!(resolve_webhook_url(Some(&config), "handler"), None);
+    }
+
+    #[test]
+    fn test_resolve_webhook_url_global_webhook_url() {
         let config = serde_json::json!({
             "webhook_url": "https://example.com/webhook"
         });
-        let url = config
-            .get("webhook_url")
-            .and_then(|u| u.as_str())
-            .map(String::from);
-        assert_eq!(url, Some("https://example.com/webhook".to_string()));
-    }
-
-    #[test]
-    fn test_webhook_url_from_config_handler_specific() {
-        let handler_name = "before_upload_handler";
-        let config = serde_json::json!({
-            "hooks": {
-                "before_upload_handler": {
-                    "url": "https://example.com/specific-hook"
-                }
-            }
-        });
-        let url = config
-            .get("hooks")
-            .and_then(|h| h.get(handler_name))
-            .and_then(|h| h.get("url"))
-            .and_then(|u| u.as_str())
-            .map(String::from);
         assert_eq!(
-            url,
-            Some("https://example.com/specific-hook".to_string())
+            resolve_webhook_url(Some(&config), "handler"),
+            Some("https://example.com/webhook".to_string())
         );
     }
 
     #[test]
-    fn test_webhook_url_from_config_url_key() {
+    fn test_resolve_webhook_url_global_url_key() {
         let config = serde_json::json!({
             "url": "https://example.com/url-key"
         });
-        let url = config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(String::from);
-        assert_eq!(url, Some("https://example.com/url-key".to_string()));
-    }
-
-    // -----------------------------------------------------------------------
-    // run_config_rules: logic tests (testing the actual logic directly)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_config_rules_max_size_exceeds() {
-        let config = serde_json::json!({
-            "rules": {
-                "max_size_bytes": 1000
-            }
-        });
-        let artifact_info = make_artifact_info(2000, "application/jar", "test/path");
-
-        let rules = config.get("rules").unwrap();
-        let max_size = rules.get("max_size_bytes").and_then(|v| v.as_i64());
-        assert_eq!(max_size, Some(1000));
-        assert!(artifact_info.size_bytes > max_size.unwrap());
-    }
-
-    #[test]
-    fn test_config_rules_max_size_within_limit() {
-        let config = serde_json::json!({
-            "rules": {
-                "max_size_bytes": 5000
-            }
-        });
-        let artifact_info = make_artifact_info(1000, "application/jar", "test/path");
-
-        let rules = config.get("rules").unwrap();
-        let max_size = rules.get("max_size_bytes").and_then(|v| v.as_i64()).unwrap();
-        assert!(artifact_info.size_bytes <= max_size);
-    }
-
-    #[test]
-    fn test_config_rules_allowed_content_types_match() {
-        let config = serde_json::json!({
-            "rules": {
-                "allowed_content_types": ["application/java-archive", "application/zip"]
-            }
-        });
-        let artifact_info =
-            make_artifact_info(100, "application/java-archive", "test/path");
-
-        let rules = config.get("rules").unwrap();
-        let allowed_types = rules
-            .get("allowed_content_types")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        let types: Vec<&str> = allowed_types
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(types
-            .iter()
-            .any(|t| artifact_info.content_type.starts_with(t)));
-    }
-
-    #[test]
-    fn test_config_rules_allowed_content_types_no_match() {
-        let config = serde_json::json!({
-            "rules": {
-                "allowed_content_types": ["application/java-archive"]
-            }
-        });
-        let artifact_info = make_artifact_info(100, "text/plain", "test/path");
-
-        let rules = config.get("rules").unwrap();
-        let allowed_types = rules
-            .get("allowed_content_types")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        let types: Vec<&str> = allowed_types
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(!types
-            .iter()
-            .any(|t| artifact_info.content_type.starts_with(t)));
-    }
-
-    #[test]
-    fn test_config_rules_blocked_content_types() {
-        let config = serde_json::json!({
-            "rules": {
-                "blocked_content_types": ["text/html", "application/javascript"]
-            }
-        });
-        let artifact_info = make_artifact_info(100, "text/html", "test/path");
-
-        let rules = config.get("rules").unwrap();
-        let blocked_types = rules
-            .get("blocked_content_types")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        let types: Vec<&str> = blocked_types
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(types
-            .iter()
-            .any(|t| artifact_info.content_type.starts_with(t)));
-    }
-
-    #[test]
-    fn test_config_rules_blocked_path_patterns() {
-        let config = serde_json::json!({
-            "rules": {
-                "blocked_path_patterns": ["SNAPSHOT", "internal/"]
-            }
-        });
-        let artifact_info = make_artifact_info(
-            100,
-            "application/jar",
-            "com/example/lib/1.0-SNAPSHOT/lib.jar",
+        assert_eq!(
+            resolve_webhook_url(Some(&config), "handler"),
+            Some("https://example.com/url-key".to_string())
         );
-
-        let rules = config.get("rules").unwrap();
-        let blocked_paths = rules
-            .get("blocked_path_patterns")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        let patterns: Vec<&str> = blocked_paths
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        let matches = patterns.iter().any(|p| artifact_info.path.contains(p));
-        assert!(matches, "SNAPSHOT should match the blocked pattern");
     }
 
     #[test]
-    fn test_config_rules_blocked_path_patterns_no_match() {
+    fn test_resolve_webhook_url_handler_specific() {
         let config = serde_json::json!({
-            "rules": {
-                "blocked_path_patterns": ["SNAPSHOT"]
+            "hooks": {
+                "before_upload_handler": {
+                    "url": "https://example.com/specific"
+                }
             }
         });
-        let artifact_info = make_artifact_info(
-            100,
-            "application/jar",
-            "com/example/lib/1.0/lib.jar",
+        assert_eq!(
+            resolve_webhook_url(Some(&config), "before_upload_handler"),
+            Some("https://example.com/specific".to_string())
         );
-
-        let rules = config.get("rules").unwrap();
-        let blocked_paths = rules
-            .get("blocked_path_patterns")
-            .and_then(|v| v.as_array())
-            .unwrap();
-        let patterns: Vec<&str> = blocked_paths
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        let matches = patterns.iter().any(|p| artifact_info.path.contains(p));
-        assert!(!matches);
     }
 
     #[test]
-    fn test_config_rules_no_rules_section() {
+    fn test_resolve_webhook_url_handler_specific_overrides_global() {
         let config = serde_json::json!({
-            "webhook_url": "https://example.com"
+            "webhook_url": "https://example.com/global",
+            "hooks": {
+                "my_handler": {
+                    "url": "https://example.com/override"
+                }
+            }
         });
-        let rules = config.get("rules");
-        assert!(rules.is_none());
+        assert_eq!(
+            resolve_webhook_url(Some(&config), "my_handler"),
+            Some("https://example.com/override".to_string())
+        );
     }
 
     #[test]
-    fn test_config_rules_empty_rules() {
+    fn test_resolve_webhook_url_handler_not_matched_falls_through() {
         let config = serde_json::json!({
-            "rules": {}
+            "webhook_url": "https://example.com/global",
+            "hooks": {
+                "other_handler": {
+                    "url": "https://example.com/other"
+                }
+            }
         });
-        let rules = config.get("rules").unwrap();
-        assert!(rules.get("max_size_bytes").is_none());
-        assert!(rules.get("allowed_content_types").is_none());
-        assert!(rules.get("blocked_content_types").is_none());
-        assert!(rules.get("blocked_path_patterns").is_none());
+        assert_eq!(
+            resolve_webhook_url(Some(&config), "my_handler"),
+            Some("https://example.com/global".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_webhook_url_priority_order() {
+        // Handler-specific > webhook_url > url
+        let config = serde_json::json!({
+            "url": "https://example.com/url",
+            "webhook_url": "https://example.com/webhook_url"
+        });
+        // webhook_url takes priority over url
+        assert_eq!(
+            resolve_webhook_url(Some(&config), "handler"),
+            Some("https://example.com/webhook_url".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
-    // validator_url extraction from config
+    // resolve_validator_url (extracted pure function)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_validator_url_from_config_global() {
+    fn test_resolve_validator_url_none_config() {
+        assert_eq!(resolve_validator_url(None, "handler"), None);
+    }
+
+    #[test]
+    fn test_resolve_validator_url_empty_config() {
+        let config = serde_json::json!({});
+        assert_eq!(resolve_validator_url(Some(&config), "handler"), None);
+    }
+
+    #[test]
+    fn test_resolve_validator_url_global() {
         let config = serde_json::json!({
             "validator_url": "https://validator.example.com/validate"
         });
-        let url = config
-            .get("validator_url")
-            .and_then(|u| u.as_str())
-            .map(String::from);
         assert_eq!(
-            url,
+            resolve_validator_url(Some(&config), "handler"),
             Some("https://validator.example.com/validate".to_string())
         );
     }
 
     #[test]
-    fn test_validator_url_from_config_handler_specific() {
-        let handler_name = "my_handler";
+    fn test_resolve_validator_url_handler_specific() {
         let config = serde_json::json!({
             "hooks": {
                 "my_handler": {
@@ -1606,16 +1608,212 @@ mod tests {
                 }
             }
         });
-        let url = config
-            .get("hooks")
-            .and_then(|h| h.get(handler_name))
-            .and_then(|h| h.get("validator_url"))
-            .and_then(|u| u.as_str())
-            .map(String::from);
         assert_eq!(
-            url,
+            resolve_validator_url(Some(&config), "my_handler"),
             Some("https://validator.example.com/my_handler".to_string())
         );
+    }
+
+    #[test]
+    fn test_resolve_validator_url_handler_specific_overrides_global() {
+        let config = serde_json::json!({
+            "validator_url": "https://validator.example.com/global",
+            "hooks": {
+                "my_handler": {
+                    "validator_url": "https://validator.example.com/override"
+                }
+            }
+        });
+        assert_eq!(
+            resolve_validator_url(Some(&config), "my_handler"),
+            Some("https://validator.example.com/override".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // evaluate_config_rules (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_evaluate_config_rules_none_config() {
+        let info = make_artifact_info(100, "application/jar", "test/path");
+        assert!(evaluate_config_rules(None, &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_no_rules_section() {
+        let config = serde_json::json!({"webhook_url": "https://example.com"});
+        let info = make_artifact_info(100, "application/jar", "test/path");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_empty_rules() {
+        let config = serde_json::json!({"rules": {}});
+        let info = make_artifact_info(100, "application/jar", "test/path");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_max_size_exceed() {
+        let config = serde_json::json!({"rules": {"max_size_bytes": 1000}});
+        let info = make_artifact_info(2000, "application/jar", "test/path");
+        let result = evaluate_config_rules(Some(&config), &info);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(!r.accept);
+        assert!(r.reason.as_ref().unwrap().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_max_size_within() {
+        let config = serde_json::json!({"rules": {"max_size_bytes": 5000}});
+        let info = make_artifact_info(1000, "application/jar", "test/path");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_max_size_exactly_equal() {
+        let config = serde_json::json!({"rules": {"max_size_bytes": 1000}});
+        let info = make_artifact_info(1000, "application/jar", "test/path");
+        // 1000 is NOT > 1000, so it should pass
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_allowed_content_types_match() {
+        let config = serde_json::json!({
+            "rules": {"allowed_content_types": ["application/java-archive", "application/zip"]}
+        });
+        let info = make_artifact_info(100, "application/java-archive", "test/path");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_allowed_content_types_prefix_match() {
+        let config = serde_json::json!({
+            "rules": {"allowed_content_types": ["application/"]}
+        });
+        let info = make_artifact_info(100, "application/java-archive", "test/path");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_allowed_content_types_no_match() {
+        let config = serde_json::json!({
+            "rules": {"allowed_content_types": ["application/java-archive"]}
+        });
+        let info = make_artifact_info(100, "text/plain", "test/path");
+        let result = evaluate_config_rules(Some(&config), &info);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(!r.accept);
+        assert!(r.reason.as_ref().unwrap().contains("not allowed"));
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_allowed_content_types_empty_list_passes() {
+        let config = serde_json::json!({
+            "rules": {"allowed_content_types": []}
+        });
+        let info = make_artifact_info(100, "text/plain", "test/path");
+        // Empty allowed list means no restriction
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_blocked_content_types_match() {
+        let config = serde_json::json!({
+            "rules": {"blocked_content_types": ["text/html", "application/javascript"]}
+        });
+        let info = make_artifact_info(100, "text/html", "test/path");
+        let result = evaluate_config_rules(Some(&config), &info);
+        assert!(result.is_some());
+        assert!(!result.unwrap().accept);
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_blocked_content_types_no_match() {
+        let config = serde_json::json!({
+            "rules": {"blocked_content_types": ["text/html"]}
+        });
+        let info = make_artifact_info(100, "application/jar", "test/path");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_blocked_path_match() {
+        let config = serde_json::json!({
+            "rules": {"blocked_path_patterns": ["SNAPSHOT", "internal/"]}
+        });
+        let info = make_artifact_info(100, "application/jar", "com/example/1.0-SNAPSHOT/lib.jar");
+        let result = evaluate_config_rules(Some(&config), &info);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(!r.accept);
+        assert!(r.reason.as_ref().unwrap().contains("blocked pattern"));
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_blocked_path_no_match() {
+        let config = serde_json::json!({
+            "rules": {"blocked_path_patterns": ["SNAPSHOT"]}
+        });
+        let info = make_artifact_info(100, "application/jar", "com/example/1.0/lib.jar");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_multiple_rules_first_fails() {
+        // max_size check runs first; if it fails, subsequent rules are not checked
+        let config = serde_json::json!({
+            "rules": {
+                "max_size_bytes": 500,
+                "blocked_content_types": ["application/jar"]
+            }
+        });
+        let info = make_artifact_info(1000, "application/jar", "test/path");
+        let result = evaluate_config_rules(Some(&config), &info);
+        assert!(result.is_some());
+        // Should fail on max_size first
+        assert!(result
+            .unwrap()
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_evaluate_config_rules_all_rules_pass() {
+        let config = serde_json::json!({
+            "rules": {
+                "max_size_bytes": 10000,
+                "allowed_content_types": ["application/"],
+                "blocked_content_types": ["text/html"],
+                "blocked_path_patterns": ["SNAPSHOT"]
+            }
+        });
+        let info = make_artifact_info(100, "application/jar", "com/example/1.0/lib.jar");
+        assert!(evaluate_config_rules(Some(&config), &info).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_blocking_event (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_blocking_event_before_events() {
+        assert!(is_blocking_event(PluginEventType::BeforeUpload));
+        assert!(is_blocking_event(PluginEventType::BeforeDownload));
+        assert!(is_blocking_event(PluginEventType::BeforeDelete));
+    }
+
+    #[test]
+    fn test_is_blocking_event_after_events() {
+        assert!(!is_blocking_event(PluginEventType::AfterUpload));
+        assert!(!is_blocking_event(PluginEventType::AfterDownload));
+        assert!(!is_blocking_event(PluginEventType::AfterDelete));
     }
 
     // -----------------------------------------------------------------------

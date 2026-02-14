@@ -688,7 +688,7 @@ pub async fn redeliver(
 ///
 /// Blocks URLs pointing to private/internal networks, loopback addresses,
 /// link-local addresses (AWS/cloud metadata), and known internal hostnames.
-fn validate_webhook_url(url_str: &str) -> Result<()> {
+pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url_str)
         .map_err(|_| AppError::Validation("Invalid webhook URL".to_string()))?;
 
@@ -772,3 +772,276 @@ fn validate_webhook_url(url_str: &str) -> Result<()> {
     ))
 )]
 pub struct WebhooksApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // WebhookEvent Display
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_event_display_artifact_uploaded() {
+        assert_eq!(
+            WebhookEvent::ArtifactUploaded.to_string(),
+            "artifact_uploaded"
+        );
+    }
+
+    #[test]
+    fn test_webhook_event_display_artifact_deleted() {
+        assert_eq!(
+            WebhookEvent::ArtifactDeleted.to_string(),
+            "artifact_deleted"
+        );
+    }
+
+    #[test]
+    fn test_webhook_event_display_repository_created() {
+        assert_eq!(
+            WebhookEvent::RepositoryCreated.to_string(),
+            "repository_created"
+        );
+    }
+
+    #[test]
+    fn test_webhook_event_display_repository_deleted() {
+        assert_eq!(
+            WebhookEvent::RepositoryDeleted.to_string(),
+            "repository_deleted"
+        );
+    }
+
+    #[test]
+    fn test_webhook_event_display_user_created() {
+        assert_eq!(WebhookEvent::UserCreated.to_string(), "user_created");
+    }
+
+    #[test]
+    fn test_webhook_event_display_user_deleted() {
+        assert_eq!(WebhookEvent::UserDeleted.to_string(), "user_deleted");
+    }
+
+    #[test]
+    fn test_webhook_event_display_build_events() {
+        assert_eq!(WebhookEvent::BuildStarted.to_string(), "build_started");
+        assert_eq!(WebhookEvent::BuildCompleted.to_string(), "build_completed");
+        assert_eq!(WebhookEvent::BuildFailed.to_string(), "build_failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // WebhookEvent serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_event_serialization() {
+        let json = serde_json::to_string(&WebhookEvent::ArtifactUploaded).unwrap();
+        assert_eq!(json, "\"artifact_uploaded\"");
+    }
+
+    #[test]
+    fn test_webhook_event_deserialization() {
+        let event: WebhookEvent = serde_json::from_str("\"build_failed\"").unwrap();
+        assert_eq!(event.to_string(), "build_failed");
+    }
+
+    #[test]
+    fn test_webhook_event_roundtrip() {
+        let original = WebhookEvent::RepositoryCreated;
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: WebhookEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.to_string(), original.to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_webhook_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_webhook_url_valid_https() {
+        assert!(validate_webhook_url("https://hooks.example.com/webhook").is_ok());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_valid_http() {
+        assert!(validate_webhook_url("http://hooks.example.com/webhook").is_ok());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_invalid_scheme_ftp() {
+        assert!(validate_webhook_url("ftp://example.com/path").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_invalid_scheme_file() {
+        assert!(validate_webhook_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_invalid_format() {
+        assert!(validate_webhook_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_localhost() {
+        assert!(validate_webhook_url("http://localhost/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_metadata_google() {
+        assert!(validate_webhook_url("http://metadata.google.internal/computeMetadata").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_metadata_azure() {
+        assert!(validate_webhook_url("http://metadata.azure.com/instance").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_aws_metadata_ip() {
+        assert!(validate_webhook_url("http://169.254.169.254/latest/meta-data").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_internal_hosts() {
+        assert!(validate_webhook_url("http://backend/api").is_err());
+        assert!(validate_webhook_url("http://postgres/").is_err());
+        assert!(validate_webhook_url("http://redis/").is_err());
+        assert!(validate_webhook_url("http://meilisearch/").is_err());
+        assert!(validate_webhook_url("http://trivy/").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_loopback_ip() {
+        assert!(validate_webhook_url("http://127.0.0.1/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_private_ip_10() {
+        assert!(validate_webhook_url("http://10.0.0.1/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_private_ip_172() {
+        assert!(validate_webhook_url("http://172.16.0.1/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_private_ip_192() {
+        assert!(validate_webhook_url("http://192.168.1.1/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_blocks_unspecified() {
+        assert!(validate_webhook_url("http://0.0.0.0/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_allows_public_ip() {
+        assert!(validate_webhook_url("http://8.8.8.8/hook").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Request/Response serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_webhook_request_deserialization() {
+        let json = r#"{
+            "name": "deploy",
+            "url": "https://hooks.example.com/deploy",
+            "events": ["artifact_uploaded"]
+        }"#;
+        let req: CreateWebhookRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "deploy");
+        assert_eq!(req.url, "https://hooks.example.com/deploy");
+        assert_eq!(req.events.len(), 1);
+        assert!(req.secret.is_none());
+        assert!(req.repository_id.is_none());
+    }
+
+    #[test]
+    fn test_create_webhook_request_with_all_fields() {
+        let json = serde_json::json!({
+            "name": "full",
+            "url": "https://hooks.example.com/full",
+            "events": ["artifact_uploaded", "artifact_deleted"],
+            "secret": "my-secret-key",
+            "repository_id": Uuid::new_v4(),
+            "headers": {"X-Custom": "value"}
+        });
+        let req: CreateWebhookRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.events.len(), 2);
+        assert!(req.secret.is_some());
+        assert!(req.repository_id.is_some());
+        assert!(req.headers.is_some());
+    }
+
+    #[test]
+    fn test_webhook_response_serialization() {
+        let resp = WebhookResponse {
+            id: Uuid::nil(),
+            name: "test".to_string(),
+            url: "https://example.com/hook".to_string(),
+            events: vec!["artifact_uploaded".to_string()],
+            is_enabled: true,
+            repository_id: None,
+            headers: None,
+            last_triggered_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["name"], "test");
+        assert_eq!(json["is_enabled"], true);
+        assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_test_webhook_response_serialization() {
+        let resp = TestWebhookResponse {
+            success: true,
+            status_code: Some(200),
+            response_body: Some("OK".to_string()),
+            error: None,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["status_code"], 200);
+    }
+
+    #[test]
+    fn test_test_webhook_response_failure() {
+        let resp = TestWebhookResponse {
+            success: false,
+            status_code: None,
+            response_body: None,
+            error: Some("Connection refused".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], false);
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("Connection refused"));
+    }
+
+    #[test]
+    fn test_delivery_response_serialization() {
+        let resp = DeliveryResponse {
+            id: Uuid::nil(),
+            webhook_id: Uuid::nil(),
+            event: "artifact_uploaded".to_string(),
+            payload: serde_json::json!({"key": "value"}),
+            response_status: Some(200),
+            response_body: Some("OK".to_string()),
+            success: true,
+            attempts: 1,
+            delivered_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["success"], true);
+        assert_eq!(json["attempts"], 1);
+    }
+}

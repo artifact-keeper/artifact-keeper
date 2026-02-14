@@ -1146,8 +1146,7 @@ mod tests {
 
     #[test]
     fn test_extract_basic_credentials_lowercase() {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
@@ -1178,10 +1177,7 @@ mod tests {
     fn test_extract_basic_credentials_colon_in_password() {
         let headers = make_basic_header("user", "p:a:s:s");
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "p:a:s:s".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "p:a:s:s".to_string())));
     }
 
     // -----------------------------------------------------------------------
@@ -1191,19 +1187,13 @@ mod tests {
     #[test]
     fn test_extract_xml_tag_simple() {
         let xml = "<id>MyPackage</id>";
-        assert_eq!(
-            extract_xml_tag(xml, "id"),
-            Some("MyPackage".to_string())
-        );
+        assert_eq!(extract_xml_tag(xml, "id"), Some("MyPackage".to_string()));
     }
 
     #[test]
     fn test_extract_xml_tag_with_whitespace() {
         let xml = "<id>  MyPackage  </id>";
-        assert_eq!(
-            extract_xml_tag(xml, "id"),
-            Some("MyPackage".to_string())
-        );
+        assert_eq!(extract_xml_tag(xml, "id"), Some("MyPackage".to_string()));
     }
 
     #[test]
@@ -1242,10 +1232,7 @@ mod tests {
             extract_xml_tag(xml, "id"),
             Some("Newtonsoft.Json".to_string())
         );
-        assert_eq!(
-            extract_xml_tag(xml, "version"),
-            Some("13.0.1".to_string())
-        );
+        assert_eq!(extract_xml_tag(xml, "version"), Some("13.0.1".to_string()));
         assert_eq!(
             extract_xml_tag(xml, "description"),
             Some("Popular JSON framework".to_string())
@@ -1313,7 +1300,10 @@ mod tests {
     #[test]
     fn test_extract_nupkg_bytes_raw_body() {
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
         let body = Bytes::from_static(b"raw nupkg content");
         let result = extract_nupkg_bytes(&headers, body.clone()).unwrap();
         assert_eq!(result, body);
@@ -1472,10 +1462,8 @@ mod tests {
 
     #[test]
     fn test_search_query_with_values() {
-        let q: SearchQuery = serde_json::from_str(
-            r#"{"q":"json","skip":10,"take":50,"prerelease":true}"#,
-        )
-        .unwrap();
+        let q: SearchQuery =
+            serde_json::from_str(r#"{"q":"json","skip":10,"take":50,"prerelease":true}"#).unwrap();
         assert_eq!(q.q, Some("json".to_string()));
         assert_eq!(q.skip, Some(10));
         assert_eq!(q.take, Some(50));
@@ -1614,10 +1602,7 @@ mod tests {
         let index = build_nuget_service_index(base);
         let resources = index["resources"].as_array().unwrap();
         let search = &resources[0];
-        assert_eq!(
-            search["@id"],
-            "https://example.com/nuget/repo/v3/search"
-        );
+        assert_eq!(search["@id"], "https://example.com/nuget/repo/v3/search");
         assert_eq!(search["@type"], "SearchQueryService");
     }
 
@@ -1627,10 +1612,7 @@ mod tests {
         let index = build_nuget_service_index(base);
         let resources = index["resources"].as_array().unwrap();
         let push = &resources[7];
-        assert_eq!(
-            push["@id"],
-            "https://example.com/nuget/repo/api/v2/package"
-        );
+        assert_eq!(push["@id"], "https://example.com/nuget/repo/api/v2/package");
         assert_eq!(push["@type"], "PackagePublish/2.0.0");
     }
 
@@ -1662,7 +1644,10 @@ mod tests {
         );
         assert_eq!(item["catalogEntry"]["id"], "newtonsoft.json");
         assert_eq!(item["catalogEntry"]["version"], "13.0.1");
-        assert_eq!(item["catalogEntry"]["description"], "Popular JSON framework");
+        assert_eq!(
+            item["catalogEntry"]["description"],
+            "Popular JSON framework"
+        );
         assert_eq!(item["catalogEntry"]["authors"], "James Newton-King");
         assert_eq!(item["catalogEntry"]["listed"], true);
     }
@@ -1685,13 +1670,7 @@ mod tests {
 
     #[test]
     fn test_build_registration_item_empty_metadata() {
-        let item = build_registration_item(
-            "http://localhost/nuget/local",
-            "pkg",
-            "0.1.0",
-            "",
-            "",
-        );
+        let item = build_registration_item("http://localhost/nuget/local", "pkg", "0.1.0", "", "");
         assert_eq!(item["catalogEntry"]["description"], "");
         assert_eq!(item["catalogEntry"]["authors"], "");
     }
@@ -1702,7 +1681,11 @@ mod tests {
 
     #[test]
     fn test_build_flatcontainer_versions_json_basic() {
-        let versions = vec!["1.0.0".to_string(), "2.0.0".to_string(), "3.0.0".to_string()];
+        let versions = vec![
+            "1.0.0".to_string(),
+            "2.0.0".to_string(),
+            "3.0.0".to_string(),
+        ];
         let json = build_flatcontainer_versions_json(&versions);
         let arr = json["versions"].as_array().unwrap();
         assert_eq!(arr.len(), 3);

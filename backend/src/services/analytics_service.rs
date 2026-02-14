@@ -727,10 +727,7 @@ mod tests {
     fn test_download_trend_deserialization() {
         let json = r#"{"date": "2024-06-15", "download_count": 100}"#;
         let trend: DownloadTrend = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            trend.date,
-            NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()
-        );
+        assert_eq!(trend.date, NaiveDate::from_ymd_opt(2024, 6, 15).unwrap());
         assert_eq!(trend.download_count, 100);
     }
 }

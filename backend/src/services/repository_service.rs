@@ -538,7 +538,9 @@ impl RepositoryService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat, RepositoryType};
+    use crate::models::repository::{
+        ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    };
 
     // -----------------------------------------------------------------------
     // repo_to_meili_doc tests
@@ -655,7 +657,11 @@ mod tests {
         for (format, expected) in formats_and_expected {
             let repo = make_test_repo(format, RepositoryType::Local);
             let doc = RepositoryService::repo_to_meili_doc(&repo);
-            assert_eq!(doc.format, expected, "Format mismatch for {:?}", repo.format);
+            assert_eq!(
+                doc.format, expected,
+                "Format mismatch for {:?}",
+                repo.format
+            );
         }
     }
 
@@ -698,7 +704,10 @@ mod tests {
             is_public: false,
             quota_bytes: None,
         };
-        assert_eq!(req.upstream_url, Some("https://registry.npmjs.org".to_string()));
+        assert_eq!(
+            req.upstream_url,
+            Some("https://registry.npmjs.org".to_string())
+        );
         assert!(!req.is_public);
     }
 
@@ -797,12 +806,18 @@ mod tests {
 
     #[test]
     fn test_build_search_pattern_basic() {
-        assert_eq!(build_search_pattern(Some("maven")), Some("%maven%".to_string()));
+        assert_eq!(
+            build_search_pattern(Some("maven")),
+            Some("%maven%".to_string())
+        );
     }
 
     #[test]
     fn test_build_search_pattern_mixed_case() {
-        assert_eq!(build_search_pattern(Some("MyRepo")), Some("%myrepo%".to_string()));
+        assert_eq!(
+            build_search_pattern(Some("MyRepo")),
+            Some("%myrepo%".to_string())
+        );
     }
 
     #[test]
@@ -873,7 +888,10 @@ mod tests {
 
     #[test]
     fn test_derive_format_key_conda_native() {
-        assert_eq!(derive_format_key(&RepositoryFormat::CondaNative), "condanative");
+        assert_eq!(
+            derive_format_key(&RepositoryFormat::CondaNative),
+            "condanative"
+        );
     }
 
     #[test]

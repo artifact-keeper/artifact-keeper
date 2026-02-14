@@ -264,7 +264,10 @@ mod tests {
         assert_eq!(input.name, "my-build");
         assert_eq!(input.build_number, 42);
         assert_eq!(input.agent.as_deref(), Some("github-actions"));
-        assert_eq!(input.vcs_url.as_deref(), Some("https://github.com/org/repo"));
+        assert_eq!(
+            input.vcs_url.as_deref(),
+            Some("https://github.com/org/repo")
+        );
         assert_eq!(input.vcs_revision.as_deref(), Some("abc123"));
         assert_eq!(input.vcs_branch.as_deref(), Some("main"));
         assert_eq!(input.vcs_message.as_deref(), Some("Fix bug"));

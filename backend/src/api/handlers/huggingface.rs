@@ -673,10 +673,7 @@ mod tests {
             HeaderValue::from_static("Bearer hf_abc123"),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "hf_abc123".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "hf_abc123".to_string())));
     }
 
     #[test]
@@ -687,10 +684,7 @@ mod tests {
             HeaderValue::from_static("bearer hf_token"),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "hf_token".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "hf_token".to_string())));
     }
 
     #[test]
@@ -703,10 +697,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "hf-pass".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "hf-pass".to_string())));
     }
 
     #[test]
@@ -905,9 +896,6 @@ mod tests {
             repo_type: "remote".to_string(),
             upstream_url: Some("https://huggingface.co".to_string()),
         };
-        assert_eq!(
-            repo.upstream_url.as_deref(),
-            Some("https://huggingface.co")
-        );
+        assert_eq!(repo.upstream_url.as_deref(), Some("https://huggingface.co"));
     }
 }

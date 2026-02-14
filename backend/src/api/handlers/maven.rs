@@ -712,10 +712,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pw".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "pw".to_string())));
     }
 
     #[test]
@@ -728,10 +725,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "p@ss:w0rd".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "p@ss:w0rd".to_string())));
     }
 
     #[test]
@@ -790,7 +784,10 @@ mod tests {
         let result = parse_metadata_path("org/apache/commons/commons-lang3/maven-metadata.xml");
         assert_eq!(
             result,
-            Some(("org.apache.commons".to_string(), "commons-lang3".to_string()))
+            Some((
+                "org.apache.commons".to_string(),
+                "commons-lang3".to_string()
+            ))
         );
     }
 
@@ -819,10 +816,7 @@ mod tests {
     fn test_parse_metadata_path_two_parts_only() {
         // groupSegment/artifactId/maven-metadata.xml minimum
         let result = parse_metadata_path("com/my-lib/maven-metadata.xml");
-        assert_eq!(
-            result,
-            Some(("com".to_string(), "my-lib".to_string()))
-        );
+        assert_eq!(result, Some(("com".to_string(), "my-lib".to_string())));
     }
 
     // -----------------------------------------------------------------------
@@ -999,7 +993,9 @@ mod tests {
     #[test]
     fn test_build_maven_storage_key_pom() {
         assert_eq!(
-            build_maven_storage_key("org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"),
+            build_maven_storage_key(
+                "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"
+            ),
             "maven/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"
         );
     }

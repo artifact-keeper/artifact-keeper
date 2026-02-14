@@ -718,9 +718,6 @@ mod tests {
             completed_at: Some(Utc::now()),
         };
         assert_eq!(session.status, SyncStatus::Failed);
-        assert_eq!(
-            session.error_message.as_deref(),
-            Some("Connection timeout")
-        );
+        assert_eq!(session.error_message.as_deref(), Some("Connection timeout"));
     }
 }

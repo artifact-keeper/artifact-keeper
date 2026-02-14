@@ -1159,7 +1159,11 @@ mod tests {
         writer
             .start_file("mypackage-1.0.dist-info/METADATA", options)
             .unwrap();
-        std::io::Write::write_all(&mut writer, b"Metadata-Version: 2.1\nName: mypackage\nVersion: 1.0\n").unwrap();
+        std::io::Write::write_all(
+            &mut writer,
+            b"Metadata-Version: 2.1\nName: mypackage\nVersion: 1.0\n",
+        )
+        .unwrap();
         let cursor = writer.finish().unwrap();
         let content = cursor.into_inner();
 
@@ -1209,9 +1213,7 @@ mod tests {
         header.set_size(pkg_info.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar_builder
-            .append(&header, &pkg_info[..])
-            .unwrap();
+        tar_builder.append(&header, &pkg_info[..]).unwrap();
         let tar_data = tar_builder.into_inner().unwrap();
 
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());

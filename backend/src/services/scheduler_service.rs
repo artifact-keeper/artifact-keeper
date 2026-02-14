@@ -330,7 +330,10 @@ mod tests {
     fn test_compute_next_run_valid_5_field_cron() {
         // Every day at midnight: "0 0 * * *"
         let result = compute_next_run("0 0 * * *");
-        assert!(result.is_some(), "Should parse a valid 5-field cron expression");
+        assert!(
+            result.is_some(),
+            "Should parse a valid 5-field cron expression"
+        );
         let next = result.unwrap();
         assert!(next > Utc::now(), "Next run should be in the future");
     }
@@ -339,7 +342,10 @@ mod tests {
     fn test_compute_next_run_valid_6_field_cron() {
         // 6-field with seconds: "0 0 0 * * *"  (every day at midnight)
         let result = compute_next_run("0 0 0 * * *");
-        assert!(result.is_some(), "Should parse a valid 6-field cron expression");
+        assert!(
+            result.is_some(),
+            "Should parse a valid 6-field cron expression"
+        );
         let next = result.unwrap();
         assert!(next > Utc::now());
     }
@@ -348,7 +354,10 @@ mod tests {
     fn test_compute_next_run_valid_7_field_cron() {
         // 7-field with seconds and year: "0 30 9 * * * *"
         let result = compute_next_run("0 30 9 * * * *");
-        assert!(result.is_some(), "Should parse a valid 7-field cron expression");
+        assert!(
+            result.is_some(),
+            "Should parse a valid 7-field cron expression"
+        );
     }
 
     #[test]
@@ -366,7 +375,10 @@ mod tests {
     fn test_compute_next_run_invalid_cron_falls_back_to_24h() {
         let before = Utc::now();
         let result = compute_next_run("this is not valid cron");
-        assert!(result.is_some(), "Invalid cron should fall back to 24h from now");
+        assert!(
+            result.is_some(),
+            "Invalid cron should fall back to 24h from now"
+        );
         let next = result.unwrap();
         // Should be roughly 24 hours from now (allow some tolerance)
         let diff = next - before;
@@ -495,7 +507,10 @@ mod tests {
 
     #[test]
     fn test_normalize_cron_7_field_unchanged() {
-        assert_eq!(normalize_cron_expression("0 30 9 * * * *"), "0 30 9 * * * *");
+        assert_eq!(
+            normalize_cron_expression("0 30 9 * * * *"),
+            "0 30 9 * * * *"
+        );
     }
 
     #[test]

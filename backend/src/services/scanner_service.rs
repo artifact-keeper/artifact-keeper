@@ -414,6 +414,70 @@ impl AdvisoryClient {
     }
 }
 
+// =========================================================================
+// Extracted pure functions (testable without DB or async)
+// =========================================================================
+
+/// Map an artifact ecosystem string to the GitHub Advisory API ecosystem parameter.
+/// Returns None if the ecosystem is not supported by GitHub Advisory DB.
+pub(crate) fn ecosystem_to_github_param(ecosystem: &str) -> Option<&'static str> {
+    match ecosystem {
+        "npm" => Some("npm"),
+        "PyPI" | "pypi" => Some("pip"),
+        "crates.io" => Some("rust"),
+        "Maven" => Some("maven"),
+        "Go" => Some("go"),
+        "NuGet" => Some("nuget"),
+        "RubyGems" => Some("rubygems"),
+        _ => None,
+    }
+}
+
+/// Determine the quarantine status of an artifact based on scan findings count.
+pub(crate) fn quarantine_status_from_findings(findings_count: i32) -> &'static str {
+    if findings_count > 0 {
+        "flagged"
+    } else {
+        "clean"
+    }
+}
+
+/// Check whether a filename (lowercased) represents a known dependency manifest.
+pub(crate) fn is_manifest_file(name_lower: &str) -> bool {
+    name_lower == "package.json"
+        || name_lower.ends_with("/package.json")
+        || name_lower == "cargo.toml"
+        || name_lower.ends_with("/cargo.toml")
+        || name_lower == "requirements.txt"
+        || name_lower.ends_with("/requirements.txt")
+        || name_lower == "go.sum"
+        || name_lower.ends_with("/go.sum")
+        || name_lower == "pom.xml"
+        || name_lower.ends_with("/pom.xml")
+        || name_lower.ends_with(".gemspec")
+        || name_lower == "gemfile.lock"
+        || name_lower.ends_with("/gemfile.lock")
+        || name_lower.ends_with(".nuspec")
+        || name_lower == "packages.config"
+}
+
+/// Check if a filename represents an extractable archive for scanning.
+pub(crate) fn is_extractable_archive(name_lower: &str) -> bool {
+    name_lower.ends_with(".tar.gz")
+        || name_lower.ends_with(".tgz")
+        || name_lower.ends_with(".crate")
+        || name_lower.ends_with(".gem")
+        || name_lower.ends_with(".zip")
+        || name_lower.ends_with(".whl")
+        || name_lower.ends_with(".jar")
+        || name_lower.ends_with(".nupkg")
+}
+
+/// Build the OSV.dev vulnerability URL for a given vulnerability ID.
+pub(crate) fn osv_vulnerability_url(vuln_id: &str) -> String {
+    format!("https://osv.dev/vulnerability/{}", vuln_id)
+}
+
 // ---------------------------------------------------------------------------
 // Dependency scanner (parses manifests, queries advisories)
 // ---------------------------------------------------------------------------
@@ -2318,10 +2382,7 @@ mod tests {
         let deps = DependencyScanner::parse_go(content);
         assert_eq!(deps.len(), 2);
         // mod1 should appear only once
-        assert_eq!(
-            deps.iter().filter(|d| d.name == "mod1").count(),
-            1
-        );
+        assert_eq!(deps.iter().filter(|d| d.name == "mod1").count(), 1);
     }
 
     #[test]
@@ -2567,11 +2628,7 @@ mod tests {
 
     #[test]
     fn test_extract_dependencies_nested_cargo_toml() {
-        let artifact = make_artifact(
-            "backend/Cargo.toml",
-            "/rust/backend/Cargo.toml",
-            None,
-        );
+        let artifact = make_artifact("backend/Cargo.toml", "/rust/backend/Cargo.toml", None);
         let content = Bytes::from("[dependencies]\ntokio = \"1.35\"\n");
         let deps = DependencyScanner::extract_dependencies(&artifact, None, &content);
         assert_eq!(deps.len(), 1);
@@ -2580,11 +2637,7 @@ mod tests {
 
     #[test]
     fn test_extract_dependencies_nested_requirements_txt() {
-        let artifact = make_artifact(
-            "app/requirements.txt",
-            "/pypi/app/requirements.txt",
-            None,
-        );
+        let artifact = make_artifact("app/requirements.txt", "/pypi/app/requirements.txt", None);
         let content = Bytes::from("django==4.2\n");
         let deps = DependencyScanner::extract_dependencies(&artifact, None, &content);
         assert_eq!(deps.len(), 1);
@@ -2609,5 +2662,301 @@ mod tests {
         let deps = DependencyScanner::extract_dependencies(&artifact, None, &content);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].ecosystem, "Maven");
+    }
+
+    // -----------------------------------------------------------------------
+    // ecosystem_to_github_param (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ecosystem_to_github_param_npm() {
+        assert_eq!(ecosystem_to_github_param("npm"), Some("npm"));
+    }
+
+    #[test]
+    fn test_ecosystem_to_github_param_pypi() {
+        assert_eq!(ecosystem_to_github_param("PyPI"), Some("pip"));
+        assert_eq!(ecosystem_to_github_param("pypi"), Some("pip"));
+    }
+
+    #[test]
+    fn test_ecosystem_to_github_param_crates() {
+        assert_eq!(ecosystem_to_github_param("crates.io"), Some("rust"));
+    }
+
+    #[test]
+    fn test_ecosystem_to_github_param_maven() {
+        assert_eq!(ecosystem_to_github_param("Maven"), Some("maven"));
+    }
+
+    #[test]
+    fn test_ecosystem_to_github_param_go() {
+        assert_eq!(ecosystem_to_github_param("Go"), Some("go"));
+    }
+
+    #[test]
+    fn test_ecosystem_to_github_param_nuget() {
+        assert_eq!(ecosystem_to_github_param("NuGet"), Some("nuget"));
+    }
+
+    #[test]
+    fn test_ecosystem_to_github_param_rubygems() {
+        assert_eq!(ecosystem_to_github_param("RubyGems"), Some("rubygems"));
+    }
+
+    #[test]
+    fn test_ecosystem_to_github_param_unknown() {
+        assert_eq!(ecosystem_to_github_param("Hex"), None);
+        assert_eq!(ecosystem_to_github_param("Composer"), None);
+        assert_eq!(ecosystem_to_github_param(""), None);
+        assert_eq!(ecosystem_to_github_param("Linux"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // quarantine_status_from_findings (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_quarantine_status_flagged() {
+        assert_eq!(quarantine_status_from_findings(1), "flagged");
+        assert_eq!(quarantine_status_from_findings(100), "flagged");
+    }
+
+    #[test]
+    fn test_quarantine_status_clean() {
+        assert_eq!(quarantine_status_from_findings(0), "clean");
+    }
+
+    #[test]
+    fn test_quarantine_status_negative_treated_as_clean() {
+        // Negative values are technically <= 0, so not > 0
+        assert_eq!(quarantine_status_from_findings(-1), "clean");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_manifest_file (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_manifest_file_known_names() {
+        assert!(is_manifest_file("package.json"));
+        assert!(is_manifest_file("cargo.toml"));
+        assert!(is_manifest_file("requirements.txt"));
+        assert!(is_manifest_file("go.sum"));
+        assert!(is_manifest_file("pom.xml"));
+        assert!(is_manifest_file("gemfile.lock"));
+        assert!(is_manifest_file("packages.config"));
+    }
+
+    #[test]
+    fn test_is_manifest_file_nested_paths() {
+        assert!(is_manifest_file("libs/core/package.json"));
+        assert!(is_manifest_file("backend/cargo.toml"));
+        assert!(is_manifest_file("app/requirements.txt"));
+        assert!(is_manifest_file("project/go.sum"));
+        assert!(is_manifest_file("module/pom.xml"));
+        assert!(is_manifest_file("ruby/gemfile.lock"));
+    }
+
+    #[test]
+    fn test_is_manifest_file_extension_based() {
+        assert!(is_manifest_file("my-gem.gemspec"));
+        assert!(is_manifest_file("my-pkg.nuspec"));
+    }
+
+    #[test]
+    fn test_is_manifest_file_unknown() {
+        assert!(!is_manifest_file("readme.md"));
+        assert!(!is_manifest_file("main.rs"));
+        assert!(!is_manifest_file("docker-compose.yml"));
+        assert!(!is_manifest_file("my-lib.jar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_extractable_archive (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_extractable_archive_tar_gz() {
+        assert!(is_extractable_archive("package.tar.gz"));
+        assert!(is_extractable_archive("lib.tgz"));
+    }
+
+    #[test]
+    fn test_is_extractable_archive_rust_ruby() {
+        assert!(is_extractable_archive("my-crate-1.0.0.crate"));
+        assert!(is_extractable_archive("my-gem-1.0.0.gem"));
+    }
+
+    #[test]
+    fn test_is_extractable_archive_zip_variants() {
+        assert!(is_extractable_archive("package.zip"));
+        assert!(is_extractable_archive("numpy-1.0.whl"));
+        assert!(is_extractable_archive("commons-lang.jar"));
+        assert!(is_extractable_archive("newtonsoft.json.nupkg"));
+    }
+
+    #[test]
+    fn test_is_extractable_archive_not_archive() {
+        assert!(!is_extractable_archive("readme.md"));
+        assert!(!is_extractable_archive("image.png"));
+        assert!(!is_extractable_archive("package.json"));
+        assert!(!is_extractable_archive("main.rs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // osv_vulnerability_url (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_osv_vulnerability_url() {
+        assert_eq!(
+            osv_vulnerability_url("GHSA-abcd-1234-efgh"),
+            "https://osv.dev/vulnerability/GHSA-abcd-1234-efgh"
+        );
+        assert_eq!(
+            osv_vulnerability_url("CVE-2024-0001"),
+            "https://osv.dev/vulnerability/CVE-2024-0001"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_pip - additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_pip_extras_in_name() {
+        // pip supports extras syntax: package[extra]==1.0
+        let content = "requests[security]==2.28.0\n";
+        let deps = DependencyScanner::parse_pip(content);
+        assert_eq!(deps.len(), 1);
+        // The extras syntax is preserved as part of the name
+        assert!(deps[0].name.contains("requests"));
+    }
+
+    #[test]
+    fn test_parse_pip_single_package() {
+        let content = "flask==2.3.0\n";
+        let deps = DependencyScanner::parse_pip(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "flask");
+        assert_eq!(deps[0].version.as_deref(), Some("2.3.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_maven - additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_maven_with_version_property() {
+        // Maven properties like ${project.version} should be treated as version
+        let content = r#"
+            <dependency>
+                <groupId>org.example</groupId>
+                <artifactId>my-lib</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        "#;
+        let deps = DependencyScanner::parse_maven(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version.as_deref(), Some("${project.version}"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_rubygems - additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_rubygems_with_platform() {
+        // Some gems include platform info
+        let content = "    nokogiri (1.15.4-arm64-darwin)\n";
+        let deps = DependencyScanner::parse_rubygems(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "nokogiri");
+        assert_eq!(deps[0].version.as_deref(), Some("1.15.4-arm64-darwin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_npm - npm workspace / special versions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_npm_star_version() {
+        let content = r#"{"dependencies": {"pkg": "*"}}"#;
+        let deps = DependencyScanner::parse_npm(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn test_parse_npm_url_version() {
+        let content = r#"{"dependencies": {"pkg": "https://example.com/pkg.tgz"}}"#;
+        let deps = DependencyScanner::parse_npm(content);
+        assert_eq!(deps.len(), 1);
+        assert!(deps[0].version.as_deref().unwrap().starts_with("https://"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_go - additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_go_mixed_modules() {
+        let content = "github.com/foo/bar v1.0.0 h1:abc=\ngitlab.com/baz/qux v2.0.0 h1:def=\n";
+        let deps = DependencyScanner::parse_go(content);
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "github.com/foo/bar");
+        assert_eq!(deps[1].name, "gitlab.com/baz/qux");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_nuget - packages.config with targetFramework
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_nuget_with_target_framework() {
+        let content = r#"<package id="Moq" version="4.18.4" targetFramework="net6.0" />"#;
+        let deps = DependencyScanner::parse_nuget(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "Moq");
+        assert_eq!(deps[0].version.as_deref(), Some("4.18.4"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_cargo - workspace dep
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_cargo_workspace_dep() {
+        let content = r#"
+            [dependencies]
+            my-lib = { workspace = true }
+        "#;
+        let deps = DependencyScanner::parse_cargo(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "my-lib");
+        assert!(deps[0].version.is_none()); // workspace = true has no version key
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_github_advisory - with multiple patched versions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_github_advisory_multiple_vulnerabilities() {
+        let dep = Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        };
+        let adv = serde_json::json!({
+            "ghsa_id": "GHSA-multi",
+            "vulnerabilities": [
+                {"first_patched_version": null},
+                {"first_patched_version": {"identifier": "2.0.0"}}
+            ]
+        });
+        let result = AdvisoryClient::parse_github_advisory(&adv, &dep).unwrap();
+        assert_eq!(result.fixed_version.as_deref(), Some("2.0.0"));
     }
 }

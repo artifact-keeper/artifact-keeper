@@ -843,7 +843,10 @@ mod tests {
     #[test]
     fn test_extract_credentials_bearer() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer my_token_123"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer my_token_123"),
+        );
         let result = extract_credentials(&headers);
         assert_eq!(
             result,
@@ -856,33 +859,30 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("bearer my_token"));
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "my_token".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "my_token".to_string())));
     }
 
     #[test]
     fn test_extract_credentials_basic() {
         let mut headers = HeaderMap::new();
         // "user:pass" => base64 "dXNlcjpwYXNz"
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNz"));
-        let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pass".to_string()))
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
         );
+        let result = extract_credentials(&headers);
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
     }
 
     #[test]
     fn test_extract_credentials_basic_lowercase() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("basic dXNlcjpwYXNz"));
-        let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pass".to_string()))
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("basic dXNlcjpwYXNz"),
         );
+        let result = extract_credentials(&headers);
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
     }
 
     #[test]
@@ -894,10 +894,7 @@ mod tests {
             HeaderValue::from_static("Basic dXNlcjpwYXNzOndvcmQ="),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pass:word".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "pass:word".to_string())));
     }
 
     #[test]
@@ -918,7 +915,10 @@ mod tests {
     #[test]
     fn test_extract_credentials_invalid_base64() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic !!!notbase64!!!"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic !!!notbase64!!!"),
+        );
         let result = extract_credentials(&headers);
         assert_eq!(result, None);
     }
@@ -954,12 +954,18 @@ mod tests {
         let collection_name = "general";
         let collection_version = "1.2.3";
         let full_name = format!("{}-{}", namespace, collection_name);
-        let filename = format!("{}-{}-{}.tar.gz", namespace, collection_name, collection_version);
+        let filename = format!(
+            "{}-{}-{}.tar.gz",
+            namespace, collection_name, collection_version
+        );
         let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
 
         assert_eq!(full_name, "community-general");
         assert_eq!(filename, "community-general-1.2.3.tar.gz");
-        assert_eq!(artifact_path, "community-general/1.2.3/community-general-1.2.3.tar.gz");
+        assert_eq!(
+            artifact_path,
+            "community-general/1.2.3/community-general-1.2.3.tar.gz"
+        );
     }
 
     #[test]
@@ -1008,7 +1014,8 @@ mod tests {
         let collection_name = "testcoll";
         let collection_version = "1.0.0";
         let filename = "testns-testcoll-1.0.0.tar.gz";
-        let collection_json: Option<serde_json::Value> = Some(serde_json::json!({"namespace": "testns"}));
+        let collection_json: Option<serde_json::Value> =
+            Some(serde_json::json!({"namespace": "testns"}));
 
         let metadata = serde_json::json!({
             "namespace": namespace,

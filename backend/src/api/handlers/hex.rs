@@ -820,10 +820,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("alice".to_string(), "hex-pass".to_string()))
-        );
+        assert_eq!(result, Some(("alice".to_string(), "hex-pass".to_string())));
     }
 
     #[test]
@@ -947,9 +944,7 @@ mod tests {
 
         let result = extract_name_version_from_tarball(&tar_data);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("metadata.config not found"));
+        assert!(result.unwrap_err().contains("metadata.config not found"));
     }
 
     #[test]
@@ -1193,9 +1188,6 @@ mod tests {
             repo_type: "remote".to_string(),
             upstream_url: Some("https://repo.hex.pm".to_string()),
         };
-        assert_eq!(
-            repo.upstream_url.as_deref(),
-            Some("https://repo.hex.pm")
-        );
+        assert_eq!(repo.upstream_url.as_deref(), Some("https://repo.hex.pm"));
     }
 }

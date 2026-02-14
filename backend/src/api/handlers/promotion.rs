@@ -817,3 +817,672 @@ pub async fn promotion_history(
     ))
 )]
 pub struct PromotionApiDoc;
+
+// ---------------------------------------------------------------------------
+// Pure helper functions (testable without DB)
+// ---------------------------------------------------------------------------
+
+/// Build the source display string for promotion responses.
+pub(crate) fn build_promotion_source_display(repo_key: &str, artifact_path: &str) -> String {
+    format!("{}/{}", repo_key, artifact_path)
+}
+
+/// Build the target display string for promotion responses.
+pub(crate) fn build_promotion_target_display(target_repo: &str, artifact_path: &str) -> String {
+    format!("{}/{}", target_repo, artifact_path)
+}
+
+/// Compute promotion pagination values (page, per_page, offset).
+/// Returns `(page, per_page, offset)`.
+pub(crate) fn compute_promotion_pagination(
+    raw_page: Option<u32>,
+    raw_per_page: Option<u32>,
+) -> (u32, u32, i64) {
+    let page = raw_page.unwrap_or(1).max(1);
+    let per_page = raw_per_page.unwrap_or(20).min(100);
+    let offset = ((page - 1) * per_page) as i64;
+    (page, per_page, offset)
+}
+
+/// Compute total pages from total items and per_page.
+pub(crate) fn compute_total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil() as u32
+}
+
+/// Build a successful promotion response.
+pub(crate) fn build_success_response(
+    source: String,
+    target: String,
+    promotion_id: Uuid,
+) -> PromotionResponse {
+    PromotionResponse {
+        promoted: true,
+        source,
+        target,
+        promotion_id: Some(promotion_id),
+        policy_violations: vec![],
+        message: Some("Artifact promoted successfully".to_string()),
+    }
+}
+
+/// Build a bulk promotion summary response.
+pub(crate) fn build_bulk_summary(
+    total: usize,
+    promoted: usize,
+    failed: usize,
+    results: Vec<PromotionResponse>,
+) -> BulkPromotionResponse {
+    BulkPromotionResponse {
+        total,
+        promoted,
+        failed,
+        results,
+    }
+}
+
+/// Build a rejection response.
+pub(crate) fn build_rejection_response(
+    artifact_id: Uuid,
+    source: String,
+    reason: String,
+    rejection_id: Uuid,
+) -> RejectionResponse {
+    RejectionResponse {
+        rejected: true,
+        artifact_id,
+        source,
+        reason,
+        rejection_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // validate_promotion_repos
+    // -----------------------------------------------------------------------
+
+    fn make_repo(
+        repo_type: RepositoryType,
+        format: crate::models::repository::RepositoryFormat,
+    ) -> crate::models::repository::Repository {
+        crate::models::repository::Repository {
+            id: Uuid::new_v4(),
+            key: "test-repo".to_string(),
+            name: "Test Repo".to_string(),
+            description: None,
+            format,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/test".to_string(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: crate::models::repository::ReplicationPriority::LocalOnly,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_valid() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let target = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        assert!(validate_promotion_repos(&source, &target).is_ok());
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_source_not_staging() {
+        let source = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let target = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let err = validate_promotion_repos(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("staging"));
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_source_remote() {
+        let source = make_repo(
+            RepositoryType::Remote,
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        let target = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        let err = validate_promotion_repos(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("staging"));
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_source_virtual() {
+        let source = make_repo(
+            RepositoryType::Virtual,
+            crate::models::repository::RepositoryFormat::Pypi,
+        );
+        let target = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Pypi,
+        );
+        let err = validate_promotion_repos(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("staging"));
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_target_not_local() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let target = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let err = validate_promotion_repos(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("local"));
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_target_remote() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Cargo,
+        );
+        let target = make_repo(
+            RepositoryType::Remote,
+            crate::models::repository::RepositoryFormat::Cargo,
+        );
+        let err = validate_promotion_repos(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("local"));
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_format_mismatch() {
+        let source = make_repo(
+            RepositoryType::Staging,
+            crate::models::repository::RepositoryFormat::Maven,
+        );
+        let target = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Npm,
+        );
+        let err = validate_promotion_repos(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("mismatch"));
+    }
+
+    #[test]
+    fn test_validate_promotion_repos_both_wrong() {
+        let source = make_repo(
+            RepositoryType::Local,
+            crate::models::repository::RepositoryFormat::Docker,
+        );
+        let target = make_repo(
+            RepositoryType::Remote,
+            crate::models::repository::RepositoryFormat::Helm,
+        );
+        // Source check comes first
+        let err = validate_promotion_repos(&source, &target).unwrap_err();
+        assert!(err.to_string().contains("staging"));
+    }
+
+    // -----------------------------------------------------------------------
+    // failed_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_failed_response_basic() {
+        let resp = failed_response(
+            "staging/artifact.jar".to_string(),
+            "release/artifact.jar".to_string(),
+            "Not found".to_string(),
+        );
+        assert!(!resp.promoted);
+        assert_eq!(resp.source, "staging/artifact.jar");
+        assert_eq!(resp.target, "release/artifact.jar");
+        assert!(resp.promotion_id.is_none());
+        assert!(resp.policy_violations.is_empty());
+        assert_eq!(resp.message, Some("Not found".to_string()));
+    }
+
+    #[test]
+    fn test_failed_response_duplicate_key() {
+        let resp = failed_response(
+            "staging/lib.tar.gz".to_string(),
+            "release/lib.tar.gz".to_string(),
+            "Artifact already exists in target".to_string(),
+        );
+        assert!(!resp.promoted);
+        assert!(resp.message.unwrap().contains("already exists"));
+    }
+
+    #[test]
+    fn test_failed_response_empty_strings() {
+        let resp = failed_response(String::new(), String::new(), String::new());
+        assert!(!resp.promoted);
+        assert_eq!(resp.source, "");
+        assert_eq!(resp.target, "");
+        assert_eq!(resp.message, Some(String::new()));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_promotion_source_display / build_promotion_target_display
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_promotion_source_display() {
+        let result = build_promotion_source_display("staging-maven", "com/example/lib-1.0.jar");
+        assert_eq!(result, "staging-maven/com/example/lib-1.0.jar");
+    }
+
+    #[test]
+    fn test_build_promotion_source_display_simple() {
+        let result = build_promotion_source_display("my-repo", "artifact.tar.gz");
+        assert_eq!(result, "my-repo/artifact.tar.gz");
+    }
+
+    #[test]
+    fn test_build_promotion_target_display() {
+        let result = build_promotion_target_display("release-maven", "com/example/lib-1.0.jar");
+        assert_eq!(result, "release-maven/com/example/lib-1.0.jar");
+    }
+
+    #[test]
+    fn test_build_promotion_target_display_nested() {
+        let result = build_promotion_target_display(
+            "releases",
+            "org/apache/commons/commons-lang3/3.14/commons-lang3-3.14.jar",
+        );
+        assert_eq!(
+            result,
+            "releases/org/apache/commons/commons-lang3/3.14/commons-lang3-3.14.jar"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_promotion_pagination
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_promotion_pagination_defaults() {
+        let (page, per_page, offset) = compute_promotion_pagination(None, None);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, 20);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_compute_promotion_pagination_page_2() {
+        let (page, per_page, offset) = compute_promotion_pagination(Some(2), Some(25));
+        assert_eq!(page, 2);
+        assert_eq!(per_page, 25);
+        assert_eq!(offset, 25);
+    }
+
+    #[test]
+    fn test_compute_promotion_pagination_page_3() {
+        let (page, per_page, offset) = compute_promotion_pagination(Some(3), Some(10));
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 10);
+        assert_eq!(offset, 20);
+    }
+
+    #[test]
+    fn test_compute_promotion_pagination_zero_page_clamps_to_1() {
+        let (page, _per_page, offset) = compute_promotion_pagination(Some(0), Some(10));
+        assert_eq!(page, 1);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_compute_promotion_pagination_per_page_capped_at_100() {
+        let (_page, per_page, _offset) = compute_promotion_pagination(Some(1), Some(200));
+        assert_eq!(per_page, 100);
+    }
+
+    #[test]
+    fn test_compute_promotion_pagination_large_page() {
+        let (page, per_page, offset) = compute_promotion_pagination(Some(100), Some(50));
+        assert_eq!(page, 100);
+        assert_eq!(per_page, 50);
+        assert_eq!(offset, 4950);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_total_pages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_total_pages_exact() {
+        assert_eq!(compute_total_pages(100, 20), 5);
+    }
+
+    #[test]
+    fn test_compute_total_pages_remainder() {
+        assert_eq!(compute_total_pages(101, 20), 6);
+    }
+
+    #[test]
+    fn test_compute_total_pages_one_item() {
+        assert_eq!(compute_total_pages(1, 20), 1);
+    }
+
+    #[test]
+    fn test_compute_total_pages_zero_items() {
+        assert_eq!(compute_total_pages(0, 20), 0);
+    }
+
+    #[test]
+    fn test_compute_total_pages_per_page_one() {
+        assert_eq!(compute_total_pages(5, 1), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_success_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_success_response() {
+        let promo_id = Uuid::new_v4();
+        let resp = build_success_response(
+            "staging/lib.jar".to_string(),
+            "release/lib.jar".to_string(),
+            promo_id,
+        );
+        assert!(resp.promoted);
+        assert_eq!(resp.source, "staging/lib.jar");
+        assert_eq!(resp.target, "release/lib.jar");
+        assert_eq!(resp.promotion_id, Some(promo_id));
+        assert!(resp.policy_violations.is_empty());
+        assert_eq!(
+            resp.message,
+            Some("Artifact promoted successfully".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_success_response_different_paths() {
+        let promo_id = Uuid::new_v4();
+        let resp = build_success_response(
+            "staging-npm/@scope/pkg-1.0.0.tgz".to_string(),
+            "releases-npm/@scope/pkg-1.0.0.tgz".to_string(),
+            promo_id,
+        );
+        assert!(resp.promoted);
+        assert_eq!(resp.promotion_id, Some(promo_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_bulk_summary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_bulk_summary_all_promoted() {
+        let results = vec![
+            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4()),
+            build_success_response("s/b".to_string(), "t/b".to_string(), Uuid::new_v4()),
+        ];
+        let summary = build_bulk_summary(2, 2, 0, results);
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.promoted, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.results.len(), 2);
+    }
+
+    #[test]
+    fn test_build_bulk_summary_mixed_results() {
+        let results = vec![
+            build_success_response("s/a".to_string(), "t/a".to_string(), Uuid::new_v4()),
+            failed_response(
+                "s/b".to_string(),
+                "t/b".to_string(),
+                "Not found".to_string(),
+            ),
+        ];
+        let summary = build_bulk_summary(2, 1, 1, results);
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.promoted, 1);
+        assert_eq!(summary.failed, 1);
+        assert!(summary.results[0].promoted);
+        assert!(!summary.results[1].promoted);
+    }
+
+    #[test]
+    fn test_build_bulk_summary_all_failed() {
+        let results = vec![
+            failed_response("s/a".to_string(), "t/a".to_string(), "err1".to_string()),
+            failed_response("s/b".to_string(), "t/b".to_string(), "err2".to_string()),
+        ];
+        let summary = build_bulk_summary(2, 0, 2, results);
+        assert_eq!(summary.promoted, 0);
+        assert_eq!(summary.failed, 2);
+    }
+
+    #[test]
+    fn test_build_bulk_summary_empty() {
+        let summary = build_bulk_summary(0, 0, 0, vec![]);
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.promoted, 0);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_rejection_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_rejection_response() {
+        let artifact_id = Uuid::new_v4();
+        let rejection_id = Uuid::new_v4();
+        let resp = build_rejection_response(
+            artifact_id,
+            "staging-maven".to_string(),
+            "Failed security scan".to_string(),
+            rejection_id,
+        );
+        assert!(resp.rejected);
+        assert_eq!(resp.artifact_id, artifact_id);
+        assert_eq!(resp.source, "staging-maven");
+        assert_eq!(resp.reason, "Failed security scan");
+        assert_eq!(resp.rejection_id, rejection_id);
+    }
+
+    #[test]
+    fn test_build_rejection_response_long_reason() {
+        let artifact_id = Uuid::new_v4();
+        let rejection_id = Uuid::new_v4();
+        let reason = "CVE-2024-12345: Critical vulnerability in log4j dependency. \
+                       Artifact contains known malicious code pattern."
+            .to_string();
+        let resp = build_rejection_response(
+            artifact_id,
+            "staging".to_string(),
+            reason.clone(),
+            rejection_id,
+        );
+        assert!(resp.rejected);
+        assert_eq!(resp.reason, reason);
+    }
+
+    #[test]
+    fn test_build_rejection_response_empty_reason() {
+        let artifact_id = Uuid::new_v4();
+        let rejection_id = Uuid::new_v4();
+        let resp = build_rejection_response(
+            artifact_id,
+            "staging".to_string(),
+            String::new(),
+            rejection_id,
+        );
+        assert!(resp.rejected);
+        assert_eq!(resp.reason, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // Serde round-trip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_promotion_response_serialization() {
+        let resp = PromotionResponse {
+            promoted: true,
+            source: "staging/lib.jar".to_string(),
+            target: "release/lib.jar".to_string(),
+            promotion_id: Some(Uuid::nil()),
+            policy_violations: vec![],
+            message: Some("OK".to_string()),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["promoted"], true);
+        assert_eq!(json["source"], "staging/lib.jar");
+        assert_eq!(json["target"], "release/lib.jar");
+        assert_eq!(json["message"], "OK");
+    }
+
+    #[test]
+    fn test_bulk_promotion_response_serialization() {
+        let resp = BulkPromotionResponse {
+            total: 3,
+            promoted: 2,
+            failed: 1,
+            results: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["total"], 3);
+        assert_eq!(json["promoted"], 2);
+        assert_eq!(json["failed"], 1);
+    }
+
+    #[test]
+    fn test_rejection_response_serialization() {
+        let id = Uuid::new_v4();
+        let rid = Uuid::new_v4();
+        let resp = RejectionResponse {
+            rejected: true,
+            artifact_id: id,
+            source: "staging".to_string(),
+            reason: "policy violation".to_string(),
+            rejection_id: rid,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["rejected"], true);
+        assert_eq!(json["artifact_id"], id.to_string());
+        assert_eq!(json["rejection_id"], rid.to_string());
+    }
+
+    #[test]
+    fn test_policy_violation_serialization() {
+        let v = PolicyViolation {
+            rule: "max-severity".to_string(),
+            severity: "high".to_string(),
+            message: "Critical vulnerability found".to_string(),
+        };
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["rule"], "max-severity");
+        assert_eq!(json["severity"], "high");
+        assert_eq!(json["message"], "Critical vulnerability found");
+    }
+
+    // -----------------------------------------------------------------------
+    // Deserialization tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_promote_artifact_request_deserialization() {
+        let json = serde_json::json!({
+            "target_repository": "release-maven",
+            "notes": "Promoted after review"
+        });
+        let req: PromoteArtifactRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.target_repository, "release-maven");
+        assert!(!req.skip_policy_check);
+        assert_eq!(req.notes, Some("Promoted after review".to_string()));
+    }
+
+    #[test]
+    fn test_promote_artifact_request_skip_policy() {
+        let json = serde_json::json!({
+            "target_repository": "releases",
+            "skip_policy_check": true
+        });
+        let req: PromoteArtifactRequest = serde_json::from_value(json).unwrap();
+        assert!(req.skip_policy_check);
+        assert!(req.notes.is_none());
+    }
+
+    #[test]
+    fn test_bulk_promote_request_deserialization() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let json = serde_json::json!({
+            "target_repository": "releases",
+            "artifact_ids": [id1, id2],
+            "notes": "Bulk promotion"
+        });
+        let req: BulkPromoteRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.target_repository, "releases");
+        assert_eq!(req.artifact_ids.len(), 2);
+        assert!(!req.skip_policy_check);
+        assert_eq!(req.notes, Some("Bulk promotion".to_string()));
+    }
+
+    #[test]
+    fn test_reject_artifact_request_deserialization() {
+        let json = serde_json::json!({
+            "reason": "Contains known vulnerability",
+            "notes": "CVE-2024-12345"
+        });
+        let req: RejectArtifactRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.reason, "Contains known vulnerability");
+        assert_eq!(req.notes, Some("CVE-2024-12345".to_string()));
+    }
+
+    #[test]
+    fn test_reject_artifact_request_no_notes() {
+        let json = serde_json::json!({ "reason": "Policy violation" });
+        let req: RejectArtifactRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.reason, "Policy violation");
+        assert!(req.notes.is_none());
+    }
+
+    #[test]
+    fn test_promotion_history_query_deserialization_defaults() {
+        let json = serde_json::json!({});
+        let query: PromotionHistoryQuery = serde_json::from_value(json).unwrap();
+        assert!(query.page.is_none());
+        assert!(query.per_page.is_none());
+        assert!(query.artifact_id.is_none());
+        assert!(query.status.is_none());
+    }
+
+    #[test]
+    fn test_promotion_history_query_deserialization_full() {
+        let art_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "page": 3,
+            "per_page": 50,
+            "artifact_id": art_id,
+            "status": "promoted"
+        });
+        let query: PromotionHistoryQuery = serde_json::from_value(json).unwrap();
+        assert_eq!(query.page, Some(3));
+        assert_eq!(query.per_page, Some(50));
+        assert_eq!(query.artifact_id, Some(art_id));
+        assert_eq!(query.status, Some("promoted".to_string()));
+    }
+}

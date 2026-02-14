@@ -1367,7 +1367,10 @@ mod tests {
     fn test_pattern_matching_multiple_patterns() {
         let patterns = vec!["libs-*".to_string(), "plugins-*".to_string()];
         assert!(MigrationService::matches_pattern("libs-release", &patterns));
-        assert!(MigrationService::matches_pattern("plugins-local", &patterns));
+        assert!(MigrationService::matches_pattern(
+            "plugins-local",
+            &patterns
+        ));
         assert!(!MigrationService::matches_pattern("ext-repo", &patterns));
     }
 
@@ -1391,8 +1394,14 @@ mod tests {
         // Note: ? is only interpreted as regex when pattern also contains *
         let patterns = vec!["lib?-release*".to_string()];
         assert!(MigrationService::matches_pattern("libs-release", &patterns));
-        assert!(MigrationService::matches_pattern("libx-release-local", &patterns));
-        assert!(!MigrationService::matches_pattern("library-release", &patterns));
+        assert!(MigrationService::matches_pattern(
+            "libx-release-local",
+            &patterns
+        ));
+        assert!(!MigrationService::matches_pattern(
+            "library-release",
+            &patterns
+        ));
     }
 
     #[test]
@@ -1400,7 +1409,10 @@ mod tests {
         // Without *, the pattern is treated as an exact match
         let patterns = vec!["lib?-release".to_string()];
         // Exact match only, ? is literal
-        assert!(!MigrationService::matches_pattern("libs-release", &patterns));
+        assert!(!MigrationService::matches_pattern(
+            "libs-release",
+            &patterns
+        ));
         assert!(MigrationService::matches_pattern("lib?-release", &patterns));
     }
 
@@ -1444,7 +1456,9 @@ mod tests {
     fn test_should_exclude_path_wildcard_single() {
         let patterns = vec!["*.tmp".to_string()];
         assert!(MigrationService::should_exclude_path("file.tmp", &patterns));
-        assert!(!MigrationService::should_exclude_path("file.jar", &patterns));
+        assert!(!MigrationService::should_exclude_path(
+            "file.jar", &patterns
+        ));
     }
 
     #[test]
@@ -1464,7 +1478,10 @@ mod tests {
     fn test_should_exclude_path_single_wildcard_in_dir() {
         // Single wildcard should NOT match across directory separators in exclude
         let patterns = vec!["*.log".to_string()];
-        assert!(MigrationService::should_exclude_path("debug.log", &patterns));
+        assert!(MigrationService::should_exclude_path(
+            "debug.log",
+            &patterns
+        ));
         // * maps to [^/]* so it won't match across /
         assert!(!MigrationService::should_exclude_path(
             "dir/debug.log",
@@ -1556,10 +1573,7 @@ mod tests {
     #[test]
     fn test_sanitize_path_star_replaced() {
         // * is a Windows-forbidden character
-        assert_eq!(
-            MigrationService::sanitize_path("file*.jar"),
-            "file_.jar"
-        );
+        assert_eq!(MigrationService::sanitize_path("file*.jar"), "file_.jar");
     }
 
     #[test]
@@ -1601,10 +1615,7 @@ mod tests {
             MigrationService::sanitize_repo_key("..repo-name--"),
             "repo-name"
         );
-        assert_eq!(
-            MigrationService::sanitize_repo_key("-.-repo-.-"),
-            "repo"
-        );
+        assert_eq!(MigrationService::sanitize_repo_key("-.-repo-.-"), "repo");
     }
 
     #[test]
@@ -2031,7 +2042,10 @@ mod tests {
         let cloned = config.clone();
         assert_eq!(cloned.source_key, "src");
         assert_eq!(cloned.target_key, "tgt");
-        assert_eq!(cloned.upstream_url, Some("https://upstream.example.com".to_string()));
+        assert_eq!(
+            cloned.upstream_url,
+            Some("https://upstream.example.com".to_string())
+        );
         assert_eq!(cloned.members.len(), 2);
     }
 }

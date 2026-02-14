@@ -446,7 +446,10 @@ mod tests {
         let config = MonitorConfig::default();
         let config2 = config.clone();
         assert_eq!(config.alert_threshold, config2.alert_threshold);
-        assert_eq!(config.alert_cooldown_minutes, config2.alert_cooldown_minutes);
+        assert_eq!(
+            config.alert_cooldown_minutes,
+            config2.alert_cooldown_minutes
+        );
         assert_eq!(config.check_timeout_secs, config2.check_timeout_secs);
     }
 

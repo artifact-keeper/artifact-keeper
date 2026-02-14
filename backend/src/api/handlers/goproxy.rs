@@ -1454,18 +1454,14 @@ mod tests {
     #[test]
     fn test_extract_basic_credentials_valid() {
         use axum::http::HeaderValue;
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("gouser:gopass");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("gouser:gopass");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
         );
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("gouser".to_string(), "gopass".to_string()))
-        );
+        assert_eq!(result, Some(("gouser".to_string(), "gopass".to_string())));
     }
 
     #[test]
@@ -1487,17 +1483,13 @@ mod tests {
     #[test]
     fn test_extract_basic_credentials_colon_in_password() {
         use axum::http::HeaderValue;
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode("user:p:a:s:s");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:p:a:s:s");
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Basic {}", encoded)).unwrap(),
         );
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "p:a:s:s".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "p:a:s:s".to_string())));
     }
 }

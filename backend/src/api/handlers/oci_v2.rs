@@ -1302,14 +1302,8 @@ mod tests {
     #[test]
     fn test_extract_bearer_token_lowercase() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("bearer my-token"),
-        );
-        assert_eq!(
-            extract_bearer_token(&headers),
-            Some("my-token".to_string())
-        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("bearer my-token"));
+        assert_eq!(extract_bearer_token(&headers), Some("my-token".to_string()));
     }
 
     #[test]
@@ -1363,10 +1357,7 @@ mod tests {
     #[test]
     fn test_extract_basic_credentials_invalid_base64() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Basic !!!invalid"),
-        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic !!!invalid"));
         assert!(extract_basic_credentials(&headers).is_none());
     }
 
@@ -1401,20 +1392,17 @@ mod tests {
     fn test_request_host_with_host_header() {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("registry.example.com"));
-        assert_eq!(
-            request_host(&headers),
-            "http://registry.example.com"
-        );
+        assert_eq!(request_host(&headers), "http://registry.example.com");
     }
 
     #[test]
     fn test_request_host_with_scheme() {
         let mut headers = HeaderMap::new();
-        headers.insert("host", HeaderValue::from_static("https://registry.example.com"));
-        assert_eq!(
-            request_host(&headers),
-            "https://registry.example.com"
+        headers.insert(
+            "host",
+            HeaderValue::from_static("https://registry.example.com"),
         );
+        assert_eq!(request_host(&headers), "https://registry.example.com");
     }
 
     #[test]
@@ -1436,10 +1424,7 @@ mod tests {
 
     #[test]
     fn test_blob_storage_key() {
-        assert_eq!(
-            blob_storage_key("sha256:abc123"),
-            "oci-blobs/sha256:abc123"
-        );
+        assert_eq!(blob_storage_key("sha256:abc123"), "oci-blobs/sha256:abc123");
     }
 
     #[test]

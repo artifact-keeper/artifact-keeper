@@ -71,7 +71,7 @@ pub struct BackupListResponse {
     pub total: i64,
 }
 
-fn parse_backup_type(s: &str) -> Option<BackupType> {
+pub(crate) fn parse_backup_type(s: &str) -> Option<BackupType> {
     match s.to_lowercase().as_str() {
         "full" => Some(BackupType::Full),
         "incremental" => Some(BackupType::Incremental),
@@ -80,7 +80,7 @@ fn parse_backup_type(s: &str) -> Option<BackupType> {
     }
 }
 
-fn parse_backup_status(s: &str) -> Option<BackupStatus> {
+pub(crate) fn parse_backup_status(s: &str) -> Option<BackupStatus> {
     match s.to_lowercase().as_str() {
         "pending" => Some(BackupStatus::Pending),
         "in_progress" => Some(BackupStatus::InProgress),
@@ -785,3 +785,309 @@ pub async fn trigger_reindex(
     ))
 )]
 pub struct AdminApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // parse_backup_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_backup_type_full() {
+        assert_eq!(parse_backup_type("full"), Some(BackupType::Full));
+    }
+
+    #[test]
+    fn test_parse_backup_type_incremental() {
+        assert_eq!(
+            parse_backup_type("incremental"),
+            Some(BackupType::Incremental)
+        );
+    }
+
+    #[test]
+    fn test_parse_backup_type_metadata() {
+        assert_eq!(parse_backup_type("metadata"), Some(BackupType::Metadata));
+    }
+
+    #[test]
+    fn test_parse_backup_type_case_insensitive() {
+        assert_eq!(parse_backup_type("FULL"), Some(BackupType::Full));
+        assert_eq!(parse_backup_type("Full"), Some(BackupType::Full));
+        assert_eq!(
+            parse_backup_type("INCREMENTAL"),
+            Some(BackupType::Incremental)
+        );
+        assert_eq!(parse_backup_type("Metadata"), Some(BackupType::Metadata));
+    }
+
+    #[test]
+    fn test_parse_backup_type_invalid() {
+        assert_eq!(parse_backup_type("unknown"), None);
+        assert_eq!(parse_backup_type(""), None);
+        assert_eq!(parse_backup_type("partial"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_backup_status
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_backup_status_pending() {
+        assert_eq!(parse_backup_status("pending"), Some(BackupStatus::Pending));
+    }
+
+    #[test]
+    fn test_parse_backup_status_in_progress() {
+        assert_eq!(
+            parse_backup_status("in_progress"),
+            Some(BackupStatus::InProgress)
+        );
+    }
+
+    #[test]
+    fn test_parse_backup_status_completed() {
+        assert_eq!(
+            parse_backup_status("completed"),
+            Some(BackupStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn test_parse_backup_status_failed() {
+        assert_eq!(parse_backup_status("failed"), Some(BackupStatus::Failed));
+    }
+
+    #[test]
+    fn test_parse_backup_status_cancelled() {
+        assert_eq!(
+            parse_backup_status("cancelled"),
+            Some(BackupStatus::Cancelled)
+        );
+    }
+
+    #[test]
+    fn test_parse_backup_status_case_insensitive() {
+        assert_eq!(
+            parse_backup_status("COMPLETED"),
+            Some(BackupStatus::Completed)
+        );
+        assert_eq!(parse_backup_status("Failed"), Some(BackupStatus::Failed));
+        assert_eq!(
+            parse_backup_status("IN_PROGRESS"),
+            Some(BackupStatus::InProgress)
+        );
+    }
+
+    #[test]
+    fn test_parse_backup_status_invalid() {
+        assert_eq!(parse_backup_status("unknown"), None);
+        assert_eq!(parse_backup_status(""), None);
+        assert_eq!(parse_backup_status("running"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // SystemSettings defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_system_settings_defaults() {
+        let settings = SystemSettings {
+            allow_anonymous_download: false,
+            max_upload_size_bytes: 100 * 1024 * 1024,
+            retention_days: 365,
+            audit_retention_days: 90,
+            backup_retention_count: 10,
+            edge_stale_threshold_minutes: 5,
+        };
+        assert!(!settings.allow_anonymous_download);
+        assert_eq!(settings.max_upload_size_bytes, 104_857_600);
+        assert_eq!(settings.retention_days, 365);
+        assert_eq!(settings.audit_retention_days, 90);
+        assert_eq!(settings.backup_retention_count, 10);
+        assert_eq!(settings.edge_stale_threshold_minutes, 5);
+    }
+
+    #[test]
+    fn test_system_settings_serialization_roundtrip() {
+        let settings = SystemSettings {
+            allow_anonymous_download: true,
+            max_upload_size_bytes: 500_000_000,
+            retention_days: 30,
+            audit_retention_days: 7,
+            backup_retention_count: 5,
+            edge_stale_threshold_minutes: 10,
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: SystemSettings = serde_json::from_str(&json).unwrap();
+        assert!(parsed.allow_anonymous_download);
+        assert_eq!(parsed.max_upload_size_bytes, 500_000_000);
+        assert_eq!(parsed.retention_days, 30);
+        assert_eq!(parsed.audit_retention_days, 7);
+        assert_eq!(parsed.backup_retention_count, 5);
+        assert_eq!(parsed.edge_stale_threshold_minutes, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // BackupResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backup_response_serialization() {
+        let resp = BackupResponse {
+            id: Uuid::nil(),
+            backup_type: "full".to_string(),
+            status: "completed".to_string(),
+            storage_path: Some("backups/2024/01/01/test.tar.gz".to_string()),
+            size_bytes: 1024,
+            artifact_count: 42,
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            created_by: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["type"], "full");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["size_bytes"], 1024);
+        assert_eq!(json["artifact_count"], 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // SystemStats serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_system_stats_serialization() {
+        let stats = SystemStats {
+            total_repositories: 10,
+            total_artifacts: 500,
+            total_storage_bytes: 1_000_000_000,
+            total_downloads: 5000,
+            total_users: 25,
+            active_peers: 3,
+            pending_sync_tasks: 0,
+        };
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["total_repositories"], 10);
+        assert_eq!(json["total_artifacts"], 500);
+        assert_eq!(json["total_storage_bytes"], 1_000_000_000i64);
+        assert_eq!(json["total_downloads"], 5000);
+        assert_eq!(json["total_users"], 25);
+    }
+
+    // -----------------------------------------------------------------------
+    // CleanupResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cleanup_response_serialization() {
+        let resp = CleanupResponse {
+            audit_logs_deleted: 100,
+            backups_deleted: 2,
+            peers_marked_offline: 1,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["audit_logs_deleted"], 100);
+        assert_eq!(json["backups_deleted"], 2);
+        assert_eq!(json["peers_marked_offline"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // ReindexResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reindex_response_serialization() {
+        let resp = ReindexResponse {
+            message: "Full reindex completed successfully".to_string(),
+            artifacts_indexed: 500,
+            repositories_indexed: 10,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["artifacts_indexed"], 500);
+        assert_eq!(json["repositories_indexed"], 10);
+        assert!(json["message"].as_str().unwrap().contains("reindex"));
+    }
+
+    // -----------------------------------------------------------------------
+    // RestoreResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_restore_response_serialization() {
+        let resp = RestoreResponse {
+            tables_restored: vec!["users".to_string(), "artifacts".to_string()],
+            artifacts_restored: 42,
+            errors: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["tables_restored"].as_array().unwrap().len(), 2);
+        assert_eq!(json["artifacts_restored"], 42);
+        assert!(json["errors"].as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Request deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_backup_request_deserialization() {
+        let json = r#"{"type": "full"}"#;
+        let req: CreateBackupRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.backup_type, Some("full".to_string()));
+        assert!(req.repository_ids.is_none());
+    }
+
+    #[test]
+    fn test_create_backup_request_with_repository_ids() {
+        let id = Uuid::new_v4();
+        let json = serde_json::json!({"type": "incremental", "repository_ids": [id]});
+        let req: CreateBackupRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.backup_type, Some("incremental".to_string()));
+        assert_eq!(req.repository_ids.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_request_deserialization() {
+        let json = r#"{"cleanup_audit_logs": true, "cleanup_old_backups": false}"#;
+        let req: CleanupRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cleanup_audit_logs, Some(true));
+        assert_eq!(req.cleanup_old_backups, Some(false));
+        assert!(req.cleanup_stale_peers.is_none());
+    }
+
+    #[test]
+    fn test_restore_request_deserialization() {
+        let json = r#"{"restore_database": true}"#;
+        let req: RestoreRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.restore_database, Some(true));
+        assert!(req.restore_artifacts.is_none());
+        assert!(req.target_repository_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // settings row parsing logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_settings_row_parsing_bool_value() {
+        let val = serde_json::json!(true);
+        assert_eq!(val.as_bool().unwrap_or(false), true);
+    }
+
+    #[test]
+    fn test_settings_row_parsing_int_value() {
+        let val = serde_json::json!(42);
+        assert_eq!(val.as_i64().unwrap_or(0), 42);
+    }
+
+    #[test]
+    fn test_settings_row_parsing_fallback_on_wrong_type() {
+        let val = serde_json::json!("not a number");
+        assert_eq!(val.as_i64().unwrap_or(100), 100);
+    }
+}

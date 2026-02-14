@@ -679,10 +679,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pw".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "pw".to_string())));
     }
 
     #[test]
@@ -695,10 +692,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_basic_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("admin".to_string(), "p@ss:word".to_string()))
-        );
+        assert_eq!(result, Some(("admin".to_string(), "p@ss:word".to_string())));
     }
 
     #[test]

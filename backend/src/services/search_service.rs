@@ -538,7 +538,10 @@ mod tests {
 
     #[test]
     fn test_build_tsquery_filter_single_word() {
-        assert_eq!(build_tsquery_filter(Some("artifact")).as_deref(), Some("artifact:*"));
+        assert_eq!(
+            build_tsquery_filter(Some("artifact")).as_deref(),
+            Some("artifact:*")
+        );
     }
 
     #[test]
@@ -574,12 +577,18 @@ mod tests {
 
     #[test]
     fn test_build_name_filter_wildcard() {
-        assert_eq!(build_name_filter(Some("my-lib*")).as_deref(), Some("my-lib%"));
+        assert_eq!(
+            build_name_filter(Some("my-lib*")).as_deref(),
+            Some("my-lib%")
+        );
     }
 
     #[test]
     fn test_build_name_filter_multiple_wildcards() {
-        assert_eq!(build_name_filter(Some("*my*lib*")).as_deref(), Some("%my%lib%"));
+        assert_eq!(
+            build_name_filter(Some("*my*lib*")).as_deref(),
+            Some("%my%lib%")
+        );
     }
 
     #[test]
@@ -589,7 +598,10 @@ mod tests {
 
     #[test]
     fn test_build_name_filter_no_wildcard() {
-        assert_eq!(build_name_filter(Some("exact-name")).as_deref(), Some("exact-name"));
+        assert_eq!(
+            build_name_filter(Some("exact-name")).as_deref(),
+            Some("exact-name")
+        );
     }
 
     // -----------------------------------------------------------------------

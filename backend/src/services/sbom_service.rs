@@ -155,7 +155,10 @@ pub(crate) fn content_hash(content: &str) -> String {
 }
 
 /// Compute the number of days a CVE has been exposed.
-pub(crate) fn days_exposed(first_detected_at: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> i64 {
+pub(crate) fn days_exposed(
+    first_detected_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> i64 {
     (now - first_detected_at).num_days()
 }
 
@@ -917,7 +920,10 @@ mod tests {
         assert_eq!(pkg["licenseConcluded"], "MIT");
         assert_eq!(pkg["licenseDeclared"], "MIT");
         assert_eq!(pkg["checksums"][0]["algorithm"], "SHA256");
-        assert_eq!(pkg["externalRefs"][0]["referenceLocator"], "pkg:npm/express@4.18.2");
+        assert_eq!(
+            pkg["externalRefs"][0]["referenceLocator"],
+            "pkg:npm/express@4.18.2"
+        );
         assert_eq!(pkg["downloadLocation"], "NOASSERTION");
     }
 
@@ -940,7 +946,10 @@ mod tests {
     fn test_build_spdx_package_index_numbering() {
         let dep = DependencyInfo {
             name: "pkg".to_string(),
-            version: None, purl: None, license: None, sha256: None,
+            version: None,
+            purl: None,
+            license: None,
+            sha256: None,
         };
         assert_eq!(build_spdx_package(&dep, 0)["SPDXID"], "SPDXRef-Package-0");
         assert_eq!(build_spdx_package(&dep, 42)["SPDXID"], "SPDXRef-Package-42");
@@ -971,7 +980,10 @@ mod tests {
     fn test_build_component_info_minimal() {
         let dep = DependencyInfo {
             name: "pkg".to_string(),
-            version: None, purl: None, license: None, sha256: None,
+            version: None,
+            purl: None,
+            license: None,
+            sha256: None,
         };
         let comp = build_component_info(&dep);
         assert!(comp.licenses.is_empty());
@@ -990,9 +1002,27 @@ mod tests {
     #[test]
     fn test_extract_unique_licenses_dedup() {
         let deps = vec![
-            DependencyInfo { name: "a".to_string(), version: None, purl: None, license: Some("MIT".to_string()), sha256: None },
-            DependencyInfo { name: "b".to_string(), version: None, purl: None, license: Some("MIT".to_string()), sha256: None },
-            DependencyInfo { name: "c".to_string(), version: None, purl: None, license: Some("Apache-2.0".to_string()), sha256: None },
+            DependencyInfo {
+                name: "a".to_string(),
+                version: None,
+                purl: None,
+                license: Some("MIT".to_string()),
+                sha256: None,
+            },
+            DependencyInfo {
+                name: "b".to_string(),
+                version: None,
+                purl: None,
+                license: Some("MIT".to_string()),
+                sha256: None,
+            },
+            DependencyInfo {
+                name: "c".to_string(),
+                version: None,
+                purl: None,
+                license: Some("Apache-2.0".to_string()),
+                sha256: None,
+            },
         ];
         let licenses = extract_unique_licenses(&deps);
         assert_eq!(licenses.len(), 2);
@@ -1001,8 +1031,20 @@ mod tests {
     #[test]
     fn test_extract_unique_licenses_skips_none() {
         let deps = vec![
-            DependencyInfo { name: "a".to_string(), version: None, purl: None, license: Some("MIT".to_string()), sha256: None },
-            DependencyInfo { name: "b".to_string(), version: None, purl: None, license: None, sha256: None },
+            DependencyInfo {
+                name: "a".to_string(),
+                version: None,
+                purl: None,
+                license: Some("MIT".to_string()),
+                sha256: None,
+            },
+            DependencyInfo {
+                name: "b".to_string(),
+                version: None,
+                purl: None,
+                license: None,
+                sha256: None,
+            },
         ];
         let licenses = extract_unique_licenses(&deps);
         assert_eq!(licenses.len(), 1);
@@ -1012,7 +1054,11 @@ mod tests {
     // check_license_compliance_pure
     // ===================================================================
 
-    fn make_test_policy(allowed: Vec<&str>, denied: Vec<&str>, allow_unknown: bool) -> LicensePolicy {
+    fn make_test_policy(
+        allowed: Vec<&str>,
+        denied: Vec<&str>,
+        allow_unknown: bool,
+    ) -> LicensePolicy {
         LicensePolicy {
             id: Uuid::new_v4(),
             repository_id: None,

@@ -1025,9 +1025,76 @@ impl SyncPolicyService {
     }
 }
 
+// =========================================================================
+// Extracted pure functions (testable without DB or async)
+// =========================================================================
+
+/// Validate that a sync policy name is non-empty after trimming whitespace.
+pub(crate) fn validate_policy_name(name: &str) -> std::result::Result<(), &'static str> {
+    if name.trim().is_empty() {
+        Err("Policy name cannot be empty")
+    } else {
+        Ok(())
+    }
+}
+
+/// Classify a database error during policy creation.
+/// Returns an appropriate user-facing error message.
+pub(crate) fn classify_policy_db_error(error_msg: &str, policy_name: &str) -> String {
+    if error_msg.contains("duplicate key") {
+        format!("Sync policy '{}' already exists", policy_name)
+    } else {
+        error_msg.to_string()
+    }
+}
+
+/// Check whether a RepoSelector has any active filters.
+/// A selector with no filters matches nothing (not everything).
+pub(crate) fn repo_selector_has_filters(selector: &RepoSelector) -> bool {
+    !selector.match_labels.is_empty()
+        || !selector.match_formats.is_empty()
+        || selector.match_pattern.is_some()
+}
+
+/// Convert a glob-style pattern (using `*` as wildcard) to a SQL LIKE
+/// pattern (using `%` as wildcard).
+pub(crate) fn glob_to_sql_pattern(glob: &str) -> String {
+    glob.replace('*', "%")
+}
+
+/// Filter repository keys by format (case-insensitive).
+pub(crate) fn filter_by_formats(repo_format: &str, match_formats: &[String]) -> bool {
+    if match_formats.is_empty() {
+        return true;
+    }
+    match_formats
+        .iter()
+        .any(|f| f.to_lowercase() == repo_format.to_lowercase())
+}
+
+/// Check if a set of labels matches ALL required label selectors (AND semantics).
+pub(crate) fn labels_match_all(
+    repo_labels: &[(&str, &str)],
+    required_labels: &HashMap<String, String>,
+) -> bool {
+    required_labels
+        .iter()
+        .all(|(k, v)| repo_labels.iter().any(|(lk, lv)| *lk == k && *lv == v))
+}
+
+/// Compute the subscription count from matched repositories and peers.
+pub(crate) fn compute_subscription_count(repo_count: usize, peer_count: usize) -> usize {
+    repo_count * peer_count
+}
+
+/// Validate a replication mode string.
+pub(crate) fn validate_replication_mode(mode: &str) -> bool {
+    matches!(mode, "push" | "pull" | "mirror")
+}
+
 /// Simple SQL LIKE pattern matching for in-memory filtering.
 /// Supports `%` as wildcard (matches zero or more characters).
-fn sql_like_match(value: &str, pattern: &str) -> bool {
+pub(crate) fn sql_like_match(value: &str, pattern: &str) -> bool {
     let parts: Vec<&str> = pattern.split('%').collect();
 
     if parts.len() == 1 {
@@ -1691,6 +1758,226 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validate_policy_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_policy_name_valid() {
+        assert!(validate_policy_name("prod-sync").is_ok());
+        assert!(validate_policy_name("a").is_ok());
+        assert!(validate_policy_name("  leading-spaces").is_ok());
+    }
+
+    #[test]
+    fn test_validate_policy_name_empty() {
+        assert!(validate_policy_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_policy_name_whitespace_only() {
+        assert!(validate_policy_name("   ").is_err());
+        assert!(validate_policy_name("\t\n").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_policy_db_error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_policy_db_error_duplicate() {
+        let result = classify_policy_db_error("duplicate key value violates", "my-policy");
+        assert_eq!(result, "Sync policy 'my-policy' already exists");
+    }
+
+    #[test]
+    fn test_classify_policy_db_error_other() {
+        let result = classify_policy_db_error("connection refused", "my-policy");
+        assert_eq!(result, "connection refused");
+    }
+
+    // -----------------------------------------------------------------------
+    // repo_selector_has_filters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_selector_has_filters_empty() {
+        let sel = RepoSelector::default();
+        assert!(!repo_selector_has_filters(&sel));
+    }
+
+    #[test]
+    fn test_repo_selector_has_filters_labels() {
+        let sel = RepoSelector {
+            match_labels: {
+                let mut m = HashMap::new();
+                m.insert("env".to_string(), "prod".to_string());
+                m
+            },
+            ..Default::default()
+        };
+        assert!(repo_selector_has_filters(&sel));
+    }
+
+    #[test]
+    fn test_repo_selector_has_filters_formats() {
+        let sel = RepoSelector {
+            match_formats: vec!["docker".to_string()],
+            ..Default::default()
+        };
+        assert!(repo_selector_has_filters(&sel));
+    }
+
+    #[test]
+    fn test_repo_selector_has_filters_pattern() {
+        let sel = RepoSelector {
+            match_pattern: Some("libs-*".to_string()),
+            ..Default::default()
+        };
+        assert!(repo_selector_has_filters(&sel));
+    }
+
+    // -----------------------------------------------------------------------
+    // glob_to_sql_pattern
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_glob_to_sql_pattern_simple() {
+        assert_eq!(glob_to_sql_pattern("libs-*"), "libs-%");
+    }
+
+    #[test]
+    fn test_glob_to_sql_pattern_multiple_wildcards() {
+        assert_eq!(glob_to_sql_pattern("*-release-*"), "%-release-%");
+    }
+
+    #[test]
+    fn test_glob_to_sql_pattern_no_wildcard() {
+        assert_eq!(glob_to_sql_pattern("exact-name"), "exact-name");
+    }
+
+    #[test]
+    fn test_glob_to_sql_pattern_all_wildcard() {
+        assert_eq!(glob_to_sql_pattern("*"), "%");
+    }
+
+    #[test]
+    fn test_glob_to_sql_pattern_empty() {
+        assert_eq!(glob_to_sql_pattern(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // filter_by_formats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_by_formats_empty_list_passes() {
+        assert!(filter_by_formats("docker", &[]));
+    }
+
+    #[test]
+    fn test_filter_by_formats_matching() {
+        let formats = vec!["docker".to_string(), "maven".to_string()];
+        assert!(filter_by_formats("docker", &formats));
+        assert!(filter_by_formats("maven", &formats));
+    }
+
+    #[test]
+    fn test_filter_by_formats_case_insensitive() {
+        let formats = vec!["Docker".to_string()];
+        assert!(filter_by_formats("docker", &formats));
+        assert!(filter_by_formats("DOCKER", &formats));
+    }
+
+    #[test]
+    fn test_filter_by_formats_no_match() {
+        let formats = vec!["docker".to_string()];
+        assert!(!filter_by_formats("maven", &formats));
+    }
+
+    // -----------------------------------------------------------------------
+    // labels_match_all
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_labels_match_all_empty_required() {
+        let repo_labels = vec![("env", "prod")];
+        let required = HashMap::new();
+        assert!(labels_match_all(&repo_labels, &required));
+    }
+
+    #[test]
+    fn test_labels_match_all_single_match() {
+        let repo_labels = vec![("env", "prod"), ("tier", "1")];
+        let mut required = HashMap::new();
+        required.insert("env".to_string(), "prod".to_string());
+        assert!(labels_match_all(&repo_labels, &required));
+    }
+
+    #[test]
+    fn test_labels_match_all_multiple_match() {
+        let repo_labels = vec![("env", "prod"), ("tier", "1"), ("team", "platform")];
+        let mut required = HashMap::new();
+        required.insert("env".to_string(), "prod".to_string());
+        required.insert("tier".to_string(), "1".to_string());
+        assert!(labels_match_all(&repo_labels, &required));
+    }
+
+    #[test]
+    fn test_labels_match_all_value_mismatch() {
+        let repo_labels = vec![("env", "staging")];
+        let mut required = HashMap::new();
+        required.insert("env".to_string(), "prod".to_string());
+        assert!(!labels_match_all(&repo_labels, &required));
+    }
+
+    #[test]
+    fn test_labels_match_all_key_missing() {
+        let repo_labels = vec![("env", "prod")];
+        let mut required = HashMap::new();
+        required.insert("tier".to_string(), "1".to_string());
+        assert!(!labels_match_all(&repo_labels, &required));
+    }
+
+    #[test]
+    fn test_labels_match_all_empty_repo_labels() {
+        let repo_labels: Vec<(&str, &str)> = vec![];
+        let mut required = HashMap::new();
+        required.insert("env".to_string(), "prod".to_string());
+        assert!(!labels_match_all(&repo_labels, &required));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_subscription_count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_subscription_count() {
+        assert_eq!(compute_subscription_count(5, 3), 15);
+        assert_eq!(compute_subscription_count(0, 10), 0);
+        assert_eq!(compute_subscription_count(10, 0), 0);
+        assert_eq!(compute_subscription_count(1, 1), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_replication_mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_replication_mode_valid() {
+        assert!(validate_replication_mode("push"));
+        assert!(validate_replication_mode("pull"));
+        assert!(validate_replication_mode("mirror"));
+    }
+
+    #[test]
+    fn test_validate_replication_mode_invalid() {
+        assert!(!validate_replication_mode("sync"));
+        assert!(!validate_replication_mode(""));
+        assert!(!validate_replication_mode("Push"));
+        assert!(!validate_replication_mode("MIRROR"));
+    }
+
+    // -----------------------------------------------------------------------
     // sql_like_match helper
     // -----------------------------------------------------------------------
 
@@ -1736,6 +2023,55 @@ mod tests {
     fn test_sql_like_match_multiple_wildcards() {
         assert!(sql_like_match("libs-release-v2", "libs-%-v2"));
         assert!(!sql_like_match("libs-release-v3", "libs-%-v2"));
+    }
+
+    #[test]
+    fn test_sql_like_match_double_wildcard() {
+        // %% is two consecutive wildcards, equivalent to %
+        assert!(sql_like_match("abc", "%%"));
+        assert!(sql_like_match("", "%%"));
+    }
+
+    #[test]
+    fn test_sql_like_match_only_prefix() {
+        assert!(sql_like_match("docker-prod", "docker%"));
+        assert!(!sql_like_match("maven-prod", "docker%"));
+    }
+
+    #[test]
+    fn test_sql_like_match_complex_pattern() {
+        // libs-%-release-%-v2
+        assert!(sql_like_match(
+            "libs-core-release-stable-v2",
+            "libs-%-release-%-v2"
+        ));
+        assert!(!sql_like_match(
+            "libs-core-release-stable-v3",
+            "libs-%-release-%-v2"
+        ));
+    }
+
+    #[test]
+    fn test_sql_like_match_single_char_value() {
+        assert!(sql_like_match("a", "%"));
+        assert!(sql_like_match("a", "a"));
+        assert!(!sql_like_match("a", "b"));
+    }
+
+    #[test]
+    fn test_sql_like_match_value_shorter_than_pattern() {
+        assert!(!sql_like_match("ab", "abc"));
+    }
+
+    #[test]
+    fn test_sql_like_match_value_longer_than_pattern() {
+        assert!(!sql_like_match("abcdef", "abc"));
+    }
+
+    #[test]
+    fn test_sql_like_match_wildcard_at_start_and_end() {
+        assert!(sql_like_match("anything-release-anything", "%release%"));
+        assert!(!sql_like_match("anything-snapshot-anything", "%release%"));
     }
 
     // -----------------------------------------------------------------------

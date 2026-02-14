@@ -1479,7 +1479,11 @@ mod tests {
     #[test]
     fn test_build_policy_result_json_all_fields_present() {
         let json = build_policy_result_json(
-            true, "warn", &[], &serde_json::json!(null), &serde_json::json!(null),
+            true,
+            "warn",
+            &[],
+            &serde_json::json!(null),
+            &serde_json::json!(null),
         );
         assert!(json.get("passed").is_some());
         assert!(json.get("action").is_some());

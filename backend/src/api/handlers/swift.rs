@@ -799,10 +799,7 @@ mod tests {
             HeaderValue::from_static("bearer my-token"),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("token".to_string(), "my-token".to_string()))
-        );
+        assert_eq!(result, Some(("token".to_string(), "my-token".to_string())));
     }
 
     #[test]
@@ -815,10 +812,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("alice".to_string(), "p@ssword".to_string()))
-        );
+        assert_eq!(result, Some(("alice".to_string(), "p@ssword".to_string())));
     }
 
     #[test]
@@ -831,10 +825,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pass".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
     }
 
     #[test]
@@ -905,10 +896,7 @@ mod tests {
             response.headers().get(CONTENT_TYPE).unwrap(),
             "application/json"
         );
-        assert_eq!(
-            response.headers().get("Content-Version").unwrap(),
-            "1"
-        );
+        assert_eq!(response.headers().get("Content-Version").unwrap(), "1");
     }
 
     #[test]
@@ -916,10 +904,7 @@ mod tests {
         let body = serde_json::json!({});
         let response = swift_json_response(StatusCode::CREATED, body);
         assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(
-            response.headers().get("Content-Version").unwrap(),
-            "1"
-        );
+        assert_eq!(response.headers().get("Content-Version").unwrap(), "1");
     }
 
     // -----------------------------------------------------------------------
@@ -934,10 +919,7 @@ mod tests {
             response.headers().get(CONTENT_TYPE).unwrap(),
             "application/problem+json"
         );
-        assert_eq!(
-            response.headers().get("Content-Version").unwrap(),
-            "1"
-        );
+        assert_eq!(response.headers().get("Content-Version").unwrap(), "1");
     }
 
     #[test]

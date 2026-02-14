@@ -635,3 +635,515 @@ fn model_policy_action_to_proto(
         crate::models::sbom::PolicyAction::Block => super::generated::PolicyAction::Block,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    // -----------------------------------------------------------------------
+    // parse_uuid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_uuid_valid() {
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let result = parse_uuid(uuid_str);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_string(), uuid_str);
+    }
+
+    #[test]
+    fn test_parse_uuid_nil() {
+        let result = parse_uuid("00000000-0000-0000-0000-000000000000");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_nil());
+    }
+
+    #[test]
+    fn test_parse_uuid_invalid() {
+        let result = parse_uuid("not-a-uuid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_uuid_empty() {
+        let result = parse_uuid("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_uuid_partial() {
+        let result = parse_uuid("550e8400-e29b-41d4");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_uuid_v4() {
+        let id = Uuid::new_v4();
+        let result = parse_uuid(&id.to_string());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), id);
+    }
+
+    // -----------------------------------------------------------------------
+    // datetime_to_proto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_datetime_to_proto_epoch() {
+        let dt = Utc.timestamp_opt(0, 0).unwrap();
+        let ts = datetime_to_proto(dt);
+        assert_eq!(ts.seconds, 0);
+        assert_eq!(ts.nanos, 0);
+    }
+
+    #[test]
+    fn test_datetime_to_proto_specific_time() {
+        let dt = Utc.timestamp_opt(1700000000, 500_000_000).unwrap();
+        let ts = datetime_to_proto(dt);
+        assert_eq!(ts.seconds, 1700000000);
+        assert_eq!(ts.nanos, 500_000_000);
+    }
+
+    #[test]
+    fn test_datetime_to_proto_current() {
+        let now = Utc::now();
+        let ts = datetime_to_proto(now);
+        assert!(ts.seconds > 0);
+        assert!(ts.nanos >= 0);
+    }
+
+    #[test]
+    fn test_datetime_to_proto_subsec_nanos() {
+        let dt = Utc.timestamp_opt(1000000, 123_456_789).unwrap();
+        let ts = datetime_to_proto(dt);
+        assert_eq!(ts.seconds, 1000000);
+        assert_eq!(ts.nanos, 123_456_789);
+    }
+
+    // -----------------------------------------------------------------------
+    // proto_to_sbom_format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proto_to_sbom_format_cyclonedx() {
+        let result = proto_to_sbom_format(super::super::generated::SbomFormat::Cyclonedx);
+        assert_eq!(result, SbomFormat::CycloneDX);
+    }
+
+    #[test]
+    fn test_proto_to_sbom_format_spdx() {
+        let result = proto_to_sbom_format(super::super::generated::SbomFormat::Spdx);
+        assert_eq!(result, SbomFormat::SPDX);
+    }
+
+    // -----------------------------------------------------------------------
+    // sbom_format_to_proto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sbom_format_to_proto_cyclonedx() {
+        let result = sbom_format_to_proto(SbomFormat::CycloneDX);
+        assert_eq!(result, super::super::generated::SbomFormat::Cyclonedx);
+    }
+
+    #[test]
+    fn test_sbom_format_to_proto_spdx() {
+        let result = sbom_format_to_proto(SbomFormat::SPDX);
+        assert_eq!(result, super::super::generated::SbomFormat::Spdx);
+    }
+
+    #[test]
+    fn test_sbom_format_roundtrip_cyclonedx() {
+        let original = SbomFormat::CycloneDX;
+        let proto = sbom_format_to_proto(original);
+        let back = proto_to_sbom_format(proto);
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn test_sbom_format_roundtrip_spdx() {
+        let original = SbomFormat::SPDX;
+        let proto = sbom_format_to_proto(original);
+        let back = proto_to_sbom_format(proto);
+        assert_eq!(back, original);
+    }
+
+    // -----------------------------------------------------------------------
+    // proto_to_cve_status / cve_status_to_proto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proto_to_cve_status_open() {
+        let result = proto_to_cve_status(super::super::generated::CveStatus::Open);
+        assert_eq!(result, CveStatus::Open);
+    }
+
+    #[test]
+    fn test_proto_to_cve_status_fixed() {
+        let result = proto_to_cve_status(super::super::generated::CveStatus::Fixed);
+        assert_eq!(result, CveStatus::Fixed);
+    }
+
+    #[test]
+    fn test_proto_to_cve_status_acknowledged() {
+        let result = proto_to_cve_status(super::super::generated::CveStatus::Acknowledged);
+        assert_eq!(result, CveStatus::Acknowledged);
+    }
+
+    #[test]
+    fn test_proto_to_cve_status_false_positive() {
+        let result = proto_to_cve_status(super::super::generated::CveStatus::FalsePositive);
+        assert_eq!(result, CveStatus::FalsePositive);
+    }
+
+    #[test]
+    fn test_cve_status_to_proto_open() {
+        let result = cve_status_to_proto(CveStatus::Open);
+        assert_eq!(result, super::super::generated::CveStatus::Open);
+    }
+
+    #[test]
+    fn test_cve_status_to_proto_fixed() {
+        let result = cve_status_to_proto(CveStatus::Fixed);
+        assert_eq!(result, super::super::generated::CveStatus::Fixed);
+    }
+
+    #[test]
+    fn test_cve_status_to_proto_acknowledged() {
+        let result = cve_status_to_proto(CveStatus::Acknowledged);
+        assert_eq!(result, super::super::generated::CveStatus::Acknowledged);
+    }
+
+    #[test]
+    fn test_cve_status_to_proto_false_positive() {
+        let result = cve_status_to_proto(CveStatus::FalsePositive);
+        assert_eq!(result, super::super::generated::CveStatus::FalsePositive);
+    }
+
+    #[test]
+    fn test_cve_status_roundtrip_all_variants() {
+        for status in [
+            CveStatus::Open,
+            CveStatus::Fixed,
+            CveStatus::Acknowledged,
+            CveStatus::FalsePositive,
+        ] {
+            let proto = cve_status_to_proto(status);
+            let back = proto_to_cve_status(proto);
+            assert_eq!(back, status);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // proto_to_policy_action / model_policy_action_to_proto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proto_to_policy_action_allow() {
+        let result = proto_to_policy_action(super::super::generated::PolicyAction::Allow);
+        assert_eq!(result, crate::models::sbom::PolicyAction::Allow);
+    }
+
+    #[test]
+    fn test_proto_to_policy_action_warn() {
+        let result = proto_to_policy_action(super::super::generated::PolicyAction::Warn);
+        assert_eq!(result, crate::models::sbom::PolicyAction::Warn);
+    }
+
+    #[test]
+    fn test_proto_to_policy_action_block() {
+        let result = proto_to_policy_action(super::super::generated::PolicyAction::Block);
+        assert_eq!(result, crate::models::sbom::PolicyAction::Block);
+    }
+
+    #[test]
+    fn test_model_policy_action_to_proto_allow() {
+        let result = model_policy_action_to_proto(crate::models::sbom::PolicyAction::Allow);
+        assert_eq!(result, super::super::generated::PolicyAction::Allow);
+    }
+
+    #[test]
+    fn test_model_policy_action_to_proto_warn() {
+        let result = model_policy_action_to_proto(crate::models::sbom::PolicyAction::Warn);
+        assert_eq!(result, super::super::generated::PolicyAction::Warn);
+    }
+
+    #[test]
+    fn test_model_policy_action_to_proto_block() {
+        let result = model_policy_action_to_proto(crate::models::sbom::PolicyAction::Block);
+        assert_eq!(result, super::super::generated::PolicyAction::Block);
+    }
+
+    #[test]
+    fn test_policy_action_roundtrip_all_variants() {
+        for action in [
+            crate::models::sbom::PolicyAction::Allow,
+            crate::models::sbom::PolicyAction::Warn,
+            crate::models::sbom::PolicyAction::Block,
+        ] {
+            let proto = model_policy_action_to_proto(action);
+            let back = proto_to_policy_action(proto);
+            assert_eq!(back, action);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // sbom_doc_to_proto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sbom_doc_to_proto_basic() {
+        let now = Utc::now();
+        let doc_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+
+        let doc = crate::models::sbom::SbomDocument {
+            id: doc_id,
+            artifact_id,
+            repository_id: repo_id,
+            format: "cyclonedx".to_string(),
+            format_version: "1.5".to_string(),
+            spec_version: Some("1.5".to_string()),
+            content: serde_json::json!({"test": true}),
+            component_count: 42,
+            dependency_count: 10,
+            license_count: 3,
+            licenses: vec!["MIT".to_string()],
+            content_hash: "sha256:abc".to_string(),
+            generator: Some("test-gen".to_string()),
+            generator_version: Some("1.0".to_string()),
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let proto = sbom_doc_to_proto(doc);
+        assert_eq!(proto.id, doc_id.to_string());
+        assert_eq!(proto.artifact_id, artifact_id.to_string());
+        assert_eq!(proto.repository_id, repo_id.to_string());
+        assert_eq!(proto.format_version, "1.5");
+        assert_eq!(proto.spec_version, "1.5");
+        assert_eq!(proto.component_count, 42);
+        assert_eq!(proto.dependency_count, 10);
+        assert_eq!(proto.license_count, 3);
+        assert_eq!(proto.licenses, vec!["MIT"]);
+        assert_eq!(proto.content_hash, "sha256:abc");
+        assert_eq!(proto.generator, "test-gen");
+        assert_eq!(proto.generator_version, "1.0");
+        assert!(proto.generated_at.is_some());
+        assert!(proto.created_at.is_some());
+    }
+
+    #[test]
+    fn test_sbom_doc_to_proto_none_fields() {
+        let now = Utc::now();
+        let doc = crate::models::sbom::SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "spdx".to_string(),
+            format_version: "2.3".to_string(),
+            spec_version: None,
+            content: serde_json::json!({}),
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let proto = sbom_doc_to_proto(doc);
+        assert_eq!(proto.spec_version, "");
+        assert_eq!(proto.generator, "");
+        assert_eq!(proto.generator_version, "");
+        assert!(proto.licenses.is_empty());
+    }
+
+    #[test]
+    fn test_sbom_doc_to_proto_content_is_bytes() {
+        let now = Utc::now();
+        let content = serde_json::json!({"key": "value"});
+        let doc = crate::models::sbom::SbomDocument {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            format: "cyclonedx".to_string(),
+            format_version: "1.5".to_string(),
+            spec_version: None,
+            content: content.clone(),
+            component_count: 0,
+            dependency_count: 0,
+            license_count: 0,
+            licenses: vec![],
+            content_hash: "".to_string(),
+            generator: None,
+            generator_version: None,
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let proto = sbom_doc_to_proto(doc);
+        // Content is serialized to bytes
+        let content_str = String::from_utf8(proto.content).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content_str).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    // -----------------------------------------------------------------------
+    // cve_entry_to_proto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cve_entry_to_proto_full() {
+        let now = Utc::now();
+        let entry_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let ack_by = Uuid::new_v4();
+        let entry = crate::models::sbom::CveHistoryEntry {
+            id: entry_id,
+            artifact_id,
+            sbom_id: Some(Uuid::new_v4()),
+            component_id: Some(Uuid::new_v4()),
+            scan_result_id: Some(Uuid::new_v4()),
+            cve_id: "CVE-2024-1234".to_string(),
+            affected_component: Some("openssl".to_string()),
+            affected_version: Some("1.1.1".to_string()),
+            fixed_version: Some("1.1.1w".to_string()),
+            severity: Some("high".to_string()),
+            cvss_score: Some(8.5),
+            cve_published_at: Some(now),
+            first_detected_at: now,
+            last_detected_at: now,
+            status: "acknowledged".to_string(),
+            acknowledged_by: Some(ack_by),
+            acknowledged_at: Some(now),
+            acknowledged_reason: Some("Won't fix".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let proto = cve_entry_to_proto(entry);
+        assert_eq!(proto.id, entry_id.to_string());
+        assert_eq!(proto.artifact_id, artifact_id.to_string());
+        assert_eq!(proto.cve_id, "CVE-2024-1234");
+        assert_eq!(proto.affected_component, "openssl");
+        assert_eq!(proto.affected_version, "1.1.1");
+        assert_eq!(proto.fixed_version, "1.1.1w");
+        assert_eq!(proto.severity, "high");
+        assert!((proto.cvss_score - 8.5).abs() < f64::EPSILON);
+        assert!(proto.cve_published_at.is_some());
+        assert!(proto.first_detected_at.is_some());
+        assert!(proto.last_detected_at.is_some());
+        assert_eq!(proto.acknowledged_by, ack_by.to_string());
+        assert!(proto.acknowledged_at.is_some());
+        assert_eq!(proto.acknowledged_reason, "Won't fix");
+    }
+
+    #[test]
+    fn test_cve_entry_to_proto_minimal() {
+        let now = Utc::now();
+        let entry = crate::models::sbom::CveHistoryEntry {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            sbom_id: None,
+            component_id: None,
+            scan_result_id: None,
+            cve_id: "CVE-2024-0001".to_string(),
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            severity: None,
+            cvss_score: None,
+            cve_published_at: None,
+            first_detected_at: now,
+            last_detected_at: now,
+            status: "open".to_string(),
+            acknowledged_by: None,
+            acknowledged_at: None,
+            acknowledged_reason: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let proto = cve_entry_to_proto(entry);
+        assert_eq!(proto.cve_id, "CVE-2024-0001");
+        assert_eq!(proto.affected_component, "");
+        assert_eq!(proto.affected_version, "");
+        assert_eq!(proto.fixed_version, "");
+        assert_eq!(proto.severity, "");
+        assert!((proto.cvss_score - 0.0).abs() < f64::EPSILON);
+        assert!(proto.cve_published_at.is_none());
+        assert_eq!(proto.acknowledged_by, "");
+        assert!(proto.acknowledged_at.is_none());
+        assert_eq!(proto.acknowledged_reason, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // license_policy_to_proto
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_license_policy_to_proto_full() {
+        let now = Utc::now();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let policy = crate::models::sbom::LicensePolicy {
+            id: policy_id,
+            repository_id: Some(repo_id),
+            name: "strict-policy".to_string(),
+            description: Some("Block GPL".to_string()),
+            allowed_licenses: vec!["MIT".to_string()],
+            denied_licenses: vec!["GPL-3.0".to_string()],
+            allow_unknown: false,
+            action: crate::models::sbom::PolicyAction::Block,
+            is_enabled: true,
+            created_at: now,
+            updated_at: Some(now),
+        };
+
+        let proto = license_policy_to_proto(policy);
+        assert_eq!(proto.id, policy_id.to_string());
+        assert_eq!(proto.repository_id, repo_id.to_string());
+        assert_eq!(proto.name, "strict-policy");
+        assert_eq!(proto.description, "Block GPL");
+        assert_eq!(proto.allowed_licenses, vec!["MIT"]);
+        assert_eq!(proto.denied_licenses, vec!["GPL-3.0"]);
+        assert!(!proto.allow_unknown);
+        assert!(proto.is_enabled);
+        assert!(proto.created_at.is_some());
+        assert!(proto.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_license_policy_to_proto_global() {
+        let now = Utc::now();
+        let policy = crate::models::sbom::LicensePolicy {
+            id: Uuid::new_v4(),
+            repository_id: None,
+            name: "global".to_string(),
+            description: None,
+            allowed_licenses: vec![],
+            denied_licenses: vec![],
+            allow_unknown: true,
+            action: crate::models::sbom::PolicyAction::Warn,
+            is_enabled: true,
+            created_at: now,
+            updated_at: None,
+        };
+
+        let proto = license_policy_to_proto(policy);
+        assert_eq!(proto.repository_id, "");
+        assert_eq!(proto.description, "");
+        assert!(proto.allow_unknown);
+        assert!(proto.updated_at.is_none());
+    }
+}

@@ -758,10 +758,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("admin".to_string(), "secret".to_string()))
-        );
+        assert_eq!(result, Some(("admin".to_string(), "secret".to_string())));
     }
 
     #[test]
@@ -774,10 +771,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "pw".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "pw".to_string())));
     }
 
     #[test]
@@ -790,10 +784,7 @@ mod tests {
             HeaderValue::from_str(&value).unwrap(),
         );
         let result = extract_credentials(&headers);
-        assert_eq!(
-            result,
-            Some(("user".to_string(), "p:a:s:s".to_string()))
-        );
+        assert_eq!(result, Some(("user".to_string(), "p:a:s:s".to_string())));
     }
 
     #[test]
@@ -934,7 +925,10 @@ mod tests {
             "/chef/{}/api/v1/cookbooks/{}/versions/{}",
             repo_key, name, version
         );
-        assert_eq!(url, "/chef/chef-local/api/v1/cookbooks/nginx/versions/12.0.0");
+        assert_eq!(
+            url,
+            "/chef/chef-local/api/v1/cookbooks/nginx/versions/12.0.0"
+        );
     }
 
     #[test]

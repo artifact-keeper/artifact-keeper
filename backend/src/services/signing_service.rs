@@ -999,8 +999,7 @@ mod tests {
         use rsa::signature::Verifier;
 
         // Try to verify with key2's public key - should fail
-        let public_key2 =
-            RsaPublicKey::from_public_key_pem(&signing_key2.public_key_pem).unwrap();
+        let public_key2 = RsaPublicKey::from_public_key_pem(&signing_key2.public_key_pem).unwrap();
         let verifying_key2 = VerifyingKey::<Sha256>::new(public_key2);
         assert!(verifying_key2.verify(data, &signature).is_err());
     }

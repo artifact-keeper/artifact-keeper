@@ -411,9 +411,18 @@ mod tests {
 
     #[test]
     fn test_audit_action_as_str_repository() {
-        assert_eq!(AuditAction::RepositoryCreated.as_str(), "REPOSITORY_CREATED");
-        assert_eq!(AuditAction::RepositoryUpdated.as_str(), "REPOSITORY_UPDATED");
-        assert_eq!(AuditAction::RepositoryDeleted.as_str(), "REPOSITORY_DELETED");
+        assert_eq!(
+            AuditAction::RepositoryCreated.as_str(),
+            "REPOSITORY_CREATED"
+        );
+        assert_eq!(
+            AuditAction::RepositoryUpdated.as_str(),
+            "REPOSITORY_UPDATED"
+        );
+        assert_eq!(
+            AuditAction::RepositoryDeleted.as_str(),
+            "REPOSITORY_DELETED"
+        );
         assert_eq!(
             AuditAction::RepositoryPermissionChanged.as_str(),
             "REPOSITORY_PERMISSION_CHANGED"
@@ -509,9 +518,8 @@ mod tests {
     #[test]
     fn test_audit_entry_builder_resource() {
         let resource_id = Uuid::new_v4();
-        let entry =
-            AuditEntry::new(AuditAction::ArtifactUploaded, ResourceType::Artifact)
-                .resource(resource_id);
+        let entry = AuditEntry::new(AuditAction::ArtifactUploaded, ResourceType::Artifact)
+            .resource(resource_id);
         assert_eq!(entry.resource_id, Some(resource_id));
     }
 
@@ -526,16 +534,14 @@ mod tests {
     #[test]
     fn test_audit_entry_builder_ip_v4() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
-        let entry =
-            AuditEntry::new(AuditAction::Login, ResourceType::User).ip(ip);
+        let entry = AuditEntry::new(AuditAction::Login, ResourceType::User).ip(ip);
         assert_eq!(entry.ip_address, Some(ip));
     }
 
     #[test]
     fn test_audit_entry_builder_ip_v6() {
         let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        let entry =
-            AuditEntry::new(AuditAction::Login, ResourceType::User).ip(ip);
+        let entry = AuditEntry::new(AuditAction::Login, ResourceType::User).ip(ip);
         assert_eq!(entry.ip_address, Some(ip));
     }
 

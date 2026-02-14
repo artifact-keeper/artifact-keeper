@@ -145,12 +145,11 @@ pub(crate) fn transfer_success_rate(
     transfer_failures_total: i32,
 ) -> f64 {
     let total_attempts = bytes_transferred_total.max(1) as f64; // avoid div/0
-    // Use failures as a fraction; note this is a simplified heuristic
+                                                                // Use failures as a fraction; note this is a simplified heuristic
     if transfer_failures_total == 0 {
         1.0
     } else {
-        let failure_rate = transfer_failures_total as f64
-            / (transfer_failures_total as f64 + 1.0);
+        let failure_rate = transfer_failures_total as f64 / (transfer_failures_total as f64 + 1.0);
         1.0 - failure_rate
     }
 }
@@ -1163,7 +1162,10 @@ mod tests {
     #[test]
     fn test_sync_task_completed_at_completed() {
         let now = Utc::now();
-        assert_eq!(sync_task_completed_at(SyncStatus::Completed, now), Some(now));
+        assert_eq!(
+            sync_task_completed_at(SyncStatus::Completed, now),
+            Some(now)
+        );
     }
 
     #[test]
@@ -1175,7 +1177,10 @@ mod tests {
     #[test]
     fn test_sync_task_completed_at_cancelled() {
         let now = Utc::now();
-        assert_eq!(sync_task_completed_at(SyncStatus::Cancelled, now), Some(now));
+        assert_eq!(
+            sync_task_completed_at(SyncStatus::Cancelled, now),
+            Some(now)
+        );
     }
 
     #[test]

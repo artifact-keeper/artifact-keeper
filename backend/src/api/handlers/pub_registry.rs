@@ -747,7 +747,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer dart_token"));
         let result = extract_credentials(&headers);
-        assert_eq!(result, Some(("token".to_string(), "dart_token".to_string())));
+        assert_eq!(
+            result,
+            Some(("token".to_string(), "dart_token".to_string()))
+        );
     }
 
     #[test]
@@ -755,13 +758,19 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("bearer dart_token"));
         let result = extract_credentials(&headers);
-        assert_eq!(result, Some(("token".to_string(), "dart_token".to_string())));
+        assert_eq!(
+            result,
+            Some(("token".to_string(), "dart_token".to_string()))
+        );
     }
 
     #[test]
     fn test_extract_credentials_basic() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjpwYXNz"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
         let result = extract_credentials(&headers);
         assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
     }
@@ -775,7 +784,10 @@ mod tests {
     #[test]
     fn test_extract_credentials_invalid_base64() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic !!!invalid!!!"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic !!!invalid!!!"),
+        );
         assert_eq!(extract_credentials(&headers), None);
     }
 
@@ -849,7 +861,10 @@ mod tests {
     fn test_upload_url_format() {
         let repo_key = "my-pub-repo";
         let upload_url = format!("/pub/{}/api/packages/versions/newUpload", repo_key);
-        assert_eq!(upload_url, "/pub/my-pub-repo/api/packages/versions/newUpload");
+        assert_eq!(
+            upload_url,
+            "/pub/my-pub-repo/api/packages/versions/newUpload"
+        );
     }
 
     #[test]
