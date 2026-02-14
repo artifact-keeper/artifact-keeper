@@ -113,79 +113,74 @@ jobs:
         run: cargo test --workspace --test '*' --verbose
 
   # ════════════════════════════════════════════════════════════════════════════
-  # SMOKE E2E (Every Push/PR) — runs on self-hosted ARC runner in K8s cluster
-  # Tests against the in-cluster backend (same pattern as web Playwright E2E)
+  # SMOKE E2E (Every Push/PR) — self-contained via Docker-in-Docker on ARC
+  # Spins up fresh backend + postgres, runs native client tests, tears down
   # ════════════════════════════════════════════════════════════════════════════
 
   smoke-e2e:
     name: 🔥 Smoke E2E Tests
     runs-on: ak-e2e-runners
     needs: [test-backend-unit]
-    timeout-minutes: 10
-    env:
-      REGISTRY_URL: http://backend.artifactkeeper-1.svc.cluster.local:8080
-      ADMIN_USER: admin
-      ADMIN_PASS: ${{ secrets.E2E_ADMIN_PASS || 'admin' }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: smoke-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: smoke-cargo-${{ runner.os }}-
-
-      - name: Install system dependencies
+      - name: Wait for Docker daemon
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl jq >/dev/null 2>&1
-
-      - name: Wait for backend readiness
-        run: |
-          echo "Waiting for backend at $REGISTRY_URL..."
+          echo "Waiting for DinD daemon..."
           for i in $(seq 1 30); do
-            if curl -sf "$REGISTRY_URL/health" >/dev/null 2>&1; then
-              echo "Backend is ready"
-              curl -s "$REGISTRY_URL/health" | jq . 2>/dev/null || true
+            if docker info >/dev/null 2>&1; then
+              echo "Docker daemon ready"
+              docker version
               break
             fi
-            if [ "$i" -eq 1 ] || [ "$i" -eq 15 ] || [ "$i" -eq 30 ]; then
-              echo "  Attempt $i/30 — debug:"
-              curl -sv "$REGISTRY_URL/health" 2>&1 | head -20 || true
-            else
-              echo "  Attempt $i/30..."
-            fi
+            echo "  Attempt $i/30..."
             sleep 2
           done
-          curl -sf "$REGISTRY_URL/health" || { echo "ERROR: Backend not reachable after 60s"; exit 1; }
+          docker info >/dev/null 2>&1 || { echo "ERROR: Docker daemon not available"; exit 1; }
 
-      - name: Ensure test repositories exist
-        run: bash scripts/e2e-setup.sh
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Run smoke tests (PyPI)
-        run: bash scripts/native-tests/test-pypi.sh
+      - name: Pull backend image
+        run: |
+          docker pull ghcr.io/artifact-keeper/artifact-keeper-backend:dev
+          docker tag ghcr.io/artifact-keeper/artifact-keeper-backend:dev artifact-keeper-backend:test
 
-      - name: Run smoke tests (npm)
-        run: bash scripts/native-tests/test-npm.sh
+      - name: Start smoke E2E stack
+        run: docker compose -f docker-compose.test.yml --profile smoke up -d
 
-      - name: Run smoke tests (Cargo)
-        run: bash scripts/native-tests/test-cargo.sh
+      - name: Wait for tests to complete
+        run: |
+          echo "Waiting for test containers to finish..."
+          timeout 480 docker wait e2e-test-pypi e2e-test-npm e2e-test-cargo || {
+            echo "ERROR: Tests timed out. Container statuses:"
+            docker ps -a --filter "name=e2e-test" --format "table {{.Names}}\t{{.Status}}"
+            echo ""
+            echo "Backend logs (last 50 lines):"
+            docker logs e2e-test-backend --tail 50 2>&1 || true
+            exit 1
+          }
 
-      - name: Run health probe tests
-        run: bash scripts/native-tests/test-health-probes.sh
+      - name: Show test results
+        if: always()
+        run: |
+          failed=false
+          for test in pypi npm cargo; do
+            container="e2e-test-${test}"
+            exit_code=$(docker inspect --format='{{.State.ExitCode}}' "$container" 2>/dev/null || echo "N/A")
+            echo ""
+            echo "═══════════════════════════════════════════"
+            echo "  ${test} — Exit Code: $exit_code"
+            echo "═══════════════════════════════════════════"
+            docker logs "$container" 2>&1 || true
+            [ "$exit_code" != "0" ] && failed=true
+          done
+          [ "$failed" = "true" ] && exit 1
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans
 
   # ════════════════════════════════════════════════════════════════════════════
   # SECURITY (Runs on all events, non-blocking)
