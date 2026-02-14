@@ -1123,6 +1123,7 @@ mod tests {
     }
 
     /// Build a single repodata entry for a package.
+    #[allow(clippy::too_many_arguments)]
     fn build_repodata_entry(
         name: &str,
         version: &str,

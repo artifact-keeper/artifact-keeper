@@ -637,25 +637,25 @@ mod tests {
 
     #[test]
     fn test_quick_search_limit_default() {
-        let limit = None::<i64>.unwrap_or(10).clamp(1, 50);
+        let limit = 10_i64.clamp(1, 50);
         assert_eq!(limit, 10);
     }
 
     #[test]
     fn test_quick_search_limit_clamp_lower() {
-        let limit = Some(0_i64).unwrap_or(10).clamp(1, 50);
+        let limit = 0_i64.clamp(1, 50);
         assert_eq!(limit, 1);
     }
 
     #[test]
     fn test_quick_search_limit_clamp_upper() {
-        let limit = Some(100_i64).unwrap_or(10).clamp(1, 50);
+        let limit = 100_i64.clamp(1, 50);
         assert_eq!(limit, 50);
     }
 
     #[test]
     fn test_quick_search_limit_within_range() {
-        let limit = Some(30_i64).unwrap_or(10).clamp(1, 50);
+        let limit = 30_i64.clamp(1, 50);
         assert_eq!(limit, 30);
     }
 
@@ -709,27 +709,27 @@ mod tests {
 
     #[test]
     fn test_advanced_search_page_defaults() {
-        let page = None::<u32>.unwrap_or(1).max(1);
-        let per_page = None::<u32>.unwrap_or(20).clamp(1, 100);
+        let page = 1_u32.max(1);
+        let per_page = 20_u32.clamp(1, 100);
         assert_eq!(page, 1);
         assert_eq!(per_page, 20);
     }
 
     #[test]
     fn test_advanced_search_page_zero_clamped() {
-        let page = Some(0_u32).unwrap_or(1).max(1);
+        let page = 0_u32.max(1);
         assert_eq!(page, 1);
     }
 
     #[test]
     fn test_advanced_search_per_page_clamped_upper() {
-        let per_page = Some(500_u32).unwrap_or(20).clamp(1, 100);
+        let per_page = 500_u32.clamp(1, 100);
         assert_eq!(per_page, 100);
     }
 
     #[test]
     fn test_advanced_search_per_page_clamped_lower() {
-        let per_page = Some(0_u32).unwrap_or(20).clamp(1, 100);
+        let per_page = 0_u32.clamp(1, 100);
         assert_eq!(per_page, 1);
     }
 
@@ -828,9 +828,9 @@ mod tests {
 
     #[test]
     fn test_suggest_limit_clamping() {
-        let limit = Some(100_i64).unwrap_or(10).clamp(1, 50);
+        let limit = 100_i64.clamp(1, 50);
         assert_eq!(limit, 50);
-        let limit = Some(0_i64).unwrap_or(10).clamp(1, 50);
+        let limit = 0_i64.clamp(1, 50);
         assert_eq!(limit, 1);
     }
 
@@ -848,14 +848,14 @@ mod tests {
 
     #[test]
     fn test_trending_days_default_and_clamp() {
-        assert_eq!(None::<i32>.unwrap_or(7).clamp(1, 90), 7); // default
-        assert_eq!(Some(0_i32).unwrap_or(7).clamp(1, 90), 1); // clamped low
-        assert_eq!(Some(365_i32).unwrap_or(7).clamp(1, 90), 90); // clamped high
+        assert_eq!(7_i32.clamp(1, 90), 7); // default
+        assert_eq!(0_i32.clamp(1, 90), 1); // clamped low
+        assert_eq!(365_i32.clamp(1, 90), 90); // clamped high
     }
 
     #[test]
     fn test_trending_limit_default_and_clamp() {
-        assert_eq!(None::<i64>.unwrap_or(20).clamp(1, 100), 20);
+        assert_eq!(20_i64.clamp(1, 100), 20);
     }
 
     // -----------------------------------------------------------------------
@@ -871,9 +871,9 @@ mod tests {
 
     #[test]
     fn test_recent_limit_default_and_clamp() {
-        assert_eq!(None::<i64>.unwrap_or(20).clamp(1, 100), 20); // default
-        assert_eq!(Some(0_i64).unwrap_or(20).clamp(1, 100), 1); // clamped low
-        assert_eq!(Some(500_i64).unwrap_or(20).clamp(1, 100), 100); // clamped high
+        assert_eq!(20_i64.clamp(1, 100), 20); // default
+        assert_eq!(0_i64.clamp(1, 100), 1); // clamped low
+        assert_eq!(500_i64.clamp(1, 100), 100); // clamped high
     }
 
     // -----------------------------------------------------------------------
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_empty_query_text_logic() {
-        let query_text = None::<String>.unwrap_or_default();
+        let query_text = String::new();
         assert!(query_text.is_empty());
     }
 }

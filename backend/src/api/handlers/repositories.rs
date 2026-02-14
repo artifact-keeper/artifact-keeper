@@ -2152,7 +2152,7 @@ mod tests {
         assert_eq!(response.name, "Maven Central");
         assert_eq!(response.format, "maven");
         assert_eq!(response.repo_type, "local");
-        assert_eq!(response.is_public, true);
+        assert!(response.is_public);
         assert_eq!(response.storage_used_bytes, 5000);
         assert_eq!(response.quota_bytes, Some(1073741824));
     }
@@ -2184,7 +2184,7 @@ mod tests {
         let response = repo_to_response(repo, 0);
         assert_eq!(response.format, "npm");
         assert_eq!(response.repo_type, "remote");
-        assert_eq!(response.is_public, false);
+        assert!(!response.is_public);
         assert_eq!(response.storage_used_bytes, 0);
         assert!(response.quota_bytes.is_none());
         assert!(response.description.is_none());

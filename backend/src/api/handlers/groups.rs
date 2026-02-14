@@ -500,21 +500,21 @@ mod tests {
 
     #[test]
     fn test_pagination_defaults() {
-        let page = None::<u32>.unwrap_or(1).max(1);
-        let per_page = None::<u32>.unwrap_or(20).min(100);
+        let page = 1_u32.max(1);
+        let per_page = 20_u32.min(100);
         assert_eq!(page, 1);
         assert_eq!(per_page, 20);
     }
 
     #[test]
     fn test_pagination_page_zero_clamped() {
-        let page = Some(0u32).unwrap_or(1).max(1);
+        let page = 0u32.max(1);
         assert_eq!(page, 1);
     }
 
     #[test]
     fn test_pagination_per_page_clamped_to_max() {
-        let per_page = Some(500u32).unwrap_or(20).min(100);
+        let per_page = 500u32.min(100);
         assert_eq!(per_page, 100);
     }
 

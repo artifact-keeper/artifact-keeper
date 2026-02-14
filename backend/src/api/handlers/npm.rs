@@ -857,6 +857,44 @@ async fn publish_package(
 // Extracted pure functions for testability
 // ---------------------------------------------------------------------------
 
+/// Rewrite tarball URLs in npm metadata JSON to point to our local instance.
+/// npm metadata contains `versions.{ver}.dist.tarball` pointing to the upstream registry.
+/// We rewrite those to point to `{base_url}/npm/{repo_key}/{package}/-/{filename}`.
+fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_key: &str) {
+    let versions = match json.get_mut("versions").and_then(|v| v.as_object_mut()) {
+        Some(v) => v,
+        None => return,
+    };
+
+    for (_version, version_data) in versions.iter_mut() {
+        // Extract package name before taking mutable borrow on dist
+        let pkg_name = version_data
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("_unknown")
+            .to_string();
+
+        if let Some(dist) = version_data.get_mut("dist") {
+            // Extract the current tarball URL and compute the new one
+            let new_url = dist
+                .get("tarball")
+                .and_then(|t| t.as_str())
+                .and_then(|tarball| {
+                    // e.g., https://registry.npmjs.org/express/-/express-4.18.2.tgz
+                    tarball.rsplit_once("/-/").map(|(_, filename)| {
+                        format!("{}/npm/{}/{}/-/{}", base_url, repo_key, pkg_name, filename)
+                    })
+                });
+
+            if let Some(url) = new_url {
+                if let Some(d) = dist.as_object_mut() {
+                    d.insert("tarball".to_string(), serde_json::Value::String(url));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1637,43 +1675,5 @@ mod tests {
         // name and version from metadata should be preserved (or_insert_with doesn't overwrite)
         assert_eq!(entry["name"], "custom-name");
         assert_eq!(entry["version"], "0.9.0");
-    }
-}
-
-/// Rewrite tarball URLs in npm metadata JSON to point to our local instance.
-/// npm metadata contains `versions.{ver}.dist.tarball` pointing to the upstream registry.
-/// We rewrite those to point to `{base_url}/npm/{repo_key}/{package}/-/{filename}`.
-fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_key: &str) {
-    let versions = match json.get_mut("versions").and_then(|v| v.as_object_mut()) {
-        Some(v) => v,
-        None => return,
-    };
-
-    for (_version, version_data) in versions.iter_mut() {
-        // Extract package name before taking mutable borrow on dist
-        let pkg_name = version_data
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("_unknown")
-            .to_string();
-
-        if let Some(dist) = version_data.get_mut("dist") {
-            // Extract the current tarball URL and compute the new one
-            let new_url = dist
-                .get("tarball")
-                .and_then(|t| t.as_str())
-                .and_then(|tarball| {
-                    // e.g., https://registry.npmjs.org/express/-/express-4.18.2.tgz
-                    tarball.rsplit_once("/-/").map(|(_, filename)| {
-                        format!("{}/npm/{}/{}/-/{}", base_url, repo_key, pkg_name, filename)
-                    })
-                });
-
-            if let Some(url) = new_url {
-                if let Some(d) = dist.as_object_mut() {
-                    d.insert("tarball".to_string(), serde_json::Value::String(url));
-                }
-            }
-        }
     }
 }

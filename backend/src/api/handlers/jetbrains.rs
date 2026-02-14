@@ -720,6 +720,102 @@ async fn plugin_details(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Escape special XML characters in attribute values and text content.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Extract plugin file and metadata from a multipart/form-data body.
+///
+/// Returns (file_bytes, plugin_name, plugin_version).
+#[allow(clippy::result_large_err)]
+fn extract_plugin_from_multipart(
+    content_type: &str,
+    body: &[u8],
+) -> Result<(Bytes, String, String), Response> {
+    let boundary = content_type
+        .split("boundary=")
+        .nth(1)
+        .map(|b| b.trim().trim_matches('"'))
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response())?;
+
+    let boundary_marker = format!("--{}", boundary);
+    let body_str = String::from_utf8_lossy(body);
+    let parts: Vec<&str> = body_str.split(&boundary_marker).collect();
+
+    let mut file_bytes: Option<Bytes> = None;
+    let mut plugin_name = String::new();
+    let mut plugin_version = String::new();
+
+    for part in &parts {
+        if part.is_empty() || *part == "--\r\n" || *part == "--" {
+            continue;
+        }
+
+        // Split headers from body at the double newline
+        let header_body_split = if part.contains("\r\n\r\n") {
+            "\r\n\r\n"
+        } else if part.contains("\n\n") {
+            "\n\n"
+        } else {
+            continue;
+        };
+
+        if let Some(idx) = part.find(header_body_split) {
+            let headers_section = &part[..idx];
+            let body_section = &part[idx + header_body_split.len()..];
+            let headers_lower = headers_section.to_lowercase();
+
+            if headers_lower.contains("name=\"file\"")
+                || headers_lower.contains("name=\"plugin\"")
+                || headers_lower.contains("filename=")
+            {
+                // Strip trailing \r\n before next boundary
+                let content = body_section.trim_end_matches("\r\n");
+                // Re-extract as bytes from original body for binary content
+                let header_offset = part.as_ptr() as usize - body_str.as_ptr() as usize;
+                let body_offset = header_offset + idx + header_body_split.len();
+                let end = header_offset + part.len();
+                let end = if end > 2 && &body[end - 2..end] == b"\r\n" {
+                    end - 2
+                } else {
+                    end
+                };
+                if body_offset <= body.len() && end <= body.len() {
+                    file_bytes = Some(Bytes::copy_from_slice(&body[body_offset..end]));
+                } else {
+                    file_bytes = Some(Bytes::copy_from_slice(content.as_bytes()));
+                }
+            } else if headers_lower.contains("name=\"name\"") {
+                plugin_name = body_section.trim().to_string();
+            } else if headers_lower.contains("name=\"version\"") {
+                plugin_version = body_section.trim().to_string();
+            }
+        }
+    }
+
+    let file_bytes = file_bytes.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "No plugin file found in multipart body",
+        )
+            .into_response()
+    })?;
+
+    if plugin_name.is_empty() {
+        plugin_name = "unknown-plugin".to_string();
+    }
+    if plugin_version.is_empty() {
+        plugin_version = "0.0.0".to_string();
+    }
+
+    Ok((file_bytes, plugin_name, plugin_version))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,100 +1120,4 @@ mod tests {
         });
         assert_eq!(metadata["plugin_id"], "my-plugin");
     }
-}
-
-/// Escape special XML characters in attribute values and text content.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-/// Extract plugin file and metadata from a multipart/form-data body.
-///
-/// Returns (file_bytes, plugin_name, plugin_version).
-#[allow(clippy::result_large_err)]
-fn extract_plugin_from_multipart(
-    content_type: &str,
-    body: &[u8],
-) -> Result<(Bytes, String, String), Response> {
-    let boundary = content_type
-        .split("boundary=")
-        .nth(1)
-        .map(|b| b.trim().trim_matches('"'))
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response())?;
-
-    let boundary_marker = format!("--{}", boundary);
-    let body_str = String::from_utf8_lossy(body);
-    let parts: Vec<&str> = body_str.split(&boundary_marker).collect();
-
-    let mut file_bytes: Option<Bytes> = None;
-    let mut plugin_name = String::new();
-    let mut plugin_version = String::new();
-
-    for part in &parts {
-        if part.is_empty() || *part == "--\r\n" || *part == "--" {
-            continue;
-        }
-
-        // Split headers from body at the double newline
-        let header_body_split = if part.contains("\r\n\r\n") {
-            "\r\n\r\n"
-        } else if part.contains("\n\n") {
-            "\n\n"
-        } else {
-            continue;
-        };
-
-        if let Some(idx) = part.find(header_body_split) {
-            let headers_section = &part[..idx];
-            let body_section = &part[idx + header_body_split.len()..];
-            let headers_lower = headers_section.to_lowercase();
-
-            if headers_lower.contains("name=\"file\"")
-                || headers_lower.contains("name=\"plugin\"")
-                || headers_lower.contains("filename=")
-            {
-                // Strip trailing \r\n before next boundary
-                let content = body_section.trim_end_matches("\r\n");
-                // Re-extract as bytes from original body for binary content
-                let header_offset = part.as_ptr() as usize - body_str.as_ptr() as usize;
-                let body_offset = header_offset + idx + header_body_split.len();
-                let end = header_offset + part.len();
-                let end = if end > 2 && &body[end - 2..end] == b"\r\n" {
-                    end - 2
-                } else {
-                    end
-                };
-                if body_offset <= body.len() && end <= body.len() {
-                    file_bytes = Some(Bytes::copy_from_slice(&body[body_offset..end]));
-                } else {
-                    file_bytes = Some(Bytes::copy_from_slice(content.as_bytes()));
-                }
-            } else if headers_lower.contains("name=\"name\"") {
-                plugin_name = body_section.trim().to_string();
-            } else if headers_lower.contains("name=\"version\"") {
-                plugin_version = body_section.trim().to_string();
-            }
-        }
-    }
-
-    let file_bytes = file_bytes.ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "No plugin file found in multipart body",
-        )
-            .into_response()
-    })?;
-
-    if plugin_name.is_empty() {
-        plugin_name = "unknown-plugin".to_string();
-    }
-    if plugin_version.is_empty() {
-        plugin_version = "0.0.0".to_string();
-    }
-
-    Ok((file_bytes, plugin_name, plugin_version))
 }

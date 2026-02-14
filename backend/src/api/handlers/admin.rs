@@ -1076,7 +1076,7 @@ mod tests {
     #[test]
     fn test_settings_row_parsing_bool_value() {
         let val = serde_json::json!(true);
-        assert_eq!(val.as_bool().unwrap_or(false), true);
+        assert!(val.as_bool().unwrap_or(false));
     }
 
     #[test]

@@ -1218,8 +1218,7 @@ mod tests {
 
     #[test]
     fn test_default_version() {
-        let version: Option<&str> = None;
-        let resolved = version.unwrap_or("dev-main");
+        let resolved: &str = "dev-main";
         assert_eq!(resolved, "dev-main");
     }
 }

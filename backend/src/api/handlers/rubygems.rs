@@ -820,6 +820,12 @@ async fn dependencies(
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,10 +1161,4 @@ mod tests {
         assert_eq!(parsed[0][1], "7.0.0");
         assert_eq!(parsed[0][2], "ruby");
     }
-}
-
-fn gzip_compress(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data)?;
-    encoder.finish()
 }

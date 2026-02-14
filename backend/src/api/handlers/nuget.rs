@@ -1325,14 +1325,13 @@ mod tests {
     fn test_extract_nupkg_from_multipart_valid() {
         let boundary = "----boundary123";
         let content_type = format!("multipart/form-data; boundary={}", boundary);
-        let body = format!(
-            "------boundary123\r\n\
+        let body = "------boundary123\r\n\
              Content-Disposition: form-data; name=\"file\"; filename=\"pkg.nupkg\"\r\n\
              Content-Type: application/octet-stream\r\n\
              \r\n\
              FILE_CONTENT_HERE\r\n\
              ------boundary123--\r\n"
-        );
+            .to_string();
         let result = extract_nupkg_from_multipart(&content_type, body.as_bytes());
         assert!(result.is_ok());
         let bytes = result.unwrap();

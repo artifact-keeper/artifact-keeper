@@ -428,9 +428,9 @@ mod tests {
         };
         let json_str = serde_json::to_string(&settings).unwrap();
         let deserialized: TelemetrySettings = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(deserialized.enabled, true);
-        assert_eq!(deserialized.review_before_send, false);
+        assert!(deserialized.enabled);
+        assert!(!deserialized.review_before_send);
         assert_eq!(deserialized.scrub_level, "aggressive");
-        assert_eq!(deserialized.include_logs, true);
+        assert!(deserialized.include_logs);
     }
 }

@@ -1031,6 +1031,104 @@ async fn verify_locks(
 // POST /lfs/:repo_key/locks/:id/unlock - Delete lock
 // ---------------------------------------------------------------------------
 
+async fn delete_lock(
+    State(state): State<SharedState>,
+    Path((repo_key, lock_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
+
+    let force = if body.is_empty() {
+        false
+    } else {
+        serde_json::from_slice::<UnlockRequest>(&body)
+            .map(|r| r.force)
+            .unwrap_or(false)
+    };
+
+    // Look up the user
+    let username = sqlx::query_scalar!("SELECT username FROM users WHERE id = $1", user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Database error: {}", e),
+            )
+        })?;
+
+    // Find the lock
+    let row = sqlx::query!(
+        r#"
+        SELECT id as "row_id!", metadata
+        FROM artifact_metadata
+        WHERE format = 'gitlfs_lock'
+          AND artifact_id = $1
+          AND metadata->>'lock_id' = $2
+        "#,
+        repo.id,
+        lock_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        lfs_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Database error: {}", e),
+        )
+    })?
+    .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Lock not found"))?;
+
+    let m = &row.metadata;
+    let lock_owner = m.get("owner").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Only the lock owner or force can unlock
+    if lock_owner != username && !force {
+        return Err(lfs_error_response(
+            StatusCode::FORBIDDEN,
+            "You do not own this lock",
+        ));
+    }
+
+    let lock_info = LockInfo {
+        id: lock_id.clone(),
+        path: m
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        locked_at: m
+            .get("locked_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        owner: LockOwner {
+            name: lock_owner.to_string(),
+        },
+    };
+
+    // Delete the lock
+    sqlx::query!("DELETE FROM artifact_metadata WHERE id = $1", row.row_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            lfs_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Database error: {}", e),
+            )
+        })?;
+
+    info!(
+        "Git LFS unlock: {} by {} (force: {})",
+        lock_id, username, force
+    );
+
+    let response = UnlockResponse { lock: lock_info };
+    Ok(lfs_json_response(StatusCode::OK, &response))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,102 +1584,4 @@ mod tests {
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
     }
-}
-
-async fn delete_lock(
-    State(state): State<SharedState>,
-    Path((repo_key, lock_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, Response> {
-    let user_id = authenticate(&state.db, &state.config, &headers).await?;
-    let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
-
-    let force = if body.is_empty() {
-        false
-    } else {
-        serde_json::from_slice::<UnlockRequest>(&body)
-            .map(|r| r.force)
-            .unwrap_or(false)
-    };
-
-    // Look up the user
-    let username = sqlx::query_scalar!("SELECT username FROM users WHERE id = $1", user_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| {
-            lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Database error: {}", e),
-            )
-        })?;
-
-    // Find the lock
-    let row = sqlx::query!(
-        r#"
-        SELECT id as "row_id!", metadata
-        FROM artifact_metadata
-        WHERE format = 'gitlfs_lock'
-          AND artifact_id = $1
-          AND metadata->>'lock_id' = $2
-        "#,
-        repo.id,
-        lock_id
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        lfs_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {}", e),
-        )
-    })?
-    .ok_or_else(|| lfs_error_response(StatusCode::NOT_FOUND, "Lock not found"))?;
-
-    let m = &row.metadata;
-    let lock_owner = m.get("owner").and_then(|v| v.as_str()).unwrap_or("");
-
-    // Only the lock owner or force can unlock
-    if lock_owner != username && !force {
-        return Err(lfs_error_response(
-            StatusCode::FORBIDDEN,
-            "You do not own this lock",
-        ));
-    }
-
-    let lock_info = LockInfo {
-        id: lock_id.clone(),
-        path: m
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        locked_at: m
-            .get("locked_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        owner: LockOwner {
-            name: lock_owner.to_string(),
-        },
-    };
-
-    // Delete the lock
-    sqlx::query!("DELETE FROM artifact_metadata WHERE id = $1", row.row_id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| {
-            lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Database error: {}", e),
-            )
-        })?;
-
-    info!(
-        "Git LFS unlock: {} by {} (force: {})",
-        lock_id, username, force
-    );
-
-    let response = UnlockResponse { lock: lock_info };
-    Ok(lfs_json_response(StatusCode::OK, &response))
 }

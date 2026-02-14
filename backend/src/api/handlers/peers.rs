@@ -899,21 +899,21 @@ mod tests {
 
     #[test]
     fn test_pagination_defaults() {
-        let page: u32 = None::<u32>.unwrap_or(1).max(1);
-        let per_page: u32 = None::<u32>.unwrap_or(20).min(100);
+        let page: u32 = 1_u32.max(1);
+        let per_page: u32 = 20_u32.min(100);
         assert_eq!(page, 1);
         assert_eq!(per_page, 20);
     }
 
     #[test]
     fn test_pagination_zero_page_clamped() {
-        let page: u32 = Some(0_u32).unwrap_or(1).max(1);
+        let page: u32 = 0_u32.max(1);
         assert_eq!(page, 1);
     }
 
     #[test]
     fn test_pagination_per_page_capped() {
-        let per_page: u32 = Some(200_u32).unwrap_or(20).min(100);
+        let per_page: u32 = 200_u32.min(100);
         assert_eq!(per_page, 100);
     }
 
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_default_cache_size() {
-        let default_cache: i64 = None::<i64>.unwrap_or(10 * 1024 * 1024 * 1024);
+        let default_cache: i64 = 10 * 1024 * 1024 * 1024;
         assert_eq!(default_cache, 10_737_418_240);
     }
 
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_assign_repo_sync_enabled_default() {
-        let sync_enabled = None::<bool>.unwrap_or(true);
+        let sync_enabled: bool = true;
         assert!(sync_enabled);
     }
 
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_sync_tasks_limit_default() {
-        let limit = None::<u32>.unwrap_or(50) as i64;
+        let limit = 50_u32 as i64;
         assert_eq!(limit, 50);
     }
 }
