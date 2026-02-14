@@ -190,6 +190,110 @@ jobs:
         run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans
 
   # ════════════════════════════════════════════════════════════════════════════
+  # CONTAINER BUILDS (PR only, path-filtered, parallel)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  detect-changes:
+    name: 🔍 Detect Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      openscap: ${{ steps.filter.outputs.openscap }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'docker/Dockerfile.backend'
+              - 'backend/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.sqlx/**'
+            openscap:
+              - 'docker/Dockerfile.openscap'
+              - 'scripts/openscap-wrapper.py'
+
+  build-backend-image:
+    name: 🐳 Build Backend Image
+    runs-on: ubuntu-24.04
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: artifact-keeper-backend:pr-test
+          cache-from: type=gha,scope=backend-linux/amd64
+          cache-to: type=gha,scope=backend-linux/amd64,mode=max
+
+      - name: Verify image starts
+        run: |
+          docker run --rm -d --name ak-test -p 8080:8080 \
+            -e DATABASE_URL=postgresql://test:test@localhost/test \
+            artifact-keeper-backend:pr-test || true
+          sleep 2
+          docker logs ak-test 2>&1 | head -20 || true
+          docker rm -f ak-test 2>/dev/null || true
+
+      - name: Image size
+        run: |
+          echo "## Backend Image" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker images artifact-keeper-backend:pr-test --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  build-openscap-image:
+    name: 🐳 Build OpenSCAP Image
+    runs-on: ubuntu-24.04
+    needs: detect-changes
+    if: needs.detect-changes.outputs.openscap == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build openscap image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.openscap
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: artifact-keeper-openscap:pr-test
+          cache-from: type=gha,scope=openscap-linux/amd64
+          cache-to: type=gha,scope=openscap-linux/amd64,mode=max
+
+      - name: Verify image starts
+        run: |
+          docker run --rm -d --name oscap-test -p 8091:8091 \
+            artifact-keeper-openscap:pr-test || true
+          sleep 3
+          docker logs oscap-test 2>&1 | head -20 || true
+          docker rm -f oscap-test 2>/dev/null || true
+
+      - name: Image size
+        run: |
+          echo "## OpenSCAP Image" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          docker images artifact-keeper-openscap:pr-test --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ════════════════════════════════════════════════════════════════════════════
   # SECURITY (Runs on all events, non-blocking)
   # ════════════════════════════════════════════════════════════════════════════
 
@@ -215,7 +319,7 @@ jobs:
   ci-complete:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
-    needs: [lint-rust, test-backend-unit, test-backend-integration, smoke-e2e, security-audit]
+    needs: [lint-rust, test-backend-unit, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -255,6 +359,20 @@ jobs:
             echo "❌ integration-tests: $integ_result" >> $GITHUB_STEP_SUMMARY
             tier1_pass=false
           fi
+
+          # Container builds (PR only, skipped on push or when files unchanged)
+          for img in backend openscap; do
+            result="${{ needs.build-backend-image.result }}"
+            [ "$img" = "openscap" ] && result="${{ needs.build-openscap-image.result }}"
+            if [[ "$result" == "success" ]]; then
+              echo "✅ build-${img}-image" >> $GITHUB_STEP_SUMMARY
+            elif [[ "$result" == "skipped" ]]; then
+              echo "⏭️ build-${img}-image (no changes)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ build-${img}-image: $result" >> $GITHUB_STEP_SUMMARY
+              tier1_pass=false
+            fi
+          done
 
           # Security audit (non-blocking)
           if [[ "${{ needs.security-audit.result }}" == "success" ]]; then

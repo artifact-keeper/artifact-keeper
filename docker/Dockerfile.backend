@@ -3,8 +3,11 @@ FROM registry.access.redhat.com/ubi9/ubi:9.5 AS rust-base
 RUN dnf install -y --nodocs \
     gcc gcc-c++ make pkg-config perl-core \
     openssl-devel zlib-devel xz-devel bzip2-devel \
-    protobuf-compiler curl \
+    unzip \
     && dnf clean all && \
+    curl -sSfL https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip \
+      -o /tmp/protoc.zip && \
+    unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 && \
     . "$HOME/.cargo/env" && \
     cargo install cargo-chef --locked
@@ -68,7 +71,7 @@ RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mn
 
 # ---------- Stage 5: Download scanner CLIs ----------
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.5 AS scanners
-RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 curl tar gzip && \
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 tar gzip && \
     curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin && \
     curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin && \
     microdnf clean all

@@ -1,10 +1,14 @@
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.5 AS rootfs-builder
 
+# Add CentOS 9 Stream repo for scap-security-guide (not in UBI repos)
+RUN dnf install -y --nodocs 'dnf-command(config-manager)' && \
+    dnf config-manager --add-repo https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/
+
 # Install OpenSCAP, SCAP content, and Python into a clean rootfs
 RUN mkdir -p /mnt/rootfs && \
     dnf install --installroot /mnt/rootfs --releasever 9 \
-        --setopt install_weak_deps=0 --nodocs -y \
+        --setopt install_weak_deps=0 --nodocs --nogpgcheck -y \
         glibc-minimal-langpack \
         ca-certificates \
         openscap-scanner \
