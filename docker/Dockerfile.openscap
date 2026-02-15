@@ -1,5 +1,5 @@
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
-FROM registry.access.redhat.com/ubi9/ubi:latest AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.5 AS rootfs-builder
 
 # Add CentOS 9 Stream repo for scap-security-guide (not in UBI repos)
 RUN ARCH=$(uname -m) && \
@@ -55,7 +55,7 @@ RUN rm -f /mnt/rootfs/etc/machine-id && \
 RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # ---------- Stage 2: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.5
 
 # Copy minimal rootfs (oscap, scap-security-guide, python3, libs)
 COPY --from=rootfs-builder /mnt/rootfs /

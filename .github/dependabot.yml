@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+    reviewers:
+      - "artifact-keeper/maintainers"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    reviewers:
+      - "artifact-keeper/maintainers"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore"
