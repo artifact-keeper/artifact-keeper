@@ -5,16 +5,18 @@ on:
     branches: [main, master, develop, 'release/**']
     paths-ignore:
       - 'site/**'
-      - '*.md'
+      - '**/*.md'
       - '.beads/**'
       - 'LICENSE'
+      - 'CLAUDE.md'
   pull_request:
     branches: [main, master, develop, 'release/**']
     paths-ignore:
       - 'site/**'
-      - '*.md'
+      - '**/*.md'
       - '.beads/**'
       - 'LICENSE'
+      - 'CLAUDE.md'
   workflow_dispatch:
 
 concurrency:

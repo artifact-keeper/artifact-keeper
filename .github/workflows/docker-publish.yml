@@ -4,6 +4,11 @@ on:
   push:
     branches: [main, master]
     tags: ['v*']
+    paths-ignore:
+      - '**/*.md'
+      - '.beads/**'
+      - 'LICENSE'
+      - 'CLAUDE.md'
   workflow_dispatch:
     inputs:
       tag:
