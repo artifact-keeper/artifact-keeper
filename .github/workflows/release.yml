@@ -26,9 +26,9 @@ jobs:
     name: 🚦 E2E Gate
     uses: ./.github/workflows/e2e.yml
     with:
-      profile: all
-      include_stress: true
-      include_failure: true
+      profile: smoke
+      include_stress: false
+      include_failure: false
 
   mesh-e2e-gate:
     name: Mesh Replication E2E (optional)

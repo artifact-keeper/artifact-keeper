@@ -53,16 +53,16 @@ EOF
 # Configure cargo registry (sparse protocol)
 echo "==> Configuring cargo registry..."
 mkdir -p ~/.cargo
-cat >> ~/.cargo/config.toml << EOF
+cat > ~/.cargo/config.toml << EOF
 [registries.test-registry]
-index = "sparse+$CARGO_REGISTRY_URL/index/"
+index = "sparse+$CARGO_REGISTRY_URL/"
 
 [registry]
 default = "test-registry"
 EOF
 
-# Set token
-export CARGO_REGISTRIES_TEST_REGISTRY_TOKEN="admin:admin123"
+# Set token (Basic auth encoded as expected by the backend)
+export CARGO_REGISTRIES_TEST_REGISTRY_TOKEN="Basic $(echo -n 'admin:admin123' | base64)"
 
 # Package the crate
 echo "==> Packaging crate..."

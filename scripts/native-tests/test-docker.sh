@@ -4,9 +4,9 @@
 set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-localhost:30080}"
-REGISTRY_USER="${REGISTRY_USER:-test}"
-REGISTRY_PASS="${REGISTRY_PASS:-testtest}"
-REPO_KEY="${REPO_KEY:-test}"
+REGISTRY_USER="${REGISTRY_USER:-admin}"
+REGISTRY_PASS="${REGISTRY_PASS:-admin123}"
+REPO_KEY="${REPO_KEY:-test-docker}"
 TEST_VERSION="1.0.$(date +%s)"
 FAILURES=0
 
