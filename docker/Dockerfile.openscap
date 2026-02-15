@@ -1,5 +1,5 @@
 # ---------- Stage 1: Build minimal rootfs with OpenSCAP ----------
-FROM registry.access.redhat.com/ubi9/ubi:9.5 AS rootfs-builder
+FROM registry.access.redhat.com/ubi9/ubi:9.7 AS rootfs-builder
 
 # Add CentOS 9 Stream repo for scap-security-guide (not in UBI repos)
 RUN ARCH=$(uname -m) && \
