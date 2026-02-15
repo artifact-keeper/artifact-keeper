@@ -315,6 +315,7 @@ fn parse_selector<T: serde::de::DeserializeOwned + Default>(value: Option<serde_
 /// List all sync policies
 #[utoipa::path(
     get,
+    operation_id = "list_sync_policies",
     path = "",
     context_path = "/api/v1/sync-policies",
     tag = "peers",
@@ -335,6 +336,7 @@ async fn list_policies(State(state): State<SharedState>) -> Result<Json<SyncPoli
 /// Create a new sync policy
 #[utoipa::path(
     post,
+    operation_id = "create_sync_policy",
     path = "",
     context_path = "/api/v1/sync-policies",
     tag = "peers",
@@ -375,6 +377,7 @@ async fn create_policy(
 /// Get a sync policy by ID
 #[utoipa::path(
     get,
+    operation_id = "get_sync_policy",
     path = "/{id}",
     context_path = "/api/v1/sync-policies",
     tag = "peers",
@@ -400,6 +403,7 @@ async fn get_policy(
 /// Update a sync policy
 #[utoipa::path(
     put,
+    operation_id = "update_sync_policy",
     path = "/{id}",
     context_path = "/api/v1/sync-policies",
     tag = "peers",
@@ -450,6 +454,7 @@ async fn update_policy(
 /// Delete a sync policy
 #[utoipa::path(
     delete,
+    operation_id = "delete_sync_policy",
     path = "/{id}",
     context_path = "/api/v1/sync-policies",
     tag = "peers",
@@ -522,6 +527,7 @@ async fn evaluate_policies(
 /// Preview what a policy would match (dry-run)
 #[utoipa::path(
     post,
+    operation_id = "preview_sync_policy",
     path = "/preview",
     context_path = "/api/v1/sync-policies",
     tag = "peers",

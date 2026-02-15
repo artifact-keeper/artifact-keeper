@@ -104,6 +104,7 @@ fn labels_list_response(labels: Vec<RepositoryLabel>) -> LabelsListResponse {
 /// List all labels on a repository
 #[utoipa::path(
     get,
+    operation_id = "list_repo_labels",
     path = "/{key}/labels",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -135,6 +136,7 @@ async fn list_labels(
 /// Set all labels on a repository (replaces existing)
 #[utoipa::path(
     put,
+    operation_id = "set_repo_labels",
     path = "/{key}/labels",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -187,6 +189,7 @@ async fn set_labels(
 /// Add or update a single label
 #[utoipa::path(
     post,
+    operation_id = "add_repo_label",
     path = "/{key}/labels/{label_key}",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
@@ -233,6 +236,7 @@ async fn add_label(
 /// Delete a label by key
 #[utoipa::path(
     delete,
+    operation_id = "delete_repo_label",
     path = "/{key}/labels/{label_key}",
     context_path = "/api/v1/repositories",
     tag = "repository-labels",
