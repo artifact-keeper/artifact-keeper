@@ -172,10 +172,12 @@ Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older releas
    ```
 4. Cherry-pick to the maintenance branch when a fix on `main` also applies to 1.0.x.
 
-**Docker image tags:**
+**Docker image tags** (set by `docker/metadata-action` in `docker-publish.yml`):
+- Version tags **strip the `v` prefix**: git tag `v1.1.0-rc.2` → Docker tag `:1.1.0-rc.2`
 - `:latest` is only set for stable releases (no `-rc`, `-beta`, etc.)
 - `:1.0`, `:1.1` series tags are set automatically via semver parsing
 - `:dev` is only set for `main` branch pushes
+- `:sha-<commit>` is set for every build
 
 ### Other Git Rules
 
@@ -197,10 +199,12 @@ Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older releas
 ## Infrastructure & Cost Rules
 
 - **NEVER build Docker images or compile code on EC2/cloud instances.** Cloud compute costs money. All builds must happen locally on the developer's MacBook or via GitHub Actions CI.
-- **Demo EC2 instance** (`i-0caaf8acac6f85d4d`, Elastic IP `3.222.57.187`): Only pull pre-built images from `ghcr.io`, never `docker compose build`. Use `docker compose pull && docker compose up -d`.
+- **Demo EC2 instance** (`i-0caaf8acac6f85d4d`, Elastic IP `3.222.57.187`): Only pull pre-built images from `ghcr.io`, never `docker compose build`.
 - **SSH access**: `ssh ubuntu@3.222.57.187` (uses local SSH key)
-- **Demo stack**: Managed via systemd service `artifact-keeper-demo` and Caddy reverse proxy for TLS.
-- **Docker images** are published to `ghcr.io/artifact-keeper/artifact-keeper-backend` by the Docker Publish CI workflow on every push to main.
+- **Demo stack**: Managed via systemd service `artifact-keeper-demo` and Caddy reverse proxy for TLS. Compose file at `/opt/artifact-keeper/deploy/demo/docker-compose.demo.yml`.
+- **Demo version pinning**: Set `ARTIFACT_KEEPER_VERSION` in `/opt/artifact-keeper/deploy/demo/.env` to pin a release (e.g., `ARTIFACT_KEEPER_VERSION=1.1.0-rc.2`). Omit the `v` prefix — Docker tags use semver without `v`. Default is `latest` if unset.
+- **Demo update procedure**: `ssh ubuntu@3.222.57.187`, edit `.env` with the desired version, then `cd /opt/artifact-keeper/deploy/demo && docker compose -f docker-compose.demo.yml pull && docker compose -f docker-compose.demo.yml up -d`.
+- **Docker images** are published to `ghcr.io/artifact-keeper/artifact-keeper-{backend,web,openscap}` by the Docker Publish CI workflow on every push to main and on release tags.
 - **GitHub Pages site** (`/site/` directory): Combined landing page + Starlight docs, deployed to `artifactkeeper.com`.
 
 <!-- MANUAL ADDITIONS END -->
