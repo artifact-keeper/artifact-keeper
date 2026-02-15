@@ -8,7 +8,11 @@ license.workspace = true
 name = "artifact-keeper"
 path = "src/main.rs"
 
+[features]
+vendored-openssl = ["openssl/vendored"]
+
 [dependencies]
+openssl = { workspace = true, optional = true }
 # Async runtime
 tokio.workspace = true
 

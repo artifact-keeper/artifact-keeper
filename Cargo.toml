@@ -86,6 +86,9 @@ wasmtime-wasi = "24.0"
 
 # Git operations
 git2 = "0.19"
+
+# OpenSSL (vendored feature for cross-compilation in release builds)
+openssl = { version = "0.10" }
 meilisearch-sdk = "0.27"
 
 # OpenAPI
