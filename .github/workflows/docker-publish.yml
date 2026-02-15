@@ -166,13 +166,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download backend amd64 digest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: backend-digests-amd64
           path: /tmp/backend-digests
 
       - name: Download openscap amd64 digest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: openscap-digests-amd64
           path: /tmp/openscap-digests
@@ -301,7 +301,7 @@ jobs:
 
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: /tmp/digests
           pattern: backend-digests-*
@@ -374,7 +374,7 @@ jobs:
 
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: /tmp/digests
           pattern: openscap-digests-*
