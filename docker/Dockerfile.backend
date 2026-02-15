@@ -121,7 +121,7 @@ RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 tar gzip && \
     microdnf clean all
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
-FROM registry.access.redhat.com/ubi9/ubi-micro:9.5
+FROM registry.access.redhat.com/ubi9/ubi-micro:9.7
 
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /
