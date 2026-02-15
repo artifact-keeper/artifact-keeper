@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0-rc.2] - 2026-02-15
+
+### Added
+- **Promotion Workflow** (#151) — approval chains, age gates, signature verification, and rejection with audit trail
+- **Auto-Promotion Rules Engine** (#152) — configurable rules for automatic artifact promotion based on quality gates, age, and scan results
+- **K8s Health Probes & OpenTelemetry Tracing** (#147) — structured health endpoints for liveness/readiness and distributed tracing with span propagation
+- **SECURITY.md** — vulnerability reporting policy
+
+### Changed
+- **UBI 9 Micro Runtime** (#160) — all containers migrated from Alpine to Red Hat UBI 9 Micro for STIG compliance
+- **Container Hardening** (#163, #164) — Cosign image signing, Trivy vulnerability scanning in CI, and STIG hardening
+- **UBI 9.5 → 9.7** (#170, #172, #173) and **Alpine 3.19 → 3.23** (#171)
+- **SonarCloud Integration** (#158, #159, #162) — static analysis and Dockerfile scanning in CI
+- **Dockerfiles Consolidated** (#157) — all Dockerfiles and Caddyfile moved to `docker/` directory
+- **Deploy Folder Relocated** (#154, #155) — moved to `artifact-keeper-iac` repository
+- **Self-Hosted ARC Runner** (#148) — smoke E2E tests run on self-hosted Actions Runner Controller
+- **Dependabot Bumps** — codeql-action 3→4, upload-artifact 4→6, download-artifact 4→7, aws-actions/configure-aws-credentials 4→6, stale 9→10
+
+### Fixed
+- **Duplicate OpenAPI operationIds** (#182) — explicit operation IDs for sync_policies and repository_labels handlers to fix SDK generation
+- **Release Build Pipeline** (#181) — add protoc installation and vendored OpenSSL for cross-platform binary builds
+- **CI Pipeline Repairs** (#174, #175, #178) — Docker publish, security scan, and Trivy scan fixes
+- **Native Test Scripts** (#177) — PyPI sed portability, NPM auth config, Cargo registry config fixes
+- **E2E Test Failures** (#146, #180) — Go, Docker, Helm, Protobuf test fixes; switched release gate to smoke profile
+- **arm64 Docker Builds** — use arch-appropriate protoc binary
+- **Artifact Download Filter** — release workflow only downloads binary archives, not E2E artifacts
+
+### Tests
+- Backend unit test coverage pushed toward 80% (#153)
+
 ## [1.1.0-rc.1] - 2026-02-13
 
 ### Added
