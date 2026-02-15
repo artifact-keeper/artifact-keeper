@@ -81,7 +81,7 @@ jobs:
         run: cargo audit --json > rust-audit.json || true
 
       - name: Upload audit results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: security-audit-reports
           path: rust-audit.json

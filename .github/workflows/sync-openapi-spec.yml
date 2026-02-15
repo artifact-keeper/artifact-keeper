@@ -62,7 +62,7 @@ jobs:
           echo "- Schemas: $(python3 -c "import json; print(len(json.load(open('openapi.json')).get('components',{}).get('schemas',{})))")" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload spec artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: openapi-spec
           path: |
