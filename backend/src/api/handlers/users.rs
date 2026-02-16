@@ -71,7 +71,7 @@ pub struct UpdateUserRequest {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct UserResponse {
+pub struct AdminUserResponse {
     pub id: Uuid,
     pub username: String,
     pub email: String,
@@ -86,18 +86,18 @@ pub struct UserResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreateUserResponse {
-    pub user: UserResponse,
+    pub user: AdminUserResponse,
     pub generated_password: Option<String>, // Only returned if password was auto-generated
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UserListResponse {
-    pub items: Vec<UserResponse>,
+    pub items: Vec<AdminUserResponse>,
     pub pagination: Pagination,
 }
 
-pub(crate) fn user_to_response(user: User) -> UserResponse {
-    UserResponse {
+pub(crate) fn user_to_response(user: User) -> AdminUserResponse {
+    AdminUserResponse {
         id: user.id,
         username: user.username,
         email: user.email,
@@ -274,7 +274,7 @@ pub async fn create_user(
         ("id" = Uuid, Path, description = "User ID"),
     ),
     responses(
-        (status = 200, description = "User details", body = UserResponse),
+        (status = 200, description = "User details", body = AdminUserResponse),
         (status = 404, description = "User not found"),
     ),
     security(("bearer_auth" = []))
@@ -282,7 +282,7 @@ pub async fn create_user(
 pub async fn get_user(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<UserResponse>> {
+) -> Result<Json<AdminUserResponse>> {
     let user = sqlx::query_as!(
         User,
         r#"
@@ -316,7 +316,7 @@ pub async fn get_user(
     ),
     request_body = UpdateUserRequest,
     responses(
-        (status = 200, description = "User updated successfully", body = UserResponse),
+        (status = 200, description = "User updated successfully", body = AdminUserResponse),
         (status = 404, description = "User not found"),
     ),
     security(("bearer_auth" = []))
@@ -326,7 +326,7 @@ pub async fn update_user(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUserRequest>,
-) -> Result<Json<UserResponse>> {
+) -> Result<Json<AdminUserResponse>> {
     let user = sqlx::query_as!(
         User,
         r#"
@@ -903,7 +903,7 @@ pub async fn reset_password(
         ListUsersQuery,
         CreateUserRequest,
         UpdateUserRequest,
-        UserResponse,
+        AdminUserResponse,
         CreateUserResponse,
         UserListResponse,
         RoleResponse,
@@ -1136,7 +1136,7 @@ mod tests {
     #[test]
     fn test_user_response_serialize() {
         let now = Utc::now();
-        let resp = UserResponse {
+        let resp = AdminUserResponse {
             id: Uuid::nil(),
             username: "admin".to_string(),
             email: "admin@example.com".to_string(),
@@ -1159,7 +1159,7 @@ mod tests {
     fn test_create_user_response_serialize_with_generated_password() {
         let now = Utc::now();
         let resp = CreateUserResponse {
-            user: UserResponse {
+            user: AdminUserResponse {
                 id: Uuid::nil(),
                 username: "new_user".to_string(),
                 email: "new@example.com".to_string(),
@@ -1182,7 +1182,7 @@ mod tests {
     fn test_create_user_response_serialize_without_generated_password() {
         let now = Utc::now();
         let resp = CreateUserResponse {
-            user: UserResponse {
+            user: AdminUserResponse {
                 id: Uuid::nil(),
                 username: "user".to_string(),
                 email: "user@example.com".to_string(),
