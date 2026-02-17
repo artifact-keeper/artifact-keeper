@@ -48,8 +48,8 @@ services:
       POSTGRES_DB: artifact_registry
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
-      - ./docker/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro,z
+      - ./docker/init-pg-ssl.sh:/docker-entrypoint-initdb.d/init-pg-ssl.sh:ro,z
       - pg_certs:/var/lib/postgresql/certs:ro
     ports:
       - "30432:5432"
@@ -71,7 +71,7 @@ services:
       dependency-track-apiserver:
         condition: service_healthy
     volumes:
-      - ./docker/init-dtrack.sh:/init-dtrack.sh:ro
+      - ./docker/init-dtrack.sh:/init-dtrack.sh:ro,z
       - shared_config:/shared
     entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl jq >/dev/null 2>&1 && /bin/sh /init-dtrack.sh"]
     restart: "no"
@@ -84,14 +84,24 @@ services:
         condition: service_healthy
       meilisearch:
         condition: service_healthy
-      dtrack-init:
-        condition: service_completed_successfully
     entrypoint:
       - /bin/sh
       - -c
       - |
-        if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
-          export DEPENDENCY_TRACK_API_KEY="$$(cat /shared/dtrack-api-key)"
+        # Wait for dtrack-init to provision the API key (up to 5 min)
+        if [ "$${DEPENDENCY_TRACK_ENABLED}" != "false" ]; then
+          echo "backend: waiting for Dependency-Track API key..."
+          for i in $$(seq 1 60); do
+            if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
+              export DEPENDENCY_TRACK_API_KEY="$$(cat /shared/dtrack-api-key)"
+              echo "backend: Dependency-Track API key loaded"
+              break
+            fi
+            if [ "$$i" -eq 60 ]; then
+              echo "backend: WARNING - Dependency-Track API key not found after 5 min, starting without it"
+            fi
+            sleep 5
+          done
         fi
         exec artifact-keeper
     environment:
@@ -124,7 +134,7 @@ services:
       - scan_workspace:/scan-workspace
       - shared_config:/shared:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/livez"]
       interval: 30s
       timeout: 10s
       start_period: 10s
@@ -234,7 +244,7 @@ services:
     container_name: artifact-keeper-web
     depends_on:
       backend:
-        condition: service_healthy
+        condition: service_started
     environment:
       BACKEND_URL: http://backend:8080
     restart: unless-stopped
@@ -244,7 +254,7 @@ services:
     container_name: artifact-keeper-caddy
     depends_on:
       backend:
-        condition: service_healthy
+        condition: service_started
       web:
         condition: service_started
     environment:
@@ -253,7 +263,7 @@ services:
       - "${HTTP_PORT:-30080}:80"
       - "${HTTPS_PORT:-30443}:443"
     volumes:
-      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro,z
       - caddy_data:/data
       - caddy_config:/config
     restart: unless-stopped
