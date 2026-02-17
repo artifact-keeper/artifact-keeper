@@ -299,6 +299,163 @@ mod tests {
         }
     }
 
+    /// Verify every path documented in the OpenAPI spec has a corresponding
+    /// route registered in the handler routers. This catches the class of bug
+    /// where a handler is annotated with `#[utoipa::path(...)]` and listed in
+    /// the module's `ApiDoc` struct but never `.route()`-ed in the router.
+    ///
+    /// For each documented path, we find the longest-matching prefix from a
+    /// known mapping of OpenAPI context_path → handler source file(s), then
+    /// verify the first static route segment appears in the source.
+    #[test]
+    fn test_all_openapi_paths_have_handlers() {
+        let spec = build_openapi();
+
+        // Collect all (METHOD, path) pairs from the OpenAPI spec
+        let mut documented: Vec<(String, String)> = Vec::new();
+        for (path, item) in &spec.paths.paths {
+            if item.get.is_some() {
+                documented.push(("GET".to_string(), path.clone()));
+            }
+            if item.post.is_some() {
+                documented.push(("POST".to_string(), path.clone()));
+            }
+            if item.put.is_some() {
+                documented.push(("PUT".to_string(), path.clone()));
+            }
+            if item.delete.is_some() {
+                documented.push(("DELETE".to_string(), path.clone()));
+            }
+            if item.patch.is_some() {
+                documented.push(("PATCH".to_string(), path.clone()));
+            }
+        }
+
+        // Top-level health/readiness endpoints use context_path="" and are
+        // registered directly in routes.rs (not under /api/v1/).
+        let top_level_prefixes = ["/health", "/ready", "/live"];
+
+        // Map from OpenAPI context_path prefix to the handler source file(s)
+        // that register routes under that prefix. Sorted by prefix length
+        // descending so the longest (most specific) prefix wins — this ensures
+        // nested sub-modules (e.g. /api/v1/admin/analytics/) match their own
+        // handler file rather than the parent admin.rs.
+        //
+        // When adding a new handler module, add its prefix here to keep this
+        // test covering it.
+        let mut handler_sources: Vec<(&str, Vec<&str>)> = vec![
+            // --- Nested admin sub-modules ---
+            ("/api/v1/admin/analytics/", vec![include_str!("handlers/analytics.rs")]),
+            ("/api/v1/admin/lifecycle/", vec![include_str!("handlers/lifecycle.rs")]),
+            ("/api/v1/admin/telemetry/", vec![include_str!("handlers/telemetry.rs")]),
+            ("/api/v1/admin/monitoring/", vec![include_str!("handlers/monitoring.rs")]),
+            ("/api/v1/admin/sso/", vec![include_str!("handlers/sso_admin.rs")]),
+            // --- Nested auth sub-modules ---
+            ("/api/v1/auth/sso/", vec![include_str!("handlers/sso.rs")]),
+            ("/api/v1/auth/totp/", vec![include_str!("handlers/totp.rs")]),
+            // --- Top-level API modules ---
+            ("/api/v1/setup", vec![include_str!("handlers/auth.rs")]),
+            ("/api/v1/auth/", vec![include_str!("handlers/auth.rs")]),
+            ("/api/v1/profile/", vec![include_str!("handlers/profile.rs")]),
+            ("/api/v1/users/", vec![include_str!("handlers/users.rs")]),
+            ("/api/v1/repositories/", vec![
+                include_str!("handlers/repositories.rs"),
+                include_str!("handlers/repository_labels.rs"),
+                include_str!("handlers/security.rs"),
+            ]),
+            ("/api/v1/artifacts/", vec![include_str!("handlers/artifacts.rs")]),
+            ("/api/v1/groups/", vec![include_str!("handlers/groups.rs")]),
+            ("/api/v1/permissions/", vec![include_str!("handlers/permissions.rs")]),
+            ("/api/v1/builds/", vec![include_str!("handlers/builds.rs")]),
+            ("/api/v1/packages/", vec![include_str!("handlers/packages.rs")]),
+            ("/api/v1/tree/", vec![include_str!("handlers/tree.rs")]),
+            ("/api/v1/search", vec![include_str!("handlers/search.rs")]),
+            ("/api/v1/peers/", vec![
+                include_str!("handlers/peers.rs"),
+                include_str!("handlers/peer.rs"),
+                include_str!("handlers/transfer.rs"),
+                include_str!("handlers/peer_instance_labels.rs"),
+            ]),
+            ("/api/v1/sync-policies/", vec![include_str!("handlers/sync_policies.rs")]),
+            // Admin routes: includes routes.rs because some routes (e.g. /metrics)
+            // are added inline in the route tree rather than in admin.rs
+            ("/api/v1/admin/", vec![
+                include_str!("handlers/admin.rs"),
+                include_str!("handlers/health.rs"),
+                include_str!("routes.rs"),
+            ]),
+            ("/api/v1/plugins/", vec![include_str!("handlers/plugins.rs")]),
+            ("/api/v1/formats/", vec![include_str!("handlers/plugins.rs")]),
+            ("/api/v1/webhooks/", vec![include_str!("handlers/webhooks.rs")]),
+            ("/api/v1/signing/", vec![include_str!("handlers/signing.rs")]),
+            ("/api/v1/security/", vec![include_str!("handlers/security.rs")]),
+            ("/api/v1/sbom/", vec![include_str!("handlers/sbom.rs")]),
+            ("/api/v1/promotion-rules/", vec![include_str!("handlers/promotion_rules.rs")]),
+            ("/api/v1/promotion/", vec![include_str!("handlers/promotion.rs")]),
+            ("/api/v1/approval/", vec![include_str!("handlers/approval.rs")]),
+            ("/api/v1/quality/", vec![include_str!("handlers/quality_gates.rs")]),
+            ("/api/v1/dependency-track/", vec![include_str!("handlers/dependency_track.rs")]),
+            ("/api/v1/instances/", vec![include_str!("handlers/remote_instances.rs")]),
+            ("/api/v1/migrations/", vec![include_str!("handlers/migration.rs")]),
+        ];
+
+        // Sort by prefix length descending so longest match wins
+        handler_sources.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        let mut missing = Vec::new();
+
+        for (method, path) in &documented {
+            // Skip top-level health/readiness endpoints — they are registered
+            // directly in create_router() in routes.rs and use context_path=""
+            if top_level_prefixes.iter().any(|p| path.starts_with(p)) {
+                continue;
+            }
+
+            if !path.starts_with("/api/v1/") {
+                missing.push(format!(
+                    "{method} {path} — unexpected prefix (expected /api/v1/ or known top-level)"
+                ));
+                continue;
+            }
+
+            // Find the handler source(s) for this path (longest prefix match)
+            let source = handler_sources
+                .iter()
+                .find(|(prefix, _)| path.starts_with(prefix));
+
+            if let Some((prefix, source_files)) = source {
+                // Extract the route segment after the matching prefix.
+                // e.g. path="/api/v1/auth/tokens/{token_id}", prefix="/api/v1/auth/"
+                //   → route_suffix="/tokens/{token_id}" → first_segment="tokens"
+                let route_suffix = &path[prefix.len() - 1..]; // keep leading /
+                let first_segment = route_suffix.split('/').nth(1).unwrap_or("");
+
+                // Skip empty segments and path parameters (e.g. {user_id})
+                if first_segment.is_empty() || first_segment.starts_with('{') {
+                    continue;
+                }
+
+                // The route string in source should contain this segment
+                // e.g. .route("/tokens", ...) for the /tokens endpoint
+                let route_pattern = format!("\"/{first_segment}");
+                let found = source_files.iter().any(|src| src.contains(&route_pattern));
+                if !found {
+                    missing.push(format!(
+                        "{method} {path} — route segment '/{first_segment}' not found in handler source(s)"
+                    ));
+                }
+            }
+            // Paths not covered by handler_sources are not checked here;
+            // add the prefix to handler_sources when adding new modules.
+        }
+
+        assert!(
+            missing.is_empty(),
+            "The following OpenAPI-documented endpoints appear to be missing route registrations:\n{}",
+            missing.join("\n")
+        );
+    }
+
     /// Export OpenAPI spec to files when EXPORT_OPENAPI_SPEC env var is set.
     /// Used by CI to generate the spec without starting the server.
     ///

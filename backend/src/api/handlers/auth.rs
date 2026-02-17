@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use axum::{
     extract::{Extension, State},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,8 @@ pub fn protected_router() -> Router<SharedState> {
     Router::new()
         .route("/me", get(get_current_user))
         .route("/ticket", post(create_download_ticket))
+        .route("/tokens", post(create_api_token))
+        .route("/tokens/:token_id", delete(revoke_api_token))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -292,6 +294,13 @@ pub async fn create_api_token(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<CreateApiTokenRequest>,
 ) -> Result<Json<CreateApiTokenResponse>> {
+    // Non-admin users cannot request the "admin" scope
+    if !auth.is_admin && payload.scopes.iter().any(|s| s == "admin") {
+        return Err(AppError::Authorization(
+            "Only administrators can create tokens with the 'admin' scope".to_string(),
+        ));
+    }
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (token, id) = auth_service
