@@ -345,58 +345,133 @@ mod tests {
         // test covering it.
         let mut handler_sources: Vec<(&str, Vec<&str>)> = vec![
             // --- Nested admin sub-modules ---
-            ("/api/v1/admin/analytics/", vec![include_str!("handlers/analytics.rs")]),
-            ("/api/v1/admin/lifecycle/", vec![include_str!("handlers/lifecycle.rs")]),
-            ("/api/v1/admin/telemetry/", vec![include_str!("handlers/telemetry.rs")]),
-            ("/api/v1/admin/monitoring/", vec![include_str!("handlers/monitoring.rs")]),
-            ("/api/v1/admin/sso/", vec![include_str!("handlers/sso_admin.rs")]),
+            (
+                "/api/v1/admin/analytics/",
+                vec![include_str!("handlers/analytics.rs")],
+            ),
+            (
+                "/api/v1/admin/lifecycle/",
+                vec![include_str!("handlers/lifecycle.rs")],
+            ),
+            (
+                "/api/v1/admin/telemetry/",
+                vec![include_str!("handlers/telemetry.rs")],
+            ),
+            (
+                "/api/v1/admin/monitoring/",
+                vec![include_str!("handlers/monitoring.rs")],
+            ),
+            (
+                "/api/v1/admin/sso/",
+                vec![include_str!("handlers/sso_admin.rs")],
+            ),
             // --- Nested auth sub-modules ---
             ("/api/v1/auth/sso/", vec![include_str!("handlers/sso.rs")]),
             ("/api/v1/auth/totp/", vec![include_str!("handlers/totp.rs")]),
             // --- Top-level API modules ---
             ("/api/v1/setup", vec![include_str!("handlers/auth.rs")]),
             ("/api/v1/auth/", vec![include_str!("handlers/auth.rs")]),
-            ("/api/v1/profile/", vec![include_str!("handlers/profile.rs")]),
+            (
+                "/api/v1/profile/",
+                vec![include_str!("handlers/profile.rs")],
+            ),
             ("/api/v1/users/", vec![include_str!("handlers/users.rs")]),
-            ("/api/v1/repositories/", vec![
-                include_str!("handlers/repositories.rs"),
-                include_str!("handlers/repository_labels.rs"),
-                include_str!("handlers/security.rs"),
-            ]),
-            ("/api/v1/artifacts/", vec![include_str!("handlers/artifacts.rs")]),
+            (
+                "/api/v1/repositories/",
+                vec![
+                    include_str!("handlers/repositories.rs"),
+                    include_str!("handlers/repository_labels.rs"),
+                    include_str!("handlers/security.rs"),
+                ],
+            ),
+            (
+                "/api/v1/artifacts/",
+                vec![include_str!("handlers/artifacts.rs")],
+            ),
             ("/api/v1/groups/", vec![include_str!("handlers/groups.rs")]),
-            ("/api/v1/permissions/", vec![include_str!("handlers/permissions.rs")]),
+            (
+                "/api/v1/permissions/",
+                vec![include_str!("handlers/permissions.rs")],
+            ),
             ("/api/v1/builds/", vec![include_str!("handlers/builds.rs")]),
-            ("/api/v1/packages/", vec![include_str!("handlers/packages.rs")]),
+            (
+                "/api/v1/packages/",
+                vec![include_str!("handlers/packages.rs")],
+            ),
             ("/api/v1/tree/", vec![include_str!("handlers/tree.rs")]),
             ("/api/v1/search", vec![include_str!("handlers/search.rs")]),
-            ("/api/v1/peers/", vec![
-                include_str!("handlers/peers.rs"),
-                include_str!("handlers/peer.rs"),
-                include_str!("handlers/transfer.rs"),
-                include_str!("handlers/peer_instance_labels.rs"),
-            ]),
-            ("/api/v1/sync-policies/", vec![include_str!("handlers/sync_policies.rs")]),
+            (
+                "/api/v1/peers/",
+                vec![
+                    include_str!("handlers/peers.rs"),
+                    include_str!("handlers/peer.rs"),
+                    include_str!("handlers/transfer.rs"),
+                    include_str!("handlers/peer_instance_labels.rs"),
+                ],
+            ),
+            (
+                "/api/v1/sync-policies/",
+                vec![include_str!("handlers/sync_policies.rs")],
+            ),
             // Admin routes: includes routes.rs because some routes (e.g. /metrics)
             // are added inline in the route tree rather than in admin.rs
-            ("/api/v1/admin/", vec![
-                include_str!("handlers/admin.rs"),
-                include_str!("handlers/health.rs"),
-                include_str!("routes.rs"),
-            ]),
-            ("/api/v1/plugins/", vec![include_str!("handlers/plugins.rs")]),
-            ("/api/v1/formats/", vec![include_str!("handlers/plugins.rs")]),
-            ("/api/v1/webhooks/", vec![include_str!("handlers/webhooks.rs")]),
-            ("/api/v1/signing/", vec![include_str!("handlers/signing.rs")]),
-            ("/api/v1/security/", vec![include_str!("handlers/security.rs")]),
+            (
+                "/api/v1/admin/",
+                vec![
+                    include_str!("handlers/admin.rs"),
+                    include_str!("handlers/health.rs"),
+                    include_str!("routes.rs"),
+                ],
+            ),
+            (
+                "/api/v1/plugins/",
+                vec![include_str!("handlers/plugins.rs")],
+            ),
+            (
+                "/api/v1/formats/",
+                vec![include_str!("handlers/plugins.rs")],
+            ),
+            (
+                "/api/v1/webhooks/",
+                vec![include_str!("handlers/webhooks.rs")],
+            ),
+            (
+                "/api/v1/signing/",
+                vec![include_str!("handlers/signing.rs")],
+            ),
+            (
+                "/api/v1/security/",
+                vec![include_str!("handlers/security.rs")],
+            ),
             ("/api/v1/sbom/", vec![include_str!("handlers/sbom.rs")]),
-            ("/api/v1/promotion-rules/", vec![include_str!("handlers/promotion_rules.rs")]),
-            ("/api/v1/promotion/", vec![include_str!("handlers/promotion.rs")]),
-            ("/api/v1/approval/", vec![include_str!("handlers/approval.rs")]),
-            ("/api/v1/quality/", vec![include_str!("handlers/quality_gates.rs")]),
-            ("/api/v1/dependency-track/", vec![include_str!("handlers/dependency_track.rs")]),
-            ("/api/v1/instances/", vec![include_str!("handlers/remote_instances.rs")]),
-            ("/api/v1/migrations/", vec![include_str!("handlers/migration.rs")]),
+            (
+                "/api/v1/promotion-rules/",
+                vec![include_str!("handlers/promotion_rules.rs")],
+            ),
+            (
+                "/api/v1/promotion/",
+                vec![include_str!("handlers/promotion.rs")],
+            ),
+            (
+                "/api/v1/approval/",
+                vec![include_str!("handlers/approval.rs")],
+            ),
+            (
+                "/api/v1/quality/",
+                vec![include_str!("handlers/quality_gates.rs")],
+            ),
+            (
+                "/api/v1/dependency-track/",
+                vec![include_str!("handlers/dependency_track.rs")],
+            ),
+            (
+                "/api/v1/instances/",
+                vec![include_str!("handlers/remote_instances.rs")],
+            ),
+            (
+                "/api/v1/migrations/",
+                vec![include_str!("handlers/migration.rs")],
+            ),
         ];
 
         // Sort by prefix length descending so longest match wins
