@@ -812,6 +812,12 @@ impl ScannerService {
             // Trivy filesystem scanner for non-container artifacts
             info!("Trivy filesystem scanner enabled");
             scanners.push(Arc::new(TrivyFsScanner::new(
+                url.clone(),
+                scan_workspace_path.clone(),
+            )));
+            // Incus/LXC container image scanner (extracts rootfs, scans with trivy)
+            info!("Incus container image scanner enabled");
+            scanners.push(Arc::new(crate::services::incus_scanner::IncusScanner::new(
                 url,
                 scan_workspace_path.clone(),
             )));

@@ -13,6 +13,7 @@ pub mod encryption;
 pub mod grype_scanner;
 pub mod helm_lint_checker;
 pub mod image_scanner;
+pub mod incus_scanner;
 pub mod ldap_service;
 pub mod meili_service;
 pub mod metadata_checker;
