@@ -80,7 +80,9 @@
                 "opkg",
                 "p2",
                 "bazel",
-                "protobuf"
+                "protobuf",
+                "incus",
+                "lxc"
               ]
             }
           }
