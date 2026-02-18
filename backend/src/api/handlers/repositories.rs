@@ -35,6 +35,18 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+/// Check that the authenticated user can access a specific repository.
+/// If `allowed_repo_ids` is set on the token, the repo must be in that set.
+fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
+    if auth.can_access_repo(repo_id) {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "Token does not have access to this repository".to_string(),
+        ))
+    }
+}
+
 /// Create repository routes
 pub fn router() -> Router<SharedState> {
     use axum::extract::DefaultBodyLimit;
@@ -345,7 +357,8 @@ pub async fn create_repository(
     Extension(auth): Extension<Option<AuthExtension>>,
     Json(payload): Json<CreateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
     validate_repository_key(&payload.key)?;
     let format = parse_format(&payload.format)?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
@@ -421,7 +434,8 @@ pub async fn update_repository(
     Path(key): Path<String>,
     Json(payload): Json<UpdateRepositoryRequest>,
 ) -> Result<Json<RepositoryResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
 
     // Validate new key if provided
     if let Some(ref new_key) = payload.key {
@@ -430,8 +444,9 @@ pub async fn update_repository(
 
     let service = state.create_repository_service();
 
-    // Get existing repo by key
+    // Get existing repo by key and check repo access
     let existing = service.get_by_key(&key).await?;
+    require_repo_access(&auth, existing.id)?;
 
     let repo = service
         .update(
@@ -473,9 +488,11 @@ pub async fn delete_repository(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<()> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("delete")?;
     let service = state.create_repository_service();
     let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
     service.delete(repo.id).await?;
     Ok(())
 }
@@ -671,8 +688,10 @@ pub async fn upload_artifact(
     body: Bytes,
 ) -> Result<Json<ArtifactResponse>> {
     let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
 
     let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
     let artifact_service = state.create_artifact_service(storage);
@@ -1012,9 +1031,11 @@ pub async fn delete_artifact(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
 ) -> Result<()> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("delete")?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
 
     let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
     let artifact_service = state.create_artifact_service(storage);
@@ -1171,10 +1192,12 @@ pub async fn add_virtual_member(
     Path(key): Path<String>,
     Json(payload): Json<AddVirtualMemberRequest>,
 ) -> Result<Json<VirtualMemberResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, virtual_repo.id)?;
     let member_repo = service.get_by_key(&payload.member_key).await?;
 
     // Get current max priority if not specified
@@ -1253,10 +1276,12 @@ pub async fn remove_virtual_member(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, member_key)): Path<(String, String)>,
 ) -> Result<()> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, virtual_repo.id)?;
     let member_repo = service.get_by_key(&member_key).await?;
 
     if virtual_repo.repo_type != RepositoryType::Virtual {
@@ -1301,10 +1326,12 @@ pub async fn update_virtual_members(
     Path(key): Path<String>,
     Json(payload): Json<UpdateVirtualMembersRequest>,
 ) -> Result<Json<VirtualMembersListResponse>> {
-    let _auth = require_auth(auth)?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, virtual_repo.id)?;
 
     if virtual_repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
