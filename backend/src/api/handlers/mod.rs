@@ -24,6 +24,7 @@ pub mod health;
 pub mod helm;
 pub mod hex;
 pub mod huggingface;
+pub mod incus;
 pub mod jetbrains;
 pub mod lifecycle;
 pub mod maven;

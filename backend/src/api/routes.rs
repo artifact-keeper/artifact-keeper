@@ -87,7 +87,9 @@ pub fn create_router(state: SharedState) -> Router {
         // VS Code Extension Marketplace API
         .nest("/vscode", handlers::vscode::router())
         // Protobuf / Buf Schema Registry (Connect RPC)
-        .nest("/proto", handlers::protobuf::router());
+        .nest("/proto", handlers::protobuf::router())
+        // Incus/LXC Container Image Repository (SimpleStreams protocol)
+        .nest("/incus", handlers::incus::router());
 
     // Disable the global body limit. This is an artifact registry — uploads
     // can be multiple GB. Without this, Axum's 2 MB default silently truncates

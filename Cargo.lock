@@ -217,6 +217,7 @@ dependencies = [
  "walkdir",
  "wasmtime",
  "wasmtime-wasi",
+ "xz2",
  "zip",
 ]
 

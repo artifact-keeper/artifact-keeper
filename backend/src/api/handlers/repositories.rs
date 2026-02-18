@@ -230,6 +230,8 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
         "protobuf" => Ok(RepositoryFormat::Protobuf),
+        "incus" => Ok(RepositoryFormat::Incus),
+        "lxc" => Ok(RepositoryFormat::Lxc),
         _ => Err(AppError::Validation(format!("Invalid format: {}", s))),
     }
 }

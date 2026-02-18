@@ -74,6 +74,9 @@ pub enum RepositoryFormat {
     Bazel,
     // Schema registries
     Protobuf,
+    // Container images
+    Incus,
+    Lxc,
 }
 
 /// Repository type enum

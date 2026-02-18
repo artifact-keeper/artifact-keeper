@@ -13,7 +13,7 @@ echo "=============================================="
 
 # Define test sets
 SMOKE_TESTS=(pypi npm cargo)
-ALL_TESTS=(pypi npm cargo maven go rpm deb helm conda docker protobuf proxy-virtual health-probes)
+ALL_TESTS=(pypi npm cargo maven go rpm deb helm conda docker protobuf incus proxy-virtual health-probes)
 
 # Select tests based on profile
 case "$PROFILE" in
@@ -26,12 +26,12 @@ case "$PROFILE" in
     proxy)
         TESTS=("proxy-virtual")
         ;;
-    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|proxy-virtual|health-probes)
+    pypi|npm|cargo|maven|go|rpm|deb|helm|conda|docker|protobuf|incus|proxy-virtual|health-probes)
         TESTS=("$PROFILE")
         ;;
     *)
         echo "ERROR: Unknown profile: $PROFILE"
-        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, proxy"
+        echo "Available profiles: smoke, all, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, protobuf, incus, proxy"
         exit 1
         ;;
 esac

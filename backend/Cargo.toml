@@ -94,6 +94,7 @@ rand = "0.9"
 quick-xml = { version = "0.39", features = ["serialize"] }
 flate2 = "1.0"
 tar = "0.4"
+xz2 = "0.1"
 mime_guess = "2.0"
 zip = "2.2"
 toml = "0.8"

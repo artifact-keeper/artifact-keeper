@@ -17,6 +17,7 @@ pub mod go;
 pub mod helm;
 pub mod hex;
 pub mod huggingface;
+pub mod incus;
 pub mod jetbrains_plugins;
 pub mod maven;
 pub mod mlmodel;
@@ -115,6 +116,8 @@ pub trait FormatHandler: Send + Sync {
             RepositoryFormat::P2 => "p2",
             RepositoryFormat::Bazel => "bazel",
             RepositoryFormat::Protobuf => "protobuf",
+            RepositoryFormat::Incus => "incus",
+            RepositoryFormat::Lxc => "lxc",
         }
     }
 
@@ -182,6 +185,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "p2" => Some(Box::new(p2::P2Handler::new())),
         "bazel" => Some(Box::new(bazel::BazelHandler::new())),
         "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
+        "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
         _ => None,
     }
 }
@@ -239,6 +243,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::P2 => Box::new(p2::P2Handler::new()),
         RepositoryFormat::Bazel => Box::new(bazel::BazelHandler::new()),
         RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
+        RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
     }
 }
 
@@ -294,5 +299,7 @@ pub fn list_core_formats() -> Vec<&'static str> {
         "p2",
         "bazel",
         "protobuf",
+        "incus",
+        "lxc",
     ]
 }
