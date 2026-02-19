@@ -144,59 +144,6 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Generate changelog
-        id: changelog
-        run: |
-          cat << 'EOF' > CHANGELOG.md
-          ## What's Changed
-
-          ### Features
-          - Full-featured artifact registry supporting 11+ package formats
-          - JWT authentication with role-based access control
-          - Repository management (local, remote, virtual)
-          - Artifact upload, download, and search
-          - Admin dashboard with system health monitoring
-
-          ### Supported Formats
-          - Maven, PyPI, NPM, Docker, Helm
-          - RPM, Debian, Go Modules
-          - NuGet, Cargo, Generic
-
-          ### Quality Assurance
-          - ✅ Full E2E test suite passed
-          - ✅ Native client tests passed (all 9 formats)
-          - ✅ Stress tests passed (100 concurrent operations)
-          - ✅ Failure injection tests passed
-
-          ### Downloads
-
-          | Platform | Architecture | Download |
-          |----------|--------------|----------|
-          | Linux | amd64 | `artifact-keeper-linux-amd64.tar.gz` |
-          | Linux | arm64 | `artifact-keeper-linux-arm64.tar.gz` |
-          | macOS | amd64 | `artifact-keeper-darwin-amd64.tar.gz` |
-          | macOS | arm64 | `artifact-keeper-darwin-arm64.tar.gz` |
-
-          ### Docker Images
-
-          ```bash
-          docker pull ghcr.io/${{ github.repository }}-backend:${{ steps.version.outputs.tag }}
-          ```
-
-          ### Quick Start
-
-          ```bash
-          # Download and extract
-          tar -xzf artifact-keeper-linux-amd64.tar.gz
-
-          # Run with PostgreSQL
-          export DATABASE_URL=postgresql://user:pass@localhost/artifact_registry
-          ./artifact-keeper-linux-amd64
-          ```
-
-          **Full Changelog**: https://github.com/${{ github.repository }}/commits/${{ steps.version.outputs.tag }}
-          EOF
-
       - name: Collect release assets
         run: |
           mkdir -p release-assets
@@ -208,7 +155,7 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Artifact Keeper ${{ steps.version.outputs.version }}
-          body_path: CHANGELOG.md
+          generate_release_notes: true
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           files: release-assets/*
