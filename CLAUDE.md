@@ -181,7 +181,7 @@ Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older releas
 
 ### Other Git Rules
 
-- **Do NOT add Co-Authored-By lines** to commit messages
+- **Do NOT add AI Co-Authored-By lines** (e.g., Claude, GPT) to commit messages — real human co-authors are fine
 - **Do NOT include "Generated with Claude" or similar AI attribution** in PR descriptions
 - **Always use `gh` CLI** for GitHub operations (PRs, issues, workflows, etc.)
   - Use `gh pr create` for pull requests

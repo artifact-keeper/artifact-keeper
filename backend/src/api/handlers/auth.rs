@@ -116,6 +116,14 @@ pub async fn login(
     State(state): State<SharedState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response> {
+    // Block local login when SSO providers are configured (issue #213)
+    let sso_providers = AuthConfigService::list_enabled_providers(&state.db).await?;
+    if !sso_providers.is_empty() {
+        return Err(AppError::Authentication(
+            "Local login is disabled when SSO is configured. Use your organization's SSO provider to sign in.".to_string(),
+        ));
+    }
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (user, tokens) = auth_service
