@@ -30,7 +30,23 @@ pull_request_rules:
         message: |
           Major version bump detected. Manual review recommended before merging.
 
-  - name: Label migration PRs
+  - name: Require tests for API handler changes
+    conditions:
+      - "files~=^backend/src/api/handlers/"
+      - -draft
+    actions:
+      label:
+        add:
+          - needs-tests
+          - api-change
+      comment:
+        message: |
+          This PR modifies API handlers. Please ensure:
+          - Unit tests cover the new/changed logic
+          - Integration test updated if endpoint behavior changed
+          - OpenAPI annotations match the implementation
+
+  - name: Label and review migrations
     conditions:
       - "files~=^backend/migrations/"
     actions:
@@ -38,14 +54,9 @@ pull_request_rules:
         add:
           - migration
           - needs-review
-
-  - name: Label API handler changes
-    conditions:
-      - "files~=^backend/src/api/handlers/"
-    actions:
-      label:
-        add:
-          - api-change
+      request_reviews:
+        teams:
+          - backend
 
   - name: Label format handler changes
     conditions:
@@ -54,6 +65,15 @@ pull_request_rules:
       label:
         add:
           - format-handler
+
+  - name: Require test checklist completion
+    conditions:
+      - "body~=\\[x\\].*[Tt]est"
+      - "#approved-reviews-by>=1"
+    actions:
+      label:
+        add:
+          - tests-verified
 
   - name: Clean up merged branches
     conditions:

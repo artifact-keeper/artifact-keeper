@@ -1,0 +1,5 @@
+* @artifact-keeper/backend
+backend/migrations/ @artifact-keeper/backend
+backend/src/api/ @artifact-keeper/backend @artifact-keeper/platform-sdk
+backend/src/formats/ @artifact-keeper/backend
+scripts/ @artifact-keeper/backend
