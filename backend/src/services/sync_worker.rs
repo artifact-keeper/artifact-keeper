@@ -65,6 +65,7 @@ struct TaskRow {
     repository_id: Uuid,
     content_type: String,
     checksum_sha256: String,
+    task_type: String,
 }
 
 // ── Core logic ──────────────────────────────────────────────────────────────
@@ -144,7 +145,8 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
                 r.key AS repository_key,
                 r.id AS repository_id,
                 a.content_type,
-                a.checksum_sha256
+                a.checksum_sha256,
+                st.task_type
             FROM sync_tasks st
             JOIN artifacts a ON a.id = st.artifact_id
             JOIN repositories r ON r.id = a.repository_id
@@ -195,7 +197,7 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
     Ok(())
 }
 
-/// Execute a single artifact transfer to a remote peer.
+/// Execute a single sync task (push or delete) to a remote peer.
 async fn execute_transfer(
     db: &PgPool,
     client: &reqwest::Client,
@@ -227,6 +229,12 @@ async fn execute_transfer(
     .execute(db)
     .await
     .map_err(|e| format!("Failed to increment active_transfers: {e}"))?;
+
+    if task.task_type == "delete" {
+        return execute_delete(db, client, task, peer_endpoint, peer_api_key).await;
+    }
+
+    // Push flow: read artifact bytes and POST to peer.
 
     // 2. Read the artifact bytes from local storage.
     let file_bytes = match read_artifact_from_storage(db, &task.storage_key).await {
@@ -281,6 +289,51 @@ async fn execute_transfer(
         }
         Err(e) => {
             let msg = format!("HTTP request failed: {e}");
+            handle_transfer_failure(db, task, &msg).await;
+            Err(msg)
+        }
+    }
+}
+
+/// Execute a delete task: tell the remote peer to remove an artifact.
+async fn execute_delete(
+    db: &PgPool,
+    client: &reqwest::Client,
+    task: &TaskRow,
+    peer_endpoint: &str,
+    peer_api_key: &str,
+) -> Result<(), String> {
+    let url = build_delete_url(peer_endpoint, &task.repository_key, &task.artifact_path);
+
+    let result = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", peer_api_key))
+        .send()
+        .await;
+
+    match result {
+        Ok(response) if response.status().is_success() || response.status().as_u16() == 404 => {
+            // 404 is acceptable: the artifact may already be gone.
+            handle_transfer_success(db, task, 0).await;
+            tracing::info!(
+                "Deleted artifact '{}' from peer (task {})",
+                task.artifact_path,
+                task.id
+            );
+            Ok(())
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let msg = format!("Remote peer returned {status} for delete: {body}");
+            handle_transfer_failure(db, task, &msg).await;
+            Err(msg)
+        }
+        Err(e) => {
+            let msg = format!("HTTP delete request failed: {e}");
             handle_transfer_failure(db, task, &msg).await;
             Err(msg)
         }
@@ -400,6 +453,20 @@ pub(crate) fn build_transfer_url(peer_endpoint: &str, repository_key: &str) -> S
         "{}/api/v1/repositories/{}/artifacts",
         peer_endpoint.trim_end_matches('/'),
         repository_key
+    )
+}
+
+/// Build the full URL for deleting an artifact from a remote peer.
+pub(crate) fn build_delete_url(
+    peer_endpoint: &str,
+    repository_key: &str,
+    artifact_path: &str,
+) -> String {
+    format!(
+        "{}/api/v1/repositories/{}/artifacts/{}",
+        peer_endpoint.trim_end_matches('/'),
+        repository_key,
+        artifact_path
     )
 }
 

@@ -452,17 +452,17 @@ impl PeerInstanceService {
         artifact_id: Uuid,
         priority: i32,
     ) -> Result<Uuid> {
-        let id = sqlx::query_scalar!(
+        let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority)
             VALUES ($1, $2, $3)
-            ON CONFLICT (peer_instance_id, artifact_id) DO UPDATE SET priority = GREATEST(sync_tasks.priority, $3)
+            ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET priority = GREATEST(sync_tasks.priority, $3)
             RETURNING id
             "#,
-            peer_instance_id,
-            artifact_id,
-            priority
         )
+        .bind(peer_instance_id)
+        .bind(artifact_id)
+        .bind(priority)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

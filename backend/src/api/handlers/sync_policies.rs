@@ -217,6 +217,10 @@ pub struct ArtifactFilterSchema {
     pub exclude_paths: Vec<String>,
     #[serde(default)]
     pub max_size_bytes: Option<i64>,
+    /// Tag selectors (AND semantics). Key = tag key, value = required tag value.
+    /// Empty value means "key must exist with any value".
+    #[serde(default)]
+    pub match_tags: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

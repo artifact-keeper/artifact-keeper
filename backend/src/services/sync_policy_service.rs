@@ -106,6 +106,11 @@ pub struct ArtifactFilter {
     /// Maximum artifact size in bytes.
     #[serde(default)]
     pub max_size_bytes: Option<i64>,
+    /// Tag selectors: all must match (AND semantics).
+    /// Key is the tag key, value is the required tag value.
+    /// Empty value means "key must exist with any value".
+    #[serde(default)]
+    pub match_tags: HashMap<String, String>,
 }
 
 impl ArtifactFilter {
@@ -147,6 +152,32 @@ impl ArtifactFilter {
             sql_like_match(artifact_path, &sql_pattern)
         }) {
             return false;
+        }
+
+        true
+    }
+
+    /// Check whether an artifact passes this filter, including tag constraints.
+    ///
+    /// `artifact_tags` is a slice of (key, value) pairs representing the artifact's labels.
+    pub fn matches_with_tags(
+        &self,
+        artifact_path: &str,
+        artifact_size_bytes: i64,
+        artifact_created_at: chrono::DateTime<chrono::Utc>,
+        artifact_tags: &[(String, String)],
+    ) -> bool {
+        if !self.matches(artifact_path, artifact_size_bytes, artifact_created_at) {
+            return false;
+        }
+
+        for (required_key, required_value) in &self.match_tags {
+            let tag_match = artifact_tags.iter().any(|(k, v)| {
+                k == required_key && (required_value.is_empty() || v == required_value)
+            });
+            if !tag_match {
+                return false;
+            }
         }
 
         true
@@ -759,6 +790,157 @@ impl SyncPolicyService {
         Ok(())
     }
 
+    /// Re-evaluate sync tasks for a single artifact (e.g., when its labels change).
+    ///
+    /// Determines which peers should have this artifact based on current policies
+    /// and the artifact's tags, then queues push or delete tasks accordingly.
+    pub async fn evaluate_for_artifact(&self, artifact_id: Uuid) -> Result<()> {
+        // 1. Look up the artifact
+        #[derive(sqlx::FromRow)]
+        struct ArtifactRow {
+            repository_id: Uuid,
+            path: String,
+            size_bytes: i64,
+            created_at: DateTime<Utc>,
+        }
+
+        let artifact: ArtifactRow = sqlx::query_as(
+            "SELECT repository_id, path, size_bytes, created_at FROM artifacts WHERE id = $1 AND is_deleted = false",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("Artifact {artifact_id} not found")))?;
+
+        // 2. Fetch the artifact's current labels
+        let label_service =
+            crate::services::artifact_label_service::ArtifactLabelService::new(self.db.clone());
+        let labels = label_service.get_labels(artifact_id).await?;
+        let tag_pairs: Vec<(String, String)> = labels
+            .iter()
+            .map(|l| (l.label_key.clone(), l.label_value.clone()))
+            .collect();
+
+        // 3. Find enabled policies that match this artifact's repo
+        let policies = self.list_enabled_policies().await?;
+        let mut desired_peers: Vec<Uuid> = Vec::new();
+
+        for policy in &policies {
+            let repo_selector: RepoSelector =
+                serde_json::from_value(policy.repo_selector.clone()).unwrap_or_default();
+            let repos = self.resolve_repos(&repo_selector).await?;
+
+            if !repos.iter().any(|r| r.id == artifact.repository_id) {
+                continue;
+            }
+
+            // 4. Check if this artifact passes the filter (including match_tags)
+            let filter: ArtifactFilter =
+                serde_json::from_value(policy.artifact_filter.clone()).unwrap_or_default();
+
+            if !filter.matches_with_tags(
+                &artifact.path,
+                artifact.size_bytes,
+                artifact.created_at,
+                &tag_pairs,
+            ) {
+                continue;
+            }
+
+            // 5. Resolve matching peers
+            let peer_selector: PeerSelector =
+                serde_json::from_value(policy.peer_selector.clone()).unwrap_or_default();
+            let peers = self.resolve_peers(&peer_selector).await?;
+
+            for peer in peers {
+                if !desired_peers.contains(&peer.id) {
+                    desired_peers.push(peer.id);
+                }
+            }
+        }
+
+        // 6. Find peers that previously completed a push for this artifact
+        let synced_peers: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT peer_instance_id FROM sync_tasks
+            WHERE artifact_id = $1 AND task_type = 'push' AND status = 'completed'
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 7. Queue push tasks for peers that should have it but don't
+        for peer_id in &desired_peers {
+            if synced_peers.contains(peer_id) {
+                continue;
+            }
+            // Cancel any pending delete for this peer+artifact
+            let _ = sqlx::query(
+                r#"
+                UPDATE sync_tasks SET status = 'cancelled'
+                WHERE peer_instance_id = $1 AND artifact_id = $2
+                  AND task_type = 'delete' AND status = 'pending'
+                "#,
+            )
+            .bind(peer_id)
+            .bind(artifact_id)
+            .execute(&self.db)
+            .await;
+
+            // Queue push
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
+                VALUES ($1, $2, 0, 'push')
+                ON CONFLICT (peer_instance_id, artifact_id, task_type)
+                DO UPDATE SET status = 'pending', priority = GREATEST(sync_tasks.priority, 0)
+                "#,
+            )
+            .bind(peer_id)
+            .bind(artifact_id)
+            .execute(&self.db)
+            .await;
+        }
+
+        // 8. Queue delete tasks for peers that shouldn't have it but do
+        for peer_id in &synced_peers {
+            if desired_peers.contains(peer_id) {
+                continue;
+            }
+            // Cancel any pending push for this peer+artifact
+            let _ = sqlx::query(
+                r#"
+                UPDATE sync_tasks SET status = 'cancelled'
+                WHERE peer_instance_id = $1 AND artifact_id = $2
+                  AND task_type = 'push' AND status = 'pending'
+                "#,
+            )
+            .bind(peer_id)
+            .bind(artifact_id)
+            .execute(&self.db)
+            .await;
+
+            // Queue delete
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
+                VALUES ($1, $2, 0, 'delete')
+                ON CONFLICT (peer_instance_id, artifact_id, task_type)
+                DO UPDATE SET status = 'pending', priority = GREATEST(sync_tasks.priority, 0)
+                "#,
+            )
+            .bind(peer_id)
+            .bind(artifact_id)
+            .execute(&self.db)
+            .await;
+        }
+
+        Ok(())
+    }
+
     /// Re-evaluate policies for a specific peer (e.g., when a new peer joins).
     pub async fn evaluate_for_peer(&self, peer_id: Uuid) -> Result<()> {
         let policies = self.list_enabled_policies().await?;
@@ -892,15 +1074,41 @@ impl SyncPolicyService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+            // Batch-fetch labels for all artifacts if the filter uses match_tags
+            let labels_map = if !filter.match_tags.is_empty() {
+                let ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
+                let label_svc = crate::services::artifact_label_service::ArtifactLabelService::new(
+                    self.db.clone(),
+                );
+                label_svc.get_labels_batch(&ids).await.unwrap_or_default()
+            } else {
+                std::collections::HashMap::new()
+            };
+
             for artifact in &artifacts {
-                if !filter.matches(&artifact.path, artifact.size_bytes, artifact.created_at) {
+                let tag_pairs: Vec<(String, String)> = labels_map
+                    .get(&artifact.id)
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .map(|l| (l.label_key.clone(), l.label_value.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if !filter.matches_with_tags(
+                    &artifact.path,
+                    artifact.size_bytes,
+                    artifact.created_at,
+                    &tag_pairs,
+                ) {
                     continue;
                 }
                 let _ = sqlx::query(
                     r#"
                     INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority)
                     VALUES ($1, $2, $3)
-                    ON CONFLICT (peer_instance_id, artifact_id)
+                    ON CONFLICT (peer_instance_id, artifact_id, task_type)
                     DO UPDATE SET priority = GREATEST(sync_tasks.priority, $3)
                     "#,
                 )
@@ -1294,6 +1502,7 @@ mod tests {
             include_paths: vec!["release/*".to_string()],
             exclude_paths: vec!["snapshot/*".to_string()],
             max_size_bytes: Some(1_073_741_824),
+            match_tags: HashMap::new(),
         };
         let json = serde_json::to_value(&f).unwrap();
         assert_eq!(json["max_age_days"], 90);
@@ -1334,6 +1543,7 @@ mod tests {
             include_paths: vec!["**/*.jar".to_string()],
             exclude_paths: vec!["test/**".to_string()],
             max_size_bytes: Some(1_000_000),
+            match_tags: HashMap::new(),
         };
         let json = serde_json::to_string(&f).unwrap();
         let roundtrip: ArtifactFilter = serde_json::from_str(&json).unwrap();
@@ -1543,12 +1753,14 @@ mod tests {
             include_paths: vec![],
             exclude_paths: vec![],
             max_size_bytes: None,
+            match_tags: HashMap::new(),
         };
         let json: serde_json::Value = serde_json::to_value(&f).unwrap();
         assert!(json.get("max_age_days").is_some());
         assert!(json.get("include_paths").is_some());
         assert!(json.get("exclude_paths").is_some());
         assert!(json.get("max_size_bytes").is_some());
+        assert!(json.get("match_tags").is_some());
     }
 
     #[test]
@@ -2183,6 +2395,7 @@ mod tests {
             max_size_bytes: Some(5000),
             include_paths: vec!["release/*".to_string()],
             exclude_paths: vec!["*.tmp".to_string()],
+            match_tags: HashMap::new(),
         };
         let now = chrono::Utc::now();
         // Passes all constraints
@@ -2205,5 +2418,95 @@ mod tests {
             ..Default::default()
         };
         assert!(f.matches("anything/at/all.bin", 100, chrono::Utc::now()));
+    }
+
+    // -----------------------------------------------------------------------
+    // matches_with_tags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matches_with_tags_empty_filter_passes_all() {
+        let f = ArtifactFilter::default();
+        let tags = vec![("distribution".to_string(), "production".to_string())];
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &tags));
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &[]));
+    }
+
+    #[test]
+    fn test_matches_with_tags_exact_match() {
+        let f = ArtifactFilter {
+            match_tags: HashMap::from([("distribution".to_string(), "production".to_string())]),
+            ..Default::default()
+        };
+        let matching = vec![("distribution".to_string(), "production".to_string())];
+        let wrong_value = vec![("distribution".to_string(), "test".to_string())];
+        let missing = vec![("support".to_string(), "ltr".to_string())];
+
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &matching));
+        assert!(!f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &wrong_value));
+        assert!(!f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &missing));
+        assert!(!f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &[]));
+    }
+
+    #[test]
+    fn test_matches_with_tags_key_only() {
+        let f = ArtifactFilter {
+            match_tags: HashMap::from([("distribution".to_string(), String::new())]),
+            ..Default::default()
+        };
+        // Any value for the key should pass
+        let with_prod = vec![("distribution".to_string(), "production".to_string())];
+        let with_test = vec![("distribution".to_string(), "test".to_string())];
+        let with_empty = vec![("distribution".to_string(), String::new())];
+        let missing = vec![("other".to_string(), "val".to_string())];
+
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &with_prod));
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &with_test));
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &with_empty));
+        assert!(!f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &missing));
+    }
+
+    #[test]
+    fn test_matches_with_tags_and_semantics() {
+        let f = ArtifactFilter {
+            match_tags: HashMap::from([
+                ("distribution".to_string(), "production".to_string()),
+                ("support".to_string(), "ltr".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let both = vec![
+            ("distribution".to_string(), "production".to_string()),
+            ("support".to_string(), "ltr".to_string()),
+        ];
+        let only_one = vec![("distribution".to_string(), "production".to_string())];
+
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &both));
+        assert!(!f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &only_one));
+    }
+
+    #[test]
+    fn test_matches_with_tags_combined_with_path_filter() {
+        let f = ArtifactFilter {
+            include_paths: vec!["release/*".to_string()],
+            match_tags: HashMap::from([("distribution".to_string(), "production".to_string())]),
+            ..Default::default()
+        };
+        let tags = vec![("distribution".to_string(), "production".to_string())];
+
+        // Both path and tags must match
+        assert!(f.matches_with_tags("release/v1.jar", 100, chrono::Utc::now(), &tags));
+        assert!(!f.matches_with_tags("snapshot/v1.jar", 100, chrono::Utc::now(), &tags));
+        assert!(!f.matches_with_tags("release/v1.jar", 100, chrono::Utc::now(), &[]));
+    }
+
+    #[test]
+    fn test_matches_with_tags_backward_compat() {
+        // A filter deserialized from old JSON (no match_tags field) should pass all tags
+        let json = r#"{"max_age_days": 30}"#;
+        let f: ArtifactFilter = serde_json::from_str(json).unwrap();
+        assert!(f.match_tags.is_empty());
+        let tags = vec![("anything".to_string(), "here".to_string())];
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &tags));
     }
 }

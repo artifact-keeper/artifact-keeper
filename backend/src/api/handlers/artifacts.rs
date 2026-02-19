@@ -21,6 +21,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id", get(get_artifact))
         .route("/:id/metadata", get(get_artifact_metadata))
         .route("/:id/stats", get(get_artifact_stats))
+        .merge(super::artifact_labels::artifact_labels_router())
 }
 
 #[derive(Debug, Serialize, ToSchema)]

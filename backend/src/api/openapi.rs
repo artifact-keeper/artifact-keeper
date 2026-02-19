@@ -126,6 +126,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::approval::ApprovalApiDoc::openapi());
     doc.merge(super::handlers::promotion_rules::PromotionRulesApiDoc::openapi());
     doc.merge(super::handlers::service_accounts::ServiceAccountsApiDoc::openapi());
+    doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());
 
     doc
 }
@@ -388,7 +389,10 @@ mod tests {
             ),
             (
                 "/api/v1/artifacts/",
-                vec![include_str!("handlers/artifacts.rs")],
+                vec![
+                    include_str!("handlers/artifacts.rs"),
+                    include_str!("handlers/artifact_labels.rs"),
+                ],
             ),
             ("/api/v1/groups/", vec![include_str!("handlers/groups.rs")]),
             (
