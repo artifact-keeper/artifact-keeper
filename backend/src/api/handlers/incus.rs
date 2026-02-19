@@ -47,7 +47,7 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/images/:product/:version/:filename",
             get(download_image).put(upload_image).delete(delete_image),
         )
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GB for container images
+        .layer(DefaultBodyLimit::disable()) // No size limit — container images can be very large
 }
 
 // ---------------------------------------------------------------------------
