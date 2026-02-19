@@ -714,13 +714,20 @@ impl LifecycleService {
 
         let excess = usage.total - quota_bytes;
 
-        // Find oldest artifacts to remove to get under quota
+        // Find least-recently-used artifacts to evict first (LRU).
+        // Never-downloaded artifacts are evicted before downloaded ones,
+        // then by least-recent download, then by creation time as tiebreaker.
         let candidates = sqlx::query_as::<_, SizeCandidate>(
             r#"
-            SELECT id, size_bytes
-            FROM artifacts
-            WHERE repository_id = $1 AND is_deleted = false
-            ORDER BY created_at ASC
+            SELECT a.id, a.size_bytes
+            FROM artifacts a
+            LEFT JOIN LATERAL (
+                SELECT MAX(ds.downloaded_at) AS last_downloaded_at
+                FROM download_statistics ds
+                WHERE ds.artifact_id = a.id
+            ) ds ON true
+            WHERE a.repository_id = $1 AND a.is_deleted = false
+            ORDER BY ds.last_downloaded_at ASC NULLS FIRST, a.created_at ASC
             "#,
         )
         .bind(repo_id)
