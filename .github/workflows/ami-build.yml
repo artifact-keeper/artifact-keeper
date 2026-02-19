@@ -25,10 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout IAC repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: artifact-keeper/artifact-keeper-iac
           path: iac
