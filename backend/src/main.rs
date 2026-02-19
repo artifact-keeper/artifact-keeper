@@ -495,6 +495,18 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
 async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<bool> {
     use std::path::Path;
 
+    // Skip admin provisioning when SSO handles admin assignment (issue #211)
+    if std::env::var("SKIP_ADMIN_PROVISIONING")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("true")
+    {
+        tracing::info!(
+            "SKIP_ADMIN_PROVISIONING=true — skipping built-in admin user creation. \
+             Admin access must be granted via SSO group mapping."
+        );
+        return Ok(false);
+    }
+
     let password_file = Path::new(storage_path).join("admin.password");
 
     // Check if an admin user already exists
