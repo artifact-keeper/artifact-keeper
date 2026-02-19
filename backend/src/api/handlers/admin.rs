@@ -627,6 +627,7 @@ pub struct CleanupRequest {
     pub cleanup_audit_logs: Option<bool>,
     pub cleanup_old_backups: Option<bool>,
     pub cleanup_stale_peers: Option<bool>,
+    pub cleanup_stale_uploads: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -634,6 +635,7 @@ pub struct CleanupResponse {
     pub audit_logs_deleted: i64,
     pub backups_deleted: i64,
     pub peers_marked_offline: i64,
+    pub stale_uploads_deleted: i64,
 }
 
 /// Run cleanup tasks
@@ -658,6 +660,7 @@ pub async fn run_cleanup(
         audit_logs_deleted: 0,
         backups_deleted: 0,
         peers_marked_offline: 0,
+        stale_uploads_deleted: 0,
     };
 
     // Get settings for cleanup
@@ -684,6 +687,13 @@ pub async fn run_cleanup(
         result.peers_marked_offline = peer_service
             .mark_stale_offline(settings.edge_stale_threshold_minutes)
             .await? as i64;
+    }
+
+    if request.cleanup_stale_uploads.unwrap_or(false) {
+        use crate::api::handlers::incus::cleanup_stale_sessions;
+        result.stale_uploads_deleted = cleanup_stale_sessions(&state.db, 24)
+            .await
+            .map_err(AppError::Internal)?;
     }
 
     Ok(Json(result))
@@ -989,11 +999,13 @@ mod tests {
             audit_logs_deleted: 100,
             backups_deleted: 2,
             peers_marked_offline: 1,
+            stale_uploads_deleted: 3,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["audit_logs_deleted"], 100);
         assert_eq!(json["backups_deleted"], 2);
         assert_eq!(json["peers_marked_offline"], 1);
+        assert_eq!(json["stale_uploads_deleted"], 3);
     }
 
     // -----------------------------------------------------------------------
