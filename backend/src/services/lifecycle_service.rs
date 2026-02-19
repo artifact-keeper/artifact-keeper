@@ -248,6 +248,7 @@ impl LifecycleService {
             "max_age_days" => self.execute_max_age(&policy, dry_run).await?,
             "max_versions" => self.execute_max_versions(&policy, dry_run).await?,
             "no_downloads_days" => self.execute_no_downloads(&policy, dry_run).await?,
+            "tag_pattern_keep" => self.execute_tag_pattern_keep(&policy, dry_run).await?,
             "tag_pattern_delete" => self.execute_tag_pattern_delete(&policy, dry_run).await?,
             "size_quota_bytes" => self.execute_size_quota(&policy, dry_run).await?,
             _ => {
@@ -531,6 +532,66 @@ impl LifecycleService {
             )
             .bind(repo_filter)
             .bind(days as i32)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            removed = result.rows_affected() as i64;
+        }
+
+        Ok(PolicyExecutionResult {
+            policy_id: policy.id,
+            policy_name: policy.name.clone(),
+            dry_run,
+            artifacts_matched: matched.count,
+            artifacts_removed: if dry_run { 0 } else { removed },
+            bytes_freed: if dry_run { 0 } else { matched.bytes },
+            errors: vec![],
+        })
+    }
+
+    async fn execute_tag_pattern_keep(
+        &self,
+        policy: &LifecyclePolicy,
+        dry_run: bool,
+    ) -> Result<PolicyExecutionResult> {
+        let pattern = policy
+            .config
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::Validation("tag_pattern_keep requires 'pattern' in config".to_string())
+            })?;
+
+        let repo_filter = policy.repository_id;
+
+        // Inverse of tag_pattern_delete: find artifacts that do NOT match the pattern
+        let matched = sqlx::query_as::<_, CountBytes>(
+            r#"
+            SELECT COUNT(*) as count, COALESCE(SUM(a.size_bytes), 0)::BIGINT as bytes
+            FROM artifacts a
+            WHERE a.is_deleted = false
+              AND ($1::UUID IS NULL OR a.repository_id = $1)
+              AND a.name !~ $2
+            "#,
+        )
+        .bind(repo_filter)
+        .bind(pattern)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut removed = 0i64;
+        if !dry_run && matched.count > 0 {
+            let result = sqlx::query(
+                r#"
+                UPDATE artifacts SET is_deleted = true
+                WHERE is_deleted = false
+                  AND ($1::UUID IS NULL OR repository_id = $1)
+                  AND name !~ $2
+                "#,
+            )
+            .bind(repo_filter)
+            .bind(pattern)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
