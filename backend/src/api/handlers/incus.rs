@@ -3,33 +3,43 @@
 //! Implements endpoints for uploading, downloading, and discovering Incus
 //! container and VM images via the SimpleStreams protocol.
 //!
-//! Routes are mounted at `/incus/{repo_key}/...`:
-//!   GET    /incus/{repo_key}/streams/v1/index.json              - SimpleStreams index
-//!   GET    /incus/{repo_key}/streams/v1/images.json             - SimpleStreams product catalog
-//!   GET    /incus/{repo_key}/images/{product}/{version}/{file}  - Download image file
-//!   PUT    /incus/{repo_key}/images/{product}/{version}/{file}  - Upload image file
-//!   DELETE /incus/{repo_key}/images/{product}/{version}/{file}  - Delete image file
+//! Uploads use **streaming I/O** — the request body is written to disk
+//! frame-by-frame, so memory stays flat regardless of image size.
+//! Both monolithic (single PUT) and chunked/resumable uploads are supported.
+//!
+//! Routes mounted at `/incus/{repo_key}/...`:
+//!   GET    /streams/v1/index.json              - SimpleStreams index
+//!   GET    /streams/v1/images.json             - SimpleStreams product catalog
+//!   GET    /images/{product}/{version}/{file}  - Download image file
+//!   PUT    /images/{product}/{version}/{file}  - Monolithic upload (streaming)
+//!   DELETE /images/{product}/{version}/{file}  - Delete image file
+//!   POST   /images/{product}/{version}/{filename}/uploads - Start chunked upload
+//!   PATCH  /uploads/{uuid}                     - Upload chunk
+//!   PUT    /uploads/{uuid}                     - Complete chunked upload
+//!   DELETE /uploads/{uuid}                     - Cancel chunked upload
+//!   GET    /uploads/{uuid}                     - Check upload progress
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, patch, post};
 use axum::Router;
 use base64::Engine;
-use bytes::Bytes;
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
 use crate::formats::incus::IncusHandler;
-use crate::formats::FormatHandler;
-use crate::services::auth_service::AuthService;
 use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::StorageBackend;
 
@@ -42,12 +52,263 @@ pub fn router() -> Router<SharedState> {
         // SimpleStreams discovery endpoints
         .route("/:repo_key/streams/v1/index.json", get(streams_index))
         .route("/:repo_key/streams/v1/images.json", get(streams_images))
-        // Image file operations
+        // Chunked / resumable upload endpoints (more-specific routes first)
+        .route(
+            "/:repo_key/images/:product/:version/:filename/uploads",
+            post(start_chunked_upload),
+        )
+        .route(
+            "/:repo_key/uploads/:uuid",
+            patch(upload_chunk)
+                .put(complete_chunked_upload)
+                .delete(cancel_chunked_upload)
+                .get(get_upload_progress),
+        )
+        // Image file operations (monolithic upload via PUT)
         .route(
             "/:repo_key/images/:product/:version/:filename",
             get(download_image).put(upload_image).delete(delete_image),
         )
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GB for container images
+        .layer(DefaultBodyLimit::disable()) // No size limit — container images can be very large
+}
+
+// ---------------------------------------------------------------------------
+// Streaming helpers — never load full file into memory
+// ---------------------------------------------------------------------------
+
+/// Stream a request body to a new file, computing SHA256 incrementally.
+/// Returns `(total_bytes, sha256_hex)`.
+async fn stream_body_to_file(body: Body, path: &Path) -> Result<(i64, String), Response> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create directory: {}", e),
+            )
+                .into_response()
+        })?;
+    }
+
+    let mut file = tokio::fs::File::create(path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create temp file: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut size: i64 = 0;
+
+    let mut stream = body.into_data_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk: bytes::Bytes = chunk_result.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Error reading request body: {}", e),
+            )
+                .into_response()
+        })?;
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to write to disk: {}", e),
+            )
+                .into_response()
+        })?;
+        size += chunk.len() as i64;
+    }
+
+    file.sync_all().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to sync file: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok((size, format!("{:x}", hasher.finalize())))
+}
+
+/// Append a request body to an existing file. Returns bytes written.
+async fn append_body_to_file(body: Body, path: &Path) -> Result<i64, Response> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open temp file for append: {}", e),
+            )
+                .into_response()
+        })?;
+
+    let mut bytes_written: i64 = 0;
+
+    let mut stream = body.into_data_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk: bytes::Bytes = chunk_result.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Error reading request body: {}", e),
+            )
+                .into_response()
+        })?;
+        file.write_all(&chunk).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to write chunk to disk: {}", e),
+            )
+                .into_response()
+        })?;
+        bytes_written += chunk.len() as i64;
+    }
+
+    file.sync_all().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to sync file: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(bytes_written)
+}
+
+/// Compute SHA256 of a file by streaming through it in 64 KB blocks.
+async fn compute_sha256_from_file(path: &Path) -> Result<String, Response> {
+    use tokio::io::AsyncReadExt;
+
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to open file for checksum: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read file for checksum: {}", e),
+            )
+                .into_response()
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Compute the on-disk path for a storage key (mirrors FilesystemStorage::key_to_path).
+fn storage_path_for_key(storage_base: &str, key: &str) -> PathBuf {
+    let prefix = &key[..2.min(key.len())];
+    PathBuf::from(storage_base).join(prefix).join(key)
+}
+
+/// Temp file path for an upload session.
+fn temp_upload_path(storage_base: &str, session_id: &Uuid) -> PathBuf {
+    let key = format!("incus-uploads/{}", session_id);
+    storage_path_for_key(storage_base, &key)
+}
+
+/// Parameters for creating or updating an artifact record.
+struct UpsertArtifactParams<'a> {
+    db: &'a PgPool,
+    repo_id: Uuid,
+    artifact_path: &'a str,
+    product: &'a str,
+    version: &'a str,
+    size_bytes: i64,
+    checksum: &'a str,
+    storage_key: &'a str,
+    user_id: Uuid,
+    metadata: &'a serde_json::Value,
+}
+
+/// Insert or update the artifact record and store metadata. Shared by
+/// monolithic and chunked upload finalization.
+async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, Response> {
+    let UpsertArtifactParams {
+        db,
+        repo_id,
+        artifact_path,
+        product,
+        version,
+        size_bytes,
+        checksum,
+        storage_key,
+        user_id,
+        metadata,
+    } = p;
+    let content_type = if artifact_path.ends_with(".tar.xz") {
+        "application/x-xz"
+    } else if artifact_path.ends_with(".tar.gz") {
+        "application/gzip"
+    } else {
+        "application/octet-stream"
+    };
+
+    let artifact = sqlx::query(
+        r#"
+        INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
+                               checksum_sha256, content_type, storage_key, uploaded_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (repository_id, path) DO UPDATE SET
+            size_bytes = $5, checksum_sha256 = $6, content_type = $7, storage_key = $8,
+            uploaded_by = $9, updated_at = NOW(), is_deleted = false
+        RETURNING id
+        "#,
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .bind(product)
+    .bind(version)
+    .bind(size_bytes)
+    .bind(checksum)
+    .bind(content_type)
+    .bind(storage_key)
+    .bind(user_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let artifact_id: Uuid = artifact.get("id");
+
+    sqlx::query(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'incus', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to store metadata: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(artifact_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -73,7 +334,7 @@ async fn authenticate(
     db: &PgPool,
     config: &crate::config::Config,
     headers: &HeaderMap,
-) -> Result<uuid::Uuid, Response> {
+) -> Result<Uuid, Response> {
     let (username, password) = extract_basic_credentials(headers).ok_or_else(|| {
         Response::builder()
             .status(StatusCode::UNAUTHORIZED)
@@ -82,7 +343,8 @@ async fn authenticate(
             .unwrap()
     })?;
 
-    let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
+    let auth_service =
+        crate::services::auth_service::AuthService::new(db.clone(), Arc::new(config.clone()));
     let (user, _tokens) = auth_service
         .authenticate(&username, &password)
         .await
@@ -102,7 +364,7 @@ async fn authenticate(
 // ---------------------------------------------------------------------------
 
 struct RepoInfo {
-    id: uuid::Uuid,
+    id: Uuid,
     storage_path: String,
     repo_type: String,
     #[allow(dead_code)]
@@ -148,17 +410,15 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 }
 
 // ---------------------------------------------------------------------------
-// GET /incus/{repo_key}/streams/v1/index.json -- SimpleStreams index
+// GET /streams/v1/index.json -- SimpleStreams index
 // ---------------------------------------------------------------------------
 
 async fn streams_index(
     State(state): State<SharedState>,
-    Path(repo_key): Path<String>,
+    AxumPath(repo_key): AxumPath<String>,
 ) -> Result<Response, Response> {
-    // Verify repo exists and is incus format
     let _repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
-    // Collect product names from artifacts
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT a.name
@@ -188,7 +448,7 @@ async fn streams_index(
             "images": {
                 "datatype": "image-downloads",
                 "format": "products:1.0",
-                "path": format!("streams/v1/images.json"),
+                "path": "streams/v1/images.json",
                 "products": products
             }
         }
@@ -202,16 +462,15 @@ async fn streams_index(
 }
 
 // ---------------------------------------------------------------------------
-// GET /incus/{repo_key}/streams/v1/images.json -- SimpleStreams product catalog
+// GET /streams/v1/images.json -- SimpleStreams product catalog
 // ---------------------------------------------------------------------------
 
 async fn streams_images(
     State(state): State<SharedState>,
-    Path(repo_key): Path<String>,
+    AxumPath(repo_key): AxumPath<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
-    // Query all non-deleted artifacts with metadata
     let rows = sqlx::query(
         r#"
         SELECT a.id, a.name, a.version, a.path, a.size_bytes, a.checksum_sha256,
@@ -235,7 +494,6 @@ async fn streams_images(
             .into_response()
     })?;
 
-    // Group artifacts by product name, then by version
     let mut products: HashMap<String, serde_json::Value> = HashMap::new();
 
     for row in &rows {
@@ -251,7 +509,6 @@ async fn streams_images(
             None => continue,
         };
 
-        // Extract architecture and other info from metadata
         let arch = metadata
             .as_ref()
             .and_then(|m| m.get("image_metadata"))
@@ -271,7 +528,6 @@ async fn streams_images(
             .and_then(|im| im.get("release"))
             .and_then(|v| v.as_str());
 
-        // Determine the ftype from path
         let filename = path.rsplit('/').next().unwrap_or(&path);
         let ftype = if filename.ends_with(".squashfs") {
             "squashfs"
@@ -297,7 +553,6 @@ async fn streams_images(
             "size": size_bytes,
         });
 
-        // Build the product entry
         let product = products.entry(name.clone()).or_insert_with(|| {
             let mut p = serde_json::json!({
                 "arch": arch,
@@ -312,7 +567,6 @@ async fn streams_images(
             p
         });
 
-        // Add item under the version
         let versions = product
             .get_mut("versions")
             .and_then(|v| v.as_object_mut())
@@ -326,7 +580,6 @@ async fn streams_images(
             .get_mut("items")
             .and_then(|i| i.as_object_mut())
         {
-            // Use a key that identifies the file type
             let item_key = if ftype.contains("tar") {
                 "incus.tar.xz".to_string()
             } else {
@@ -349,12 +602,12 @@ async fn streams_images(
 }
 
 // ---------------------------------------------------------------------------
-// GET /incus/{repo_key}/images/{product}/{version}/{filename} -- Download
+// GET /images/{product}/{version}/{filename} -- Download
 // ---------------------------------------------------------------------------
 
 async fn download_image(
     State(state): State<SharedState>,
-    Path((repo_key, product, version, filename)): Path<(String, String, String, String)>,
+    AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
@@ -420,21 +673,20 @@ async fn download_image(
 }
 
 // ---------------------------------------------------------------------------
-// PUT /incus/{repo_key}/images/{product}/{version}/{filename} -- Upload
+// PUT /images/{product}/{version}/{filename} -- Monolithic streaming upload
 // ---------------------------------------------------------------------------
 
 async fn upload_image(
     State(state): State<SharedState>,
-    Path((repo_key, product, version, filename)): Path<(String, String, String, String)>,
+    AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     let user_id = authenticate(&state.db, &state.config, &headers).await?;
     let repo = resolve_incus_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
-    // Validate path through format handler
     let artifact_path = format!("{}/{}/{}", product, version, filename);
     IncusHandler::parse_path(&artifact_path).map_err(|e| {
         (
@@ -444,81 +696,50 @@ async fn upload_image(
             .into_response()
     })?;
 
-    // Compute checksum
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum = format!("{:x}", hasher.finalize());
+    // Stream body to temp file (never buffers entire image in RAM)
+    let temp_id = Uuid::new_v4();
+    let temp_path = temp_upload_path(&repo.storage_path, &temp_id);
+    let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
-    let size_bytes = body.len() as i64;
+    // Extract metadata from the file on disk
+    let metadata = IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path)
+        .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+
+    // Move temp file to final storage location (atomic rename, same filesystem)
     let storage_key = format!("incus/{}/{}", repo.id, artifact_path);
-
-    // Store the file
-    let storage = FilesystemStorage::new(&repo.storage_path);
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Parse metadata from the upload
-    let handler = IncusHandler::new();
-    let metadata = handler
-        .parse_metadata(&artifact_path, &body)
+    let final_path = storage_path_for_key(&repo.storage_path, &storage_key);
+    if let Some(parent) = final_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create directory: {}", e),
+            )
+                .into_response()
+        })?;
+    }
+    tokio::fs::rename(&temp_path, &final_path)
         .await
-        .unwrap_or(serde_json::json!({}));
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to finalize upload: {}", e),
+            )
+                .into_response()
+        })?;
 
-    // Insert artifact record
-    let artifact = sqlx::query(
-        r#"
-        INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, storage_key, uploaded_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (repository_id, path) DO UPDATE SET
-            size_bytes = $5, checksum_sha256 = $6, storage_key = $7,
-            uploaded_by = $8, updated_at = NOW(), is_deleted = false
-        RETURNING id
-        "#,
-    )
-    .bind(repo.id)
-    .bind(&artifact_path)
-    .bind(&product)
-    .bind(&version)
-    .bind(size_bytes)
-    .bind(&checksum)
-    .bind(&storage_key)
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let artifact_id: uuid::Uuid = artifact.get("id");
-
-    // Store metadata
-    sqlx::query(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, metadata)
-        VALUES ($1, $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(&metadata)
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to store metadata: {}", e),
-        )
-            .into_response()
-    })?;
+    let artifact_id = upsert_artifact(UpsertArtifactParams {
+        db: &state.db,
+        repo_id: repo.id,
+        artifact_path: &artifact_path,
+        product: &product,
+        version: &version,
+        size_bytes,
+        checksum: &checksum,
+        storage_key: &storage_key,
+        user_id,
+        metadata: &metadata,
+    })
+    .await?;
 
     tracing::info!(
         "Uploaded Incus image: {}/{}/{} ({}B, sha256:{})",
@@ -547,12 +768,12 @@ async fn upload_image(
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /incus/{repo_key}/images/{product}/{version}/{filename} -- Delete
+// DELETE /images/{product}/{version}/{filename} -- Delete image
 // ---------------------------------------------------------------------------
 
 async fn delete_image(
     State(state): State<SharedState>,
-    Path((repo_key, product, version, filename)): Path<(String, String, String, String)>,
+    AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let _user_id = authenticate(&state.db, &state.config, &headers).await?;
@@ -590,6 +811,400 @@ async fn delete_image(
         .unwrap())
 }
 
+// ===========================================================================
+// Chunked / resumable upload endpoints
+// ===========================================================================
+
+/// Look up an upload session by UUID.
+async fn get_session(db: &PgPool, session_id: Uuid) -> Result<UploadSession, Response> {
+    sqlx::query_as::<_, UploadSession>(
+        r#"
+        SELECT id, repository_id, user_id, artifact_path, product, version,
+               filename, bytes_received, storage_temp_path
+        FROM incus_upload_sessions
+        WHERE id = $1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Upload session not found").into_response())
+}
+
+#[derive(sqlx::FromRow)]
+struct UploadSession {
+    id: Uuid,
+    repository_id: Uuid,
+    user_id: Uuid,
+    artifact_path: String,
+    product: String,
+    version: String,
+    filename: String,
+    bytes_received: i64,
+    storage_temp_path: String,
+}
+
+// ---------------------------------------------------------------------------
+// POST /images/{product}/{version}/{filename}/uploads -- Start chunked upload
+// ---------------------------------------------------------------------------
+
+async fn start_chunked_upload(
+    State(state): State<SharedState>,
+    AxumPath((repo_key, product, version, filename)): AxumPath<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, Response> {
+    let user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
+
+    let artifact_path = format!("{}/{}/{}", product, version, filename);
+    IncusHandler::parse_path(&artifact_path).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid image path: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let session_id = Uuid::new_v4();
+    let temp_path = temp_upload_path(&repo.storage_path, &session_id);
+
+    // Stream initial body (may be empty) to temp file
+    let (initial_bytes, _checksum) = stream_body_to_file(body, &temp_path).await?;
+
+    // Record session
+    sqlx::query(
+        r#"
+        INSERT INTO incus_upload_sessions
+            (id, repository_id, user_id, artifact_path, product, version,
+             filename, bytes_received, storage_temp_path)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(session_id)
+    .bind(repo.id)
+    .bind(user_id)
+    .bind(&artifact_path)
+    .bind(&product)
+    .bind(&version)
+    .bind(&filename)
+    .bind(initial_bytes)
+    .bind(temp_path.to_string_lossy().as_ref())
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    tracing::info!(
+        "Started chunked upload session {} for {}/{}/{} ({} initial bytes)",
+        session_id,
+        product,
+        version,
+        filename,
+        initial_bytes
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(
+            "Location",
+            format!("/incus/{}/uploads/{}", repo_key, session_id),
+        )
+        .header("Upload-UUID", session_id.to_string())
+        .header("Range", format!("0-{}", initial_bytes))
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "session_id": session_id,
+                "bytes_received": initial_bytes,
+            })
+            .to_string(),
+        ))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /uploads/{uuid} -- Upload a chunk
+// ---------------------------------------------------------------------------
+
+async fn upload_chunk(
+    State(state): State<SharedState>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, Response> {
+    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let session = get_session(&state.db, session_id).await?;
+    let temp_path = PathBuf::from(&session.storage_temp_path);
+
+    // Append body to temp file (no read-back of existing data)
+    let bytes_written = append_body_to_file(body, &temp_path).await?;
+    let new_total = session.bytes_received + bytes_written;
+
+    // Update session
+    sqlx::query(
+        "UPDATE incus_upload_sessions SET bytes_received = $2, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(session_id)
+    .bind(new_total)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    tracing::debug!(
+        "Chunk uploaded for session {}: +{} bytes (total: {})",
+        session_id,
+        bytes_written,
+        new_total
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(
+            "Location",
+            format!("/incus/{}/uploads/{}", repo_key, session_id),
+        )
+        .header("Upload-UUID", session_id.to_string())
+        .header("Range", format!("0-{}", new_total))
+        .body(Body::empty())
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// PUT /uploads/{uuid} -- Complete chunked upload
+// ---------------------------------------------------------------------------
+
+async fn complete_chunked_upload(
+    State(state): State<SharedState>,
+    AxumPath((repo_key, session_id)): AxumPath<(String, Uuid)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, Response> {
+    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let session = get_session(&state.db, session_id).await?;
+    let repo = resolve_incus_repo(&state.db, &repo_key).await?;
+    let temp_path = PathBuf::from(&session.storage_temp_path);
+
+    // Append any final body data
+    let final_bytes = append_body_to_file(body, &temp_path).await?;
+    let total_bytes = session.bytes_received + final_bytes;
+
+    // Compute SHA256 by streaming through the file
+    let checksum = compute_sha256_from_file(&temp_path).await?;
+
+    // Verify client-provided checksum if present
+    if let Some(expected) = headers.get("X-Checksum-Sha256") {
+        let expected = expected.to_str().unwrap_or("");
+        if expected != checksum {
+            // Checksum mismatch — clean up
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .execute(&state.db)
+                .await;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Checksum mismatch: expected {}, computed {}",
+                    expected, checksum
+                ),
+            )
+                .into_response());
+        }
+    }
+
+    // Extract metadata from the file on disk
+    let metadata = IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path)
+        .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
+
+    // Move temp file to final storage location
+    let storage_key = format!("incus/{}/{}", session.repository_id, session.artifact_path);
+    let final_path = storage_path_for_key(&repo.storage_path, &storage_key);
+    if let Some(parent) = final_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create directory: {}", e),
+            )
+                .into_response()
+        })?;
+    }
+    tokio::fs::rename(&temp_path, &final_path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to finalize upload: {}", e),
+            )
+                .into_response()
+        })?;
+
+    // Create artifact record
+    let artifact_id = upsert_artifact(UpsertArtifactParams {
+        db: &state.db,
+        repo_id: session.repository_id,
+        artifact_path: &session.artifact_path,
+        product: &session.product,
+        version: &session.version,
+        size_bytes: total_bytes,
+        checksum: &checksum,
+        storage_key: &storage_key,
+        user_id: session.user_id,
+        metadata: &metadata,
+    })
+    .await?;
+
+    // Clean up session
+    let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+        .bind(session_id)
+        .execute(&state.db)
+        .await;
+
+    tracing::info!(
+        "Completed chunked upload {}: {}/{}/{} ({}B, sha256:{})",
+        session_id,
+        session.product,
+        session.version,
+        session.filename,
+        total_bytes,
+        &checksum[..12]
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::CREATED)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "id": artifact_id,
+                "product": session.product,
+                "version": session.version,
+                "file": session.filename,
+                "size": total_bytes,
+                "sha256": checksum,
+            })
+            .to_string(),
+        ))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /uploads/{uuid} -- Cancel chunked upload
+// ---------------------------------------------------------------------------
+
+async fn cancel_chunked_upload(
+    State(state): State<SharedState>,
+    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let session = get_session(&state.db, session_id).await?;
+
+    // Delete temp file
+    let _ = tokio::fs::remove_file(&session.storage_temp_path).await;
+
+    // Delete session
+    sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+        .bind(session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+
+    tracing::info!("Cancelled chunked upload session {}", session_id);
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /uploads/{uuid} -- Check upload progress
+// ---------------------------------------------------------------------------
+
+async fn get_upload_progress(
+    State(state): State<SharedState>,
+    AxumPath((_repo_key, session_id)): AxumPath<(String, Uuid)>,
+) -> Result<Response, Response> {
+    let session = get_session(&state.db, session_id).await?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header("Range", format!("0-{}", session.bytes_received))
+        .body(Body::from(
+            serde_json::json!({
+                "session_id": session.id,
+                "artifact_path": session.artifact_path,
+                "bytes_received": session.bytes_received,
+            })
+            .to_string(),
+        ))
+        .unwrap())
+}
+
+// ===========================================================================
+// Stale upload cleanup
+// ===========================================================================
+
+/// Delete upload sessions that haven't been updated in `max_age_hours`.
+/// Returns the number of sessions cleaned up.
+pub async fn cleanup_stale_sessions(db: &PgPool, max_age_hours: i64) -> Result<i64, String> {
+    let stale = sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+        SELECT id, storage_temp_path
+        FROM incus_upload_sessions
+        WHERE updated_at < NOW() - make_interval(hours => $1::int)
+        "#,
+    )
+    .bind(max_age_hours as i32)
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("Failed to query stale sessions: {}", e))?;
+
+    let count = stale.len() as i64;
+
+    for (id, temp_path) in &stale {
+        let _ = tokio::fs::remove_file(temp_path).await;
+        let _ = sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1")
+            .bind(id)
+            .execute(db)
+            .await;
+        tracing::info!("Cleaned up stale upload session {}", id);
+    }
+
+    Ok(count)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +1228,21 @@ mod tests {
     fn test_extract_basic_credentials_missing() {
         let headers = HeaderMap::new();
         assert!(extract_basic_credentials(&headers).is_none());
+    }
+
+    #[test]
+    fn test_storage_path_for_key() {
+        let path = storage_path_for_key("/data", "incus/abc/file.tar.xz");
+        assert_eq!(path, PathBuf::from("/data/in/incus/abc/file.tar.xz"));
+    }
+
+    #[test]
+    fn test_temp_upload_path() {
+        let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let path = temp_upload_path("/data", &id);
+        assert_eq!(
+            path,
+            PathBuf::from("/data/in/incus-uploads/550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 }

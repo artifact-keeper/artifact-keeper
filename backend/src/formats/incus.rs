@@ -78,28 +78,70 @@ impl IncusHandler {
         }
     }
 
-    /// Try to extract metadata.yaml from a tar.xz archive.
+    /// Try to extract metadata.yaml from a tar.xz archive (in-memory buffer).
     pub fn extract_metadata(content: &[u8]) -> Option<IncusImageMetadata> {
+        Self::extract_metadata_from_reader(std::io::Cursor::new(content))
+    }
+
+    /// Try to extract metadata.yaml from a tar.xz archive on disk.
+    /// Streams through the file without loading it entirely into memory.
+    pub fn extract_metadata_from_file(path: &std::path::Path) -> Option<IncusImageMetadata> {
+        let file = std::fs::File::open(path).ok()?;
+        Self::extract_metadata_from_reader(std::io::BufReader::new(file))
+    }
+
+    /// Build metadata JSON from a file on disk (for streaming uploads).
+    /// Streams through the file instead of loading it into memory.
+    pub fn parse_metadata_from_file(
+        path_str: &str,
+        file_path: &std::path::Path,
+    ) -> Result<serde_json::Value> {
+        let info = Self::parse_path(path_str)?;
+
+        let mut metadata = serde_json::json!({
+            "file_type": info.file_type.as_str(),
+        });
+
+        if let Some(product) = &info.product {
+            metadata["product"] = serde_json::Value::String(product.clone());
+        }
+        if let Some(version) = &info.version {
+            metadata["version"] = serde_json::Value::String(version.clone());
+        }
+
+        if info.file_type.is_tarball() {
+            if let Some(image_meta) = Self::extract_metadata_from_file(file_path) {
+                metadata["image_metadata"] =
+                    serde_json::to_value(&image_meta).unwrap_or(serde_json::Value::Null);
+            }
+        }
+
+        Ok(metadata)
+    }
+
+    /// Extract metadata.yaml from a compressed tarball via a generic reader.
+    fn extract_metadata_from_reader<R: std::io::Read>(mut reader: R) -> Option<IncusImageMetadata> {
         use flate2::read::GzDecoder;
         use std::io::Read;
 
-        // Try xz first, then gzip
-        let reader: Box<dyn Read> = if content.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A]) {
-            // XZ magic bytes
-            let mut probe = [0u8; 1];
-            let mut decoder = xz2::read::XzDecoder::new(content);
-            match decoder.read(&mut probe) {
-                Ok(1) => {
-                    // Valid xz stream; create a fresh decoder for the full content
-                    Box::new(xz2::read::XzDecoder::new(content))
-                }
-                _ => return None,
-            }
+        // Read the first 6 bytes to detect compression format
+        let mut magic = [0u8; 6];
+        let n = reader.read(&mut magic).ok()?;
+        if n < 5 {
+            return None;
+        }
+
+        // Chain the magic bytes back with the rest of the reader
+        let full_reader = std::io::Cursor::new(magic[..n].to_vec()).chain(reader);
+
+        // Try xz first (magic: FD 37 7A 58 5A), then gzip
+        let decompressor: Box<dyn Read> = if magic.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A]) {
+            Box::new(xz2::read::XzDecoder::new(full_reader))
         } else {
-            Box::new(GzDecoder::new(content))
+            Box::new(GzDecoder::new(full_reader))
         };
 
-        let mut archive = tar::Archive::new(reader);
+        let mut archive = tar::Archive::new(decompressor);
         let entries = archive.entries().ok()?;
 
         for entry in entries {
