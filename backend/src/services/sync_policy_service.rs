@@ -3574,4 +3574,1041 @@ mod tests {
         assert_eq!(req.artifact_filter.match_tags["stable"], "true");
         assert_eq!(req.precedence, 25);
     }
+
+    // -----------------------------------------------------------------------
+    // SyncPolicy deserialization from raw JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_policy_deserialization_from_json() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "deser-policy",
+            "description": "testing deser",
+            "enabled": false,
+            "repo_selector": {"match_formats": ["npm"]},
+            "peer_selector": {"all": true},
+            "replication_mode": "pull",
+            "priority": 3,
+            "artifact_filter": {"max_size_bytes": 2048},
+            "precedence": 10,
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-06-15T12:30:00Z"
+        }"#;
+        let policy: SyncPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(policy.name, "deser-policy");
+        assert_eq!(policy.description, "testing deser");
+        assert!(!policy.enabled);
+        assert_eq!(policy.replication_mode, "pull");
+        assert_eq!(policy.priority, 3);
+        assert_eq!(policy.precedence, 10);
+        assert_eq!(policy.repo_selector["match_formats"][0], "npm");
+        assert_eq!(policy.peer_selector["all"], true);
+        assert_eq!(policy.artifact_filter["max_size_bytes"], 2048);
+    }
+
+    #[test]
+    fn test_sync_policy_deserialization_empty_nested_objects() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "name": "empty-nested",
+            "description": "",
+            "enabled": true,
+            "repo_selector": {},
+            "peer_selector": {},
+            "replication_mode": "push",
+            "priority": 0,
+            "artifact_filter": {},
+            "precedence": 100,
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let policy: SyncPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(policy.name, "empty-nested");
+        assert!(policy.enabled);
+        assert_eq!(policy.id, Uuid::nil());
+    }
+
+    // -----------------------------------------------------------------------
+    // MatchedRepo deserialization and roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matched_repo_roundtrip() {
+        let id = Uuid::new_v4();
+        let r = MatchedRepo {
+            id,
+            key: "maven-release".to_string(),
+            format: "maven".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let roundtrip: MatchedRepo = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.id, id);
+        assert_eq!(roundtrip.key, "maven-release");
+        assert_eq!(roundtrip.format, "maven");
+    }
+
+    #[test]
+    fn test_matched_repo_deserialization_from_json() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "key": "docker-staging",
+            "format": "docker"
+        }"#;
+        let r: MatchedRepo = serde_json::from_str(json).unwrap();
+        assert_eq!(r.key, "docker-staging");
+        assert_eq!(r.format, "docker");
+    }
+
+    // -----------------------------------------------------------------------
+    // MatchedPeer deserialization with null region
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matched_peer_deserialization_null_region() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "no-region-peer",
+            "region": null
+        }"#;
+        let p: MatchedPeer = serde_json::from_str(json).unwrap();
+        assert_eq!(p.name, "no-region-peer");
+        assert!(p.region.is_none());
+    }
+
+    #[test]
+    fn test_matched_peer_json_field_count() {
+        let p = MatchedPeer {
+            id: Uuid::nil(),
+            name: "test".to_string(),
+            region: Some("us".to_string()),
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "MatchedPeer should have exactly 3 fields");
+    }
+
+    // -----------------------------------------------------------------------
+    // EvaluationResult deserialization from raw JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_evaluation_result_deserialization_from_json() {
+        let json = r#"{
+            "created": 12,
+            "updated": 8,
+            "removed": 3,
+            "policies_evaluated": 5,
+            "retroactive_tasks_queued": 42
+        }"#;
+        let r: EvaluationResult = serde_json::from_str(json).unwrap();
+        assert_eq!(r.created, 12);
+        assert_eq!(r.updated, 8);
+        assert_eq!(r.removed, 3);
+        assert_eq!(r.policies_evaluated, 5);
+        assert_eq!(r.retroactive_tasks_queued, 42);
+    }
+
+    #[test]
+    fn test_evaluation_result_field_count() {
+        let r = EvaluationResult {
+            created: 0,
+            updated: 0,
+            removed: 0,
+            policies_evaluated: 0,
+            retroactive_tasks_queued: 0,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            5,
+            "EvaluationResult should have exactly 5 fields"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PreviewResult deserialization with nested data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_preview_result_deserialization_from_json() {
+        let json = r#"{
+            "matched_repositories": [
+                {"id": "550e8400-e29b-41d4-a716-446655440000", "key": "npm-prod", "format": "npm"}
+            ],
+            "matched_peers": [
+                {"id": "550e8400-e29b-41d4-a716-446655440001", "name": "peer-1", "region": "eu-west-1"}
+            ],
+            "subscription_count": 1
+        }"#;
+        let p: PreviewResult = serde_json::from_str(json).unwrap();
+        assert_eq!(p.matched_repositories.len(), 1);
+        assert_eq!(p.matched_repositories[0].key, "npm-prod");
+        assert_eq!(p.matched_peers.len(), 1);
+        assert_eq!(p.matched_peers[0].name, "peer-1");
+        assert_eq!(p.matched_peers[0].region, Some("eu-west-1".to_string()));
+        assert_eq!(p.subscription_count, 1);
+    }
+
+    #[test]
+    fn test_preview_result_empty_collections() {
+        let p = PreviewResult {
+            matched_repositories: vec![],
+            matched_peers: vec![],
+            subscription_count: 0,
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert!(json["matched_repositories"].as_array().unwrap().is_empty());
+        assert!(json["matched_peers"].as_array().unwrap().is_empty());
+        assert_eq!(json["subscription_count"], 0);
+    }
+
+    #[test]
+    fn test_preview_result_field_count() {
+        let p = PreviewResult {
+            matched_repositories: vec![],
+            matched_peers: vec![],
+            subscription_count: 0,
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "PreviewResult should have exactly 3 fields");
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateSyncPolicyRequest serialization (reverse direction)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_request_serialization() {
+        let req = CreateSyncPolicyRequest {
+            name: "ser-test".to_string(),
+            description: "serialization test".to_string(),
+            enabled: false,
+            repo_selector: RepoSelector {
+                match_formats: vec!["docker".to_string()],
+                ..Default::default()
+            },
+            peer_selector: PeerSelector {
+                all: true,
+                ..Default::default()
+            },
+            replication_mode: "mirror".to_string(),
+            priority: 5,
+            artifact_filter: ArtifactFilter {
+                max_age_days: Some(14),
+                ..Default::default()
+            },
+            precedence: 25,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["name"], "ser-test");
+        assert_eq!(json["description"], "serialization test");
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["replication_mode"], "mirror");
+        assert_eq!(json["priority"], 5);
+        assert_eq!(json["precedence"], 25);
+        assert_eq!(json["repo_selector"]["match_formats"][0], "docker");
+        assert_eq!(json["peer_selector"]["all"], true);
+        assert_eq!(json["artifact_filter"]["max_age_days"], 14);
+    }
+
+    #[test]
+    fn test_create_request_field_count() {
+        let json = r#"{"name": "test"}"#;
+        let req: CreateSyncPolicyRequest = serde_json::from_str(json).unwrap();
+        let json_val = serde_json::to_value(&req).unwrap();
+        let obj = json_val.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            9,
+            "CreateSyncPolicyRequest should have exactly 9 fields, got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UpdateSyncPolicyRequest serialization and roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_request_serialization_all_none() {
+        let req = UpdateSyncPolicyRequest {
+            name: None,
+            description: None,
+            enabled: None,
+            repo_selector: None,
+            peer_selector: None,
+            replication_mode: None,
+            priority: None,
+            artifact_filter: None,
+            precedence: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json["name"].is_null());
+        assert!(json["description"].is_null());
+        assert!(json["enabled"].is_null());
+        assert!(json["repo_selector"].is_null());
+        assert!(json["peer_selector"].is_null());
+        assert!(json["replication_mode"].is_null());
+        assert!(json["priority"].is_null());
+        assert!(json["artifact_filter"].is_null());
+        assert!(json["precedence"].is_null());
+    }
+
+    #[test]
+    fn test_update_request_serialization_all_some() {
+        let req = UpdateSyncPolicyRequest {
+            name: Some("updated".to_string()),
+            description: Some("new desc".to_string()),
+            enabled: Some(true),
+            repo_selector: Some(RepoSelector::default()),
+            peer_selector: Some(PeerSelector::default()),
+            replication_mode: Some("pull".to_string()),
+            priority: Some(10),
+            artifact_filter: Some(ArtifactFilter::default()),
+            precedence: Some(50),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["name"], "updated");
+        assert_eq!(json["description"], "new desc");
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["replication_mode"], "pull");
+        assert_eq!(json["priority"], 10);
+        assert_eq!(json["precedence"], 50);
+    }
+
+    #[test]
+    fn test_update_request_roundtrip() {
+        let req = UpdateSyncPolicyRequest {
+            name: Some("rtrip".to_string()),
+            description: None,
+            enabled: Some(false),
+            repo_selector: None,
+            peer_selector: Some(PeerSelector {
+                all: true,
+                ..Default::default()
+            }),
+            replication_mode: Some("mirror".to_string()),
+            priority: None,
+            artifact_filter: None,
+            precedence: Some(1),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let roundtrip: UpdateSyncPolicyRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.name, Some("rtrip".to_string()));
+        assert!(roundtrip.description.is_none());
+        assert_eq!(roundtrip.enabled, Some(false));
+        assert!(roundtrip.repo_selector.is_none());
+        assert!(roundtrip.peer_selector.is_some());
+        assert!(roundtrip.peer_selector.unwrap().all);
+        assert_eq!(roundtrip.replication_mode, Some("mirror".to_string()));
+        assert!(roundtrip.priority.is_none());
+        assert!(roundtrip.artifact_filter.is_none());
+        assert_eq!(roundtrip.precedence, Some(1));
+    }
+
+    #[test]
+    fn test_update_request_field_count() {
+        let req = UpdateSyncPolicyRequest {
+            name: None,
+            description: None,
+            enabled: None,
+            repo_selector: None,
+            peer_selector: None,
+            replication_mode: None,
+            priority: None,
+            artifact_filter: None,
+            precedence: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            9,
+            "UpdateSyncPolicyRequest should have exactly 9 fields"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TogglePolicyRequest serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_toggle_request_serialization_true() {
+        let req = TogglePolicyRequest { enabled: true };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["enabled"], true);
+        let obj = json.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            1,
+            "TogglePolicyRequest should have exactly 1 field"
+        );
+    }
+
+    #[test]
+    fn test_toggle_request_serialization_false() {
+        let req = TogglePolicyRequest { enabled: false };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["enabled"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter::matches - additional path interaction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_include_paths_with_percent_literal() {
+        // Ensure the glob-to-sql conversion works: * becomes %
+        let f = ArtifactFilter {
+            include_paths: vec!["com/example/*".to_string()],
+            ..Default::default()
+        };
+        assert!(f.matches("com/example/lib-1.0.jar", 100, chrono::Utc::now()));
+        assert!(f.matches("com/example/", 100, chrono::Utc::now()));
+        assert!(!f.matches("org/example/lib.jar", 100, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn test_filter_exclude_paths_with_multiple_patterns() {
+        let f = ArtifactFilter {
+            exclude_paths: vec![
+                "*.snapshot".to_string(),
+                "*.tmp".to_string(),
+                "test/*".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(!f.matches("build.snapshot", 100, chrono::Utc::now()));
+        assert!(!f.matches("cache.tmp", 100, chrono::Utc::now()));
+        assert!(!f.matches("test/unit.jar", 100, chrono::Utc::now()));
+        assert!(f.matches("release/build.jar", 100, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn test_filter_include_and_exclude_same_pattern() {
+        // If the same pattern appears in both include and exclude, exclude wins
+        let f = ArtifactFilter {
+            include_paths: vec!["release/*".to_string()],
+            exclude_paths: vec!["release/*".to_string()],
+            ..Default::default()
+        };
+        assert!(!f.matches("release/v1.jar", 100, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn test_filter_no_include_no_exclude_passes_any_path() {
+        let f = ArtifactFilter {
+            max_age_days: None,
+            max_size_bytes: None,
+            include_paths: vec![],
+            exclude_paths: vec![],
+            match_tags: HashMap::new(),
+        };
+        assert!(f.matches("deeply/nested/path/file.bin", 0, chrono::Utc::now()));
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter::matches_with_tags - tags with base filter failing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matches_with_tags_path_filter_rejects_before_tags() {
+        let f = ArtifactFilter {
+            include_paths: vec!["release/*".to_string()],
+            match_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
+            ..Default::default()
+        };
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        // Tags match but path does not
+        assert!(!f.matches_with_tags("snapshot/v1.jar", 100, chrono::Utc::now(), &tags));
+    }
+
+    #[test]
+    fn test_matches_with_tags_age_filter_rejects_before_tags() {
+        let f = ArtifactFilter {
+            max_age_days: Some(1),
+            match_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
+            ..Default::default()
+        };
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        let old = chrono::Utc::now() - chrono::Duration::days(30);
+        assert!(!f.matches_with_tags("a.jar", 100, old, &tags));
+    }
+
+    #[test]
+    fn test_matches_with_tags_exclude_rejects_before_tags() {
+        let f = ArtifactFilter {
+            exclude_paths: vec!["*.log".to_string()],
+            match_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
+            ..Default::default()
+        };
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        assert!(!f.matches_with_tags("debug.log", 100, chrono::Utc::now(), &tags));
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncPolicyRow conversion with extreme values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_policy_row_with_negative_priority() {
+        let now = Utc::now();
+        let row = SyncPolicyRow {
+            id: Uuid::new_v4(),
+            name: "negative-priority".to_string(),
+            description: String::new(),
+            enabled: true,
+            repo_selector: serde_json::json!({}),
+            peer_selector: serde_json::json!({}),
+            replication_mode: "push".to_string(),
+            priority: -10,
+            artifact_filter: serde_json::json!({}),
+            precedence: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let policy: SyncPolicy = row.into();
+        assert_eq!(policy.priority, -10);
+        assert_eq!(policy.precedence, 0);
+    }
+
+    #[test]
+    fn test_sync_policy_row_with_max_precedence() {
+        let now = Utc::now();
+        let row = SyncPolicyRow {
+            id: Uuid::nil(),
+            name: "max-prec".to_string(),
+            description: String::new(),
+            enabled: false,
+            repo_selector: serde_json::json!(null),
+            peer_selector: serde_json::json!([]),
+            replication_mode: "mirror".to_string(),
+            priority: i32::MAX,
+            artifact_filter: serde_json::json!({"key": "value"}),
+            precedence: i32::MAX,
+            created_at: now,
+            updated_at: now,
+        };
+        let policy: SyncPolicy = row.into();
+        assert_eq!(policy.priority, i32::MAX);
+        assert_eq!(policy.precedence, i32::MAX);
+        assert!(!policy.enabled);
+    }
+
+    #[test]
+    fn test_sync_policy_row_with_complex_json_values() {
+        let now = Utc::now();
+        let row = SyncPolicyRow {
+            id: Uuid::new_v4(),
+            name: "complex-json".to_string(),
+            description: "has deeply nested JSON".to_string(),
+            enabled: true,
+            repo_selector: serde_json::json!({
+                "match_labels": {"env": "prod", "tier": "1"},
+                "match_formats": ["docker", "maven", "npm"],
+                "match_pattern": "libs-*"
+            }),
+            peer_selector: serde_json::json!({
+                "all": false,
+                "match_region": "us-east-1",
+                "match_labels": {"dc": "east"}
+            }),
+            replication_mode: "pull".to_string(),
+            priority: 42,
+            artifact_filter: serde_json::json!({
+                "max_age_days": 30,
+                "include_paths": ["release/*"],
+                "exclude_paths": ["*.tmp"],
+                "max_size_bytes": 10485760,
+                "match_tags": {"stable": "true"}
+            }),
+            precedence: 10,
+            created_at: now,
+            updated_at: now,
+        };
+        let policy: SyncPolicy = row.into();
+        assert_eq!(policy.repo_selector["match_labels"]["env"], "prod");
+        assert_eq!(
+            policy.repo_selector["match_formats"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(policy.peer_selector["match_region"], "us-east-1");
+        assert_eq!(policy.artifact_filter["max_age_days"], 30);
+        assert_eq!(policy.artifact_filter["match_tags"]["stable"], "true");
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter with match_tags roundtrip (all fields populated)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_filter_all_fields_roundtrip() {
+        let f = ArtifactFilter {
+            max_age_days: Some(90),
+            include_paths: vec!["release/*".to_string(), "stable/*".to_string()],
+            exclude_paths: vec!["*.tmp".to_string()],
+            max_size_bytes: Some(104_857_600),
+            match_tags: HashMap::from([
+                ("env".to_string(), "prod".to_string()),
+                ("team".to_string(), String::new()),
+            ]),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let roundtrip: ArtifactFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.max_age_days, Some(90));
+        assert_eq!(roundtrip.include_paths.len(), 2);
+        assert_eq!(roundtrip.exclude_paths, vec!["*.tmp"]);
+        assert_eq!(roundtrip.max_size_bytes, Some(104_857_600));
+        assert_eq!(roundtrip.match_tags.len(), 2);
+        assert_eq!(roundtrip.match_tags["env"], "prod");
+        assert_eq!(roundtrip.match_tags["team"], "");
+    }
+
+    // -----------------------------------------------------------------------
+    // PeerSelector with all=true and empty collections
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_selector_all_true_with_empty_labels() {
+        let sel = PeerSelector {
+            all: true,
+            match_labels: HashMap::new(),
+            match_region: None,
+            match_peers: vec![],
+        };
+        let json = serde_json::to_value(&sel).unwrap();
+        assert_eq!(json["all"], true);
+        assert!(json["match_labels"].as_object().unwrap().is_empty());
+        assert!(json["match_region"].is_null());
+        assert!(json["match_peers"].as_array().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateSyncPolicyRequest deserialization with only optional defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_request_explicit_defaults_match_implicit() {
+        let minimal = r#"{"name": "test"}"#;
+        let explicit = r#"{
+            "name": "test",
+            "description": "",
+            "enabled": true,
+            "repo_selector": {},
+            "peer_selector": {},
+            "replication_mode": "push",
+            "priority": 0,
+            "artifact_filter": {},
+            "precedence": 100
+        }"#;
+        let req_min: CreateSyncPolicyRequest = serde_json::from_str(minimal).unwrap();
+        let req_exp: CreateSyncPolicyRequest = serde_json::from_str(explicit).unwrap();
+        assert_eq!(req_min.name, req_exp.name);
+        assert_eq!(req_min.description, req_exp.description);
+        assert_eq!(req_min.enabled, req_exp.enabled);
+        assert_eq!(req_min.replication_mode, req_exp.replication_mode);
+        assert_eq!(req_min.priority, req_exp.priority);
+        assert_eq!(req_min.precedence, req_exp.precedence);
+    }
+
+    // -----------------------------------------------------------------------
+    // MatchedRepo JSON field names
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matched_repo_json_field_names() {
+        let r = MatchedRepo {
+            id: Uuid::nil(),
+            key: "test".to_string(),
+            format: "docker".to_string(),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "MatchedRepo should have exactly 3 fields");
+        assert!(json.get("id").is_some());
+        assert!(json.get("key").is_some());
+        assert!(json.get("format").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncPolicy Clone and Debug traits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_policy_clone() {
+        let policy = SyncPolicy {
+            id: Uuid::new_v4(),
+            name: "clone-test".to_string(),
+            description: "cloning".to_string(),
+            enabled: true,
+            repo_selector: serde_json::json!({}),
+            peer_selector: serde_json::json!({}),
+            replication_mode: "push".to_string(),
+            priority: 0,
+            artifact_filter: serde_json::json!({}),
+            precedence: 100,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let cloned = policy.clone();
+        assert_eq!(cloned.id, policy.id);
+        assert_eq!(cloned.name, policy.name);
+        assert_eq!(cloned.enabled, policy.enabled);
+    }
+
+    #[test]
+    fn test_sync_policy_debug() {
+        let policy = SyncPolicy {
+            id: Uuid::nil(),
+            name: "debug-test".to_string(),
+            description: String::new(),
+            enabled: true,
+            repo_selector: serde_json::json!({}),
+            peer_selector: serde_json::json!({}),
+            replication_mode: "push".to_string(),
+            priority: 0,
+            artifact_filter: serde_json::json!({}),
+            precedence: 100,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let debug_str = format!("{:?}", policy);
+        assert!(debug_str.contains("debug-test"));
+        assert!(debug_str.contains("SyncPolicy"));
+    }
+
+    #[test]
+    fn test_peer_selector_clone() {
+        let sel = PeerSelector {
+            all: true,
+            match_labels: HashMap::from([("dc".to_string(), "east".to_string())]),
+            match_region: Some("us-east-1".to_string()),
+            match_peers: vec![Uuid::new_v4()],
+        };
+        let cloned = sel.clone();
+        assert_eq!(cloned.all, sel.all);
+        assert_eq!(cloned.match_labels, sel.match_labels);
+        assert_eq!(cloned.match_region, sel.match_region);
+        assert_eq!(cloned.match_peers, sel.match_peers);
+    }
+
+    #[test]
+    fn test_artifact_filter_clone() {
+        let f = ArtifactFilter {
+            max_age_days: Some(30),
+            include_paths: vec!["release/*".to_string()],
+            exclude_paths: vec!["*.tmp".to_string()],
+            max_size_bytes: Some(1_000_000),
+            match_tags: HashMap::from([("env".to_string(), "prod".to_string())]),
+        };
+        let cloned = f.clone();
+        assert_eq!(cloned.max_age_days, f.max_age_days);
+        assert_eq!(cloned.include_paths, f.include_paths);
+        assert_eq!(cloned.exclude_paths, f.exclude_paths);
+        assert_eq!(cloned.max_size_bytes, f.max_size_bytes);
+        assert_eq!(cloned.match_tags, f.match_tags);
+    }
+
+    #[test]
+    fn test_evaluation_result_clone() {
+        let r = EvaluationResult {
+            created: 1,
+            updated: 2,
+            removed: 3,
+            policies_evaluated: 4,
+            retroactive_tasks_queued: 5,
+        };
+        let cloned = r.clone();
+        assert_eq!(cloned.created, 1);
+        assert_eq!(cloned.updated, 2);
+        assert_eq!(cloned.removed, 3);
+        assert_eq!(cloned.policies_evaluated, 4);
+        assert_eq!(cloned.retroactive_tasks_queued, 5);
+    }
+
+    #[test]
+    fn test_preview_result_clone() {
+        let p = PreviewResult {
+            matched_repositories: vec![MatchedRepo {
+                id: Uuid::nil(),
+                key: "test".to_string(),
+                format: "docker".to_string(),
+            }],
+            matched_peers: vec![MatchedPeer {
+                id: Uuid::nil(),
+                name: "peer".to_string(),
+                region: None,
+            }],
+            subscription_count: 1,
+        };
+        let cloned = p.clone();
+        assert_eq!(cloned.matched_repositories.len(), 1);
+        assert_eq!(cloned.matched_peers.len(), 1);
+        assert_eq!(cloned.subscription_count, 1);
+    }
+
+    #[test]
+    fn test_matched_peer_clone() {
+        let p = MatchedPeer {
+            id: Uuid::new_v4(),
+            name: "clone-peer".to_string(),
+            region: Some("ap-southeast-1".to_string()),
+        };
+        let cloned = p.clone();
+        assert_eq!(cloned.id, p.id);
+        assert_eq!(cloned.name, p.name);
+        assert_eq!(cloned.region, p.region);
+    }
+
+    #[test]
+    fn test_toggle_request_clone() {
+        let req = TogglePolicyRequest { enabled: true };
+        let cloned = req.clone();
+        assert!(cloned.enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug trait verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_selector_debug() {
+        let sel = PeerSelector::default();
+        let debug_str = format!("{:?}", sel);
+        assert!(debug_str.contains("PeerSelector"));
+    }
+
+    #[test]
+    fn test_artifact_filter_debug() {
+        let f = ArtifactFilter::default();
+        let debug_str = format!("{:?}", f);
+        assert!(debug_str.contains("ArtifactFilter"));
+    }
+
+    #[test]
+    fn test_evaluation_result_debug() {
+        let r = EvaluationResult {
+            created: 1,
+            updated: 2,
+            removed: 3,
+            policies_evaluated: 4,
+            retroactive_tasks_queued: 5,
+        };
+        let debug_str = format!("{:?}", r);
+        assert!(debug_str.contains("EvaluationResult"));
+    }
+
+    #[test]
+    fn test_matched_peer_debug() {
+        let p = MatchedPeer {
+            id: Uuid::nil(),
+            name: "test".to_string(),
+            region: None,
+        };
+        let debug_str = format!("{:?}", p);
+        assert!(debug_str.contains("MatchedPeer"));
+    }
+
+    #[test]
+    fn test_toggle_request_debug() {
+        let req = TogglePolicyRequest { enabled: true };
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("TogglePolicyRequest"));
+    }
+
+    #[test]
+    fn test_create_request_debug() {
+        let json = r#"{"name": "test"}"#;
+        let req: CreateSyncPolicyRequest = serde_json::from_str(json).unwrap();
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("CreateSyncPolicyRequest"));
+    }
+
+    #[test]
+    fn test_update_request_debug() {
+        let req = UpdateSyncPolicyRequest {
+            name: None,
+            description: None,
+            enabled: None,
+            repo_selector: None,
+            peer_selector: None,
+            replication_mode: None,
+            priority: None,
+            artifact_filter: None,
+            precedence: None,
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("UpdateSyncPolicyRequest"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter::matches_with_tags - empty tags map passes all
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matches_with_tags_empty_required_tags_passes_any_artifact_tags() {
+        let f = ArtifactFilter {
+            match_tags: HashMap::new(),
+            include_paths: vec!["release/*".to_string()],
+            ..Default::default()
+        };
+        let tags = vec![
+            ("env".to_string(), "prod".to_string()),
+            ("team".to_string(), "backend".to_string()),
+        ];
+        assert!(f.matches_with_tags("release/v1.jar", 100, chrono::Utc::now(), &tags));
+    }
+
+    #[test]
+    fn test_matches_with_tags_empty_required_and_empty_artifact_tags() {
+        let f = ArtifactFilter {
+            match_tags: HashMap::new(),
+            ..Default::default()
+        };
+        assert!(f.matches_with_tags("a.jar", 100, chrono::Utc::now(), &[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncPolicy with various replication modes in serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_policy_disabled_serialization() {
+        let policy = SyncPolicy {
+            id: Uuid::nil(),
+            name: "disabled".to_string(),
+            description: String::new(),
+            enabled: false,
+            repo_selector: serde_json::json!({}),
+            peer_selector: serde_json::json!({}),
+            replication_mode: "push".to_string(),
+            priority: 0,
+            artifact_filter: serde_json::json!({}),
+            precedence: 100,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["replication_mode"], "push");
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateSyncPolicyRequest with replication mode values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_request_replication_modes() {
+        for mode in ["push", "pull", "mirror"] {
+            let json = format!(r#"{{"name": "test", "replication_mode": "{}"}}"#, mode);
+            let req: CreateSyncPolicyRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(req.replication_mode, mode);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PeerSelector deserialization with only match_peers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_selector_only_match_peers() {
+        let id = Uuid::new_v4();
+        let json = format!(r#"{{"match_peers": ["{}"]}}"#, id);
+        let sel: PeerSelector = serde_json::from_str(&json).unwrap();
+        assert!(!sel.all);
+        assert!(sel.match_labels.is_empty());
+        assert!(sel.match_region.is_none());
+        assert_eq!(sel.match_peers.len(), 1);
+        assert_eq!(sel.match_peers[0], id);
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter::matches with zero-byte artifacts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_zero_size_artifact() {
+        let f = ArtifactFilter {
+            max_size_bytes: Some(0),
+            ..Default::default()
+        };
+        assert!(f.matches("empty.bin", 0, chrono::Utc::now()));
+    }
+
+    #[test]
+    fn test_filter_large_size_artifact() {
+        let f = ArtifactFilter {
+            max_size_bytes: Some(i64::MAX),
+            ..Default::default()
+        };
+        assert!(f.matches("huge.bin", i64::MAX, chrono::Utc::now()));
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter::matches future created_at
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_future_created_at_with_max_age() {
+        let f = ArtifactFilter {
+            max_age_days: Some(7),
+            ..Default::default()
+        };
+        // An artifact with a future timestamp has negative age, should pass
+        let future = chrono::Utc::now() + chrono::Duration::days(1);
+        assert!(f.matches("a.jar", 100, future));
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateSyncPolicyRequest with empty name (valid for deserialization)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_request_empty_name_deserializes() {
+        // Deserialization succeeds; validation is done at the service layer
+        let json = r#"{"name": ""}"#;
+        let req: CreateSyncPolicyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "");
+    }
+
+    #[test]
+    fn test_create_request_whitespace_name_deserializes() {
+        let json = r#"{"name": "   "}"#;
+        let req: CreateSyncPolicyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "   ");
+    }
+
+    // -----------------------------------------------------------------------
+    // MatchedRepo Clone and Debug
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matched_repo_clone() {
+        let r = MatchedRepo {
+            id: Uuid::new_v4(),
+            key: "clone-repo".to_string(),
+            format: "helm".to_string(),
+        };
+        let cloned = r.clone();
+        assert_eq!(cloned.id, r.id);
+        assert_eq!(cloned.key, r.key);
+        assert_eq!(cloned.format, r.format);
+    }
+
+    #[test]
+    fn test_matched_repo_debug() {
+        let r = MatchedRepo {
+            id: Uuid::nil(),
+            key: "debug".to_string(),
+            format: "npm".to_string(),
+        };
+        let debug_str = format!("{:?}", r);
+        assert!(debug_str.contains("MatchedRepo"));
+    }
 }

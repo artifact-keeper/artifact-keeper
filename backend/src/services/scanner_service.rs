@@ -3884,4 +3884,798 @@ mod tests {
         let git = deps.iter().find(|d| d.name == "git-dep").unwrap();
         assert_eq!(git.version.as_deref(), Some("0.5"));
     }
+
+    // -----------------------------------------------------------------------
+    // RawFinding serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_raw_finding_serialization_full() {
+        let finding = RawFinding {
+            severity: Severity::Critical,
+            title: "SQL Injection".to_string(),
+            description: Some("Improper input sanitization".to_string()),
+            cve_id: Some("CVE-2024-0001".to_string()),
+            affected_component: Some("db-driver".to_string()),
+            affected_version: Some("1.0.0".to_string()),
+            fixed_version: Some("1.0.1".to_string()),
+            source: Some("trivy".to_string()),
+            source_url: Some("https://trivy.dev/vuln/CVE-2024-0001".to_string()),
+        };
+        let json = serde_json::to_value(&finding).unwrap();
+        assert_eq!(json["severity"], "critical");
+        assert_eq!(json["title"], "SQL Injection");
+        assert_eq!(json["description"], "Improper input sanitization");
+        assert_eq!(json["cve_id"], "CVE-2024-0001");
+        assert_eq!(json["affected_component"], "db-driver");
+        assert_eq!(json["affected_version"], "1.0.0");
+        assert_eq!(json["fixed_version"], "1.0.1");
+        assert_eq!(json["source"], "trivy");
+    }
+
+    #[test]
+    fn test_raw_finding_serialization_minimal() {
+        let finding = RawFinding {
+            severity: Severity::Info,
+            title: "Informational notice".to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        };
+        let json = serde_json::to_value(&finding).unwrap();
+        assert_eq!(json["severity"], "info");
+        assert_eq!(json["title"], "Informational notice");
+        assert!(json["description"].is_null());
+        assert!(json["cve_id"].is_null());
+        assert!(json["source"].is_null());
+    }
+
+    #[test]
+    fn test_raw_finding_serialization_all_severities() {
+        for (severity, expected_str) in [
+            (Severity::Critical, "critical"),
+            (Severity::High, "high"),
+            (Severity::Medium, "medium"),
+            (Severity::Low, "low"),
+            (Severity::Info, "info"),
+        ] {
+            let finding = make_finding(severity);
+            let json = serde_json::to_value(&finding).unwrap();
+            assert_eq!(json["severity"], expected_str);
+        }
+    }
+
+    #[test]
+    fn test_raw_finding_debug() {
+        let finding = make_finding(Severity::High);
+        let debug = format!("{:?}", finding);
+        assert!(debug.contains("RawFinding"));
+        assert!(debug.contains("High"));
+    }
+
+    #[test]
+    fn test_raw_finding_clone() {
+        let finding = RawFinding {
+            severity: Severity::Medium,
+            title: "XSS vulnerability".to_string(),
+            description: Some("Reflected XSS".to_string()),
+            cve_id: Some("CVE-2024-9999".to_string()),
+            affected_component: Some("web-ui".to_string()),
+            affected_version: Some("2.0.0".to_string()),
+            fixed_version: Some("2.0.1".to_string()),
+            source: Some("grype".to_string()),
+            source_url: Some("https://example.com".to_string()),
+        };
+        let cloned = finding.clone();
+        assert_eq!(cloned.severity, finding.severity);
+        assert_eq!(cloned.title, finding.title);
+        assert_eq!(cloned.description, finding.description);
+        assert_eq!(cloned.cve_id, finding.cve_id);
+        assert_eq!(cloned.affected_component, finding.affected_component);
+        assert_eq!(cloned.affected_version, finding.affected_version);
+        assert_eq!(cloned.fixed_version, finding.fixed_version);
+        assert_eq!(cloned.source, finding.source);
+        assert_eq!(cloned.source_url, finding.source_url);
+    }
+
+    // -----------------------------------------------------------------------
+    // AdvisoryMatch debug trait
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_advisory_match_debug() {
+        let m = AdvisoryMatch {
+            id: "GHSA-dbg-test".to_string(),
+            summary: Some("Debug test".to_string()),
+            details: None,
+            severity: "high".to_string(),
+            aliases: vec!["CVE-2024-0001".to_string()],
+            affected_version: None,
+            fixed_version: None,
+            source: "osv.dev".to_string(),
+            source_url: None,
+        };
+        let debug = format!("{:?}", m);
+        assert!(debug.contains("AdvisoryMatch"));
+        assert!(debug.contains("GHSA-dbg-test"));
+        assert!(debug.contains("CVE-2024-0001"));
+    }
+
+    // -----------------------------------------------------------------------
+    // AdvisoryMatch deserialization edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_advisory_match_deserialize_all_nulls() {
+        let json = serde_json::json!({
+            "id": "OSV-001",
+            "summary": null,
+            "details": null,
+            "severity": "low",
+            "aliases": [],
+            "affected_version": null,
+            "fixed_version": null,
+            "source": "osv.dev",
+            "source_url": null
+        });
+        let m: AdvisoryMatch = serde_json::from_value(json).unwrap();
+        assert_eq!(m.id, "OSV-001");
+        assert!(m.summary.is_none());
+        assert!(m.details.is_none());
+        assert!(m.aliases.is_empty());
+        assert!(m.affected_version.is_none());
+        assert!(m.fixed_version.is_none());
+        assert!(m.source_url.is_none());
+    }
+
+    #[test]
+    fn test_advisory_match_deserialize_multiple_aliases() {
+        let json = serde_json::json!({
+            "id": "GHSA-multi",
+            "summary": null,
+            "details": null,
+            "severity": "critical",
+            "aliases": ["CVE-2024-0001", "CVE-2024-0002", "GHSA-other"],
+            "affected_version": null,
+            "fixed_version": null,
+            "source": "github",
+            "source_url": null
+        });
+        let m: AdvisoryMatch = serde_json::from_value(json).unwrap();
+        assert_eq!(m.aliases.len(), 3);
+        assert_eq!(m.aliases[0], "CVE-2024-0001");
+        assert_eq!(m.aliases[1], "CVE-2024-0002");
+        assert_eq!(m.aliases[2], "GHSA-other");
+    }
+
+    // -----------------------------------------------------------------------
+    // OsvQuery and OsvPackage serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_osv_query_serialization_with_version() {
+        let query = OsvQuery {
+            package: OsvPackage {
+                name: "express".to_string(),
+                ecosystem: "npm".to_string(),
+            },
+            version: Some("4.18.2".to_string()),
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert_eq!(json["package"]["name"], "express");
+        assert_eq!(json["package"]["ecosystem"], "npm");
+        assert_eq!(json["version"], "4.18.2");
+    }
+
+    #[test]
+    fn test_osv_query_serialization_without_version() {
+        let query = OsvQuery {
+            package: OsvPackage {
+                name: "flask".to_string(),
+                ecosystem: "PyPI".to_string(),
+            },
+            version: None,
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        assert_eq!(json["package"]["name"], "flask");
+        assert_eq!(json["package"]["ecosystem"], "PyPI");
+        assert!(json["version"].is_null());
+    }
+
+    #[test]
+    fn test_osv_package_serialization() {
+        let pkg = OsvPackage {
+            name: "tokio".to_string(),
+            ecosystem: "crates.io".to_string(),
+        };
+        let json = serde_json::to_value(&pkg).unwrap();
+        assert_eq!(json["name"], "tokio");
+        assert_eq!(json["ecosystem"], "crates.io");
+    }
+
+    // -----------------------------------------------------------------------
+    // Severity::from_str_loose usage in scanner context
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_severity_from_str_loose_as_used_in_scanner() {
+        // The scanner calls Severity::from_str_loose on advisory severity
+        // strings and falls back to Severity::Medium. Verify all paths.
+        assert_eq!(
+            Severity::from_str_loose("critical").unwrap_or(Severity::Medium),
+            Severity::Critical
+        );
+        assert_eq!(
+            Severity::from_str_loose("high").unwrap_or(Severity::Medium),
+            Severity::High
+        );
+        assert_eq!(
+            Severity::from_str_loose("medium").unwrap_or(Severity::Medium),
+            Severity::Medium
+        );
+        assert_eq!(
+            Severity::from_str_loose("moderate").unwrap_or(Severity::Medium),
+            Severity::Medium
+        );
+        assert_eq!(
+            Severity::from_str_loose("low").unwrap_or(Severity::Medium),
+            Severity::Low
+        );
+        assert_eq!(
+            Severity::from_str_loose("info").unwrap_or(Severity::Medium),
+            Severity::Info
+        );
+        assert_eq!(
+            Severity::from_str_loose("informational").unwrap_or(Severity::Medium),
+            Severity::Info
+        );
+        assert_eq!(
+            Severity::from_str_loose("none").unwrap_or(Severity::Medium),
+            Severity::Info
+        );
+        // Unknown strings fall back to Medium (the default used in the scanner)
+        assert_eq!(
+            Severity::from_str_loose("unknown").unwrap_or(Severity::Medium),
+            Severity::Medium
+        );
+        assert_eq!(
+            Severity::from_str_loose("").unwrap_or(Severity::Medium),
+            Severity::Medium
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - robustness with non-array aliases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_aliases_not_array() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "OSV-2024-500",
+                    "aliases": "not-an-array"
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].aliases.is_empty());
+    }
+
+    #[test]
+    fn test_parse_osv_response_aliases_null() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "OSV-2024-600",
+                    "aliases": null
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].aliases.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - severity from severity array (type field)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_severity_from_empty_severity_array() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "OSV-2024-700",
+                    "severity": []
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        // Empty severity array, no database_specific, falls back to "medium"
+        assert_eq!(matches[0].severity, "medium");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - affected with no ranges
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_affected_no_ranges() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "OSV-2024-800",
+                    "affected": [{"package": {"name": "pkg"}}]
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].fixed_version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - affected ranges with no fixed event
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_ranges_no_fixed_event() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "OSV-2024-900",
+                    "affected": [{
+                        "ranges": [{
+                            "type": "SEMVER",
+                            "events": [
+                                {"introduced": "0"},
+                                {"last_affected": "2.0.0"}
+                            ]
+                        }]
+                    }]
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].fixed_version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_github_advisory - vulnerabilities with null first_patched_version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_github_advisory_first_patched_version_null() {
+        let dep = Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        };
+        let adv = serde_json::json!({
+            "ghsa_id": "GHSA-null-patch",
+            "vulnerabilities": [
+                {"first_patched_version": null}
+            ]
+        });
+        let result = AdvisoryClient::parse_github_advisory(&adv, &dep).unwrap();
+        assert!(result.fixed_version.is_none());
+    }
+
+    #[test]
+    fn test_parse_github_advisory_no_vulnerabilities_key() {
+        let dep = Dependency {
+            name: "pkg".to_string(),
+            version: None,
+            ecosystem: "npm".to_string(),
+        };
+        let adv = serde_json::json!({
+            "ghsa_id": "GHSA-no-vulns"
+        });
+        let result = AdvisoryClient::parse_github_advisory(&adv, &dep).unwrap();
+        assert!(result.fixed_version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dependency with various ecosystems
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dependency_all_ecosystems() {
+        let ecosystems = [
+            "npm",
+            "PyPI",
+            "crates.io",
+            "Maven",
+            "Go",
+            "NuGet",
+            "RubyGems",
+            "Linux",
+        ];
+        for eco in ecosystems {
+            let dep = Dependency {
+                name: "test-pkg".to_string(),
+                version: Some("1.0.0".to_string()),
+                ecosystem: eco.to_string(),
+            };
+            assert_eq!(dep.ecosystem, eco);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // OsvBatchQuery with single query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_osv_batch_query_single_entry() {
+        let query = OsvBatchQuery {
+            queries: vec![OsvQuery {
+                package: OsvPackage {
+                    name: "serde".to_string(),
+                    ecosystem: "crates.io".to_string(),
+                },
+                version: Some("1.0.195".to_string()),
+            }],
+        };
+        let json = serde_json::to_value(&query).unwrap();
+        let queries = json["queries"].as_array().unwrap();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0]["package"]["name"], "serde");
+        assert_eq!(queries[0]["version"], "1.0.195");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - dep with no version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_dep_with_no_version() {
+        let deps = vec![Dependency {
+            name: "unversioned-pkg".to_string(),
+            version: None,
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "VULN-NO-VER",
+                    "summary": "Something bad"
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].affected_version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_github_advisory - dep with no version
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_github_advisory_dep_with_no_version() {
+        let dep = Dependency {
+            name: "pkg".to_string(),
+            version: None,
+            ecosystem: "npm".to_string(),
+        };
+        let adv = serde_json::json!({
+            "ghsa_id": "GHSA-no-ver",
+            "severity": "low"
+        });
+        let result = AdvisoryClient::parse_github_advisory(&adv, &dep).unwrap();
+        assert!(result.affected_version.is_none());
+        assert_eq!(result.severity, "low");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_github_advisory - description field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_github_advisory_description_maps_to_details() {
+        let dep = Dependency {
+            name: "pkg".to_string(),
+            version: None,
+            ecosystem: "npm".to_string(),
+        };
+        let adv = serde_json::json!({
+            "ghsa_id": "GHSA-desc",
+            "description": "Full description of the vulnerability"
+        });
+        let result = AdvisoryClient::parse_github_advisory(&adv, &dep).unwrap();
+        assert_eq!(
+            result.details.as_deref(),
+            Some("Full description of the vulnerability")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_dependencies - nested gemfile.lock
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_dependencies_nested_gemfile_lock() {
+        let artifact = make_artifact("vendor/Gemfile.lock", "/ruby/vendor/Gemfile.lock", None);
+        let content = Bytes::from("    bundler (2.4.22)\n");
+        let deps = DependencyScanner::extract_dependencies(&artifact, None, &content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].ecosystem, "RubyGems");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_dependencies - packages.config (NuGet)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_dependencies_packages_config_case_insensitive() {
+        let artifact = make_artifact("PACKAGES.CONFIG", "/nuget/PACKAGES.CONFIG", None);
+        let content = Bytes::from(r#"<package id="TestPkg" version="1.0" />"#);
+        let deps = DependencyScanner::extract_dependencies(&artifact, None, &content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].ecosystem, "NuGet");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - vuln with details but no summary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_details_without_summary() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "OSV-DETAIL-ONLY",
+                    "details": "A detailed description without summary"
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].summary.is_none());
+        assert_eq!(
+            matches[0].details.as_deref(),
+            Some("A detailed description without summary")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AdvisoryMatch deserialization from JSON string
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_advisory_match_deserialize_from_json_string() {
+        let json_str = r#"{
+            "id": "GHSA-json-str",
+            "summary": "From JSON string",
+            "details": "Details here",
+            "severity": "critical",
+            "aliases": ["CVE-2024-0001", "GHSA-other"],
+            "affected_version": "1.0.0",
+            "fixed_version": "1.0.1",
+            "source": "github",
+            "source_url": "https://example.com/advisory"
+        }"#;
+        let m: AdvisoryMatch = serde_json::from_str(json_str).unwrap();
+        assert_eq!(m.id, "GHSA-json-str");
+        assert_eq!(m.summary.as_deref(), Some("From JSON string"));
+        assert_eq!(m.details.as_deref(), Some("Details here"));
+        assert_eq!(m.severity, "critical");
+        assert_eq!(m.aliases.len(), 2);
+        assert_eq!(m.affected_version.as_deref(), Some("1.0.0"));
+        assert_eq!(m.fixed_version.as_deref(), Some("1.0.1"));
+        assert_eq!(m.source, "github");
+        assert_eq!(
+            m.source_url.as_deref(),
+            Some("https://example.com/advisory")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - source URL format
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_source_url_format() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{"id": "GHSA-url-test"}]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].source_url.as_deref(),
+            Some("https://osv.dev/vulnerability/GHSA-url-test")
+        );
+        assert_eq!(matches[0].source, "osv.dev");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_github_advisory - source field is always "github"
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_github_advisory_source_is_github() {
+        let dep = Dependency {
+            name: "pkg".to_string(),
+            version: None,
+            ecosystem: "npm".to_string(),
+        };
+        let adv = serde_json::json!({
+            "ghsa_id": "GHSA-src-test",
+            "html_url": "https://github.com/advisories/GHSA-src-test"
+        });
+        let result = AdvisoryClient::parse_github_advisory(&adv, &dep).unwrap();
+        assert_eq!(result.source, "github");
+        assert_eq!(
+            result.source_url.as_deref(),
+            Some("https://github.com/advisories/GHSA-src-test")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // make_artifact helper validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_make_artifact_fields() {
+        let artifact = make_artifact("test.jar", "/maven/test.jar", Some("3.0"));
+        assert_eq!(artifact.name, "test.jar");
+        assert_eq!(artifact.path, "/maven/test.jar");
+        assert_eq!(artifact.version.as_deref(), Some("3.0"));
+        assert_eq!(artifact.size_bytes, 100);
+        assert_eq!(artifact.checksum_sha256, "abc123");
+        assert!(!artifact.is_deleted);
+        assert!(artifact.uploaded_by.is_none());
+        assert!(artifact.checksum_md5.is_none());
+        assert!(artifact.checksum_sha1.is_none());
+    }
+
+    #[test]
+    fn test_make_artifact_no_version() {
+        let artifact = make_artifact("readme.md", "/docs/readme.md", None);
+        assert!(artifact.version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Severity equality used in count_findings_by_severity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_severity_equality() {
+        assert_eq!(Severity::Critical, Severity::Critical);
+        assert_eq!(Severity::High, Severity::High);
+        assert_eq!(Severity::Medium, Severity::Medium);
+        assert_eq!(Severity::Low, Severity::Low);
+        assert_eq!(Severity::Info, Severity::Info);
+        assert_ne!(Severity::Critical, Severity::High);
+        assert_ne!(Severity::High, Severity::Medium);
+        assert_ne!(Severity::Low, Severity::Info);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_osv_response - multiple fixed events picks first
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_osv_response_multiple_fixed_events() {
+        let deps = vec![Dependency {
+            name: "pkg".to_string(),
+            version: Some("1.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+        let body = serde_json::json!({
+            "results": [{
+                "vulns": [{
+                    "id": "OSV-MULTI-FIX",
+                    "affected": [{
+                        "ranges": [{
+                            "type": "SEMVER",
+                            "events": [
+                                {"introduced": "0"},
+                                {"fixed": "1.5.0"},
+                                {"introduced": "2.0.0"},
+                                {"fixed": "2.1.0"}
+                            ]
+                        }]
+                    }]
+                }]
+            }]
+        });
+        let matches = AdvisoryClient::parse_osv_response(&body, &deps);
+        assert_eq!(matches.len(), 1);
+        // find_map picks the first "fixed" event
+        assert_eq!(matches[0].fixed_version.as_deref(), Some("1.5.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup_advisories - multiple alias overlap
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_advisories_transitive_alias_dedup() {
+        // OSV entry has alias CVE-X. GH entry #1 has id CVE-X.
+        // GH entry #2 has id GHSA-Y. Both should reduce to just OSV entry.
+        let osv = vec![AdvisoryMatch {
+            id: "GHSA-xxx".to_string(),
+            summary: None,
+            details: None,
+            severity: "high".to_string(),
+            aliases: vec!["CVE-2024-1111".to_string(), "GHSA-yyy".to_string()],
+            affected_version: None,
+            fixed_version: None,
+            source: "osv.dev".to_string(),
+            source_url: None,
+        }];
+        let gh = vec![
+            AdvisoryMatch {
+                id: "CVE-2024-1111".to_string(),
+                summary: None,
+                details: None,
+                severity: "high".to_string(),
+                aliases: vec![],
+                affected_version: None,
+                fixed_version: None,
+                source: "github".to_string(),
+                source_url: None,
+            },
+            AdvisoryMatch {
+                id: "GHSA-yyy".to_string(),
+                summary: None,
+                details: None,
+                severity: "high".to_string(),
+                aliases: vec![],
+                affected_version: None,
+                fixed_version: None,
+                source: "github".to_string(),
+                source_url: None,
+            },
+        ];
+        let result = dedup_advisories(osv, gh);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "GHSA-xxx");
+    }
 }

@@ -1411,4 +1411,529 @@ mod tests {
         assert_eq!(json["username"], "svc-round");
         assert_eq!(json["token_count"], 5);
     }
+
+    // -----------------------------------------------------------------------
+    // router()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_router_returns_valid_router() {
+        let _router = router();
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenAPI doc: tag, path, and operation coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_openapi_doc_has_service_accounts_tag() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let tags = doc.tags.as_ref().expect("OpenAPI doc should have tags");
+        let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            tag_names.contains(&"service_accounts"),
+            "Expected 'service_accounts' tag, found: {:?}",
+            tag_names
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_contains_base_path() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(|k| k.as_str()).collect();
+        assert!(
+            paths.contains(&"/api/v1/service-accounts"),
+            "Expected base path '/api/v1/service-accounts', found: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_contains_id_path() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(|k| k.as_str()).collect();
+        assert!(
+            paths.contains(&"/api/v1/service-accounts/{id}"),
+            "Expected path '/api/v1/service-accounts/{{id}}', found: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_contains_tokens_path() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(|k| k.as_str()).collect();
+        assert!(
+            paths.contains(&"/api/v1/service-accounts/{id}/tokens"),
+            "Expected tokens path, found: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_contains_token_revoke_path() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(|k| k.as_str()).collect();
+        assert!(
+            paths.contains(&"/api/v1/service-accounts/{id}/tokens/{token_id}"),
+            "Expected token revoke path, found: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_contains_repo_selector_preview_path() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let paths: Vec<&str> = doc.paths.paths.keys().map(|k| k.as_str()).collect();
+        assert!(
+            paths.contains(&"/api/v1/service-accounts/repo-selector/preview"),
+            "Expected repo-selector preview path, found: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_base_path_has_get_and_post() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let base = doc.paths.paths.get("/api/v1/service-accounts").unwrap();
+        assert!(base.get.is_some(), "Base path should have GET (list)");
+        assert!(base.post.is_some(), "Base path should have POST (create)");
+    }
+
+    #[test]
+    fn test_openapi_doc_id_path_has_get_patch_delete() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let id_path = doc
+            .paths
+            .paths
+            .get("/api/v1/service-accounts/{id}")
+            .unwrap();
+        assert!(id_path.get.is_some(), "ID path should have GET");
+        assert!(id_path.patch.is_some(), "ID path should have PATCH");
+        assert!(id_path.delete.is_some(), "ID path should have DELETE");
+    }
+
+    #[test]
+    fn test_openapi_doc_tokens_path_has_get_and_post() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let tokens = doc
+            .paths
+            .paths
+            .get("/api/v1/service-accounts/{id}/tokens")
+            .unwrap();
+        assert!(tokens.get.is_some(), "Tokens path should have GET (list)");
+        assert!(
+            tokens.post.is_some(),
+            "Tokens path should have POST (create)"
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_token_revoke_path_has_delete() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let revoke = doc
+            .paths
+            .paths
+            .get("/api/v1/service-accounts/{id}/tokens/{token_id}")
+            .unwrap();
+        assert!(
+            revoke.delete.is_some(),
+            "Token revoke path should have DELETE"
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_preview_path_has_post() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let preview = doc
+            .paths
+            .paths
+            .get("/api/v1/service-accounts/repo-selector/preview")
+            .unwrap();
+        assert!(preview.post.is_some(), "Preview path should have POST");
+    }
+
+    #[test]
+    fn test_openapi_doc_has_all_expected_schemas() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let schemas = doc.components.as_ref().unwrap();
+        let schema_names: Vec<&str> = schemas.schemas.keys().map(|k| k.as_str()).collect();
+        let expected = [
+            "CreateServiceAccountRequest",
+            "ServiceAccountResponse",
+            "ServiceAccountListResponse",
+            "ServiceAccountSummaryResponse",
+            "UpdateServiceAccountRequest",
+            "CreateTokenRequest",
+            "CreateTokenResponse",
+            "TokenInfoResponse",
+            "TokenListResponse",
+            "PreviewRepoSelectorRequest",
+            "PreviewRepoSelectorResponse",
+            "MatchedRepoResponse",
+        ];
+        for name in &expected {
+            assert!(
+                schema_names.contains(name),
+                "Missing schema '{}' in OpenAPI doc. Found: {:?}",
+                name,
+                schema_names
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_doc_path_count_is_exact() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        assert_eq!(
+            doc.paths.paths.len(),
+            5,
+            "Expected exactly 5 paths in OpenAPI doc"
+        );
+    }
+
+    #[test]
+    fn test_openapi_doc_total_operation_count() {
+        let doc = ServiceAccountsApiDoc::openapi();
+        let mut count = 0;
+        for item in doc.paths.paths.values() {
+            if item.get.is_some() {
+                count += 1;
+            }
+            if item.post.is_some() {
+                count += 1;
+            }
+            if item.patch.is_some() {
+                count += 1;
+            }
+            if item.delete.is_some() {
+                count += 1;
+            }
+            if item.put.is_some() {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 9,
+            "Expected 9 operations total (matches 9 handler fns)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_token_info_response: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_token_info_response_multiple_scopes() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let scopes = vec![
+            "read".to_string(),
+            "write".to_string(),
+            "delete".to_string(),
+            "admin".to_string(),
+        ];
+        let resp = build_token_info_response(
+            id,
+            "multi-scope".to_string(),
+            "ak_ms".to_string(),
+            scopes.clone(),
+            None,
+            None,
+            now,
+            false,
+            vec![],
+            None,
+        );
+        assert_eq!(resp.scopes, scopes);
+        assert_eq!(resp.scopes.len(), 4);
+    }
+
+    #[test]
+    fn test_build_token_info_response_multiple_repos_no_selector() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let r1 = Uuid::new_v4();
+        let r2 = Uuid::new_v4();
+        let r3 = Uuid::new_v4();
+        let resp = build_token_info_response(
+            id,
+            "multi-repo".to_string(),
+            "ak_mr".to_string(),
+            vec!["read".to_string()],
+            None,
+            None,
+            now,
+            false,
+            vec![r1, r2, r3],
+            None,
+        );
+        assert_eq!(resp.repository_ids.len(), 3);
+        assert!(resp.repository_ids.contains(&r1));
+        assert!(resp.repository_ids.contains(&r2));
+        assert!(resp.repository_ids.contains(&r3));
+        assert!(resp.repo_selector.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_repo_map: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_repo_map_preserves_insertion_order_per_token() {
+        let t = Uuid::new_v4();
+        let r1 = Uuid::new_v4();
+        let r2 = Uuid::new_v4();
+        let r3 = Uuid::new_v4();
+        let map = build_repo_map(vec![(t, r1), (t, r2), (t, r3)]);
+        let repos = &map[&t];
+        assert_eq!(repos[0], r1);
+        assert_eq!(repos[1], r2);
+        assert_eq!(repos[2], r3);
+    }
+
+    #[test]
+    fn test_build_repo_map_many_tokens_each_with_one_repo() {
+        let pairs: Vec<(Uuid, Uuid)> = (0..10).map(|_| (Uuid::new_v4(), Uuid::new_v4())).collect();
+        let map = build_repo_map(pairs.clone());
+        assert_eq!(map.len(), 10);
+        for (token_id, repo_id) in &pairs {
+            assert_eq!(map[token_id], vec![*repo_id]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_selector_map: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_selector_map_all_none_selectors() {
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let rows: Vec<(Uuid, Option<serde_json::Value>)> =
+            ids.iter().map(|id| (*id, None)).collect();
+        let map = build_selector_map(rows);
+        assert_eq!(map.len(), 3);
+        for id in &ids {
+            assert_eq!(map[id], None);
+        }
+    }
+
+    #[test]
+    fn test_build_selector_map_complex_selector_values() {
+        let id = Uuid::new_v4();
+        let complex = serde_json::json!({
+            "match_formats": ["docker", "maven", "npm"],
+            "match_labels": {"env": "staging", "team": "platform"},
+            "match_pattern": "libs-*-snapshot"
+        });
+        let map = build_selector_map(vec![(id, Some(complex.clone()))]);
+        let stored = map[&id].as_ref().unwrap();
+        assert_eq!(stored["match_formats"].as_array().unwrap().len(), 3);
+        assert_eq!(stored["match_labels"]["team"], "platform");
+        assert_eq!(stored["match_pattern"], "libs-*-snapshot");
+    }
+
+    // -----------------------------------------------------------------------
+    // DTO serialization: additional coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_token_request_with_repo_ids_and_no_selector() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let json = format!(
+            r#"{{"name":"scoped","scopes":["read"],"repository_ids":["{}","{}"],"repo_selector":null}}"#,
+            id1, id2
+        );
+        let req: CreateTokenRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.repository_ids.as_ref().unwrap().len(), 2);
+        assert!(req.repository_ids.as_ref().unwrap().contains(&id1));
+        assert!(req.repository_ids.as_ref().unwrap().contains(&id2));
+        assert!(req.repo_selector.is_none());
+    }
+
+    #[test]
+    fn test_create_token_request_negative_expires_in_days() {
+        let json = r#"{"name":"neg","scopes":["read"],"expires_in_days":-1}"#;
+        let req: CreateTokenRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.expires_in_days, Some(-1));
+    }
+
+    #[test]
+    fn test_create_token_response_round_trip() {
+        let id = Uuid::new_v4();
+        let resp = CreateTokenResponse {
+            id,
+            token: "ak_secret_xyz789".to_string(),
+            name: "roundtrip-token".to_string(),
+        };
+        let serialized = serde_json::to_string(&resp).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(json["id"], id.to_string());
+        assert_eq!(json["token"], "ak_secret_xyz789");
+        assert_eq!(json["name"], "roundtrip-token");
+    }
+
+    #[test]
+    fn test_token_list_response_with_multiple_items() {
+        let now = Utc::now();
+        let resp = TokenListResponse {
+            items: vec![
+                TokenInfoResponse {
+                    id: Uuid::new_v4(),
+                    name: "token-a".to_string(),
+                    token_prefix: "ak_aaa".to_string(),
+                    scopes: vec!["read".to_string()],
+                    expires_at: Some(now),
+                    last_used_at: None,
+                    created_at: now,
+                    is_expired: false,
+                    repo_selector: None,
+                    repository_ids: vec![],
+                },
+                TokenInfoResponse {
+                    id: Uuid::new_v4(),
+                    name: "token-b".to_string(),
+                    token_prefix: "ak_bbb".to_string(),
+                    scopes: vec!["write".to_string()],
+                    expires_at: None,
+                    last_used_at: Some(now),
+                    created_at: now,
+                    is_expired: true,
+                    repo_selector: Some(serde_json::json!({"match_formats": ["cargo"]})),
+                    repository_ids: vec![Uuid::new_v4()],
+                },
+            ],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], "token-a");
+        assert_eq!(items[0]["is_expired"], false);
+        assert_eq!(items[1]["name"], "token-b");
+        assert_eq!(items[1]["is_expired"], true);
+        assert!(items[1]["repo_selector"].is_object());
+    }
+
+    #[test]
+    fn test_service_account_response_round_trip() {
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let resp = ServiceAccountResponse {
+            id,
+            username: "svc-pipeline".to_string(),
+            display_name: Some("Pipeline Bot".to_string()),
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let serialized = serde_json::to_string(&resp).unwrap();
+        let deserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized["id"], id.to_string());
+        assert_eq!(deserialized["username"], "svc-pipeline");
+        assert_eq!(deserialized["display_name"], "Pipeline Bot");
+        assert_eq!(deserialized["is_active"], true);
+    }
+
+    #[test]
+    fn test_matched_repo_response_round_trip() {
+        let id = Uuid::new_v4();
+        let resp = MatchedRepoResponse {
+            id,
+            key: "docker-staging".to_string(),
+            format: "docker".to_string(),
+        };
+        let serialized = serde_json::to_string(&resp).unwrap();
+        let deserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized["id"], id.to_string());
+        assert_eq!(deserialized["key"], "docker-staging");
+        assert_eq!(deserialized["format"], "docker");
+    }
+
+    #[test]
+    fn test_preview_response_round_trip_with_items() {
+        let id = Uuid::new_v4();
+        let resp = PreviewRepoSelectorResponse {
+            matched_repositories: vec![MatchedRepoResponse {
+                id,
+                key: "npm-releases".to_string(),
+                format: "npm".to_string(),
+            }],
+            total: 1,
+        };
+        let serialized = serde_json::to_string(&resp).unwrap();
+        let deserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized["total"], 1);
+        let repos = deserialized["matched_repositories"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["id"], id.to_string());
+    }
+
+    #[test]
+    fn test_update_request_deserialize_null_fields() {
+        let json = r#"{"display_name":null,"is_active":null}"#;
+        let req: UpdateServiceAccountRequest = serde_json::from_str(json).unwrap();
+        assert!(req.display_name.is_none());
+        assert!(req.is_active.is_none());
+    }
+
+    #[test]
+    fn test_create_service_account_request_unicode_name() {
+        let json = r#"{"name":"svc-日本語","description":"Unicode test"}"#;
+        let req: CreateServiceAccountRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "svc-日本語");
+    }
+
+    #[test]
+    fn test_create_service_account_request_empty_name() {
+        let json = r#"{"name":""}"#;
+        let req: CreateServiceAccountRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "");
+    }
+
+    #[test]
+    fn test_preview_repo_selector_request_array_selector() {
+        let json = r#"{"repo_selector":[1,2,3]}"#;
+        let req: PreviewRepoSelectorRequest = serde_json::from_str(json).unwrap();
+        assert!(req.repo_selector.is_array());
+    }
+
+    // -----------------------------------------------------------------------
+    // From<ServiceAccountSummary>: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_summary_conversion_large_token_count() {
+        let now = Utc::now();
+        let summary = ServiceAccountSummary {
+            id: Uuid::new_v4(),
+            username: "svc-heavy".to_string(),
+            display_name: Some("Heavy User".to_string()),
+            is_active: true,
+            token_count: i64::MAX,
+            created_at: now,
+            updated_at: now,
+        };
+        let resp: ServiceAccountSummaryResponse = summary.into();
+        assert_eq!(resp.token_count, i64::MAX);
+    }
+
+    #[test]
+    fn test_summary_conversion_inactive_account() {
+        let now = Utc::now();
+        let summary = ServiceAccountSummary {
+            id: Uuid::new_v4(),
+            username: "svc-disabled".to_string(),
+            display_name: None,
+            is_active: false,
+            token_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let resp: ServiceAccountSummaryResponse = summary.into();
+        assert!(!resp.is_active);
+        assert!(resp.display_name.is_none());
+        assert_eq!(resp.token_count, 0);
+        assert_eq!(resp.username, "svc-disabled");
+    }
 }
