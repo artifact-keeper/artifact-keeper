@@ -1,0 +1,73 @@
+# OIDC Bootstrap E2E Test
+# Tests that OIDC env vars are bootstrapped into the database on startup.
+# Uses SKIP_ADMIN_PROVISIONING=true to verify the chicken-and-egg fix.
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    container_name: oidc-boot-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: "xforwarded"
+    command: start-dev
+    ports:
+      - "8180:8080"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: oidc-boot-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    image: ak-test-oidc:local
+    container_name: oidc-boot-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+    user: root
+    volumes:
+      - backend_data:/data
+    environment:
+      DATABASE_URL: postgres://registry:registry@postgres:5432/artifact_registry
+      JWT_SECRET: test-jwt-secret-for-oidc-bootstrap-testing
+      STORAGE_PATH: /data/storage
+      PLUGINS_ENABLED: "false"
+      RUST_LOG: info,artifact_keeper=debug
+
+      # Key: SKIP admin provisioning to test the bootstrap path
+      SKIP_ADMIN_PROVISIONING: "true"
+
+      # OIDC env vars that should be bootstrapped into oidc_configs table
+      OIDC_ISSUER: http://keycloak:8080/realms/artifact-keeper
+      OIDC_CLIENT_ID: artifact-keeper
+      OIDC_CLIENT_SECRET: artifact-keeper-secret
+      OIDC_REDIRECT_URI: http://localhost:8080/api/v1/auth/sso/oidc/default/callback
+      OIDC_GROUPS_CLAIM: roles
+      OIDC_SCOPES: "openid email profile"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  backend_data:
