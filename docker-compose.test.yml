@@ -18,6 +18,7 @@
 #   docker      - Docker/OCI image tests
 #   protobuf    - Protobuf/BSR Connect RPC tests
 #   proxy       - Remote proxy + virtual repository tests
+#   storage-gc  - Storage garbage collection tests
 #   smoke       - Smoke tests only (pypi, npm, cargo)
 #   all         - All native client tests
 
@@ -406,6 +407,27 @@ services:
     networks:
       - e2e-test-network
     profiles: ["tag-replication", "all"]
+
+  # ==========================================================================
+  # STORAGE GARBAGE COLLECTION TESTS
+  # ==========================================================================
+
+  storage-gc-test:
+    image: alpine:3.19
+    container_name: e2e-test-storage-gc
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      REGISTRY_URL: http://backend:8080
+      ADMIN_USER: admin
+      ADMIN_PASS: admin123
+    volumes:
+      - ./scripts/native-tests:/scripts:ro
+    command: ["sh", "-c", "apk add --no-cache bash curl jq >/dev/null 2>&1 && bash /scripts/test-storage-gc.sh"]
+    networks:
+      - e2e-test-network
+    profiles: ["storage-gc", "all"]
 
   # ==========================================================================
   # RED TEAM SECURITY TESTING

@@ -76,7 +76,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --profile PROFILE  Test profile to run (smoke, all, proxy, redteam, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker)"
+            echo "  --profile PROFILE  Test profile to run (smoke, all, proxy, redteam, storage-gc, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker)"
             echo "  --build            Force rebuild all containers"
             echo "  --clean            Clean up containers and volumes after tests"
             echo "  --stress           Run stress tests after E2E tests"
@@ -153,6 +153,21 @@ if [ "$PROFILE" = "redteam" ]; then
         echo -e "${RED}Red team tests failed (exit code: $REDTEAM_EXIT).${NC}"
     fi
     exit $REDTEAM_EXIT
+fi
+
+# Storage GC profile: run GC tests only (no Playwright)
+if [ "$PROFILE" = "storage-gc" ]; then
+    echo -e "${BLUE}Running storage GC E2E tests...${NC}"
+    docker compose -f docker-compose.test.yml --profile storage-gc up \
+        $BUILD_FLAG --abort-on-container-exit --exit-code-from storage-gc-test
+    GC_EXIT=$?
+    echo ""
+    if [ $GC_EXIT -eq 0 ]; then
+        echo -e "${GREEN}Storage GC tests completed.${NC}"
+    else
+        echo -e "${RED}Storage GC tests failed (exit code: $GC_EXIT).${NC}"
+    fi
+    exit $GC_EXIT
 fi
 
 # Build and start containers with profile
