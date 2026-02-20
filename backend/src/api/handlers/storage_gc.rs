@@ -1,16 +1,14 @@
 //! Storage garbage collection API handler.
 
-use axum::{extract::State, routing::post, Json, Router};
 use axum::extract::Extension;
+use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
-use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::storage_gc_service::{StorageGcResult, StorageGcService};
-use crate::storage::filesystem::FilesystemStorage;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -55,8 +53,11 @@ pub async fn run_storage_gc(
         ));
     }
 
-    let storage = Arc::new(FilesystemStorage::new(&state.config.storage_path));
-    let service = StorageGcService::new(state.db.clone(), storage);
+    let service = StorageGcService::new(
+        state.db.clone(),
+        state.storage.clone(),
+        state.config.storage_backend.clone(),
+    );
     let result = service.run_gc(payload.dry_run).await?;
     Ok(Json(result))
 }

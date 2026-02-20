@@ -30,7 +30,11 @@ struct GaugeStats {
 
 /// Spawn all background scheduler tasks.
 /// Returns join handles for graceful shutdown (not currently used, fire-and-forget).
-pub fn spawn_all(db: PgPool, config: Config) {
+pub fn spawn_all(
+    db: PgPool,
+    config: Config,
+    primary_storage: Arc<dyn crate::storage::StorageBackend>,
+) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
         let db = db.clone();
@@ -140,13 +144,14 @@ pub fn spawn_all(db: PgPool, config: Config) {
     {
         let db = db.clone();
         let config_clone = config.clone();
+        let gc_storage = primary_storage.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(120)).await;
-            let storage = Arc::new(
-                crate::storage::filesystem::FilesystemStorage::new(&config_clone.storage_path),
+            let service = crate::services::storage_gc_service::StorageGcService::new(
+                db,
+                gc_storage,
+                config_clone.storage_backend.clone(),
             );
-            let service =
-                crate::services::storage_gc_service::StorageGcService::new(db, storage);
             let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
 
             loop {

@@ -23,34 +23,63 @@ pub struct StorageGcResult {
 }
 
 /// Storage garbage collection service.
+///
+/// For cloud backends (S3/Azure/GCS), the shared storage instance handles all
+/// deletions directly since storage keys are globally unique. For filesystem,
+/// each repository has its own storage directory, so the service resolves the
+/// correct backend per repo using the repository's `storage_path`.
 pub struct StorageGcService {
     db: PgPool,
-    storage: Arc<dyn StorageBackend>,
+    shared_storage: Arc<dyn StorageBackend>,
+    storage_backend_type: String,
 }
 
 impl StorageGcService {
-    pub fn new(db: PgPool, storage: Arc<dyn StorageBackend>) -> Self {
-        Self { db, storage }
+    pub fn new(
+        db: PgPool,
+        shared_storage: Arc<dyn StorageBackend>,
+        storage_backend_type: String,
+    ) -> Self {
+        Self {
+            db,
+            shared_storage,
+            storage_backend_type,
+        }
+    }
+
+    /// Get the storage backend for a given repository path.
+    fn storage_for_path(&self, repo_storage_path: &str) -> Arc<dyn StorageBackend> {
+        match self.storage_backend_type.as_str() {
+            "s3" | "azure" | "gcs" => self.shared_storage.clone(),
+            _ => Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                repo_storage_path,
+            )),
+        }
     }
 
     /// Run garbage collection on orphaned storage keys.
     ///
     /// Finds storage keys referenced only by soft-deleted artifacts (no live
-    /// artifact shares the same key), deletes the physical file, then
-    /// hard-deletes the database records.
+    /// artifact shares the same key), deletes the physical file from the
+    /// correct storage backend, then hard-deletes the database records.
     pub async fn run_gc(&self, dry_run: bool) -> Result<StorageGcResult> {
-        // Find orphaned storage keys: keys where ALL referencing artifacts are deleted
+        // Find orphaned storage keys joined with their repository storage paths.
+        // Group by (storage_key, storage_path) so filesystem mode deletes from
+        // each repo directory that held a copy of the content.
         let orphans = sqlx::query(
             r#"
-            SELECT DISTINCT a.storage_key, SUM(a.size_bytes) as total_bytes, COUNT(*) as artifact_count
+            SELECT a.storage_key, r.storage_path,
+                   SUM(a.size_bytes) as total_bytes,
+                   COUNT(*) as artifact_count
             FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = true
               AND NOT EXISTS (
                 SELECT 1 FROM artifacts a2
                 WHERE a2.storage_key = a.storage_key
                   AND a2.is_deleted = false
               )
-            GROUP BY a.storage_key
+            GROUP BY a.storage_key, r.storage_path
             "#,
         )
         .fetch_all(&self.db)
@@ -78,11 +107,15 @@ impl StorageGcService {
 
         for row in &orphans {
             let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+            let storage_path: String = row.try_get("storage_path").unwrap_or_default();
             let bytes: i64 = row.try_get("total_bytes").unwrap_or(0);
             let count: i64 = row.try_get("artifact_count").unwrap_or(0);
 
+            // Resolve the correct storage backend for this repo's path
+            let storage = self.storage_for_path(&storage_path);
+
             // Delete the physical file first
-            if let Err(e) = self.storage.delete(&storage_key).await {
+            if let Err(e) = storage.delete(&storage_key).await {
                 let msg = format!("Failed to delete storage key {}: {}", storage_key, e);
                 tracing::warn!("{}", msg);
                 result.errors.push(msg);
@@ -114,12 +147,10 @@ impl StorageGcService {
             }
 
             // Hard-delete artifact records (cascades to child tables)
-            match sqlx::query(
-                "DELETE FROM artifacts WHERE storage_key = $1 AND is_deleted = true",
-            )
-            .bind(&storage_key)
-            .execute(&self.db)
-            .await
+            match sqlx::query("DELETE FROM artifacts WHERE storage_key = $1 AND is_deleted = true")
+                .bind(&storage_key)
+                .execute(&self.db)
+                .await
             {
                 Ok(_) => {
                     result.storage_keys_deleted += 1;

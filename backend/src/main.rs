@@ -192,6 +192,7 @@ async fn main() -> Result<()> {
     };
 
     // Create application state with WASM plugin support
+    let scheduler_storage = primary_storage.clone();
     let mut app_state = api::AppState::with_wasm_plugins(
         config.clone(),
         db_pool.clone(),
@@ -247,7 +248,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(app_state);
 
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
-    scheduler_service::spawn_all(db_pool.clone(), config.clone());
+    scheduler_service::spawn_all(db_pool.clone(), config.clone(), scheduler_storage);
 
     // Spawn background sync worker for peer replication
     artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
