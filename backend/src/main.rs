@@ -534,21 +534,11 @@ async fn init_peer_identity(db: &sqlx::PgPool, config: &Config) -> Result<uuid::
 /// env vars (OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, etc.) without
 /// needing admin API access first.
 async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
-    use artifact_keeper_backend::services::auth_config_service::{
-        AuthConfigService, CreateOidcConfigRequest,
-    };
+    use artifact_keeper_backend::services::auth_config_service::AuthConfigService;
 
-    let issuer = match std::env::var("OIDC_ISSUER") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return Ok(()),
-    };
-    let client_id = match std::env::var("OIDC_CLIENT_ID") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return Ok(()),
-    };
-    let client_secret = match std::env::var("OIDC_CLIENT_SECRET") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return Ok(()),
+    let req = match build_oidc_bootstrap_request() {
+        Some(r) => r,
+        None => return Ok(()),
     };
 
     // Only bootstrap when no OIDC configs exist in the database
@@ -561,41 +551,6 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
         return Ok(());
     }
 
-    let scopes = std::env::var("OIDC_SCOPES")
-        .ok()
-        .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>());
-
-    let groups_claim = std::env::var("OIDC_GROUPS_CLAIM").unwrap_or_else(|_| "groups".to_string());
-    let redirect_uri = std::env::var("OIDC_REDIRECT_URI").ok();
-    let username_claim = std::env::var("OIDC_USERNAME_CLAIM").ok();
-    let email_claim = std::env::var("OIDC_EMAIL_CLAIM").ok();
-
-    let mut attr_map = serde_json::Map::new();
-    attr_map.insert(
-        "groups_claim".into(),
-        serde_json::Value::String(groups_claim),
-    );
-    if let Some(uri) = redirect_uri {
-        attr_map.insert("redirect_uri".into(), serde_json::Value::String(uri));
-    }
-    if let Some(claim) = username_claim {
-        attr_map.insert("username_claim".into(), serde_json::Value::String(claim));
-    }
-    if let Some(claim) = email_claim {
-        attr_map.insert("email_claim".into(), serde_json::Value::String(claim));
-    }
-
-    let req = CreateOidcConfigRequest {
-        name: "default".to_string(),
-        issuer_url: issuer,
-        client_id,
-        client_secret,
-        scopes,
-        attribute_mapping: Some(serde_json::Value::Object(attr_map)),
-        is_enabled: Some(true),
-        auto_create_users: Some(true),
-    };
-
     let config = AuthConfigService::create_oidc(db, req).await?;
     tracing::info!(
         "Bootstrapped OIDC provider '{}' (id={}) from environment variables",
@@ -604,6 +559,79 @@ async fn bootstrap_oidc_from_env(db: &sqlx::PgPool) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Raw OIDC environment variable values for bootstrap.
+#[derive(Default)]
+struct OidcEnvVars {
+    issuer: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    scopes: Option<String>,
+    groups_claim: Option<String>,
+    redirect_uri: Option<String>,
+    username_claim: Option<String>,
+    email_claim: Option<String>,
+}
+
+/// Build a CreateOidcConfigRequest from OIDC_* environment variables.
+/// Returns None if any of the three required env vars are missing or empty.
+fn build_oidc_bootstrap_request(
+) -> Option<artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest> {
+    build_oidc_request_from_values(OidcEnvVars {
+        issuer: std::env::var("OIDC_ISSUER").ok(),
+        client_id: std::env::var("OIDC_CLIENT_ID").ok(),
+        client_secret: std::env::var("OIDC_CLIENT_SECRET").ok(),
+        scopes: std::env::var("OIDC_SCOPES").ok(),
+        groups_claim: std::env::var("OIDC_GROUPS_CLAIM").ok(),
+        redirect_uri: std::env::var("OIDC_REDIRECT_URI").ok(),
+        username_claim: std::env::var("OIDC_USERNAME_CLAIM").ok(),
+        email_claim: std::env::var("OIDC_EMAIL_CLAIM").ok(),
+    })
+}
+
+/// Pure function that assembles a CreateOidcConfigRequest from optional values.
+/// Returns None if issuer, client_id, or client_secret are missing or empty.
+fn build_oidc_request_from_values(
+    env: OidcEnvVars,
+) -> Option<artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest> {
+    use artifact_keeper_backend::services::auth_config_service::CreateOidcConfigRequest;
+
+    let issuer = env.issuer.filter(|v| !v.is_empty())?;
+    let client_id = env.client_id.filter(|v| !v.is_empty())?;
+    let client_secret = env.client_secret.filter(|v| !v.is_empty())?;
+
+    let scopes = env
+        .scopes
+        .map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>());
+
+    let groups_claim_val = env.groups_claim.unwrap_or_else(|| "groups".to_string());
+
+    let mut attr_map = serde_json::Map::new();
+    attr_map.insert(
+        "groups_claim".into(),
+        serde_json::Value::String(groups_claim_val),
+    );
+    if let Some(uri) = env.redirect_uri {
+        attr_map.insert("redirect_uri".into(), serde_json::Value::String(uri));
+    }
+    if let Some(claim) = env.username_claim {
+        attr_map.insert("username_claim".into(), serde_json::Value::String(claim));
+    }
+    if let Some(claim) = env.email_claim {
+        attr_map.insert("email_claim".into(), serde_json::Value::String(claim));
+    }
+
+    Some(CreateOidcConfigRequest {
+        name: "default".to_string(),
+        issuer_url: issuer,
+        client_id,
+        client_secret,
+        scopes,
+        attribute_mapping: Some(serde_json::Value::Object(attr_map)),
+        is_enabled: Some(true),
+        auto_create_users: Some(true),
+    })
 }
 
 /// Provision the initial admin user on first boot and determine setup mode.
@@ -775,4 +803,250 @@ async fn load_active_plugins(
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     Ok(plugins)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // build_oidc_request_from_values
+    // -----------------------------------------------------------------------
+
+    fn env(
+        issuer: Option<&str>,
+        client_id: Option<&str>,
+        client_secret: Option<&str>,
+    ) -> OidcEnvVars {
+        OidcEnvVars {
+            issuer: issuer.map(String::from),
+            client_id: client_id.map(String::from),
+            client_secret: client_secret.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_request_all_required_fields() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("my-client"),
+            Some("my-secret"),
+        ))
+        .unwrap();
+
+        assert_eq!(req.name, "default");
+        assert_eq!(req.issuer_url, "https://idp.example.com");
+        assert_eq!(req.client_id, "my-client");
+        assert_eq!(req.client_secret, "my-secret");
+        assert_eq!(req.is_enabled, Some(true));
+        assert_eq!(req.auto_create_users, Some(true));
+    }
+
+    #[test]
+    fn test_bootstrap_request_missing_issuer() {
+        let req = build_oidc_request_from_values(env(None, Some("client"), Some("secret")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_missing_client_id() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            None,
+            Some("secret"),
+        ));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_missing_client_secret() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            None,
+        ));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_empty_issuer() {
+        let req = build_oidc_request_from_values(env(Some(""), Some("client"), Some("secret")));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_empty_client_id() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some(""),
+            Some("secret"),
+        ));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_empty_client_secret() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some(""),
+        ));
+        assert!(req.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_default_groups_claim() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        ))
+        .unwrap();
+
+        let attr = req.attribute_mapping.unwrap();
+        assert_eq!(attr["groups_claim"], "groups");
+    }
+
+    #[test]
+    fn test_bootstrap_request_custom_groups_claim() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.groups_claim = Some("roles".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        let attr = req.attribute_mapping.unwrap();
+        assert_eq!(attr["groups_claim"], "roles");
+    }
+
+    #[test]
+    fn test_bootstrap_request_scopes_parsing() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.scopes = Some("openid email profile offline_access".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        assert_eq!(
+            req.scopes.unwrap(),
+            vec!["openid", "email", "profile", "offline_access"]
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_request_no_scopes() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        ))
+        .unwrap();
+
+        assert!(req.scopes.is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_redirect_uri() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.redirect_uri = Some("https://app.example.com/callback".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        let attr = req.attribute_mapping.unwrap();
+        assert_eq!(attr["redirect_uri"], "https://app.example.com/callback");
+    }
+
+    #[test]
+    fn test_bootstrap_request_no_redirect_uri() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        ))
+        .unwrap();
+
+        let attr = req.attribute_mapping.unwrap();
+        assert!(attr.get("redirect_uri").is_none());
+    }
+
+    #[test]
+    fn test_bootstrap_request_custom_username_claim() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.username_claim = Some("upn".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        let attr = req.attribute_mapping.unwrap();
+        assert_eq!(attr["username_claim"], "upn");
+    }
+
+    #[test]
+    fn test_bootstrap_request_custom_email_claim() {
+        let mut e = env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        );
+        e.email_claim = Some("mail".into());
+        let req = build_oidc_request_from_values(e).unwrap();
+
+        let attr = req.attribute_mapping.unwrap();
+        assert_eq!(attr["email_claim"], "mail");
+    }
+
+    #[test]
+    fn test_bootstrap_request_all_optional_fields() {
+        let req = build_oidc_request_from_values(OidcEnvVars {
+            issuer: Some("https://auth.corp.com/realms/main".into()),
+            client_id: Some("artifact-keeper".into()),
+            client_secret: Some("super-secret-123".into()),
+            scopes: Some("openid email profile".into()),
+            groups_claim: Some("roles".into()),
+            redirect_uri: Some("https://app.corp.com/sso/callback".into()),
+            username_claim: Some("samaccountname".into()),
+            email_claim: Some("mail".into()),
+        })
+        .unwrap();
+
+        assert_eq!(req.issuer_url, "https://auth.corp.com/realms/main");
+        assert_eq!(req.client_id, "artifact-keeper");
+        assert_eq!(req.client_secret, "super-secret-123");
+        assert_eq!(req.scopes.unwrap(), vec!["openid", "email", "profile"]);
+
+        let attr = req.attribute_mapping.unwrap();
+        assert_eq!(attr["groups_claim"], "roles");
+        assert_eq!(attr["redirect_uri"], "https://app.corp.com/sso/callback");
+        assert_eq!(attr["username_claim"], "samaccountname");
+        assert_eq!(attr["email_claim"], "mail");
+    }
+
+    #[test]
+    fn test_bootstrap_request_no_optional_claims_in_attr_map() {
+        let req = build_oidc_request_from_values(env(
+            Some("https://idp.example.com"),
+            Some("client"),
+            Some("secret"),
+        ))
+        .unwrap();
+
+        let attr = req.attribute_mapping.unwrap();
+        let obj = attr.as_object().unwrap();
+        // Only groups_claim should be present (it always has a default)
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key("groups_claim"));
+        assert!(!obj.contains_key("redirect_uri"));
+        assert!(!obj.contains_key("username_claim"));
+        assert!(!obj.contains_key("email_claim"));
+    }
 }

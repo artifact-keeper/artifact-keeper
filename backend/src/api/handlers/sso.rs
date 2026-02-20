@@ -111,12 +111,7 @@ pub async fn oidc_login(
         })?;
 
     // 4. Build redirect_uri from attribute_mapping, falling back to relative path
-    let redirect_uri = row
-        .attribute_mapping
-        .get("redirect_uri")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| format!("/api/v1/auth/sso/oidc/{id}/callback"));
+    let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id);
 
     // 5. Build authorization URL
     let scope = if row.scopes.is_empty() {
@@ -195,12 +190,7 @@ pub async fn oidc_callback(
         .ok_or_else(|| AppError::Internal("OIDC discovery missing token_endpoint".into()))?;
 
     // 4. Build redirect_uri (must match the one used in the login request)
-    let redirect_uri = row
-        .attribute_mapping
-        .get("redirect_uri")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| format!("/api/v1/auth/sso/oidc/{id}/callback"));
+    let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id);
 
     // 5. Exchange authorization code for tokens
     let token_response: serde_json::Value = http_client
@@ -229,18 +219,9 @@ pub async fn oidc_callback(
     // 7. Extract user claims (using attribute_mapping overrides when configured)
     let attr = &row.attribute_mapping;
 
-    let username_claim = attr
-        .get("username_claim")
-        .and_then(|v| v.as_str())
-        .unwrap_or("preferred_username");
-    let email_claim = attr
-        .get("email_claim")
-        .and_then(|v| v.as_str())
-        .unwrap_or("email");
-    let groups_claim = attr
-        .get("groups_claim")
-        .and_then(|v| v.as_str())
-        .unwrap_or("groups");
+    let username_claim = resolve_oidc_claim_name(attr, "username_claim", "preferred_username");
+    let email_claim = resolve_oidc_claim_name(attr, "email_claim", "email");
+    let groups_claim = resolve_oidc_claim_name(attr, "groups_claim", "groups");
 
     let sub = claims["sub"]
         .as_str()
@@ -257,14 +238,7 @@ pub async fn oidc_callback(
 
     let display_name = claims["name"].as_str().map(|s| s.to_string());
 
-    let groups = claims[groups_claim]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let groups = extract_oidc_groups(&claims, groups_claim);
 
     // 8. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
@@ -593,6 +567,44 @@ pub struct SsoApiDoc;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve the redirect URI from OIDC attribute_mapping, falling back to the
+/// default callback path for the given provider ID.
+pub(crate) fn resolve_oidc_redirect_uri(
+    attribute_mapping: &serde_json::Value,
+    provider_id: &uuid::Uuid,
+) -> String {
+    attribute_mapping
+        .get("redirect_uri")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("/api/v1/auth/sso/oidc/{provider_id}/callback"))
+}
+
+/// Resolve a claim name from OIDC attribute_mapping, returning the configured
+/// value or the provided default.
+pub(crate) fn resolve_oidc_claim_name<'a>(
+    attribute_mapping: &'a serde_json::Value,
+    key: &str,
+    default: &'a str,
+) -> &'a str {
+    attribute_mapping
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+}
+
+/// Extract user groups from JWT claims using the configured groups claim name.
+pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str) -> Vec<String> {
+    claims[groups_claim]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Decode the payload segment of a JWT without verifying the signature.
 ///
 /// This is safe here because we just received the token directly from the
@@ -791,6 +803,206 @@ mod tests {
         assert_eq!(json["refresh_token"], "rt_456");
         assert_eq!(json["token_type"], "Bearer");
     }
+
+    // -----------------------------------------------------------------------
+    // resolve_oidc_redirect_uri
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_redirect_uri_from_attribute_mapping() {
+        let attr = serde_json::json!({
+            "redirect_uri": "https://app.example.com/callback"
+        });
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            resolve_oidc_redirect_uri(&attr, &id),
+            "https://app.example.com/callback"
+        );
+    }
+
+    #[test]
+    fn test_redirect_uri_fallback_when_missing() {
+        let attr = serde_json::json!({});
+        let id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            resolve_oidc_redirect_uri(&attr, &id),
+            "/api/v1/auth/sso/oidc/550e8400-e29b-41d4-a716-446655440000/callback"
+        );
+    }
+
+    #[test]
+    fn test_redirect_uri_fallback_when_null() {
+        let attr = serde_json::json!({ "redirect_uri": null });
+        let id = uuid::Uuid::nil();
+        assert_eq!(
+            resolve_oidc_redirect_uri(&attr, &id),
+            "/api/v1/auth/sso/oidc/00000000-0000-0000-0000-000000000000/callback"
+        );
+    }
+
+    #[test]
+    fn test_redirect_uri_fallback_when_non_string() {
+        let attr = serde_json::json!({ "redirect_uri": 42 });
+        let id = uuid::Uuid::nil();
+        // Non-string value should fall back to default
+        assert!(resolve_oidc_redirect_uri(&attr, &id).starts_with("/api/v1/auth/sso/oidc/"));
+    }
+
+    #[test]
+    fn test_redirect_uri_with_null_attribute_mapping() {
+        let attr = serde_json::Value::Null;
+        let id = uuid::Uuid::nil();
+        assert!(resolve_oidc_redirect_uri(&attr, &id).contains("/callback"));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_oidc_claim_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_claim_name_custom_groups_claim() {
+        let attr = serde_json::json!({ "groups_claim": "roles" });
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "groups_claim", "groups"),
+            "roles"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_default_groups() {
+        let attr = serde_json::json!({});
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "groups_claim", "groups"),
+            "groups"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_custom_username() {
+        let attr = serde_json::json!({ "username_claim": "upn" });
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "username_claim", "preferred_username"),
+            "upn"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_default_username() {
+        let attr = serde_json::json!({});
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "username_claim", "preferred_username"),
+            "preferred_username"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_custom_email() {
+        let attr = serde_json::json!({ "email_claim": "mail" });
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "email_claim", "email"),
+            "mail"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_default_email() {
+        let attr = serde_json::json!({});
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "email_claim", "email"),
+            "email"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_null_value_uses_default() {
+        let attr = serde_json::json!({ "groups_claim": null });
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "groups_claim", "groups"),
+            "groups"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_non_string_uses_default() {
+        let attr = serde_json::json!({ "groups_claim": 123 });
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "groups_claim", "groups"),
+            "groups"
+        );
+    }
+
+    #[test]
+    fn test_claim_name_null_mapping_uses_default() {
+        let attr = serde_json::Value::Null;
+        assert_eq!(
+            resolve_oidc_claim_name(&attr, "groups_claim", "groups"),
+            "groups"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_oidc_groups
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_groups_standard() {
+        let claims = serde_json::json!({
+            "groups": ["admin", "developers", "users"]
+        });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert_eq!(groups, vec!["admin", "developers", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_custom_claim() {
+        let claims = serde_json::json!({
+            "roles": ["manager", "viewer"]
+        });
+        let groups = extract_oidc_groups(&claims, "roles");
+        assert_eq!(groups, vec!["manager", "viewer"]);
+    }
+
+    #[test]
+    fn test_extract_groups_missing_claim() {
+        let claims = serde_json::json!({ "sub": "user-123" });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_extract_groups_empty_array() {
+        let claims = serde_json::json!({ "groups": [] });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_extract_groups_non_array_claim() {
+        let claims = serde_json::json!({ "groups": "admin" });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert!(groups.is_empty()); // string is not an array
+    }
+
+    #[test]
+    fn test_extract_groups_mixed_types_in_array() {
+        let claims = serde_json::json!({
+            "groups": ["admin", 42, "users", null, true]
+        });
+        let groups = extract_oidc_groups(&claims, "groups");
+        // Only string values are extracted
+        assert_eq!(groups, vec!["admin", "users"]);
+    }
+
+    #[test]
+    fn test_extract_groups_null_claim() {
+        let claims = serde_json::json!({ "groups": null });
+        let groups = extract_oidc_groups(&claims, "groups");
+        assert!(groups.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested object claims (existing test extended)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_decode_jwt_payload_with_nested_object() {
