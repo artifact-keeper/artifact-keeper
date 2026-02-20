@@ -1284,4 +1284,506 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // build_execution_result tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a LifecyclePolicy with the given fields for use in
+    /// build_execution_result tests. Only id, name, and policy_type matter
+    /// for the builder; everything else gets sensible defaults.
+    fn make_policy(id: Uuid, name: &str, policy_type: &str) -> LifecyclePolicy {
+        let now = Utc::now();
+        LifecyclePolicy {
+            id,
+            repository_id: None,
+            name: name.to_string(),
+            description: None,
+            enabled: true,
+            policy_type: policy_type.to_string(),
+            config: json!({}),
+            priority: 0,
+            last_run_at: None,
+            last_run_items_removed: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn test_build_execution_result_dry_run_zeroes_removed_and_freed() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Age Policy", "max_age_days");
+        let result = LifecycleService::build_execution_result(&policy, true, 42, 42, 1_048_576);
+
+        assert_eq!(result.policy_id, id);
+        assert_eq!(result.policy_name, "Age Policy");
+        assert!(result.dry_run);
+        assert_eq!(result.artifacts_matched, 42);
+        assert_eq!(
+            result.artifacts_removed, 0,
+            "dry_run should zero artifacts_removed"
+        );
+        assert_eq!(result.bytes_freed, 0, "dry_run should zero bytes_freed");
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_build_execution_result_real_run_preserves_values() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Version Cleanup", "max_versions");
+        let result = LifecycleService::build_execution_result(&policy, false, 100, 80, 5_000_000);
+
+        assert_eq!(result.policy_id, id);
+        assert_eq!(result.policy_name, "Version Cleanup");
+        assert!(!result.dry_run);
+        assert_eq!(result.artifacts_matched, 100);
+        assert_eq!(result.artifacts_removed, 80);
+        assert_eq!(result.bytes_freed, 5_000_000);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_build_execution_result_zero_values() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Empty Run", "no_downloads_days");
+        let result = LifecycleService::build_execution_result(&policy, false, 0, 0, 0);
+
+        assert_eq!(result.artifacts_matched, 0);
+        assert_eq!(result.artifacts_removed, 0);
+        assert_eq!(result.bytes_freed, 0);
+        assert!(!result.dry_run);
+    }
+
+    #[test]
+    fn test_build_execution_result_zero_values_dry_run() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Empty Dry", "max_age_days");
+        let result = LifecycleService::build_execution_result(&policy, true, 0, 0, 0);
+
+        assert_eq!(result.artifacts_matched, 0);
+        assert_eq!(result.artifacts_removed, 0);
+        assert_eq!(result.bytes_freed, 0);
+        assert!(result.dry_run);
+    }
+
+    #[test]
+    fn test_build_execution_result_large_values() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Big Repo Cleanup", "size_quota_bytes");
+        let matched = 1_000_000i64;
+        let removed = 999_999i64;
+        let bytes = 10_000_000_000_000i64; // 10 TB
+        let result =
+            LifecycleService::build_execution_result(&policy, false, matched, removed, bytes);
+
+        assert_eq!(result.artifacts_matched, 1_000_000);
+        assert_eq!(result.artifacts_removed, 999_999);
+        assert_eq!(result.bytes_freed, 10_000_000_000_000);
+    }
+
+    #[test]
+    fn test_build_execution_result_large_values_dry_run() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Big Dry Run", "size_quota_bytes");
+        let result = LifecycleService::build_execution_result(
+            &policy,
+            true,
+            1_000_000,
+            999_999,
+            10_000_000_000_000,
+        );
+
+        assert_eq!(result.artifacts_matched, 1_000_000);
+        assert_eq!(
+            result.artifacts_removed, 0,
+            "dry_run must zero even large artifacts_removed"
+        );
+        assert_eq!(
+            result.bytes_freed, 0,
+            "dry_run must zero even large bytes_freed"
+        );
+    }
+
+    #[test]
+    fn test_build_execution_result_matched_greater_than_removed() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Partial Cleanup", "tag_pattern_delete");
+        let result = LifecycleService::build_execution_result(&policy, false, 50, 30, 2048);
+
+        assert_eq!(result.artifacts_matched, 50);
+        assert_eq!(result.artifacts_removed, 30);
+        assert_eq!(result.bytes_freed, 2048);
+    }
+
+    #[test]
+    fn test_build_execution_result_clones_policy_name() {
+        let id = Uuid::new_v4();
+        let policy = make_policy(id, "Original Name", "max_age_days");
+        let result = LifecycleService::build_execution_result(&policy, false, 1, 1, 100);
+
+        // The result should have a cloned copy of the policy name
+        assert_eq!(result.policy_name, "Original Name");
+        // Verify the original policy is still intact (not moved)
+        assert_eq!(policy.name, "Original Name");
+    }
+
+    #[test]
+    fn test_build_execution_result_errors_always_empty() {
+        // build_execution_result always returns an empty errors vec;
+        // errors are only populated by the caller (e.g., execute_all_enabled).
+        let policy = make_policy(Uuid::new_v4(), "Test", "max_age_days");
+
+        let dry = LifecycleService::build_execution_result(&policy, true, 10, 10, 500);
+        assert!(dry.errors.is_empty());
+
+        let real = LifecycleService::build_execution_result(&policy, false, 10, 10, 500);
+        assert!(real.errors.is_empty());
+    }
+
+    #[test]
+    fn test_build_execution_result_preserves_policy_id() {
+        // Verify with a nil UUID (edge case)
+        let nil_policy = make_policy(Uuid::nil(), "Nil ID Policy", "max_versions");
+        let result = LifecycleService::build_execution_result(&nil_policy, false, 5, 5, 100);
+        assert_eq!(result.policy_id, Uuid::nil());
+
+        // And with a specific UUID
+        let specific_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let specific_policy = make_policy(specific_id, "Specific", "max_age_days");
+        let result2 = LifecycleService::build_execution_result(&specific_policy, true, 1, 1, 50);
+        assert_eq!(result2.policy_id, specific_id);
+    }
+
+    #[test]
+    fn test_build_execution_result_each_policy_type() {
+        // Confirm build_execution_result works identically regardless of policy_type
+        // (it does not branch on policy_type, but this guards against future regressions).
+        let types = [
+            "max_age_days",
+            "max_versions",
+            "no_downloads_days",
+            "tag_pattern_keep",
+            "tag_pattern_delete",
+            "size_quota_bytes",
+        ];
+        for pt in types {
+            let policy = make_policy(Uuid::new_v4(), &format!("{} policy", pt), pt);
+            let result = LifecycleService::build_execution_result(&policy, false, 10, 7, 4096);
+            assert_eq!(result.artifacts_matched, 10);
+            assert_eq!(result.artifacts_removed, 7);
+            assert_eq!(result.bytes_freed, 4096);
+            assert_eq!(result.policy_name, format!("{} policy", pt));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_policy_config: boundary and edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_validate_max_age_days_boundary_one() {
+        let svc = make_service_for_validation();
+        let config = json!({"days": 1});
+        assert!(svc.validate_policy_config("max_age_days", &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_age_days_very_large() {
+        let svc = make_service_for_validation();
+        let config = json!({"days": 36500}); // 100 years
+        assert!(svc.validate_policy_config("max_age_days", &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_age_days_float_value() {
+        let svc = make_service_for_validation();
+        // 30.5 is a float, as_i64() returns None for non-integer JSON numbers
+        let config = json!({"days": 30.5});
+        let result = svc.validate_policy_config("max_age_days", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_age_days_null_value() {
+        let svc = make_service_for_validation();
+        let config = json!({"days": null});
+        let result = svc.validate_policy_config("max_age_days", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_versions_boundary_one() {
+        let svc = make_service_for_validation();
+        let config = json!({"keep": 1});
+        assert!(svc.validate_policy_config("max_versions", &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_versions_very_large() {
+        let svc = make_service_for_validation();
+        let config = json!({"keep": 100_000});
+        assert!(svc.validate_policy_config("max_versions", &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_versions_float_value() {
+        let svc = make_service_for_validation();
+        let config = json!({"keep": 5.5});
+        let result = svc.validate_policy_config("max_versions", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_no_downloads_days_boundary_one() {
+        let svc = make_service_for_validation();
+        let config = json!({"days": 1});
+        assert!(svc
+            .validate_policy_config("no_downloads_days", &config)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_no_downloads_days_negative() {
+        let svc = make_service_for_validation();
+        let config = json!({"days": -10});
+        let result = svc.validate_policy_config("no_downloads_days", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_size_quota_bytes_boundary_one() {
+        let svc = make_service_for_validation();
+        let config = json!({"quota_bytes": 1});
+        assert!(svc
+            .validate_policy_config("size_quota_bytes", &config)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_size_quota_bytes_very_large() {
+        let svc = make_service_for_validation();
+        // 1 PB
+        let config = json!({"quota_bytes": 1_125_899_906_842_624_i64});
+        assert!(svc
+            .validate_policy_config("size_quota_bytes", &config)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_size_quota_bytes_float_value() {
+        let svc = make_service_for_validation();
+        let config = json!({"quota_bytes": 1073741824.5});
+        let result = svc.validate_policy_config("size_quota_bytes", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_tag_pattern_complex_regex() {
+        let svc = make_service_for_validation();
+        let config = json!({"pattern": r"^v\d+\.\d+\.\d+(-rc\.\d+)?$"});
+        assert!(svc
+            .validate_policy_config("tag_pattern_keep", &config)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_tag_pattern_empty_string() {
+        // An empty regex is technically valid (matches everything)
+        let svc = make_service_for_validation();
+        let config = json!({"pattern": ""});
+        assert!(svc
+            .validate_policy_config("tag_pattern_delete", &config)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_tag_pattern_delete_invalid_nested_groups() {
+        let svc = make_service_for_validation();
+        let config = json!({"pattern": "((("});
+        let result = svc.validate_policy_config("tag_pattern_delete", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_tag_pattern_null_pattern() {
+        let svc = make_service_for_validation();
+        let config = json!({"pattern": null});
+        let result = svc.validate_policy_config("tag_pattern_keep", &config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_tag_pattern_boolean_pattern() {
+        let svc = make_service_for_validation();
+        let config = json!({"pattern": true});
+        let result = svc.validate_policy_config("tag_pattern_delete", &config);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_policy_config: error message content
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_validate_max_age_error_message_content() {
+        let svc = make_service_for_validation();
+        let config = json!({});
+        let err = svc
+            .validate_policy_config("max_age_days", &config)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_age_days"),
+            "Error should mention the policy type"
+        );
+        assert!(
+            msg.contains("days"),
+            "Error should mention the missing field"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_max_versions_error_message_content() {
+        let svc = make_service_for_validation();
+        let config = json!({"keep": -1});
+        let err = svc
+            .validate_policy_config("max_versions", &config)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("max_versions"));
+        assert!(msg.contains("keep"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_size_quota_error_message_content() {
+        let svc = make_service_for_validation();
+        let config = json!({"quota_bytes": 0});
+        let err = svc
+            .validate_policy_config("size_quota_bytes", &config)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("size_quota_bytes"));
+        assert!(msg.contains("quota_bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_tag_pattern_invalid_regex_error_message() {
+        let svc = make_service_for_validation();
+        let config = json!({"pattern": "[bad"});
+        let err = svc
+            .validate_policy_config("tag_pattern_keep", &config)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("regex"), "Error should mention regex");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_policy_config: extra keys are silently ignored
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_validate_extra_keys_ignored() {
+        let svc = make_service_for_validation();
+
+        // max_age_days with extra fields
+        let config = json!({"days": 30, "extra": "ignored", "another": 99});
+        assert!(svc.validate_policy_config("max_age_days", &config).is_ok());
+
+        // tag_pattern_keep with extra fields
+        let config = json!({"pattern": "^release", "foo": "bar"});
+        assert!(svc
+            .validate_policy_config("tag_pattern_keep", &config)
+            .is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // PolicyExecutionResult: serialization edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_policy_execution_result_serialization_large_values() {
+        let result = PolicyExecutionResult {
+            policy_id: Uuid::new_v4(),
+            policy_name: "Terabyte Cleanup".to_string(),
+            dry_run: false,
+            artifacts_matched: i64::MAX,
+            artifacts_removed: i64::MAX,
+            bytes_freed: i64::MAX,
+            errors: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains(&i64::MAX.to_string()));
+    }
+
+    #[test]
+    fn test_policy_execution_result_serialization_zero_artifacts() {
+        let result = PolicyExecutionResult {
+            policy_id: Uuid::nil(),
+            policy_name: "No-Op".to_string(),
+            dry_run: false,
+            artifacts_matched: 0,
+            artifacts_removed: 0,
+            bytes_freed: 0,
+            errors: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["artifacts_matched"], 0);
+        assert_eq!(parsed["artifacts_removed"], 0);
+        assert_eq!(parsed["bytes_freed"], 0);
+        assert_eq!(parsed["dry_run"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // CreatePolicyRequest: deserialization edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_policy_request_missing_required_field() {
+        // Missing "name" field
+        let json_str = r#"{"policy_type": "max_age_days", "config": {"days": 30}}"#;
+        let result: std::result::Result<CreatePolicyRequest, _> = serde_json::from_str(json_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_policy_request_missing_config() {
+        // Missing "config" field
+        let json_str = r#"{"name": "Test", "policy_type": "max_age_days"}"#;
+        let result: std::result::Result<CreatePolicyRequest, _> = serde_json::from_str(json_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_policy_request_partial_fields() {
+        let json_val = json!({
+            "enabled": false,
+            "priority": 99
+        });
+        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        assert!(req.name.is_none());
+        assert!(req.description.is_none());
+        assert_eq!(req.enabled, Some(false));
+        assert!(req.config.is_none());
+        assert_eq!(req.priority, Some(99));
+    }
+
+    #[test]
+    fn test_update_policy_request_all_fields() {
+        let json_val = json!({
+            "name": "Updated Name",
+            "description": "Updated Description",
+            "enabled": true,
+            "config": {"days": 60},
+            "priority": 5
+        });
+        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        assert_eq!(req.name, Some("Updated Name".to_string()));
+        assert_eq!(req.description, Some("Updated Description".to_string()));
+        assert_eq!(req.enabled, Some(true));
+        assert!(req.config.is_some());
+        assert_eq!(req.config.unwrap()["days"], 60);
+        assert_eq!(req.priority, Some(5));
+    }
 }

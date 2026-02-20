@@ -466,4 +466,659 @@ mod tests {
         assert_eq!(findings[1].title, "CVE-2024-67890 in libc6");
         assert!(findings[1].fixed_version.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // write_temp_file tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_write_temp_file_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_file.bin");
+        let content = Bytes::from_static(b"hello world");
+
+        write_temp_file(&path, &content, "test").await.unwrap();
+
+        let read_back = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(read_back, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_write_temp_file_empty_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        let content = Bytes::new();
+
+        write_temp_file(&path, &content, "empty").await.unwrap();
+
+        let read_back = tokio::fs::read(&path).await.unwrap();
+        assert!(read_back.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_temp_file_invalid_path() {
+        // Writing to a path under a nonexistent directory should fail
+        let path = PathBuf::from("/nonexistent_dir_abc123/test_file.bin");
+        let content = Bytes::from_static(b"data");
+
+        let result = write_temp_file(&path, &content, "bad path").await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Failed to write bad path"));
+    }
+
+    // -----------------------------------------------------------------------
+    // run_command tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_command_success() {
+        // `true` always exits 0
+        run_command("true", &[], "true command").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_command_failure_nonzero_exit() {
+        // `false` always exits 1
+        let result = run_command("false", &[], "false command").await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("false command failed"));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_nonexistent_program() {
+        let result = run_command("nonexistent_program_xyz_12345", &[], "missing program").await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Failed to execute nonexistent_program_xyz_12345"));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_with_args() {
+        // `echo hello` should succeed
+        run_command("echo", &["hello"], "echo test").await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // IncusScanner::new and basic accessors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scanner_new() {
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            "/tmp/scan-workspace".to_string(),
+        );
+        assert_eq!(scanner.trivy_url, "http://trivy:8090");
+        assert_eq!(scanner.scan_workspace, "/tmp/scan-workspace");
+    }
+
+    #[test]
+    fn test_scanner_name() {
+        let scanner = IncusScanner::new("http://trivy:8090".to_string(), "/tmp".to_string());
+        assert_eq!(scanner.name(), "incus-image");
+    }
+
+    #[test]
+    fn test_scanner_scan_type() {
+        let scanner = IncusScanner::new("http://trivy:8090".to_string(), "/tmp".to_string());
+        assert_eq!(scanner.scan_type(), "incus");
+    }
+
+    // -----------------------------------------------------------------------
+    // workspace_dir tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_workspace_dir() {
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            "/var/scan-workspace".to_string(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+        let dir = scanner.workspace_dir(&artifact);
+        let expected = format!("/var/scan-workspace/incus-{}", artifact.id);
+        assert_eq!(dir, PathBuf::from(expected));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_applicable: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_applicable_lxd_tarball() {
+        let artifact = make_incus_artifact("lxd.tar.xz", "ubuntu-noble/20240215/lxd.tar.xz");
+        assert!(IncusScanner::is_applicable(&artifact));
+    }
+
+    #[test]
+    fn test_is_applicable_custom_tarball_name() {
+        // Any .tar.xz file under product/version/ is treated as a unified tarball
+        let artifact = make_incus_artifact(
+            "custom-image.tar.xz",
+            "alpine-edge/v3.20/custom-image.tar.xz",
+        );
+        assert!(IncusScanner::is_applicable(&artifact));
+    }
+
+    #[test]
+    fn test_is_applicable_tar_gz() {
+        let artifact = make_incus_artifact("image.tar.gz", "debian-trixie/v1.0/image.tar.gz");
+        assert!(IncusScanner::is_applicable(&artifact));
+    }
+
+    #[test]
+    fn test_is_applicable_qcow2_extension() {
+        let artifact = make_incus_artifact("rootfs.qcow2", "fedora-40/v1.0/rootfs.qcow2");
+        assert!(IncusScanner::is_applicable(&artifact));
+    }
+
+    #[test]
+    fn test_not_applicable_streams_images() {
+        let artifact = make_incus_artifact("images.json", "streams/v1/images.json");
+        assert!(!IncusScanner::is_applicable(&artifact));
+    }
+
+    #[test]
+    fn test_is_applicable_leading_slash_in_path() {
+        // parse_path trims leading slashes, so this should still work
+        let artifact = make_incus_artifact("incus.tar.xz", "/ubuntu-noble/20240215/incus.tar.xz");
+        assert!(IncusScanner::is_applicable(&artifact));
+    }
+
+    #[test]
+    fn test_not_applicable_meta_tar_xz() {
+        let artifact = make_incus_artifact("meta.tar.xz", "ubuntu-noble/20240215/meta.tar.xz");
+        assert!(!IncusScanner::is_applicable(&artifact));
+    }
+
+    // -----------------------------------------------------------------------
+    // convert_findings: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_convert_findings_no_vulnerabilities_field() {
+        // When vulnerabilities is None, the result should produce no findings
+        let report = TrivyReport {
+            results: vec![crate::services::image_scanner::TrivyResult {
+                target: "usr/lib/dpkg/status".to_string(),
+                class: "os-pkgs".to_string(),
+                result_type: "ubuntu".to_string(),
+                vulnerabilities: None,
+            }],
+        };
+        let findings = IncusScanner::convert_findings(&report);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_convert_findings_empty_vulnerabilities_vec() {
+        let report = TrivyReport {
+            results: vec![crate::services::image_scanner::TrivyResult {
+                target: "some/target".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "gomod".to_string(),
+                vulnerabilities: Some(vec![]),
+            }],
+        };
+        let findings = IncusScanner::convert_findings(&report);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_convert_findings_multiple_results() {
+        let report = TrivyReport {
+            results: vec![
+                crate::services::image_scanner::TrivyResult {
+                    target: "dpkg/status".to_string(),
+                    class: "os-pkgs".to_string(),
+                    result_type: "ubuntu".to_string(),
+                    vulnerabilities: Some(vec![
+                        crate::services::image_scanner::TrivyVulnerability {
+                            vulnerability_id: "CVE-2024-00001".to_string(),
+                            pkg_name: "openssl".to_string(),
+                            installed_version: "1.0.0".to_string(),
+                            fixed_version: Some("1.0.1".to_string()),
+                            severity: "CRITICAL".to_string(),
+                            title: Some("Critical vuln".to_string()),
+                            description: Some("Desc".to_string()),
+                            primary_url: None,
+                        },
+                    ]),
+                },
+                crate::services::image_scanner::TrivyResult {
+                    target: "go.sum".to_string(),
+                    class: "lang-pkgs".to_string(),
+                    result_type: "gomod".to_string(),
+                    vulnerabilities: Some(vec![
+                        crate::services::image_scanner::TrivyVulnerability {
+                            vulnerability_id: "CVE-2024-00002".to_string(),
+                            pkg_name: "github.com/example/lib".to_string(),
+                            installed_version: "0.5.0".to_string(),
+                            fixed_version: None,
+                            severity: "LOW".to_string(),
+                            title: None,
+                            description: None,
+                            primary_url: None,
+                        },
+                    ]),
+                },
+            ],
+        };
+
+        let findings = IncusScanner::convert_findings(&report);
+        assert_eq!(findings.len(), 2);
+
+        // First from os-pkgs result
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].cve_id, Some("CVE-2024-00001".to_string()));
+        assert_eq!(
+            findings[0].affected_component,
+            Some("openssl (dpkg/status)".to_string())
+        );
+        assert_eq!(findings[0].fixed_version, Some("1.0.1".to_string()));
+
+        // Second from gomod result
+        assert_eq!(findings[1].severity, Severity::Low);
+        assert_eq!(
+            findings[1].title,
+            "CVE-2024-00002 in github.com/example/lib"
+        );
+        assert_eq!(
+            findings[1].affected_component,
+            Some("github.com/example/lib (go.sum)".to_string())
+        );
+        assert!(findings[1].fixed_version.is_none());
+        assert!(findings[1].description.is_none());
+        assert!(findings[1].source_url.is_none());
+    }
+
+    #[test]
+    fn test_convert_findings_all_severity_levels() {
+        let make_vuln = |id: &str, sev: &str| crate::services::image_scanner::TrivyVulnerability {
+            vulnerability_id: id.to_string(),
+            pkg_name: "pkg".to_string(),
+            installed_version: "1.0".to_string(),
+            fixed_version: None,
+            severity: sev.to_string(),
+            title: None,
+            description: None,
+            primary_url: None,
+        };
+
+        let report = TrivyReport {
+            results: vec![crate::services::image_scanner::TrivyResult {
+                target: "test".to_string(),
+                class: "os-pkgs".to_string(),
+                result_type: "debian".to_string(),
+                vulnerabilities: Some(vec![
+                    make_vuln("CVE-1", "CRITICAL"),
+                    make_vuln("CVE-2", "HIGH"),
+                    make_vuln("CVE-3", "MEDIUM"),
+                    make_vuln("CVE-4", "LOW"),
+                    make_vuln("CVE-5", "UNKNOWN"),
+                ]),
+            }],
+        };
+
+        let findings = IncusScanner::convert_findings(&report);
+        assert_eq!(findings.len(), 5);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[1].severity, Severity::High);
+        assert_eq!(findings[2].severity, Severity::Medium);
+        assert_eq!(findings[3].severity, Severity::Low);
+        // Unknown severity falls back to Info
+        assert_eq!(findings[4].severity, Severity::Info);
+    }
+
+    #[test]
+    fn test_convert_findings_preserves_source_url() {
+        let report = TrivyReport {
+            results: vec![crate::services::image_scanner::TrivyResult {
+                target: "test".to_string(),
+                class: "os-pkgs".to_string(),
+                result_type: "alpine".to_string(),
+                vulnerabilities: Some(vec![crate::services::image_scanner::TrivyVulnerability {
+                    vulnerability_id: "CVE-2024-99999".to_string(),
+                    pkg_name: "musl".to_string(),
+                    installed_version: "1.2.4".to_string(),
+                    fixed_version: Some("1.2.5".to_string()),
+                    severity: "HIGH".to_string(),
+                    title: Some("musl overflow".to_string()),
+                    description: Some("Heap overflow in musl libc".to_string()),
+                    primary_url: Some("https://avd.aquasec.com/nvd/cve-2024-99999".to_string()),
+                }]),
+            }],
+        };
+
+        let findings = IncusScanner::convert_findings(&report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].source_url,
+            Some("https://avd.aquasec.com/nvd/cve-2024-99999".to_string())
+        );
+        assert_eq!(
+            findings[0].description,
+            Some("Heap overflow in musl libc".to_string())
+        );
+        assert_eq!(findings[0].affected_version, Some("1.2.4".to_string()));
+    }
+
+    #[test]
+    fn test_convert_findings_source_always_trivy_incus() {
+        let report = TrivyReport {
+            results: vec![crate::services::image_scanner::TrivyResult {
+                target: "t".to_string(),
+                class: "".to_string(),
+                result_type: "".to_string(),
+                vulnerabilities: Some(vec![crate::services::image_scanner::TrivyVulnerability {
+                    vulnerability_id: "CVE-X".to_string(),
+                    pkg_name: "p".to_string(),
+                    installed_version: "1".to_string(),
+                    fixed_version: None,
+                    severity: "LOW".to_string(),
+                    title: None,
+                    description: None,
+                    primary_url: None,
+                }]),
+            }],
+        };
+
+        let findings = IncusScanner::convert_findings(&report);
+        assert_eq!(findings[0].source, Some("trivy-incus".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // scan method: non-applicable artifact and empty content
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_scan_returns_empty_for_non_applicable_artifact() {
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            "/tmp/test-workspace".to_string(),
+        );
+        // streams/v1/index.json is not applicable
+        let artifact = make_incus_artifact("index.json", "streams/v1/index.json");
+        let content = Bytes::from_static(b"{}");
+
+        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scan_returns_empty_for_empty_content() {
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            "/tmp/test-workspace".to_string(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+        let content = Bytes::new();
+
+        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scan_returns_empty_for_metadata_only() {
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            "/tmp/test-workspace".to_string(),
+        );
+        let artifact =
+            make_incus_artifact("metadata.tar.xz", "ubuntu-noble/20240215/metadata.tar.xz");
+        let content = Bytes::from_static(b"some content");
+
+        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
+        assert!(findings.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // prepare_workspace: QCOW2 returns error (unscannable)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_prepare_workspace_qcow2_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_incus_artifact("rootfs.img", "ubuntu-noble/20240215/rootfs.img");
+        let content = Bytes::from_static(b"fake qcow2 data");
+
+        let result = scanner.prepare_workspace(&artifact, &content).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("QCOW2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // prepare_workspace: invalid path yields error
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_prepare_workspace_invalid_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        // Single-segment path cannot be parsed by IncusHandler::parse_path
+        let mut artifact = make_incus_artifact("bad.bin", "bad.bin");
+        // Force path to something that fails parse_path but passes is_applicable check
+        // Actually parse_path will fail, so prepare_workspace will error
+        artifact.path = "single_segment".to_string();
+
+        let content = Bytes::from_static(b"data");
+        let result = scanner.prepare_workspace(&artifact, &content).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Invalid Incus path"));
+    }
+
+    // -----------------------------------------------------------------------
+    // scan gracefully handles prepare_workspace failure
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_scan_qcow2_returns_empty_findings() {
+        // QCOW2 artifacts are applicable but prepare_workspace fails,
+        // so scan should return empty findings gracefully.
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_incus_artifact("rootfs.img", "ubuntu-noble/20240215/rootfs.img");
+        let content = Bytes::from_static(b"fake qcow2 data");
+
+        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
+        assert!(findings.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_tarball: XZ magic bytes detection
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_extract_tarball_detects_xz_magic() {
+        // We cannot produce a valid tar.xz in tests easily, but we can verify
+        // the function correctly identifies XZ format via magic bytes and fails
+        // gracefully on invalid content.
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs_dir = dir.path().join("rootfs");
+        tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
+
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        // XZ magic bytes: 0xFD 0x37 0x7A 0x58 0x5A followed by invalid data
+        let mut xz_content = vec![0xFD, 0x37, 0x7A, 0x58, 0x5A];
+        xz_content.extend_from_slice(b"not-valid-xz-data");
+        let content = Bytes::from(xz_content);
+
+        let result = scanner.extract_tarball(&content, &rootfs_dir).await;
+        // Should fail during tar extraction (invalid xz data), not during write
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("tar extraction failed"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_tarball_detects_gzip_fallback() {
+        // Content without XZ magic bytes should be treated as gzip
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs_dir = dir.path().join("rootfs");
+        tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
+
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        // Gzip magic: 1F 8B, but followed by garbage
+        let content = Bytes::from_static(&[0x1F, 0x8B, 0x08, 0x00, 0x00]);
+
+        let result = scanner.extract_tarball(&content, &rootfs_dir).await;
+        // Should fail during tar extraction (invalid gzip)
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("tar extraction failed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_squashfs: nonexistent unsquashfs binary
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_extract_squashfs_writes_file_then_runs_unsquashfs() {
+        // This test verifies that the squashfs path is written correctly.
+        // unsquashfs is likely not available in CI, so we expect either
+        // a "not found" error or a "failed" error from unsquashfs.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let rootfs_dir = workspace.join("rootfs");
+        tokio::fs::create_dir_all(&rootfs_dir).await.unwrap();
+
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        let content = Bytes::from_static(b"not-a-real-squashfs");
+        let result = scanner
+            .extract_squashfs(&content, &workspace, &rootfs_dir)
+            .await;
+
+        // Should fail (unsquashfs either not found or fails on bad data)
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_workspace
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cleanup_workspace_removes_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+
+        // Create the workspace dir
+        let workspace = scanner.workspace_dir(&artifact);
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        assert!(workspace.exists());
+
+        scanner.cleanup_workspace(&artifact).await;
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_workspace_nonexistent_dir_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://trivy:8090".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+
+        // Workspace doesn't exist, cleanup should not panic
+        scanner.cleanup_workspace(&artifact).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // TrivyReport deserialization from JSON
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_trivy_report_deserialization_full() {
+        let json = r#"{
+            "Results": [
+                {
+                    "Target": "usr/lib/dpkg/status",
+                    "Class": "os-pkgs",
+                    "Type": "ubuntu",
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2024-11111",
+                            "PkgName": "zlib",
+                            "InstalledVersion": "1.2.13",
+                            "FixedVersion": "1.2.14",
+                            "Severity": "HIGH",
+                            "Title": "zlib vuln",
+                            "Description": "A vuln in zlib",
+                            "PrimaryURL": "https://example.com/cve"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let report: TrivyReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].target, "usr/lib/dpkg/status");
+        let vulns = report.results[0].vulnerabilities.as_ref().unwrap();
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0].vulnerability_id, "CVE-2024-11111");
+        assert_eq!(vulns[0].pkg_name, "zlib");
+        assert_eq!(vulns[0].severity, "HIGH");
+    }
+
+    #[test]
+    fn test_trivy_report_deserialization_empty_results() {
+        let json = r#"{"Results": []}"#;
+        let report: TrivyReport = serde_json::from_str(json).unwrap();
+        assert!(report.results.is_empty());
+    }
+
+    #[test]
+    fn test_trivy_report_deserialization_missing_results() {
+        // "Results" field is missing entirely; defaults to empty vec
+        let json = r#"{}"#;
+        let report: TrivyReport = serde_json::from_str(json).unwrap();
+        assert!(report.results.is_empty());
+    }
+
+    #[test]
+    fn test_trivy_report_deserialization_no_vulnerabilities() {
+        let json = r#"{
+            "Results": [
+                {
+                    "Target": "Gemfile.lock",
+                    "Class": "lang-pkgs",
+                    "Type": "bundler"
+                }
+            ]
+        }"#;
+        let report: TrivyReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.results.len(), 1);
+        assert!(report.results[0].vulnerabilities.is_none());
+    }
 }

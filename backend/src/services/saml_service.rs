@@ -2122,4 +2122,607 @@ mod tests {
         let response = service.parse_saml_response(xml).unwrap();
         assert!(response.status_code.ends_with(":Success"));
     }
+
+    // =======================================================================
+    // get_xml_attr tests
+    // =======================================================================
+
+    #[test]
+    fn test_get_xml_attr_present() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content(r#"Element ID="_abc" Version="2.0""#, 7);
+        assert_eq!(get_xml_attr(&elem, "ID"), Some("_abc".to_string()));
+        assert_eq!(get_xml_attr(&elem, "Version"), Some("2.0".to_string()));
+    }
+
+    #[test]
+    fn test_get_xml_attr_missing() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content(r#"Element ID="_abc""#, 7);
+        assert_eq!(get_xml_attr(&elem, "Version"), None);
+        assert_eq!(get_xml_attr(&elem, "NotHere"), None);
+    }
+
+    #[test]
+    fn test_get_xml_attr_no_attributes() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content("Element", 7);
+        assert_eq!(get_xml_attr(&elem, "ID"), None);
+    }
+
+    #[test]
+    fn test_get_xml_attr_value_with_special_chars() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content(
+            r#"StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success""#,
+            10,
+        );
+        assert_eq!(
+            get_xml_attr(&elem, "Value"),
+            Some("urn:oasis:names:tc:SAML:2.0:status:Success".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_xml_attr_empty_value() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content(r#"Element Name="""#, 7);
+        assert_eq!(get_xml_attr(&elem, "Name"), Some(String::new()));
+    }
+
+    // =======================================================================
+    // collect_xml_attrs tests
+    // =======================================================================
+
+    #[test]
+    fn test_collect_xml_attrs_multiple() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content(
+            r#"Response ID="_resp1" InResponseTo="_req1" Version="2.0""#,
+            8,
+        );
+        let attrs = collect_xml_attrs(&elem);
+
+        assert_eq!(attrs.len(), 3);
+        assert!(attrs.contains(&("ID".to_string(), "_resp1".to_string())));
+        assert!(attrs.contains(&("InResponseTo".to_string(), "_req1".to_string())));
+        assert!(attrs.contains(&("Version".to_string(), "2.0".to_string())));
+    }
+
+    #[test]
+    fn test_collect_xml_attrs_single() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content(r#"Assertion ID="_a1""#, 9);
+        let attrs = collect_xml_attrs(&elem);
+
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(attrs[0], ("ID".to_string(), "_a1".to_string()));
+    }
+
+    #[test]
+    fn test_collect_xml_attrs_none() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content("Issuer", 6);
+        let attrs = collect_xml_attrs(&elem);
+
+        assert!(attrs.is_empty());
+    }
+
+    #[test]
+    fn test_collect_xml_attrs_preserves_order() {
+        use quick_xml::events::BytesStart;
+
+        let elem = BytesStart::from_content(
+            r#"Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2099-12-31T23:59:59Z""#,
+            10,
+        );
+        let attrs = collect_xml_attrs(&elem);
+
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].0, "NotBefore");
+        assert_eq!(attrs[0].1, "2020-01-01T00:00:00Z");
+        assert_eq!(attrs[1].0, "NotOnOrAfter");
+        assert_eq!(attrs[1].1, "2099-12-31T23:59:59Z");
+    }
+
+    // =======================================================================
+    // SamlResponseParser tests
+    // =======================================================================
+
+    /// Drive a SamlResponseParser through an XML string and return the result.
+    fn parse_xml_fragment(xml: &str) -> SamlResponse {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let mut reader = Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+
+        let mut parser = SamlResponseParser::new();
+        let mut buf = Vec::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => parser.handle_start(e),
+                Ok(Event::Empty(ref e)) => parser.handle_empty(e),
+                Ok(Event::Text(ref e)) => parser.handle_text(e),
+                Ok(Event::End(ref e)) => parser.handle_end(e),
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("XML parse error: {}", e),
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        parser.finish()
+    }
+
+    #[test]
+    fn test_parser_new_defaults() {
+        let parser = SamlResponseParser::new();
+        let response = parser.finish();
+
+        assert!(response.id.is_empty());
+        assert!(response.in_response_to.is_none());
+        assert!(response.issuer.is_empty());
+        assert!(response.status_code.is_empty());
+        assert!(response.status_message.is_none());
+        assert!(response.assertion.is_none());
+    }
+
+    #[test]
+    fn test_parser_response_element() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     ID="_resp42" InResponseTo="_req99" Version="2.0">
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        assert_eq!(response.id, "_resp42");
+        assert_eq!(response.in_response_to, Some("_req99".to_string()));
+    }
+
+    #[test]
+    fn test_parser_response_without_in_response_to() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     ID="_resp42" Version="2.0">
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        assert_eq!(response.id, "_resp42");
+        assert!(response.in_response_to.is_none());
+    }
+
+    #[test]
+    fn test_parser_issuer_outside_assertion() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Issuer>https://idp.test.com</saml:Issuer>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        assert_eq!(response.issuer, "https://idp.test.com");
+    }
+
+    #[test]
+    fn test_parser_issuer_inside_assertion() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Issuer>https://response-issuer.com</saml:Issuer>
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Issuer>https://assertion-issuer.com</saml:Issuer>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        // Response-level issuer
+        assert_eq!(response.issuer, "https://response-issuer.com");
+        // Assertion-level issuer
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.issuer, "https://assertion-issuer.com");
+    }
+
+    #[test]
+    fn test_parser_status_code_self_closing() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <samlp:Status>
+                <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+            </samlp:Status>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        assert!(response.status_code.ends_with(":Success"));
+    }
+
+    #[test]
+    fn test_parser_status_message() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <samlp:Status>
+                <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Requester"/>
+                <samlp:StatusMessage>Invalid request</samlp:StatusMessage>
+            </samlp:Status>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        assert!(response.status_code.ends_with(":Requester"));
+        assert_eq!(response.status_message.as_deref(), Some("Invalid request"));
+    }
+
+    #[test]
+    fn test_parser_name_id_with_format() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Subject>
+                    <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">alice@example.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+
+        assert_eq!(assertion.name_id, "alice@example.com");
+        assert_eq!(
+            assertion.name_id_format.as_deref(),
+            Some("urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress")
+        );
+    }
+
+    #[test]
+    fn test_parser_conditions() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:Conditions NotBefore="2025-01-01T00:00:00Z" NotOnOrAfter="2025-12-31T23:59:59Z">
+                    <saml:AudienceRestriction>
+                        <saml:Audience>my-sp</saml:Audience>
+                        <saml:Audience>other-sp</saml:Audience>
+                    </saml:AudienceRestriction>
+                </saml:Conditions>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+
+        assert_eq!(
+            assertion.not_before.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            assertion.not_on_or_after.as_deref(),
+            Some("2025-12-31T23:59:59Z")
+        );
+        assert_eq!(assertion.audiences.len(), 2);
+        assert!(assertion.audiences.contains(&"my-sp".to_string()));
+        assert!(assertion.audiences.contains(&"other-sp".to_string()));
+    }
+
+    #[test]
+    fn test_parser_authn_statement_session_index() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:AuthnStatement SessionIndex="idx_42"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+
+        assert_eq!(assertion.session_index, Some("idx_42".to_string()));
+    }
+
+    #[test]
+    fn test_parser_attributes_single_value() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="email">
+                        <saml:AttributeValue>bob@example.com</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+
+        assert_eq!(
+            assertion.attributes.get("email"),
+            Some(&vec!["bob@example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parser_attributes_multi_value() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="roles">
+                        <saml:AttributeValue>admin</saml:AttributeValue>
+                        <saml:AttributeValue>editor</saml:AttributeValue>
+                        <saml:AttributeValue>viewer</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+
+        let roles = assertion.attributes.get("roles").unwrap();
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles[0], "admin");
+        assert_eq!(roles[1], "editor");
+        assert_eq!(roles[2], "viewer");
+    }
+
+    #[test]
+    fn test_parser_multiple_attributes() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Assertion ID="_a1" Version="2.0">
+                <saml:AttributeStatement>
+                    <saml:Attribute Name="email">
+                        <saml:AttributeValue>user@test.com</saml:AttributeValue>
+                    </saml:Attribute>
+                    <saml:Attribute Name="displayName">
+                        <saml:AttributeValue>Test User</saml:AttributeValue>
+                    </saml:Attribute>
+                    <saml:Attribute Name="groups">
+                        <saml:AttributeValue>Engineering</saml:AttributeValue>
+                        <saml:AttributeValue>Platform</saml:AttributeValue>
+                    </saml:Attribute>
+                </saml:AttributeStatement>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+        let assertion = response.assertion.as_ref().unwrap();
+
+        assert_eq!(assertion.attributes.len(), 3);
+        assert_eq!(
+            assertion.attributes.get("email"),
+            Some(&vec!["user@test.com".to_string()])
+        );
+        assert_eq!(
+            assertion.attributes.get("displayName"),
+            Some(&vec!["Test User".to_string()])
+        );
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(groups, &vec!["Engineering", "Platform"]);
+    }
+
+    #[test]
+    fn test_parser_no_assertion() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                                     ID="_r1" Version="2.0">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <samlp:Status>
+                <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Requester"/>
+            </samlp:Status>
+        </samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        assert_eq!(response.id, "_r1");
+        assert_eq!(response.issuer, "https://idp.example.com");
+        assert!(response.assertion.is_none());
+    }
+
+    #[test]
+    fn test_parser_full_response() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+                xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+                ID="_full_resp" InResponseTo="_orig_req" Version="2.0">
+    <saml:Issuer>https://idp.full-test.com</saml:Issuer>
+    <samlp:Status>
+        <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+    </samlp:Status>
+    <saml:Assertion ID="_full_assertion" Version="2.0">
+        <saml:Issuer>https://idp.full-test.com</saml:Issuer>
+        <saml:Subject>
+            <saml:NameID Format="urn:oasis:names:tc:SAML:2.0:nameid-format:persistent">user123</saml:NameID>
+        </saml:Subject>
+        <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2099-01-01T00:00:00Z">
+            <saml:AudienceRestriction>
+                <saml:Audience>test-sp</saml:Audience>
+            </saml:AudienceRestriction>
+        </saml:Conditions>
+        <saml:AuthnStatement SessionIndex="session_full"/>
+        <saml:AttributeStatement>
+            <saml:Attribute Name="email">
+                <saml:AttributeValue>user123@full-test.com</saml:AttributeValue>
+            </saml:Attribute>
+            <saml:Attribute Name="groups">
+                <saml:AttributeValue>TeamA</saml:AttributeValue>
+                <saml:AttributeValue>TeamB</saml:AttributeValue>
+            </saml:Attribute>
+        </saml:AttributeStatement>
+    </saml:Assertion>
+</samlp:Response>"#;
+
+        let response = parse_xml_fragment(xml);
+
+        // Response-level fields
+        assert_eq!(response.id, "_full_resp");
+        assert_eq!(response.in_response_to, Some("_orig_req".to_string()));
+        assert_eq!(response.issuer, "https://idp.full-test.com");
+        assert!(response.status_code.ends_with(":Success"));
+
+        // Assertion-level fields
+        let assertion = response.assertion.as_ref().unwrap();
+        assert_eq!(assertion.id, "_full_assertion");
+        assert_eq!(assertion.issuer, "https://idp.full-test.com");
+        assert_eq!(assertion.name_id, "user123");
+        assert_eq!(
+            assertion.name_id_format.as_deref(),
+            Some("urn:oasis:names:tc:SAML:2.0:nameid-format:persistent")
+        );
+        assert_eq!(assertion.session_index, Some("session_full".to_string()));
+        assert_eq!(
+            assertion.not_before.as_deref(),
+            Some("2020-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            assertion.not_on_or_after.as_deref(),
+            Some("2099-01-01T00:00:00Z")
+        );
+        assert_eq!(assertion.audiences, vec!["test-sp"]);
+        assert_eq!(
+            assertion.attributes.get("email"),
+            Some(&vec!["user123@full-test.com".to_string()])
+        );
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(groups, &vec!["TeamA", "TeamB"]);
+    }
+
+    #[test]
+    fn test_parser_handle_empty_for_status_code() {
+        // Verify handle_empty correctly processes self-closing StatusCode
+        use quick_xml::events::BytesStart;
+
+        let mut parser = SamlResponseParser::new();
+
+        let elem = BytesStart::from_content(
+            r#"StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success""#,
+            10,
+        );
+        parser.handle_empty(&elem);
+
+        let response = parser.finish();
+        assert!(response.status_code.ends_with(":Success"));
+    }
+
+    #[test]
+    fn test_parser_handle_empty_for_authn_statement() {
+        // AuthnStatement is often self-closing
+        use quick_xml::events::BytesStart;
+
+        let mut parser = SamlResponseParser::new();
+        // Must set in_assertion for session_index to be stored
+        parser.in_assertion = true;
+
+        let elem = BytesStart::from_content(r#"AuthnStatement SessionIndex="sess_99""#, 14);
+        parser.handle_empty(&elem);
+
+        let response = parser.finish();
+        // session_index is stored on the assertion struct, not the response
+        // We need to check the internal assertion field
+        // Since finish() returns only the response (assertion not yet attached),
+        // check that it didn't panic and the status wasn't affected
+        assert!(response.status_code.is_empty());
+    }
+
+    #[test]
+    fn test_parser_handle_empty_ignores_unknown() {
+        use quick_xml::events::BytesStart;
+
+        let mut parser = SamlResponseParser::new();
+
+        let elem = BytesStart::from_content(r#"UnknownElement foo="bar""#, 14);
+        parser.handle_empty(&elem);
+
+        // Should not panic or change state
+        let response = parser.finish();
+        assert!(response.id.is_empty());
+    }
+
+    #[test]
+    fn test_parser_handle_text_ignores_whitespace() {
+        use quick_xml::events::BytesText;
+
+        let mut parser = SamlResponseParser::new();
+        parser.current_element = "Issuer".to_string();
+
+        let text = BytesText::new("   ");
+        parser.handle_text(&text);
+
+        // Whitespace-only text should be ignored
+        let response = parser.finish();
+        assert!(response.issuer.is_empty());
+    }
+
+    #[test]
+    fn test_parser_handle_end_attribute_collects_values() {
+        use quick_xml::events::{BytesEnd, BytesStart};
+
+        let mut parser = SamlResponseParser::new();
+        parser.in_assertion = true;
+
+        // Simulate starting an Attribute element
+        let start = BytesStart::from_content(r#"Attribute Name="groups""#, 9);
+        parser.handle_start(&start);
+
+        // Simulate AttributeValue text nodes
+        parser.current_element = "AttributeValue".to_string();
+        let text1 = quick_xml::events::BytesText::new("GroupA");
+        parser.handle_text(&text1);
+        let text2 = quick_xml::events::BytesText::new("GroupB");
+        parser.handle_text(&text2);
+
+        // Close the Attribute element
+        let end = BytesEnd::new("Attribute");
+        parser.handle_end(&end);
+
+        // Close the Assertion to finalize
+        let end_assertion = BytesEnd::new("Assertion");
+        parser.handle_end(&end_assertion);
+
+        let response = parser.finish();
+        let assertion = response.assertion.as_ref().unwrap();
+        let groups = assertion.attributes.get("groups").unwrap();
+        assert_eq!(groups, &vec!["GroupA", "GroupB"]);
+    }
+
+    #[test]
+    fn test_parser_handle_end_assertion_produces_assertion() {
+        use quick_xml::events::{BytesEnd, BytesStart};
+
+        let mut parser = SamlResponseParser::new();
+
+        // Start the assertion
+        let start = BytesStart::from_content(r#"Assertion ID="_test_end""#, 9);
+        parser.handle_start(&start);
+        assert!(parser.in_assertion);
+
+        // End the assertion
+        let end = BytesEnd::new("Assertion");
+        parser.handle_end(&end);
+        assert!(!parser.in_assertion);
+
+        let response = parser.finish();
+        assert!(response.assertion.is_some());
+        assert_eq!(response.assertion.as_ref().unwrap().id, "_test_end");
+    }
 }

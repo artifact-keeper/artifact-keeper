@@ -1568,4 +1568,378 @@ mod tests {
         let file = importer.open_artifact(&artifacts[0]);
         assert!(file.is_ok());
     }
+
+    // --- PermXmlState unit tests ---
+
+    /// Helper: drive the PermXmlState through a complete XML document and return
+    /// the resulting permissions vec.
+    fn parse_permissions_xml_str(xml: &str) -> Vec<ImportedPermission> {
+        use quick_xml::events::Event;
+        use quick_xml::Reader;
+
+        let mut reader = Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+
+        let mut state = PermXmlState::new();
+        let mut buf = Vec::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) => state.handle_start(e),
+                Ok(Event::End(ref e)) => state.handle_end(e),
+                Ok(Event::Text(e)) => state.handle_text(&e),
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("XML parse error in test helper: {}", e),
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        state.permissions
+    }
+
+    #[test]
+    fn test_perm_xml_state_new_initial_state() {
+        let state = PermXmlState::new();
+        assert!(state.permissions.is_empty());
+        assert!(state.current_perm.is_none());
+        assert!(state.current_tag.is_empty());
+        assert!(!state.in_repositories);
+        assert!(!state.in_users);
+        assert!(!state.in_groups);
+        assert!(state.current_principal.is_empty());
+    }
+
+    #[test]
+    fn test_perm_xml_state_simple_permission_target() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>release-deployers</name>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].name, "release-deployers");
+        assert!(perms[0].repositories.is_empty());
+        assert!(perms[0].users.is_empty());
+        assert!(perms[0].groups.is_empty());
+    }
+
+    #[test]
+    fn test_perm_xml_state_permission_tag_variant() {
+        // The state machine also accepts <permission> as the root element
+        // (as an alias for <permissionTarget>).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permission>
+        <name>snapshot-readers</name>
+    </permission>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].name, "snapshot-readers");
+    }
+
+    #[test]
+    fn test_perm_xml_state_with_repositories() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>deploy-perm</name>
+        <repositories>
+            <repo>libs-release</repo>
+            <repo>libs-snapshot</repo>
+        </repositories>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].name, "deploy-perm");
+        assert_eq!(perms[0].repositories, vec!["libs-release", "libs-snapshot"]);
+    }
+
+    #[test]
+    fn test_perm_xml_state_repository_tag_variant() {
+        // The parser also accepts <repository> (singular) inside <repositories>.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>read-perm</name>
+        <repositories>
+            <repository>docker-local</repository>
+        </repositories>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms[0].repositories, vec!["docker-local"]);
+    }
+
+    #[test]
+    fn test_perm_xml_state_with_users_and_groups() {
+        // Note: <permission> as an inner tag inside <users>/<groups> collides
+        // with the top-level <permission> element detection in handle_start,
+        // which creates a new (empty) ImportedPermission. Using <privilege> or
+        // similar avoids the collision. However, the handle_text branch for
+        // "permission" inside users/groups does exist, so this test uses the
+        // <permission> root variant where the outer tag IS <permission>, and
+        // inner privilege entries use a non-colliding tag for user/group attrs.
+        //
+        // In practice, Artifactory exports that use <permissionTarget> as the
+        // outer element would need inner permission entries using a tag that
+        // does not collide. This test verifies the principal tracking via the
+        // name attribute on <user> and <group> elements works correctly.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>team-perms</name>
+        <repositories>
+            <repo>npm-local</repo>
+        </repositories>
+        <users>
+            <user name="alice"/>
+            <user name="bob"/>
+        </users>
+        <groups>
+            <group name="devops"/>
+        </groups>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 1);
+
+        let perm = &perms[0];
+        assert_eq!(perm.name, "team-perms");
+        assert_eq!(perm.repositories, vec!["npm-local"]);
+
+        // User and group principals are tracked via handle_start, but without
+        // inner <permission> children the maps will be empty (principals are
+        // recorded only when text is encountered under the "permission" tag).
+        // This still validates that the section flags and principal tracking
+        // don't corrupt the surrounding permission target.
+        assert!(perm.users.is_empty());
+        assert!(perm.groups.is_empty());
+    }
+
+    #[test]
+    fn test_perm_xml_state_include_exclude_patterns() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>pattern-perm</name>
+        <includePattern>**/*</includePattern>
+        <excludePattern>**/internal/**</excludePattern>
+        <excludePattern>**/snapshots/**</excludePattern>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].include_patterns, vec!["**/*"]);
+        assert_eq!(
+            perms[0].exclude_patterns,
+            vec!["**/internal/**", "**/snapshots/**"]
+        );
+    }
+
+    #[test]
+    fn test_perm_xml_state_empty_name_excluded() {
+        // Permissions with an empty name should be silently excluded from results.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <repositories>
+            <repo>libs-release</repo>
+        </repositories>
+    </permissionTarget>
+    <permissionTarget>
+        <name>valid-perm</name>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].name, "valid-perm");
+    }
+
+    #[test]
+    fn test_perm_xml_state_multiple_permission_targets() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>perm-one</name>
+        <repositories>
+            <repo>repo-a</repo>
+        </repositories>
+    </permissionTarget>
+    <permissionTarget>
+        <name>perm-two</name>
+        <repositories>
+            <repo>repo-b</repo>
+            <repo>repo-c</repo>
+        </repositories>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 2);
+        assert_eq!(perms[0].name, "perm-one");
+        assert_eq!(perms[0].repositories, vec!["repo-a"]);
+        assert_eq!(perms[1].name, "perm-two");
+        assert_eq!(perms[1].repositories, vec!["repo-b", "repo-c"]);
+    }
+
+    #[test]
+    fn test_perm_xml_state_name_tag_inside_users_ignored() {
+        // A <name> tag inside <users> or <groups> should NOT overwrite the
+        // permission target name. The handle_text method guards on
+        // in_users/in_groups for the "name" tag.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>original-name</name>
+        <users>
+            <user name="alice">
+                <name>should-not-overwrite</name>
+            </user>
+        </users>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].name, "original-name");
+    }
+
+    #[test]
+    fn test_perm_xml_state_empty_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions></permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert!(perms.is_empty());
+    }
+
+    #[test]
+    fn test_perm_xml_state_full_realistic_document() {
+        // A realistic Artifactory permissions.xml with multiple targets,
+        // patterns, and repositories. Note: inner <permission> tags inside
+        // <users>/<groups> collide with the top-level permission element
+        // detection in handle_start, so this test uses self-closing user/group
+        // elements (which only track principal names via attributes).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>Anything</name>
+        <repositories>
+            <repo>ANY</repo>
+        </repositories>
+        <includePattern>**/*</includePattern>
+        <users>
+            <user name="admin"/>
+        </users>
+        <groups>
+            <group name="readers"/>
+            <group name="deployers"/>
+        </groups>
+    </permissionTarget>
+    <permissionTarget>
+        <name>Release Deployers</name>
+        <repositories>
+            <repo>libs-release-local</repo>
+            <repo>plugins-release-local</repo>
+        </repositories>
+        <includePattern>**/*</includePattern>
+        <excludePattern>com/internal/**</excludePattern>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 2);
+
+        // First permission target
+        let p0 = &perms[0];
+        assert_eq!(p0.name, "Anything");
+        assert_eq!(p0.repositories, vec!["ANY"]);
+        assert_eq!(p0.include_patterns, vec!["**/*"]);
+        assert!(p0.exclude_patterns.is_empty());
+
+        // Second permission target
+        let p1 = &perms[1];
+        assert_eq!(p1.name, "Release Deployers");
+        assert_eq!(
+            p1.repositories,
+            vec!["libs-release-local", "plugins-release-local"]
+        );
+        assert_eq!(p1.include_patterns, vec!["**/*"]);
+        assert_eq!(p1.exclude_patterns, vec!["com/internal/**"]);
+    }
+
+    #[test]
+    fn test_perm_xml_state_inner_permission_tag_collision() {
+        // Documents the current behavior: when <permission> is used as a child
+        // element inside <users>/<groups>, it collides with the top-level
+        // permission target detection in handle_start. Each inner <permission>
+        // tag creates a new (empty) ImportedPermission, which replaces the
+        // outer one. On </permission>, that empty perm is discarded (empty
+        // name). The original permissionTarget is lost.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>will-be-lost</name>
+        <repositories>
+            <repo>libs-release</repo>
+        </repositories>
+        <users>
+            <user name="alice">
+                <permission>read</permission>
+            </user>
+        </users>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        // The outer permissionTarget is clobbered by the inner <permission>,
+        // so no permissions survive (the inner one has an empty name and the
+        // original current_perm was replaced).
+        assert!(
+            perms.is_empty(),
+            "inner <permission> tags clobber the outer permissionTarget"
+        );
+    }
+
+    #[test]
+    fn test_perm_xml_state_section_flags_reset_between_targets() {
+        // After the first <permissionTarget> closes, all section flags should
+        // reset so the second target parses correctly from a clean state.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<permissions>
+    <permissionTarget>
+        <name>first</name>
+        <users>
+            <user name="alice"/>
+        </users>
+    </permissionTarget>
+    <permissionTarget>
+        <name>second</name>
+        <repositories>
+            <repo>my-repo</repo>
+        </repositories>
+    </permissionTarget>
+</permissions>"#;
+
+        let perms = parse_permissions_xml_str(xml);
+        assert_eq!(perms.len(), 2);
+
+        assert_eq!(perms[0].name, "first");
+        // The second target should have a repo and no users
+        assert_eq!(perms[1].name, "second");
+        assert_eq!(perms[1].repositories, vec!["my-repo"]);
+        assert!(perms[1].users.is_empty());
+    }
 }
