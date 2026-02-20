@@ -28,15 +28,15 @@ RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \
     ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then ARCH="linux_x86_64"; \
     elif [ "$ARCH" = "aarch64" ]; then ARCH="linux_arm64"; fi && \
-    GRPCURL_VERSION=$(curl -sL https://api.github.com/repos/fullstorydev/grpcurl/releases/latest | jq -r .tag_name) && \
-    curl -sL "https://github.com/fullstorydev/grpcurl/releases/download/${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION#v}_${ARCH}.tar.gz" | \
+    GRPCURL_VERSION=$(curl --proto '=https' --tlsv1.2 -sL https://api.github.com/repos/fullstorydev/grpcurl/releases/latest | jq -r .tag_name) && \
+    curl --proto '=https' --tlsv1.2 -sL "https://github.com/fullstorydev/grpcurl/releases/download/${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION#v}_${ARCH}.tar.gz" | \
     tar -xz -C /usr/local/bin grpcurl && \
     chmod +x /usr/local/bin/grpcurl && \
     ARCH=$(uname -m) && \
     if [ "$ARCH" = "x86_64" ]; then ARCH="linux_amd64"; \
     elif [ "$ARCH" = "aarch64" ]; then ARCH="linux_arm64"; fi && \
-    NUCLEI_VERSION=$(curl -sL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | jq -r .tag_name) && \
-    curl -sL "https://github.com/projectdiscovery/nuclei/releases/download/${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION#v}_${ARCH}.zip" -o /tmp/nuclei.zip && \
+    NUCLEI_VERSION=$(curl --proto '=https' --tlsv1.2 -sL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | jq -r .tag_name) && \
+    curl --proto '=https' --tlsv1.2 -sL "https://github.com/projectdiscovery/nuclei/releases/download/${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION#v}_${ARCH}.zip" -o /tmp/nuclei.zip && \
     unzip -o /tmp/nuclei.zip -d /usr/local/bin && \
     chmod +x /usr/local/bin/nuclei && \
     rm /tmp/nuclei.zip
