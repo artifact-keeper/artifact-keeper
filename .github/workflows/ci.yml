@@ -100,6 +100,16 @@ jobs:
           name: lcov-coverage
           path: lcov.info
 
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=artifact-keeper_artifact-keeper
+            -Dsonar.organization=artifact-keeper
+            -Dsonar.rust.lcov.reportPaths=lcov.info
+
   # ════════════════════════════════════════════════════════════════════════════
   # TIER 2: INTEGRATION (Main Branch Push Only)
   # ════════════════════════════════════════════════════════════════════════════
