@@ -325,10 +325,12 @@ async fn download_chart(
                     &upstream_path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let fname = fname.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path_suffix(
                                 &db,
+                                &state,
                                 member_id,
                                 &storage_path,
                                 &fname,

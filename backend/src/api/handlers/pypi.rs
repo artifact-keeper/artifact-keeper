@@ -29,8 +29,6 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
 use crate::formats::pypi::PypiHandler;
 use crate::services::auth_service::AuthService;
-use crate::storage::filesystem::FilesystemStorage;
-use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -454,7 +452,7 @@ async fn download_or_metadata(
     // PEP 658: if filename ends with .metadata, serve extracted METADATA
     if filename.ends_with(".metadata") {
         let real_filename = filename.trim_end_matches(".metadata");
-        return serve_metadata(&state.db, repo.id, &repo.storage_path, real_filename).await;
+        return serve_metadata(&state, &state.db, repo.id, &repo.storage_path, real_filename).await;
     }
 
     // Regular file download
@@ -543,10 +541,12 @@ async fn serve_file(
                     &upstream_path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let fname = fname.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path_suffix(
                                 &db,
+                                &state,
                                 member_id,
                                 &storage_path,
                                 &fname,
@@ -583,7 +583,7 @@ async fn serve_file(
     };
 
     // Read from storage
-    let storage = FilesystemStorage::new(&repo.storage_path);
+    let storage = state.storage_for_repo(&repo.storage_path);
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -622,6 +622,7 @@ async fn serve_file(
 }
 
 async fn serve_metadata(
+    state: &SharedState,
     db: &PgPool,
     repo_id: uuid::Uuid,
     storage_path: &str,
@@ -652,7 +653,7 @@ async fn serve_metadata(
     .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response())?;
 
     // Try to extract METADATA from the package file
-    let storage = FilesystemStorage::new(storage_path);
+    let storage = state.storage_for_repo(storage_path);
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -873,7 +874,7 @@ async fn upload(
 
     // Store the file
     let storage_key = format!("pypi/{}/{}/{}", normalized, pkg_version, filename);
-    let storage = FilesystemStorage::new(&repo.storage_path);
+    let storage = state.storage_for_repo(&repo.storage_path);
     storage
         .put(&storage_key, content.clone())
         .await

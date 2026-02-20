@@ -28,6 +28,7 @@ use std::sync::Arc;
 pub struct AppState {
     pub config: Config,
     pub db: PgPool,
+    pub storage: Arc<dyn StorageBackend>,
     pub plugin_registry: Option<Arc<PluginRegistry>>,
     pub wasm_plugin_service: Option<Arc<WasmPluginService>>,
     pub scanner_service: Option<Arc<ScannerService>>,
@@ -41,10 +42,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config, db: PgPool) -> Self {
+    pub fn new(config: Config, db: PgPool, storage: Arc<dyn StorageBackend>) -> Self {
         Self {
             config,
             db,
+            storage,
             plugin_registry: None,
             wasm_plugin_service: None,
             scanner_service: None,
@@ -61,12 +63,14 @@ impl AppState {
     pub fn with_wasm_plugins(
         config: Config,
         db: PgPool,
+        storage: Arc<dyn StorageBackend>,
         plugin_registry: Arc<PluginRegistry>,
         wasm_plugin_service: Arc<WasmPluginService>,
     ) -> Self {
         Self {
             config,
             db,
+            storage,
             plugin_registry: Some(plugin_registry),
             wasm_plugin_service: Some(wasm_plugin_service),
             scanner_service: None,
@@ -76,6 +80,20 @@ impl AppState {
             proxy_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Get the storage backend for a given repository.
+    ///
+    /// For S3/Azure/GCS, all repos share a single backend instance (artifacts
+    /// are keyed by content-addressed SHA-256 hashes). For filesystem, each
+    /// repo has its own directory so we create a per-repo instance.
+    pub fn storage_for_repo(&self, repo_storage_path: &str) -> Arc<dyn StorageBackend> {
+        match self.config.storage_backend.as_str() {
+            "s3" | "azure" | "gcs" => self.storage.clone(),
+            _ => Arc::new(crate::storage::filesystem::FilesystemStorage::new(
+                repo_storage_path,
+            )),
         }
     }
 

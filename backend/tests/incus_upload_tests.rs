@@ -149,7 +149,11 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
 
 /// Build a SharedState for the incus router.
 fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
-    Arc::new(AppState::new(test_config(storage_path), pool))
+    let storage: std::sync::Arc<dyn artifact_keeper_backend::storage::StorageBackend> =
+        std::sync::Arc::new(
+            artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(storage_path),
+        );
+    Arc::new(AppState::new(test_config(storage_path), pool, storage))
 }
 
 /// Generate deterministic test data of a given size.

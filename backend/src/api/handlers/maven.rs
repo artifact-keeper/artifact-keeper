@@ -26,8 +26,6 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
 use crate::formats::maven::{generate_metadata_xml, MavenHandler};
 use crate::services::auth_service::AuthService;
-use crate::storage::filesystem::FilesystemStorage;
-use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -229,7 +227,7 @@ async fn download(
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
         // First try to find a stored checksum file
         let checksum_storage_key = format!("maven/{}", path);
-        let storage = FilesystemStorage::new(&repo.storage_path);
+        let storage = state.storage_for_repo(&repo.storage_path);
         if let Ok(content) = storage.get(&checksum_storage_key).await {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -360,10 +358,12 @@ async fn serve_artifact(
                     path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let artifact_path = artifact_path.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path(
                                 &db,
+                                &state,
                                 member_id,
                                 &storage_path,
                                 &artifact_path,
@@ -387,7 +387,7 @@ async fn serve_artifact(
         }
     };
 
-    let storage = FilesystemStorage::new(&repo.storage_path);
+    let storage = state.storage_for_repo(&repo.storage_path);
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -449,7 +449,7 @@ async fn serve_computed_checksum(
     let checksum = match checksum_type {
         ChecksumType::Sha256 => artifact.checksum_sha256,
         _ => {
-            let storage = FilesystemStorage::new(storage_path);
+            let storage = state.storage_for_repo(storage_path);
             let content = storage.get(&artifact.storage_key).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -507,7 +507,7 @@ async fn upload(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let storage_key = format!("maven/{}", path);
-    let storage = FilesystemStorage::new(&repo.storage_path);
+    let storage = state.storage_for_repo(&repo.storage_path);
 
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return
     if parse_checksum_path(&path).is_some() {

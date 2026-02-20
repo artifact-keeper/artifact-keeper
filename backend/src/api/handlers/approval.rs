@@ -22,8 +22,6 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
-use crate::storage::filesystem::FilesystemStorage;
-use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -549,8 +547,8 @@ pub async fn approve_promotion(
     .ok_or_else(|| AppError::NotFound("Artifact not found in source repository".to_string()))?;
 
     // Copy storage content
-    let source_storage = FilesystemStorage::new(&source_repo.storage_path);
-    let target_storage = FilesystemStorage::new(&target_repo.storage_path);
+    let source_storage = state.storage_for_repo(&source_repo.storage_path);
+    let target_storage = state.storage_for_repo(&target_repo.storage_path);
 
     let content = source_storage
         .get(&artifact.storage_key)

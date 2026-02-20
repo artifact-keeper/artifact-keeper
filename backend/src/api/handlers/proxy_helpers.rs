@@ -7,6 +7,7 @@ use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::api::AppState;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
@@ -151,6 +152,7 @@ async fn fetch_virtual_members(
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_path(
     db: &PgPool,
+    state: &AppState,
     repo_id: Uuid,
     storage_path: &str,
     artifact_path: &str,
@@ -174,8 +176,8 @@ pub async fn local_fetch_by_path(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = crate::storage::filesystem::FilesystemStorage::new(storage_path);
-    let content = crate::storage::StorageBackend::get(&storage, &artifact.storage_key)
+    let storage = state.storage_for_repo(storage_path);
+    let content = storage.get(&artifact.storage_key)
         .await
         .map_err(|e| {
             (
@@ -192,6 +194,7 @@ pub async fn local_fetch_by_path(
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_name_version(
     db: &PgPool,
+    state: &AppState,
     repo_id: Uuid,
     storage_path: &str,
     name: &str,
@@ -217,8 +220,8 @@ pub async fn local_fetch_by_name_version(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = crate::storage::filesystem::FilesystemStorage::new(storage_path);
-    let content = crate::storage::StorageBackend::get(&storage, &artifact.storage_key)
+    let storage = state.storage_for_repo(storage_path);
+    let content = storage.get(&artifact.storage_key)
         .await
         .map_err(|e| {
             (
@@ -235,6 +238,7 @@ pub async fn local_fetch_by_name_version(
 /// Used for handlers like npm that query by filename suffix.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
+    state: &AppState,
     repo_id: Uuid,
     storage_path: &str,
     path_suffix: &str,
@@ -258,8 +262,8 @@ pub async fn local_fetch_by_path_suffix(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = crate::storage::filesystem::FilesystemStorage::new(storage_path);
-    let content = crate::storage::StorageBackend::get(&storage, &artifact.storage_key)
+    let storage = state.storage_for_repo(storage_path);
+    let content = storage.get(&artifact.storage_key)
         .await
         .map_err(|e| {
             (

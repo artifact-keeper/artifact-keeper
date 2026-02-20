@@ -677,9 +677,10 @@ async fn download_object(
                     &upstream_path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let path = path_clone.clone();
                         async move {
-                            proxy_helpers::local_fetch_by_path(&db, member_id, &storage_path, &path)
+                            proxy_helpers::local_fetch_by_path(&db, &state, member_id, &storage_path, &path)
                                 .await
                         }
                     },

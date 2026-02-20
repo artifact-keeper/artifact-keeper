@@ -9,7 +9,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::Duration;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
@@ -26,7 +25,6 @@ use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
-use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::s3::{S3Backend, S3Config};
 use crate::storage::StorageBackend;
 
@@ -374,7 +372,7 @@ pub async fn create_repository(
             description: payload.description,
             format,
             repo_type,
-            storage_backend: "filesystem".to_string(),
+            storage_backend: state.config.storage_backend.clone(),
             storage_path,
             upstream_url: payload.upstream_url,
             is_public: payload.is_public.unwrap_or(false),
@@ -556,7 +554,7 @@ pub async fn list_artifacts(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
 
-    let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
+    let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
     let (artifacts, total) = artifact_service
@@ -623,7 +621,7 @@ pub async fn get_artifact_metadata(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
 
-    let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
+    let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
     let artifact = sqlx::query_as!(
@@ -693,7 +691,7 @@ pub async fn upload_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
 
-    let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
+    let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = state.create_artifact_service(storage);
 
     // Extract name from path
@@ -894,7 +892,7 @@ pub async fn download_artifact(
     }
 
     // Fall back to proxied download (filesystem or S3 without redirect)
-    let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
+    let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
     let download_result = artifact_service
@@ -974,9 +972,10 @@ pub async fn download_artifact(
                 &path,
                 |member_id, storage_path| {
                     let db = db.clone();
+                    let state = state.clone();
                     let p = path_clone.clone();
                     async move {
-                        proxy_helpers::local_fetch_by_path(&db, member_id, &storage_path, &p).await
+                        proxy_helpers::local_fetch_by_path(&db, &state, member_id, &storage_path, &p).await
                     }
                 },
             )
@@ -1037,7 +1036,7 @@ pub async fn delete_artifact(
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
 
-    let storage = Arc::new(FilesystemStorage::new(&repo.storage_path));
+    let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = state.create_artifact_service(storage);
 
     // Find the artifact

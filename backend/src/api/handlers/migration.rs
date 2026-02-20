@@ -32,7 +32,6 @@ use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
 use crate::services::migration_worker::{ConflictResolution, MigrationWorker, WorkerConfig};
 use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
 use crate::services::source_registry::SourceRegistry;
-use crate::storage::filesystem::FilesystemStorage;
 
 /// Create the migration router
 pub fn router() -> Router<SharedState> {
@@ -1025,8 +1024,7 @@ async fn start_migration(
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
 
     // Create storage backend
-    let storage: Arc<dyn crate::storage::StorageBackend> =
-        Arc::new(FilesystemStorage::new(&state.config.storage_path));
+    let storage = state.storage_for_repo(&state.config.storage_path);
 
     // Create cancellation token for this job
     let cancel_token = CancellationToken::new();
@@ -1154,8 +1152,7 @@ async fn resume_migration(
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
 
-    let storage: Arc<dyn crate::storage::StorageBackend> =
-        Arc::new(FilesystemStorage::new(&state.config.storage_path));
+    let storage = state.storage_for_repo(&state.config.storage_path);
     let cancel_token = CancellationToken::new();
 
     let worker_config = WorkerConfig {

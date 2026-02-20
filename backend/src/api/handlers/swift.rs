@@ -425,11 +425,13 @@ async fn download_archive(
                     &upstream_path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let name = name_clone.clone();
                         let version = version_clone.clone();
                         async move {
                             proxy_helpers::local_fetch_by_name_version(
                                 &db,
+                                &state,
                                 member_id,
                                 &storage_path,
                                 &name,

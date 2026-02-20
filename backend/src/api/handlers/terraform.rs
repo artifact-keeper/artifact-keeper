@@ -380,11 +380,13 @@ async fn download_module(
                     &upstream_path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let vname = vname.clone();
                         let vversion = vversion.clone();
                         async move {
                             proxy_helpers::local_fetch_by_name_version(
                                 &db,
+                                &state,
                                 member_id,
                                 &storage_path,
                                 &vname,
@@ -928,11 +930,13 @@ async fn download_provider(
                     &upstream_path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let vname = vname.clone();
                         let vversion = vversion.clone();
                         async move {
                             proxy_helpers::local_fetch_by_name_version(
                                 &db,
+                                &state,
                                 member_id,
                                 &storage_path,
                                 &vname,

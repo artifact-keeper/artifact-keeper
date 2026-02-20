@@ -19,8 +19,6 @@ use crate::models::repository::RepositoryType;
 use crate::models::sbom::PolicyAction;
 use crate::services::promotion_policy_service::PromotionPolicyService;
 use crate::services::repository_service::RepositoryService;
-use crate::storage::filesystem::FilesystemStorage;
-use crate::storage::StorageBackend;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -313,8 +311,8 @@ pub async fn promote_artifact(
     }
 
     let new_artifact_id = Uuid::new_v4();
-    let source_storage = FilesystemStorage::new(&source_repo.storage_path);
-    let target_storage = FilesystemStorage::new(&target_repo.storage_path);
+    let source_storage = state.storage_for_repo(&source_repo.storage_path);
+    let target_storage = state.storage_for_repo(&target_repo.storage_path);
 
     let content = source_storage
         .get(&artifact.storage_key)
@@ -473,8 +471,8 @@ pub async fn promote_artifacts_bulk(
         let source_display = format!("{}/{}", repo_key, artifact.path);
         let target_display = format!("{}/{}", req.target_repository, artifact.path);
 
-        let source_storage = FilesystemStorage::new(&source_repo.storage_path);
-        let target_storage = FilesystemStorage::new(&target_repo.storage_path);
+        let source_storage = state.storage_for_repo(&source_repo.storage_path);
+        let target_storage = state.storage_for_repo(&target_repo.storage_path);
 
         let content = match source_storage.get(&artifact.storage_key).await {
             Ok(c) => c,

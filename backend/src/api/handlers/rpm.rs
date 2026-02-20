@@ -577,10 +577,12 @@ async fn download_package(
                     &upstream_path,
                     |member_id, storage_path| {
                         let db = db.clone();
+                        let state = state.clone();
                         let suffix = filename_clone.clone();
                         async move {
                             proxy_helpers::local_fetch_by_path_suffix(
                                 &db,
+                                &state,
                                 member_id,
                                 &storage_path,
                                 &suffix,

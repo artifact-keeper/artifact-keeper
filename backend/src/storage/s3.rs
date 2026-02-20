@@ -219,10 +219,19 @@ pub struct S3Backend {
 impl S3Backend {
     /// Create new S3 backend from configuration
     pub async fn new(config: S3Config) -> Result<Self> {
-        // Load credentials using the default credential chain:
-        // env vars -> ~/.aws/credentials -> container credentials -> instance metadata (IRSA/EC2)
-        let credentials = Credentials::default()
-            .map_err(|e| AppError::Config(format!("Failed to load AWS credentials: {}", e)))?;
+        // S3-prefixed credential env vars take precedence, then fall back to the
+        // default AWS credential chain (AWS_ACCESS_KEY_ID, ~/.aws/credentials, IRSA, etc.)
+        let credentials = if let (Ok(ak), Ok(sk)) = (
+            std::env::var("S3_ACCESS_KEY_ID"),
+            std::env::var("S3_SECRET_ACCESS_KEY"),
+        ) {
+            tracing::info!("Using S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY for S3 credentials");
+            Credentials::new(Some(&ak), Some(&sk), None, None, None)
+                .map_err(|e| AppError::Config(format!("Invalid S3 credentials: {}", e)))?
+        } else {
+            Credentials::default()
+                .map_err(|e| AppError::Config(format!("Failed to load AWS credentials: {}", e)))?
+        };
 
         // Create region (with optional custom endpoint)
         let region = match &config.endpoint {

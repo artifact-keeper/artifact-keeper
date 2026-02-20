@@ -22,7 +22,6 @@ use uuid::Uuid;
 
 use crate::api::SharedState;
 use crate::services::auth_service::AuthService;
-use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
 // OCI error helpers
@@ -393,7 +392,7 @@ async fn handle_head_blob(
 
     match blob {
         Ok(Some(b)) => {
-            let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+            let storage = state.storage_for_repo(&storage_path);
             if storage.exists(&b.storage_key).await.unwrap_or(false) {
                 return Response::builder()
                     .status(StatusCode::OK)
@@ -441,7 +440,7 @@ async fn handle_get_blob(
 
     match blob {
         Ok(Some(b)) => {
-            let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+            let storage = state.storage_for_repo(&storage_path);
             match storage.get(&b.storage_key).await {
                 Ok(data) => {
                     return Response::builder()
@@ -499,7 +498,7 @@ async fn handle_start_upload(
                 );
             }
 
-            let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+            let storage = state.storage_for_repo(&storage_path);
             let key = blob_storage_key(digest);
             if let Err(e) = storage.put(&key, body.clone()).await {
                 return oci_error(
@@ -533,7 +532,7 @@ async fn handle_start_upload(
 
     // If body is non-empty, store it as initial chunk
     if !body.is_empty() {
-        let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+        let storage = state.storage_for_repo(&storage_path);
         if let Err(e) = storage.put(&temp_key, body.clone()).await {
             return oci_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -616,7 +615,7 @@ async fn handle_patch_upload(
         Err(e) => return e,
     };
 
-    let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+    let storage = state.storage_for_repo(&storage_path);
 
     // Read existing data and append
     let mut existing = match storage.get(&session.storage_temp_key).await {
@@ -725,7 +724,7 @@ async fn handle_complete_upload(
         Err(e) => return e,
     };
 
-    let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+    let storage = state.storage_for_repo(&storage_path);
 
     // Read accumulated data and append final chunk
     let mut data = match storage.get(&session.storage_temp_key).await {
@@ -837,7 +836,7 @@ async fn handle_head_manifest(
         }
     };
 
-    let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+    let storage = state.storage_for_repo(&storage_path);
     let manifest_key = manifest_storage_key(&manifest_digest);
 
     match storage.get(&manifest_key).await {
@@ -898,7 +897,7 @@ async fn handle_get_manifest(
         }
     };
 
-    let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+    let storage = state.storage_for_repo(&storage_path);
     let manifest_key = manifest_storage_key(&manifest_digest);
 
     match storage.get(&manifest_key).await {
@@ -946,7 +945,7 @@ async fn handle_put_manifest(
     let manifest_key = manifest_storage_key(&digest);
 
     // Store manifest
-    let storage = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+    let storage = state.storage_for_repo(&storage_path);
     if let Err(e) = storage.put(&manifest_key, body.clone()).await {
         return oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,

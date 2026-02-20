@@ -150,10 +150,46 @@ async fn main() -> Result<()> {
     let metrics_handle = metrics_service::init_metrics();
     tracing::info!("Prometheus metrics recorder initialized");
 
+    // Create primary storage backend based on STORAGE_BACKEND config
+    let primary_storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> =
+        match config.storage_backend.as_str() {
+            "s3" => {
+                let s3 = artifact_keeper_backend::storage::s3::S3Backend::from_env().await?;
+                tracing::info!("S3 storage backend initialized");
+                Arc::new(s3)
+            }
+            "azure" => {
+                let azure_config =
+                    artifact_keeper_backend::storage::azure::AzureConfig::from_env()?;
+                let azure =
+                    artifact_keeper_backend::storage::azure::AzureBackend::new(azure_config)
+                        .await?;
+                tracing::info!("Azure Blob storage backend initialized");
+                Arc::new(azure)
+            }
+            "gcs" => {
+                let gcs_config = artifact_keeper_backend::storage::gcs::GcsConfig::from_env()?;
+                let gcs =
+                    artifact_keeper_backend::storage::gcs::GcsBackend::new(gcs_config).await?;
+                tracing::info!("GCS storage backend initialized");
+                Arc::new(gcs)
+            }
+            _ => {
+                tracing::info!(
+                    "Filesystem storage backend initialized at {}",
+                    config.storage_path
+                );
+                Arc::new(artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(
+                    &config.storage_path,
+                ))
+            }
+        };
+
     // Create application state with WASM plugin support
     let mut app_state = api::AppState::with_wasm_plugins(
         config.clone(),
         db_pool.clone(),
+        primary_storage,
         plugin_registry,
         wasm_plugin_service,
     );
