@@ -12,7 +12,7 @@ RUN dnf install -y --nodocs \
       aarch64) PROTOC_ARCH="linux-aarch_64" ;; \
       *)       echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
-    curl -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip" \
+    curl --proto '=https' --tlsv1.2 -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-${PROTOC_ARCH}.zip" \
       -o /tmp/protoc.zip && \
     unzip -q /tmp/protoc.zip -d /usr/local && rm /tmp/protoc.zip && \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 && \
@@ -118,8 +118,8 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7 AS scanners
 ARG TRIVY_VERSION=v0.69.1
 ARG GRYPE_VERSION=v0.108.0
 RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 tar gzip && \
-    curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin "${TRIVY_VERSION}" && \
-    curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin "${GRYPE_VERSION}" && \
+    curl --proto '=https' --tlsv1.2 -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin "${TRIVY_VERSION}" && \
+    curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin "${GRYPE_VERSION}" && \
     microdnf clean all
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
