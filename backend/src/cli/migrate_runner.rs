@@ -2,7 +2,12 @@
 //!
 //! This module implements the actual execution logic for migration CLI commands.
 
-use crate::cli::migrate::{error, output, table_row, MigrateCli, MigrateCommand, MigrateConfig};
+use crate::cli::migrate::{
+    error, output, table_row, ArtifactoryConfig, MigrateCli, MigrateCommand, MigrateConfig,
+};
+use crate::services::artifactory_client::{
+    ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig,
+};
 use crate::services::artifactory_import::{
     ArtifactoryImporter, ImportProgress, ImportedRepository,
 };
@@ -323,6 +328,77 @@ fn import_security_data(
     Ok(())
 }
 
+/// Build an authenticated Artifactory client from the migration config.
+fn build_client(
+    format: &str,
+    config: &MigrateConfig,
+) -> Result<(ArtifactoryClient, String), Box<dyn std::error::Error>> {
+    let artifactory = config
+        .artifactory
+        .as_ref()
+        .ok_or("No Artifactory configuration provided")?;
+
+    let url = artifactory
+        .url
+        .as_ref()
+        .ok_or("No Artifactory URL provided")?;
+
+    let auth = build_auth(format, artifactory)?;
+    let client_config = ArtifactoryClientConfig {
+        base_url: url.clone(),
+        auth,
+        ..Default::default()
+    };
+
+    let client = ArtifactoryClient::new(client_config)?;
+    Ok((client, url.clone()))
+}
+
+/// Build authentication credentials from the Artifactory config.
+fn build_auth(
+    format: &str,
+    artifactory: &ArtifactoryConfig,
+) -> Result<ArtifactoryAuth, Box<dyn std::error::Error>> {
+    if let Some(ref token) = artifactory.token {
+        return Ok(ArtifactoryAuth::ApiToken(token.clone()));
+    }
+    if let (Some(ref username), Some(ref password)) = (&artifactory.username, &artifactory.password)
+    {
+        return Ok(ArtifactoryAuth::BasicAuth {
+            username: username.clone(),
+            password: password.clone(),
+        });
+    }
+    error(format, "No authentication credentials provided");
+    Err("No authentication credentials".into())
+}
+
+/// Filter repositories by include/exclude patterns and display the table.
+fn filter_repositories<'a>(
+    format: &str,
+    repositories: &'a [ImportedRepository],
+    include: Option<&[String]>,
+    exclude: Option<&[String]>,
+) -> Vec<&'a ImportedRepository> {
+    if format == "text" {
+        println!("\nRepositories:");
+        table_row(&["Key", "Type", "Package Type"]);
+        table_row(&["---", "----", "------------"]);
+    }
+
+    let mut selected = Vec::new();
+    for repo in repositories {
+        if !repo_passes_filters(&repo.key, include, exclude) {
+            continue;
+        }
+        selected.push(repo);
+        if format == "text" {
+            table_row(&[&repo.key, &repo.repo_type, &repo.package_type]);
+        }
+    }
+    selected
+}
+
 /// Run import from Artifactory export directory
 #[allow(clippy::too_many_arguments)]
 async fn run_import(
@@ -359,23 +435,7 @@ async fn run_import(
 
     // List and filter repositories
     let repositories = importer.list_repositories()?;
-
-    if format == "text" {
-        println!("\nRepositories:");
-        table_row(&["Key", "Type", "Package Type"]);
-        table_row(&["---", "----", "------------"]);
-    }
-
-    let mut repos_to_import = Vec::new();
-    for repo in &repositories {
-        if !repo_passes_filters(&repo.key, include, exclude) {
-            continue;
-        }
-        repos_to_import.push(repo);
-        if format == "text" {
-            table_row(&[&repo.key, &repo.repo_type, &repo.package_type]);
-        }
-    }
+    let repos_to_import = filter_repositories(format, &repositories, include, exclude);
 
     output(
         format,
@@ -425,40 +485,8 @@ async fn run_import(
 
 /// Run connection test
 async fn run_test(format: &str, config: &MigrateConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let artifactory = config
-        .artifactory
-        .as_ref()
-        .ok_or("No Artifactory configuration provided")?;
-
-    let url = artifactory
-        .url
-        .as_ref()
-        .ok_or("No Artifactory URL provided")?;
-
+    let (client, url) = build_client(format, config)?;
     output(format, &format!("Testing connection to {}...", url), None);
-
-    // Build auth
-    let auth = if let Some(ref token) = artifactory.token {
-        crate::services::artifactory_client::ArtifactoryAuth::ApiToken(token.clone())
-    } else if let (Some(ref username), Some(ref password)) =
-        (&artifactory.username, &artifactory.password)
-    {
-        crate::services::artifactory_client::ArtifactoryAuth::BasicAuth {
-            username: username.clone(),
-            password: password.clone(),
-        }
-    } else {
-        error(format, "No authentication credentials provided");
-        return Err("No authentication credentials".into());
-    };
-
-    let client_config = crate::services::artifactory_client::ArtifactoryClientConfig {
-        base_url: url.clone(),
-        auth,
-        ..Default::default()
-    };
-
-    let client = crate::services::artifactory_client::ArtifactoryClient::new(client_config)?;
 
     match client.ping().await {
         Ok(true) => {
@@ -505,44 +533,12 @@ async fn run_assess(
     exclude: Option<&[String]>,
     output_path: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let artifactory = config
-        .artifactory
-        .as_ref()
-        .ok_or("No Artifactory configuration provided")?;
-
-    let url = artifactory
-        .url
-        .as_ref()
-        .ok_or("No Artifactory URL provided")?;
-
+    let (client, url) = build_client(format, config)?;
     output(
         format,
         &format!("Running assessment against {}...", url),
         None,
     );
-
-    // Build auth
-    let auth = if let Some(ref token) = artifactory.token {
-        crate::services::artifactory_client::ArtifactoryAuth::ApiToken(token.clone())
-    } else if let (Some(ref username), Some(ref password)) =
-        (&artifactory.username, &artifactory.password)
-    {
-        crate::services::artifactory_client::ArtifactoryAuth::BasicAuth {
-            username: username.clone(),
-            password: password.clone(),
-        }
-    } else {
-        error(format, "No authentication credentials provided");
-        return Err("No authentication credentials".into());
-    };
-
-    let client_config = crate::services::artifactory_client::ArtifactoryClientConfig {
-        base_url: url.clone(),
-        auth,
-        ..Default::default()
-    };
-
-    let client = crate::services::artifactory_client::ArtifactoryClient::new(client_config)?;
 
     // List repositories
     let repositories = client.list_repositories().await?;
