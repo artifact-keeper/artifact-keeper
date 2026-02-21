@@ -72,4 +72,5 @@ pub mod transfer;
 pub mod tree;
 pub mod users;
 pub mod vscode;
+pub mod wasm_proxy;
 pub mod webhooks;

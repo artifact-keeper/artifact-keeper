@@ -237,7 +237,7 @@ Extend Artifact Keeper with custom format handlers compiled to WebAssembly.
 - **WIT-based interface** - Plugins implement a well-defined `FormatHandler` contract
 - **Wasmtime runtime** - Sandboxed execution with fuel-based CPU limits and memory caps
 - **Hot reload** - Install, enable, disable, and reload plugins without restart
-- **Sources** - Load from Git repositories, ZIP uploads, or local paths
+- **Sources** - Load from Git repositories or ZIP uploads
 
 ## Quick Start
 

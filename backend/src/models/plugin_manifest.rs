@@ -62,6 +62,9 @@ pub struct CapabilitiesConfig {
     /// Plugin can validate artifacts before storage
     #[serde(default = "default_true")]
     pub validate_artifact: bool,
+    /// Plugin can handle native protocol HTTP requests (v2 WIT)
+    #[serde(default)]
+    pub handle_request: bool,
 }
 
 impl Default for CapabilitiesConfig {
@@ -70,6 +73,7 @@ impl Default for CapabilitiesConfig {
             parse_metadata: true,
             generate_index: false,
             validate_artifact: true,
+            handle_request: false,
         }
     }
 }
@@ -175,6 +179,7 @@ impl PluginManifest {
             parse_metadata: self.capabilities.parse_metadata,
             generate_index: self.capabilities.generate_index,
             validate_artifact: self.capabilities.validate_artifact,
+            handle_request: self.capabilities.handle_request,
         }
     }
 

@@ -53,6 +53,7 @@ pub mod sync_policy_service;
 pub mod token_service;
 pub mod transfer_service;
 pub mod trivy_fs_scanner;
+pub mod wasm_bindings;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
 

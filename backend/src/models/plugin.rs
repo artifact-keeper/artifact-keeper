@@ -111,6 +111,9 @@ pub struct PluginCapabilities {
     pub generate_index: bool,
     /// Plugin can validate artifacts
     pub validate_artifact: bool,
+    /// Plugin can handle native protocol HTTP requests (v2 WIT)
+    #[serde(default)]
+    pub handle_request: bool,
 }
 
 impl Default for PluginCapabilities {
@@ -119,6 +122,7 @@ impl Default for PluginCapabilities {
             parse_metadata: true,
             generate_index: false,
             validate_artifact: true,
+            handle_request: false,
         }
     }
 }
@@ -222,6 +226,7 @@ mod tests {
             parse_metadata: false,
             generate_index: true,
             validate_artifact: false,
+            handle_request: false,
         };
         let json = serde_json::to_string(&caps).unwrap();
         let deserialized: PluginCapabilities = serde_json::from_str(&json).unwrap();

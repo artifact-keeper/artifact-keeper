@@ -12,6 +12,10 @@ use uuid::Uuid;
 
 use crate::models::plugin::{PluginCapabilities, PluginResourceLimits};
 
+use super::wasm_bindings::{
+    FormatPlugin, WasmHttpRequest, WasmHttpResponse, WasmRepoContext, WitHttpRequest,
+    WitMetadataV2, WitRepoContext,
+};
 use super::wasm_runtime::{
     CompiledPlugin, WasmError, WasmIndexFile, WasmMetadata, WasmResult, WasmRuntime,
     WasmValidationError,
@@ -32,8 +36,10 @@ pub struct ActivePlugin {
     pub version: String,
     /// Internal version counter for hot-reload tracking
     pub internal_version: u64,
-    /// Compiled WASM component
+    /// Compiled WASM component (v1 world)
     pub compiled: Arc<CompiledPlugin>,
+    /// Compiled WASM component for v2 world (handle-request support)
+    pub compiled_v2: Option<Arc<CompiledPlugin>>,
     /// Plugin capabilities
     pub capabilities: PluginCapabilities,
     /// Resource limits for execution
@@ -124,9 +130,28 @@ impl PluginRegistry {
             name, id, version, format_key
         );
 
-        // Compile the WASM component
+        // Compile the WASM component (v1 world)
         let compiled = self.runtime.compile(wasm_bytes)?;
         let compiled = Arc::new(compiled);
+
+        // Compile v2 world if plugin declares handle_request capability
+        let compiled_v2 = if capabilities.handle_request {
+            match self.runtime.compile(wasm_bytes) {
+                Ok(c) => {
+                    info!("Plugin {} compiled for v2 world (handle-request)", name);
+                    Some(Arc::new(c))
+                }
+                Err(e) => {
+                    warn!(
+                        "Plugin {} declared handle_request but v2 compilation failed: {}",
+                        name, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Get next internal version
         let internal_version = self.next_version().await;
@@ -138,6 +163,7 @@ impl PluginRegistry {
             version: version.clone(),
             internal_version,
             compiled,
+            compiled_v2,
             capabilities,
             limits,
         });
@@ -282,32 +308,31 @@ impl PluginRegistry {
             plugin.name, path
         );
 
-        // Create store with resource limits
-        let _store = self.runtime.create_store(
+        let mut store = self.runtime.create_store(
             &plugin.compiled,
             &plugin.id.to_string(),
             &plugin.format_key,
             &plugin.limits,
         )?;
 
-        // TODO: Actually instantiate the component and call parse_metadata
-        // This requires bindgen-generated bindings from the WIT interface
-        // For now, return a placeholder that will be replaced when we generate
-        // the actual bindings
+        let instance = FormatPlugin::instantiate_async(
+            &mut store,
+            plugin.compiled.component(),
+            plugin.compiled.linker(),
+        )
+        .await
+        .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
 
-        // Placeholder implementation
-        warn!(
-            "parse_metadata not yet fully implemented - returning placeholder for {}",
-            path
-        );
+        let handler = instance.artifact_keeper_format_handler();
+        let result = handler
+            .call_parse_metadata(&mut store, path, data)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
 
-        Ok(WasmMetadata {
-            path: path.to_string(),
-            version: None,
-            content_type: "application/octet-stream".to_string(),
-            size_bytes: data.len() as u64,
-            checksum_sha256: None,
-        })
+        match result {
+            Ok(metadata) => Ok(WasmMetadata::from(metadata)),
+            Err(msg) => Err(WasmError::PluginError(msg)),
+        }
     }
 
     /// Execute validate on a plugin.
@@ -318,7 +343,7 @@ impl PluginRegistry {
         &self,
         format_key: &str,
         path: &str,
-        _data: &[u8],
+        data: &[u8],
     ) -> WasmResult<Result<(), WasmValidationError>> {
         let plugin = self.get_by_format(format_key).await.ok_or_else(|| {
             WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
@@ -334,22 +359,34 @@ impl PluginRegistry {
             plugin.name, path
         );
 
-        // Create store with resource limits
-        let _store = self.runtime.create_store(
+        let mut store = self.runtime.create_store(
             &plugin.compiled,
             &plugin.id.to_string(),
             &plugin.format_key,
             &plugin.limits,
         )?;
 
-        // TODO: Actually instantiate the component and call validate
-        // Placeholder implementation
-        warn!(
-            "validate not yet fully implemented - returning success for {}",
-            path
-        );
+        let instance = FormatPlugin::instantiate_async(
+            &mut store,
+            plugin.compiled.component(),
+            plugin.compiled.linker(),
+        )
+        .await
+        .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
 
-        Ok(Ok(()))
+        let handler = instance.artifact_keeper_format_handler();
+        let result = handler
+            .call_validate(&mut store, path, data)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+
+        match result {
+            Ok(()) => Ok(Ok(())),
+            Err(msg) => Ok(Err(WasmValidationError {
+                message: msg,
+                field: None,
+            })),
+        }
     }
 
     /// Execute generate_index on a plugin.
@@ -376,22 +413,101 @@ impl PluginRegistry {
             artifacts.len()
         );
 
-        // Create store with resource limits
-        let _store = self.runtime.create_store(
+        let mut store = self.runtime.create_store(
             &plugin.compiled,
             &plugin.id.to_string(),
             &plugin.format_key,
             &plugin.limits,
         )?;
 
-        // TODO: Actually instantiate the component and call generate_index
-        // Placeholder implementation
-        warn!(
-            "generate_index not yet fully implemented - returning None for {}",
-            format_key
+        let wit_artifacts: Vec<super::wasm_bindings::WitMetadata> =
+            artifacts.iter().map(Into::into).collect();
+
+        let instance = FormatPlugin::instantiate_async(
+            &mut store,
+            plugin.compiled.component(),
+            plugin.compiled.linker(),
+        )
+        .await
+        .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
+
+        let handler = instance.artifact_keeper_format_handler();
+        let result = handler
+            .call_generate_index(&mut store, &wit_artifacts)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+
+        match result {
+            Ok(Some(files)) => Ok(Some(super::wasm_bindings::index_files_from_wit(files))),
+            Ok(None) => Ok(None),
+            Err(msg) => Err(WasmError::PluginError(msg)),
+        }
+    }
+
+    /// Check if a plugin supports handle_request (v2 protocol serving).
+    pub async fn has_handle_request(&self, format_key: &str) -> bool {
+        self.get_by_format(format_key)
+            .await
+            .map(|p| p.capabilities.handle_request && p.compiled_v2.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Execute handle_request on a v2 plugin.
+    ///
+    /// Routes an HTTP request to the plugin for native protocol serving
+    /// (e.g., PEP 503 for pip, repodata for dnf).
+    pub async fn execute_handle_request(
+        &self,
+        format_key: &str,
+        request: &WasmHttpRequest,
+        context: &WasmRepoContext,
+        artifacts: &[WasmMetadata],
+    ) -> WasmResult<WasmHttpResponse> {
+        let plugin = self.get_by_format(format_key).await.ok_or_else(|| {
+            WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
+        })?;
+
+        let compiled_v2 = plugin.compiled_v2.as_ref().ok_or_else(|| {
+            WasmError::ValidationFailed(format!(
+                "Plugin '{}' does not support handle_request",
+                plugin.name
+            ))
+        })?;
+
+        debug!(
+            "Executing handle_request on plugin {} for {} {}",
+            plugin.name, request.method, request.path
         );
 
-        Ok(None)
+        let mut store = self.runtime.create_store(
+            compiled_v2,
+            &plugin.id.to_string(),
+            &plugin.format_key,
+            &plugin.limits,
+        )?;
+
+        let wit_request: WitHttpRequest = request.into();
+        let wit_context: WitRepoContext = context.into();
+        let wit_artifacts: Vec<WitMetadataV2> = artifacts.iter().map(Into::into).collect();
+
+        let instance = super::wasm_bindings::v2::FormatPluginV2::instantiate_async(
+            &mut store,
+            compiled_v2.component(),
+            compiled_v2.linker(),
+        )
+        .await
+        .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
+
+        let req_handler = instance.artifact_keeper_format_request_handler();
+        let result = req_handler
+            .call_handle_request(&mut store, &wit_request, &wit_context, &wit_artifacts)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+
+        match result {
+            Ok(response) => Ok(WasmHttpResponse::from(response)),
+            Err(msg) => Err(WasmError::PluginError(msg)),
+        }
     }
 }
 
