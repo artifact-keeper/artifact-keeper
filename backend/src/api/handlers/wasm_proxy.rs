@@ -185,6 +185,7 @@ fn build_wasm_request(
 }
 
 /// Convert a WASM HTTP response to an axum HTTP response.
+#[allow(clippy::result_large_err)]
 fn wasm_response_to_http(
     response: crate::services::wasm_bindings::WasmHttpResponse,
 ) -> Result<Response<Body>, Response<Body>> {
