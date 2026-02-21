@@ -11,6 +11,7 @@ pub mod backup_service;
 pub mod build_service;
 pub mod dependency_track_service;
 pub mod encryption;
+pub mod event_bus;
 pub mod grype_scanner;
 pub mod helm_lint_checker;
 pub mod image_scanner;
