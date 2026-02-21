@@ -198,7 +198,7 @@ jobs:
       # exit-code: 0 means scan results are informational — unfixed base image
       # CVEs (Red Hat's responsibility) should not block image publishing.
       - name: Trivy scan - Backend
-        uses: aquasecurity/trivy-action@0.34.0
+        uses: aquasecurity/trivy-action@0.34.1
         with:
           image-ref: ${{ steps.refs.outputs.backend }}
           format: 'sarif'
@@ -208,7 +208,7 @@ jobs:
           exit-code: '0'
 
       - name: Trivy scan - OpenSCAP
-        uses: aquasecurity/trivy-action@0.34.0
+        uses: aquasecurity/trivy-action@0.34.1
         if: always()
         with:
           image-ref: ${{ steps.refs.outputs.openscap }}
@@ -231,6 +231,16 @@ jobs:
         with:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: trivy-scan-reports
+          path: |
+            backend-trivy.sarif
+            openscap-trivy.sarif
+          retention-days: 90
 
       # --- OpenSCAP STIG compliance scan ---
       - name: Install OpenSCAP

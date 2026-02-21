@@ -116,7 +116,7 @@ RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 # ---------- Stage 5: Download scanner CLIs ----------
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7 AS scanners
 ARG TRIVY_VERSION=v0.69.1
-ARG GRYPE_VERSION=v0.108.0
+ARG GRYPE_VERSION=v0.109.0
 RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 tar gzip && \
     curl --proto '=https' --tlsv1.2 -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin "${TRIVY_VERSION}" && \
     curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin "${GRYPE_VERSION}" && \
