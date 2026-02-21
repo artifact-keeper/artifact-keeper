@@ -100,3 +100,6 @@ scripts/sso-e2e/sso-config-ids.env
 
 # Astro build cache
 .astro/
+
+# Git worktrees
+.worktrees/
