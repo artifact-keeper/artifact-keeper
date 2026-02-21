@@ -16,6 +16,23 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("OPENSCAP_PORT", "8091"))
 
+# Allowed base directories for scan paths (container-extracted filesystems)
+ALLOWED_SCAN_DIRS = os.environ.get(
+    "OPENSCAP_ALLOWED_SCAN_DIRS", "/tmp/:/var/tmp/"
+).split(":")
+
+
+def validate_scan_path(path):
+    """Validate that a scan path is safe (absolute, real, under allowed dirs)."""
+    if not path or not os.path.isabs(path):
+        return None
+    real_path = os.path.realpath(path)
+    for allowed in ALLOWED_SCAN_DIRS:
+        if allowed and real_path.startswith(os.path.realpath(allowed)):
+            return real_path
+    return None
+
+
 # XCCDF 1.2 namespace
 XCCDF_NS = "http://checklists.nist.gov/xccdf/1.2"
 
@@ -36,8 +53,14 @@ def find_scap_content():
 
 
 def detect_os_from_path(scan_path):
-    """Try to detect the OS family from os-release in an extracted filesystem."""
-    os_release = os.path.join(scan_path, "etc", "os-release")
+    """Try to detect the OS family from os-release in an extracted filesystem.
+
+    scan_path must already be validated by validate_scan_path().
+    """
+    os_release = os.path.realpath(os.path.join(scan_path, "etc", "os-release"))
+    # Verify the resolved path is still under the scan_path (prevent traversal)
+    if not os_release.startswith(os.path.realpath(scan_path)):
+        return None
     if not os.path.exists(os_release):
         return None
     try:
@@ -236,11 +259,12 @@ class OpenSCAPHandler(BaseHTTPRequestHandler):
             self._json_response(400, {"error": "invalid JSON"})
             return
 
-        scan_path = req.get("path", "")
+        raw_path = req.get("path", "")
         profile = req.get("profile", "xccdf_org.ssgproject.content_profile_standard")
 
+        scan_path = validate_scan_path(raw_path)
         if not scan_path or not os.path.isdir(scan_path):
-            self._json_response(400, {"error": f"scan path not found: {scan_path}"})
+            self._json_response(400, {"error": "scan path not found or not allowed"})
             return
 
         content_file = select_content_file(scan_path, self.available_content)

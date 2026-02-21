@@ -271,8 +271,19 @@ pub struct PermissionsResponse {
 impl ArtifactoryClient {
     /// Create a new Artifactory client with the given configuration
     pub fn new(config: ArtifactoryClientConfig) -> Result<Self, ArtifactoryError> {
+        // Enforce HTTPS unless explicitly opted out for local dev
+        let allow_http = std::env::var("ALLOW_HTTP_INTEGRATIONS")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        if !allow_http && !config.base_url.starts_with("https://") {
+            eprintln!(
+                "[WARN] Artifactory base_url is not HTTPS. Set ALLOW_HTTP_INTEGRATIONS=1 for local dev."
+            );
+        }
+
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
+            .https_only(!allow_http)
             .build()?;
 
         Ok(Self { client, config })

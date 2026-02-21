@@ -3,7 +3,6 @@
 //! Provides symmetric encryption for storing Artifactory credentials
 //! and other sensitive migration data.
 
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -58,8 +57,7 @@ impl CredentialEncryption {
     /// Returns: IV (16 bytes) || ciphertext || HMAC (32 bytes)
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
         // Generate random IV
-        let mut iv = [0u8; 16];
-        rand::rng().fill_bytes(&mut iv);
+        let iv: [u8; 16] = rand::random();
 
         // Derive encryption key from main key + IV
         let enc_key = self.derive_enc_key(&iv);

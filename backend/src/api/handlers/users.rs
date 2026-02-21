@@ -795,7 +795,10 @@ pub async fn change_password(
         tracing::info!("Setup complete. API fully unlocked.");
 
         // Delete the password file (best-effort)
-        let password_file = std::path::Path::new(&state.config.storage_path).join("admin.password");
+        let storage_base = std::path::Path::new(&state.config.storage_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&state.config.storage_path));
+        let password_file = storage_base.join("admin.password");
         if password_file.exists() {
             if let Err(e) = std::fs::remove_file(&password_file) {
                 tracing::warn!("Failed to delete admin password file: {}", e);

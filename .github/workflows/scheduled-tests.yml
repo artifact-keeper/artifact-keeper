@@ -6,10 +6,16 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   nightly-e2e:
     name: 🌙 Nightly E2E Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     timeout-minutes: 45
     steps:
       - name: Checkout

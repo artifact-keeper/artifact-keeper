@@ -32,7 +32,7 @@ pub struct OidcConfigRow {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Clone, FromRow)]
 pub struct LdapConfigRow {
     pub id: Uuid,
     pub name: String,
@@ -55,7 +55,17 @@ pub struct LdapConfigRow {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+redacted_debug!(LdapConfigRow {
+    show id,
+    show name,
+    show server_url,
+    show bind_dn,
+    redact_option bind_password_encrypted,
+    show user_base_dn,
+    show is_enabled,
+});
+
+#[derive(Clone, FromRow)]
 pub struct SamlConfigRow {
     pub id: Uuid,
     pub name: String,
@@ -73,6 +83,16 @@ pub struct SamlConfigRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+redacted_debug!(SamlConfigRow {
+    show id,
+    show name,
+    show entity_id,
+    show sso_url,
+    redact certificate,
+    show sp_entity_id,
+    show is_enabled,
+});
 
 #[derive(Debug, Clone, FromRow)]
 pub struct SsoSession {
@@ -1860,5 +1880,59 @@ mod tests {
         assert!(req.require_signed_assertions.is_none());
         assert!(req.admin_group.is_none());
         assert!(req.is_enabled.is_none());
+    }
+
+    #[test]
+    fn test_ldap_config_row_debug_redacts_password() {
+        let row = LdapConfigRow {
+            id: uuid::Uuid::nil(),
+            name: "test-ldap".to_string(),
+            server_url: "ldap://example.com".to_string(),
+            bind_dn: Some("cn=admin".to_string()),
+            bind_password_encrypted: Some("super-secret-encrypted".to_string()),
+            user_base_dn: "dc=example,dc=com".to_string(),
+            user_filter: "(uid={0})".to_string(),
+            group_base_dn: None,
+            group_filter: None,
+            email_attribute: "mail".to_string(),
+            display_name_attribute: "cn".to_string(),
+            username_attribute: "uid".to_string(),
+            groups_attribute: "memberOf".to_string(),
+            admin_group_dn: None,
+            use_starttls: false,
+            is_enabled: true,
+            priority: 0,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let debug = format!("{:?}", row);
+        assert!(debug.contains("test-ldap"));
+        assert!(!debug.contains("super-secret-encrypted"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_saml_config_row_debug_redacts_certificate() {
+        let row = SamlConfigRow {
+            id: uuid::Uuid::nil(),
+            name: "test-saml".to_string(),
+            entity_id: "https://idp.example.com".to_string(),
+            sso_url: "https://idp.example.com/sso".to_string(),
+            slo_url: None,
+            certificate: "-----BEGIN CERTIFICATE-----\nMIIBxTCCAW...".to_string(),
+            name_id_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress".to_string(),
+            attribute_mapping: serde_json::json!({}),
+            sp_entity_id: "https://sp.example.com".to_string(),
+            sign_requests: false,
+            require_signed_assertions: true,
+            admin_group: None,
+            is_enabled: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let debug = format!("{:?}", row);
+        assert!(debug.contains("test-saml"));
+        assert!(!debug.contains("BEGIN CERTIFICATE"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }

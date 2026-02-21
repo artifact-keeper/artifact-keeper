@@ -285,7 +285,10 @@ pub async fn liveness_check() -> impl IntoResponse {
 async fn check_storage_health(config: &crate::config::Config) -> CheckStatus {
     match config.storage_backend.as_str() {
         "filesystem" => {
-            let probe_path = std::path::Path::new(&config.storage_path).join(".health-probe");
+            let storage_base = std::path::Path::new(&config.storage_path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(&config.storage_path));
+            let probe_path = storage_base.join(".health-probe");
             match tokio::fs::write(&probe_path, b"ok").await {
                 Ok(()) => match tokio::fs::read(&probe_path).await {
                     Ok(data) if data == b"ok" => {

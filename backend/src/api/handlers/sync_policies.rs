@@ -10,7 +10,7 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::SharedState;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::services::sync_policy_service::{
     ArtifactFilter, CreateSyncPolicyRequest, EvaluationResult, PeerSelector, PreviewResult,
     RepoSelector, SyncPolicy, SyncPolicyService, UpdateSyncPolicyRequest,
@@ -308,10 +308,34 @@ fn preview_to_response(p: PreviewResult) -> PreviewResultResponse {
     }
 }
 
-fn parse_selector<T: serde::de::DeserializeOwned + Default>(value: Option<serde_json::Value>) -> T {
-    value
-        .map(|v| serde_json::from_value(v).unwrap_or_default())
-        .unwrap_or_default()
+/// Max number of items in selector collections to prevent unbounded allocation.
+const MAX_SELECTOR_ITEMS: usize = 1000;
+
+fn parse_selector<T: serde::de::DeserializeOwned + Default>(
+    value: Option<serde_json::Value>,
+) -> Result<T> {
+    let parsed = value
+        .map(|v| {
+            // Reject oversized JSON arrays/objects before deserialization
+            if let Some(arr) = v.as_array() {
+                if arr.len() > MAX_SELECTOR_ITEMS {
+                    return Err(AppError::Validation(
+                        "Selector contains too many items".to_string(),
+                    ));
+                }
+            }
+            if let Some(obj) = v.as_object() {
+                if obj.len() > MAX_SELECTOR_ITEMS {
+                    return Err(AppError::Validation(
+                        "Selector contains too many items".to_string(),
+                    ));
+                }
+            }
+            Ok(serde_json::from_value(v).unwrap_or_default())
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,9 +383,9 @@ async fn create_policy(
     State(state): State<SharedState>,
     Json(payload): Json<CreateSyncPolicyPayload>,
 ) -> Result<Json<SyncPolicyResponse>> {
-    let repo_selector: RepoSelector = parse_selector(payload.repo_selector);
-    let peer_selector: PeerSelector = parse_selector(payload.peer_selector);
-    let artifact_filter: ArtifactFilter = parse_selector(payload.artifact_filter);
+    let repo_selector: RepoSelector = parse_selector(payload.repo_selector)?;
+    let peer_selector: PeerSelector = parse_selector(payload.peer_selector)?;
+    let artifact_filter: ArtifactFilter = parse_selector(payload.artifact_filter)?;
 
     let req = CreateSyncPolicyRequest {
         name: payload.name,
@@ -432,13 +456,16 @@ async fn update_policy(
 ) -> Result<Json<SyncPolicyResponse>> {
     let repo_selector: Option<RepoSelector> = payload
         .repo_selector
-        .map(|v| serde_json::from_value(v).unwrap_or_default());
+        .map(|v| parse_selector(Some(v)))
+        .transpose()?;
     let peer_selector: Option<PeerSelector> = payload
         .peer_selector
-        .map(|v| serde_json::from_value(v).unwrap_or_default());
+        .map(|v| parse_selector(Some(v)))
+        .transpose()?;
     let artifact_filter: Option<ArtifactFilter> = payload
         .artifact_filter
-        .map(|v| serde_json::from_value(v).unwrap_or_default());
+        .map(|v| parse_selector(Some(v)))
+        .transpose()?;
 
     let req = UpdateSyncPolicyRequest {
         name: payload.name,
@@ -548,9 +575,9 @@ async fn preview_policy(
     State(state): State<SharedState>,
     Json(payload): Json<PreviewPolicyPayload>,
 ) -> Result<Json<PreviewResultResponse>> {
-    let repo_selector: RepoSelector = parse_selector(payload.repo_selector);
-    let peer_selector: PeerSelector = parse_selector(payload.peer_selector);
-    let artifact_filter: ArtifactFilter = parse_selector(payload.artifact_filter);
+    let repo_selector: RepoSelector = parse_selector(payload.repo_selector)?;
+    let peer_selector: PeerSelector = parse_selector(payload.peer_selector)?;
+    let artifact_filter: ArtifactFilter = parse_selector(payload.artifact_filter)?;
 
     let req = CreateSyncPolicyRequest {
         name: payload.name,
@@ -748,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_parse_selector_with_none() {
-        let sel: RepoSelector = parse_selector(None);
+        let sel: RepoSelector = parse_selector(None).unwrap();
         assert!(sel.match_labels.is_empty());
         assert!(sel.match_formats.is_empty());
     }
@@ -756,16 +783,49 @@ mod tests {
     #[test]
     fn test_parse_selector_with_value() {
         let val = serde_json::json!({"match_formats": ["docker"]});
-        let sel: RepoSelector = parse_selector(Some(val));
+        let sel: RepoSelector = parse_selector(Some(val)).unwrap();
         assert_eq!(sel.match_formats, vec!["docker"]);
     }
 
     #[test]
     fn test_parse_selector_with_invalid_value() {
         let val = serde_json::json!("not an object");
-        let sel: RepoSelector = parse_selector(Some(val));
+        let sel: RepoSelector = parse_selector(Some(val)).unwrap();
         // Should fall back to default
         assert!(sel.match_labels.is_empty());
+    }
+
+    #[test]
+    fn test_parse_selector_rejects_oversized_array() {
+        let items: Vec<serde_json::Value> = (0..1001).map(|i| serde_json::json!(i)).collect();
+        let val = serde_json::Value::Array(items);
+        let result: Result<RepoSelector> = parse_selector(Some(val));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("too many items"),
+            "expected 'too many items' error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_selector_rejects_oversized_object() {
+        let mut map = serde_json::Map::new();
+        for i in 0..1001 {
+            map.insert(format!("key_{i}"), serde_json::json!(i));
+        }
+        let val = serde_json::Value::Object(map);
+        let result: Result<RepoSelector> = parse_selector(Some(val));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_selector_accepts_max_size_array() {
+        let items: Vec<serde_json::Value> = (0..1000).map(|i| serde_json::json!(i)).collect();
+        let val = serde_json::Value::Array(items);
+        // Array of ints won't deserialize to RepoSelector, so falls back to default
+        let result: RepoSelector = parse_selector(Some(val)).unwrap();
+        assert!(result.match_labels.is_empty());
     }
 
     #[test]

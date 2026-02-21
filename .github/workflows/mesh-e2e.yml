@@ -18,6 +18,9 @@ on:
         type: string
         default: 'dev'
 
+permissions:
+  contents: read
+
 concurrency:
   group: mesh-e2e
   cancel-in-progress: false

@@ -2,6 +2,9 @@
 //!
 //! Open-source artifact registry supporting 13+ package formats.
 
+#[macro_use]
+mod macros;
+
 pub mod api;
 pub mod cli;
 pub mod config;

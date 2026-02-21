@@ -16,6 +16,8 @@ on:
         required: true
         default: 'latest'
 
+permissions: {}
+
 env:
   REGISTRY: ghcr.io
   BACKEND_IMAGE: ${{ github.repository }}-backend
@@ -464,6 +466,7 @@ jobs:
   summary:
     name: Publish Summary
     runs-on: ubuntu-latest
+    permissions: {}
     needs: [merge-backend, merge-openscap]
     if: always()
     steps:

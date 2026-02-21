@@ -19,7 +19,7 @@ use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 
 /// SAML configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SamlConfig {
     /// SAML IdP metadata URL
     pub idp_metadata_url: Option<String>,
@@ -48,6 +48,22 @@ pub struct SamlConfig {
     /// Require signed assertions
     pub require_signed_assertions: bool,
 }
+
+redacted_debug!(SamlConfig {
+    show idp_metadata_url,
+    show idp_sso_url,
+    show idp_issuer,
+    redact_option idp_certificate,
+    show sp_entity_id,
+    show acs_url,
+    show username_attr,
+    show email_attr,
+    show display_name_attr,
+    show groups_attr,
+    show admin_group,
+    show sign_requests,
+    show require_signed_assertions,
+});
 
 impl SamlConfig {
     /// Create SAML config from environment variables
@@ -2724,5 +2740,30 @@ mod tests {
         let response = parser.finish();
         assert!(response.assertion.is_some());
         assert_eq!(response.assertion.as_ref().unwrap().id, "_test_end");
+    }
+
+    #[test]
+    fn test_saml_config_debug_redacts_certificate() {
+        let config = SamlConfig {
+            idp_metadata_url: Some("https://idp.example.com/metadata".to_string()),
+            idp_sso_url: "https://idp.example.com/sso".to_string(),
+            idp_issuer: "https://idp.example.com".to_string(),
+            idp_certificate: Some("-----BEGIN CERTIFICATE-----\nMIIC8jCCAdqgAwI...".to_string()),
+            sp_entity_id: "https://registry.example.com".to_string(),
+            acs_url: "https://registry.example.com/api/v1/auth/saml/callback".to_string(),
+            username_attr: "NameID".to_string(),
+            email_attr: "email".to_string(),
+            display_name_attr: "displayName".to_string(),
+            groups_attr: "groups".to_string(),
+            admin_group: Some("registry-admins".to_string()),
+            sign_requests: false,
+            require_signed_assertions: true,
+        };
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("idp.example.com"));
+        assert!(debug.contains("registry.example.com"));
+        assert!(!debug.contains("BEGIN CERTIFICATE"));
+        assert!(!debug.contains("MIIC8jCCAdqgAwI"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }
