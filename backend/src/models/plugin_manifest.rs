@@ -504,6 +504,28 @@ validate_artifact = false
         assert!(caps.parse_metadata);
         assert!(caps.generate_index);
         assert!(!caps.validate_artifact);
+        assert!(!caps.handle_request); // defaults to false
+    }
+
+    #[test]
+    fn test_to_capabilities_with_handle_request() {
+        let toml = r#"
+[plugin]
+name = "protocol-plugin"
+version = "2.0.0"
+
+[capabilities]
+parse_metadata = true
+generate_index = true
+validate_artifact = true
+handle_request = true
+"#;
+        let manifest = PluginManifest::from_toml(toml).unwrap();
+        let caps = manifest.to_capabilities();
+        assert!(caps.handle_request);
+        assert!(caps.parse_metadata);
+        assert!(caps.generate_index);
+        assert!(caps.validate_artifact);
     }
 
     // -----------------------------------------------------------------------
@@ -544,11 +566,12 @@ timeout_secs = 10
     #[test]
     fn test_capabilities_config_default() {
         // Default impl now matches serde defaults: parse_metadata and validate_artifact
-        // are true, generate_index is false.
+        // are true, generate_index and handle_request are false.
         let caps = CapabilitiesConfig::default();
         assert!(caps.parse_metadata);
         assert!(!caps.generate_index);
         assert!(caps.validate_artifact);
+        assert!(!caps.handle_request);
     }
 
     #[test]
@@ -558,6 +581,7 @@ timeout_secs = 10
         assert!(caps.parse_metadata); // true from serde(default = "default_true")
         assert!(!caps.generate_index); // false from serde(default)
         assert!(caps.validate_artifact); // true from serde(default = "default_true")
+        assert!(!caps.handle_request); // false from serde(default)
     }
 
     #[test]
