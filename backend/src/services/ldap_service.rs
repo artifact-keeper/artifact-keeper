@@ -49,7 +49,10 @@ impl fmt::Debug for LdapConfig {
             .field("base_dn", &self.base_dn)
             .field("user_filter", &self.user_filter)
             .field("bind_dn", &self.bind_dn)
-            .field("bind_password", &self.bind_password.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "bind_password",
+                &self.bind_password.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("username_attr", &self.username_attr)
             .field("email_attr", &self.email_attr)
             .field("display_name_attr", &self.display_name_attr)

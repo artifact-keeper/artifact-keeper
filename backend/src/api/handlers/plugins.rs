@@ -1049,9 +1049,7 @@ pub async fn install_from_local(
         AppError::Validation("Path does not exist or is not accessible".to_string())
     })?;
     if !canonical_path.is_dir() {
-        return Err(AppError::Validation(
-            "Path is not a directory".to_string(),
-        ));
+        return Err(AppError::Validation("Path is not a directory".to_string()));
     }
     let canonical_str = canonical_path.to_string_lossy().to_string();
 

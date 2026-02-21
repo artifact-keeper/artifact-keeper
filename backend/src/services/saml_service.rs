@@ -56,7 +56,10 @@ impl fmt::Debug for SamlConfig {
             .field("idp_metadata_url", &self.idp_metadata_url)
             .field("idp_sso_url", &self.idp_sso_url)
             .field("idp_issuer", &self.idp_issuer)
-            .field("idp_certificate", &self.idp_certificate.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "idp_certificate",
+                &self.idp_certificate.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("sp_entity_id", &self.sp_entity_id)
             .field("acs_url", &self.acs_url)
             .field("username_attr", &self.username_attr)

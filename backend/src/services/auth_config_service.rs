@@ -64,7 +64,10 @@ impl fmt::Debug for LdapConfigRow {
             .field("name", &self.name)
             .field("server_url", &self.server_url)
             .field("bind_dn", &self.bind_dn)
-            .field("bind_password_encrypted", &self.bind_password_encrypted.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "bind_password_encrypted",
+                &self.bind_password_encrypted.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("user_base_dn", &self.user_base_dn)
             .field("is_enabled", &self.is_enabled)
             .finish_non_exhaustive()
