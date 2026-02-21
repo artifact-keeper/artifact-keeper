@@ -109,6 +109,19 @@ pub struct AzureBackend {
 impl AzureBackend {
     /// Create a new Azure Blob Storage backend
     pub async fn new(config: AzureConfig) -> Result<Self> {
+        // Validate HTTPS for custom endpoints
+        let allow_http = std::env::var("ALLOW_HTTP_INTEGRATIONS")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        if let Some(ref endpoint) = config.endpoint {
+            if !allow_http && !endpoint.starts_with("https://") {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    "Azure storage endpoint is not HTTPS. Set ALLOW_HTTP_INTEGRATIONS=1 for local dev."
+                );
+            }
+        }
+
         // Decode the access key
         let decoded_key = BASE64.decode(&config.access_key).map_err(|e| {
             AppError::Config(format!(
@@ -119,6 +132,7 @@ impl AzureBackend {
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .https_only(!allow_http)
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
 
