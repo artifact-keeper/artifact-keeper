@@ -378,7 +378,10 @@ impl AuthService {
         let prefix = &token[..8];
         let token_hash = Self::hash_password(&token)?;
 
-        let expires_at = expires_in_days.map(|days| Utc::now() + Duration::days(days));
+        let expires_at = expires_in_days.map(|days| {
+            let clamped = days.clamp(1, 3650); // Cap at ~10 years
+            Utc::now() + Duration::days(clamped)
+        });
 
         let record = sqlx::query!(
             r#"
