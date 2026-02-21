@@ -95,9 +95,6 @@ mod tests {
             output.contains("None"),
             "should show None for missing optional"
         );
-        assert!(
-            !output.contains("nope"),
-            "should not leak redacted field"
-        );
+        assert!(!output.contains("nope"), "should not leak redacted field");
     }
 }
