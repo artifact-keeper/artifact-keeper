@@ -762,6 +762,10 @@ impl DependencyTrackService {
         project_uuid: &str,
         days: u32,
     ) -> Result<Vec<DtProjectMetrics>> {
+        // Validate project_uuid is a proper UUID to prevent SSRF via path manipulation
+        uuid::Uuid::parse_str(project_uuid).map_err(|_| {
+            AppError::Validation(format!("Invalid project UUID: {}", project_uuid))
+        })?;
         let url = format!(
             "{}/api/v1/metrics/project/{}/days/{}",
             self.config.base_url, project_uuid, days
