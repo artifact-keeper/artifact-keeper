@@ -17,8 +17,8 @@ use super::wasm_bindings::{
     WitMetadataV2, WitRepoContext,
 };
 use super::wasm_runtime::{
-    CompiledPlugin, PluginContext, WasmError, WasmIndexFile, WasmMetadata, WasmResult,
-    WasmRuntime, WasmValidationError,
+    CompiledPlugin, PluginContext, WasmError, WasmIndexFile, WasmMetadata, WasmResult, WasmRuntime,
+    WasmValidationError,
 };
 
 /// Active plugin in the registry.
@@ -607,7 +607,8 @@ mod tests {
         let context = WasmRepoContext {
             repo_key: "test-repo".to_string(),
             base_url: "http://localhost/ext/pypi/test-repo".to_string(),
-            download_base_url: "http://localhost/api/v1/repositories/test-repo/download".to_string(),
+            download_base_url: "http://localhost/api/v1/repositories/test-repo/download"
+                .to_string(),
         };
         let result = registry
             .execute_handle_request("nonexistent", &request, &context, &[])

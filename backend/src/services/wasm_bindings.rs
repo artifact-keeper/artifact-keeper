@@ -311,10 +311,7 @@ mod tests {
         };
         let wit: WitRepoContext = (&ctx).into();
         assert_eq!(wit.repo_key, "my-pypi");
-        assert_eq!(
-            wit.base_url,
-            "https://example.com/ext/pypi-custom/my-pypi"
-        );
+        assert_eq!(wit.base_url, "https://example.com/ext/pypi-custom/my-pypi");
         assert_eq!(
             wit.download_base_url,
             "https://example.com/api/v1/repositories/my-pypi/download"

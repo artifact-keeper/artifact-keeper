@@ -323,8 +323,12 @@ mod tests {
         headers.insert("accept", HeaderValue::from_static("application/json"));
         let pairs = headers_to_pairs(&headers);
         assert_eq!(pairs.len(), 2);
-        assert!(pairs.iter().any(|(k, v)| k == "content-type" && v == "text/html"));
-        assert!(pairs.iter().any(|(k, v)| k == "accept" && v == "application/json"));
+        assert!(pairs
+            .iter()
+            .any(|(k, v)| k == "content-type" && v == "text/html"));
+        assert!(pairs
+            .iter()
+            .any(|(k, v)| k == "accept" && v == "application/json"));
     }
 
     // -----------------------------------------------------------------------
