@@ -135,11 +135,8 @@ mod tests {
         let mut bytes = Vec::new();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
-        loop {
-            match tokio::time::timeout_at(deadline, body.next()).await {
-                Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
-                _ => break,
-            }
+        while let Ok(Some(Ok(chunk))) = tokio::time::timeout_at(deadline, body.next()).await {
+            bytes.extend_from_slice(&chunk);
         }
         bytes
     }
