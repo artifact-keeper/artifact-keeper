@@ -19,6 +19,9 @@ on:
       - 'CLAUDE.md'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -159,6 +162,9 @@ jobs:
     name: 🔥 Smoke E2E Tests
     runs-on: ak-e2e-runners
     needs: [test-backend-unit]
+    permissions:
+      contents: read
+      packages: read
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
@@ -242,6 +248,9 @@ jobs:
   detect-changes:
     name: 🔍 Detect Changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     if: github.event_name == 'pull_request'
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
