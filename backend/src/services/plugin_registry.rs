@@ -865,4 +865,252 @@ mod tests {
         // Should fail at v1 compilation before even attempting v2
         assert!(result.is_err());
     }
+
+    /// Minimal valid WASM component (WAT text format).
+    /// This compiles but cannot be instantiated (no exports).
+    const MINIMAL_COMPONENT: &[u8] = b"(component)";
+
+    #[tokio::test]
+    async fn test_register_and_lookup_minimal_component() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+        let result = registry
+            .register(
+                id,
+                "test-plugin".to_string(),
+                "test-format".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(result.is_ok(), "register failed: {:?}", result.err());
+
+        // Verify plugin is findable by format key
+        let plugin = registry.get_by_format("test-format").await;
+        assert!(plugin.is_some());
+        let plugin = plugin.unwrap();
+        assert_eq!(plugin.name, "test-plugin");
+        assert_eq!(plugin.format_key, "test-format");
+        assert_eq!(plugin.version, "1.0.0");
+        assert_eq!(plugin.id, id);
+        assert_eq!(plugin.internal_version, 1);
+        assert!(plugin.compiled_v2.is_none()); // no handle_request
+
+        // Verify plugin is findable by ID
+        assert!(registry.get_by_id(id).await.is_some());
+
+        // Verify counts and lists
+        assert_eq!(registry.plugin_count().await, 1);
+        assert!(registry.has_format("test-format").await);
+        assert!(!registry.has_format("other-format").await);
+
+        let formats = registry.list_formats().await;
+        assert_eq!(formats.len(), 1);
+        assert!(formats.contains(&"test-format".to_string()));
+
+        let plugins = registry.list_plugins().await;
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "test-plugin");
+    }
+
+    #[tokio::test]
+    async fn test_register_with_handle_request_compiles_v2() {
+        let registry = PluginRegistry::new().unwrap();
+        let caps = PluginCapabilities {
+            handle_request: true,
+            ..Default::default()
+        };
+        let result = registry
+            .register(
+                Uuid::new_v4(),
+                "v2-plugin".to_string(),
+                "v2-format".to_string(),
+                "2.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                caps,
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(result.is_ok(), "register failed: {:?}", result.err());
+
+        let plugin = registry.get_by_format("v2-format").await.unwrap();
+        assert!(plugin.compiled_v2.is_some());
+        assert!(plugin.capabilities.handle_request);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_existing_plugin() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+        registry
+            .register(
+                id,
+                "removable".to_string(),
+                "removable-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.plugin_count().await, 1);
+
+        let result = registry.unregister(id).await;
+        assert!(result.is_ok());
+        assert_eq!(registry.plugin_count().await, 0);
+        assert!(registry.get_by_format("removable-fmt").await.is_none());
+        assert!(registry.get_by_id(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_same_id() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+
+        // Register v1
+        registry
+            .register(
+                id,
+                "hot-plugin".to_string(),
+                "hot-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        let v1 = registry.get_by_format("hot-fmt").await.unwrap();
+        assert_eq!(v1.version, "1.0.0");
+        assert_eq!(v1.internal_version, 1);
+
+        // Hot-reload with same ID, new version
+        registry
+            .register(
+                id,
+                "hot-plugin".to_string(),
+                "hot-fmt".to_string(),
+                "2.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        let v2 = registry.get_by_format("hot-fmt").await.unwrap();
+        assert_eq!(v2.version, "2.0.0");
+        assert_eq!(v2.internal_version, 2);
+
+        // Still only one plugin
+        assert_eq!(registry.plugin_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_different_id_same_format_key_rejected() {
+        let registry = PluginRegistry::new().unwrap();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        registry
+            .register(
+                id1,
+                "plugin-a".to_string(),
+                "shared-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        // Different ID, same format_key should be rejected
+        let result = registry
+            .register(
+                id2,
+                "plugin-b".to_string(),
+                "shared-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(WasmError::ValidationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_has_handle_request_with_v2_plugin() {
+        let registry = PluginRegistry::new().unwrap();
+        let caps = PluginCapabilities {
+            handle_request: true,
+            ..Default::default()
+        };
+        registry
+            .register(
+                Uuid::new_v4(),
+                "protocol-plugin".to_string(),
+                "proto-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                caps,
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(registry.has_handle_request("proto-fmt").await);
+        assert!(!registry.has_handle_request("other-fmt").await);
+    }
+
+    #[tokio::test]
+    async fn test_active_plugin_debug_format() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+        registry
+            .register(
+                id,
+                "debug-test".to_string(),
+                "debug-fmt".to_string(),
+                "0.1.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        let plugin = registry.get_by_format("debug-fmt").await.unwrap();
+        let debug_str = format!("{:?}", plugin);
+        assert!(debug_str.contains("ActivePlugin"));
+        assert!(debug_str.contains("debug-test"));
+        assert!(debug_str.contains("debug-fmt"));
+        assert!(debug_str.contains("0.1.0"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_removes_registered_plugins() {
+        let registry = PluginRegistry::new().unwrap();
+        registry
+            .register(
+                Uuid::new_v4(),
+                "clear-test".to_string(),
+                "clear-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.plugin_count().await, 1);
+
+        registry.clear().await;
+        assert_eq!(registry.plugin_count().await, 0);
+        assert!(registry.get_by_format("clear-fmt").await.is_none());
+        assert!(registry.list_formats().await.is_empty());
+    }
 }
