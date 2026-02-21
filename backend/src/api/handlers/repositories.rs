@@ -443,7 +443,7 @@ pub async fn update_repository(
 
     // Validate quota_bytes is within a reasonable range (max 100 TiB)
     if let Some(quota) = payload.quota_bytes {
-        if quota < 0 || quota > 100 * 1024 * 1024 * 1024 * 1024 {
+        if !(0..=100 * 1024 * 1024 * 1024 * 1024).contains(&quota) {
             return Err(AppError::Validation(
                 "quota_bytes must be between 0 and 100 TiB".to_string(),
             ));
