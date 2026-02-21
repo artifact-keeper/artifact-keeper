@@ -27,6 +27,8 @@ pub struct CreateRepositoryRequest {
     pub upstream_url: Option<String>,
     pub is_public: bool,
     pub quota_bytes: Option<i64>,
+    /// Custom format key for WASM plugin handlers (e.g. "rpm-custom").
+    pub format_key: Option<String>,
 }
 
 /// Request to update a repository
@@ -98,6 +100,17 @@ impl RepositoryService {
         self.meili_service = Some(meili_service);
     }
 
+    /// Get the custom format_key for a repository (if set for WASM plugins).
+    pub async fn get_format_key(&self, repo_id: Uuid) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT format_key FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(row.and_then(|r| r.0))
+    }
+
     /// Create a new repository
     pub async fn create(&self, req: CreateRepositoryRequest) -> Result<Repository> {
         // Validate remote repository has upstream URL
@@ -161,6 +174,16 @@ impl RepositoryService {
                 AppError::Database(e.to_string())
             }
         })?;
+
+        // Set custom format_key for WASM plugin handlers
+        if let Some(ref fk) = req.format_key {
+            sqlx::query("UPDATE repositories SET format_key = $1 WHERE id = $2")
+                .bind(fk)
+                .bind(repo.id)
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
 
         // Index repository in Meilisearch (non-blocking)
         if let Some(ref meili) = self.meili_service {
@@ -682,6 +705,7 @@ mod tests {
             upstream_url: None,
             is_public: true,
             quota_bytes: Some(1_000_000_000),
+            format_key: None,
         };
         assert_eq!(req.key, "my-repo");
         assert_eq!(req.format, RepositoryFormat::Maven);
@@ -703,6 +727,7 @@ mod tests {
             upstream_url: Some("https://registry.npmjs.org".to_string()),
             is_public: false,
             quota_bytes: None,
+            format_key: None,
         };
         assert_eq!(
             req.upstream_url,

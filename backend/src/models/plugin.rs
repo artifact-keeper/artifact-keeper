@@ -111,6 +111,9 @@ pub struct PluginCapabilities {
     pub generate_index: bool,
     /// Plugin can validate artifacts
     pub validate_artifact: bool,
+    /// Plugin can handle native protocol HTTP requests (v2 WIT)
+    #[serde(default)]
+    pub handle_request: bool,
 }
 
 impl Default for PluginCapabilities {
@@ -119,6 +122,7 @@ impl Default for PluginCapabilities {
             parse_metadata: true,
             generate_index: false,
             validate_artifact: true,
+            handle_request: false,
         }
     }
 }
@@ -214,6 +218,7 @@ mod tests {
         assert!(caps.parse_metadata);
         assert!(!caps.generate_index);
         assert!(caps.validate_artifact);
+        assert!(!caps.handle_request);
     }
 
     #[test]
@@ -222,12 +227,36 @@ mod tests {
             parse_metadata: false,
             generate_index: true,
             validate_artifact: false,
+            handle_request: false,
         };
         let json = serde_json::to_string(&caps).unwrap();
         let deserialized: PluginCapabilities = serde_json::from_str(&json).unwrap();
         assert!(!deserialized.parse_metadata);
         assert!(deserialized.generate_index);
         assert!(!deserialized.validate_artifact);
+        assert!(!deserialized.handle_request);
+    }
+
+    #[test]
+    fn test_plugin_capabilities_handle_request_serde() {
+        let caps = PluginCapabilities {
+            parse_metadata: true,
+            generate_index: true,
+            validate_artifact: true,
+            handle_request: true,
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        assert!(json.contains("handle_request"));
+        let deserialized: PluginCapabilities = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.handle_request);
+    }
+
+    #[test]
+    fn test_plugin_capabilities_handle_request_missing_defaults_false() {
+        // Older JSON without handle_request should default to false
+        let json = r#"{"parse_metadata":true,"generate_index":false,"validate_artifact":true}"#;
+        let caps: PluginCapabilities = serde_json::from_str(json).unwrap();
+        assert!(!caps.handle_request);
     }
 
     // -----------------------------------------------------------------------

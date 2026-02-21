@@ -106,6 +106,8 @@ pub struct CreateRepositoryRequest {
     pub is_public: Option<bool>,
     pub upstream_url: Option<String>,
     pub quota_bytes: Option<i64>,
+    /// Custom format key for WASM plugin format handlers (e.g. "rpm-custom").
+    pub format_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -375,6 +377,7 @@ pub async fn create_repository(
             upstream_url: payload.upstream_url,
             is_public: payload.is_public.unwrap_or(false),
             quota_bytes: payload.quota_bytes,
+            format_key: payload.format_key,
         })
         .await?;
 
@@ -695,17 +698,57 @@ pub async fn upload_artifact(
     // Extract name from path
     let name = path.split('/').next_back().unwrap_or(&path).to_string();
 
-    // Infer content type from extension
-    let content_type = mime_guess::from_path(&name)
-        .first_or_octet_stream()
-        .to_string();
+    // Check if this repo has a WASM plugin format handler
+    let format_key = repo_service.get_format_key(repo.id).await?;
+    let mut wasm_metadata = None;
+
+    if let (Some(ref fk), Some(ref registry)) = (&format_key, &state.plugin_registry) {
+        if registry.has_format(fk).await {
+            // Run WASM plugin validate + parse_metadata
+            match registry.execute_validate(fk, &path, &body).await {
+                Ok(Ok(())) => {}
+                Ok(Err(validation_err)) => {
+                    return Err(crate::error::AppError::Validation(
+                        validation_err.to_string(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!("WASM plugin validate error for {}: {}", fk, e);
+                    return Err(crate::error::AppError::Internal(format!(
+                        "Plugin error: {}",
+                        e
+                    )));
+                }
+            }
+
+            match registry.execute_parse_metadata(fk, &path, &body).await {
+                Ok(meta) => {
+                    wasm_metadata = Some(meta);
+                }
+                Err(e) => {
+                    tracing::warn!("WASM plugin parse_metadata error for {}: {}", fk, e);
+                }
+            }
+        }
+    }
+
+    // Use WASM-extracted metadata if available
+    let version = wasm_metadata.as_ref().and_then(|m| m.version.clone());
+    let content_type = wasm_metadata
+        .as_ref()
+        .map(|m| m.content_type.clone())
+        .unwrap_or_else(|| {
+            mime_guess::from_path(&name)
+                .first_or_octet_stream()
+                .to_string()
+        });
 
     let artifact = artifact_service
         .upload(
             repo.id,
             &path,
             &name,
-            None, // version extracted from format handler
+            version.as_deref(),
             &content_type,
             body,
             Some(auth.user_id),
@@ -713,6 +756,7 @@ pub async fn upload_artifact(
         .await?;
 
     let downloads = artifact_service.get_download_stats(artifact.id).await?;
+    let metadata_json = wasm_metadata.map(|m| m.to_json());
 
     Ok(Json(ArtifactResponse {
         id: artifact.id,
@@ -725,7 +769,7 @@ pub async fn upload_artifact(
         content_type: artifact.content_type,
         download_count: downloads,
         created_at: artifact.created_at,
-        metadata: None,
+        metadata: metadata_json,
     }))
 }
 

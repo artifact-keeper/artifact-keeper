@@ -74,3 +74,58 @@ world format-plugin {
     /// Export the format handler interface.
     export handler;
 }
+
+/// HTTP request/response interface for native protocol serving.
+///
+/// Plugins that implement this interface can serve native client protocols
+/// (e.g., PEP 503 for pip, repodata for dnf) directly from WASM.
+interface request-handler {
+    use handler.{metadata};
+
+    /// Incoming HTTP request from a native client.
+    record http-request {
+        /// HTTP method (GET, POST, PUT, DELETE, HEAD)
+        method: string,
+        /// Request path relative to the plugin mount point
+        path: string,
+        /// Query string (without leading "?"), empty if none
+        query: string,
+        /// Request headers as key-value pairs
+        headers: list<tuple<string, string>>,
+        /// Request body bytes (empty for GET/HEAD)
+        body: list<u8>,
+    }
+
+    /// Repository context so the plugin can generate correct URLs.
+    record repo-context {
+        /// Repository key (e.g., "my-rpm-repo")
+        repo-key: string,
+        /// Base URL for this plugin's mount point
+        base-url: string,
+        /// Base URL for downloading artifacts from storage
+        download-base-url: string,
+    }
+
+    /// HTTP response returned by the plugin.
+    record http-response {
+        /// HTTP status code
+        status: u16,
+        /// Response headers
+        headers: list<tuple<string, string>>,
+        /// Response body bytes
+        body: list<u8>,
+    }
+
+    /// Handle an HTTP request for this format's native protocol.
+    handle-request: func(
+        request: http-request,
+        context: repo-context,
+        artifacts: list<metadata>,
+    ) -> result<http-response, string>;
+}
+
+/// Extended world for plugins that serve native client protocols.
+world format-plugin-v2 {
+    export handler;
+    export request-handler;
+}

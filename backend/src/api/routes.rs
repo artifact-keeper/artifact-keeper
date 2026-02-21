@@ -89,7 +89,9 @@ pub fn create_router(state: SharedState) -> Router {
         // Protobuf / Buf Schema Registry (Connect RPC)
         .nest("/proto", handlers::protobuf::router())
         // Incus/LXC Container Image Repository (SimpleStreams protocol)
-        .nest("/incus", handlers::incus::router());
+        .nest("/incus", handlers::incus::router())
+        // WASM plugin native protocol proxy (pip, dnf, etc.)
+        .nest("/ext", handlers::wasm_proxy::router());
 
     // Disable the global body limit. This is an artifact registry — uploads
     // can be multiple GB. Without this, Axum's 2 MB default silently truncates

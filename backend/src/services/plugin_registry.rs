@@ -12,8 +12,12 @@ use uuid::Uuid;
 
 use crate::models::plugin::{PluginCapabilities, PluginResourceLimits};
 
+use super::wasm_bindings::{
+    FormatPlugin, WasmHttpRequest, WasmHttpResponse, WasmRepoContext, WitHttpRequest,
+    WitMetadataV2, WitRepoContext,
+};
 use super::wasm_runtime::{
-    CompiledPlugin, WasmError, WasmIndexFile, WasmMetadata, WasmResult, WasmRuntime,
+    CompiledPlugin, PluginContext, WasmError, WasmIndexFile, WasmMetadata, WasmResult, WasmRuntime,
     WasmValidationError,
 };
 
@@ -32,8 +36,10 @@ pub struct ActivePlugin {
     pub version: String,
     /// Internal version counter for hot-reload tracking
     pub internal_version: u64,
-    /// Compiled WASM component
+    /// Compiled WASM component (v1 world)
     pub compiled: Arc<CompiledPlugin>,
+    /// Compiled WASM component for v2 world (handle-request support)
+    pub compiled_v2: Option<Arc<CompiledPlugin>>,
     /// Plugin capabilities
     pub capabilities: PluginCapabilities,
     /// Resource limits for execution
@@ -124,9 +130,28 @@ impl PluginRegistry {
             name, id, version, format_key
         );
 
-        // Compile the WASM component
+        // Compile the WASM component (v1 world)
         let compiled = self.runtime.compile(wasm_bytes)?;
         let compiled = Arc::new(compiled);
+
+        // Compile v2 world if plugin declares handle_request capability
+        let compiled_v2 = if capabilities.handle_request {
+            match self.runtime.compile(wasm_bytes) {
+                Ok(c) => {
+                    info!("Plugin {} compiled for v2 world (handle-request)", name);
+                    Some(Arc::new(c))
+                }
+                Err(e) => {
+                    warn!(
+                        "Plugin {} declared handle_request but v2 compilation failed: {}",
+                        name, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Get next internal version
         let internal_version = self.next_version().await;
@@ -138,6 +163,7 @@ impl PluginRegistry {
             version: version.clone(),
             internal_version,
             compiled,
+            compiled_v2,
             capabilities,
             limits,
         });
@@ -256,6 +282,36 @@ impl PluginRegistry {
         info!("Plugin registry cleared");
     }
 
+    /// Resolve a plugin by format key, returning an error if not registered.
+    async fn resolve_plugin(&self, format_key: &str) -> WasmResult<Arc<ActivePlugin>> {
+        self.get_by_format(format_key).await.ok_or_else(|| {
+            WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
+        })
+    }
+
+    /// Create a store and instantiate a v1 FormatPlugin for the given plugin.
+    async fn instantiate_v1(
+        &self,
+        plugin: &ActivePlugin,
+    ) -> WasmResult<(wasmtime::Store<PluginContext>, FormatPlugin)> {
+        let mut store = self.runtime.create_store(
+            &plugin.compiled,
+            &plugin.id.to_string(),
+            &plugin.format_key,
+            &plugin.limits,
+        )?;
+
+        let instance = FormatPlugin::instantiate_async(
+            &mut store,
+            plugin.compiled.component(),
+            plugin.compiled.linker(),
+        )
+        .await
+        .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
+
+        Ok((store, instance))
+    }
+
     /// Execute parse_metadata on a plugin.
     ///
     /// Looks up the plugin by format key and executes the parse_metadata
@@ -266,9 +322,7 @@ impl PluginRegistry {
         path: &str,
         data: &[u8],
     ) -> WasmResult<WasmMetadata> {
-        let plugin = self.get_by_format(format_key).await.ok_or_else(|| {
-            WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
-        })?;
+        let plugin = self.resolve_plugin(format_key).await?;
 
         if !plugin.capabilities.parse_metadata {
             return Err(WasmError::ValidationFailed(format!(
@@ -282,32 +336,17 @@ impl PluginRegistry {
             plugin.name, path
         );
 
-        // Create store with resource limits
-        let _store = self.runtime.create_store(
-            &plugin.compiled,
-            &plugin.id.to_string(),
-            &plugin.format_key,
-            &plugin.limits,
-        )?;
+        let (mut store, instance) = self.instantiate_v1(&plugin).await?;
+        let handler = instance.artifact_keeper_format_handler();
+        let result = handler
+            .call_parse_metadata(&mut store, path, data)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
 
-        // TODO: Actually instantiate the component and call parse_metadata
-        // This requires bindgen-generated bindings from the WIT interface
-        // For now, return a placeholder that will be replaced when we generate
-        // the actual bindings
-
-        // Placeholder implementation
-        warn!(
-            "parse_metadata not yet fully implemented - returning placeholder for {}",
-            path
-        );
-
-        Ok(WasmMetadata {
-            path: path.to_string(),
-            version: None,
-            content_type: "application/octet-stream".to_string(),
-            size_bytes: data.len() as u64,
-            checksum_sha256: None,
-        })
+        match result {
+            Ok(metadata) => Ok(WasmMetadata::from(metadata)),
+            Err(msg) => Err(WasmError::PluginError(msg)),
+        }
     }
 
     /// Execute validate on a plugin.
@@ -318,14 +357,11 @@ impl PluginRegistry {
         &self,
         format_key: &str,
         path: &str,
-        _data: &[u8],
+        data: &[u8],
     ) -> WasmResult<Result<(), WasmValidationError>> {
-        let plugin = self.get_by_format(format_key).await.ok_or_else(|| {
-            WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
-        })?;
+        let plugin = self.resolve_plugin(format_key).await?;
 
         if !plugin.capabilities.validate_artifact {
-            // If plugin doesn't support validation, treat as valid
             return Ok(Ok(()));
         }
 
@@ -334,22 +370,20 @@ impl PluginRegistry {
             plugin.name, path
         );
 
-        // Create store with resource limits
-        let _store = self.runtime.create_store(
-            &plugin.compiled,
-            &plugin.id.to_string(),
-            &plugin.format_key,
-            &plugin.limits,
-        )?;
+        let (mut store, instance) = self.instantiate_v1(&plugin).await?;
+        let handler = instance.artifact_keeper_format_handler();
+        let result = handler
+            .call_validate(&mut store, path, data)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
 
-        // TODO: Actually instantiate the component and call validate
-        // Placeholder implementation
-        warn!(
-            "validate not yet fully implemented - returning success for {}",
-            path
-        );
-
-        Ok(Ok(()))
+        match result {
+            Ok(()) => Ok(Ok(())),
+            Err(msg) => Ok(Err(WasmValidationError {
+                message: msg,
+                field: None,
+            })),
+        }
     }
 
     /// Execute generate_index on a plugin.
@@ -361,12 +395,9 @@ impl PluginRegistry {
         format_key: &str,
         artifacts: &[WasmMetadata],
     ) -> WasmResult<Option<Vec<WasmIndexFile>>> {
-        let plugin = self.get_by_format(format_key).await.ok_or_else(|| {
-            WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
-        })?;
+        let plugin = self.resolve_plugin(format_key).await?;
 
         if !plugin.capabilities.generate_index {
-            // If plugin doesn't support index generation, return None
             return Ok(None);
         }
 
@@ -376,22 +407,87 @@ impl PluginRegistry {
             artifacts.len()
         );
 
-        // Create store with resource limits
-        let _store = self.runtime.create_store(
-            &plugin.compiled,
+        let (mut store, instance) = self.instantiate_v1(&plugin).await?;
+        let wit_artifacts: Vec<super::wasm_bindings::WitMetadata> =
+            artifacts.iter().map(Into::into).collect();
+
+        let handler = instance.artifact_keeper_format_handler();
+        let result = handler
+            .call_generate_index(&mut store, &wit_artifacts)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+
+        match result {
+            Ok(Some(files)) => Ok(Some(super::wasm_bindings::index_files_from_wit(files))),
+            Ok(None) => Ok(None),
+            Err(msg) => Err(WasmError::PluginError(msg)),
+        }
+    }
+
+    /// Check if a plugin supports handle_request (v2 protocol serving).
+    pub async fn has_handle_request(&self, format_key: &str) -> bool {
+        self.get_by_format(format_key)
+            .await
+            .map(|p| p.capabilities.handle_request && p.compiled_v2.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Execute handle_request on a v2 plugin.
+    ///
+    /// Routes an HTTP request to the plugin for native protocol serving
+    /// (e.g., PEP 503 for pip, repodata for dnf).
+    pub async fn execute_handle_request(
+        &self,
+        format_key: &str,
+        request: &WasmHttpRequest,
+        context: &WasmRepoContext,
+        artifacts: &[WasmMetadata],
+    ) -> WasmResult<WasmHttpResponse> {
+        let plugin = self.get_by_format(format_key).await.ok_or_else(|| {
+            WasmError::ValidationFailed(format!("No plugin registered for format '{}'", format_key))
+        })?;
+
+        let compiled_v2 = plugin.compiled_v2.as_ref().ok_or_else(|| {
+            WasmError::ValidationFailed(format!(
+                "Plugin '{}' does not support handle_request",
+                plugin.name
+            ))
+        })?;
+
+        debug!(
+            "Executing handle_request on plugin {} for {} {}",
+            plugin.name, request.method, request.path
+        );
+
+        let mut store = self.runtime.create_store(
+            compiled_v2,
             &plugin.id.to_string(),
             &plugin.format_key,
             &plugin.limits,
         )?;
 
-        // TODO: Actually instantiate the component and call generate_index
-        // Placeholder implementation
-        warn!(
-            "generate_index not yet fully implemented - returning None for {}",
-            format_key
-        );
+        let wit_request: WitHttpRequest = request.into();
+        let wit_context: WitRepoContext = context.into();
+        let wit_artifacts: Vec<WitMetadataV2> = artifacts.iter().map(Into::into).collect();
 
-        Ok(None)
+        let instance = super::wasm_bindings::v2::FormatPluginV2::instantiate_async(
+            &mut store,
+            compiled_v2.component(),
+            compiled_v2.linker(),
+        )
+        .await
+        .map_err(|e| WasmError::InstantiationFailed(e.to_string()))?;
+
+        let req_handler = instance.artifact_keeper_format_request_handler();
+        let result = req_handler
+            .call_handle_request(&mut store, &wit_request, &wit_context, &wit_artifacts)
+            .await
+            .map_err(|e: wasmtime::Error| WasmError::CallFailed(e.to_string()))?;
+
+        match result {
+            Ok(response) => Ok(WasmHttpResponse::from(response)),
+            Err(msg) => Err(WasmError::PluginError(msg)),
+        }
     }
 }
 
@@ -490,5 +586,531 @@ mod tests {
         assert_eq!(v1, 1);
         assert_eq!(v2, 2);
         assert_eq!(v3, 3);
+    }
+
+    #[tokio::test]
+    async fn test_has_handle_request_no_plugin() {
+        let registry = PluginRegistry::new().unwrap();
+        assert!(!registry.has_handle_request("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_execute_handle_request_no_plugin() {
+        let registry = PluginRegistry::new().unwrap();
+        let request = WasmHttpRequest {
+            method: "GET".to_string(),
+            path: "/simple/".to_string(),
+            query: String::new(),
+            headers: vec![],
+            body: vec![],
+        };
+        let context = WasmRepoContext {
+            repo_key: "test-repo".to_string(),
+            base_url: "http://localhost/ext/pypi/test-repo".to_string(),
+            download_base_url: "http://localhost/api/v1/repositories/test-repo/download"
+                .to_string(),
+        };
+        let result = registry
+            .execute_handle_request("nonexistent", &request, &context, &[])
+            .await;
+        assert!(matches!(result, Err(WasmError::ValidationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_plugin_not_found() {
+        let registry = PluginRegistry::new().unwrap();
+        let result = registry.resolve_plugin("missing-format").await;
+        assert!(result.is_err());
+        if let Err(WasmError::ValidationFailed(msg)) = result {
+            assert!(msg.contains("missing-format"));
+        }
+    }
+
+    #[test]
+    fn test_plugin_info_debug_clone() {
+        let info = PluginInfo {
+            id: Uuid::nil(),
+            name: "test".to_string(),
+            format_key: "fmt".to_string(),
+            version: "0.1.0".to_string(),
+            internal_version: 42,
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.name, "test");
+        assert_eq!(cloned.format_key, "fmt");
+        assert_eq!(cloned.version, "0.1.0");
+        assert_eq!(cloned.internal_version, 42);
+        let debug = format!("{:?}", info);
+        assert!(debug.contains("PluginInfo"));
+        assert!(debug.contains("test"));
+    }
+
+    #[test]
+    fn test_registry_default() {
+        // Default should succeed (creates a WasmRuntime internally)
+        let registry = PluginRegistry::default();
+        // Verify it's empty
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert_eq!(registry.plugin_count().await, 0);
+        });
+    }
+
+    #[test]
+    fn test_registry_runtime_accessor() {
+        let registry = PluginRegistry::new().unwrap();
+        let _runtime = registry.runtime();
+    }
+
+    #[tokio::test]
+    async fn test_register_invalid_wasm_bytes() {
+        let registry = PluginRegistry::new().unwrap();
+        let result = registry
+            .register(
+                Uuid::new_v4(),
+                "bad-plugin".to_string(),
+                "bad-format".to_string(),
+                "1.0.0".to_string(),
+                b"not valid wasm bytes",
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_empty_wasm_bytes() {
+        let registry = PluginRegistry::new().unwrap();
+        let result = registry
+            .register(
+                Uuid::new_v4(),
+                "empty-plugin".to_string(),
+                "empty-format".to_string(),
+                "1.0.0".to_string(),
+                b"",
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_with_runtime_constructor() {
+        let runtime = WasmRuntime::new().unwrap();
+        let registry = PluginRegistry::with_runtime(runtime);
+        assert_eq!(registry.plugin_count().await, 0);
+        assert!(registry.list_formats().await.is_empty());
+        assert!(!registry.has_format("test").await);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_error_message_contains_id() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+        let result = registry.unregister(id).await;
+        match result {
+            Err(WasmError::ValidationFailed(msg)) => {
+                assert!(msg.contains(&id.to_string()));
+                assert!(msg.contains("not found"));
+            }
+            other => panic!("Expected ValidationFailed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_plugins_empty() {
+        let registry = PluginRegistry::new().unwrap();
+        let plugins = registry.list_plugins().await;
+        assert!(plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_formats_empty() {
+        let registry = PluginRegistry::new().unwrap();
+        let formats = registry.list_formats().await;
+        assert!(formats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_by_id_nonexistent() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::nil();
+        assert!(registry.get_by_id(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_then_count() {
+        let registry = PluginRegistry::new().unwrap();
+        registry.clear().await;
+        assert_eq!(registry.plugin_count().await, 0);
+        assert!(registry.list_formats().await.is_empty());
+        assert!(registry.list_plugins().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_plugin_error_message_content() {
+        let registry = PluginRegistry::new().unwrap();
+        let result = registry.resolve_plugin("custom-rpm").await;
+        match result {
+            Err(WasmError::ValidationFailed(msg)) => {
+                assert!(msg.contains("custom-rpm"));
+                assert!(msg.contains("No plugin registered"));
+            }
+            other => panic!("Expected ValidationFailed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_parse_metadata_error_message() {
+        let registry = PluginRegistry::new().unwrap();
+        let result = registry
+            .execute_parse_metadata("custom-deb", "/test.deb", b"fake")
+            .await;
+        match result {
+            Err(WasmError::ValidationFailed(msg)) => {
+                assert!(msg.contains("custom-deb"));
+            }
+            other => panic!("Expected ValidationFailed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_validate_error_message() {
+        let registry = PluginRegistry::new().unwrap();
+        let result = registry
+            .execute_validate("custom-npm", "/package.tgz", b"fake")
+            .await;
+        match result {
+            Err(WasmError::ValidationFailed(msg)) => {
+                assert!(msg.contains("custom-npm"));
+            }
+            other => panic!("Expected ValidationFailed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_generate_index_error_message() {
+        let registry = PluginRegistry::new().unwrap();
+        let result = registry.execute_generate_index("custom-cargo", &[]).await;
+        match result {
+            Err(WasmError::ValidationFailed(msg)) => {
+                assert!(msg.contains("custom-cargo"));
+            }
+            other => panic!("Expected ValidationFailed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_handle_request_no_plugin_error_message() {
+        let registry = PluginRegistry::new().unwrap();
+        let request = WasmHttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: String::new(),
+            headers: vec![],
+            body: vec![],
+        };
+        let context = WasmRepoContext {
+            repo_key: "r".to_string(),
+            base_url: "http://localhost".to_string(),
+            download_base_url: "http://localhost/dl".to_string(),
+        };
+        let result = registry
+            .execute_handle_request("no-such-format", &request, &context, &[])
+            .await;
+        match result {
+            Err(WasmError::ValidationFailed(msg)) => {
+                assert!(msg.contains("no-such-format"));
+            }
+            other => panic!("Expected ValidationFailed, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_has_handle_request_without_v2() {
+        // A plugin with handle_request capability but no compiled_v2 should return false
+        let registry = PluginRegistry::new().unwrap();
+        // No plugins registered, so has_handle_request returns false
+        assert!(!registry.has_handle_request("any-format").await);
+    }
+
+    #[tokio::test]
+    async fn test_version_counter_starts_at_zero() {
+        let registry = PluginRegistry::new().unwrap();
+        // First call should return 1 (increments from 0)
+        let v = registry.next_version().await;
+        assert_eq!(v, 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_invalid_wasm_with_handle_request() {
+        let registry = PluginRegistry::new().unwrap();
+        let caps = PluginCapabilities {
+            handle_request: true,
+            ..Default::default()
+        };
+        let result = registry
+            .register(
+                Uuid::new_v4(),
+                "v2-plugin".to_string(),
+                "v2-format".to_string(),
+                "1.0.0".to_string(),
+                b"invalid wasm",
+                caps,
+                PluginResourceLimits::default(),
+            )
+            .await;
+        // Should fail at v1 compilation before even attempting v2
+        assert!(result.is_err());
+    }
+
+    /// Minimal valid WASM component (WAT text format).
+    /// This compiles but cannot be instantiated (no exports).
+    const MINIMAL_COMPONENT: &[u8] = b"(component)";
+
+    #[tokio::test]
+    async fn test_register_and_lookup_minimal_component() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+        let result = registry
+            .register(
+                id,
+                "test-plugin".to_string(),
+                "test-format".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(result.is_ok(), "register failed: {:?}", result.err());
+
+        // Verify plugin is findable by format key
+        let plugin = registry.get_by_format("test-format").await;
+        assert!(plugin.is_some());
+        let plugin = plugin.unwrap();
+        assert_eq!(plugin.name, "test-plugin");
+        assert_eq!(plugin.format_key, "test-format");
+        assert_eq!(plugin.version, "1.0.0");
+        assert_eq!(plugin.id, id);
+        assert_eq!(plugin.internal_version, 1);
+        assert!(plugin.compiled_v2.is_none()); // no handle_request
+
+        // Verify plugin is findable by ID
+        assert!(registry.get_by_id(id).await.is_some());
+
+        // Verify counts and lists
+        assert_eq!(registry.plugin_count().await, 1);
+        assert!(registry.has_format("test-format").await);
+        assert!(!registry.has_format("other-format").await);
+
+        let formats = registry.list_formats().await;
+        assert_eq!(formats.len(), 1);
+        assert!(formats.contains(&"test-format".to_string()));
+
+        let plugins = registry.list_plugins().await;
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "test-plugin");
+    }
+
+    #[tokio::test]
+    async fn test_register_with_handle_request_compiles_v2() {
+        let registry = PluginRegistry::new().unwrap();
+        let caps = PluginCapabilities {
+            handle_request: true,
+            ..Default::default()
+        };
+        let result = registry
+            .register(
+                Uuid::new_v4(),
+                "v2-plugin".to_string(),
+                "v2-format".to_string(),
+                "2.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                caps,
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(result.is_ok(), "register failed: {:?}", result.err());
+
+        let plugin = registry.get_by_format("v2-format").await.unwrap();
+        assert!(plugin.compiled_v2.is_some());
+        assert!(plugin.capabilities.handle_request);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_existing_plugin() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+        registry
+            .register(
+                id,
+                "removable".to_string(),
+                "removable-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.plugin_count().await, 1);
+
+        let result = registry.unregister(id).await;
+        assert!(result.is_ok());
+        assert_eq!(registry.plugin_count().await, 0);
+        assert!(registry.get_by_format("removable-fmt").await.is_none());
+        assert!(registry.get_by_id(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_hot_reload_same_id() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+
+        // Register v1
+        registry
+            .register(
+                id,
+                "hot-plugin".to_string(),
+                "hot-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        let v1 = registry.get_by_format("hot-fmt").await.unwrap();
+        assert_eq!(v1.version, "1.0.0");
+        assert_eq!(v1.internal_version, 1);
+
+        // Hot-reload with same ID, new version
+        registry
+            .register(
+                id,
+                "hot-plugin".to_string(),
+                "hot-fmt".to_string(),
+                "2.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        let v2 = registry.get_by_format("hot-fmt").await.unwrap();
+        assert_eq!(v2.version, "2.0.0");
+        assert_eq!(v2.internal_version, 2);
+
+        // Still only one plugin
+        assert_eq!(registry.plugin_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_register_different_id_same_format_key_rejected() {
+        let registry = PluginRegistry::new().unwrap();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        registry
+            .register(
+                id1,
+                "plugin-a".to_string(),
+                "shared-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        // Different ID, same format_key should be rejected
+        let result = registry
+            .register(
+                id2,
+                "plugin-b".to_string(),
+                "shared-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(WasmError::ValidationFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_has_handle_request_with_v2_plugin() {
+        let registry = PluginRegistry::new().unwrap();
+        let caps = PluginCapabilities {
+            handle_request: true,
+            ..Default::default()
+        };
+        registry
+            .register(
+                Uuid::new_v4(),
+                "protocol-plugin".to_string(),
+                "proto-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                caps,
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(registry.has_handle_request("proto-fmt").await);
+        assert!(!registry.has_handle_request("other-fmt").await);
+    }
+
+    #[tokio::test]
+    async fn test_active_plugin_debug_format() {
+        let registry = PluginRegistry::new().unwrap();
+        let id = Uuid::new_v4();
+        registry
+            .register(
+                id,
+                "debug-test".to_string(),
+                "debug-fmt".to_string(),
+                "0.1.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+
+        let plugin = registry.get_by_format("debug-fmt").await.unwrap();
+        let debug_str = format!("{:?}", plugin);
+        assert!(debug_str.contains("ActivePlugin"));
+        assert!(debug_str.contains("debug-test"));
+        assert!(debug_str.contains("debug-fmt"));
+        assert!(debug_str.contains("0.1.0"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_removes_registered_plugins() {
+        let registry = PluginRegistry::new().unwrap();
+        registry
+            .register(
+                Uuid::new_v4(),
+                "clear-test".to_string(),
+                "clear-fmt".to_string(),
+                "1.0.0".to_string(),
+                MINIMAL_COMPONENT,
+                PluginCapabilities::default(),
+                PluginResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.plugin_count().await, 1);
+
+        registry.clear().await;
+        assert_eq!(registry.plugin_count().await, 0);
+        assert!(registry.get_by_format("clear-fmt").await.is_none());
+        assert!(registry.list_formats().await.is_empty());
     }
 }
