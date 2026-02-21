@@ -54,6 +54,11 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<DomainEvent> {
         self.tx.subscribe()
     }
+
+    /// Convenience: create a timestamped domain event and publish it in one call.
+    pub fn emit(&self, event_type: &str, entity_id: impl ToString, actor: Option<String>) {
+        self.publish(DomainEvent::now(event_type, entity_id.to_string(), actor));
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +133,59 @@ mod tests {
         let e2 = rx2.recv().await.unwrap();
         assert_eq!(e1.event_type, e2.event_type);
         assert_eq!(e1.entity_id, e2.entity_id);
+    }
+
+    #[test]
+    fn domain_event_now_sets_fields_and_timestamp() {
+        let event = DomainEvent::now("repo.deleted", "repo-42", Some("alice".into()));
+        assert_eq!(event.event_type, "repo.deleted");
+        assert_eq!(event.entity_id, "repo-42");
+        assert_eq!(event.actor, Some("alice".into()));
+        // Timestamp should be a valid RFC 3339 string
+        chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .expect("timestamp should be valid RFC 3339");
+    }
+
+    #[test]
+    fn domain_event_now_with_no_actor() {
+        let event = DomainEvent::now("user.updated", "u-7", None);
+        assert_eq!(event.event_type, "user.updated");
+        assert_eq!(event.entity_id, "u-7");
+        assert_eq!(event.actor, None);
+    }
+
+    #[tokio::test]
+    async fn emit_creates_and_publishes_event() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+
+        bus.emit("permission.created", "p-99", Some("bob".into()));
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, "permission.created");
+        assert_eq!(event.entity_id, "p-99");
+        assert_eq!(event.actor, Some("bob".into()));
+        chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .expect("timestamp should be valid RFC 3339");
+    }
+
+    #[tokio::test]
+    async fn emit_with_uuid_entity_id() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let id = uuid::Uuid::new_v4();
+
+        bus.emit("group.deleted", id, None);
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.entity_id, id.to_string());
+        assert_eq!(event.actor, None);
+    }
+
+    #[tokio::test]
+    async fn emit_no_subscribers_does_not_panic() {
+        let bus = EventBus::new(16);
+        bus.emit("test.event", "x", None);
     }
 
     #[tokio::test]

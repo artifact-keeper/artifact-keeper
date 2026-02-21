@@ -21,7 +21,6 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
-use crate::services::event_bus::DomainEvent;
 use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -382,11 +381,9 @@ pub async fn create_repository(
         })
         .await?;
 
-    state.event_bus.publish(DomainEvent::now(
-        "repository.created",
-        repo.id.to_string(),
-        Some(auth.username.clone()),
-    ));
+    state
+        .event_bus
+        .emit("repository.created", repo.id, Some(auth.username.clone()));
 
     Ok(Json(repo_to_response(repo, 0)))
 }
@@ -479,11 +476,9 @@ pub async fn update_repository(
 
     let storage_used = service.get_storage_usage(repo.id).await?;
 
-    state.event_bus.publish(DomainEvent::now(
-        "repository.updated",
-        repo.id.to_string(),
-        Some(auth.username.clone()),
-    ));
+    state
+        .event_bus
+        .emit("repository.updated", repo.id, Some(auth.username.clone()));
 
     Ok(Json(repo_to_response(repo, storage_used)))
 }
@@ -515,11 +510,9 @@ pub async fn delete_repository(
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
     service.delete(repo.id).await?;
-    state.event_bus.publish(DomainEvent::now(
-        "repository.deleted",
-        repo.id.to_string(),
-        Some(auth.username.clone()),
-    ));
+    state
+        .event_bus
+        .emit("repository.deleted", repo.id, Some(auth.username.clone()));
     Ok(())
 }
 

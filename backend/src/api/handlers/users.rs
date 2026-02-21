@@ -16,7 +16,6 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::auth_service::AuthService;
-use crate::services::event_bus::DomainEvent;
 use std::sync::atomic::Ordering;
 
 /// Create user routes
@@ -259,11 +258,9 @@ pub async fn create_user(
         }
     })?;
 
-    state.event_bus.publish(DomainEvent::now(
-        "user.created",
-        user.id.to_string(),
-        Some(auth.username.clone()),
-    ));
+    state
+        .event_bus
+        .emit("user.created", user.id, Some(auth.username.clone()));
 
     Ok(Json(CreateUserResponse {
         user: user_to_response(user),
@@ -363,11 +360,9 @@ pub async fn update_user(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    state.event_bus.publish(DomainEvent::now(
-        "user.updated",
-        user.id.to_string(),
-        Some(auth.username.clone()),
-    ));
+    state
+        .event_bus
+        .emit("user.updated", user.id, Some(auth.username.clone()));
 
     Ok(Json(user_to_response(user)))
 }
@@ -407,11 +402,9 @@ pub async fn delete_user(
         return Err(AppError::NotFound("User not found".to_string()));
     }
 
-    state.event_bus.publish(DomainEvent::now(
-        "user.deleted",
-        id.to_string(),
-        Some(auth.username.clone()),
-    ));
+    state
+        .event_bus
+        .emit("user.deleted", id, Some(auth.username.clone()));
 
     Ok(())
 }
