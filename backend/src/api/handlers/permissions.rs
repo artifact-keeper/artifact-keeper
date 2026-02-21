@@ -258,6 +258,10 @@ pub async fn create_permission(
         }
     })?;
 
+    state
+        .event_bus
+        .emit("permission.created", permission.id, None);
+
     Ok(Json(PermissionResponse {
         id: permission.id,
         principal_type: permission.principal_type,
@@ -373,6 +377,10 @@ pub async fn update_permission(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
+    state
+        .event_bus
+        .emit("permission.updated", permission.id, None);
+
     Ok(Json(PermissionResponse {
         id: permission.id,
         principal_type: permission.principal_type,
@@ -416,6 +424,8 @@ pub async fn delete_permission(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Permission not found".to_string()));
     }
+
+    state.event_bus.emit("permission.deleted", id, None);
 
     Ok(())
 }

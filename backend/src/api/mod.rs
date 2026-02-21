@@ -10,6 +10,7 @@ pub mod routes;
 use crate::config::Config;
 use crate::services::artifact_service::ArtifactService;
 use crate::services::dependency_track_service::DependencyTrackService;
+use crate::services::event_bus::EventBus;
 use crate::services::meili_service::MeiliService;
 use crate::services::plugin_registry::PluginRegistry;
 use crate::services::proxy_service::ProxyService;
@@ -39,6 +40,7 @@ pub struct AppState {
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
     /// When true, most API endpoints return 403 until the admin changes the default password.
     pub setup_required: Arc<AtomicBool>,
+    pub event_bus: Arc<EventBus>,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             proxy_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
+            event_bus: Arc::new(EventBus::new(1024)),
         }
     }
 
@@ -80,6 +83,7 @@ impl AppState {
             proxy_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
+            event_bus: Arc::new(EventBus::new(1024)),
         }
     }
 

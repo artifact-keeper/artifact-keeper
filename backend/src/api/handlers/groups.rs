@@ -212,6 +212,8 @@ pub async fn create_group(
         }
     })?;
 
+    state.event_bus.emit("group.created", group.id, None);
+
     Ok(Json(GroupResponse {
         id: group.id,
         name: group.name,
@@ -318,6 +320,8 @@ pub async fn update_group(
             .await
             .unwrap_or(0);
 
+    state.event_bus.emit("group.updated", group.id, None);
+
     Ok(Json(GroupResponse {
         id: group.id,
         name: group.name,
@@ -354,6 +358,8 @@ pub async fn delete_group(State(state): State<SharedState>, Path(id): Path<Uuid>
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Group not found".to_string()));
     }
+
+    state.event_bus.emit("group.deleted", id, None);
 
     Ok(())
 }
@@ -400,6 +406,8 @@ pub async fn add_members(
         .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
+    state.event_bus.emit("group.member_added", id, None);
+
     Ok(())
 }
 
@@ -433,6 +441,8 @@ pub async fn remove_members(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
     }
+
+    state.event_bus.emit("group.member_removed", id, None);
 
     Ok(())
 }

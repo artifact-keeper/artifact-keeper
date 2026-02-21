@@ -18,6 +18,7 @@ pub mod conda;
 pub mod cran;
 pub mod debian;
 pub mod dependency_track;
+pub mod events;
 pub mod gitlfs;
 pub mod goproxy;
 pub mod groups;

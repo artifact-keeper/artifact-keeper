@@ -381,6 +381,10 @@ pub async fn create_repository(
         })
         .await?;
 
+    state
+        .event_bus
+        .emit("repository.created", repo.id, Some(auth.username.clone()));
+
     Ok(Json(repo_to_response(repo, 0)))
 }
 
@@ -472,6 +476,10 @@ pub async fn update_repository(
 
     let storage_used = service.get_storage_usage(repo.id).await?;
 
+    state
+        .event_bus
+        .emit("repository.updated", repo.id, Some(auth.username.clone()));
+
     Ok(Json(repo_to_response(repo, storage_used)))
 }
 
@@ -502,6 +510,9 @@ pub async fn delete_repository(
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
     service.delete(repo.id).await?;
+    state
+        .event_bus
+        .emit("repository.deleted", repo.id, Some(auth.username.clone()));
     Ok(())
 }
 

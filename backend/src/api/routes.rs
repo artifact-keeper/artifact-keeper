@@ -294,6 +294,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Domain event stream (SSE) with auth middleware
+        .nest(
+            "/events",
+            handlers::events::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Signing key management routes with auth middleware
         .nest(
             "/signing",
