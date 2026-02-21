@@ -1043,22 +1043,19 @@ pub async fn install_from_local(
 ) -> Result<Json<PluginInstallResponse>> {
     let svc = wasm_service(&state)?;
 
-    // Verify path exists and is a directory
+    // Validate and canonicalize the path to prevent path traversal
     let path = std::path::Path::new(&request.path);
-    if !path.exists() {
-        return Err(AppError::Validation(format!(
-            "Path does not exist: {}",
-            request.path
-        )));
+    let canonical_path = path.canonicalize().map_err(|_| {
+        AppError::Validation("Path does not exist or is not accessible".to_string())
+    })?;
+    if !canonical_path.is_dir() {
+        return Err(AppError::Validation(
+            "Path is not a directory".to_string(),
+        ));
     }
-    if !path.is_dir() {
-        return Err(AppError::Validation(format!(
-            "Path is not a directory: {}",
-            request.path
-        )));
-    }
+    let canonical_str = canonical_path.to_string_lossy().to_string();
 
-    let result = svc.install_from_local(&request.path).await?;
+    let result = svc.install_from_local(&canonical_str).await?;
 
     Ok(Json(PluginInstallResponse {
         plugin_id: result.plugin_id,
