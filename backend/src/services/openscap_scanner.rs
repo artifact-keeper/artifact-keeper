@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::Scanner;
+use crate::services::scanner_service::{sanitize_artifact_filename, Scanner};
 
 // ---------------------------------------------------------------------------
 // OpenSCAP wrapper JSON response structures
@@ -100,8 +100,10 @@ impl OpenScapScanner {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
+        // Sanitize the filename to its basename to prevent path traversal
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
-        let artifact_path = workspace.join(original_filename);
+        let safe_filename = sanitize_artifact_filename(original_filename);
+        let artifact_path = workspace.join(&safe_filename);
 
         tokio::fs::write(&artifact_path, content)
             .await
