@@ -145,33 +145,22 @@ pub async fn rate_limit_middleware(
 
 /// Extract the client IP address from the request.
 ///
-/// Checks the following headers in order:
-/// 1. X-Forwarded-For (first IP)
-/// 2. X-Real-IP
-/// 3. Falls back to "unknown"
+/// Uses the actual TCP peer address from ConnectInfo as the primary source.
+/// Proxy headers (X-Forwarded-For, X-Real-IP) are NOT trusted because they
+/// can be trivially spoofed by clients. Only the socket-level peer address
+/// is reliable for rate limiting.
 fn extract_client_ip(request: &Request) -> String {
-    // Try X-Forwarded-For first
-    if let Some(forwarded_for) = request
-        .headers()
-        .get("X-Forwarded-For")
-        .and_then(|h| h.to_str().ok())
+    // Use the actual TCP connection peer address (set by axum's ConnectInfo)
+    if let Some(connect_info) = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
     {
-        // Take the first IP (client IP in proxy chain)
-        if let Some(client_ip) = forwarded_for.split(',').next() {
-            return format!("ip:{}", client_ip.trim());
-        }
+        return format!("ip:{}", connect_info.0.ip());
     }
 
-    // Try X-Real-IP
-    if let Some(real_ip) = request
-        .headers()
-        .get("X-Real-IP")
-        .and_then(|h| h.to_str().ok())
-    {
-        return format!("ip:{}", real_ip.trim());
-    }
-
-    // Fallback to unknown (in production, you might want to use connection info)
+    // Fallback: use a single key for all requests so rate limiting still works.
+    // This means all unauthenticated requests share one bucket, which is
+    // conservative but safe (cannot be bypassed via header spoofing).
     "ip:unknown".to_string()
 }
 
@@ -360,41 +349,22 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_extract_client_ip_x_forwarded_for_single() {
+    fn test_extract_client_ip_ignores_x_forwarded_for() {
+        // X-Forwarded-For is client-spoofable, so the rate limiter ignores it
         let request = axum::extract::Request::builder()
             .header("X-Forwarded-For", "192.168.1.1")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:192.168.1.1");
+        assert_eq!(extract_client_ip(&request), "ip:unknown");
     }
 
     #[test]
-    fn test_extract_client_ip_x_forwarded_for_chain() {
-        let request = axum::extract::Request::builder()
-            .header("X-Forwarded-For", "10.0.0.1, 192.168.1.1, 172.16.0.1")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        // Should take the first IP (client IP)
-        assert_eq!(extract_client_ip(&request), "ip:10.0.0.1");
-    }
-
-    #[test]
-    fn test_extract_client_ip_x_real_ip() {
+    fn test_extract_client_ip_ignores_x_real_ip() {
         let request = axum::extract::Request::builder()
             .header("X-Real-IP", "10.20.30.40")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:10.20.30.40");
-    }
-
-    #[test]
-    fn test_extract_client_ip_forwarded_for_takes_priority_over_real_ip() {
-        let request = axum::extract::Request::builder()
-            .header("X-Forwarded-For", "1.2.3.4")
-            .header("X-Real-IP", "5.6.7.8")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:1.2.3.4");
+        assert_eq!(extract_client_ip(&request), "ip:unknown");
     }
 
     #[test]
@@ -406,11 +376,31 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_client_ip_x_forwarded_for_with_whitespace() {
-        let request = axum::extract::Request::builder()
-            .header("X-Forwarded-For", "  10.0.0.1  , 192.168.1.1")
+    fn test_extract_client_ip_uses_connect_info() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "192.168.1.100:12345".parse().unwrap();
+        let mut request = axum::extract::Request::builder()
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(extract_client_ip(&request), "ip:10.0.0.1");
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        assert_eq!(extract_client_ip(&request), "ip:192.168.1.100");
+    }
+
+    #[test]
+    fn test_extract_client_ip_connect_info_over_headers() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "10.0.0.5:9999".parse().unwrap();
+        let mut request = axum::extract::Request::builder()
+            .header("X-Forwarded-For", "1.2.3.4")
+            .header("X-Real-IP", "5.6.7.8")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        // ConnectInfo takes priority over spoofable headers
+        assert_eq!(extract_client_ip(&request), "ip:10.0.0.5");
     }
 }

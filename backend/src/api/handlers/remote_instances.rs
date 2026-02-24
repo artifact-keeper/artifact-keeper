@@ -114,6 +114,31 @@ async fn delete_instance(
 // Proxy helpers
 // ---------------------------------------------------------------------------
 
+/// Validate that the proxy path is safe and does not contain attempts to
+/// escape to arbitrary hosts or internal services.
+fn validate_proxy_path(path: &str) -> Result<()> {
+    // Reject paths that could manipulate the URL to reach other hosts
+    if path.contains("://") || path.starts_with("//") {
+        return Err(AppError::Validation(
+            "Proxy path must not contain a URL scheme or protocol-relative prefix".into(),
+        ));
+    }
+    // Reject path traversal attempts
+    if path.contains("..") {
+        return Err(AppError::Validation(
+            "Proxy path must not contain path traversal sequences".into(),
+        ));
+    }
+    // Only allow proxying to /api/ paths on the remote instance
+    let normalized = path.trim_start_matches('/');
+    if !normalized.starts_with("api/") && !normalized.starts_with("health") {
+        return Err(AppError::Validation(
+            "Proxy path must start with api/ or health".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Build the full target URL on the remote instance.
 fn build_target_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path)
@@ -163,6 +188,7 @@ async fn proxy_get(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
+    validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
@@ -198,6 +224,7 @@ async fn proxy_post(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
+    validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
@@ -235,6 +262,7 @@ async fn proxy_put(
     Path((id, path)): Path<(Uuid, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response> {
+    validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 
@@ -270,6 +298,7 @@ async fn proxy_delete(
     Extension(auth): Extension<AuthExtension>,
     Path((id, path)): Path<(Uuid, String)>,
 ) -> Result<Response> {
+    validate_proxy_path(&path)?;
     let (url, api_key) = RemoteInstanceService::get_decrypted(&state.db, id, auth.user_id).await?;
     let target = build_target_url(&url, &path);
 

@@ -142,8 +142,14 @@ impl Config {
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
-            peer_api_key: env::var("PEER_API_KEY")
-                .unwrap_or_else(|_| "change-me-in-production".into()),
+            peer_api_key: env::var("PEER_API_KEY").unwrap_or_else(|_| {
+                let key = format!("{:032x}", rand::random::<u128>());
+                tracing::warn!(
+                    "PEER_API_KEY not set, generated random key. \
+                     Set PEER_API_KEY in your environment for stable peer authentication."
+                );
+                key
+            }),
             dependency_track_url: env::var("DEPENDENCY_TRACK_URL").ok(),
             otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             otel_service_name: env::var("OTEL_SERVICE_NAME")

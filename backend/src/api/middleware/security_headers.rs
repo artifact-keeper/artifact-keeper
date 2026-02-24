@@ -24,7 +24,9 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
     );
     headers.insert(
         "content-security-policy",
-        "default-src 'self'".parse().unwrap(),
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            .parse()
+            .unwrap(),
     );
 
     response
@@ -118,14 +120,15 @@ mod tests {
     #[tokio::test]
     async fn test_security_headers_content_security_policy() {
         let resp = build_response().await;
-        assert_eq!(
-            resp.headers()
-                .get("content-security-policy")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "default-src 'self'"
-        );
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("script-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
     }
 
     #[tokio::test]

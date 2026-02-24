@@ -666,7 +666,10 @@ impl ArtifactService {
         Ok(metadata)
     }
 
-    /// Set artifact metadata
+    /// Set artifact metadata.
+    ///
+    /// Sanitizes URL values in the metadata to prevent stored XSS via
+    /// `javascript:`, `data:`, or `vbscript:` scheme URLs.
     pub async fn set_metadata(
         &self,
         artifact_id: Uuid,
@@ -674,6 +677,7 @@ impl ArtifactService {
         metadata: serde_json::Value,
         properties: serde_json::Value,
     ) -> Result<ArtifactMetadata> {
+        let metadata = sanitize_metadata_urls(metadata);
         let meta = sqlx::query_as!(
             ArtifactMetadata,
             r#"
@@ -782,6 +786,72 @@ impl ArtifactService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(count)
+    }
+}
+
+/// URL fields commonly found in package metadata across all formats.
+const URL_FIELD_NAMES: &[&str] = &[
+    "homepage",
+    "home_page",
+    "homepage_uri",
+    "repository",
+    "repository_url",
+    "source_code_uri",
+    "bug_tracker",
+    "bug_tracker_url",
+    "bugs",
+    "documentation",
+    "documentation_url",
+    "docs_url",
+    "download_url",
+    "project_url",
+    "package_url",
+    "url",
+    "website",
+];
+
+/// Returns true if a string looks like a dangerous URL scheme that could
+/// trigger script execution when rendered as a link.
+fn is_dangerous_url(s: &str) -> bool {
+    let lower = s.trim().to_lowercase();
+    lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("data:text/html")
+}
+
+/// Recursively walk a JSON value and replace any URL-like string fields
+/// that use dangerous schemes (javascript:, vbscript:, data:text/html)
+/// with an empty string.
+fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sanitized = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let key_lower = k.to_lowercase();
+                    let is_url_field = URL_FIELD_NAMES.iter().any(|f| key_lower == *f)
+                        || key_lower.ends_with("_url")
+                        || key_lower.ends_with("_uri")
+                        || key_lower.ends_with("_link");
+                    let new_v = if is_url_field {
+                        match &v {
+                            serde_json::Value::String(s) if is_dangerous_url(s) => {
+                                serde_json::Value::String(String::new())
+                            }
+                            _ => sanitize_metadata_urls(v),
+                        }
+                    } else {
+                        sanitize_metadata_urls(v)
+                    };
+                    (k, new_v)
+                })
+                .collect();
+            serde_json::Value::Object(sanitized)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(sanitize_metadata_urls).collect())
+        }
+        other => other,
     }
 }
 
@@ -968,5 +1038,81 @@ mod tests {
         assert_eq!(info.version, None);
         assert_eq!(info.uploaded_by, None);
         assert_eq!(info.size_bytes, 0);
+    }
+
+    #[test]
+    fn test_sanitize_metadata_urls_strips_javascript() {
+        let metadata = serde_json::json!({
+            "name": "evil-package",
+            "homepage": "javascript:alert(1)",
+            "repository": "https://github.com/example/repo"
+        });
+        let sanitized = sanitize_metadata_urls(metadata);
+        assert_eq!(sanitized["homepage"], "");
+        assert_eq!(sanitized["repository"], "https://github.com/example/repo");
+    }
+
+    #[test]
+    fn test_sanitize_metadata_urls_strips_vbscript() {
+        let metadata = serde_json::json!({
+            "homepage": "vbscript:msgbox('xss')"
+        });
+        let sanitized = sanitize_metadata_urls(metadata);
+        assert_eq!(sanitized["homepage"], "");
+    }
+
+    #[test]
+    fn test_sanitize_metadata_urls_strips_data_html() {
+        let metadata = serde_json::json!({
+            "documentation_url": "data:text/html,<script>alert(1)</script>"
+        });
+        let sanitized = sanitize_metadata_urls(metadata);
+        assert_eq!(sanitized["documentation_url"], "");
+    }
+
+    #[test]
+    fn test_sanitize_metadata_urls_preserves_safe_urls() {
+        let metadata = serde_json::json!({
+            "homepage": "https://example.com",
+            "repository_url": "https://github.com/foo/bar",
+            "description": "A normal description",
+            "name": "my-package"
+        });
+        let sanitized = sanitize_metadata_urls(metadata.clone());
+        assert_eq!(sanitized, metadata);
+    }
+
+    #[test]
+    fn test_sanitize_metadata_urls_nested_objects() {
+        let metadata = serde_json::json!({
+            "project": {
+                "homepage": "javascript:void(0)",
+                "name": "test"
+            }
+        });
+        let sanitized = sanitize_metadata_urls(metadata);
+        assert_eq!(sanitized["project"]["homepage"], "");
+        assert_eq!(sanitized["project"]["name"], "test");
+    }
+
+    #[test]
+    fn test_sanitize_metadata_urls_case_insensitive() {
+        let metadata = serde_json::json!({
+            "homepage": "JAVASCRIPT:alert(1)"
+        });
+        let sanitized = sanitize_metadata_urls(metadata);
+        assert_eq!(sanitized["homepage"], "");
+    }
+
+    #[test]
+    fn test_is_dangerous_url() {
+        assert!(is_dangerous_url("javascript:alert(1)"));
+        assert!(is_dangerous_url("JAVASCRIPT:alert(1)"));
+        assert!(is_dangerous_url("  javascript:alert(1)"));
+        assert!(is_dangerous_url("vbscript:foo"));
+        assert!(is_dangerous_url("data:text/html,<script>"));
+        assert!(!is_dangerous_url("https://example.com"));
+        assert!(!is_dangerous_url("http://example.com"));
+        assert!(!is_dangerous_url("data:image/png;base64,abc"));
     }
 }

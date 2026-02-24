@@ -405,7 +405,10 @@ impl LdapService {
                 .success()
                 .map_err(|e| AppError::Internal(format!("Service account bind failed: {e}")))?;
 
-            let search_filter = self.config.user_filter.replace("{username}", username);
+            let search_filter = self
+                .config
+                .user_filter
+                .replace("{username}", &Self::sanitize_ldap_input(username));
             let attrs = vec![
                 self.config.username_attr.as_str(),
                 self.config.email_attr.as_str(),

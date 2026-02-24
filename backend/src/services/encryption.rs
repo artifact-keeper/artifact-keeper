@@ -1,8 +1,12 @@
 //! Encryption utilities for storing sensitive credentials.
 //!
-//! Provides symmetric encryption for storing Artifactory credentials
-//! and other sensitive migration data.
+//! Provides AES-256-GCM authenticated encryption for storing Artifactory
+//! credentials and other sensitive migration data.
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -22,11 +26,9 @@ pub enum EncryptionError {
     EncryptionFailed(String),
 }
 
-/// Simple XOR-based encryption with HMAC for integrity.
+/// AES-256-GCM authenticated encryption for credentials.
 ///
-/// Note: For production use, consider using a proper encryption library
-/// like `aes-gcm` or `chacha20poly1305`. This implementation is a
-/// placeholder that provides basic protection.
+/// Ciphertext format: nonce (12 bytes) || AES-GCM ciphertext+tag
 pub struct CredentialEncryption {
     key: [u8; 32],
 }
@@ -47,107 +49,48 @@ impl CredentialEncryption {
     pub fn from_passphrase(passphrase: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(passphrase.as_bytes());
-        let result = hasher.finalize();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&result);
+        let key: [u8; 32] = hasher.finalize().into();
         Self { key }
     }
 
-    /// Encrypt plaintext data.
-    /// Returns: IV (16 bytes) || ciphertext || HMAC (32 bytes)
+    /// Encrypt plaintext data using AES-256-GCM.
+    /// Returns: nonce (12 bytes) || ciphertext+tag
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        // Generate random IV
-        let iv: [u8; 16] = rand::random();
+        let cipher = Aes256Gcm::new_from_slice(&self.key)
+            .expect("AES-256-GCM key length is always 32 bytes");
 
-        // Derive encryption key from main key + IV
-        let enc_key = self.derive_enc_key(&iv);
+        // Generate random 96-bit nonce
+        let nonce_bytes: [u8; 12] = rand::random();
+        let nonce = Nonce::from_slice(&nonce_bytes);
 
-        // XOR encryption (simple stream cipher)
-        let mut ciphertext = Vec::with_capacity(plaintext.len());
-        for (i, byte) in plaintext.iter().enumerate() {
-            let key_byte = enc_key[i % enc_key.len()];
-            ciphertext.push(byte ^ key_byte);
-        }
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .expect("AES-256-GCM encryption should not fail with valid key and nonce");
 
-        // Compute HMAC for integrity
-        let hmac = self.compute_hmac(&iv, &ciphertext);
-
-        // Combine: IV || ciphertext || HMAC
-        let mut result = Vec::with_capacity(16 + ciphertext.len() + 32);
-        result.extend_from_slice(&iv);
+        // Combine: nonce || ciphertext+tag
+        let mut result = Vec::with_capacity(12 + ciphertext.len());
+        result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&ciphertext);
-        result.extend_from_slice(&hmac);
-
         result
     }
 
-    /// Decrypt ciphertext data.
+    /// Decrypt ciphertext data using AES-256-GCM.
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-        // Minimum size: IV (16) + HMAC (32) = 48 bytes
-        if data.len() < 48 {
+        // Minimum size: nonce (12) + tag (16) = 28 bytes
+        if data.len() < 28 {
             return Err(EncryptionError::CiphertextTooShort);
         }
 
-        // Extract components
-        let iv = &data[0..16];
-        let ciphertext = &data[16..data.len() - 32];
-        let stored_hmac = &data[data.len() - 32..];
+        let cipher = Aes256Gcm::new_from_slice(&self.key)
+            .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
 
-        // Verify HMAC
-        let computed_hmac = self.compute_hmac(iv, ciphertext);
-        if !constant_time_compare(stored_hmac, &computed_hmac) {
-            return Err(EncryptionError::DecryptionFailed);
-        }
+        let nonce = Nonce::from_slice(&data[0..12]);
+        let ciphertext = &data[12..];
 
-        // Derive decryption key
-        let enc_key = self.derive_enc_key(iv);
-
-        // XOR decryption
-        let mut plaintext = Vec::with_capacity(ciphertext.len());
-        for (i, byte) in ciphertext.iter().enumerate() {
-            let key_byte = enc_key[i % enc_key.len()];
-            plaintext.push(byte ^ key_byte);
-        }
-
-        Ok(plaintext)
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| EncryptionError::DecryptionFailed)
     }
-
-    /// Derive encryption key from main key and IV using SHA-256.
-    fn derive_enc_key(&self, iv: &[u8]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(self.key);
-        hasher.update(iv);
-        hasher.update(b"encryption");
-        let result = hasher.finalize();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&result);
-        key
-    }
-
-    /// Compute HMAC over IV and ciphertext.
-    fn compute_hmac(&self, iv: &[u8], ciphertext: &[u8]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(self.key);
-        hasher.update(iv);
-        hasher.update(ciphertext);
-        hasher.update(b"hmac");
-        let result = hasher.finalize();
-        let mut hmac = [0u8; 32];
-        hmac.copy_from_slice(&result);
-        hmac
-    }
-}
-
-/// Constant-time comparison to prevent timing attacks.
-fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 /// Encrypt credentials JSON for storage.
@@ -232,7 +175,7 @@ mod tests {
         let enc1 = encryptor.encrypt(plaintext);
         let enc2 = encryptor.encrypt(plaintext);
 
-        // Due to random IV, encryptions should differ
+        // Due to random nonce, encryptions should differ
         assert_ne!(enc1, enc2);
 
         // But both should decrypt to the same value
@@ -240,5 +183,34 @@ mod tests {
             encryptor.decrypt(&enc1).unwrap(),
             encryptor.decrypt(&enc2).unwrap()
         );
+    }
+
+    #[test]
+    fn test_empty_plaintext() {
+        let encryptor = CredentialEncryption::from_passphrase("key");
+        let encrypted = encryptor.encrypt(b"");
+        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn test_large_plaintext() {
+        let encryptor = CredentialEncryption::from_passphrase("key");
+        let plaintext = vec![0xAB_u8; 1_000_000];
+        let encrypted = encryptor.encrypt(&plaintext);
+        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+        assert_eq!(plaintext, decrypted);
+    }
+
+    #[test]
+    fn test_invalid_key_length() {
+        let result = CredentialEncryption::new(&[0u8; 16]);
+        assert!(matches!(result, Err(EncryptionError::InvalidKeyLength(16))));
+    }
+
+    #[test]
+    fn test_valid_key_length() {
+        let result = CredentialEncryption::new(&[0u8; 32]);
+        assert!(result.is_ok());
     }
 }
