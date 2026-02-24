@@ -747,8 +747,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         );
         if let Err(e) = std::fs::write(&password_file, &file_contents) {
             tracing::error!("Failed to write admin password file: {}", e);
-            // Fall back to logging the password directly
-            tracing::info!("Generated admin password: {}", password);
+            tracing::error!("Admin password could not be persisted. Re-run the server or check file permissions for: {}", password_file.display());
         } else {
             tracing::info!("Admin password written to: {}", password_file.display());
         }

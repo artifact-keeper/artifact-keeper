@@ -5,7 +5,7 @@ use std::sync::Arc;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::handlers;
-use super::middleware::auth::{auth_middleware, optional_auth_middleware};
+use super::middleware::auth::{admin_middleware, auth_middleware, optional_auth_middleware};
 use super::middleware::demo::demo_guard;
 use super::middleware::rate_limit::{rate_limit_middleware, RateLimiter};
 use super::middleware::setup::setup_guard;
@@ -254,7 +254,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Admin routes with auth middleware
+        // Admin routes with admin middleware (requires is_admin)
         .nest(
             "/admin",
             handlers::admin::router()
@@ -267,7 +267,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 .nest("/sso", handlers::sso_admin::router())
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
-                    auth_middleware,
+                    admin_middleware,
                 )),
         )
         // Plugin routes with auth middleware
