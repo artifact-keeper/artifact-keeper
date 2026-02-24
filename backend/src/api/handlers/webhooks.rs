@@ -420,6 +420,9 @@ pub async fn test_webhook(
         }
     });
 
+    // Re-validate URL at delivery time to prevent DNS rebinding attacks
+    validate_webhook_url(&webhook.url)?;
+
     // Send webhook
     let client = reqwest::Client::new();
     let mut request = client
@@ -617,6 +620,9 @@ pub async fn redeliver(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
+
+    // Re-validate URL at delivery time to prevent DNS rebinding attacks
+    validate_webhook_url(&webhook.url)?;
 
     // Send webhook
     let client = reqwest::Client::new();

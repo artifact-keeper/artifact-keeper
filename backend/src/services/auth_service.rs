@@ -372,6 +372,11 @@ impl AuthService {
         if scopes.len() > 50 {
             return Err(AppError::Validation("Too many scopes (max 50)".to_string()));
         }
+        if scopes.iter().any(|s| s.len() > 256) {
+            return Err(AppError::Validation(
+                "Scope name too long (max 256 characters)".to_string(),
+            ));
+        }
 
         // Generate random token
         let token = format!(

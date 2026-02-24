@@ -308,28 +308,30 @@ fn preview_to_response(p: PreviewResult) -> PreviewResultResponse {
     }
 }
 
-/// Max number of items in selector collections to prevent unbounded allocation.
-const MAX_SELECTOR_ITEMS: usize = 1000;
+/// Max total number of values (including nested) in a selector JSON tree.
+const MAX_SELECTOR_VALUES: usize = 5000;
+
+/// Recursively count all values in a serde_json::Value tree.
+fn count_json_values(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(arr) => 1 + arr.iter().map(count_json_values).sum::<usize>(),
+        serde_json::Value::Object(obj) => 1 + obj.values().map(count_json_values).sum::<usize>(),
+        _ => 1,
+    }
+}
 
 fn parse_selector<T: serde::de::DeserializeOwned + Default>(
     value: Option<serde_json::Value>,
 ) -> Result<T> {
     let parsed = value
         .map(|v| {
-            // Reject oversized JSON arrays/objects before deserialization
-            if let Some(arr) = v.as_array() {
-                if arr.len() > MAX_SELECTOR_ITEMS {
-                    return Err(AppError::Validation(
-                        "Selector contains too many items".to_string(),
-                    ));
-                }
-            }
-            if let Some(obj) = v.as_object() {
-                if obj.len() > MAX_SELECTOR_ITEMS {
-                    return Err(AppError::Validation(
-                        "Selector contains too many items".to_string(),
-                    ));
-                }
+            // Count all nested values to prevent unbounded allocation on
+            // deeply nested or wide structures (CodeQL: uncontrolled-allocation-size).
+            let total = count_json_values(&v);
+            if total > MAX_SELECTOR_VALUES {
+                return Err(AppError::Validation(format!(
+                    "Selector too complex ({total} values, max {MAX_SELECTOR_VALUES})"
+                )));
             }
             Ok(serde_json::from_value(v).unwrap_or_default())
         })
@@ -797,21 +799,22 @@ mod tests {
 
     #[test]
     fn test_parse_selector_rejects_oversized_array() {
-        let items: Vec<serde_json::Value> = (0..1001).map(|i| serde_json::json!(i)).collect();
+        // 5001 flat values exceeds MAX_SELECTOR_VALUES (5000)
+        let items: Vec<serde_json::Value> = (0..5001).map(|i| serde_json::json!(i)).collect();
         let val = serde_json::Value::Array(items);
         let result: Result<RepoSelector> = parse_selector(Some(val));
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("too many items"),
-            "expected 'too many items' error, got: {err_msg}"
+            err_msg.contains("too complex"),
+            "expected 'too complex' error, got: {err_msg}"
         );
     }
 
     #[test]
     fn test_parse_selector_rejects_oversized_object() {
         let mut map = serde_json::Map::new();
-        for i in 0..1001 {
+        for i in 0..5001 {
             map.insert(format!("key_{i}"), serde_json::json!(i));
         }
         let val = serde_json::Value::Object(map);
@@ -820,7 +823,21 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_selector_accepts_max_size_array() {
+    fn test_parse_selector_rejects_deeply_nested() {
+        // Nested structure: object with 100 keys, each containing array of 60 values
+        // Total: 1 (root) + 100 (keys with arrays) + 100*60 (values) = 6101 > 5000
+        let mut map = serde_json::Map::new();
+        for i in 0..100 {
+            let items: Vec<serde_json::Value> = (0..60).map(|j| serde_json::json!(j)).collect();
+            map.insert(format!("key_{i}"), serde_json::Value::Array(items));
+        }
+        let val = serde_json::Value::Object(map);
+        let result: Result<RepoSelector> = parse_selector(Some(val));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_selector_accepts_reasonable_size() {
         let items: Vec<serde_json::Value> = (0..1000).map(|i| serde_json::json!(i)).collect();
         let val = serde_json::Value::Array(items);
         // Array of ints won't deserialize to RepoSelector, so falls back to default

@@ -597,6 +597,9 @@ impl PluginService {
             plugin_name: plugin.name.clone(),
         };
 
+        // Re-validate URL at delivery time to prevent DNS rebinding attacks
+        crate::api::validation::validate_outbound_url(&webhook_url, "Plugin webhook URL")?;
+
         debug!("Sending webhook to {}: {:?}", webhook_url, payload);
 
         let response = self
