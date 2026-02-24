@@ -49,9 +49,7 @@ impl CredentialEncryption {
     pub fn from_passphrase(passphrase: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(passphrase.as_bytes());
-        let result = hasher.finalize();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&result);
+        let key: [u8; 32] = hasher.finalize().into();
         Self { key }
     }
 
