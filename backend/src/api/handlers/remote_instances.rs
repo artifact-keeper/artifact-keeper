@@ -20,7 +20,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::remote_instance_service::{RemoteInstanceResponse, RemoteInstanceService};
 
-use super::webhooks::validate_outbound_url;
+use crate::api::validation::validate_outbound_url;
 
 /// Build the router for `/api/v1/instances`.
 pub fn router() -> Router<SharedState> {

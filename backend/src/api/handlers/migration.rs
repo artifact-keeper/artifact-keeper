@@ -44,7 +44,7 @@ use crate::services::migration_worker::{ConflictResolution, MigrationWorker, Wor
 use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
 use crate::services::source_registry::SourceRegistry;
 
-use super::webhooks::validate_outbound_url;
+use crate::api::validation::validate_outbound_url;
 
 /// Create the migration router
 pub fn router() -> Router<SharedState> {
@@ -2030,6 +2030,31 @@ mod tests {
         let per_page = 50i64;
         let offset = (page - 1) * per_page;
         assert_eq!(offset, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // migration_encryption_key tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_migration_encryption_key_returns_env_value() {
+        // If the env var happens to be set, it should return its value
+        if let Ok(val) = std::env::var("MIGRATION_ENCRYPTION_KEY") {
+            let result = migration_encryption_key();
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), val);
+        }
+    }
+
+    #[test]
+    fn test_migration_encryption_key_errors_when_unset() {
+        // Temporarily check if the env var is unset
+        if std::env::var("MIGRATION_ENCRYPTION_KEY").is_err() {
+            let result = migration_encryption_key();
+            assert!(result.is_err());
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(err_msg.contains("MIGRATION_ENCRYPTION_KEY"));
+        }
     }
 }
 

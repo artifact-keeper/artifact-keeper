@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use std::net::IpAddr;
-
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -689,73 +687,7 @@ pub async fn redeliver(
 /// Blocks URLs pointing to private/internal networks, loopback addresses,
 /// link-local addresses (AWS/cloud metadata), and known internal hostnames.
 pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
-    validate_outbound_url(url_str, "Webhook URL")
-}
-
-/// Validate that an outbound URL is safe from SSRF attacks.
-///
-/// Rejects private/internal IPs, known cloud metadata endpoints, and
-/// Docker-internal service hostnames. `label` is used in error messages
-/// (e.g. "Webhook URL", "Remote instance URL").
-pub(crate) fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
-    let parsed = reqwest::Url::parse(url_str)
-        .map_err(|_| AppError::Validation(format!("Invalid {}", label)))?;
-
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(AppError::Validation(format!(
-            "{} must use http or https",
-            label
-        )));
-    }
-
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| AppError::Validation(format!("{} must have a host", label)))?;
-
-    // Block known internal/metadata hostnames
-    let blocked_hosts = [
-        "localhost",
-        "metadata.google.internal",
-        "metadata.azure.com",
-        "169.254.169.254",
-        "backend",
-        "postgres",
-        "redis",
-        "meilisearch",
-        "trivy",
-    ];
-    let host_lower = host.to_lowercase();
-    for blocked in &blocked_hosts {
-        if host_lower == *blocked || host_lower.ends_with(&format!(".{}", blocked)) {
-            return Err(AppError::Validation(format!(
-                "{} host '{}' is not allowed",
-                label, host
-            )));
-        }
-    }
-
-    // Block private/internal IP ranges
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let is_blocked = match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback()              // 127.0.0.0/8
-                    || v4.is_private()         // 10/8, 172.16/12, 192.168/16
-                    || v4.is_link_local()      // 169.254/16 (AWS metadata)
-                    || v4.is_unspecified()      // 0.0.0.0
-                    || v4.is_broadcast() // 255.255.255.255
-            }
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if is_blocked {
-            return Err(AppError::Validation(format!(
-                "{} IP '{}' is not allowed (private/internal network)",
-                label, ip
-            )));
-        }
-    }
-
-    Ok(())
+    crate::api::validation::validate_outbound_url(url_str, "Webhook URL")
 }
 
 #[derive(OpenApi)]
@@ -1053,5 +985,24 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], true);
         assert_eq!(json["attempts"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_webhook_url (delegates to validation::validate_outbound_url)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_webhook_url_allows_valid() {
+        assert!(validate_webhook_url("https://hooks.example.com/notify").is_ok());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_localhost() {
+        assert!(validate_webhook_url("http://localhost/hook").is_err());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_private_ip() {
+        assert!(validate_webhook_url("http://10.0.0.1/hook").is_err());
     }
 }
