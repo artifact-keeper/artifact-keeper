@@ -31,16 +31,17 @@ pub enum EncryptionError {
     EncryptionFailed(String),
 }
 
-/// Application-level salt for HKDF. This provides domain separation so that
-/// identical passphrases used in different applications produce different keys.
-const HKDF_SALT: &[u8] = b"artifact-keeper-credential-encryption-v1";
-
-/// Info string for HKDF expand step, binding the derived key to its purpose.
-const HKDF_INFO: &[u8] = b"aes-256-gcm-key";
+/// HKDF info string for the expand step. This binds the derived key to this
+/// application and purpose, providing domain separation so that the same
+/// passphrase used elsewhere produces a different key.
+const HKDF_INFO: &[u8] = b"artifact-keeper/credential-encryption/aes-256-gcm/v1";
 
 /// Derive a 32-byte key from a passphrase using HKDF-SHA256.
+///
+/// Uses a `None` salt (HKDF defaults to a hash-length zero block). Domain
+/// separation is achieved through the `info` parameter in the expand step.
 fn derive_key_hkdf(passphrase: &str) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), passphrase.as_bytes());
+    let hk = Hkdf::<Sha256>::new(None, passphrase.as_bytes());
     let mut key = [0u8; 32];
     hk.expand(HKDF_INFO, &mut key)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
