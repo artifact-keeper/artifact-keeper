@@ -689,19 +689,29 @@ pub async fn redeliver(
 /// Blocks URLs pointing to private/internal networks, loopback addresses,
 /// link-local addresses (AWS/cloud metadata), and known internal hostnames.
 pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
+    validate_outbound_url(url_str, "Webhook URL")
+}
+
+/// Validate that an outbound URL is safe from SSRF attacks.
+///
+/// Rejects private/internal IPs, known cloud metadata endpoints, and
+/// Docker-internal service hostnames. `label` is used in error messages
+/// (e.g. "Webhook URL", "Remote instance URL").
+pub(crate) fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(url_str)
-        .map_err(|_| AppError::Validation("Invalid webhook URL".to_string()))?;
+        .map_err(|_| AppError::Validation(format!("Invalid {}", label)))?;
 
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
-        return Err(AppError::Validation(
-            "Webhook URL must use http or https".to_string(),
-        ));
+        return Err(AppError::Validation(format!(
+            "{} must use http or https",
+            label
+        )));
     }
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| AppError::Validation("Webhook URL must have a host".to_string()))?;
+        .ok_or_else(|| AppError::Validation(format!("{} must have a host", label)))?;
 
     // Block known internal/metadata hostnames
     let blocked_hosts = [
@@ -719,8 +729,8 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
     for blocked in &blocked_hosts {
         if host_lower == *blocked || host_lower.ends_with(&format!(".{}", blocked)) {
             return Err(AppError::Validation(format!(
-                "Webhook URL host '{}' is not allowed",
-                host
+                "{} host '{}' is not allowed",
+                label, host
             )));
         }
     }
@@ -739,8 +749,8 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
         };
         if is_blocked {
             return Err(AppError::Validation(format!(
-                "Webhook URL IP '{}' is not allowed (private/internal network)",
-                ip
+                "{} IP '{}' is not allowed (private/internal network)",
+                label, ip
             )));
         }
     }

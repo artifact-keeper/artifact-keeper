@@ -49,7 +49,14 @@ impl FilesystemBackend {
     }
 
     fn key_to_path(&self, key: &str) -> PathBuf {
-        self.base_path.join(key)
+        // Sanitize the key to prevent path traversal.
+        // Remove any ".." components and leading "/" to ensure the
+        // resolved path stays under self.base_path.
+        let sanitized: PathBuf = std::path::Path::new(key)
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .collect();
+        self.base_path.join(sanitized)
     }
 }
 

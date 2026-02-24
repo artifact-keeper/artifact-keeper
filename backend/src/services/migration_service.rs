@@ -156,8 +156,13 @@ impl MigrationService {
         let (url, auth_type, credentials_enc) = connection;
 
         // Decrypt credentials using the migration encryption key
-        let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
-            .unwrap_or_else(|_| "default-migration-key-change-in-prod".to_string());
+        let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY").map_err(|_| {
+            MigrationError::ConfigError(
+                "MIGRATION_ENCRYPTION_KEY is not set. \
+                 Configure this environment variable before using migration features."
+                    .to_string(),
+            )
+        })?;
         let credentials_json =
             crate::services::encryption::decrypt_credentials(&credentials_enc, &encryption_key)
                 .map_err(|e| MigrationError::ConfigError(format!("Decryption failed: {}", e)))?;
@@ -704,11 +709,10 @@ impl MigrationService {
 
         for pattern in patterns {
             if pattern.contains('*') {
-                // Simple glob matching
-                let regex_pattern = pattern
-                    .replace('.', r"\.")
-                    .replace('*', ".*")
-                    .replace('?', ".");
+                // Simple glob matching: escape all regex metacharacters first,
+                // then convert glob wildcards to regex equivalents.
+                let escaped = regex::escape(pattern);
+                let regex_pattern = escaped.replace(r"\*", ".*").replace(r"\?", ".");
                 if let Ok(re) = regex::Regex::new(&format!("^{}$", regex_pattern)) {
                     if re.is_match(key) {
                         return true;
@@ -726,11 +730,12 @@ impl MigrationService {
     pub fn should_exclude_path(path: &str, exclude_patterns: &[String]) -> bool {
         for pattern in exclude_patterns {
             if pattern.contains('*') {
-                let regex_pattern = pattern
-                    .replace('.', r"\.")
-                    .replace("**", ".*")
-                    .replace('*', "[^/]*")
-                    .replace('?', ".");
+                // Escape all regex metacharacters first, then convert globs
+                let escaped = regex::escape(pattern);
+                let regex_pattern = escaped
+                    .replace(r"\*\*", ".*")
+                    .replace(r"\*", "[^/]*")
+                    .replace(r"\?", ".");
                 if let Ok(re) = regex::Regex::new(&format!("^{}$", regex_pattern)) {
                     if re.is_match(path) {
                         return true;

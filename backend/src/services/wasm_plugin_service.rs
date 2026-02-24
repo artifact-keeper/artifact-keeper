@@ -687,6 +687,48 @@ impl WasmPluginService {
         url: &str,
         git_ref: Option<&str>,
     ) -> Result<PluginInstallResult> {
+        // Validate the URL: only allow https:// git URLs to prevent SSRF
+        // via file://, ssh://, or git:// protocols targeting internal resources
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            let scheme = parsed.scheme();
+            if scheme != "https" && scheme != "http" {
+                return Err(AppError::Validation(format!(
+                    "Plugin git URL must use https (got {}://)",
+                    scheme
+                )));
+            }
+            if let Some(host) = parsed.host_str() {
+                let host_lower = host.to_lowercase();
+                let blocked = ["localhost", "169.254.169.254", "metadata.google.internal"];
+                for b in &blocked {
+                    if host_lower == *b {
+                        return Err(AppError::Validation(format!(
+                            "Plugin git URL host '{}' is not allowed",
+                            host
+                        )));
+                    }
+                }
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    let is_private = match ip {
+                        std::net::IpAddr::V4(v4) => {
+                            v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                        }
+                        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+                    };
+                    if is_private {
+                        return Err(AppError::Validation(format!(
+                            "Plugin git URL IP '{}' is not allowed (private/internal)",
+                            ip
+                        )));
+                    }
+                }
+            }
+        } else {
+            return Err(AppError::Validation(
+                "Plugin git URL is not a valid URL".to_string(),
+            ));
+        }
+
         info!("Installing plugin from Git: {} (ref: {:?})", url, git_ref);
 
         // Ensure plugins directory exists

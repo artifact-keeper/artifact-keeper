@@ -29,9 +29,22 @@ use crate::services::artifactory_client::{
     ArtifactoryAuth, ArtifactoryClient, ArtifactoryClientConfig,
 };
 use crate::services::encryption::{decrypt_credentials, encrypt_credentials};
+
+/// Return the migration encryption key from the environment, or error if unset.
+fn migration_encryption_key() -> Result<String> {
+    std::env::var("MIGRATION_ENCRYPTION_KEY").map_err(|_| {
+        AppError::Internal(
+            "MIGRATION_ENCRYPTION_KEY is not set. \
+             Configure this environment variable before using migration features."
+                .to_string(),
+        )
+    })
+}
 use crate::services::migration_worker::{ConflictResolution, MigrationWorker, WorkerConfig};
 use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
 use crate::services::source_registry::SourceRegistry;
+
+use super::webhooks::validate_outbound_url;
 
 /// Create the migration router
 pub fn router() -> Router<SharedState> {
@@ -453,10 +466,12 @@ async fn create_connection(
     State(state): State<SharedState>,
     Json(req): Json<CreateConnectionRequest>,
 ) -> Result<(StatusCode, Json<ConnectionResponse>)> {
+    // Validate URL to prevent SSRF when migration fetches from this source
+    validate_outbound_url(&req.url, "Migration source URL")?;
+
     // Encrypt credentials before storing
     let credentials_json = serde_json::to_string(&req.credentials)?;
-    let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-migration-key-change-in-prod".to_string());
+    let encryption_key = migration_encryption_key()?;
     let credentials_enc = encrypt_credentials(&credentials_json, &encryption_key);
 
     let connection: SourceConnectionRow = sqlx::query_as(
@@ -642,7 +657,7 @@ fn create_source_client(
     match connection.source_type.as_str() {
         "nexus" => {
             let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
-                .unwrap_or_else(|_| "default-migration-key-change-in-prod".to_string());
+                .map_err(|_| "MIGRATION_ENCRYPTION_KEY is not set".to_string())?;
             let credentials_json =
                 decrypt_credentials(&connection.credentials_enc, &encryption_key)
                     .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
@@ -675,7 +690,7 @@ fn create_artifactory_client(
 ) -> std::result::Result<ArtifactoryClient, String> {
     // Decrypt credentials
     let encryption_key = std::env::var("MIGRATION_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-migration-key-change-in-prod".to_string());
+        .map_err(|_| "MIGRATION_ENCRYPTION_KEY is not set".to_string())?;
 
     let credentials_json = decrypt_credentials(&connection.credentials_enc, &encryption_key)
         .map_err(|e| format!("Failed to decrypt credentials: {}", e))?;
