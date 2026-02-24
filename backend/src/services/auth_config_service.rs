@@ -299,7 +299,10 @@ pub struct LdapTestResult {
 pub fn encryption_key() -> String {
     std::env::var("SSO_ENCRYPTION_KEY")
         .or_else(|_| std::env::var("JWT_SECRET"))
-        .unwrap_or_else(|_| "artifact-keeper-sso-encryption-key".to_string())
+        .expect(
+            "Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set. \
+             At least one must be configured for SSO credential encryption.",
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,12 +1411,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_encryption_key_fallback() {
-        // When neither env var is set, the default key is returned.
-        // We cannot guarantee env vars are unset in CI, but we can at least
-        // confirm the function returns a non-empty string.
-        let key = encryption_key();
-        assert!(!key.is_empty());
+    #[should_panic(expected = "Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set")]
+    fn test_encryption_key_panics_when_unset() {
+        // When neither env var is set, the function should panic with a clear
+        // message rather than falling back to a hardcoded key.
+        // Note: this test only verifies the panic path; in CI where JWT_SECRET
+        // is set, it would return that value instead. The #[should_panic] will
+        // only trigger if both env vars are truly absent.
+        let _key = encryption_key();
+    }
+
+    #[test]
+    fn test_encryption_key_uses_jwt_secret_fallback() {
+        // When JWT_SECRET is set, encryption_key() should return it as fallback
+        // for SSO_ENCRYPTION_KEY. We just verify it returns a non-empty string.
+        // (In CI, JWT_SECRET is typically set.)
+        if std::env::var("JWT_SECRET").is_ok() || std::env::var("SSO_ENCRYPTION_KEY").is_ok() {
+            let key = encryption_key();
+            assert!(!key.is_empty());
+        }
     }
 
     // -----------------------------------------------------------------------

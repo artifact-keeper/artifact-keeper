@@ -687,6 +687,10 @@ impl WasmPluginService {
         url: &str,
         git_ref: Option<&str>,
     ) -> Result<PluginInstallResult> {
+        // Validate the URL to prevent SSRF via file://, ssh://, or git://
+        // protocols targeting internal resources.
+        crate::api::validation::validate_outbound_url(url, "Plugin git URL")?;
+
         info!("Installing plugin from Git: {} (ref: {:?})", url, git_ref);
 
         // Ensure plugins directory exists

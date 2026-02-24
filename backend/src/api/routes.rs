@@ -168,37 +168,45 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // User routes with auth middleware
+        // User management routes require admin privileges
         .nest(
             "/users",
-            handlers::users::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::users::router()
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    admin_middleware,
+                )),
         )
         // Profile routes (authenticated user context) with auth middleware
         .nest(
             "/profile",
-            handlers::profile::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::profile::router()
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Group routes with auth middleware
         .nest(
             "/groups",
-            handlers::groups::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::groups::router()
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Permission routes with auth middleware
         .nest(
             "/permissions",
-            handlers::permissions::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::permissions::router()
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Build routes with optional auth
         .nest(
@@ -249,10 +257,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         // Sync policy routes with auth middleware
         .nest(
             "/sync-policies",
-            handlers::sync_policies::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::sync_policies::router()
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Admin routes with admin middleware (requires is_admin)
         .nest(
@@ -265,6 +275,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 .nest("/telemetry", handlers::telemetry::router())
                 .nest("/monitoring", handlers::monitoring::router())
                 .nest("/sso", handlers::sso_admin::router())
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     admin_middleware,
@@ -289,10 +300,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         // Webhook routes with auth middleware
         .nest(
             "/webhooks",
-            handlers::webhooks::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                auth_middleware,
-            )),
+            handlers::webhooks::router()
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    auth_middleware,
+                )),
         )
         // Domain event stream (SSE) with auth middleware
         .nest(

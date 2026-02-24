@@ -20,6 +20,8 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::remote_instance_service::{RemoteInstanceResponse, RemoteInstanceService};
 
+use crate::api::validation::validate_outbound_url;
+
 /// Build the router for `/api/v1/instances`.
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -82,6 +84,9 @@ async fn create_instance(
     Extension(auth): Extension<AuthExtension>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> Result<Json<RemoteInstanceResponse>> {
+    // Validate URL to prevent SSRF via the proxy endpoints
+    validate_outbound_url(&req.url, "Remote instance URL")?;
+
     let instance =
         RemoteInstanceService::create(&state.db, auth.user_id, &req.name, &req.url, &req.api_key)
             .await?;

@@ -49,7 +49,14 @@ impl FilesystemBackend {
     }
 
     fn key_to_path(&self, key: &str) -> PathBuf {
-        self.base_path.join(key)
+        // Sanitize the key to prevent path traversal.
+        // Remove any ".." components and leading "/" to ensure the
+        // resolved path stays under self.base_path.
+        let sanitized: PathBuf = std::path::Path::new(key)
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .collect();
+        self.base_path.join(sanitized)
     }
 }
 
@@ -607,5 +614,79 @@ mod tests {
 
         // Ensure backend() returns a clone of the backend arc
         let _backend_ref = storage.backend();
+    }
+
+    // -----------------------------------------------------------------------
+    // Path traversal protection in key_to_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_key_to_path_normal_key() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("maven/com/example/artifact.jar");
+        assert_eq!(
+            path,
+            PathBuf::from("/storage/maven/com/example/artifact.jar")
+        );
+    }
+
+    #[test]
+    fn test_key_to_path_strips_dotdot() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("maven/../../etc/passwd");
+        // ".." components are filtered out, only normal components remain
+        assert_eq!(path, PathBuf::from("/storage/maven/etc/passwd"));
+    }
+
+    #[test]
+    fn test_key_to_path_strips_leading_slash() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("/etc/shadow");
+        // Leading "/" (RootDir component) is filtered out
+        assert_eq!(path, PathBuf::from("/storage/etc/shadow"));
+    }
+
+    #[test]
+    fn test_key_to_path_strips_pure_traversal() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("../../../etc/passwd");
+        assert_eq!(path, PathBuf::from("/storage/etc/passwd"));
+    }
+
+    #[test]
+    fn test_key_to_path_preserves_nested_dirs() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("npm/@scope/package/-/package-1.0.0.tgz");
+        assert_eq!(
+            path,
+            PathBuf::from("/storage/npm/@scope/package/-/package-1.0.0.tgz")
+        );
+    }
+
+    #[test]
+    fn test_key_to_path_empty_key() {
+        let backend = FilesystemBackend::new(PathBuf::from("/storage"));
+        let path = backend.key_to_path("");
+        assert_eq!(path, PathBuf::from("/storage"));
+    }
+
+    #[tokio::test]
+    async fn test_put_get_with_traversal_key_stays_inside_storage() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(temp_dir.path().to_path_buf());
+
+        // Attempt to write with a traversal key
+        backend
+            .put("../../escape.txt", Bytes::from("should stay inside"))
+            .await
+            .unwrap();
+
+        // The file should be stored inside the temp dir, not outside
+        let path = backend.key_to_path("../../escape.txt");
+        assert!(path.starts_with(temp_dir.path()));
+
+        // And we can read it back via the same key
+        let content = backend.get("../../escape.txt").await.unwrap();
+        assert_eq!(content, Bytes::from("should stay inside"));
     }
 }
