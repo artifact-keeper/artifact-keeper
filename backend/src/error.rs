@@ -97,18 +97,31 @@ impl AppError {
         }
     }
 
-    /// Return a user-facing message. Internal details are hidden for
-    /// wrapped foreign errors (Sqlx, Io, etc.) to avoid leaking internals.
+    /// Return a user-facing message. Internal details are hidden for server-side
+    /// errors to avoid leaking table names, SQL queries, file paths, or config
+    /// values. The full error is still logged via `tracing::error!` in
+    /// `into_response`.
     fn user_message(&self) -> String {
         match self {
-            Self::Sqlx(_) => "Database operation failed".to_string(),
+            // Server-side errors: return generic messages (details are logged)
+            Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
             Self::Migration(_) => "Database migration failed".to_string(),
+            Self::Storage(_) => "Storage operation failed".to_string(),
+            Self::Config(_) => "Server configuration error".to_string(),
+            Self::Internal(_) => "Internal server error".to_string(),
             Self::Io(_) => "IO operation failed".to_string(),
             Self::AddrParse(_) => "Invalid address".to_string(),
-            Self::Json(_) => "Invalid JSON".to_string(),
             Self::Jwt(_) => "Invalid token".to_string(),
-            // All other variants carry their own user-facing message
-            other => other.to_string(),
+            Self::Wasm(_) => "Plugin execution failed".to_string(),
+            // Client-facing errors: pass through their message
+            Self::Authentication(msg)
+            | Self::Unauthorized(msg)
+            | Self::Authorization(msg)
+            | Self::NotFound(msg)
+            | Self::Conflict(msg)
+            | Self::Validation(msg)
+            | Self::QuotaExceeded(msg) => msg.clone(),
+            Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
 }
@@ -126,5 +139,135 @@ impl IntoResponse for AppError {
         }));
 
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Server-side errors: user_message must NOT leak internal details
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_database_error_hides_details() {
+        let err = AppError::Database("SELECT * FROM users WHERE id = 42".into());
+        assert_eq!(err.user_message(), "Database operation failed");
+        assert!(!err.user_message().contains("SELECT"));
+    }
+
+    #[test]
+    fn test_storage_error_hides_details() {
+        let err = AppError::Storage("/var/data/artifacts/secret-file.tar".into());
+        assert_eq!(err.user_message(), "Storage operation failed");
+        assert!(!err.user_message().contains("/var"));
+    }
+
+    #[test]
+    fn test_config_error_hides_details() {
+        let err = AppError::Config("AWS_SECRET_KEY is invalid".into());
+        assert_eq!(err.user_message(), "Server configuration error");
+        assert!(!err.user_message().contains("AWS"));
+    }
+
+    #[test]
+    fn test_internal_error_hides_details() {
+        let err = AppError::Internal("stack trace at 0x7fff".into());
+        assert_eq!(err.user_message(), "Internal server error");
+        assert!(!err.user_message().contains("stack"));
+    }
+
+    #[test]
+    fn test_io_error_hides_details() {
+        let err = AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "/etc/shadow: permission denied",
+        ));
+        assert_eq!(err.user_message(), "IO operation failed");
+        assert!(!err.user_message().contains("/etc"));
+    }
+
+    #[test]
+    fn test_jwt_error_hides_details() {
+        // Construct a JWT error by decoding garbage
+        let err: jsonwebtoken::errors::Error = jsonwebtoken::decode::<serde_json::Value>(
+            "not-a-token",
+            &jsonwebtoken::DecodingKey::from_secret(b"x"),
+            &jsonwebtoken::Validation::default(),
+        )
+        .unwrap_err();
+        let app_err = AppError::Jwt(err);
+        assert_eq!(app_err.user_message(), "Invalid token");
+    }
+
+    // -----------------------------------------------------------------------
+    // Client-facing errors: user_message passes through
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_authentication_passes_through() {
+        let err = AppError::Authentication("bad credentials".into());
+        assert_eq!(err.user_message(), "bad credentials");
+    }
+
+    #[test]
+    fn test_not_found_passes_through() {
+        let err = AppError::NotFound("artifact foo:1.0 not found".into());
+        assert_eq!(err.user_message(), "artifact foo:1.0 not found");
+    }
+
+    #[test]
+    fn test_validation_passes_through() {
+        let err = AppError::Validation("name is required".into());
+        assert_eq!(err.user_message(), "name is required");
+    }
+
+    #[test]
+    fn test_conflict_passes_through() {
+        let err = AppError::Conflict("version already exists".into());
+        assert_eq!(err.user_message(), "version already exists");
+    }
+
+    #[test]
+    fn test_quota_exceeded_passes_through() {
+        let err = AppError::QuotaExceeded("storage limit reached".into());
+        assert_eq!(err.user_message(), "storage limit reached");
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP status codes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_status_codes() {
+        assert_eq!(
+            AppError::Database("x".into()).status_and_code().0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            AppError::Authentication("x".into()).status_and_code().0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::Authorization("x".into()).status_and_code().0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            AppError::NotFound("x".into()).status_and_code().0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AppError::Conflict("x".into()).status_and_code().0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            AppError::Validation("x".into()).status_and_code().0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::QuotaExceeded("x".into()).status_and_code().0,
+            StatusCode::INSUFFICIENT_STORAGE
+        );
     }
 }

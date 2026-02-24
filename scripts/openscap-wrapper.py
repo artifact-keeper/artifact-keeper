@@ -8,6 +8,7 @@ Endpoints:
 
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -262,6 +263,12 @@ class OpenSCAPHandler(BaseHTTPRequestHandler):
         raw_path = req.get("path", "")
         profile = req.get("profile", "xccdf_org.ssgproject.content_profile_standard")
 
+        # Validate profile string: XCCDF profile IDs only contain
+        # alphanumerics, dots, underscores, and hyphens.
+        if not re.fullmatch(r"[a-zA-Z0-9._\-]+", profile):
+            self._json_response(400, {"error": "invalid profile name"})
+            return
+
         scan_path = validate_scan_path(raw_path)
         if not scan_path or not os.path.isdir(scan_path):
             self._json_response(400, {"error": "scan path not found or not allowed"})
@@ -275,7 +282,7 @@ class OpenSCAPHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # Verify the requested profile exists
+        # Verify the requested profile exists in the SCAP content
         profiles = list_profiles(content_file)
         if profile not in profiles and profiles:
             # Fall back to first available profile
