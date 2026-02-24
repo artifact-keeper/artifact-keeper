@@ -11,9 +11,11 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Errors that can occur during encryption operations
 #[derive(Error, Debug)]
@@ -31,21 +33,16 @@ pub enum EncryptionError {
     EncryptionFailed(String),
 }
 
-/// HKDF info string for the expand step. This binds the derived key to this
-/// application and purpose, providing domain separation so that the same
-/// passphrase used elsewhere produces a different key.
-const HKDF_INFO: &[u8] = b"artifact-keeper/credential-encryption/aes-256-gcm/v1";
-
-/// Derive a 32-byte key from a passphrase using HKDF-SHA256.
+/// Derive a 32-byte key from a passphrase using HMAC-SHA256.
 ///
-/// Uses a `None` salt (HKDF defaults to a hash-length zero block). Domain
-/// separation is achieved through the `info` parameter in the expand step.
+/// Uses the passphrase as the HMAC key and an application-specific context
+/// string as the message, producing a 32-byte derived key with domain
+/// separation. This is equivalent to a single-step KDF per NIST SP 800-108.
 fn derive_key_hkdf(passphrase: &str) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, passphrase.as_bytes());
-    let mut key = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut key)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    key
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(passphrase.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(b"artifact-keeper/credential-encryption/aes-256-gcm/v1");
+    mac.finalize().into_bytes().into()
 }
 
 /// Derive a 32-byte key from a passphrase using legacy raw SHA-256 (for

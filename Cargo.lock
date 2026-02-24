@@ -190,7 +190,6 @@ dependencies = [
  "futures",
  "git2",
  "hex",
- "hkdf",
  "hmac",
  "jsonwebtoken",
  "ldap3",

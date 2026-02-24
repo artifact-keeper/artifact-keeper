@@ -37,7 +37,6 @@ sha2.workspace = true
 md-5.workspace = true
 sha1.workspace = true
 hmac.workspace = true
-hkdf.workspace = true
 
 # Encryption
 aes-gcm.workspace = true
