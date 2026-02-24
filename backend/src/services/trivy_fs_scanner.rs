@@ -69,9 +69,15 @@ impl TrivyFsScanner {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
-        // Use the original filename from the path (last segment) for correct extension detection
+        // Use the original filename from the path (last segment) for correct extension detection,
+        // then sanitize to basename to prevent path traversal
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
-        let artifact_path = workspace.join(original_filename);
+        let safe_filename = Path::new(original_filename)
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("artifact"))
+            .to_string_lossy()
+            .to_string();
+        let artifact_path = workspace.join(&safe_filename);
 
         tokio::fs::write(&artifact_path, content)
             .await

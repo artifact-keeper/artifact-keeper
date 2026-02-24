@@ -1116,7 +1116,13 @@ impl ScannerService {
                 ))
             })?;
 
-        let artifact_path = workspace_dir.join(&artifact.name);
+        // Sanitize the artifact name to its basename to prevent path traversal
+        let safe_name = Path::new(&artifact.name)
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("artifact"))
+            .to_string_lossy()
+            .to_string();
+        let artifact_path = workspace_dir.join(&safe_name);
 
         // Write the artifact content to the workspace
         tokio::fs::write(&artifact_path, content)
@@ -1126,7 +1132,7 @@ impl ScannerService {
             })?;
 
         // Extract archives if applicable
-        let name_lower = artifact.name.to_lowercase();
+        let name_lower = safe_name.to_lowercase();
         if name_lower.ends_with(".tar.gz")
             || name_lower.ends_with(".tgz")
             || name_lower.ends_with(".crate")
@@ -1145,6 +1151,10 @@ impl ScannerService {
     }
 
     /// Extract a tar.gz archive into the target directory.
+    ///
+    /// Iterates entries manually instead of using `archive.unpack()` to protect
+    /// against tar-slip attacks: symlinks, hardlinks, and paths that escape the
+    /// target directory via `..` components are silently skipped.
     async fn extract_tar_gz(&self, content: &Bytes, target_dir: &Path) -> Result<()> {
         let content = content.clone();
         let target = target_dir.to_path_buf();
@@ -1155,9 +1165,36 @@ impl ScannerService {
 
             let decoder = GzDecoder::new(content.as_ref());
             let mut archive = Archive::new(decoder);
-            archive
-                .unpack(&target)
-                .map_err(|e| AppError::Storage(format!("Failed to extract tar.gz archive: {}", e)))
+
+            for entry in archive
+                .entries()
+                .map_err(|e| AppError::Storage(format!("Failed to read tar.gz entries: {}", e)))?
+            {
+                let mut entry = entry.map_err(|e| {
+                    AppError::Storage(format!("Failed to read tar.gz entry: {}", e))
+                })?;
+
+                // Skip symlinks and hardlinks to prevent symlink escape attacks
+                let kind = entry.header().entry_type();
+                if kind.is_symlink() || kind.is_hard_link() {
+                    continue;
+                }
+
+                // Validate that the resolved path stays within the target directory
+                let path = entry
+                    .path()
+                    .map_err(|e| AppError::Storage(format!("Failed to read entry path: {}", e)))?;
+                let full_path = target.join(&path);
+                if !full_path.starts_with(&target) {
+                    continue;
+                }
+
+                entry.unpack_in(&target).map_err(|e| {
+                    AppError::Storage(format!("Failed to extract tar.gz entry: {}", e))
+                })?;
+            }
+
+            Ok(())
         })
         .await
         .map_err(|e| AppError::Internal(format!("Archive extraction task failed: {}", e)))?

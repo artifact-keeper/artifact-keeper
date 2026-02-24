@@ -362,6 +362,25 @@ impl BackupService {
     }
 
     async fn export_table(&self, table: &str) -> Result<serde_json::Value> {
+        // Allowlist of tables that may be exported to prevent SQL injection via table name
+        const ALLOWED_TABLES: &[&str] = &[
+            "users",
+            "repositories",
+            "artifacts",
+            "download_stats",
+            "api_tokens",
+            "roles",
+            "user_roles",
+            "repository_permissions",
+        ];
+
+        if !ALLOWED_TABLES.contains(&table) {
+            return Err(AppError::Validation(format!(
+                "Invalid export table: {}",
+                table
+            )));
+        }
+
         // Export table data as JSON array
         let query = format!("SELECT row_to_json(t) FROM {} t", table);
         let rows: Vec<serde_json::Value> = sqlx::query_scalar(&query)
