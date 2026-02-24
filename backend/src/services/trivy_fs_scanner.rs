@@ -12,7 +12,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::image_scanner::TrivyReport;
-use crate::services::scanner_service::Scanner;
+use crate::services::scanner_service::{sanitize_artifact_filename, Scanner};
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
 pub struct TrivyFsScanner {
@@ -72,11 +72,7 @@ impl TrivyFsScanner {
         // Use the original filename from the path (last segment) for correct extension detection,
         // then sanitize to basename to prevent path traversal
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
-        let safe_filename = Path::new(original_filename)
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new("artifact"))
-            .to_string_lossy()
-            .to_string();
+        let safe_filename = sanitize_artifact_filename(original_filename);
         let artifact_path = workspace.join(&safe_filename);
 
         tokio::fs::write(&artifact_path, content)

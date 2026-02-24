@@ -30,6 +30,64 @@ use crate::storage::filesystem::FilesystemStorage;
 use crate::storage::StorageBackend;
 
 // ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Sanitize a filename to its basename, stripping any directory components
+/// to prevent path traversal attacks. Returns `"artifact"` as a fallback
+/// when the input has no valid filename component.
+pub(crate) fn sanitize_artifact_filename(name: &str) -> String {
+    Path::new(name)
+        .file_name()
+        .unwrap_or(std::ffi::OsStr::new("artifact"))
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Extract a tar.gz archive into `target_dir` while guarding against tar-slip
+/// attacks: symlinks, hardlinks, and paths that escape the target directory
+/// via `..` components are silently skipped.
+///
+/// This is a synchronous, blocking function — callers should run it inside
+/// `tokio::task::spawn_blocking`.
+fn extract_tar_gz_safe(content: &[u8], target: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let decoder = GzDecoder::new(content);
+    let mut archive = Archive::new(decoder);
+
+    for entry in archive
+        .entries()
+        .map_err(|e| AppError::Storage(format!("Failed to read tar.gz entries: {}", e)))?
+    {
+        let mut entry =
+            entry.map_err(|e| AppError::Storage(format!("Failed to read tar.gz entry: {}", e)))?;
+
+        // Skip symlinks and hardlinks to prevent symlink escape attacks
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            continue;
+        }
+
+        // Validate that the resolved path stays within the target directory
+        let path = entry
+            .path()
+            .map_err(|e| AppError::Storage(format!("Failed to read entry path: {}", e)))?;
+        let full_path = target.join(&path);
+        if !full_path.starts_with(target) {
+            continue;
+        }
+
+        entry
+            .unpack_in(target)
+            .map_err(|e| AppError::Storage(format!("Failed to extract tar.gz entry: {}", e)))?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Scanner trait
 // ---------------------------------------------------------------------------
 
@@ -1117,11 +1175,7 @@ impl ScannerService {
             })?;
 
         // Sanitize the artifact name to its basename to prevent path traversal
-        let safe_name = Path::new(&artifact.name)
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new("artifact"))
-            .to_string_lossy()
-            .to_string();
+        let safe_name = sanitize_artifact_filename(&artifact.name);
         let artifact_path = workspace_dir.join(&safe_name);
 
         // Write the artifact content to the workspace
@@ -1159,45 +1213,9 @@ impl ScannerService {
         let content = content.clone();
         let target = target_dir.to_path_buf();
 
-        tokio::task::spawn_blocking(move || {
-            use flate2::read::GzDecoder;
-            use tar::Archive;
-
-            let decoder = GzDecoder::new(content.as_ref());
-            let mut archive = Archive::new(decoder);
-
-            for entry in archive
-                .entries()
-                .map_err(|e| AppError::Storage(format!("Failed to read tar.gz entries: {}", e)))?
-            {
-                let mut entry = entry.map_err(|e| {
-                    AppError::Storage(format!("Failed to read tar.gz entry: {}", e))
-                })?;
-
-                // Skip symlinks and hardlinks to prevent symlink escape attacks
-                let kind = entry.header().entry_type();
-                if kind.is_symlink() || kind.is_hard_link() {
-                    continue;
-                }
-
-                // Validate that the resolved path stays within the target directory
-                let path = entry
-                    .path()
-                    .map_err(|e| AppError::Storage(format!("Failed to read entry path: {}", e)))?;
-                let full_path = target.join(&path);
-                if !full_path.starts_with(&target) {
-                    continue;
-                }
-
-                entry.unpack_in(&target).map_err(|e| {
-                    AppError::Storage(format!("Failed to extract tar.gz entry: {}", e))
-                })?;
-            }
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("Archive extraction task failed: {}", e)))?
+        tokio::task::spawn_blocking(move || extract_tar_gz_safe(&content, &target))
+            .await
+            .map_err(|e| AppError::Internal(format!("Archive extraction task failed: {}", e)))?
     }
 
     /// Extract a zip archive into the target directory.
@@ -4714,5 +4732,249 @@ mod tests {
         let result = dedup_advisories(osv, gh);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "GHSA-xxx");
+    }
+
+    // -----------------------------------------------------------------------
+    // sanitize_artifact_filename tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_normal_filename() {
+        assert_eq!(
+            sanitize_artifact_filename("package.tar.gz"),
+            "package.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_path_traversal_dotdot() {
+        assert_eq!(sanitize_artifact_filename("../../../etc/passwd"), "passwd");
+    }
+
+    #[test]
+    fn test_sanitize_absolute_path() {
+        assert_eq!(sanitize_artifact_filename("/etc/passwd"), "passwd");
+    }
+
+    #[test]
+    fn test_sanitize_nested_path() {
+        assert_eq!(sanitize_artifact_filename("path/to/file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn test_sanitize_double_dots_only() {
+        // ".." has no filename component, should fallback to "artifact"
+        assert_eq!(sanitize_artifact_filename(".."), "artifact");
+    }
+
+    #[test]
+    fn test_sanitize_empty_string() {
+        assert_eq!(sanitize_artifact_filename(""), "artifact");
+    }
+
+    #[test]
+    fn test_sanitize_slash_only() {
+        assert_eq!(sanitize_artifact_filename("/"), "artifact");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_extension() {
+        assert_eq!(
+            sanitize_artifact_filename("../../malicious.crate"),
+            "malicious.crate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_tar_gz_safe tests
+    // -----------------------------------------------------------------------
+
+    fn create_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            for (path, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(0);
+                header.set_cksum();
+                tar.append(&header, *data).unwrap();
+            }
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        buf
+    }
+
+    fn create_tar_gz_with_symlink(
+        normal_entries: &[(&str, &[u8])],
+        symlinks: &[(&str, &str)],
+    ) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+
+            for (path, data) in normal_entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(0);
+                header.set_cksum();
+                tar.append(&header, *data).unwrap();
+            }
+
+            for (link_name, target) in symlinks {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_path(link_name).unwrap();
+                header.set_link_name(target).unwrap();
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_mtime(0);
+                header.set_cksum();
+                tar.append(&header, &[][..]).unwrap();
+            }
+
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_extract_tar_gz_normal_files() {
+        let archive = create_tar_gz(&[
+            ("hello.txt", b"hello world"),
+            ("subdir/nested.txt", b"nested content"),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar_gz_safe(&archive, tmp.path()).unwrap();
+
+        assert!(tmp.path().join("hello.txt").exists());
+        assert!(tmp.path().join("subdir/nested.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("hello.txt")).unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn test_extract_tar_gz_skips_symlinks() {
+        let archive =
+            create_tar_gz_with_symlink(&[("legit.txt", b"ok")], &[("evil_link", "/etc/passwd")]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar_gz_safe(&archive, tmp.path()).unwrap();
+
+        assert!(tmp.path().join("legit.txt").exists());
+        assert!(!tmp.path().join("evil_link").exists());
+    }
+
+    #[test]
+    fn test_extract_tar_gz_skips_path_traversal() {
+        // The Rust tar crate's set_path() rejects ".." components, so we
+        // construct the header at a lower level by writing the name bytes
+        // directly into the GNU header to simulate a malicious archive.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+
+            // Malicious entry: set a placeholder path, then overwrite with "../escape.txt"
+            let data = b"malicious payload";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("placeholder.txt").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            {
+                let gnu = header.as_gnu_mut().unwrap();
+                let evil_path = b"../escape.txt\0";
+                gnu.name[..evil_path.len()].copy_from_slice(evil_path);
+            }
+            header.set_cksum();
+            tar.append(&header, &data[..]).unwrap();
+
+            // Safe entry
+            let safe_data = b"safe content";
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_path("safe.txt").unwrap();
+            header2.set_size(safe_data.len() as u64);
+            header2.set_mode(0o644);
+            header2.set_mtime(0);
+            header2.set_cksum();
+            tar.append(&header2, &safe_data[..]).unwrap();
+
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar_gz_safe(&buf, tmp.path()).unwrap();
+
+        // The safe file should exist, but the traversal attempt should not escape
+        assert!(tmp.path().join("safe.txt").exists());
+        // The "../escape.txt" path should NOT have been created above the target
+        assert!(!tmp.path().parent().unwrap().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn test_extract_tar_gz_skips_hardlinks() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut buf = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut buf, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+
+            // Normal file
+            let data = b"normal";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("normal.txt").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            tar.append(&header, &data[..]).unwrap();
+
+            // Hardlink entry
+            let mut hl_header = tar::Header::new_gnu();
+            hl_header.set_entry_type(tar::EntryType::Link);
+            hl_header.set_path("hardlink.txt").unwrap();
+            hl_header.set_link_name("normal.txt").unwrap();
+            hl_header.set_size(0);
+            hl_header.set_mode(0o644);
+            hl_header.set_mtime(0);
+            hl_header.set_cksum();
+            tar.append(&hl_header, &[][..]).unwrap();
+
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar_gz_safe(&buf, tmp.path()).unwrap();
+
+        assert!(tmp.path().join("normal.txt").exists());
+        assert!(!tmp.path().join("hardlink.txt").exists());
+    }
+
+    #[test]
+    fn test_extract_tar_gz_empty_archive() {
+        let archive = create_tar_gz(&[]);
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar_gz_safe(&archive, tmp.path()).unwrap();
+        // Should succeed with no files created
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 }

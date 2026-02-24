@@ -97,6 +97,29 @@ pub struct BackupService {
     active_backup: Arc<Mutex<Option<Uuid>>>,
 }
 
+/// Allowlist of database tables that may be exported via backup.
+const ALLOWED_EXPORT_TABLES: &[&str] = &[
+    "users",
+    "repositories",
+    "artifacts",
+    "download_stats",
+    "api_tokens",
+    "roles",
+    "user_roles",
+    "repository_permissions",
+];
+
+/// Validate that a table name is in the export allowlist.
+fn validate_export_table(table: &str) -> Result<()> {
+    if !ALLOWED_EXPORT_TABLES.contains(&table) {
+        return Err(AppError::Validation(format!(
+            "Invalid export table: {}",
+            table
+        )));
+    }
+    Ok(())
+}
+
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
         Self {
@@ -362,24 +385,7 @@ impl BackupService {
     }
 
     async fn export_table(&self, table: &str) -> Result<serde_json::Value> {
-        // Allowlist of tables that may be exported to prevent SQL injection via table name
-        const ALLOWED_TABLES: &[&str] = &[
-            "users",
-            "repositories",
-            "artifacts",
-            "download_stats",
-            "api_tokens",
-            "roles",
-            "user_roles",
-            "repository_permissions",
-        ];
-
-        if !ALLOWED_TABLES.contains(&table) {
-            return Err(AppError::Validation(format!(
-                "Invalid export table: {}",
-                table
-            )));
-        }
+        validate_export_table(table)?;
 
         // Export table data as JSON array
         let query = format!("SELECT row_to_json(t) FROM {} t", table);
@@ -1033,5 +1039,41 @@ mod tests {
         let bs3 = bs; // Clone
         assert_eq!(bs, bs2);
         assert_eq!(bs, bs3);
+    }
+
+    // -----------------------------------------------------------------------
+    // export_table allowlist validation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_export_table_allowed_tables() {
+        for table in ALLOWED_EXPORT_TABLES {
+            assert!(
+                validate_export_table(table).is_ok(),
+                "expected '{}' to be allowed",
+                table
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_export_table_rejects_unknown() {
+        assert!(validate_export_table("admin_secrets").is_err());
+    }
+
+    #[test]
+    fn test_validate_export_table_rejects_sql_injection() {
+        assert!(validate_export_table("users; DROP TABLE users").is_err());
+    }
+
+    #[test]
+    fn test_validate_export_table_rejects_empty() {
+        assert!(validate_export_table("").is_err());
+    }
+
+    #[test]
+    fn test_validate_export_table_case_sensitive() {
+        // "Users" (capital) should not match "users"
+        assert!(validate_export_table("Users").is_err());
     }
 }
