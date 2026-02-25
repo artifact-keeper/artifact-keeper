@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0-rc.4] - 2026-02-25
+
+### Added
+- **Service accounts and token scoping** (#205, #208, #209) - service account entities with API tokens, scope enforcement across all repository handlers, and RepoSelector-based token restrictions
+- **Incus/LXC container image support** (#206) - new `incus` repository format implementing the SimpleStreams protocol for container and VM images
+- **SSE event stream for live data refresh** (#269) - server-sent events endpoint allowing the web UI to receive real-time cache invalidation signals
+- **Physical storage garbage collection** (#233) - background task to reclaim disk space from soft-deleted artifacts
+- **Tag-filtered peer replication** (#243) - filter replication to only sync artifacts matching specified tag patterns
+- **WASM plugin v2: handle-request** (#256) - plugins can now serve native package format wire protocols directly
+- **`SKIP_ADMIN_PROVISIONING` env var** (#224) - skip admin user creation on first boot for SSO-only deployments
+- **Artifact filter enforcement with retroactive sync** (#204) - evaluate filters against existing artifacts when policies change
+
+### Fixed
+- **Storage backend hardcoded to filesystem** (#237, #244, #245, #246) - use the configured storage backend (S3, Azure, GCS) instead of always defaulting to local filesystem
+- **OIDC env var config ignored** (#249) - environment variable configuration for OIDC providers was not being read
+- **Local login not blocked with SSO** (#223) - block local password login when SSO providers are configured
+- **LRU eviction for size quotas** (#226) - change storage quota eviction from FIFO to least-recently-used ordering
+- **Lifecycle policy execution** (#225) - implement `tag_pattern_keep` lifecycle policy type
+- **Streaming uploads for Incus** (#217, #242) - fix chunked upload handling for large container images
+- **96 code scanning alerts resolved** (#267, #268) - taint-flow fixes, safe string handling, and input validation improvements
+- **DNS rebinding protection** - bound allocations, upgrade KDF from static HMAC to HKDF with domain separation
+- **HTTPS enforced in Dockerfile healthchecks** (#251)
+
+### Security
+- **Privilege escalation fix** (#273) - enforce admin checks on user creation and all admin routes
+- **Archive extraction hardening** (#274) - path traversal protection, safe file handling, parameterized SQL
+- **Encryption and rate limiter hardening** (#275) - improved encryption key derivation, LDAP injection prevention, CSP headers, XSS/SSRF mitigations
+- **SSRF and path traversal fixes** (#277) - close server-side request forgery vectors and path traversal in file operations
+- **KDF upgrade** - migrate from static HMAC key to HKDF with domain separation, fix CodeQL hard-coded crypto alerts
+
+### Changed
+- SonarCloud scanner added to CI (#247)
+- Code coverage reporting with cargo-llvm-cov (#229)
+- All environment variables documented in .env.example (#227)
+- Mergify auto-merge configuration (#215)
+- Dependency bumps: actions/upload-artifact 4 to 6, actions/checkout 4 to 6, actions/attest-build-provenance 2 to 3
+
+### Tests
+- Unit test coverage increased toward 80% quality gate (#253, #254)
+
 ## [1.1.0-rc.3] - 2026-02-17
 
 ### Fixed

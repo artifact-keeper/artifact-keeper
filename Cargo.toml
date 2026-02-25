@@ -3,7 +3,7 @@ resolver = "2"
 members = ["backend"]
 
 [workspace.package]
-version = "1.1.0-rc.3"
+version = "1.1.0-rc.4"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/yourorg/artifact-keeper"
