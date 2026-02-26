@@ -1703,14 +1703,7 @@ async fn sharded_repodata_index(
     let mut shards_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (pkg_name, artifacts) in &by_name {
         let shard = build_shard(&subdir, artifacts);
-        let shard_msgpack = rmp_serde::to_vec(&shard).map_err(|e| {
-            tracing::error!("msgpack serialization error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
-        let shard_compressed = zstd_compress(&shard_msgpack).map_err(|e| {
-            tracing::error!("zstd compression error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
+        let shard_compressed = serialize_msgpack_zst(&shard)?;
 
         let mut hasher = Sha256::new();
         hasher.update(&shard_compressed);
@@ -1723,14 +1716,7 @@ async fn sharded_repodata_index(
     let base_url = format!("/conda/{}/{}/", repo_key, subdir);
     let index = build_sharded_index(&subdir, &base_url, &shards_map);
 
-    let index_msgpack = rmp_serde::to_vec(&index).map_err(|e| {
-        tracing::error!("msgpack serialization error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
-    let compressed = zstd_compress(&index_msgpack).map_err(|e| {
-        tracing::error!("zstd compression error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-    })?;
+    let compressed = serialize_msgpack_zst(&index)?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1781,14 +1767,7 @@ async fn sharded_repodata_shard(
     // Find the shard matching the requested hash
     for artifacts in by_name.values() {
         let shard = build_shard(&subdir, artifacts);
-        let shard_msgpack = rmp_serde::to_vec(&shard).map_err(|e| {
-            tracing::error!("msgpack serialization error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
-        let shard_compressed = zstd_compress(&shard_msgpack).map_err(|e| {
-            tracing::error!("zstd compression error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-        })?;
+        let shard_compressed = serialize_msgpack_zst(&shard)?;
 
         let mut hasher = Sha256::new();
         hasher.update(&shard_compressed);
@@ -1809,6 +1788,69 @@ async fn sharded_repodata_shard(
     Err((StatusCode::NOT_FOUND, "Shard not found").into_response())
 }
 
+/// Extract a repodata entry JSON object from an artifact's metadata.
+/// Shared by `build_repodata` and `build_shard` to avoid duplication.
+fn build_artifact_entry(
+    artifact: &CondaArtifact,
+    filename: &str,
+    subdir: &str,
+) -> serde_json::Value {
+    let meta = artifact.metadata.as_ref();
+    let meta_str = |field| {
+        meta.and_then(|m| m.get(field).and_then(|v| v.as_str()))
+            .unwrap_or("")
+    };
+    let meta_json = |field| {
+        meta.and_then(|m| m.get(field))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([]))
+    };
+
+    let pkg_name = meta
+        .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+        .unwrap_or(&artifact.name);
+    let version = meta
+        .and_then(|m| m.get("version").and_then(|v| v.as_str()))
+        .or(artifact.version.as_deref())
+        .unwrap_or("0");
+    let build = if meta_str("build").is_empty() {
+        "0"
+    } else {
+        meta_str("build")
+    };
+    let build_number = meta
+        .and_then(|m| m.get("build_number").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+
+    let mut entry = serde_json::json!({
+        "build": build,
+        "build_number": build_number,
+        "constrains": meta_json("constrains"),
+        "depends": meta_json("depends"),
+        "fn": filename,
+        "license": meta_str("license"),
+        "md5": meta_str("md5"),
+        "name": pkg_name,
+        "sha256": artifact.checksum_sha256,
+        "size": artifact.size_bytes,
+        "subdir": subdir,
+        "version": version,
+    });
+
+    // Optional fields (only include when non-empty/present)
+    for field in &["noarch", "license_family", "features", "track_features"] {
+        let val = meta_str(field);
+        if !val.is_empty() {
+            entry[field] = serde_json::Value::String(val.to_string());
+        }
+    }
+    if let Some(ts) = meta.and_then(|m| m.get("timestamp").and_then(|v| v.as_u64())) {
+        entry["timestamp"] = serde_json::json!(ts);
+    }
+
+    entry
+}
+
 /// Build a CEP-16 shard for a single package name.
 ///
 /// Contains all versions/builds of the package, split into `packages`
@@ -1823,98 +1865,7 @@ fn build_shard(subdir: &str, artifacts: &[&CondaArtifact]) -> serde_json::Value 
             continue;
         }
 
-        let pkg_name = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-            .unwrap_or(&artifact.name);
-
-        let version = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("version").and_then(|v| v.as_str()))
-            .or(artifact.version.as_deref())
-            .unwrap_or("0");
-
-        let build = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("build").and_then(|v| v.as_str()))
-            .unwrap_or("0");
-
-        let build_number = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("build_number").and_then(|v| v.as_u64()))
-            .unwrap_or(0);
-
-        let depends = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("depends"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
-
-        let constrains = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("constrains"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
-
-        let license = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("license").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let noarch = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("noarch").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let md5 = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("md5").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let license_family = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("license_family").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let timestamp = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("timestamp").and_then(|v| v.as_u64()));
-
-        let mut entry = serde_json::json!({
-            "build": build,
-            "build_number": build_number,
-            "constrains": constrains,
-            "depends": depends,
-            "fn": filename,
-            "license": license,
-            "md5": md5,
-            "name": pkg_name,
-            "sha256": artifact.checksum_sha256,
-            "size": artifact.size_bytes,
-            "subdir": subdir,
-            "version": version,
-        });
-
-        if !noarch.is_empty() {
-            entry["noarch"] = serde_json::Value::String(noarch.to_string());
-        }
-        if !license_family.is_empty() {
-            entry["license_family"] = serde_json::Value::String(license_family.to_string());
-        }
-        if let Some(ts) = timestamp {
-            entry["timestamp"] = serde_json::json!(ts);
-        }
+        let entry = build_artifact_entry(artifact, filename, subdir);
 
         if is_conda_v2(filename) {
             packages_conda.insert(filename.to_string(), entry);
@@ -2044,120 +1995,7 @@ async fn build_repodata(
             continue;
         }
 
-        let pkg_name = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("name").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| artifact.name.clone());
-
-        let version = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("version").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .or_else(|| artifact.version.clone())
-            .unwrap_or_else(|| "0".to_string());
-
-        let build = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("build").and_then(|v| v.as_str()))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "0".to_string());
-
-        let build_number = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("build_number").and_then(|v| v.as_u64()))
-            .unwrap_or(0);
-
-        let depends = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("depends"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
-
-        let constrains = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("constrains"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!([]));
-
-        let license = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("license").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let license_family = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("license_family").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let timestamp = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("timestamp").and_then(|v| v.as_u64()));
-
-        let features = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("features").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let track_features = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("track_features").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let noarch = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("noarch").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let md5 = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("md5").and_then(|v| v.as_str()))
-            .unwrap_or("");
-
-        let mut entry = serde_json::json!({
-            "build": build,
-            "build_number": build_number,
-            "constrains": constrains,
-            "depends": depends,
-            "fn": filename,
-            "license": license,
-            "md5": md5,
-            "name": pkg_name,
-            "sha256": artifact.checksum_sha256,
-            "size": artifact.size_bytes,
-            "subdir": subdir,
-            "version": version,
-        });
-
-        // Include optional fields only when non-empty/present
-        if !license_family.is_empty() {
-            entry["license_family"] = serde_json::Value::String(license_family.to_string());
-        }
-        if let Some(ts) = timestamp {
-            entry["timestamp"] = serde_json::json!(ts);
-        }
-        if !features.is_empty() {
-            entry["features"] = serde_json::Value::String(features.to_string());
-        }
-        if !track_features.is_empty() {
-            entry["track_features"] = serde_json::Value::String(track_features.to_string());
-        }
-        if !noarch.is_empty() {
-            entry["noarch"] = serde_json::Value::String(noarch.to_string());
-        }
+        let entry = build_artifact_entry(artifact, filename, subdir);
 
         if is_conda_v2(filename) {
             packages_conda.insert(filename.to_string(), entry);
@@ -3104,6 +2942,20 @@ async fn store_conda_package(
 // ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
+
+/// Serialize to msgpack and compress with zstd.
+/// Shared by shard index and individual shard handlers.
+#[allow(clippy::result_large_err)]
+fn serialize_msgpack_zst<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Response> {
+    let msgpack = rmp_serde::to_vec(value).map_err(|e| {
+        tracing::error!("msgpack serialization error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
+    zstd_compress(&msgpack).map_err(|e| {
+        tracing::error!("zstd compression error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })
+}
 
 /// Compress data using bzip2.
 fn bzip2_compress(data: &[u8]) -> Vec<u8> {
