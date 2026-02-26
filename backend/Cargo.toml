@@ -105,6 +105,7 @@ serde_yaml = "0.9"
 regex = "1.11"
 bzip2 = "0.5"
 zstd = "0.13"
+rmp-serde = "1.3"
 
 # WASM runtime
 wasmtime.workspace = true
