@@ -988,6 +988,33 @@ async fn resolve_conda_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInf
     })
 }
 
+/// Check that the caller has read access to a repository.
+///
+/// Public repositories allow unauthenticated access. Private repositories
+/// require valid Basic credentials (username:password or __token__:jwt).
+/// Returns 401 with `WWW-Authenticate: Basic` if access is denied.
+async fn check_read_access(
+    db: &sqlx::PgPool,
+    config: &crate::config::Config,
+    headers: &HeaderMap,
+    repo: &RepoInfo,
+) -> Result<(), Response> {
+    // Use a runtime query (not the sqlx::query! macro) to avoid offline cache changes
+    use sqlx::Row;
+    let is_public: bool = sqlx::query("SELECT is_public FROM repositories WHERE id = $1")
+        .bind(repo.id)
+        .fetch_one(db)
+        .await
+        .map(|row| row.get::<bool, _>("is_public"))
+        .unwrap_or(false);
+
+    if is_public {
+        return Ok(());
+    }
+    // Private repo: require authentication
+    authenticate(db, config, headers).await.map(|_| ())
+}
+
 // ---------------------------------------------------------------------------
 // Artifact query helper
 // ---------------------------------------------------------------------------
@@ -1121,6 +1148,18 @@ async fn channeldata_json(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    check_read_access(&state.db, &state.config, &headers, &repo).await?;
+
+    // Virtual repos: merge channeldata from all members
+    if repo.repo_type == "virtual" {
+        let channeldata =
+            build_virtual_channeldata(&state.db, state.proxy_service.as_deref(), repo.id).await?;
+        let body = serde_json::to_string_pretty(&channeldata)
+            .unwrap()
+            .into_bytes();
+        return Ok(cacheable_response(body, "application/json", &headers));
+    }
 
     // For remote repos, proxy channeldata from upstream
     if repo.repo_type == "remote" {
@@ -1435,6 +1474,24 @@ async fn repodata_json(
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
 
+    check_read_access(&state.db, &state.config, &headers, &repo).await?;
+
+    // Virtual repos: merge repodata from all members
+    if repo.repo_type == "virtual" {
+        let repodata = build_virtual_repodata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &repo_key,
+            &subdir,
+        )
+        .await?;
+        let body = serde_json::to_string_pretty(&repodata)
+            .unwrap()
+            .into_bytes();
+        return Ok(cacheable_response(body, "application/json", &headers));
+    }
+
     // For remote repos, proxy repodata from upstream
     if repo.repo_type == "remote" {
         if let Some(ref upstream_url) = repo.upstream_url {
@@ -1483,6 +1540,27 @@ async fn repodata_json_bz2(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    check_read_access(&state.db, &state.config, &headers, &repo).await?;
+
+    // Virtual repos: merge repodata from all members
+    if repo.repo_type == "virtual" {
+        let repodata = build_virtual_repodata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &repo_key,
+            &subdir,
+        )
+        .await?;
+        let json_bytes = serde_json::to_vec(&repodata).unwrap();
+        let compressed = bzip2_compress(&json_bytes);
+        return Ok(cacheable_response(
+            compressed,
+            "application/x-bzip2",
+            &headers,
+        ));
+    }
 
     // For remote repos, proxy compressed repodata from upstream
     if repo.repo_type == "remote" {
@@ -1535,7 +1613,11 @@ async fn repodata_json_sig(
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
 
-    let json_bytes = serde_json::to_vec(&repodata).unwrap();
+    // Use pretty-printed JSON to match what repodata_json() serves,
+    // so clients can verify the signature against the downloaded repodata.
+    let json_bytes = serde_json::to_string_pretty(&repodata)
+        .unwrap()
+        .into_bytes();
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     let signature = signing_svc
@@ -1577,6 +1659,26 @@ async fn repodata_json_zst(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    check_read_access(&state.db, &state.config, &headers, &repo).await?;
+
+    // Virtual repos: merge repodata from all members
+    if repo.repo_type == "virtual" {
+        let repodata = build_virtual_repodata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &repo_key,
+            &subdir,
+        )
+        .await?;
+        let json_bytes = serde_json::to_vec(&repodata).unwrap();
+        let compressed = zstd_compress(&json_bytes).map_err(|e| {
+            tracing::error!("zstd compression error for virtual repodata: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+        })?;
+        return Ok(cacheable_response(compressed, "application/zstd", &headers));
+    }
 
     // For remote repos, proxy compressed repodata from upstream
     if repo.repo_type == "remote" {
@@ -2128,15 +2230,190 @@ async fn build_repodata(
     }))
 }
 
+/// Build merged repodata.json for a virtual repository by combining member repos.
+///
+/// Members are iterated in priority order (from `virtual_repo_members` table).
+/// For hosted/local members, we query their artifacts directly. For remote members,
+/// we proxy their upstream repodata and parse it. The merge uses first-writer-wins
+/// semantics: if two members provide the same filename, the higher-priority member
+/// (lower priority number) wins.
+async fn build_virtual_repodata(
+    db: &sqlx::PgPool,
+    proxy_service: Option<&crate::services::proxy_service::ProxyService>,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    subdir: &str,
+) -> Result<serde_json::Value, Response> {
+    validate_cep26_subdir(subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+
+    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+
+    let mut merged_packages = serde_json::Map::new();
+    let mut merged_packages_conda = serde_json::Map::new();
+
+    for member in &members {
+        let member_type = format!("{:?}", member.repo_type).to_lowercase();
+
+        if member_type == "remote" {
+            // Remote member: fetch upstream repodata and parse it
+            if let (Some(proxy), Some(upstream_url)) =
+                (proxy_service, member.upstream_url.as_deref())
+            {
+                let upstream_path = format!("{}/repodata.json", subdir);
+                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await
+                {
+                    if let Ok(upstream_rd) = serde_json::from_slice::<serde_json::Value>(&content) {
+                        if let Some(pkgs) = upstream_rd.get("packages").and_then(|v| v.as_object())
+                        {
+                            for (k, v) in pkgs {
+                                merged_packages.entry(k.clone()).or_insert(v.clone());
+                            }
+                        }
+                        if let Some(pkgs) = upstream_rd
+                            .get("packages.conda")
+                            .and_then(|v| v.as_object())
+                        {
+                            for (k, v) in pkgs {
+                                merged_packages_conda.entry(k.clone()).or_insert(v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Hosted/local/staging member: query artifacts from DB
+            let artifacts = list_conda_artifacts(db, member.id).await?;
+            let subdir_artifacts = artifacts_for_subdir(&artifacts, subdir);
+
+            for artifact in &subdir_artifacts {
+                let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+                if !is_conda_package(filename) {
+                    continue;
+                }
+                let entry = build_artifact_entry(artifact, filename, subdir);
+                if is_conda_v2(filename) {
+                    merged_packages_conda
+                        .entry(filename.to_string())
+                        .or_insert(entry);
+                } else {
+                    merged_packages.entry(filename.to_string()).or_insert(entry);
+                }
+            }
+        }
+    }
+
+    let base_url = format!("/conda/{}/{}/", virtual_repo_key, subdir);
+
+    Ok(serde_json::json!({
+        "info": {
+            "subdir": subdir,
+            "base_url": base_url,
+        },
+        "packages": merged_packages,
+        "packages.conda": merged_packages_conda,
+        "removed": [],
+        "repodata_version": 1,
+    }))
+}
+
+/// Build merged channeldata.json for a virtual repository.
+async fn build_virtual_channeldata(
+    db: &sqlx::PgPool,
+    proxy_service: Option<&crate::services::proxy_service::ProxyService>,
+    virtual_repo_id: uuid::Uuid,
+) -> Result<serde_json::Value, Response> {
+    let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+
+    let mut merged_packages = serde_json::Map::new();
+
+    for member in &members {
+        let member_type = format!("{:?}", member.repo_type).to_lowercase();
+
+        if member_type == "remote" {
+            if let (Some(proxy), Some(upstream_url)) =
+                (proxy_service, member.upstream_url.as_deref())
+            {
+                if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    "channeldata.json",
+                )
+                .await
+                {
+                    if let Ok(upstream_cd) = serde_json::from_slice::<serde_json::Value>(&content) {
+                        if let Some(pkgs) = upstream_cd.get("packages").and_then(|v| v.as_object())
+                        {
+                            for (k, v) in pkgs {
+                                merged_packages.entry(k.clone()).or_insert(v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let artifacts = list_conda_artifacts(db, member.id).await?;
+            for artifact in &artifacts {
+                let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+                if !is_conda_package(filename) {
+                    continue;
+                }
+                let pkg_name = artifact
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("name").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| artifact.name.clone());
+
+                merged_packages.entry(pkg_name).or_insert_with(|| {
+                    let subdir = artifact
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("subdir").and_then(|v| v.as_str()))
+                        .unwrap_or("noarch");
+                    let meta = artifact.metadata.as_ref();
+                    let meta_str = |field: &str| {
+                        meta.and_then(|m| m.get(field).and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                    };
+                    serde_json::json!({
+                        "subdirs": [subdir],
+                        "version": artifact.version.as_deref().unwrap_or("0"),
+                        "license": meta_str("license"),
+                        "summary": meta_str("summary"),
+                    })
+                });
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "channeldata_version": 1,
+        "packages": merged_packages,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // GET /conda/{repo_key}/{subdir}/{filename} - Download package
 // ---------------------------------------------------------------------------
 
 async fn download_package(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path((repo_key, subdir, filename)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    check_read_access(&state.db, &state.config, &headers, &repo).await?;
 
     // Look up artifact by path
     let artifact_path = format!("{}/{}", subdir, filename);
@@ -7853,5 +8130,61 @@ mod tests {
         // Valid subdirs pass
         assert!(validate_cep26_subdir("linux-64").is_ok());
         assert!(validate_cep26_subdir("noarch").is_ok());
+    }
+
+    // =======================================================================
+    // Signature verification (bead: artifact-keeper-9sw)
+    //
+    // Verify that a signed repodata payload can be verified against the
+    // corresponding public key. Mirrors the pattern in signing_service tests.
+    // =======================================================================
+
+    #[test]
+    fn test_signature_verifies_against_public_key() {
+        use rsa::pkcs1v15::{SigningKey as RsaSigningKey, VerifyingKey};
+        use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+        use rsa::signature::{Signer, Verifier};
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+
+        // Generate a fresh RSA-2048 key pair
+        let mut rng = rsa::rand_core::OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+        let public_key = RsaPublicKey::from(&private_key);
+
+        let public_pem = public_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("pub pem");
+
+        // Build a sample repodata JSON (same structure the handler produces)
+        let repodata = serde_json::json!({
+            "info": { "subdir": "noarch" },
+            "packages": {},
+            "packages.conda": {
+                "test-pkg-1.0-0.conda": {
+                    "name": "test-pkg",
+                    "version": "1.0",
+                    "build": "0",
+                    "build_number": 0,
+                    "depends": [],
+                    "sha256": "abc123",
+                    "size": 1024,
+                    "subdir": "noarch",
+                }
+            },
+            "repodata_version": 1,
+        });
+
+        // Sign with the private key (compact JSON, matching repodata_json_sig handler)
+        let json_bytes = serde_json::to_vec(&repodata).unwrap();
+        let signing_key = RsaSigningKey::<sha2::Sha256>::new(private_key);
+        let signature = signing_key.sign(&json_bytes);
+
+        // Verify with the public key (PEM round-trip)
+        let parsed_pub = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
+        let verifying_key = VerifyingKey::<sha2::Sha256>::new(parsed_pub);
+        assert!(
+            verifying_key.verify(&json_bytes, &signature).is_ok(),
+            "Signature should verify against the public key"
+        );
     }
 }

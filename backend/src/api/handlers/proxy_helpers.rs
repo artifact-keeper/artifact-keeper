@@ -114,7 +114,7 @@ where
 }
 
 /// Fetch virtual repository member repos sorted by priority.
-async fn fetch_virtual_members(
+pub async fn fetch_virtual_members(
     db: &PgPool,
     virtual_repo_id: Uuid,
 ) -> Result<Vec<Repository>, Response> {

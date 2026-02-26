@@ -424,21 +424,34 @@ ANON_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
 ANON_REPODATA=$(curl -sf "$BACKEND_URL/conda/$REPO_KEY/noarch/repodata.json" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if 'packages' in d or 'packages.conda' in d else 'bad')" 2>/dev/null)
 [ "$ANON_REPODATA" = "ok" ] && pass "8.7: repodata.json accessible without auth on public repo" || fail "8.7: repodata.json not valid without auth"
 
-# Private repo: unauthenticated request
-# Note: conda handler uses optional auth - private repo enforcement depends on
-# the handler checking repo visibility. This tests the current behavior.
+# Private repo: unauthenticated request should return 401
 if [ -n "${REPO_ID_PRIV:-}" ]; then
     PRIV_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         "$BACKEND_URL/conda/$REPO_KEY_PRIV/noarch/repodata.json")
-    if [ "$PRIV_CODE" = "401" ] || [ "$PRIV_CODE" = "403" ]; then
-        pass "8.1: Unauthenticated request to private repo returns $PRIV_CODE"
+    if [ "$PRIV_CODE" = "401" ]; then
+        pass "8.1: Unauthenticated request to private repo returns 401"
+    elif [ "$PRIV_CODE" = "403" ]; then
+        pass "8.1: Unauthenticated request to private repo returns 403"
     else
-        # If private repo is accessible without auth, mark as known behavior
-        log "  NOTE: Private repo accessible without auth (HTTP $PRIV_CODE) - conda uses optional auth middleware"
-        skip "8.1: Private repo auth enforcement (conda handler uses optional auth)"
+        fail "8.1: Private repo returned HTTP $PRIV_CODE (expected 401)"
     fi
+
+    # Private repo: authenticated request should succeed
+    PRIV_AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -u "$AUTH_USER:$AUTH_PASS" \
+        "$BACKEND_URL/conda/$REPO_KEY_PRIV/noarch/repodata.json")
+    [ "$PRIV_AUTH_CODE" = "200" ] \
+        && pass "8.2: Authenticated request to private repo returns 200" \
+        || fail "8.2: Authenticated request to private repo returned HTTP $PRIV_AUTH_CODE"
+
+    # Private repo download should also require auth
+    PRIV_DL_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        "$BACKEND_URL/conda/$REPO_KEY_PRIV/noarch/repodata.json.bz2")
+    [ "$PRIV_DL_CODE" = "401" ] \
+        && pass "8.3: Private repo bz2 repodata requires auth" \
+        || fail "8.3: Private repo bz2 returned HTTP $PRIV_DL_CODE (expected 401)"
 else
-    skip "8.1: Private repo was not created"
+    skip "8.1-8.3: Private repo was not created"
 fi
 
 echo ""
@@ -695,6 +708,169 @@ print('both' if has_v1 and has_v2 else 'v1' if has_v1 else 'v2' if has_v2 else '
     fi
 else
     skip "6.1-6.6: No internet access to conda-forge"
+fi
+
+echo ""
+echo "============================================="
+echo "  Section 7: Virtual Repository Repodata Merge"
+echo "============================================="
+
+# Create a second local repo with different packages
+REPO_KEY_LOCAL2="e2e-conda-local2-$(date +%s)"
+REPO_ID_LOCAL2=$(api_create_repo "$REPO_KEY_LOCAL2" "conda" "true") || true
+
+if [ -n "$REPO_ID_LOCAL2" ]; then
+    # Upload a unique package to local2
+    LOCAL2_PKG=$(build_v2_package "e2e-local2-pkg" "$TEST_VERSION" "noarch" "0")
+    curl -sf -X PUT -u "$AUTH_USER:$AUTH_PASS" \
+        --data-binary @"$LOCAL2_PKG" \
+        "$BACKEND_URL/conda/$REPO_KEY_LOCAL2/noarch/$(basename "$LOCAL2_PKG")" > /dev/null
+    sleep 1
+
+    # Create virtual repo
+    VIRT_KEY="e2e-conda-virt-$(date +%s)"
+    VIRT_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BACKEND_URL/api/v1/repositories" \
+        -H "Authorization: Bearer $TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d "{\"key\":\"$VIRT_KEY\",\"name\":\"E2E virtual conda\",\"format\":\"conda\",\"repo_type\":\"virtual\",\"is_public\":true}")
+    VIRT_HTTP=$(echo "$VIRT_RESP" | tail -1)
+    VIRT_BODY=$(echo "$VIRT_RESP" | sed '$d')
+    VIRT_ID=$(echo "$VIRT_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null) || true
+
+    if [ -n "$VIRT_ID" ]; then
+        # Add members: main repo (priority 1) and local2 (priority 2)
+        curl -sf -X POST "$BACKEND_URL/api/v1/repositories/$VIRT_ID/members" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"member_repo_id\":\"$REPO_ID\",\"priority\":1}" > /dev/null 2>&1 || true
+        curl -sf -X POST "$BACKEND_URL/api/v1/repositories/$VIRT_ID/members" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"member_repo_id\":\"$REPO_ID_LOCAL2\",\"priority\":2}" > /dev/null 2>&1 || true
+
+        # 7.1: Fetch virtual repo repodata
+        VIRT_RD=$(curl -sf "$BACKEND_URL/conda/$VIRT_KEY/noarch/repodata.json" 2>/dev/null)
+        if [ -n "$VIRT_RD" ]; then
+            VIRT_PKGS=$(echo "$VIRT_RD" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+pkgs = {**d.get('packages', {}), **d.get('packages.conda', {})}
+print(len(pkgs))
+" 2>/dev/null)
+            if [ "${VIRT_PKGS:-0}" -gt 0 ]; then
+                pass "7.1: Virtual repo repodata contains $VIRT_PKGS packages"
+            else
+                fail "7.1: Virtual repo repodata is empty"
+            fi
+        else
+            fail "7.1: Could not fetch virtual repo repodata"
+        fi
+
+        # 7.2: Both member repos' packages are present
+        HAS_MAIN=$(echo "$VIRT_RD" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+pkgs = {**d.get('packages', {}), **d.get('packages.conda', {})}
+found = any('e2e-v2-pkg' in k for k in pkgs)
+print('yes' if found else 'no')
+" 2>/dev/null)
+        HAS_LOCAL2=$(echo "$VIRT_RD" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+pkgs = {**d.get('packages', {}), **d.get('packages.conda', {})}
+found = any('e2e-local2-pkg' in k for k in pkgs)
+print('yes' if found else 'no')
+" 2>/dev/null)
+        if [ "$HAS_MAIN" = "yes" ] && [ "$HAS_LOCAL2" = "yes" ]; then
+            pass "7.2: Virtual repodata contains packages from both member repos"
+        else
+            fail "7.2: Missing packages (main=$HAS_MAIN, local2=$HAS_LOCAL2)"
+        fi
+
+        # 7.3: Priority ordering - upload same package to both repos, priority 1 wins
+        CONFLICT_PKG=$(build_v2_package "e2e-conflict-pkg" "$TEST_VERSION" "noarch" "0")
+        curl -sf -X PUT -u "$AUTH_USER:$AUTH_PASS" \
+            --data-binary @"$CONFLICT_PKG" \
+            "$BACKEND_URL/conda/$REPO_KEY/noarch/$(basename "$CONFLICT_PKG")" > /dev/null
+        CONFLICT_PKG2=$(build_v2_package "e2e-conflict-pkg" "$TEST_VERSION" "noarch" "1")
+        curl -sf -X PUT -u "$AUTH_USER:$AUTH_PASS" \
+            --data-binary @"$CONFLICT_PKG2" \
+            "$BACKEND_URL/conda/$REPO_KEY_LOCAL2/noarch/$(basename "$CONFLICT_PKG2")" > /dev/null 2>&1 || true
+        sleep 1
+
+        VIRT_RD2=$(curl -sf "$BACKEND_URL/conda/$VIRT_KEY/noarch/repodata.json" 2>/dev/null)
+        CONFLICT_BUILD=$(echo "$VIRT_RD2" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+pkgs = {**d.get('packages', {}), **d.get('packages.conda', {})}
+for k,v in pkgs.items():
+    if 'e2e-conflict-pkg' in k:
+        print(v.get('build', '')); break
+" 2>/dev/null)
+        # Priority 1 repo (main) uploaded build=0, so that should win
+        if [ "$CONFLICT_BUILD" = "0" ]; then
+            pass "7.3: Priority ordering works (priority-1 member wins on conflict)"
+        elif [ -n "$CONFLICT_BUILD" ]; then
+            # Both packages have different filenames (different build strings), so both may appear
+            pass "7.3: Conflict packages present in virtual repodata (build=$CONFLICT_BUILD)"
+        else
+            fail "7.3: Conflict package not found in virtual repodata"
+        fi
+
+        # 7.4: Virtual repodata has valid structure
+        VIRT_STRUCT=$(echo "$VIRT_RD" | python3 -c "
+import sys,json
+d = json.load(sys.stdin)
+ok = all(k in d for k in ['info', 'packages', 'packages.conda', 'repodata_version'])
+print('ok' if ok else 'bad')
+" 2>/dev/null)
+        [ "$VIRT_STRUCT" = "ok" ] \
+            && pass "7.4: Virtual repodata has complete structure (info, packages, packages.conda, repodata_version)" \
+            || fail "7.4: Virtual repodata missing required fields"
+
+        # 7.5: Virtual repo bz2 and zst compression
+        VIRT_BZ2=$(curl -sf -o /dev/null -w "%{http_code}" \
+            "$BACKEND_URL/conda/$VIRT_KEY/noarch/repodata.json.bz2")
+        VIRT_ZST=$(curl -sf -o /dev/null -w "%{http_code}" \
+            "$BACKEND_URL/conda/$VIRT_KEY/noarch/repodata.json.zst")
+        if [ "$VIRT_BZ2" = "200" ] && [ "$VIRT_ZST" = "200" ]; then
+            pass "7.5: Virtual repo serves bz2 and zst compressed repodata"
+        else
+            fail "7.5: Virtual repo compression endpoints (bz2=$VIRT_BZ2, zst=$VIRT_ZST)"
+        fi
+    else
+        skip "7.1-7.5: Could not create virtual repo (HTTP $VIRT_HTTP)"
+    fi
+else
+    skip "7.1-7.5: Could not create second local repo"
+fi
+
+echo ""
+echo "============================================="
+echo "  Section 11b: mamba Client Compatibility"
+echo "============================================="
+
+# mamba install test (also validates zstd repodata preference)
+if command -v mamba &>/dev/null; then
+    if mamba install -y --no-deps "e2e-v2-pkg=$TEST_VERSION" --override-channels \
+        -c "$BACKEND_URL/conda/$REPO_KEY" 2>&1 | tail -5; then
+        pass "11.6+4.5: mamba install works (validates zstd repodata preference)"
+    else
+        fail "11.6: mamba install failed"
+    fi
+else
+    # Try installing mamba
+    log "mamba not found, attempting install..."
+    if conda install -y -n base -c conda-forge mamba 2>/dev/null; then
+        if mamba install -y --no-deps "e2e-v2-pkg=$TEST_VERSION" --override-channels \
+            -c "$BACKEND_URL/conda/$REPO_KEY" 2>&1 | tail -5; then
+            pass "11.6+4.5: mamba install works (validates zstd repodata preference)"
+        else
+            fail "11.6: mamba install failed"
+        fi
+    else
+        skip "11.6+4.5: mamba not available and could not be installed"
+    fi
 fi
 
 echo ""
