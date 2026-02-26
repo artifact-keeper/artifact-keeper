@@ -171,7 +171,17 @@ fn validate_cep26_build(build: &str) -> Result<(), String> {
 /// Validate a conda filename per CEP-26.
 ///
 /// Format: `<name>-<version>-<build>.<ext>`, max 211 characters.
+/// Also rejects path traversal sequences and directory separators.
 fn validate_cep26_filename(filename: &str) -> Result<(), String> {
+    if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+        return Err(format!(
+            "filename '{}' contains path traversal sequences",
+            filename
+        ));
+    }
+    if filename.contains('\0') {
+        return Err("filename contains null bytes".to_string());
+    }
     if filename.len() > CEP26_MAX_FILENAME_LEN {
         return Err(format!(
             "filename '{}' exceeds max length of {} characters (got {})",
@@ -375,13 +385,12 @@ const KNOWN_SUBDIRS: &[&str] = &[
 // HTTP Caching helpers
 // ---------------------------------------------------------------------------
 
-/// Compute an ETag from response body bytes (weak ETag using SHA-256 prefix).
+/// Compute an ETag from response body bytes using the full SHA-256 hash.
 fn compute_etag(body: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(body);
     let hash = format!("{:x}", hasher.finalize());
-    // Use first 16 hex chars (64 bits) for a compact but collision-resistant ETag
-    format!("W/\"{}\"", &hash[..16])
+    format!("\"{}\"", hash)
 }
 
 /// Check if the request has a matching ETag (If-None-Match) and return 304 if so.
@@ -849,9 +858,19 @@ pub fn token_router() -> Router<SharedState> {
         )
         .route(
             "/:token/:repo_key/:subdir/:filename/attestation",
-            get(get_attestation).put(put_attestation),
+            get(get_attestation_with_token).put(put_attestation_with_token),
         )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        // Token URLs embed secrets in the path. Prevent leakage via Referer
+        // headers and ensure proxies don't cache token-authenticated responses.
+        .layer(axum::middleware::map_response(
+            |mut response: Response| async move {
+                let headers = response.headers_mut();
+                headers.insert("Referrer-Policy", "no-referrer".parse().unwrap());
+                headers.insert("Cache-Control", "private, no-store".parse().unwrap());
+                response
+            },
+        ))
 }
 
 // ---------------------------------------------------------------------------
@@ -944,11 +963,8 @@ async fn resolve_conda_repo(db: &sqlx::PgPool, repo_key: &str) -> Result<RepoInf
     .fetch_optional(db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Database error resolving conda repo '{}': {}", repo_key, e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
 
@@ -1006,11 +1022,8 @@ async fn list_conda_artifacts(
     .fetch_all(db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Database error listing conda artifacts: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     Ok(rows
@@ -1057,6 +1070,47 @@ fn is_conda_package(filename: &str) -> bool {
     filename.ends_with(".conda") || filename.ends_with(".tar.bz2")
 }
 
+/// Extract and sanitize the upload filename from Content-Disposition or
+/// X-Package-Filename headers. Strips trailing RFC 6266 parameters after `;`
+/// and rejects path traversal sequences.
+#[allow(clippy::result_large_err)]
+fn extract_upload_filename(headers: &HeaderMap) -> Result<String, Response> {
+    let raw = headers
+        .get("Content-Disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split("filename=").nth(1).map(|f| {
+                // Strip trailing parameters (e.g., "; other=value")
+                let f = f.split(';').next().unwrap_or(f);
+                f.trim_matches('"').trim_matches('\'').trim().to_string()
+            })
+        })
+        .or_else(|| {
+            headers
+                .get("X-Package-Filename")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Missing filename: provide Content-Disposition or X-Package-Filename header",
+            )
+                .into_response()
+        })?;
+
+    // Reject path traversal and null bytes
+    if raw.contains("..") || raw.contains('/') || raw.contains('\\') || raw.contains('\0') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Filename contains path traversal sequences",
+        )
+            .into_response());
+    }
+
+    Ok(raw)
+}
+
 // ---------------------------------------------------------------------------
 // GET /conda/{repo_key}/channeldata.json
 // ---------------------------------------------------------------------------
@@ -1084,11 +1138,8 @@ async fn channeldata_json(
         .fetch_all(&state.db)
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
-            )
-                .into_response()
+            tracing::error!("Database error querying channeldata: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         })?;
 
         rows.into_iter()
@@ -1450,11 +1501,8 @@ async fn repodata_json_zst(
     let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
     let json_bytes = serde_json::to_vec(&repodata).unwrap();
     let compressed = zstd_compress(&json_bytes).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("zstd compression error: {}", e),
-        )
-            .into_response()
+        tracing::error!("zstd compression error for repodata: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     Ok(cacheable_response(compressed, "application/zstd", &headers))
@@ -1656,18 +1704,12 @@ async fn sharded_repodata_index(
     for (pkg_name, artifacts) in &by_name {
         let shard = build_shard(&subdir, artifacts);
         let shard_msgpack = rmp_serde::to_vec(&shard).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("msgpack error: {}", e),
-            )
-                .into_response()
+            tracing::error!("msgpack serialization error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         })?;
         let shard_compressed = zstd_compress(&shard_msgpack).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("zstd error: {}", e),
-            )
-                .into_response()
+            tracing::error!("zstd compression error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         })?;
 
         let mut hasher = Sha256::new();
@@ -1682,18 +1724,12 @@ async fn sharded_repodata_index(
     let index = build_sharded_index(&subdir, &base_url, &shards_map);
 
     let index_msgpack = rmp_serde::to_vec(&index).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("msgpack error: {}", e),
-        )
-            .into_response()
+        tracing::error!("msgpack serialization error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
     let compressed = zstd_compress(&index_msgpack).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("zstd error: {}", e),
-        )
-            .into_response()
+        tracing::error!("zstd compression error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     Ok(Response::builder()
@@ -1746,18 +1782,12 @@ async fn sharded_repodata_shard(
     for artifacts in by_name.values() {
         let shard = build_shard(&subdir, artifacts);
         let shard_msgpack = rmp_serde::to_vec(&shard).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("msgpack error: {}", e),
-            )
-                .into_response()
+            tracing::error!("msgpack serialization error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         })?;
         let shard_compressed = zstd_compress(&shard_msgpack).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("zstd error: {}", e),
-            )
-                .into_response()
+            tracing::error!("zstd compression error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         })?;
 
         let mut hasher = Sha256::new();
@@ -1945,11 +1975,8 @@ async fn list_removed_artifacts(
     .fetch_all(db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Database error listing removed artifacts: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     let prefix = format!("{}/", subdir);
@@ -1982,6 +2009,10 @@ async fn build_repodata(
     subdir: &str,
     latest_only: bool,
 ) -> Result<serde_json::Value, Response> {
+    // Validate subdir on read paths (defense-in-depth)
+    validate_cep26_subdir(subdir)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid subdir: {}", e)).into_response())?;
+
     let all_artifacts = list_conda_artifacts(db, repo_id).await?;
     let subdir_artifacts = artifacts_for_subdir(&all_artifacts, subdir);
 
@@ -2183,11 +2214,8 @@ async fn download_package(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Database error looking up package: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
 
@@ -2275,11 +2303,8 @@ async fn download_package(
     // Read from storage
     let storage = state.storage_for_repo(&repo.storage_path);
     let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Storage error reading conda package: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     // Record download
@@ -2357,27 +2382,7 @@ async fn upload_post(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "noarch".to_string());
 
-    let filename = headers
-        .get("Content-Disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split("filename=")
-                .nth(1)
-                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-        })
-        .or_else(|| {
-            headers
-                .get("X-Package-Filename")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Missing filename: provide Content-Disposition or X-Package-Filename header",
-            )
-                .into_response()
-        })?;
+    let filename = extract_upload_filename(&headers)?;
 
     if !is_conda_package(&filename) {
         return Err((
@@ -2444,27 +2449,7 @@ async fn upload_post_with_token(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "noarch".to_string());
 
-    let filename = headers
-        .get("Content-Disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split("filename=")
-                .nth(1)
-                .map(|f| f.trim_matches('"').trim_matches('\'').to_string())
-        })
-        .or_else(|| {
-            headers
-                .get("X-Package-Filename")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "Missing filename: provide Content-Disposition or X-Package-Filename header",
-            )
-                .into_response()
-        })?;
+    let filename = extract_upload_filename(&headers)?;
 
     if !is_conda_package(&filename) {
         return Err((
@@ -2565,6 +2550,32 @@ fn extract_conda_metadata(content: &[u8], filename: &str) -> Option<serde_json::
     }
 }
 
+/// Maximum decompressed size for metadata extraction (100 MB).
+/// Protects against decompression bombs in crafted packages.
+const MAX_DECOMPRESSED_METADATA_SIZE: usize = 100 * 1024 * 1024;
+
+/// Maximum number of tar entries to iterate when searching for metadata.
+const MAX_TAR_ENTRIES: usize = 10_000;
+
+/// Decompress zstd with a size limit to prevent decompression bombs.
+fn limited_decode_zstd(compressed: &[u8], max_size: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::new(std::io::Cursor::new(compressed)).ok()?;
+    let mut output = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = decoder.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        output.extend_from_slice(&buf[..n]);
+        if output.len() > max_size {
+            return None; // Exceeds limit, likely a bomb
+        }
+    }
+    Some(output)
+}
+
 /// Extract metadata from .conda (v2) ZIP package.
 ///
 /// The .conda format is a ZIP archive containing:
@@ -2599,11 +2610,16 @@ fn extract_conda_v2_metadata(content: &[u8]) -> Option<serde_json::Value> {
             std::io::Read::read_to_end(&mut file, &mut compressed).ok()?;
             drop(file);
 
-            // Decompress the zstd tar
-            let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed)).ok()?;
+            // Decompress the zstd tar with size limit
+            let decompressed = limited_decode_zstd(&compressed, MAX_DECOMPRESSED_METADATA_SIZE)?;
             let mut tar = tar::Archive::new(std::io::Cursor::new(&decompressed));
 
+            let mut entries_checked = 0;
             for entry in tar.entries().ok()? {
+                entries_checked += 1;
+                if entries_checked > MAX_TAR_ENTRIES {
+                    break;
+                }
                 let mut entry = entry.ok()?;
                 let path = entry.path().ok()?.to_string_lossy().to_string();
                 if path == "info/index.json" || path.ends_with("/index.json") {
@@ -2625,7 +2641,12 @@ fn extract_conda_v1_metadata(content: &[u8]) -> Option<serde_json::Value> {
     let decoder = bzip2::read::BzDecoder::new(std::io::Cursor::new(content));
     let mut archive = tar::Archive::new(decoder);
 
+    let mut entries_checked = 0;
     for entry in archive.entries().ok()? {
+        entries_checked += 1;
+        if entries_checked > MAX_TAR_ENTRIES {
+            break;
+        }
         let mut entry = entry.ok()?;
         let path = entry.path().ok()?.to_string_lossy().to_string();
         if path == "info/index.json" {
@@ -2642,23 +2663,28 @@ fn extract_conda_v1_metadata(content: &[u8]) -> Option<serde_json::Value> {
 // CEP-27 Attestation endpoints
 // ---------------------------------------------------------------------------
 
-/// Store or update a CEP-27 publish attestation for a package.
-///
-/// PUT /conda/{repo_key}/{subdir}/{filename}/attestation
-///
-/// Accepts an in-toto Statement v1 JSON body. Validates the structure,
-/// verifies the subject matches the target package, and stores the
-/// attestation in the artifact's metadata.
-async fn put_attestation(
-    State(state): State<SharedState>,
-    headers: HeaderMap,
-    Path((repo_key, subdir, filename)): Path<(String, String, String)>,
-    body: Bytes,
-) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+/// Maximum body size for attestation uploads (1 MB). Attestations are small
+/// JSON documents; anything larger is suspicious.
+const ATTESTATION_MAX_BODY_SIZE: usize = 1024 * 1024;
 
-    // Require authentication
-    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+/// Core logic for storing a CEP-27 attestation, shared by both main and
+/// token-authenticated handlers.
+async fn store_attestation(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    subdir: &str,
+    filename: &str,
+    body: &Bytes,
+) -> Result<Response, Response> {
+    // Enforce attestation-specific body size limit (H3)
+    if body.len() > ATTESTATION_MAX_BODY_SIZE {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Attestation body exceeds 1 MB limit",
+        )
+            .into_response());
+    }
 
     // Look up the target package
     let artifact_path = format!("{}/{}", subdir, filename);
@@ -2669,16 +2695,19 @@ async fn put_attestation(
     .bind(&artifact_path)
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)).into_response())?
+    .map_err(|e| {
+        tracing::error!("Database error looking up artifact for attestation: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
 
     let (artifact_id, package_sha256) = artifact;
 
     // Parse and validate the attestation
-    let attestation: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response())?;
+    let attestation: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid JSON body").into_response())?;
 
-    validate_cep27_attestation(&attestation, &filename, &package_sha256).map_err(|e| {
+    validate_cep27_attestation(&attestation, filename, &package_sha256).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("CEP-27 attestation validation failed: {}", e),
@@ -2687,8 +2716,6 @@ async fn put_attestation(
     })?;
 
     // Store the attestation in artifact metadata
-    // We upsert into artifact_metadata, merging the attestation into the
-    // existing metadata JSON object under the "attestation" key.
     sqlx::query(
         r#"
         INSERT INTO artifact_metadata (artifact_id, metadata)
@@ -2702,11 +2729,8 @@ async fn put_attestation(
     .execute(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to store attestation: {}", e),
-        )
-            .into_response()
+        tracing::error!("Failed to store attestation: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     info!(
@@ -2724,17 +2748,13 @@ async fn put_attestation(
         .unwrap())
 }
 
-/// Retrieve the CEP-27 publish attestation for a package.
-///
-/// GET /conda/{repo_key}/{subdir}/{filename}/attestation
-///
-/// Returns the in-toto Statement v1 JSON if an attestation exists.
-async fn get_attestation(
-    State(state): State<SharedState>,
-    Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+/// Core logic for retrieving a CEP-27 attestation.
+async fn fetch_attestation(
+    state: &SharedState,
+    repo: &RepoInfo,
+    subdir: &str,
+    filename: &str,
 ) -> Result<Response, Response> {
-    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-
     let artifact_path = format!("{}/{}", subdir, filename);
     let row: Option<(serde_json::Value,)> = sqlx::query_as(
         r#"
@@ -2750,11 +2770,8 @@ async fn get_attestation(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Database error fetching attestation: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     let metadata =
@@ -2768,13 +2785,74 @@ async fn get_attestation(
             .into_response()
     })?;
 
-    let body = serde_json::to_string_pretty(attestation).unwrap();
+    let body = serde_json::to_string_pretty(attestation).map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+    })?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .header(CONTENT_LENGTH, body.len().to_string())
         .body(Body::from(body))
         .unwrap())
+}
+
+/// PUT /conda/{repo_key}/{subdir}/{filename}/attestation
+async fn put_attestation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
+}
+
+/// GET /conda/{repo_key}/{subdir}/{filename}/attestation
+///
+/// Requires authentication to match the repository's read-auth posture.
+async fn get_attestation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    // Attestations follow the repo's auth requirements. If the repo is
+    // public the authenticate call will succeed with anonymous access
+    // via the optional auth middleware on the outer router.
+    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    fetch_attestation(&state, &repo, &subdir, &filename).await
+}
+
+/// PUT /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
+async fn put_attestation_with_token(
+    State(state): State<SharedState>,
+    Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let _user_id = if extract_basic_credentials(&headers).is_some() {
+        authenticate(&state.db, &state.config, &headers).await?
+    } else {
+        authenticate_with_token(&state.db, &state.config, &token).await?
+    };
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    store_attestation(&state, &repo, &repo_key, &subdir, &filename, &body).await
+}
+
+/// GET /conda/t/{token}/{repo_key}/{subdir}/{filename}/attestation
+async fn get_attestation_with_token(
+    State(state): State<SharedState>,
+    Path((token, repo_key, subdir, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let _user_id = if extract_basic_credentials(&headers).is_some() {
+        authenticate(&state.db, &state.config, &headers).await?
+    } else {
+        authenticate_with_token(&state.db, &state.config, &token).await?
+    };
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    fetch_attestation(&state, &repo, &subdir, &filename).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2845,11 +2923,8 @@ async fn store_conda_package(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Database error checking for duplicate artifact: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     if existing.is_some() {
@@ -2863,11 +2938,8 @@ async fn store_conda_package(
         .put(&storage_key, content.clone())
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
+            tracing::error!("Storage error writing conda package: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         })?;
 
     let size_bytes = content.len() as i64;
@@ -2900,11 +2972,8 @@ async fn store_conda_package(
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
+        tracing::error!("Database error inserting artifact: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
 
     // Extract metadata from package contents
@@ -5571,16 +5640,16 @@ mod tests {
     fn test_compute_etag_format() {
         let etag = compute_etag(b"test");
         assert!(
-            etag.starts_with("W/\""),
-            "ETag should be a weak ETag: {}",
+            etag.starts_with('"'),
+            "ETag should start with quote: {}",
             etag
         );
         assert!(etag.ends_with('"'), "ETag should end with quote: {}", etag);
-        // W/"<16 hex chars>"
+        // "<64 hex chars>" (full SHA-256)
         assert_eq!(
             etag.len(),
-            3 + 16 + 1,
-            "ETag should be W/ + quote + 16 hex + quote"
+            1 + 64 + 1,
+            "ETag should be quote + 64 hex + quote"
         );
     }
 
@@ -7721,5 +7790,112 @@ mod tests {
         });
         let err = validate_cep27_attestation(&att, "", "").unwrap_err();
         assert!(err.contains("exactly 1"), "error: {}", err);
+    }
+
+    // -----------------------------------------------------------------------
+    // Security hardening tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filename_path_traversal_rejected() {
+        // Path traversal sequences must be rejected
+        assert!(validate_cep26_filename("../../etc/passwd").is_err());
+        assert!(validate_cep26_filename("foo/../bar.conda").is_err());
+        assert!(validate_cep26_filename("foo/bar.conda").is_err());
+        assert!(validate_cep26_filename("foo\\bar.conda").is_err());
+        assert!(validate_cep26_filename("foo\0bar.conda").is_err());
+        // Normal filenames pass
+        assert!(validate_cep26_filename("numpy-1.26.4-py312_0.conda").is_ok());
+        assert!(validate_cep26_filename("pkg-1.0-0.tar.bz2").is_ok());
+    }
+
+    #[test]
+    fn test_extract_upload_filename_sanitizes_content_disposition() {
+        use axum::http::HeaderMap;
+
+        // Normal Content-Disposition
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Disposition",
+            "attachment; filename=\"numpy-1.0-0.conda\""
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_upload_filename(&headers).unwrap(),
+            "numpy-1.0-0.conda"
+        );
+
+        // Content-Disposition with trailing params (M4 fix)
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Disposition",
+            "attachment; filename=\"numpy-1.0-0.conda\"; other=value"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_upload_filename(&headers).unwrap(),
+            "numpy-1.0-0.conda"
+        );
+
+        // Path traversal in filename
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Disposition",
+            "attachment; filename=\"../../evil.conda\"".parse().unwrap(),
+        );
+        assert!(extract_upload_filename(&headers).is_err());
+
+        // X-Package-Filename fallback
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Package-Filename", "numpy-1.0-0.conda".parse().unwrap());
+        assert_eq!(
+            extract_upload_filename(&headers).unwrap(),
+            "numpy-1.0-0.conda"
+        );
+
+        // Missing both headers
+        let headers = HeaderMap::new();
+        assert!(extract_upload_filename(&headers).is_err());
+    }
+
+    #[test]
+    fn test_etag_uses_full_sha256() {
+        let etag = compute_etag(b"test data");
+        // Full SHA-256 is 64 hex chars, wrapped in quotes: "xxxx...xxxx"
+        assert_eq!(etag.len(), 66);
+        assert!(etag.starts_with('"'));
+        assert!(etag.ends_with('"'));
+        // Must not be a weak ETag
+        assert!(!etag.starts_with("W/"));
+
+        // Different content produces different ETags
+        let etag2 = compute_etag(b"different data");
+        assert_ne!(etag, etag2);
+    }
+
+    #[test]
+    fn test_limited_decode_zstd_rejects_oversized() {
+        // Create a large decompressible payload
+        let data = vec![0u8; 1024 * 1024]; // 1 MB of zeros
+        let compressed = zstd::encode_all(std::io::Cursor::new(&data), 1).unwrap();
+
+        // Should succeed with generous limit
+        assert!(limited_decode_zstd(&compressed, 2 * 1024 * 1024).is_some());
+
+        // Should fail with tight limit
+        assert!(limited_decode_zstd(&compressed, 512).is_none());
+    }
+
+    #[test]
+    fn test_subdir_validated_in_build_repodata_path() {
+        // validate_cep26_subdir rejects traversal-like patterns
+        assert!(validate_cep26_subdir("../etc").is_err());
+        assert!(validate_cep26_subdir("foo/bar").is_err());
+        assert!(validate_cep26_subdir("LINUX-64").is_err());
+        // Valid subdirs pass
+        assert!(validate_cep26_subdir("linux-64").is_ok());
+        assert!(validate_cep26_subdir("noarch").is_ok());
     }
 }
