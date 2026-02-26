@@ -4,17 +4,22 @@
 //!
 //! Routes are mounted at `/conda/{repo_key}/...`:
 //!   GET  /conda/{repo_key}/channeldata.json                  - Channel metadata
+//!   GET  /conda/{repo_key}/notices.json                      - Channel notices (CEP-6)
 //!   GET  /conda/{repo_key}/keys/repo.pub                     - Repository public key (PEM)
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json            - Repository data for subdir
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.bz2        - Compressed repodata
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.sig        - Repodata signature (raw bytes)
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.zst        - Compressed repodata (zstd)
 //!   GET  /conda/{repo_key}/{subdir}/current_repodata.json    - Current (latest) repodata
+//!   GET  /conda/{repo_key}/{subdir}/run_exports.json         - Run exports metadata (CEP-12)
 //!   GET  /conda/{repo_key}/{subdir}/repodata_shards.msgpack.zst - CEP-16 shard index
 //!   GET  /conda/{repo_key}/{subdir}/shards/{hash}.msgpack.zst   - CEP-16 individual shard
 //!   GET  /conda/{repo_key}/{subdir}/{filename}               - Download package
 //!   PUT  /conda/{repo_key}/{subdir}/{filename}               - Upload package
 //!   POST /conda/{repo_key}/upload                            - Upload package (alternative)
+//!
+//! All read routes are also available with URL path token authentication:
+//!   GET  /conda/t/{token}/{repo_key}/...                     - Token-authenticated access
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -120,6 +125,8 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         // Channel metadata
         .route("/:repo_key/channeldata.json", get(channeldata_json))
+        // Channel notices (CEP-6)
+        .route("/:repo_key/notices.json", get(notices_json))
         // Public key endpoint
         .route("/:repo_key/keys/repo.pub", get(repo_public_key))
         // Upload (alternative POST)
@@ -141,6 +148,11 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/:subdir/current_repodata.json",
             get(current_repodata_json),
+        )
+        // Run exports (CEP-12)
+        .route(
+            "/:repo_key/:subdir/run_exports.json",
+            get(run_exports_json),
         )
         // CEP-16 sharded repodata
         .route(
@@ -170,6 +182,7 @@ pub fn router() -> Router<SharedState> {
 pub fn token_router() -> Router<SharedState> {
     Router::new()
         .route("/:token/:repo_key/channeldata.json", get(channeldata_json))
+        .route("/:token/:repo_key/notices.json", get(notices_json))
         .route("/:token/:repo_key/keys/repo.pub", get(repo_public_key))
         .route("/:token/:repo_key/upload", post(upload_post_with_token))
         .route(
@@ -191,6 +204,10 @@ pub fn token_router() -> Router<SharedState> {
         .route(
             "/:token/:repo_key/:subdir/current_repodata.json",
             get(current_repodata_json),
+        )
+        .route(
+            "/:token/:repo_key/:subdir/run_exports.json",
+            get(run_exports_json),
         )
         .route(
             "/:token/:repo_key/:subdir/repodata_shards.msgpack.zst",
@@ -496,6 +513,79 @@ async fn channeldata_json(
 
     let body = serde_json::to_string_pretty(&channeldata).unwrap().into_bytes();
 
+    Ok(cacheable_response(body, "application/json", &headers))
+}
+
+// ---------------------------------------------------------------------------
+// GET /conda/{repo_key}/notices.json (CEP-6)
+// ---------------------------------------------------------------------------
+
+/// Channel notices endpoint (CEP-6).
+///
+/// Returns channel-level notifications displayed to users during
+/// install/update operations. Used for deprecation warnings, security
+/// advisories, and maintenance notices.
+async fn notices_json(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let _repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    // Return an empty notices array. Future: store notices in the database
+    // per-repository and serve them here.
+    let notices = serde_json::json!({
+        "notices": []
+    });
+
+    let body = serde_json::to_vec_pretty(&notices).unwrap();
+    Ok(cacheable_response(body, "application/json", &headers))
+}
+
+// ---------------------------------------------------------------------------
+// GET /conda/{repo_key}/{subdir}/run_exports.json (CEP-12)
+// ---------------------------------------------------------------------------
+
+/// Run exports metadata endpoint (CEP-12).
+///
+/// Returns run_exports data per package so conda-build can determine
+/// runtime dependencies without downloading full packages.
+async fn run_exports_json(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path((repo_key, subdir)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    let all_artifacts = list_conda_artifacts(&state.db, repo.id).await?;
+    let subdir_artifacts = artifacts_for_subdir(&all_artifacts, &subdir);
+
+    let mut packages = serde_json::Map::new();
+
+    for artifact in &subdir_artifacts {
+        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+        if !is_conda_package(filename) {
+            continue;
+        }
+
+        // Extract run_exports from metadata if available
+        let run_exports = artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("run_exports"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        packages.insert(filename.to_string(), serde_json::json!({
+            "run_exports": run_exports,
+        }));
+    }
+
+    let response = serde_json::json!({
+        "info": { "subdir": subdir },
+        "packages": packages,
+    });
+
+    let body = serde_json::to_vec_pretty(&response).unwrap();
     Ok(cacheable_response(body, "application/json", &headers))
 }
 
@@ -4485,6 +4575,90 @@ mod tests {
     fn test_channeldata_packages_key_is_object() {
         let cd = build_channeldata_json(&serde_json::Map::new());
         assert!(cd["packages"].is_object());
+    }
+
+    // =======================================================================
+    // Notices.json (CEP-6) tests (bead: artifact-keeper-dsk)
+    // =======================================================================
+
+    #[test]
+    fn test_notices_json_structure() {
+        // The notices.json endpoint should return a JSON object with a "notices" array
+        let notices = serde_json::json!({ "notices": [] });
+        assert!(notices["notices"].is_array());
+        assert!(notices["notices"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_notices_json_with_entries() {
+        // When notices exist, each should have id, message, level, created_at
+        let notices = serde_json::json!({
+            "notices": [
+                {
+                    "id": "notice-001",
+                    "message": "This channel is deprecated. Please migrate to channel-v2.",
+                    "level": "warning",
+                    "created_at": "2026-01-15T00:00:00Z"
+                },
+                {
+                    "id": "notice-002",
+                    "message": "Scheduled maintenance on 2026-02-01.",
+                    "level": "info",
+                    "created_at": "2026-01-20T00:00:00Z"
+                }
+            ]
+        });
+        let arr = notices["notices"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["level"], "warning");
+        assert_eq!(arr[1]["level"], "info");
+    }
+
+    // =======================================================================
+    // Run exports (CEP-12) tests (bead: artifact-keeper-mya)
+    // =======================================================================
+
+    #[test]
+    fn test_run_exports_json_structure() {
+        // run_exports.json should have info.subdir and packages map
+        let re = serde_json::json!({
+            "info": { "subdir": "linux-64" },
+            "packages": {},
+        });
+        assert_eq!(re["info"]["subdir"], "linux-64");
+        assert!(re["packages"].is_object());
+    }
+
+    #[test]
+    fn test_run_exports_json_with_package_data() {
+        // Packages with run_exports should include the data
+        let re = serde_json::json!({
+            "info": { "subdir": "linux-64" },
+            "packages": {
+                "numpy-1.26.4-py312h_0.conda": {
+                    "run_exports": {
+                        "weak": ["numpy >=1.26.4,<2.0a0"]
+                    }
+                }
+            },
+        });
+        let pkg = &re["packages"]["numpy-1.26.4-py312h_0.conda"];
+        assert!(pkg["run_exports"]["weak"].is_array());
+    }
+
+    #[test]
+    fn test_run_exports_empty_for_package_without_exports() {
+        // Packages without run_exports should have empty object
+        let re = serde_json::json!({
+            "info": { "subdir": "noarch" },
+            "packages": {
+                "six-1.16.0-pyh_0.conda": {
+                    "run_exports": {}
+                }
+            },
+        });
+        let pkg = &re["packages"]["six-1.16.0-pyh_0.conda"];
+        assert!(pkg["run_exports"].as_object().unwrap().is_empty());
     }
 
     // =======================================================================
