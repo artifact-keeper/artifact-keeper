@@ -10,6 +10,7 @@
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.bz2        - Compressed repodata
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.sig        - Repodata signature (raw bytes)
 //!   GET  /conda/{repo_key}/{subdir}/repodata.json.zst        - Compressed repodata (zstd)
+//!   GET  /conda/{repo_key}/{subdir}/repodata.json.jlap       - JLAP incremental updates
 //!   GET  /conda/{repo_key}/{subdir}/current_repodata.json    - Current (latest) repodata
 //!   GET  /conda/{repo_key}/{subdir}/run_exports.json         - Run exports metadata (CEP-12)
 //!   GET  /conda/{repo_key}/{subdir}/patch_instructions.json  - Repodata patch instructions
@@ -155,6 +156,269 @@ fn cacheable_response(
 }
 
 // ---------------------------------------------------------------------------
+// JLAP (JSON Lines And Patches) - incremental repodata updates
+// ---------------------------------------------------------------------------
+//
+// JLAP is a conda protocol for incremental repodata updates. Instead of
+// downloading the full repodata.json on every solve, clients fetch
+// repodata.json.jlap which contains a series of JSON patches.
+//
+// File format:
+//   Line 0:     IV (64 hex chars, initialization vector for checksum chain)
+//   Lines 1..N: Patch lines (compact JSON: {from, patch, to})
+//   Line N+1:   Metadata line (compact JSON: {latest, url})
+//   Line N+2:   Trailing checksum (64 hex chars)
+//
+// The checksum chain uses BLAKE2b-256 in keyed mode where each line's
+// checksum depends on the previous line's checksum.
+
+/// JLAP patch step limit. If a diff produces more operations than this,
+/// skip the patch (clients will fall back to full download).
+#[allow(dead_code)]
+const JLAP_PATCH_STEPS_LIMIT: usize = 8192;
+
+/// Compute BLAKE2b-256 keyed hash (32-byte digest).
+///
+/// Uses BLAKE2b in MAC mode with a 32-byte key as specified by the JLAP
+/// checksum chain protocol.
+fn blake2_256_keyed(data: &[u8], key: &[u8; 32]) -> [u8; 32] {
+    use blake2::Blake2bMac;
+    use blake2::digest::consts::U32;
+    use blake2::digest::{FixedOutput, KeyInit};
+
+    let mut hasher = <Blake2bMac<U32>>::new_from_slice(key)
+        .expect("BLAKE2b-256 keyed hash creation should not fail");
+    blake2::digest::Update::update(&mut hasher, data);
+    let result = hasher.finalize_fixed();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Compute BLAKE2b-256 unkeyed hash of data (for hashing repodata.json content).
+fn blake2_256(data: &[u8]) -> [u8; 32] {
+    use blake2::Blake2b;
+    use blake2::digest::consts::U32;
+    use blake2::digest::FixedOutput;
+
+    type Blake2b256 = Blake2b<U32>;
+    let mut hasher = Blake2b256::default();
+    blake2::digest::Update::update(&mut hasher, data);
+    let result = hasher.finalize_fixed();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Generate RFC 6902 JSON Patch operations to transform `old` repodata into `new`.
+///
+/// Only diffs the `packages` and `packages.conda` maps (the volatile parts).
+/// Returns the operations as a JSON array, or None if there are no changes.
+#[allow(dead_code)]
+fn generate_repodata_patch(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Option<Vec<serde_json::Value>> {
+    let mut ops = Vec::new();
+
+    for section in &["packages", "packages.conda"] {
+        let old_map = old.get(section).and_then(|v| v.as_object());
+        let new_map = new.get(section).and_then(|v| v.as_object());
+
+        let old_map = old_map.cloned().unwrap_or_default();
+        let new_map = new_map.cloned().unwrap_or_default();
+
+        // Removed packages
+        for key in old_map.keys() {
+            if !new_map.contains_key(key) {
+                ops.push(serde_json::json!({
+                    "op": "remove",
+                    "path": format!("/{}/{}", section, escape_json_pointer(key)),
+                }));
+            }
+        }
+
+        // Added packages
+        for (key, value) in &new_map {
+            if !old_map.contains_key(key) {
+                ops.push(serde_json::json!({
+                    "op": "add",
+                    "path": format!("/{}/{}", section, escape_json_pointer(key)),
+                    "value": value,
+                }));
+            }
+        }
+
+        // Changed packages
+        for (key, new_value) in &new_map {
+            if let Some(old_value) = old_map.get(key) {
+                if old_value != new_value {
+                    ops.push(serde_json::json!({
+                        "op": "replace",
+                        "path": format!("/{}/{}", section, escape_json_pointer(key)),
+                        "value": new_value,
+                    }));
+                }
+            }
+        }
+    }
+
+    // Also diff the "removed" array
+    let old_removed = old.get("removed");
+    let new_removed = new.get("removed");
+    if old_removed != new_removed {
+        if let Some(nr) = new_removed {
+            ops.push(serde_json::json!({
+                "op": "replace",
+                "path": "/removed",
+                "value": nr,
+            }));
+        }
+    }
+
+    if ops.is_empty() {
+        None
+    } else if ops.len() > JLAP_PATCH_STEPS_LIMIT {
+        tracing::debug!(
+            ops = ops.len(),
+            limit = JLAP_PATCH_STEPS_LIMIT,
+            "JLAP patch too large, skipping"
+        );
+        None
+    } else {
+        Some(ops)
+    }
+}
+
+/// Escape a JSON Pointer token per RFC 6901 (~ -> ~0, / -> ~1).
+#[allow(dead_code)]
+fn escape_json_pointer(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
+/// Build a complete JLAP file from a series of patch entries.
+///
+/// Each entry is (from_hash, patch_ops, to_hash). The function constructs
+/// the IV line, patch lines, metadata line, and trailing checksum.
+fn build_jlap_file(
+    patches: &[([u8; 32], Vec<serde_json::Value>, [u8; 32])],
+    latest_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut lines: Vec<String> = Vec::new();
+    let iv = [0u8; 32];
+
+    // Line 0: IV (all zeros for a fresh JLAP file)
+    lines.push(hex::encode(iv));
+
+    // Patch lines
+    for (from_hash, ops, to_hash) in patches {
+        let patch_line = serde_json::json!({
+            "from": hex::encode(from_hash),
+            "patch": ops,
+            "to": hex::encode(to_hash),
+        });
+        // Compact JSON, sorted keys
+        lines.push(sorted_compact_json(&patch_line));
+    }
+
+    // Metadata line
+    let metadata = serde_json::json!({
+        "latest": hex::encode(latest_hash),
+        "url": "repodata.json",
+    });
+    lines.push(sorted_compact_json(&metadata));
+
+    // Compute checksum chain to produce trailing checksum
+    let mut checksum = iv;
+    for line in &lines[1..] {
+        checksum = blake2_256_keyed(line.as_bytes(), &checksum);
+    }
+
+    // Trailing checksum line
+    lines.push(hex::encode(checksum));
+
+    // Join with newlines, no trailing newline
+    lines.join("\n").into_bytes()
+}
+
+/// Build a minimal "bootstrap" JLAP file with no patches.
+///
+/// This tells clients the current repodata hash without providing any
+/// incremental patches. Clients will compare their cached hash against
+/// `latest` and fall back to a full download if they differ.
+fn build_bootstrap_jlap(repodata_bytes: &[u8]) -> Vec<u8> {
+    let hash = blake2_256(repodata_bytes);
+    build_jlap_file(&[], &hash)
+}
+
+/// Serialize a JSON value with sorted keys and compact separators.
+///
+/// This matches Python's `json.dumps(obj, sort_keys=True, separators=(",", ":"))`.
+fn sorted_compact_json(value: &serde_json::Value) -> String {
+    // serde_json serializes object keys in insertion order.
+    // We need sorted keys for JLAP spec compliance.
+    fn sort_value(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let sorted: serde_json::Map<String, serde_json::Value> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), sort_value(v)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect();
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(sort_value).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    let sorted = sort_value(value);
+    serde_json::to_string(&sorted).unwrap()
+}
+
+/// Verify a JLAP file's checksum chain integrity.
+///
+/// Returns Ok(()) if the chain is valid, Err with a description if not.
+#[allow(dead_code)]
+fn verify_jlap_chain(content: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(content).map_err(|e| format!("invalid UTF-8: {}", e))?;
+    let lines: Vec<&str> = text.split('\n').collect();
+
+    if lines.len() < 3 {
+        return Err(format!("JLAP file too short: {} lines (need >= 3)", lines.len()));
+    }
+
+    // Line 0 is the IV
+    let iv = hex::decode(lines[0]).map_err(|e| format!("invalid IV hex: {}", e))?;
+    if iv.len() != 32 {
+        return Err(format!("IV must be 32 bytes, got {}", iv.len()));
+    }
+    let mut checksum: [u8; 32] = iv.try_into().unwrap();
+
+    // Compute chain for lines 1..N-1 (all lines except IV and trailing checksum)
+    for line in &lines[1..lines.len() - 1] {
+        checksum = blake2_256_keyed(line.as_bytes(), &checksum);
+    }
+
+    // Verify trailing checksum
+    let expected = hex::encode(checksum);
+    let actual = lines[lines.len() - 1];
+    if expected != actual {
+        return Err(format!(
+            "checksum mismatch: expected {}, got {}",
+            expected, actual
+        ));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -181,6 +445,11 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/:subdir/repodata.json.zst",
             get(repodata_json_zst),
+        )
+        // JLAP incremental repodata updates
+        .route(
+            "/:repo_key/:subdir/repodata.json.jlap",
+            get(repodata_json_jlap),
         )
         .route(
             "/:repo_key/:subdir/current_repodata.json",
@@ -242,6 +511,10 @@ pub fn token_router() -> Router<SharedState> {
         .route(
             "/:token/:repo_key/:subdir/repodata.json.zst",
             get(repodata_json_zst),
+        )
+        .route(
+            "/:token/:repo_key/:subdir/repodata.json.jlap",
+            get(repodata_json_jlap),
         )
         .route(
             "/:token/:repo_key/:subdir/current_repodata.json",
@@ -861,6 +1134,101 @@ async fn repodata_json_zst(
     })?;
 
     Ok(cacheable_response(compressed, "application/zstd", &headers))
+}
+
+// ---------------------------------------------------------------------------
+// GET /conda/{repo_key}/{subdir}/repodata.json.jlap
+// ---------------------------------------------------------------------------
+
+/// Return a JLAP (JSON Lines And Patches) file for incremental repodata updates.
+///
+/// Conda 23.9+ and mamba clients request this endpoint first to check for
+/// incremental updates. The JLAP file contains a BLAKE2b-256 checksum chain
+/// and RFC 6902 JSON patches that transform old repodata into current.
+///
+/// Currently serves a "bootstrap" JLAP that communicates the current repodata
+/// hash without patches. Clients compare against their cached hash and fall
+/// back to a full download when no applicable patches exist.
+///
+/// Supports HTTP Range requests (`Accept-Ranges: bytes`) so clients can
+/// fetch only newly appended lines on subsequent requests.
+async fn repodata_json_jlap(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path((repo_key, subdir)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
+
+    // Serialize repodata identically to how repodata_json serves it
+    let json_bytes = serde_json::to_string_pretty(&repodata).unwrap().into_bytes();
+
+    // Build the JLAP file
+    let jlap_body = build_bootstrap_jlap(&json_bytes);
+
+    let etag = compute_etag(&jlap_body);
+
+    // Check for conditional request
+    if let Some(not_modified) = check_conditional_request(&headers, &etag) {
+        return Ok(not_modified);
+    }
+
+    // Check for Range request
+    if let Some(range_header) = headers.get(axum::http::header::RANGE).and_then(|v| v.to_str().ok()) {
+        if let Some(start) = parse_range_start(range_header, jlap_body.len()) {
+            let end = jlap_body.len() - 1;
+            if start > end {
+                // 416 Range Not Satisfiable
+                return Ok(Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("Content-Range", format!("bytes */{}", jlap_body.len()))
+                    .body(Body::empty())
+                    .unwrap());
+            }
+
+            let slice = &jlap_body[start..=end];
+            return Ok(Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_TYPE, "application/json")
+                .header(CONTENT_LENGTH, slice.len().to_string())
+                .header("Content-Range", format!("bytes {}-{}/{}", start, end, jlap_body.len()))
+                .header("Accept-Ranges", "bytes")
+                .header(ETAG, &etag)
+                .header(CACHE_CONTROL, "public, max-age=60")
+                .body(Body::from(slice.to_vec()))
+                .unwrap());
+        }
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, jlap_body.len().to_string())
+        .header("Accept-Ranges", "bytes")
+        .header(ETAG, &etag)
+        .header(CACHE_CONTROL, "public, max-age=60")
+        .body(Body::from(jlap_body))
+        .unwrap())
+}
+
+/// Parse a `Range: bytes=N-` header and return the start offset.
+fn parse_range_start(range_header: &str, total_len: usize) -> Option<usize> {
+    let range = range_header.strip_prefix("bytes=")?;
+    if let Some(start_str) = range.strip_suffix('-') {
+        let start: usize = start_str.parse().ok()?;
+        if start < total_len {
+            return Some(start);
+        }
+    }
+    // Handle "bytes=N-M" format
+    let parts: Vec<&str> = range.splitn(2, '-').collect();
+    if parts.len() == 2 {
+        let start: usize = parts[0].parse().ok()?;
+        if start < total_len {
+            return Some(start);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5944,5 +6312,395 @@ mod tests {
             compressed.len(),
             json.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // JLAP (JSON Lines And Patches)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_blake2_256_basic() {
+        let hash = blake2_256(b"hello world");
+        // BLAKE2b-256 of "hello world"
+        assert_eq!(hash.len(), 32);
+        let hex = hex::encode(hash);
+        assert_eq!(hex.len(), 64);
+        // Known test vector for BLAKE2b-256("hello world")
+        assert_eq!(
+            hex,
+            "256c83b297114d201b30179f3f0ef0cace9783622da5974326b436178aeef610"
+        );
+    }
+
+    #[test]
+    fn test_blake2_256_keyed_basic() {
+        let key = [0u8; 32];
+        let hash = blake2_256_keyed(b"test data", &key);
+        assert_eq!(hash.len(), 32);
+
+        // Same input with different key should produce different output
+        let key2 = [1u8; 32];
+        let hash2 = blake2_256_keyed(b"test data", &key2);
+        assert_ne!(hash, hash2);
+    }
+
+    #[test]
+    fn test_blake2_256_keyed_deterministic() {
+        let key = [42u8; 32];
+        let hash1 = blake2_256_keyed(b"deterministic input", &key);
+        let hash2 = blake2_256_keyed(b"deterministic input", &key);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_sorted_compact_json() {
+        let value = serde_json::json!({
+            "zebra": 1,
+            "alpha": 2,
+            "middle": {"z": true, "a": false}
+        });
+        let compact = sorted_compact_json(&value);
+        // Keys should be alphabetically sorted, no spaces
+        assert_eq!(compact, r#"{"alpha":2,"middle":{"a":false,"z":true},"zebra":1}"#);
+    }
+
+    #[test]
+    fn test_sorted_compact_json_patch_line() {
+        let patch_line = serde_json::json!({
+            "from": "aaaa",
+            "patch": [{"op": "add", "path": "/packages/foo", "value": {}}],
+            "to": "bbbb",
+        });
+        let compact = sorted_compact_json(&patch_line);
+        assert!(compact.starts_with(r#"{"from":"aaaa","#));
+        assert!(compact.contains(r#""to":"bbbb""#));
+        // No spaces or newlines
+        assert!(!compact.contains(' '));
+        assert!(!compact.contains('\n'));
+    }
+
+    #[test]
+    fn test_escape_json_pointer() {
+        assert_eq!(escape_json_pointer("simple"), "simple");
+        assert_eq!(escape_json_pointer("a/b"), "a~1b");
+        assert_eq!(escape_json_pointer("a~b"), "a~0b");
+        assert_eq!(escape_json_pointer("a~/b"), "a~0~1b");
+    }
+
+    #[test]
+    fn test_build_bootstrap_jlap_structure() {
+        let repodata = b"{}";
+        let jlap = build_bootstrap_jlap(repodata);
+        let text = std::str::from_utf8(&jlap).unwrap();
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        // Bootstrap JLAP: IV + metadata + trailing checksum = 3 lines
+        assert_eq!(lines.len(), 3, "bootstrap JLAP should have exactly 3 lines");
+
+        // Line 0: IV (all zeros)
+        assert_eq!(lines[0], "0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(lines[0].len(), 64);
+
+        // Line 1: metadata with "latest" hash and "url"
+        let metadata: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(metadata["url"], "repodata.json");
+        assert!(metadata["latest"].is_string());
+        assert_eq!(metadata["latest"].as_str().unwrap().len(), 64);
+
+        // Line 2: trailing checksum (64 hex chars)
+        assert_eq!(lines[2].len(), 64);
+
+        // No trailing newline
+        assert!(!text.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_build_bootstrap_jlap_hash_matches_content() {
+        let repodata = serde_json::to_string_pretty(&serde_json::json!({
+            "info": {"subdir": "linux-64"},
+            "packages": {},
+            "packages.conda": {},
+            "repodata_version": 1,
+        }))
+        .unwrap();
+
+        let jlap = build_bootstrap_jlap(repodata.as_bytes());
+        let text = std::str::from_utf8(&jlap).unwrap();
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        let metadata: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let latest_hex = metadata["latest"].as_str().unwrap();
+
+        // Verify the hash matches BLAKE2b-256 of the repodata bytes
+        let expected_hash = hex::encode(blake2_256(repodata.as_bytes()));
+        assert_eq!(latest_hex, expected_hash);
+    }
+
+    #[test]
+    fn test_verify_jlap_chain_valid() {
+        let repodata = b"test repodata content";
+        let jlap = build_bootstrap_jlap(repodata);
+        assert!(verify_jlap_chain(&jlap).is_ok());
+    }
+
+    #[test]
+    fn test_verify_jlap_chain_with_patches() {
+        let from_hash = [0xAAu8; 32];
+        let to_hash = [0xBBu8; 32];
+        let patches = vec![(
+            from_hash,
+            vec![serde_json::json!({"op": "add", "path": "/packages/test", "value": {}})],
+            to_hash,
+        )];
+
+        let jlap = build_jlap_file(&patches, &to_hash);
+        assert!(verify_jlap_chain(&jlap).is_ok());
+    }
+
+    #[test]
+    fn test_verify_jlap_chain_corrupted() {
+        let repodata = b"test";
+        let mut jlap = build_bootstrap_jlap(repodata);
+
+        // Corrupt the trailing checksum
+        let text = std::str::from_utf8(&jlap).unwrap().to_string();
+        let lines: Vec<&str> = text.split('\n').collect();
+        let corrupted = format!(
+            "{}\n{}\n{}",
+            lines[0],
+            lines[1],
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        jlap = corrupted.into_bytes();
+
+        let result = verify_jlap_chain(&jlap);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn test_verify_jlap_chain_too_short() {
+        let result = verify_jlap_chain(b"one\ntwo");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn test_generate_repodata_patch_add_package() {
+        let old = serde_json::json!({
+            "packages": {},
+            "packages.conda": {},
+        });
+        let new = serde_json::json!({
+            "packages": {},
+            "packages.conda": {
+                "numpy-1.26.4-py312_0.conda": {
+                    "name": "numpy",
+                    "version": "1.26.4",
+                }
+            },
+        });
+
+        let ops = generate_repodata_patch(&old, &new).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["op"], "add");
+        assert!(ops[0]["path"].as_str().unwrap().contains("numpy"));
+    }
+
+    #[test]
+    fn test_generate_repodata_patch_remove_package() {
+        let old = serde_json::json!({
+            "packages": {"pkg-1.0.tar.bz2": {"name": "pkg"}},
+            "packages.conda": {},
+        });
+        let new = serde_json::json!({
+            "packages": {},
+            "packages.conda": {},
+        });
+
+        let ops = generate_repodata_patch(&old, &new).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["op"], "remove");
+    }
+
+    #[test]
+    fn test_generate_repodata_patch_replace_package() {
+        let old = serde_json::json!({
+            "packages": {
+                "pkg-1.0.tar.bz2": {"name": "pkg", "version": "1.0"}
+            },
+            "packages.conda": {},
+        });
+        let new = serde_json::json!({
+            "packages": {
+                "pkg-1.0.tar.bz2": {"name": "pkg", "version": "1.0", "depends": ["python"]}
+            },
+            "packages.conda": {},
+        });
+
+        let ops = generate_repodata_patch(&old, &new).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["op"], "replace");
+    }
+
+    #[test]
+    fn test_generate_repodata_patch_no_changes() {
+        let data = serde_json::json!({
+            "packages": {"a": {"name": "a"}},
+            "packages.conda": {},
+        });
+        assert!(generate_repodata_patch(&data, &data).is_none());
+    }
+
+    #[test]
+    fn test_generate_repodata_patch_multiple_operations() {
+        let old = serde_json::json!({
+            "packages": {
+                "a-1.0.tar.bz2": {"name": "a"},
+                "b-1.0.tar.bz2": {"name": "b"},
+            },
+            "packages.conda": {},
+        });
+        let new = serde_json::json!({
+            "packages": {
+                "b-1.0.tar.bz2": {"name": "b", "extra": true},
+                "c-1.0.tar.bz2": {"name": "c"},
+            },
+            "packages.conda": {},
+        });
+
+        let ops = generate_repodata_patch(&old, &new).unwrap();
+        // Remove a, replace b, add c = 3 operations
+        assert_eq!(ops.len(), 3);
+
+        let op_types: Vec<&str> = ops.iter().map(|o| o["op"].as_str().unwrap()).collect();
+        assert!(op_types.contains(&"remove"));
+        assert!(op_types.contains(&"add"));
+        assert!(op_types.contains(&"replace"));
+    }
+
+    #[test]
+    fn test_build_jlap_file_with_real_patch() {
+        let old_repodata = serde_json::json!({
+            "info": {"subdir": "linux-64"},
+            "packages": {},
+            "packages.conda": {},
+            "repodata_version": 1,
+        });
+        let new_repodata = serde_json::json!({
+            "info": {"subdir": "linux-64"},
+            "packages": {},
+            "packages.conda": {
+                "scipy-1.12.0-py312_0.conda": {
+                    "name": "scipy",
+                    "version": "1.12.0",
+                }
+            },
+            "repodata_version": 1,
+        });
+
+        let old_bytes = serde_json::to_string(&old_repodata).unwrap();
+        let new_bytes = serde_json::to_string(&new_repodata).unwrap();
+
+        let from_hash = blake2_256(old_bytes.as_bytes());
+        let to_hash = blake2_256(new_bytes.as_bytes());
+
+        let ops = generate_repodata_patch(&old_repodata, &new_repodata).unwrap();
+        let patches = vec![(from_hash, ops, to_hash)];
+
+        let jlap = build_jlap_file(&patches, &to_hash);
+        let text = std::str::from_utf8(&jlap).unwrap();
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        // IV + 1 patch + metadata + checksum = 4 lines
+        assert_eq!(lines.len(), 4);
+
+        // Verify patch line is valid JSON
+        let patch_line: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(patch_line["from"].as_str().unwrap(), hex::encode(from_hash));
+        assert_eq!(patch_line["to"].as_str().unwrap(), hex::encode(to_hash));
+        assert!(patch_line["patch"].is_array());
+
+        // Verify chain integrity
+        assert!(verify_jlap_chain(&jlap).is_ok());
+    }
+
+    #[test]
+    fn test_jlap_checksum_chain_continuity() {
+        // Build a multi-patch JLAP and verify each link in the chain
+        let h1 = [0x11u8; 32];
+        let h2 = [0x22u8; 32];
+        let h3 = [0x33u8; 32];
+
+        let patches = vec![
+            (h1, vec![serde_json::json!({"op": "add", "path": "/p/a", "value": 1})], h2),
+            (h2, vec![serde_json::json!({"op": "add", "path": "/p/b", "value": 2})], h3),
+        ];
+
+        let jlap = build_jlap_file(&patches, &h3);
+        assert!(verify_jlap_chain(&jlap).is_ok());
+
+        let text = std::str::from_utf8(&jlap).unwrap();
+        let lines: Vec<&str> = text.split('\n').collect();
+        // IV + 2 patches + metadata + checksum = 5 lines
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_range_start_basic() {
+        assert_eq!(parse_range_start("bytes=100-", 1000), Some(100));
+        assert_eq!(parse_range_start("bytes=0-", 1000), Some(0));
+        assert_eq!(parse_range_start("bytes=999-", 1000), Some(999));
+    }
+
+    #[test]
+    fn test_parse_range_start_beyond_length() {
+        assert_eq!(parse_range_start("bytes=1000-", 1000), None);
+        assert_eq!(parse_range_start("bytes=5000-", 100), None);
+    }
+
+    #[test]
+    fn test_parse_range_start_with_end() {
+        assert_eq!(parse_range_start("bytes=100-200", 1000), Some(100));
+    }
+
+    #[test]
+    fn test_parse_range_start_invalid() {
+        assert_eq!(parse_range_start("invalid", 1000), None);
+        assert_eq!(parse_range_start("bytes=abc-", 1000), None);
+    }
+
+    #[test]
+    fn test_jlap_metadata_has_required_fields() {
+        let repodata = b"test content";
+        let jlap = build_bootstrap_jlap(repodata);
+        let text = std::str::from_utf8(&jlap).unwrap();
+        let lines: Vec<&str> = text.split('\n').collect();
+
+        let metadata: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+
+        // Required fields per JLAP spec
+        assert!(metadata.get("latest").is_some(), "metadata must have 'latest' field");
+        assert!(metadata.get("url").is_some(), "metadata must have 'url' field");
+        assert_eq!(metadata["url"], "repodata.json");
+    }
+
+    #[test]
+    fn test_generate_repodata_patch_removed_array_change() {
+        let old = serde_json::json!({
+            "packages": {},
+            "packages.conda": {},
+            "removed": [],
+        });
+        let new = serde_json::json!({
+            "packages": {},
+            "packages.conda": {},
+            "removed": ["old-pkg-1.0.tar.bz2"],
+        });
+
+        let ops = generate_repodata_patch(&old, &new).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["op"], "replace");
+        assert_eq!(ops[0]["path"], "/removed");
     }
 }
