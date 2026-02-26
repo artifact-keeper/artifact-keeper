@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -54,6 +56,61 @@ const KNOWN_SUBDIRS: &[&str] = &[
     "win-64",
     "win-arm64",
 ];
+
+// ---------------------------------------------------------------------------
+// HTTP Caching helpers
+// ---------------------------------------------------------------------------
+
+/// Compute an ETag from response body bytes (weak ETag using SHA-256 prefix).
+fn compute_etag(body: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let hash = format!("{:x}", hasher.finalize());
+    // Use first 16 hex chars (64 bits) for a compact but collision-resistant ETag
+    format!("W/\"{}\"", &hash[..16])
+}
+
+/// Check if the request has a matching ETag (If-None-Match) and return 304 if so.
+/// Returns Some(304 response) if the client's cached version matches, None otherwise.
+fn check_conditional_request(headers: &HeaderMap, etag: &str) -> Option<Response> {
+    if let Some(if_none_match) = headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+        // Handle comma-separated ETags and wildcard
+        if if_none_match == "*" || if_none_match.split(',').any(|t| t.trim() == etag) {
+            return Some(
+                Response::builder()
+                    .status(StatusCode::NOT_MODIFIED)
+                    .header(ETAG, etag)
+                    .header(CACHE_CONTROL, "public, max-age=60")
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+        }
+    }
+    None
+}
+
+/// Build a cacheable response with ETag and Cache-Control headers.
+fn cacheable_response(
+    body: Vec<u8>,
+    content_type: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let etag = compute_etag(&body);
+
+    // Check for conditional request first
+    if let Some(not_modified) = check_conditional_request(headers, &etag) {
+        return not_modified;
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .header(ETAG, &etag)
+        .header(CACHE_CONTROL, "public, max-age=60")
+        .body(Body::from(body))
+        .unwrap()
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -287,6 +344,7 @@ fn is_conda_package(filename: &str) -> bool {
 
 async fn channeldata_json(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
@@ -364,13 +422,9 @@ async fn channeldata_json(
         "subdirs": KNOWN_SUBDIRS,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_string_pretty(&channeldata).unwrap(),
-        ))
-        .unwrap())
+    let body = serde_json::to_string_pretty(&channeldata).unwrap().into_bytes();
+
+    Ok(cacheable_response(body, "application/json", &headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -379,19 +433,15 @@ async fn channeldata_json(
 
 async fn repodata_json(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
 
-    let body = serde_json::to_string_pretty(&repodata).unwrap();
+    let body = serde_json::to_string_pretty(&repodata).unwrap().into_bytes();
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .header(CONTENT_LENGTH, body.len().to_string())
-        .body(Body::from(body))
-        .unwrap())
+    Ok(cacheable_response(body, "application/json", &headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +450,7 @@ async fn repodata_json(
 
 async fn repodata_json_bz2(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
@@ -408,12 +459,7 @@ async fn repodata_json_bz2(
     let json_bytes = serde_json::to_vec(&repodata).unwrap();
     let compressed = bzip2_compress(&json_bytes);
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/x-bzip2")
-        .header(CONTENT_LENGTH, compressed.len().to_string())
-        .body(Body::from(compressed))
-        .unwrap())
+    Ok(cacheable_response(compressed, "application/x-bzip2", &headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +515,7 @@ async fn repodata_json_sig(
 /// Modern conda/mamba clients prefer zstd over bz2 for faster decompression.
 async fn repodata_json_zst(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
@@ -482,12 +529,7 @@ async fn repodata_json_zst(
             .into_response()
     })?;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/zstd")
-        .header(CONTENT_LENGTH, compressed.len().to_string())
-        .body(Body::from(compressed))
-        .unwrap())
+    Ok(cacheable_response(compressed, "application/zstd", &headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -534,19 +576,15 @@ async fn repo_public_key(
 
 async fn current_repodata_json(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     let repodata = build_repodata(&state.db, repo.id, &subdir, true).await?;
 
-    let body = serde_json::to_string_pretty(&repodata).unwrap();
+    let body = serde_json::to_string_pretty(&repodata).unwrap().into_bytes();
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .header(CONTENT_LENGTH, body.len().to_string())
-        .body(Body::from(body))
-        .unwrap())
+    Ok(cacheable_response(body, "application/json", &headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -3828,6 +3866,122 @@ mod tests {
         assert!(body.len() > 0);
         let body2 = serde_json::to_string_pretty(&rd).unwrap();
         assert_eq!(body.len(), body2.len(), "Serialized size should be deterministic");
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP Caching: ETag, Cache-Control, conditional requests (bead: artifact-keeper-76g)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_etag_deterministic() {
+        let body = b"some repodata content";
+        let etag1 = compute_etag(body);
+        let etag2 = compute_etag(body);
+        assert_eq!(etag1, etag2, "ETag should be deterministic for same content");
+    }
+
+    #[test]
+    fn test_compute_etag_format() {
+        let etag = compute_etag(b"test");
+        assert!(etag.starts_with("W/\""), "ETag should be a weak ETag: {}", etag);
+        assert!(etag.ends_with('"'), "ETag should end with quote: {}", etag);
+        // W/"<16 hex chars>"
+        assert_eq!(etag.len(), 3 + 16 + 1, "ETag should be W/ + quote + 16 hex + quote");
+    }
+
+    #[test]
+    fn test_compute_etag_changes_with_content() {
+        let etag1 = compute_etag(b"content A");
+        let etag2 = compute_etag(b"content B");
+        assert_ne!(etag1, etag2, "Different content should produce different ETags");
+    }
+
+    #[test]
+    fn test_check_conditional_request_matches() {
+        let etag = compute_etag(b"test body");
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
+
+        let result = check_conditional_request(&headers, &etag);
+        assert!(result.is_some(), "Matching ETag should return 304");
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn test_check_conditional_request_no_match() {
+        let etag = compute_etag(b"test body");
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, "W/\"different\"".parse().unwrap());
+
+        let result = check_conditional_request(&headers, &etag);
+        assert!(result.is_none(), "Non-matching ETag should return None");
+    }
+
+    #[test]
+    fn test_check_conditional_request_wildcard() {
+        let etag = compute_etag(b"anything");
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, "*".parse().unwrap());
+
+        let result = check_conditional_request(&headers, &etag);
+        assert!(result.is_some(), "Wildcard should match any ETag");
+    }
+
+    #[test]
+    fn test_check_conditional_request_no_header() {
+        let etag = compute_etag(b"test body");
+        let headers = HeaderMap::new();
+
+        let result = check_conditional_request(&headers, &etag);
+        assert!(result.is_none(), "No If-None-Match header should return None");
+    }
+
+    #[test]
+    fn test_cacheable_response_includes_etag() {
+        let body = b"repodata json content".to_vec();
+        let headers = HeaderMap::new();
+        let resp = cacheable_response(body.clone(), "application/json", &headers);
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(ETAG).is_some(), "Response should have ETag");
+        assert!(resp.headers().get(CACHE_CONTROL).is_some(), "Response should have Cache-Control");
+        assert_eq!(
+            resp.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap(),
+            "public, max-age=60"
+        );
+    }
+
+    #[test]
+    fn test_cacheable_response_304_on_matching_etag() {
+        let body = b"repodata json content".to_vec();
+        let etag = compute_etag(&body);
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.parse().unwrap());
+
+        let resp = cacheable_response(body, "application/json", &headers);
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn test_cacheable_response_200_on_stale_etag() {
+        let body = b"updated repodata json content".to_vec();
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, "W/\"stale_etag_value\"".parse().unwrap());
+
+        let resp = cacheable_response(body, "application/json", &headers);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_check_conditional_request_comma_separated_etags() {
+        let etag = compute_etag(b"test body");
+        let mut headers = HeaderMap::new();
+        let header_val = format!("W/\"old\", {}, W/\"other\"", etag);
+        headers.insert(IF_NONE_MATCH, header_val.parse().unwrap());
+
+        let result = check_conditional_request(&headers, &etag);
+        assert!(result.is_some(), "ETag in comma-separated list should match");
     }
 
     #[test]
