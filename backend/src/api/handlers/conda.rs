@@ -4509,6 +4509,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Enhanced repodata entry builder that includes all conda-spec fields.
+    #[allow(clippy::too_many_arguments)]
     fn build_repodata_entry_full(
         name: &str,
         version: &str,
@@ -5542,7 +5543,7 @@ mod tests {
         let body = serde_json::to_string_pretty(&rd).unwrap();
 
         // Content-Length should be deterministic and correct
-        assert!(body.len() > 0);
+        assert!(!body.is_empty());
         let body2 = serde_json::to_string_pretty(&rd).unwrap();
         assert_eq!(
             body.len(),
@@ -6632,7 +6633,7 @@ mod tests {
         let entry = &shard["packages.conda"]["numpy-1.26.4-py312_0.conda"];
         assert_eq!(entry["build"], "py312_0");
         assert_eq!(entry["build_number"], 0);
-        assert!(entry["depends"].as_array().unwrap().len() > 0);
+        assert!(!entry["depends"].as_array().unwrap().is_empty());
         assert!(entry.get("constrains").is_some());
         assert!(entry.get("license").is_some());
         assert!(entry.get("sha256").is_some());
