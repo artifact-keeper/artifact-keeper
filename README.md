@@ -7,7 +7,7 @@
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=artifact-keeper_artifact-keeper&metric=ncloc)](https://sonarcloud.io/dashboard?id=artifact-keeper_artifact-keeper)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
-[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://ghcr.io/artifact-keeper/artifact-keeper-backend)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io%20%7C%20Docker%20Hub-blue.svg)](https://hub.docker.com/u/artifactkeeper)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/bsgeraci)
 
 An enterprise-grade, open-source artifact registry supporting **45+ package formats**. Built with Rust.

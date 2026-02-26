@@ -1,3 +1,10 @@
+# Container images are available from two registries:
+#   ghcr.io (default):  ghcr.io/artifact-keeper/artifact-keeper-{backend,web,openscap}
+#   Docker Hub:         artifactkeeper/{backend,web,openscap}
+#
+# To use Docker Hub instead, replace image references below. For example:
+#   ghcr.io/artifact-keeper/artifact-keeper-backend:latest  ->  artifactkeeper/backend:latest
+
 services:
   # Generate self-signed TLS certificates for PostgreSQL.
   # Writes certs to the shared pg_certs volume; postgres waits for this.
@@ -77,7 +84,7 @@ services:
     restart: "no"
 
   backend:
-    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest  # or artifactkeeper/backend:latest
     container_name: artifact-keeper-backend
     depends_on:
       postgres:
@@ -170,7 +177,7 @@ services:
     restart: unless-stopped
 
   openscap:
-    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest
+    image: ghcr.io/artifact-keeper/artifact-keeper-openscap:latest  # or artifactkeeper/openscap:latest
     container_name: artifact-keeper-openscap
     ports:
       - "8091:8091"
@@ -240,7 +247,7 @@ services:
     restart: unless-stopped
 
   web:
-    image: ghcr.io/artifact-keeper/artifact-keeper-web:latest
+    image: ghcr.io/artifact-keeper/artifact-keeper-web:latest  # or artifactkeeper/web:latest
     container_name: artifact-keeper-web
     depends_on:
       backend:
