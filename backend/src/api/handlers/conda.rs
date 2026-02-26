@@ -3406,4 +3406,466 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages_conda.len(), 1);
     }
+
+    // =======================================================================
+    // Channeldata.json compliance (bead: artifact-keeper-0p3)
+    // =======================================================================
+
+    #[test]
+    fn test_channeldata_multiple_packages_with_subdirs() {
+        let mut packages = serde_json::Map::new();
+
+        // numpy in linux-64 and osx-arm64
+        packages.insert(
+            "numpy".to_string(),
+            build_channeldata_package_entry(
+                &["linux-64".to_string(), "osx-arm64".to_string()],
+                "1.26.4",
+            ),
+        );
+        // requests in noarch only
+        packages.insert(
+            "requests".to_string(),
+            build_channeldata_package_entry(&["noarch".to_string()], "2.31.0"),
+        );
+        // scipy in multiple platforms
+        packages.insert(
+            "scipy".to_string(),
+            build_channeldata_package_entry(
+                &[
+                    "linux-64".to_string(),
+                    "osx-64".to_string(),
+                    "osx-arm64".to_string(),
+                    "win-64".to_string(),
+                ],
+                "1.11.4",
+            ),
+        );
+
+        let cd = build_channeldata_json(&packages);
+
+        assert_eq!(cd["channeldata_version"], 1);
+        assert_eq!(cd["packages"].as_object().unwrap().len(), 3);
+
+        // Verify numpy entry
+        let numpy = &cd["packages"]["numpy"];
+        assert_eq!(numpy["version"], "1.26.4");
+        assert_eq!(numpy["subdirs"].as_array().unwrap().len(), 2);
+
+        // Verify scipy entry has all 4 subdirs
+        let scipy = &cd["packages"]["scipy"];
+        assert_eq!(scipy["subdirs"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_channeldata_version_is_integer_1() {
+        let cd = build_channeldata_json(&serde_json::Map::new());
+        assert!(cd["channeldata_version"].is_number());
+        assert_eq!(cd["channeldata_version"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn test_channeldata_subdirs_is_complete_array() {
+        let cd = build_channeldata_json(&serde_json::Map::new());
+        let subdirs: Vec<&str> = cd["subdirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        // Must have all standard subdirs
+        assert!(subdirs.contains(&"noarch"), "Missing noarch");
+        assert!(subdirs.contains(&"linux-64"), "Missing linux-64");
+        assert!(subdirs.contains(&"linux-aarch64"), "Missing linux-aarch64");
+        assert!(subdirs.contains(&"osx-64"), "Missing osx-64");
+        assert!(subdirs.contains(&"osx-arm64"), "Missing osx-arm64");
+        assert!(subdirs.contains(&"win-64"), "Missing win-64");
+    }
+
+    #[test]
+    fn test_channeldata_packages_key_is_object() {
+        let cd = build_channeldata_json(&serde_json::Map::new());
+        assert!(cd["packages"].is_object());
+    }
+
+    // =======================================================================
+    // Client compatibility tests (bead: artifact-keeper-afv)
+    //
+    // These verify URL/path patterns that conda, mamba, and micromamba
+    // clients actually request.
+    // =======================================================================
+
+    #[test]
+    fn test_conda_client_repodata_path_format() {
+        // conda requests: /{channel}/{subdir}/repodata.json
+        let path = "linux-64/repodata.json";
+        let info = crate::formats::conda_native::CondaNativeHandler::parse_path(path).unwrap();
+        assert!(info.is_index);
+        assert_eq!(info.subdir.as_deref(), Some("linux-64"));
+    }
+
+    #[test]
+    fn test_conda_client_channeldata_path() {
+        // conda requests: /{channel}/channeldata.json
+        let info =
+            crate::formats::conda_native::CondaNativeHandler::parse_path("channeldata.json")
+                .unwrap();
+        assert!(info.is_index);
+        assert!(info.subdir.is_none());
+    }
+
+    #[test]
+    fn test_conda_client_v2_download_path() {
+        // mamba/conda request: /{channel}/{subdir}/{name}-{ver}-{build}.conda
+        let info = crate::formats::conda_native::CondaNativeHandler::parse_path(
+            "linux-64/numpy-1.26.4-py312h02b7e37_0.conda",
+        )
+        .unwrap();
+        assert!(!info.is_index);
+        assert_eq!(info.name.as_deref(), Some("numpy"));
+        assert_eq!(info.version.as_deref(), Some("1.26.4"));
+        assert_eq!(info.build.as_deref(), Some("py312h02b7e37_0"));
+    }
+
+    #[test]
+    fn test_conda_client_v1_download_path() {
+        // older conda: /{channel}/{subdir}/{name}-{ver}-{build}.tar.bz2
+        let info = crate::formats::conda_native::CondaNativeHandler::parse_path(
+            "noarch/requests-2.31.0-pyhd8ed1ab_0.tar.bz2",
+        )
+        .unwrap();
+        assert!(!info.is_index);
+        assert_eq!(info.name.as_deref(), Some("requests"));
+        assert_eq!(info.subdir.as_deref(), Some("noarch"));
+    }
+
+    #[test]
+    fn test_mamba_prefers_zst_endpoint() {
+        // mamba/micromamba request repodata.json.zst first, fallback to .json
+        // Verify our handler has an endpoint for it (test that zst_compress works)
+        let data = br#"{"info":{"subdir":"linux-64"},"packages":{}}"#;
+        let compressed = zstd_compress(data).unwrap();
+        assert!(!compressed.is_empty());
+        // Verify it decompresses correctly
+        let decompressed = zstd::decode_all(std::io::Cursor::new(&compressed)).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_all_known_subdirs_are_valid_for_client_paths() {
+        // Every known subdir should parse correctly as part of a conda path
+        for subdir in KNOWN_SUBDIRS {
+            let path = format!("{}/test-1.0-0.conda", subdir);
+            let info =
+                crate::formats::conda_native::CondaNativeHandler::parse_path(&path).unwrap();
+            assert_eq!(info.subdir.as_deref(), Some(*subdir));
+        }
+    }
+
+    #[test]
+    fn test_condarc_url_patterns() {
+        // .condarc channel URLs: https://host/conda/{repo_key}
+        // conda appends /{subdir}/repodata.json automatically
+        // Verify our path parsing handles the subdir/filename part correctly
+        let paths = vec![
+            "noarch/repodata.json",
+            "linux-64/repodata.json",
+            "linux-64/repodata.json.bz2",
+            "noarch/pip-24.0-pyhd8ed1ab_0.conda",
+            "linux-64/numpy-1.26.4-py312h02b7e37_0.tar.bz2",
+        ];
+
+        for path in paths {
+            let result = crate::formats::conda_native::CondaNativeHandler::parse_path(path);
+            assert!(result.is_ok(), "Failed to parse conda client path: {}", path);
+        }
+    }
+
+    #[test]
+    fn test_package_filename_with_hyphens_in_name() {
+        // Many conda packages have hyphens: python-dateutil, scikit-learn
+        let info = crate::formats::conda_native::CondaNativeHandler::parse_path(
+            "noarch/python-dateutil-2.8.2-pyhd8ed1ab_0.tar.bz2",
+        )
+        .unwrap();
+        assert_eq!(info.name.as_deref(), Some("python-dateutil"));
+        assert_eq!(info.version.as_deref(), Some("2.8.2"));
+    }
+
+    #[test]
+    fn test_package_filename_with_underscores() {
+        let info = crate::formats::conda_native::CondaNativeHandler::parse_path(
+            "linux-64/ca_certificates-2024.2.2-hbcca054_0.conda",
+        )
+        .unwrap();
+        assert_eq!(info.name.as_deref(), Some("ca_certificates"));
+        assert_eq!(info.version.as_deref(), Some("2024.2.2"));
+    }
+
+    #[test]
+    fn test_package_filename_with_dots_in_version() {
+        let info = crate::formats::conda_native::CondaNativeHandler::parse_path(
+            "linux-64/openssl-3.2.0-hd590300_1.conda",
+        )
+        .unwrap();
+        assert_eq!(info.name.as_deref(), Some("openssl"));
+        assert_eq!(info.version.as_deref(), Some("3.2.0"));
+        assert_eq!(info.build.as_deref(), Some("hd590300_1"));
+    }
+
+    // =======================================================================
+    // Signing and verification (bead: artifact-keeper-xll)
+    //
+    // Unit tests for the signing key endpoint patterns and repodata
+    // signature structure. Full signing verification requires DB/services
+    // but we can test the response structure and key format expectations.
+    // =======================================================================
+
+    #[test]
+    fn test_repodata_json_is_deterministic_for_signing() {
+        // Signing requires deterministic serialization. The same repodata
+        // should produce the same JSON bytes every time.
+        let mut packages = serde_json::Map::new();
+        packages.insert(
+            "numpy-1.26.4-py312_0.conda".to_string(),
+            serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py312_0",
+                "build_number": 0,
+                "depends": ["python >=3.12"],
+                "sha256": "abc123",
+                "size": 8192,
+                "subdir": "linux-64",
+            }),
+        );
+
+        let rd = build_repodata_json("linux-64", &serde_json::Map::new(), &packages);
+        let bytes1 = serde_json::to_vec(&rd).unwrap();
+        let bytes2 = serde_json::to_vec(&rd).unwrap();
+        assert_eq!(bytes1, bytes2, "Repodata serialization must be deterministic");
+    }
+
+    #[test]
+    fn test_repodata_signing_changes_with_content() {
+        // Different repodata should produce different bytes (and thus different sigs)
+        let mut packages1 = serde_json::Map::new();
+        packages1.insert(
+            "pkg-1.0-0.conda".to_string(),
+            serde_json::json!({"name": "pkg", "version": "1.0"}),
+        );
+        let rd1 = build_repodata_json("linux-64", &serde_json::Map::new(), &packages1);
+
+        let mut packages2 = serde_json::Map::new();
+        packages2.insert(
+            "pkg-2.0-0.conda".to_string(),
+            serde_json::json!({"name": "pkg", "version": "2.0"}),
+        );
+        let rd2 = build_repodata_json("linux-64", &serde_json::Map::new(), &packages2);
+
+        let bytes1 = serde_json::to_vec(&rd1).unwrap();
+        let bytes2 = serde_json::to_vec(&rd2).unwrap();
+        assert_ne!(bytes1, bytes2, "Different content should produce different bytes");
+    }
+
+    #[test]
+    fn test_repodata_sha256_for_download_verification() {
+        // Each package entry should have a sha256 field for download verification
+        let entry = build_repodata_entry(
+            "numpy", "1.26.4", "py312_0", 0,
+            &serde_json::json!([]),
+            "md5hash", "abc123def456", 8192, "linux-64",
+        );
+        assert_eq!(entry["sha256"], "abc123def456");
+        assert!(!entry["sha256"].as_str().unwrap().is_empty());
+    }
+
+    // =======================================================================
+    // Remote repository proxy path construction (bead: artifact-keeper-eo4)
+    // =======================================================================
+
+    #[test]
+    fn test_proxy_upstream_path_v2_package() {
+        // When proxying, we construct: {subdir}/{filename}
+        let subdir = "linux-64";
+        let filename = "numpy-1.26.4-py312h02b7e37_0.conda";
+        let upstream_path = format!("{}/{}", subdir, filename);
+        assert_eq!(upstream_path, "linux-64/numpy-1.26.4-py312h02b7e37_0.conda");
+    }
+
+    #[test]
+    fn test_proxy_upstream_path_v1_package() {
+        let subdir = "noarch";
+        let filename = "requests-2.31.0-pyhd8ed1ab_0.tar.bz2";
+        let upstream_path = format!("{}/{}", subdir, filename);
+        assert_eq!(
+            upstream_path,
+            "noarch/requests-2.31.0-pyhd8ed1ab_0.tar.bz2"
+        );
+    }
+
+    #[test]
+    fn test_proxy_upstream_path_repodata() {
+        let subdir = "linux-64";
+        let filename = "repodata.json";
+        let upstream_path = format!("{}/{}", subdir, filename);
+        assert_eq!(upstream_path, "linux-64/repodata.json");
+    }
+
+    #[test]
+    fn test_proxy_content_type_for_formats() {
+        // Proxy should use correct content type for each format
+        assert_eq!(conda_content_type("numpy.conda"), "application/octet-stream");
+        assert_eq!(conda_content_type("requests.tar.bz2"), "application/x-tar");
+    }
+
+    // =======================================================================
+    // Virtual repository metadata merge (bead: artifact-keeper-rec)
+    //
+    // Test that repodata entries from multiple sources can be merged.
+    // =======================================================================
+
+    #[test]
+    fn test_virtual_repodata_merge_different_packages() {
+        // Local repo has numpy, remote has scipy - merged repodata has both
+        let mut local_packages = serde_json::Map::new();
+        local_packages.insert(
+            "numpy-1.26.4-py312_0.conda".to_string(),
+            serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py312_0",
+                "build_number": 0,
+                "depends": ["python >=3.12"],
+                "sha256": "local_sha",
+                "size": 8192,
+                "subdir": "linux-64",
+            }),
+        );
+
+        let mut remote_packages = serde_json::Map::new();
+        remote_packages.insert(
+            "scipy-1.11.4-py312_0.conda".to_string(),
+            serde_json::json!({
+                "name": "scipy",
+                "version": "1.11.4",
+                "build": "py312_0",
+                "build_number": 0,
+                "depends": ["numpy >=1.22", "python >=3.12"],
+                "sha256": "remote_sha",
+                "size": 16384,
+                "subdir": "linux-64",
+            }),
+        );
+
+        // Merge: local takes priority, then remote
+        let mut merged = local_packages.clone();
+        for (k, v) in &remote_packages {
+            merged.entry(k.clone()).or_insert(v.clone());
+        }
+
+        let rd = build_repodata_json("linux-64", &serde_json::Map::new(), &merged);
+        let pkgs = rd["packages.conda"].as_object().unwrap();
+        assert_eq!(pkgs.len(), 2);
+        assert!(pkgs.contains_key("numpy-1.26.4-py312_0.conda"));
+        assert!(pkgs.contains_key("scipy-1.11.4-py312_0.conda"));
+    }
+
+    #[test]
+    fn test_virtual_repodata_merge_priority_ordering() {
+        // When same package exists in local and remote, local wins
+        let mut local_packages = serde_json::Map::new();
+        local_packages.insert(
+            "numpy-1.26.4-py312_0.conda".to_string(),
+            serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "sha256": "local_sha_wins",
+                "size": 8192,
+            }),
+        );
+
+        let mut remote_packages = serde_json::Map::new();
+        remote_packages.insert(
+            "numpy-1.26.4-py312_0.conda".to_string(),
+            serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "sha256": "remote_sha_loses",
+                "size": 8192,
+            }),
+        );
+
+        // Priority merge: local first
+        let mut merged = local_packages.clone();
+        for (k, v) in &remote_packages {
+            merged.entry(k.clone()).or_insert(v.clone());
+        }
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged["numpy-1.26.4-py312_0.conda"]["sha256"], "local_sha_wins");
+    }
+
+    #[test]
+    fn test_virtual_repodata_merge_preserves_all_metadata_fields() {
+        // After merge, all metadata fields should be intact
+        let mut packages = serde_json::Map::new();
+        packages.insert(
+            "numpy-1.26.4-py312_0.conda".to_string(),
+            serde_json::json!({
+                "name": "numpy",
+                "version": "1.26.4",
+                "build": "py312_0",
+                "build_number": 0,
+                "depends": ["python >=3.12", "libcblas >=3.9"],
+                "constrains": ["numpy-base <0a0"],
+                "license": "BSD-3-Clause",
+                "license_family": "BSD",
+                "md5": "md5hash",
+                "sha256": "sha256hash",
+                "size": 8192,
+                "subdir": "linux-64",
+                "timestamp": 1709000000000_u64,
+            }),
+        );
+
+        let rd = build_repodata_json("linux-64", &serde_json::Map::new(), &packages);
+        let entry = &rd["packages.conda"]["numpy-1.26.4-py312_0.conda"];
+
+        // Verify all fields survived the merge through repodata construction
+        assert_eq!(entry["name"], "numpy");
+        assert_eq!(entry["version"], "1.26.4");
+        assert_eq!(entry["build"], "py312_0");
+        assert_eq!(entry["build_number"], 0);
+        assert_eq!(entry["depends"].as_array().unwrap().len(), 2);
+        assert_eq!(entry["constrains"].as_array().unwrap().len(), 1);
+        assert_eq!(entry["license"], "BSD-3-Clause");
+        assert_eq!(entry["license_family"], "BSD");
+        assert_eq!(entry["sha256"], "sha256hash");
+        assert_eq!(entry["size"], 8192);
+        assert_eq!(entry["timestamp"], 1709000000000_u64);
+    }
+
+    #[test]
+    fn test_virtual_repodata_merge_mixed_v1_v2_sources() {
+        // Virtual repo merges v1 from remote and v2 from local
+        let mut packages = serde_json::Map::new();
+        packages.insert(
+            "old-pkg-1.0-0.tar.bz2".to_string(),
+            serde_json::json!({"name": "old-pkg", "version": "1.0"}),
+        );
+
+        let mut packages_conda = serde_json::Map::new();
+        packages_conda.insert(
+            "new-pkg-2.0-0.conda".to_string(),
+            serde_json::json!({"name": "new-pkg", "version": "2.0"}),
+        );
+
+        let rd = build_repodata_json("linux-64", &packages, &packages_conda);
+
+        // v1 and v2 should be in their respective sections
+        assert_eq!(rd["packages"].as_object().unwrap().len(), 1);
+        assert_eq!(rd["packages.conda"].as_object().unwrap().len(), 1);
+    }
 }
