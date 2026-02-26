@@ -228,6 +228,129 @@ fn validate_cep26_naming(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// CEP-27: Publish attestation validation
+// ---------------------------------------------------------------------------
+//
+// CEP-27 defines an in-toto Statement v1 attestation format for conda
+// package provenance. Attestations are signed with Sigstore and bind a
+// package filename + SHA256 to a publishing identity.
+
+/// The in-toto Statement v1 type URI.
+const INTOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
+
+/// The CEP-27 predicate type for conda publish attestations.
+const CEP27_PREDICATE_TYPE: &str =
+    "https://schemas.conda.org/attestations-publish-1.schema.json";
+
+/// Validate a CEP-27 publish attestation structure.
+///
+/// Checks that the attestation conforms to the in-toto Statement v1 schema
+/// with the conda publish predicate type. Does NOT verify cryptographic
+/// signatures (that requires Sigstore infrastructure).
+fn validate_cep27_attestation(
+    attestation: &serde_json::Value,
+    expected_filename: &str,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    // Validate _type field
+    let stmt_type = attestation
+        .get("_type")
+        .and_then(|v| v.as_str())
+        .ok_or("attestation missing '_type' field")?;
+    if stmt_type != INTOTO_STATEMENT_V1 {
+        return Err(format!(
+            "attestation _type must be '{}', got '{}'",
+            INTOTO_STATEMENT_V1, stmt_type
+        ));
+    }
+
+    // Validate predicateType
+    let predicate_type = attestation
+        .get("predicateType")
+        .and_then(|v| v.as_str())
+        .ok_or("attestation missing 'predicateType' field")?;
+    if predicate_type != CEP27_PREDICATE_TYPE {
+        return Err(format!(
+            "attestation predicateType must be '{}', got '{}'",
+            CEP27_PREDICATE_TYPE, predicate_type
+        ));
+    }
+
+    // Validate subject array (exactly one entry)
+    let subjects = attestation
+        .get("subject")
+        .and_then(|v| v.as_array())
+        .ok_or("attestation missing 'subject' array")?;
+    if subjects.len() != 1 {
+        return Err(format!(
+            "attestation subject must have exactly 1 entry, got {}",
+            subjects.len()
+        ));
+    }
+
+    let subject = &subjects[0];
+
+    // Validate subject name matches expected filename
+    let name = subject
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or("attestation subject missing 'name' field")?;
+    if name != expected_filename {
+        return Err(format!(
+            "attestation subject name '{}' does not match package filename '{}'",
+            name, expected_filename
+        ));
+    }
+
+    // Validate subject digest
+    let digest = subject
+        .get("digest")
+        .and_then(|v| v.as_object())
+        .ok_or("attestation subject missing 'digest' object")?;
+    let sha256 = digest
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .ok_or("attestation subject digest missing 'sha256' field")?;
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "attestation sha256 must be a 64-character hex string, got '{}'",
+            sha256
+        ));
+    }
+    if sha256 != expected_sha256 {
+        return Err(format!(
+            "attestation sha256 '{}' does not match package sha256 '{}'",
+            sha256, expected_sha256
+        ));
+    }
+
+    // Validate predicate (optional, but if present must have targetChannel)
+    if let Some(predicate) = attestation.get("predicate") {
+        if !predicate.is_null() {
+            let pred_obj = predicate
+                .as_object()
+                .ok_or("attestation predicate must be an object or null")?;
+            if let Some(target) = pred_obj.get("targetChannel") {
+                let url = target
+                    .as_str()
+                    .ok_or("targetChannel must be a string")?;
+                if url.is_empty() || url.len() > 2083 {
+                    return Err(format!(
+                        "targetChannel must be 1-2083 characters, got {}",
+                        url.len()
+                    ));
+                }
+                if url.ends_with('/') {
+                    return Err("targetChannel must not end with a trailing slash".to_string());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Common Conda subdirectories.
 const KNOWN_SUBDIRS: &[&str] = &[
     "noarch",
@@ -659,6 +782,11 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/:subdir/:filename",
             get(download_package).put(upload_package_put),
         )
+        // CEP-27 attestation endpoints
+        .route(
+            "/:repo_key/:subdir/:filename/attestation",
+            get(get_attestation).put(put_attestation),
+        )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
@@ -719,6 +847,10 @@ pub fn token_router() -> Router<SharedState> {
         .route(
             "/:token/:repo_key/:subdir/:filename",
             get(download_package).put(upload_package_put_with_token),
+        )
+        .route(
+            "/:token/:repo_key/:subdir/:filename/attestation",
+            get(get_attestation).put(put_attestation),
         )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
 }
@@ -2470,6 +2602,150 @@ fn extract_conda_v1_metadata(content: &[u8]) -> Option<serde_json::Value> {
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// CEP-27 Attestation endpoints
+// ---------------------------------------------------------------------------
+
+/// Store or update a CEP-27 publish attestation for a package.
+///
+/// PUT /conda/{repo_key}/{subdir}/{filename}/attestation
+///
+/// Accepts an in-toto Statement v1 JSON body. Validates the structure,
+/// verifies the subject matches the target package, and stores the
+/// attestation in the artifact's metadata.
+async fn put_attestation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    // Require authentication
+    let _user_id = authenticate(&state.db, &state.config, &headers).await?;
+
+    // Look up the target package
+    let artifact_path = format!("{}/{}", subdir, filename);
+    let artifact: (uuid::Uuid, String) = sqlx::query_as(
+        "SELECT id, checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false LIMIT 1",
+    )
+    .bind(repo.id)
+    .bind(&artifact_path)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)).into_response())?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response())?;
+
+    let (artifact_id, package_sha256) = artifact;
+
+    // Parse and validate the attestation
+    let attestation: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid JSON: {}", e),
+        )
+            .into_response()
+    })?;
+
+    validate_cep27_attestation(&attestation, &filename, &package_sha256).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("CEP-27 attestation validation failed: {}", e),
+        )
+            .into_response()
+    })?;
+
+    // Store the attestation in artifact metadata
+    // We upsert into artifact_metadata, merging the attestation into the
+    // existing metadata JSON object under the "attestation" key.
+    sqlx::query(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, metadata)
+        VALUES ($1, jsonb_build_object('attestation', $2::jsonb))
+        ON CONFLICT (artifact_id) DO UPDATE
+        SET metadata = artifact_metadata.metadata || jsonb_build_object('attestation', $2::jsonb)
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(&attestation)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to store attestation: {}", e),
+        )
+            .into_response()
+    })?;
+
+    info!(
+        repo = %repo_key,
+        package = %filename,
+        "CEP-27 attestation stored"
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::CREATED)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"status": "attestation stored"}).to_string(),
+        ))
+        .unwrap())
+}
+
+/// Retrieve the CEP-27 publish attestation for a package.
+///
+/// GET /conda/{repo_key}/{subdir}/{filename}/attestation
+///
+/// Returns the in-toto Statement v1 JSON if an attestation exists.
+async fn get_attestation(
+    State(state): State<SharedState>,
+    Path((repo_key, subdir, filename)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_conda_repo(&state.db, &repo_key).await?;
+
+    let artifact_path = format!("{}/{}", subdir, filename);
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        r#"
+        SELECT am.metadata
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false
+        LIMIT 1
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&artifact_path)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let metadata = row.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, "Package not found").into_response()
+    })?;
+
+    let attestation = metadata
+        .0
+        .get("attestation")
+        .ok_or_else(|| {
+            (StatusCode::NOT_FOUND, "No attestation found for this package").into_response()
+        })?;
+
+    let body = serde_json::to_string_pretty(attestation).unwrap();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -7027,5 +7303,162 @@ mod tests {
             "numpy", "1.26.4", "py312-0", "numpy-1.26.4-py312-0.conda", "linux-64"
         ).unwrap_err();
         assert!(err.contains("invalid character"), "error: {}", err);
+    }
+
+    // -----------------------------------------------------------------------
+    // CEP-27: Publish attestation validation
+    // -----------------------------------------------------------------------
+
+    fn make_valid_attestation(filename: &str, sha256: &str) -> serde_json::Value {
+        serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{
+                "name": filename,
+                "digest": { "sha256": sha256 }
+            }],
+            "predicateType": "https://schemas.conda.org/attestations-publish-1.schema.json",
+            "predicate": {
+                "targetChannel": "https://my-registry.example.com/conda/main"
+            }
+        })
+    }
+
+    #[test]
+    fn test_cep27_valid_attestation() {
+        let sha = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+        let att = make_valid_attestation("numpy-1.26.4-py312_0.conda", sha);
+        assert!(validate_cep27_attestation(&att, "numpy-1.26.4-py312_0.conda", sha).is_ok());
+    }
+
+    #[test]
+    fn test_cep27_valid_attestation_no_predicate() {
+        let sha = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+        let att = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{
+                "name": "pkg-1.0-py312_0.conda",
+                "digest": { "sha256": sha }
+            }],
+            "predicateType": "https://schemas.conda.org/attestations-publish-1.schema.json",
+            "predicate": null
+        });
+        assert!(validate_cep27_attestation(&att, "pkg-1.0-py312_0.conda", sha).is_ok());
+    }
+
+    #[test]
+    fn test_cep27_wrong_statement_type() {
+        let sha = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+        let att = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "subject": [{"name": "pkg.conda", "digest": {"sha256": sha}}],
+            "predicateType": CEP27_PREDICATE_TYPE,
+        });
+        let err = validate_cep27_attestation(&att, "pkg.conda", sha).unwrap_err();
+        assert!(err.contains("_type"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_cep27_wrong_predicate_type() {
+        let sha = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+        let att = serde_json::json!({
+            "_type": INTOTO_STATEMENT_V1,
+            "subject": [{"name": "pkg.conda", "digest": {"sha256": sha}}],
+            "predicateType": "https://example.com/wrong",
+        });
+        let err = validate_cep27_attestation(&att, "pkg.conda", sha).unwrap_err();
+        assert!(err.contains("predicateType"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_cep27_mismatched_filename() {
+        let sha = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+        let att = make_valid_attestation("wrong-filename.conda", sha);
+        let err = validate_cep27_attestation(&att, "actual-filename.conda", sha).unwrap_err();
+        assert!(err.contains("does not match"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_cep27_mismatched_sha256() {
+        let att = make_valid_attestation(
+            "pkg.conda",
+            "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        );
+        let err = validate_cep27_attestation(
+            &att,
+            "pkg.conda",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap_err();
+        assert!(err.contains("does not match"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_cep27_invalid_sha256_format() {
+        let att = serde_json::json!({
+            "_type": INTOTO_STATEMENT_V1,
+            "subject": [{"name": "pkg.conda", "digest": {"sha256": "too-short"}}],
+            "predicateType": CEP27_PREDICATE_TYPE,
+        });
+        let err = validate_cep27_attestation(&att, "pkg.conda", "too-short").unwrap_err();
+        assert!(err.contains("64-character hex"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_cep27_multiple_subjects_rejected() {
+        let sha = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+        let att = serde_json::json!({
+            "_type": INTOTO_STATEMENT_V1,
+            "subject": [
+                {"name": "pkg1.conda", "digest": {"sha256": sha}},
+                {"name": "pkg2.conda", "digest": {"sha256": sha}},
+            ],
+            "predicateType": CEP27_PREDICATE_TYPE,
+        });
+        let err = validate_cep27_attestation(&att, "pkg1.conda", sha).unwrap_err();
+        assert!(err.contains("exactly 1"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_cep27_trailing_slash_in_target_channel() {
+        let sha = "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b";
+        let att = serde_json::json!({
+            "_type": INTOTO_STATEMENT_V1,
+            "subject": [{"name": "pkg.conda", "digest": {"sha256": sha}}],
+            "predicateType": CEP27_PREDICATE_TYPE,
+            "predicate": {
+                "targetChannel": "https://example.com/conda/"
+            }
+        });
+        let err = validate_cep27_attestation(&att, "pkg.conda", sha).unwrap_err();
+        assert!(err.contains("trailing slash"), "error: {}", err);
+    }
+
+    #[test]
+    fn test_cep27_missing_fields() {
+        // Missing _type
+        let att = serde_json::json!({"subject": [], "predicateType": "x"});
+        assert!(validate_cep27_attestation(&att, "", "").unwrap_err().contains("_type"));
+
+        // Missing predicateType
+        let att = serde_json::json!({"_type": INTOTO_STATEMENT_V1, "subject": []});
+        assert!(validate_cep27_attestation(&att, "", "").unwrap_err().contains("predicateType"));
+
+        // Missing subject
+        let att = serde_json::json!({
+            "_type": INTOTO_STATEMENT_V1,
+            "predicateType": CEP27_PREDICATE_TYPE,
+        });
+        assert!(validate_cep27_attestation(&att, "", "").unwrap_err().contains("subject"));
+    }
+
+    #[test]
+    fn test_cep27_empty_subject_array() {
+        let att = serde_json::json!({
+            "_type": INTOTO_STATEMENT_V1,
+            "subject": [],
+            "predicateType": CEP27_PREDICATE_TYPE,
+        });
+        let err = validate_cep27_attestation(&att, "", "").unwrap_err();
+        assert!(err.contains("exactly 1"), "error: {}", err);
     }
 }
