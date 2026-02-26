@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "artifact-keeper-backend"
-version = "1.1.0-rc.3"
+version = "1.1.0-rc.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -244,6 +244,7 @@ dependencies = [
  "wasmtime-wasi",
  "xz2",
  "zip",
+ "zstd",
 ]
 
 [[package]]
