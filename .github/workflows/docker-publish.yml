@@ -22,6 +22,8 @@ env:
   REGISTRY: ghcr.io
   BACKEND_IMAGE: ${{ github.repository }}-backend
   OPENSCAP_IMAGE: ${{ github.repository }}-openscap
+  DOCKERHUB_BACKEND: artifactkeeper/backend
+  DOCKERHUB_OPENSCAP: artifactkeeper/openscap
 
 jobs:
   build-backend:
@@ -341,14 +343,20 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Log in to Container Registry
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (ghcr.io)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -363,11 +371,28 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: Create manifest list and push
+      - name: Extract metadata (Docker Hub)
+        id: meta-dockerhub
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ env.DOCKERHUB_BACKEND }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list and push (ghcr.io)
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
 
       - name: Inspect image
         id: inspect
@@ -376,6 +401,12 @@ jobs:
           DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
             ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Copy to Docker Hub
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
+            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
 
       - name: Sign image with cosign (keyless)
         run: |
@@ -414,14 +445,20 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Log in to Container Registry
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (ghcr.io)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -436,11 +473,28 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: Create manifest list and push
+      - name: Extract metadata (Docker Hub)
+        id: meta-dockerhub
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ env.DOCKERHUB_OPENSCAP }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list and push (ghcr.io)
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
 
       - name: Inspect image
         id: inspect
@@ -449,6 +503,12 @@ jobs:
           DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
             ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Copy to Docker Hub
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
+            ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@${{ steps.inspect.outputs.digest }}
 
       - name: Sign image with cosign (keyless)
         run: |
@@ -475,10 +535,12 @@ jobs:
           echo "## Docker Images Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Backend" >> $GITHUB_STEP_SUMMARY
-          echo "\`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`docker.io/${{ env.DOCKERHUB_BACKEND }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### OpenSCAP" >> $GITHUB_STEP_SUMMARY
-          echo "\`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`docker.io/${{ env.DOCKERHUB_OPENSCAP }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
           echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC)" >> $GITHUB_STEP_SUMMARY
