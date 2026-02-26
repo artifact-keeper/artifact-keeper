@@ -425,6 +425,23 @@ jobs:
           push-to-registry: true
         continue-on-error: true
 
+      - name: Checkout (for VEX files)
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .vex
+
+      - name: Attach VEX attestations
+        run: |
+          for vex in .vex/*.vex.json; do
+            [ -f "$vex" ] || continue
+            echo "Attaching VEX: $vex"
+            docker scout attestation add \
+              --file "$vex" \
+              --predicate-type https://openvex.dev/ns/v0.2.0 \
+              ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
+          done
+        continue-on-error: true
+
   merge-openscap:
     name: OpenSCAP Multi-Arch Manifest
     runs-on: ubuntu-latest
