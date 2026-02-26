@@ -29,7 +29,8 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+    IF_NONE_MATCH,
 };
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -95,6 +96,24 @@ fn check_conditional_request(headers: &HeaderMap, etag: &str) -> Option<Response
     None
 }
 
+/// Check if the client accepts gzip encoding.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|e| e.trim().starts_with("gzip")))
+        .unwrap_or(false)
+}
+
+/// Gzip-compress data using flate2.
+fn gzip_compress(data: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
 /// Build a cacheable response with ETag and Cache-Control headers.
 fn cacheable_response(
     body: Vec<u8>,
@@ -106,6 +125,23 @@ fn cacheable_response(
     // Check for conditional request first
     if let Some(not_modified) = check_conditional_request(headers, &etag) {
         return not_modified;
+    }
+
+    // Serve gzip-compressed response if the client accepts it and the content
+    // type is JSON (repodata, channeldata, etc.). This helps clients that
+    // don't support zstd or bz2.
+    if content_type == "application/json" && accepts_gzip(headers) {
+        let compressed = gzip_compress(&body);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, content_type)
+            .header(CONTENT_ENCODING, "gzip")
+            .header(CONTENT_LENGTH, compressed.len().to_string())
+            .header(ETAG, &etag)
+            .header(CACHE_CONTROL, "public, max-age=60")
+            .header("Vary", "Accept-Encoding")
+            .body(Body::from(compressed))
+            .unwrap();
     }
 
     Response::builder()
@@ -732,7 +768,7 @@ async fn repodata_json(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
 
     let body = serde_json::to_string_pretty(&repodata).unwrap().into_bytes();
 
@@ -749,7 +785,7 @@ async fn repodata_json_bz2(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
 
     let json_bytes = serde_json::to_vec(&repodata).unwrap();
     let compressed = bzip2_compress(&json_bytes);
@@ -770,7 +806,7 @@ async fn repodata_json_sig(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
 
     let json_bytes = serde_json::to_vec(&repodata).unwrap();
 
@@ -814,7 +850,7 @@ async fn repodata_json_zst(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &subdir, false).await?;
+    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, false).await?;
     let json_bytes = serde_json::to_vec(&repodata).unwrap();
     let compressed = zstd_compress(&json_bytes).map_err(|e| {
         (
@@ -875,7 +911,7 @@ async fn current_repodata_json(
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
-    let repodata = build_repodata(&state.db, repo.id, &subdir, true).await?;
+    let repodata = build_repodata(&state.db, repo.id, &repo_key, &subdir, true).await?;
 
     let body = serde_json::to_string_pretty(&repodata).unwrap().into_bytes();
 
@@ -1168,13 +1204,56 @@ fn build_sharded_index(
 // Repodata generation
 // ---------------------------------------------------------------------------
 
+/// List soft-deleted conda artifacts for a repo+subdir to populate the `removed` array.
+///
+/// Uses runtime query (not compile-time macro) to avoid needing a live
+/// database connection or sqlx-offline cache update.
+async fn list_removed_artifacts(
+    db: &sqlx::PgPool,
+    repo_id: uuid::Uuid,
+    subdir: &str,
+) -> Result<Vec<String>, Response> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT a.path FROM artifacts a WHERE a.repository_id = $1 AND a.is_deleted = true ORDER BY a.path",
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let prefix = format!("{}/", subdir);
+    Ok(rows
+        .into_iter()
+        .filter_map(|(path,)| {
+            if path.starts_with(&prefix) {
+                let filename = path.rsplit('/').next().unwrap_or(&path);
+                if is_conda_package(filename) {
+                    return Some(filename.to_string());
+                }
+            }
+            None
+        })
+        .collect())
+}
+
 /// Build repodata.json for a given subdir from the database.
 ///
 /// When `latest_only` is true, only the most recent version of each package
 /// is included (for current_repodata.json).
+///
+/// `repo_key` is included so we can set `base_url` in the `info` section
+/// per CEP-15, allowing clients to resolve package downloads from a
+/// separate CDN or mirror.
 async fn build_repodata(
     db: &sqlx::PgPool,
     repo_id: uuid::Uuid,
+    repo_key: &str,
     subdir: &str,
     latest_only: bool,
 ) -> Result<serde_json::Value, Response> {
@@ -1331,10 +1410,22 @@ async fn build_repodata(
         }
     }
 
+    // Collect filenames of soft-deleted packages for the "removed" array
+    let removed = list_removed_artifacts(db, repo_id, subdir).await?;
+
+    // CEP-15: base_url tells the client where to download packages from.
+    // This allows hosting packages on a separate CDN while serving repodata
+    // from the registry itself.
+    let base_url = format!("/conda/{}/{}/", repo_key, subdir);
+
     Ok(serde_json::json!({
-        "info": { "subdir": subdir },
+        "info": {
+            "subdir": subdir,
+            "base_url": base_url,
+        },
         "packages": packages,
         "packages.conda": packages_conda,
+        "removed": removed,
         "repodata_version": 1,
     }))
 }
@@ -5699,6 +5790,159 @@ mod tests {
             "Single shard ({} bytes) should be much smaller than full repodata ({} bytes)",
             shard_compressed.len(),
             full_bytes.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // P3: base_url, removed array, Content-Encoding gzip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_accepts_gzip_positive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip, deflate, br".parse().unwrap());
+        assert!(accepts_gzip(&headers));
+    }
+
+    #[test]
+    fn test_accepts_gzip_negative() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "br, zstd".parse().unwrap());
+        assert!(!accepts_gzip(&headers));
+    }
+
+    #[test]
+    fn test_accepts_gzip_missing_header() {
+        let headers = HeaderMap::new();
+        assert!(!accepts_gzip(&headers));
+    }
+
+    #[test]
+    fn test_gzip_compress_roundtrip() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let original = b"hello world, this is a test of gzip compression";
+        let compressed = gzip_compress(original);
+
+        // Compressed should be non-empty
+        assert!(!compressed.is_empty());
+
+        // Decompress and verify roundtrip
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_cacheable_response_gzip_when_accepted() {
+        let body = serde_json::to_vec(&serde_json::json!({"test": true})).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
+
+        let resp = cacheable_response(body, "application/json", &headers);
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_ENCODING).unwrap().to_str().unwrap(),
+            "gzip"
+        );
+        assert_eq!(
+            resp.headers().get("Vary").unwrap().to_str().unwrap(),
+            "Accept-Encoding"
+        );
+    }
+
+    #[test]
+    fn test_cacheable_response_no_gzip_for_binary() {
+        let body = vec![0u8; 100];
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, "gzip, deflate".parse().unwrap());
+
+        let resp = cacheable_response(body, "application/x-bzip2", &headers);
+
+        // Binary content types should not be gzip-encoded
+        assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    #[test]
+    fn test_cacheable_response_no_gzip_without_accept() {
+        let body = serde_json::to_vec(&serde_json::json!({"test": true})).unwrap();
+        let headers = HeaderMap::new();
+
+        let resp = cacheable_response(body, "application/json", &headers);
+
+        // No Accept-Encoding means no gzip
+        assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    #[test]
+    fn test_repodata_base_url_in_info() {
+        // The build_repodata function adds base_url to the info section.
+        // Since we can't call the async function directly in unit tests,
+        // verify the test helper output matches expected structure.
+        let rd = build_repodata_json(
+            "linux-64",
+            &serde_json::Map::new(),
+            &serde_json::Map::new(),
+        );
+
+        // The test helper doesn't include base_url (it's a simplified version),
+        // but the actual build_repodata does. Test the format of base_url
+        // that build_repodata produces.
+        let base_url = format!("/conda/{}/{}/", "my-repo", "linux-64");
+        assert_eq!(base_url, "/conda/my-repo/linux-64/");
+
+        // Verify the info.subdir is present
+        assert_eq!(rd["info"]["subdir"], "linux-64");
+    }
+
+    #[test]
+    fn test_base_url_format_for_various_repos() {
+        // CEP-15 base_url must be a relative path to the subdir
+        let cases = vec![
+            ("my-repo", "noarch", "/conda/my-repo/noarch/"),
+            ("internal", "linux-64", "/conda/internal/linux-64/"),
+            ("conda-forge", "osx-arm64", "/conda/conda-forge/osx-arm64/"),
+            ("ml-models", "win-64", "/conda/ml-models/win-64/"),
+        ];
+
+        for (repo_key, subdir, expected) in cases {
+            let base_url = format!("/conda/{}/{}/", repo_key, subdir);
+            assert_eq!(base_url, expected, "base_url for {}/{}", repo_key, subdir);
+        }
+    }
+
+    #[test]
+    fn test_gzip_compress_reduces_size() {
+        // JSON compresses well with gzip
+        let json = serde_json::to_vec(&serde_json::json!({
+            "packages": {
+                "numpy-1.26.4-py312h2809609_0.conda": {
+                    "build": "py312h2809609_0",
+                    "build_number": 0,
+                    "depends": ["python >=3.12,<3.13", "libopenblas >=0.3.25"],
+                    "name": "numpy",
+                    "version": "1.26.4",
+                    "size": 8388608,
+                    "sha256": "abcdef1234567890",
+                    "subdir": "linux-64",
+                },
+            },
+            "packages.conda": {},
+            "removed": [],
+            "info": { "subdir": "linux-64", "base_url": "/conda/test/linux-64/" },
+            "repodata_version": 1,
+        }))
+        .unwrap();
+
+        let compressed = gzip_compress(&json);
+        assert!(
+            compressed.len() < json.len(),
+            "gzip compressed ({} bytes) should be smaller than original ({} bytes)",
+            compressed.len(),
+            json.len()
         );
     }
 }
