@@ -73,7 +73,7 @@ fn require_visible(
 /// Create repository routes
 pub fn router() -> Router<SharedState> {
     use axum::extract::DefaultBodyLimit;
-    use axum::routing::delete;
+    use axum::routing::{delete, put};
 
     Router::new()
         .route("/", get(list_repositories).post(create_repository))
@@ -82,6 +82,11 @@ pub fn router() -> Router<SharedState> {
             get(get_repository)
                 .patch(update_repository)
                 .delete(delete_repository),
+        )
+        // Cache TTL configuration for proxy/remote repositories
+        .route(
+            "/:key/cache-ttl",
+            put(set_cache_ttl).get(get_cache_ttl),
         )
         // Virtual repository member management
         .route(
@@ -213,6 +218,124 @@ fn validate_repository_key(key: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Validate that a cache TTL value (in seconds) is within the acceptable range.
+/// Minimum is 1 second, maximum is 30 days (2,592,000 seconds).
+fn validate_cache_ttl(secs: i64) -> bool {
+    (1..=2_592_000).contains(&secs)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetCacheTtlRequest {
+    pub cache_ttl_seconds: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CacheTtlResponse {
+    pub repository_key: String,
+    pub cache_ttl_seconds: i64,
+}
+
+/// Set the proxy cache TTL for a repository
+#[utoipa::path(
+    put,
+    path = "/{key}/cache-ttl",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetCacheTtlRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Cache TTL updated", body = CacheTtlResponse),
+        (status = 400, description = "Invalid TTL value"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_cache_ttl(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetCacheTtlRequest>,
+) -> Result<Json<CacheTtlResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    if !validate_cache_ttl(payload.cache_ttl_seconds) {
+        return Err(AppError::Validation(
+            "cache_ttl_seconds must be between 1 and 2592000 (30 days)".to_string(),
+        ));
+    }
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    // Upsert into repository_config table
+    sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, 'cache_ttl_secs', $2)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = $2, updated_at = NOW()
+        "#,
+    )
+    .bind(repo.id)
+    .bind(payload.cache_ttl_seconds.to_string())
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(CacheTtlResponse {
+        repository_key: key,
+        cache_ttl_seconds: payload.cache_ttl_seconds,
+    }))
+}
+
+/// Get the proxy cache TTL for a repository
+#[utoipa::path(
+    get,
+    path = "/{key}/cache-ttl",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Current cache TTL", body = CacheTtlResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_cache_ttl(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<CacheTtlResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    // Read from repository_config table
+    let result: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT value FROM repository_config
+        WHERE repository_id = $1 AND key = 'cache_ttl_secs'
+        "#,
+    )
+    .bind(repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let ttl = result
+        .and_then(|(v,)| v.parse::<i64>().ok())
+        .unwrap_or(3600); // default 1 hour
+
+    Ok(Json(CacheTtlResponse {
+        repository_key: key,
+        cache_ttl_seconds: ttl,
+    }))
 }
 
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
@@ -1463,6 +1586,8 @@ pub async fn update_virtual_members(
         get_repository,
         update_repository,
         delete_repository,
+        set_cache_ttl,
+        get_cache_ttl,
         list_artifacts,
         get_artifact_metadata,
         upload_artifact,
@@ -1479,6 +1604,8 @@ pub async fn update_virtual_members(
         UpdateRepositoryRequest,
         RepositoryResponse,
         RepositoryListResponse,
+        SetCacheTtlRequest,
+        CacheTtlResponse,
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
@@ -2526,5 +2653,76 @@ mod tests {
             AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
             other => panic!("Expected NotFound error, got: {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_cache_ttl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_cache_ttl_valid_5_minutes() {
+        assert!(validate_cache_ttl(300));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_1_day() {
+        assert!(validate_cache_ttl(86400));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_1_week() {
+        assert!(validate_cache_ttl(604800));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_minimum() {
+        assert!(validate_cache_ttl(1));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_maximum() {
+        assert!(validate_cache_ttl(2_592_000));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_zero() {
+        assert!(!validate_cache_ttl(0));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_negative() {
+        assert!(!validate_cache_ttl(-1));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_too_large() {
+        assert!(!validate_cache_ttl(2_592_001));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_very_negative() {
+        assert!(!validate_cache_ttl(-86400));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache TTL DTO serialization / deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_cache_ttl_request_deserialization() {
+        let json = r#"{"cache_ttl_seconds": 3600}"#;
+        let req: SetCacheTtlRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cache_ttl_seconds, 3600);
+    }
+
+    #[test]
+    fn test_cache_ttl_response_serialization() {
+        let resp = CacheTtlResponse {
+            repository_key: "my-remote-repo".to_string(),
+            cache_ttl_seconds: 7200,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"repository_key\":\"my-remote-repo\""));
+        assert!(json.contains("\"cache_ttl_seconds\":7200"));
     }
 }
