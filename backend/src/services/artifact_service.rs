@@ -626,6 +626,29 @@ impl ArtifactService {
             return Err(AppError::NotFound("Artifact not found".to_string()));
         }
 
+        // Enqueue delete sync tasks for all eligible peers (non-blocking)
+        let _ = sqlx::query(
+            r#"
+            INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
+            SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+            FROM peer_instances pi
+            JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
+            JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+            WHERE pi.is_local = false
+              AND pi.status IN ('online', 'syncing')
+              AND prs.replication_mode::text IN ('push', 'mirror')
+              AND prs.sync_enabled = true
+            ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| {
+            tracing::warn!("Failed to enqueue delete sync tasks for artifact {}: {}", id, e);
+            e
+        });
+
         // Trigger AfterDelete hooks (non-blocking)
         self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
             .await;
@@ -1114,5 +1137,32 @@ mod tests {
         assert!(!is_dangerous_url("https://example.com"));
         assert!(!is_dangerous_url("http://example.com"));
         assert!(!is_dangerous_url("data:image/png;base64,abc"));
+    }
+
+    // -----------------------------------------------------------------------
+    // delete sync task SQL validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_delete_sync_task_sql_contains_required_clauses() {
+        let sql = r#"
+            INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
+            SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+            FROM peer_instances pi
+            JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
+            JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+            WHERE pi.is_local = false
+              AND pi.status IN ('online', 'syncing')
+              AND prs.replication_mode::text IN ('push', 'mirror')
+              AND prs.sync_enabled = true
+            ON CONFLICT (peer_instance_id, artifact_id, task_type) DO NOTHING
+        "#;
+        assert!(sql.contains("INSERT INTO sync_tasks"));
+        assert!(sql.contains("'delete'"));
+        assert!(sql.contains("peer_repo_subscriptions"));
+        assert!(sql.contains("replication_mode"));
+        assert!(sql.contains("sync_enabled"));
+        assert!(sql.contains("is_local = false"));
+        assert!(sql.contains("ON CONFLICT"));
     }
 }
