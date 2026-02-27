@@ -751,6 +751,8 @@ mod tests {
             dependency_track_url: None,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".into(),
+            gc_schedule: "0 0 * * * *".into(),
+            lifecycle_check_interval_secs: 60,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -792,6 +794,8 @@ mod tests {
             dependency_track_url: None,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".into(),
+            gc_schedule: "0 0 * * * *".into(),
+            lifecycle_check_interval_secs: 60,
         }
     }
 

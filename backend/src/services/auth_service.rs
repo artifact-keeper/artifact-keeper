@@ -1034,6 +1034,8 @@ mod tests {
             dependency_track_url: None,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".to_string(),
+            gc_schedule: "0 0 * * * *".to_string(),
+            lifecycle_check_interval_secs: 60,
         })
     }
 
