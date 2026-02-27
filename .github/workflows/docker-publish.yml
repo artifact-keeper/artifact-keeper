@@ -418,7 +418,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest }}
@@ -537,7 +537,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@${{ steps.inspect.outputs.digest }}
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           subject-digest: ${{ steps.inspect.outputs.digest }}
