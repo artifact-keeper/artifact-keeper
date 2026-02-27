@@ -39,6 +39,9 @@ pub struct SearchQuery {
     pub offset: Option<i64>,
     /// Limit for pagination
     pub limit: Option<i64>,
+    /// When true, only return results from public repositories.
+    #[serde(default)]
+    pub public_only: bool,
 }
 
 /// Search response with pagination and facets
@@ -104,6 +107,40 @@ pub(crate) fn build_suggest_pattern(prefix: &str) -> String {
     format!("{}%", prefix)
 }
 
+/// Row type returned by all search SQL queries (12 fields).
+type SearchResultRow = (
+    Uuid,
+    Uuid,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+    DateTime<Utc>,
+    i64,
+    f32,
+);
+
+/// Convert a database row tuple into a [`SearchResult`].
+fn row_to_search_result(r: SearchResultRow) -> SearchResult {
+    SearchResult {
+        id: r.0,
+        repository_id: r.1,
+        repository_key: r.2,
+        path: r.3,
+        name: r.4,
+        version: r.5,
+        format: r.6.unwrap_or_default(),
+        size_bytes: r.7,
+        content_type: r.8,
+        created_at: r.9,
+        download_count: r.10,
+        score: r.11,
+    }
+}
+
 /// Search service
 pub struct SearchService {
     db: PgPool,
@@ -139,87 +176,73 @@ impl SearchService {
         limit: i64,
     ) -> Result<Vec<SearchResult>> {
         let q_filter = build_tsquery_filter(query.q.as_deref());
-
         let name_filter = build_name_filter(query.name.as_deref());
 
-        let results = sqlx::query!(
-            r#"
-            SELECT
-                a.id,
-                a.repository_id,
-                r.key as repository_key,
-                a.path,
-                a.name,
-                a.version,
-                r.format::text as format,
-                a.size_bytes,
-                a.content_type,
-                a.created_at,
-                COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0) as "download_count!",
-                1.0::real as score
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.is_deleted = false
-              AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
-              AND ($2::text IS NULL OR r.format::text = $2)
-              AND ($3::text IS NULL OR a.name ILIKE $3)
-            ORDER BY a.created_at DESC
-            OFFSET $4
-            LIMIT $5
-            "#,
-            q_filter,
-            query.format,
-            name_filter,
-            offset,
-            limit
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<SearchResultRow> = sqlx::query_as(
+                r#"
+                SELECT
+                    a.id,
+                    a.repository_id,
+                    r.key,
+                    a.path,
+                    a.name,
+                    a.version,
+                    r.format::text,
+                    a.size_bytes,
+                    a.content_type,
+                    a.created_at,
+                    COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0)::BIGINT,
+                    1.0::real
+                FROM artifacts a
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE a.is_deleted = false
+                  AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
+                  AND ($2::text IS NULL OR r.format::text = $2)
+                  AND ($3::text IS NULL OR a.name ILIKE $3)
+                  AND ($6 = false OR r.is_public = true)
+                ORDER BY a.created_at DESC
+                OFFSET $4
+                LIMIT $5
+                "#,
+            )
+            .bind(&q_filter)
+            .bind(&query.format)
+            .bind(&name_filter)
+            .bind(offset)
+            .bind(limit)
+            .bind(query.public_only)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(results
-            .into_iter()
-            .map(|r| SearchResult {
-                id: r.id,
-                repository_id: r.repository_id,
-                repository_key: r.repository_key,
-                path: r.path,
-                name: r.name,
-                version: r.version,
-                format: r.format.unwrap_or_default(),
-                size_bytes: r.size_bytes,
-                content_type: r.content_type,
-                created_at: r.created_at,
-                download_count: r.download_count,
-                score: r.score.unwrap_or(1.0),
-            })
-            .collect())
+        Ok(rows.into_iter().map(row_to_search_result).collect())
     }
 
     async fn count_results(&self, query: &SearchQuery) -> Result<i64> {
         let q_filter = build_tsquery_filter(query.q.as_deref());
-
         let name_filter = build_name_filter(query.name.as_deref());
 
-        let count = sqlx::query_scalar!(
+        let count: (i64,) = sqlx::query_as(
             r#"
-            SELECT COUNT(*) as "count!"
+            SELECT COUNT(*)::BIGINT
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = false
               AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
               AND ($2::text IS NULL OR r.format::text = $2)
               AND ($3::text IS NULL OR a.name ILIKE $3)
+              AND ($4 = false OR r.is_public = true)
             "#,
-            q_filter,
-            query.format,
-            name_filter
         )
+        .bind(&q_filter)
+        .bind(&query.format)
+        .bind(&name_filter)
+        .bind(query.public_only)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(count)
+        Ok(count.0)
     }
 
     async fn get_facets(&self) -> Result<SearchFacets> {
@@ -318,101 +341,80 @@ impl SearchService {
     }
 
     /// Get trending artifacts (most downloaded recently)
-    pub async fn trending(&self, days: i32, limit: i64) -> Result<Vec<SearchResult>> {
-        let results = sqlx::query!(
+    pub async fn trending(
+        &self,
+        days: i32,
+        limit: i64,
+        public_only: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let rows: Vec<SearchResultRow> = sqlx::query_as(
             r#"
-            SELECT
-                a.id,
-                a.repository_id,
-                r.key as repository_key,
-                a.path,
-                a.name,
-                a.version,
-                r.format::text as format,
-                a.size_bytes,
-                a.content_type,
-                a.created_at,
-                COUNT(ds.id) as "download_count!"
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            LEFT JOIN download_statistics ds ON ds.artifact_id = a.id
-                AND ds.downloaded_at >= NOW() - make_interval(days => $1)
-            WHERE a.is_deleted = false
-            GROUP BY a.id, r.id
-            ORDER BY 11 DESC
-            LIMIT $2
-            "#,
-            days,
-            limit
+                SELECT
+                    a.id,
+                    a.repository_id,
+                    r.key,
+                    a.path,
+                    a.name,
+                    a.version,
+                    r.format::text,
+                    a.size_bytes,
+                    a.content_type,
+                    a.created_at,
+                    COUNT(ds.id)::BIGINT,
+                    1.0::real
+                FROM artifacts a
+                JOIN repositories r ON r.id = a.repository_id
+                LEFT JOIN download_statistics ds ON ds.artifact_id = a.id
+                    AND ds.downloaded_at >= NOW() - make_interval(days => $1)
+                WHERE a.is_deleted = false
+                  AND ($3 = false OR r.is_public = true)
+                GROUP BY a.id, r.id
+                ORDER BY 11 DESC
+                LIMIT $2
+                "#,
         )
+        .bind(days)
+        .bind(limit)
+        .bind(public_only)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(results
-            .into_iter()
-            .map(|r| SearchResult {
-                id: r.id,
-                repository_id: r.repository_id,
-                repository_key: r.repository_key,
-                path: r.path,
-                name: r.name,
-                version: r.version,
-                format: r.format.unwrap_or_default(),
-                size_bytes: r.size_bytes,
-                content_type: r.content_type,
-                created_at: r.created_at,
-                download_count: r.download_count,
-                score: 1.0,
-            })
-            .collect())
+        Ok(rows.into_iter().map(row_to_search_result).collect())
     }
 
     /// Get recently added artifacts
-    pub async fn recent(&self, limit: i64) -> Result<Vec<SearchResult>> {
-        let results = sqlx::query!(
+    pub async fn recent(&self, limit: i64, public_only: bool) -> Result<Vec<SearchResult>> {
+        let rows: Vec<SearchResultRow> = sqlx::query_as(
             r#"
-            SELECT
-                a.id,
-                a.repository_id,
-                r.key as repository_key,
-                a.path,
-                a.name,
-                a.version,
-                r.format::text as format,
-                a.size_bytes,
-                a.content_type,
-                a.created_at,
-                COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0) as "download_count!"
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.is_deleted = false
-            ORDER BY a.created_at DESC
-            LIMIT $1
-            "#,
-            limit
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+                SELECT
+                    a.id,
+                    a.repository_id,
+                    r.key,
+                    a.path,
+                    a.name,
+                    a.version,
+                    r.format::text,
+                    a.size_bytes,
+                    a.content_type,
+                    a.created_at,
+                    COALESCE((SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id), 0)::BIGINT,
+                    1.0::real
+                FROM artifacts a
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE a.is_deleted = false
+                  AND ($2 = false OR r.is_public = true)
+                ORDER BY a.created_at DESC
+                LIMIT $1
+                "#,
+            )
+            .bind(limit)
+            .bind(public_only)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(results
-            .into_iter()
-            .map(|r| SearchResult {
-                id: r.id,
-                repository_id: r.repository_id,
-                repository_key: r.repository_key,
-                path: r.path,
-                name: r.name,
-                version: r.version,
-                format: r.format.unwrap_or_default(),
-                size_bytes: r.size_bytes,
-                content_type: r.content_type,
-                created_at: r.created_at,
-                download_count: r.download_count,
-                score: 1.0,
-            })
-            .collect())
+        Ok(rows.into_iter().map(row_to_search_result).collect())
     }
 }
 
@@ -432,6 +434,7 @@ mod tests {
         assert!(query.name.is_none());
         assert!(query.offset.is_none());
         assert!(query.limit.is_none());
+        assert!(!query.public_only);
     }
 
     #[test]
@@ -733,5 +736,89 @@ mod tests {
         let prefix = "";
         let pattern = format!("{}%", prefix);
         assert_eq!(pattern, "%");
+    }
+
+    // -----------------------------------------------------------------------
+    // public_only field behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_query_public_only_defaults_false() {
+        let json = r#"{"q": "test"}"#;
+        let query: SearchQuery = serde_json::from_str(json).unwrap();
+        assert!(!query.public_only);
+    }
+
+    #[test]
+    fn test_search_query_public_only_explicit_true() {
+        let json = r#"{"q": "test", "public_only": true}"#;
+        let query: SearchQuery = serde_json::from_str(json).unwrap();
+        assert!(query.public_only);
+    }
+
+    #[test]
+    fn test_search_query_public_only_explicit_false() {
+        let json = r#"{"public_only": false}"#;
+        let query: SearchQuery = serde_json::from_str(json).unwrap();
+        assert!(!query.public_only);
+    }
+
+    // -----------------------------------------------------------------------
+    // row_to_search_result
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_row_to_search_result_all_fields() {
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let row: SearchResultRow = (
+            id,
+            repo_id,
+            "my-repo".to_string(),
+            "com/example/lib.jar".to_string(),
+            "lib".to_string(),
+            Some("1.0".to_string()),
+            Some("maven".to_string()),
+            2048,
+            "application/java-archive".to_string(),
+            now,
+            10,
+            0.95,
+        );
+        let result = row_to_search_result(row);
+        assert_eq!(result.id, id);
+        assert_eq!(result.repository_id, repo_id);
+        assert_eq!(result.repository_key, "my-repo");
+        assert_eq!(result.path, "com/example/lib.jar");
+        assert_eq!(result.name, "lib");
+        assert_eq!(result.version.as_deref(), Some("1.0"));
+        assert_eq!(result.format, "maven");
+        assert_eq!(result.size_bytes, 2048);
+        assert_eq!(result.content_type, "application/java-archive");
+        assert_eq!(result.created_at, now);
+        assert_eq!(result.download_count, 10);
+        assert!((result.score - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_row_to_search_result_none_format() {
+        let row: SearchResultRow = (
+            Uuid::nil(),
+            Uuid::nil(),
+            "repo".to_string(),
+            "path".to_string(),
+            "name".to_string(),
+            None,
+            None, // format is None
+            0,
+            "text/plain".to_string(),
+            Utc::now(),
+            0,
+            1.0,
+        );
+        let result = row_to_search_result(row);
+        assert_eq!(result.format, ""); // unwrap_or_default
+        assert!(result.version.is_none());
     }
 }

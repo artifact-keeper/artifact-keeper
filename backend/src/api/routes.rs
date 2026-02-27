@@ -5,7 +5,10 @@ use std::sync::Arc;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::handlers;
-use super::middleware::auth::{admin_middleware, auth_middleware, optional_auth_middleware};
+use super::middleware::auth::{
+    admin_middleware, auth_middleware, optional_auth_middleware, repo_visibility_middleware,
+    RepoVisibilityState,
+};
 use super::middleware::demo::demo_guard;
 use super::middleware::rate_limit::{rate_limit_middleware, RateLimiter};
 use super::middleware::setup::setup_guard;
@@ -16,6 +19,58 @@ use crate::services::auth_service::AuthService;
 pub fn create_router(state: SharedState) -> Router {
     // Build OpenAPI spec once at startup
     let openapi = super::openapi::build_openapi();
+
+    // Build repo-visibility state used by all format-handler routes.
+    // This middleware performs optional auth + private-repo gating in a
+    // single pass so that every format handler is protected by default.
+    let vis_auth_service = Arc::new(AuthService::new(
+        state.db.clone(),
+        Arc::new(state.config.clone()),
+    ));
+    let vis_state = RepoVisibilityState {
+        auth_service: vis_auth_service,
+        db: state.db.clone(),
+    };
+
+    // All native-protocol format handlers share the repo visibility
+    // middleware: anonymous users can only access public repositories.
+    let format_routes = Router::new()
+        .nest("/npm", handlers::npm::router())
+        .nest("/maven", handlers::maven::router())
+        .nest("/pypi", handlers::pypi::router())
+        .nest("/debian", handlers::debian::router())
+        .nest("/nuget", handlers::nuget::router())
+        .nest("/rpm", handlers::rpm::router())
+        .nest("/cargo", handlers::cargo::router())
+        .nest("/gems", handlers::rubygems::router())
+        .nest("/lfs", handlers::gitlfs::router())
+        .nest("/pub", handlers::pub_registry::router())
+        .nest("/go", handlers::goproxy::router())
+        .nest("/helm", handlers::helm::router())
+        .nest("/composer", handlers::composer::router())
+        .nest("/conan", handlers::conan::router())
+        .nest("/alpine", handlers::alpine::router())
+        .nest("/conda", handlers::conda::router())
+        .nest("/conda/t", handlers::conda::token_router())
+        .nest("/swift", handlers::swift::router())
+        .nest("/terraform", handlers::terraform::router())
+        .nest("/cocoapods", handlers::cocoapods::router())
+        .nest("/hex", handlers::hex::router())
+        .nest("/huggingface", handlers::huggingface::router())
+        .nest("/jetbrains", handlers::jetbrains::router())
+        .nest("/chef", handlers::chef::router())
+        .nest("/puppet", handlers::puppet::router())
+        .nest("/ansible", handlers::ansible::router())
+        .nest("/cran", handlers::cran::router())
+        .nest("/ivy", handlers::sbt::router())
+        .nest("/vscode", handlers::vscode::router())
+        .nest("/proto", handlers::protobuf::router())
+        .nest("/incus", handlers::incus::router())
+        .nest("/ext", handlers::wasm_proxy::router())
+        .layer(middleware::from_fn_with_state(
+            vis_state,
+            repo_visibility_middleware,
+        ));
 
     let mut router = Router::new()
         // Health endpoints (no auth required)
@@ -31,69 +86,8 @@ pub fn create_router(state: SharedState) -> Router {
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
         .nest("/v2", handlers::oci_v2::router())
-        // npm Registry API
-        .nest("/npm", handlers::npm::router())
-        // PyPI Simple Repository API (PEP 503)
-        .nest("/maven", handlers::maven::router())
-        .nest("/pypi", handlers::pypi::router())
-        // Debian/APT Repository API
-        .nest("/debian", handlers::debian::router())
-        // NuGet v3 API
-        .nest("/nuget", handlers::nuget::router())
-        // RPM/YUM Repository API
-        .nest("/rpm", handlers::rpm::router())
-        // Cargo sparse registry API
-        .nest("/cargo", handlers::cargo::router())
-        // RubyGems API
-        .nest("/gems", handlers::rubygems::router())
-        // Git LFS API
-        .nest("/lfs", handlers::gitlfs::router())
-        // Pub (Dart/Flutter) Repository API
-        .nest("/pub", handlers::pub_registry::router())
-        // Go Proxy API (GOPROXY protocol)
-        .nest("/go", handlers::goproxy::router())
-        // Helm Chart Repository API
-        .nest("/helm", handlers::helm::router())
-        // Composer (PHP) Repository API
-        .nest("/composer", handlers::composer::router())
-        // Conan v2 Repository API (C/C++ packages)
-        .nest("/conan", handlers::conan::router())
-        // Alpine/APK Repository API
-        .nest("/alpine", handlers::alpine::router())
-        // Conda Channel API
-        .nest("/conda", handlers::conda::router())
-        // Conda with URL path token authentication (/conda/t/<TOKEN>/<repo_key>/...)
-        .nest("/conda/t", handlers::conda::token_router())
-        // Swift Package Registry (SE-0292)
-        .nest("/swift", handlers::swift::router())
-        // Terraform Registry Protocol
-        .nest("/terraform", handlers::terraform::router())
-        // CocoaPods Spec Repo API
-        .nest("/cocoapods", handlers::cocoapods::router())
-        // Hex.pm Repository API (Elixir/Erlang packages)
-        .nest("/hex", handlers::hex::router())
-        // HuggingFace Hub API
-        .nest("/huggingface", handlers::huggingface::router())
-        // JetBrains Plugin Repository API
-        .nest("/jetbrains", handlers::jetbrains::router())
-        // Chef Supermarket API
-        .nest("/chef", handlers::chef::router())
-        // Puppet Forge API
-        .nest("/puppet", handlers::puppet::router())
-        // Ansible Galaxy API
-        .nest("/ansible", handlers::ansible::router())
-        // CRAN Repository API (R packages)
-        .nest("/cran", handlers::cran::router())
-        // SBT/Ivy Repository API (Scala/Java packages)
-        .nest("/ivy", handlers::sbt::router())
-        // VS Code Extension Marketplace API
-        .nest("/vscode", handlers::vscode::router())
-        // Protobuf / Buf Schema Registry (Connect RPC)
-        .nest("/proto", handlers::protobuf::router())
-        // Incus/LXC Container Image Repository (SimpleStreams protocol)
-        .nest("/incus", handlers::incus::router())
-        // WASM plugin native protocol proxy (pip, dnf, etc.)
-        .nest("/ext", handlers::wasm_proxy::router());
+        // All native-protocol format handler routes (repo visibility enforced)
+        .merge(format_routes);
 
     // Disable the global body limit. This is an artifact registry — uploads
     // can be multiple GB. Without this, Axum's 2 MB default silently truncates

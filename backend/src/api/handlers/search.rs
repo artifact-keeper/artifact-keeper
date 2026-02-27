@@ -5,7 +5,7 @@
 //! falling back to PostgreSQL full-text search.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     routing::get,
     Json, Router,
 };
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::search_service::{SearchQuery, SearchService};
@@ -107,6 +108,7 @@ pub struct QuickSearchResponse {
 )]
 pub async fn quick_search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<QuickSearchQuery>,
 ) -> Result<Json<QuickSearchResponse>> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
@@ -124,6 +126,7 @@ pub async fn quick_search(
         name: None,
         offset: Some(0),
         limit: Some(limit),
+        public_only: auth.is_none(),
     };
 
     let service = SearchService::new(state.db.clone());
@@ -190,6 +193,7 @@ pub struct AdvancedSearchResponse {
 )]
 pub async fn advanced_search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<AdvancedSearchQuery>,
 ) -> Result<Json<AdvancedSearchResponse>> {
     let page = params.page.unwrap_or(1).max(1);
@@ -202,6 +206,7 @@ pub async fn advanced_search(
         name: params.name.clone(),
         offset: Some(offset),
         limit: Some(per_page as i64),
+        public_only: auth.is_none(),
     };
 
     let service = SearchService::new(state.db.clone());
@@ -506,13 +511,14 @@ pub struct TrendingQuery {
 )]
 pub async fn trending(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<TrendingQuery>,
 ) -> Result<Json<Vec<SearchResultItem>>> {
     let days = params.days.unwrap_or(7).clamp(1, 90);
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     let service = SearchService::new(state.db.clone());
-    let results = service.trending(days, limit).await?;
+    let results = service.trending(days, limit, auth.is_none()).await?;
 
     let items = results
         .into_iter()
@@ -554,12 +560,13 @@ pub struct RecentQuery {
 )]
 pub async fn recent(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<RecentQuery>,
 ) -> Result<Json<Vec<SearchResultItem>>> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     let service = SearchService::new(state.db.clone());
-    let results = service.recent(limit).await?;
+    let results = service.recent(limit, auth.is_none()).await?;
 
     let items = results
         .into_iter()

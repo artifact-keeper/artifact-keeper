@@ -43,6 +43,33 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
     }
 }
 
+/// Ensure a repository is visible to the current user.
+/// Public repos are visible to everyone. Private repos require authentication.
+fn require_visible(
+    repo: &crate::models::repository::Repository,
+    auth: &Option<AuthExtension>,
+) -> Result<()> {
+    if repo.is_public {
+        return Ok(());
+    }
+    match auth {
+        Some(a) => {
+            if a.can_access_repo(repo.id) {
+                Ok(())
+            } else {
+                Err(AppError::NotFound(format!(
+                    "Repository '{}' not found",
+                    repo.key
+                )))
+            }
+        }
+        None => Err(AppError::NotFound(format!(
+            "Repository '{}' not found",
+            repo.key
+        ))),
+    }
+}
+
 /// Create repository routes
 pub fn router() -> Router<SharedState> {
     use axum::extract::DefaultBodyLimit;
@@ -269,6 +296,7 @@ fn parse_repo_type(s: &str) -> Result<RepositoryType> {
 )]
 pub async fn list_repositories(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListRepositoriesQuery>,
 ) -> Result<Json<RepositoryListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
@@ -282,6 +310,7 @@ pub async fn list_repositories(
         .map(|t| parse_repo_type(t))
         .transpose()?;
 
+    let public_only = auth.is_none();
     let service = RepositoryService::new(state.db.clone());
     let (repos, total) = service
         .list(
@@ -289,7 +318,7 @@ pub async fn list_repositories(
             per_page as i64,
             format_filter,
             type_filter,
-            false,
+            public_only,
             query.q.as_deref(),
         )
         .await?;
@@ -404,10 +433,12 @@ pub async fn create_repository(
 )]
 pub async fn get_repository(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<RepositoryResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
     let storage_used = service.get_storage_usage(repo.id).await?;
 
     Ok(Json(repo_to_response(repo, storage_used)))
@@ -565,6 +596,7 @@ pub struct ArtifactListResponse {
 )]
 pub async fn list_artifacts(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
     Query(query): Query<ListArtifactsQuery>,
 ) -> Result<Json<ArtifactListResponse>> {
@@ -574,6 +606,7 @@ pub async fn list_artifacts(
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
 
     let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -637,10 +670,12 @@ pub async fn list_artifacts(
 )]
 pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
 ) -> Result<Json<ArtifactResponse>> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
 
     let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -878,6 +913,7 @@ pub async fn download_artifact(
 ) -> Result<impl IntoResponse> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
 
     // Get client IP for analytics
     let ip_addr = request

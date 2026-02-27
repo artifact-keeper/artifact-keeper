@@ -3,7 +3,7 @@
 //! Provides a virtual folder tree derived from artifact paths within a repository.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     routing::get,
     Json, Router,
 };
@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 
@@ -77,6 +78,7 @@ struct FolderEntry {
 )]
 pub async fn get_tree(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<TreeQuery>,
 ) -> Result<Json<TreeResponse>> {
     let repo_key = match params.repository_key {
@@ -88,12 +90,24 @@ pub async fn get_tree(
         }
     };
 
-    // Verify repository exists
-    let repo = sqlx::query!("SELECT id FROM repositories WHERE key = $1", repo_key)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
+    // Verify repository exists and check visibility
+    let repo_row: Option<(Uuid, bool)> =
+        sqlx::query_as("SELECT id, is_public FROM repositories WHERE key = $1")
+            .bind(&repo_key)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let (repo_id, is_public) = repo_row
         .ok_or_else(|| AppError::NotFound(format!("Repository '{}' not found", repo_key)))?;
+
+    // Private repos require authentication
+    if !is_public && auth.is_none() {
+        return Err(AppError::NotFound(format!(
+            "Repository '{}' not found",
+            repo_key
+        )));
+    }
 
     let prefix = params.path.unwrap_or_default();
     let prefix_depth = if prefix.is_empty() {
@@ -117,7 +131,7 @@ pub async fn get_tree(
           AND ($2 = '' OR a.path LIKE $2 || '%')
         ORDER BY a.path
         "#,
-        repo.id,
+        repo_id,
         if prefix.is_empty() {
             String::new()
         } else {

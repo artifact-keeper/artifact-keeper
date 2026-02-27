@@ -242,6 +242,33 @@ async fn validate_api_token_with_scopes(
     })
 }
 
+/// Try to resolve an optional authentication token into an [`AuthExtension`].
+///
+/// Returns `Some(ext)` when a valid Bearer JWT, Bearer API token, or ApiKey
+/// token is present, and `None` otherwise (missing, invalid, or expired).
+/// This is the shared logic used by [`optional_auth_middleware`] and
+/// [`repo_visibility_middleware`].
+async fn try_resolve_auth(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+) -> Option<AuthExtension> {
+    match extracted {
+        ExtractedToken::Bearer(token) => {
+            if let Ok(claims) = auth_service.validate_access_token(token) {
+                Some(AuthExtension::from(claims))
+            } else {
+                validate_api_token_with_scopes(auth_service, token)
+                    .await
+                    .ok()
+            }
+        }
+        ExtractedToken::ApiKey(token) => validate_api_token_with_scopes(auth_service, token)
+            .await
+            .ok(),
+        ExtractedToken::None | ExtractedToken::Invalid => None,
+    }
+}
+
 /// Optional authentication middleware - allows unauthenticated requests
 ///
 /// Supports the same authentication schemes as auth_middleware but
@@ -252,22 +279,7 @@ pub async fn optional_auth_middleware(
     next: Next,
 ) -> Response {
     let extracted = extract_token(&request);
-
-    let auth_ext = match extracted {
-        ExtractedToken::Bearer(token) => {
-            if let Ok(claims) = auth_service.validate_access_token(token) {
-                Some(AuthExtension::from(claims))
-            } else {
-                validate_api_token_with_scopes(&auth_service, token)
-                    .await
-                    .ok()
-            }
-        }
-        ExtractedToken::ApiKey(token) => validate_api_token_with_scopes(&auth_service, token)
-            .await
-            .ok(),
-        ExtractedToken::None | ExtractedToken::Invalid => None,
-    };
+    let auth_ext = try_resolve_auth(&auth_service, extracted).await;
 
     request.extensions_mut().insert(auth_ext);
     next.run(request).await
@@ -321,6 +333,69 @@ pub async fn admin_middleware(
 
     request.extensions_mut().insert(auth_ext);
     next.run(request).await
+}
+
+/// State for the repo visibility middleware.
+#[derive(Clone)]
+pub struct RepoVisibilityState {
+    pub auth_service: Arc<AuthService>,
+    pub db: sqlx::PgPool,
+}
+
+/// Middleware that enforces repository visibility on format handler routes.
+///
+/// For routes whose first path segment is a repository key, this middleware
+/// checks whether the repository is public. If it is not public, the request
+/// must carry a valid authentication token; otherwise a 404 is returned (to
+/// avoid leaking the existence of private repos).
+///
+/// This provides defence-in-depth: even if individual format handlers forget
+/// to check visibility, this middleware blocks anonymous access to private
+/// repository content.
+pub async fn repo_visibility_middleware(
+    State(vis_state): State<RepoVisibilityState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    // Extract the first path segment as a potential repo key.
+    let path = request.uri().path().to_string();
+    let repo_key = path.trim_start_matches('/').split('/').next().unwrap_or("");
+
+    if repo_key.is_empty() {
+        return next.run(request).await;
+    }
+
+    // Look up whether this repo is public.
+    let is_public: Option<bool> =
+        sqlx::query_scalar("SELECT is_public FROM repositories WHERE key = $1")
+            .bind(repo_key)
+            .fetch_optional(&vis_state.db)
+            .await
+            .ok()
+            .flatten();
+
+    // If no repo found for this key, let the handler return its own 404.
+    let Some(is_public) = is_public else {
+        return next.run(request).await;
+    };
+
+    // Perform optional auth (shared with optional_auth_middleware).
+    let extracted = extract_token(&request);
+    let auth_ext = try_resolve_auth(&vis_state.auth_service, extracted).await;
+
+    // Insert auth extension for downstream handlers.
+    request.extensions_mut().insert(auth_ext.clone());
+
+    // If the repo is public, allow access unconditionally.
+    if is_public {
+        return next.run(request).await;
+    }
+
+    // Private repo: require authentication.
+    match auth_ext {
+        Some(_) => next.run(request).await,
+        None => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
 }
 
 #[cfg(test)]
