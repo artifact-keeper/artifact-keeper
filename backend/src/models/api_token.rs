@@ -25,6 +25,9 @@ pub struct ApiToken {
     pub created_by_user_id: Option<Uuid>,
     pub description: Option<String>,
     pub repo_selector: Option<serde_json::Value>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_ip: Option<String>,
+    pub last_used_user_agent: Option<String>,
 }
 
 redacted_debug!(ApiToken {
@@ -78,6 +81,9 @@ mod tests {
             created_by_user_id: None,
             description: None,
             repo_selector: None,
+            revoked_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
         };
         let debug = format!("{:?}", token);
         assert!(debug.contains("my-token"));

@@ -264,11 +264,12 @@ impl AuthService {
 
         let prefix = &token[..8];
 
-        // Find token by prefix
+        // Find token by prefix (includes revoked_at and last_used_at for
+        // revocation check and debounced usage tracking).
         let stored_token = sqlx::query!(
             r#"
             SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,
-                   at.repo_selector
+                   at.repo_selector, at.revoked_at, at.last_used_at
             FROM api_tokens at
             WHERE at.token_prefix = $1
             "#,
@@ -278,6 +279,13 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("Invalid API token".to_string()))?;
+
+        // Check revocation before spending time on hash verification
+        if stored_token.revoked_at.is_some() {
+            return Err(AppError::Unauthorized(
+                "Token has been revoked".to_string(),
+            ));
+        }
 
         // Verify full token hash
         if !Self::verify_password(token, &stored_token.token_hash)? {
@@ -291,14 +299,25 @@ impl AuthService {
             }
         }
 
-        // Update last used timestamp
-        sqlx::query!(
-            "UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1",
-            stored_token.id
-        )
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        // Debounced usage analytics: only update last_used_at if it has been
+        // more than 5 minutes since the last recorded use (or never used).
+        let should_update = stored_token
+            .last_used_at
+            .map(|lu| Utc::now() - lu > Duration::minutes(5))
+            .unwrap_or(true);
+
+        if should_update {
+            let token_id = stored_token.id;
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1",
+                )
+                .bind(token_id)
+                .execute(&db)
+                .await;
+            });
+        }
 
         // Fetch user
         let user = sqlx::query_as!(
@@ -412,13 +431,13 @@ impl AuthService {
         Ok((token, record.id))
     }
 
-    /// Revoke an API token
+    /// Revoke an API token (soft-revoke: sets revoked_at instead of deleting).
     pub async fn revoke_api_token(&self, token_id: Uuid, user_id: Uuid) -> Result<()> {
-        let result = sqlx::query!(
-            "DELETE FROM api_tokens WHERE id = $1 AND user_id = $2",
-            token_id,
-            user_id
+        let result = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
         )
+        .bind(token_id)
+        .bind(user_id)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

@@ -54,11 +54,16 @@ pub struct TokenInfo {
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub is_expired: bool,
+    pub is_revoked: bool,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_ip: Option<String>,
+    pub last_used_user_agent: Option<String>,
 }
 
 impl From<ApiToken> for TokenInfo {
     fn from(token: ApiToken) -> Self {
         let is_expired = is_token_expired(token.expires_at);
+        let is_revoked = is_token_revoked(token.revoked_at);
 
         Self {
             id: token.id,
@@ -70,6 +75,10 @@ impl From<ApiToken> for TokenInfo {
             last_used_at: token.last_used_at,
             created_at: token.created_at,
             is_expired,
+            is_revoked,
+            revoked_at: token.revoked_at,
+            last_used_ip: token.last_used_ip,
+            last_used_user_agent: token.last_used_user_agent,
         }
     }
 }
@@ -109,6 +118,11 @@ pub(crate) fn validate_scopes_pure(scopes: &[String]) -> std::result::Result<(),
 /// Determine if a token is expired given an optional expiration timestamp.
 pub(crate) fn is_token_expired(expires_at: Option<DateTime<Utc>>) -> bool {
     expires_at.map(|exp| exp < Utc::now()).unwrap_or(false)
+}
+
+/// Determine if a token has been revoked.
+pub(crate) fn is_token_revoked(revoked_at: Option<DateTime<Utc>>) -> bool {
+    revoked_at.is_some()
 }
 
 /// Check if a set of scopes grants access for a required scope.
@@ -206,18 +220,18 @@ impl TokenService {
     /// # Returns
     /// * `Ok(Vec<TokenInfo>)` - List of token information (without actual token values)
     pub async fn list_tokens(&self, user_id: Uuid) -> Result<Vec<TokenInfo>> {
-        let tokens = sqlx::query_as!(
-            ApiToken,
+        let tokens = sqlx::query_as::<_, ApiToken>(
             r#"
             SELECT id, user_id, name, token_hash, token_prefix, scopes,
                    expires_at, last_used_at, created_at,
-                   created_by_user_id, description, repo_selector
+                   created_by_user_id, description, repo_selector,
+                   revoked_at, last_used_ip, last_used_user_agent
             FROM api_tokens
             WHERE user_id = $1
             ORDER BY created_at DESC
             "#,
-            user_id
         )
+        .bind(user_id)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -235,18 +249,18 @@ impl TokenService {
     /// * `Ok(TokenInfo)` - Token information
     /// * `Err(AppError::NotFound)` - If token doesn't exist or belongs to another user
     pub async fn get_token(&self, token_id: Uuid, user_id: Uuid) -> Result<TokenInfo> {
-        let token = sqlx::query_as!(
-            ApiToken,
+        let token = sqlx::query_as::<_, ApiToken>(
             r#"
             SELECT id, user_id, name, token_hash, token_prefix, scopes,
                    expires_at, last_used_at, created_at,
-                   created_by_user_id, description, repo_selector
+                   created_by_user_id, description, repo_selector,
+                   revoked_at, last_used_ip, last_used_user_agent
             FROM api_tokens
             WHERE id = $1 AND user_id = $2
             "#,
-            token_id,
-            user_id
         )
+        .bind(token_id)
+        .bind(user_id)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -277,10 +291,13 @@ impl TokenService {
     /// # Returns
     /// * `Ok(u64)` - Number of tokens revoked
     pub async fn revoke_all_tokens(&self, user_id: Uuid) -> Result<u64> {
-        let result = sqlx::query!("DELETE FROM api_tokens WHERE user_id = $1", user_id)
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+        let result = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result.rows_affected())
     }
@@ -472,6 +489,9 @@ mod tests {
             created_by_user_id: None,
             description: None,
             repo_selector: None,
+            revoked_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
         }
     }
 
@@ -494,6 +514,9 @@ mod tests {
             created_by_user_id: None,
             description: None,
             repo_selector: None,
+            revoked_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
         };
 
         let info = TokenInfo::from(token.clone());
@@ -517,6 +540,9 @@ mod tests {
             created_by_user_id: None,
             description: None,
             repo_selector: None,
+            revoked_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
         };
 
         let info = TokenInfo::from(token);
@@ -551,6 +577,9 @@ mod tests {
             created_by_user_id: None,
             description: None,
             repo_selector: None,
+            revoked_at: None,
+            last_used_ip: Some("192.168.1.1".to_string()),
+            last_used_user_agent: Some("curl/7.88".to_string()),
         };
 
         let info = TokenInfo::from(token);
@@ -562,6 +591,9 @@ mod tests {
         assert!(info.expires_at.is_some());
         assert!(info.last_used_at.is_some());
         assert!(!info.is_expired);
+        assert!(!info.is_revoked);
+        assert_eq!(info.last_used_ip.as_deref(), Some("192.168.1.1"));
+        assert_eq!(info.last_used_user_agent.as_deref(), Some("curl/7.88"));
     }
 
     #[test]
@@ -681,6 +713,48 @@ mod tests {
     #[test]
     fn test_is_token_expired_just_expired() {
         assert!(is_token_expired(Some(Utc::now() - Duration::seconds(1))));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_token_revoked (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_token_revoked_none() {
+        assert!(!is_token_revoked(None));
+    }
+
+    #[test]
+    fn test_is_token_revoked_some() {
+        assert!(is_token_revoked(Some(Utc::now())));
+    }
+
+    #[test]
+    fn test_is_token_revoked_past_timestamp() {
+        assert!(is_token_revoked(Some(Utc::now() - Duration::days(30))));
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenInfo revocation fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_info_revoked_token() {
+        let revoked_at = Some(Utc::now() - Duration::hours(1));
+        let mut token = make_api_token(None, None, vec!["read:artifacts".to_string()]);
+        token.revoked_at = revoked_at;
+
+        let info = TokenInfo::from(token);
+        assert!(info.is_revoked);
+        assert!(info.revoked_at.is_some());
+    }
+
+    #[test]
+    fn test_token_info_active_token_not_revoked() {
+        let token = make_api_token(None, None, vec!["read:artifacts".to_string()]);
+        let info = TokenInfo::from(token);
+        assert!(!info.is_revoked);
+        assert!(info.revoked_at.is_none());
     }
 
     // -----------------------------------------------------------------------
