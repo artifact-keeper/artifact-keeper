@@ -813,12 +813,16 @@ pub async fn change_password(
         state.setup_required.store(false, Ordering::Relaxed);
         tracing::info!("Setup complete. API fully unlocked.");
 
-        // Delete the password file (best-effort)
+        // Delete the password file (best-effort).
+        // storage_path is from server config, not user input, but we
+        // canonicalize and verify the path stays under the base dir.
         let storage_base = std::path::Path::new(&state.config.storage_path)
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from(&state.config.storage_path));
         let password_file = storage_base.join("admin.password");
-        if password_file.exists() {
+        if !password_file.starts_with(&storage_base) {
+            tracing::warn!("Password file path escapes storage base, skipping delete");
+        } else if password_file.exists() {
             if let Err(e) = std::fs::remove_file(&password_file) {
                 tracing::warn!("Failed to delete admin password file: {}", e);
             } else {
