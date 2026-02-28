@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use bcrypt::{hash, verify, DEFAULT_COST};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -299,10 +299,7 @@ impl AuthService {
 
         // Debounced usage analytics: only update last_used_at if it has been
         // more than 5 minutes since the last recorded use (or never used).
-        let should_update = stored_token
-            .last_used_at
-            .map(|lu| Utc::now() - lu > Duration::minutes(5))
-            .unwrap_or(true);
+        let should_update = should_debounce_usage_update(stored_token.last_used_at);
 
         if should_update {
             let token_id = stored_token.id;
@@ -956,6 +953,16 @@ impl AuthService {
     }
 }
 
+/// Determine whether a token's `last_used_at` timestamp is old enough
+/// to warrant a database update. Uses a 5-minute debounce window to
+/// avoid writing to the database on every single token use.
+pub(crate) fn should_debounce_usage_update(last_used_at: Option<DateTime<Utc>>) -> bool {
+    match last_used_at {
+        None => true,
+        Some(lu) => Utc::now() - lu > Duration::minutes(5),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1426,5 +1433,47 @@ mod tests {
             .filter(|r| r.as_str() == "developer")
             .count();
         assert_eq!(dev_count, 1, "developer role should not be duplicated");
+    }
+
+    // -----------------------------------------------------------------------
+    // should_debounce_usage_update (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_debounce_never_used_returns_true() {
+        assert!(should_debounce_usage_update(None));
+    }
+
+    #[test]
+    fn test_debounce_used_just_now_returns_false() {
+        let last_used = Utc::now() - Duration::seconds(1);
+        assert!(!should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_used_4_min_ago_returns_false() {
+        let last_used = Utc::now() - Duration::minutes(4);
+        assert!(!should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_used_6_min_ago_returns_true() {
+        let last_used = Utc::now() - Duration::minutes(6);
+        assert!(should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_used_1_hour_ago_returns_true() {
+        let last_used = Utc::now() - Duration::hours(1);
+        assert!(should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_boundary_exactly_5_min() {
+        // The function uses `Utc::now() - lu > Duration::minutes(5)`, so a
+        // last_used value 4 minutes and 59 seconds ago should NOT trigger an
+        // update (the difference is not strictly greater than 5 minutes).
+        let last_used = Utc::now() - Duration::seconds(4 * 60 + 59);
+        assert!(!should_debounce_usage_update(Some(last_used)));
     }
 }

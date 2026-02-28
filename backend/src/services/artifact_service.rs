@@ -256,11 +256,14 @@ impl ArtifactService {
             if let Some(quota) = repo.quota_bytes {
                 if let Ok(current_usage) = self.repo_service.get_storage_usage(repository_id).await
                 {
-                    let usage_pct = crate::services::repository_service::quota_usage_percentage(
+                    if crate::services::repository_service::exceeds_quota_warning_threshold(
                         current_usage,
                         quota,
-                    );
-                    if usage_pct > 0.8 {
+                    ) {
+                        let usage_pct = crate::services::repository_service::quota_usage_percentage(
+                            current_usage,
+                            quota,
+                        );
                         tracing::warn!(
                             repository_key = %repo.key,
                             usage_percent = format!("{:.1}", usage_pct * 100.0),

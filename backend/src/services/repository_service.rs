@@ -83,6 +83,11 @@ pub(crate) fn quota_usage_percentage(used_bytes: i64, quota_bytes: i64) -> f64 {
     used_bytes as f64 / quota_bytes as f64
 }
 
+/// Check whether quota usage exceeds the warning threshold (80%).
+pub(crate) fn exceeds_quota_warning_threshold(used_bytes: i64, quota_bytes: i64) -> bool {
+    quota_usage_percentage(used_bytes, quota_bytes) > 0.8
+}
+
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
@@ -967,5 +972,51 @@ mod tests {
         let threshold = 0.8;
         assert!(quota_usage_percentage(85, 100) > threshold);
         assert!(quota_usage_percentage(70, 100) <= threshold);
+    }
+
+    // -----------------------------------------------------------------------
+    // exceeds_quota_warning_threshold (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_exceeds_quota_threshold_at_90_percent() {
+        assert!(exceeds_quota_warning_threshold(900, 1000));
+    }
+
+    #[test]
+    fn test_exceeds_quota_threshold_at_80_percent() {
+        // Exactly 0.8 is not > 0.8
+        assert!(!exceeds_quota_warning_threshold(800, 1000));
+    }
+
+    #[test]
+    fn test_exceeds_quota_threshold_at_81_percent() {
+        assert!(exceeds_quota_warning_threshold(810, 1000));
+    }
+
+    #[test]
+    fn test_exceeds_quota_threshold_at_50_percent() {
+        assert!(!exceeds_quota_warning_threshold(500, 1000));
+    }
+
+    #[test]
+    fn test_exceeds_quota_threshold_at_100_percent() {
+        assert!(exceeds_quota_warning_threshold(1000, 1000));
+    }
+
+    #[test]
+    fn test_exceeds_quota_threshold_over_quota() {
+        assert!(exceeds_quota_warning_threshold(1500, 1000));
+    }
+
+    #[test]
+    fn test_exceeds_quota_threshold_zero_quota() {
+        // Zero quota returns 0.0 from quota_usage_percentage, which is not > 0.8
+        assert!(!exceeds_quota_warning_threshold(500, 0));
+    }
+
+    #[test]
+    fn test_exceeds_quota_threshold_empty() {
+        assert!(!exceeds_quota_warning_threshold(0, 1000));
     }
 }

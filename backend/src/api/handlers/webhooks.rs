@@ -708,6 +708,43 @@ pub(crate) fn webhook_retry_delay_secs(attempt: i32) -> i64 {
     }
 }
 
+/// Outcome of a webhook delivery retry attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetryOutcome {
+    /// Delivery succeeded (2xx status).
+    Success,
+    /// Max attempts exhausted, delivery is dead-lettered.
+    DeadLetter,
+    /// Should retry after the given delay in seconds.
+    Retry { delay_secs: i64 },
+}
+
+/// Determine the outcome of a webhook delivery attempt.
+///
+/// Given the current attempt count, max attempts, and whether the HTTP call
+/// succeeded, returns whether to mark success, dead-letter, or schedule a retry.
+pub(crate) fn determine_retry_outcome(
+    success: bool,
+    current_attempts: i32,
+    max_attempts: i32,
+) -> RetryOutcome {
+    let new_attempts = current_attempts + 1;
+    if success {
+        RetryOutcome::Success
+    } else if new_attempts >= max_attempts {
+        RetryOutcome::DeadLetter
+    } else {
+        RetryOutcome::Retry {
+            delay_secs: webhook_retry_delay_secs(new_attempts),
+        }
+    }
+}
+
+/// Check whether an HTTP status code indicates a successful webhook delivery.
+pub(crate) fn is_webhook_delivery_success(status_code: u16) -> bool {
+    (200..300).contains(&status_code)
+}
+
 /// A row from the webhook_deliveries retry queue.
 #[derive(Debug)]
 struct RetryDeliveryRow {
@@ -839,14 +876,19 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
                 Ok(response) => {
                     let status = response.status().as_u16() as i32;
                     let body = response.text().await.ok();
-                    ((200..300).contains(&status), Some(status), body)
+                    (
+                        is_webhook_delivery_success(status as u16),
+                        Some(status),
+                        body,
+                    )
                 }
                 Err(e) => (false, None, Some(e.to_string())),
             };
 
         let new_attempts = delivery.attempts + 1;
+        let outcome = determine_retry_outcome(success, delivery.attempts, delivery.max_attempts);
 
-        if success {
+        if outcome == RetryOutcome::Success {
             // Delivery succeeded
             let _ = sqlx::query(
                 r#"
@@ -866,7 +908,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             .bind(new_attempts)
             .execute(db)
             .await;
-        } else if new_attempts >= delivery.max_attempts {
+        } else if outcome == RetryOutcome::DeadLetter {
             // Max attempts exhausted: dead letter
             let _ = sqlx::query(
                 r#"
@@ -890,9 +932,8 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
                 delivery.id,
                 new_attempts
             );
-        } else {
+        } else if let RetryOutcome::Retry { delay_secs } = outcome {
             // Schedule next retry
-            let delay_secs = webhook_retry_delay_secs(new_attempts);
             let _ = sqlx::query(
                 r#"
                 UPDATE webhook_deliveries
@@ -1250,5 +1291,109 @@ mod tests {
     #[test]
     fn test_webhook_retry_backoff_capped() {
         assert_eq!(webhook_retry_delay_secs(10), 14400);
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_retry_outcome (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_retry_outcome_success() {
+        assert_eq!(determine_retry_outcome(true, 0, 5), RetryOutcome::Success);
+    }
+
+    #[test]
+    fn test_retry_outcome_dead_letter() {
+        // attempts=4, max=5: new_attempts = 5 >= 5 → DeadLetter
+        assert_eq!(
+            determine_retry_outcome(false, 4, 5),
+            RetryOutcome::DeadLetter
+        );
+    }
+
+    #[test]
+    fn test_retry_outcome_retry_first_attempt() {
+        // attempts=0, max=5: new_attempts = 1 < 5 → Retry with delay for attempt 1
+        assert_eq!(
+            determine_retry_outcome(false, 0, 5),
+            RetryOutcome::Retry { delay_secs: 30 }
+        );
+    }
+
+    #[test]
+    fn test_retry_outcome_retry_second_attempt() {
+        // attempts=1, max=5: new_attempts = 2 < 5 → Retry with delay for attempt 2
+        assert_eq!(
+            determine_retry_outcome(false, 1, 5),
+            RetryOutcome::Retry { delay_secs: 120 }
+        );
+    }
+
+    #[test]
+    fn test_retry_outcome_retry_third_attempt() {
+        // attempts=2, max=5: new_attempts = 3 < 5 → Retry with delay for attempt 3
+        assert_eq!(
+            determine_retry_outcome(false, 2, 5),
+            RetryOutcome::Retry { delay_secs: 900 }
+        );
+    }
+
+    #[test]
+    fn test_retry_outcome_dead_letter_exact() {
+        // attempts=2, max=3: new_attempts = 3 >= 3 → DeadLetter
+        assert_eq!(
+            determine_retry_outcome(false, 2, 3),
+            RetryOutcome::DeadLetter
+        );
+    }
+
+    #[test]
+    fn test_retry_outcome_success_ignores_attempts() {
+        // Even with high attempt count, success is success
+        assert_eq!(determine_retry_outcome(true, 4, 5), RetryOutcome::Success);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_webhook_delivery_success (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_delivery_success_200() {
+        assert!(is_webhook_delivery_success(200));
+    }
+
+    #[test]
+    fn test_is_delivery_success_201() {
+        assert!(is_webhook_delivery_success(201));
+    }
+
+    #[test]
+    fn test_is_delivery_success_204() {
+        assert!(is_webhook_delivery_success(204));
+    }
+
+    #[test]
+    fn test_is_delivery_success_299() {
+        assert!(is_webhook_delivery_success(299));
+    }
+
+    #[test]
+    fn test_is_delivery_success_300() {
+        assert!(!is_webhook_delivery_success(300));
+    }
+
+    #[test]
+    fn test_is_delivery_success_400() {
+        assert!(!is_webhook_delivery_success(400));
+    }
+
+    #[test]
+    fn test_is_delivery_success_500() {
+        assert!(!is_webhook_delivery_success(500));
+    }
+
+    #[test]
+    fn test_is_delivery_success_199() {
+        assert!(!is_webhook_delivery_success(199));
     }
 }

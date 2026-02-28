@@ -366,31 +366,12 @@ impl LifecycleService {
         let mut results = Vec::new();
 
         for policy in policies {
-            let is_due = if let Some(ref cron_expr) = policy.cron_schedule {
-                match cron::Schedule::from_str(cron_expr) {
-                    Ok(schedule) => match policy.last_run_at {
-                        None => true,
-                        Some(last_run) => {
-                            // Check if there is a scheduled time between last_run and now
-                            schedule
-                                .after(&last_run)
-                                .take_while(|t| *t <= now)
-                                .next()
-                                .is_some()
-                        }
-                    },
-                    Err(_) => {
-                        tracing::warn!(
-                            "Invalid cron expression '{}' for policy '{}', using default cadence",
-                            cron_expr,
-                            policy.name,
-                        );
-                        Self::is_due_by_default_cadence(policy.last_run_at, now, default_cadence)
-                    }
-                }
-            } else {
-                Self::is_due_by_default_cadence(policy.last_run_at, now, default_cadence)
-            };
+            let is_due = Self::is_policy_due(
+                policy.cron_schedule.as_deref(),
+                policy.last_run_at,
+                now,
+                default_cadence,
+            );
 
             if !is_due {
                 continue;
@@ -430,6 +411,36 @@ impl LifecycleService {
         match last_run_at {
             None => true,
             Some(last) => now - last >= cadence,
+        }
+    }
+
+    /// Determine whether a policy is currently due for execution.
+    ///
+    /// When the policy has a `cron_schedule`, checks whether any scheduled
+    /// occurrence falls between `last_run_at` and `now`. If the cron expression
+    /// is invalid, falls back to the default cadence. When there is no cron
+    /// schedule, uses `is_due_by_default_cadence`.
+    fn is_policy_due(
+        cron_schedule: Option<&str>,
+        last_run_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        default_cadence: chrono::Duration,
+    ) -> bool {
+        if let Some(cron_expr) = cron_schedule {
+            let normalized = normalize_cron_expression(cron_expr);
+            match cron::Schedule::from_str(&normalized) {
+                Ok(schedule) => match last_run_at {
+                    None => true,
+                    Some(last_run) => schedule
+                        .after(&last_run)
+                        .take_while(|t| *t <= now)
+                        .next()
+                        .is_some(),
+                },
+                Err(_) => Self::is_due_by_default_cadence(last_run_at, now, default_cadence),
+            }
+        } else {
+            Self::is_due_by_default_cadence(last_run_at, now, default_cadence)
         }
     }
 
@@ -2077,5 +2088,124 @@ mod tests {
         let invalid = "not-a-cron";
         let normalized = normalize_cron_expression(invalid);
         assert!(cron::Schedule::from_str(&normalized).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_policy_due (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_policy_due_no_cron_never_run() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        assert!(LifecycleService::is_policy_due(None, None, now, cadence));
+    }
+
+    #[test]
+    fn test_is_policy_due_no_cron_recently_run() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(1);
+        let cadence = chrono::Duration::hours(6);
+        assert!(!LifecycleService::is_policy_due(
+            None,
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_no_cron_overdue() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(7);
+        let cadence = chrono::Duration::hours(6);
+        assert!(LifecycleService::is_policy_due(
+            None,
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_valid_cron_never_run() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        // Every minute cron
+        assert!(LifecycleService::is_policy_due(
+            Some("0 * * * * *"),
+            None,
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_valid_cron_recently_run() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::minutes(30);
+        let cadence = chrono::Duration::hours(6);
+        // Hourly cron: no occurrence should fall within 30 minutes
+        assert!(!LifecycleService::is_policy_due(
+            Some("0 0 * * * *"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_valid_cron_overdue() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::minutes(2);
+        let cadence = chrono::Duration::hours(6);
+        // Every minute cron: should have an occurrence in last 2 minutes
+        assert!(LifecycleService::is_policy_due(
+            Some("0 * * * * *"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_invalid_cron_falls_back_to_cadence_due() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(7);
+        let cadence = chrono::Duration::hours(6);
+        assert!(LifecycleService::is_policy_due(
+            Some("invalid"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_invalid_cron_falls_back_to_cadence_not_due() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(1);
+        let cadence = chrono::Duration::hours(6);
+        assert!(!LifecycleService::is_policy_due(
+            Some("invalid"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_5_field_cron_normalized() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::minutes(6);
+        let cadence = chrono::Duration::hours(6);
+        // 5-field cron "*/5 * * * *" (every 5 minutes) gets normalized to 6-field;
+        // with last_run 6 minutes ago there should be at least one occurrence
+        assert!(LifecycleService::is_policy_due(
+            Some("*/5 * * * *"),
+            Some(last_run),
+            now,
+            cadence
+        ));
     }
 }
