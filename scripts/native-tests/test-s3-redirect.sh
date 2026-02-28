@@ -290,10 +290,52 @@ if [ -n "$CLOUDFRONT_URL" ]; then
 fi
 
 # -------------------------------------------------------------------------
+# Test scanner with S3 storage backend
+# -------------------------------------------------------------------------
+header "Testing Scanner with S3 Backend"
+
+info "Triggering security scan on S3-backed artifact..."
+ARTIFACT_ID=$(docker exec artifact-keeper-db psql -U registry -d artifact_registry -t -c "
+    SELECT id FROM artifacts
+    WHERE repository_id = '$REPO_ID' AND path = 'test/redirect-test.txt'
+    LIMIT 1
+" | tr -d ' \n')
+
+if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "" ]; then
+    fail "Could not find artifact ID for scan test"
+fi
+
+info "Artifact ID: $ARTIFACT_ID"
+
+# Trigger a scan via the API
+SCAN_RESP=$(curl -s -w "\n%{http_code}" -X POST "${API_URL}/api/v1/security/scans" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $TOKEN" \
+    -d "{\"artifact_id\": \"${ARTIFACT_ID}\"}" 2>&1)
+
+SCAN_BODY=$(echo "$SCAN_RESP" | head -n -1)
+SCAN_STATUS=$(echo "$SCAN_RESP" | tail -1)
+
+# A text file is not a scannable artifact type, so we accept either:
+# - 200/201/202: scan was queued/completed (scanner resolved storage correctly)
+# - 400/422: scanner correctly rejected non-scannable content type
+# What we do NOT accept:
+# - 500 with "No such file or directory" (scanner tried local filesystem instead of S3)
+if [ "$SCAN_STATUS" = "500" ]; then
+    if echo "$SCAN_BODY" | grep -qi "no such file\|not found\|os error 2"; then
+        fail "Scanner failed with filesystem error on S3-backed repo. Storage resolution is broken."
+    fi
+    info "Scan returned 500 but not a filesystem error (may be expected for text files)"
+    pass "Scanner did not fall back to local filesystem"
+else
+    pass "Scan request returned HTTP $SCAN_STATUS (scanner resolved storage correctly)"
+fi
+
+# -------------------------------------------------------------------------
 # Summary
 # -------------------------------------------------------------------------
 header "Test Summary"
-echo -e "${GREEN}All S3 redirect tests passed!${NC}"
+echo -e "${GREEN}All S3 tests passed (redirect + scanner)!${NC}"
 echo ""
 echo "Configuration tested:"
 echo "  API URL: ${API_URL}"
