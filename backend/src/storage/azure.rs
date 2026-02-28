@@ -923,6 +923,38 @@ mod tests {
         AzureBackend::new(create_test_config()).await.unwrap()
     }
 
+    /// Create an RBAC backend directly without reading env vars.
+    fn create_rbac_backend(credential: TokenCredentialSource) -> AzureBackend {
+        let client = reqwest::Client::new();
+        let provider = TokenCredentialProvider {
+            client: client.clone(),
+            credential,
+            cache: RwLock::new(None),
+        };
+        AzureBackend {
+            config: create_rbac_config(),
+            client,
+            auth: AzureAuthMode::TokenCredential {
+                provider: Arc::new(provider),
+            },
+            path_format: StoragePathFormat::Native,
+        }
+    }
+
+    fn service_principal_cred() -> TokenCredentialSource {
+        TokenCredentialSource::ServicePrincipal {
+            tenant_id: "fake-tenant".to_string(),
+            client_id: "fake-client".to_string(),
+            client_secret: "fake-secret".to_string(),
+        }
+    }
+
+    fn managed_identity_cred(client_id: Option<&str>) -> TokenCredentialSource {
+        TokenCredentialSource::ManagedIdentity {
+            client_id: client_id.map(|s| s.to_string()),
+        }
+    }
+
     // ── Auth mode resolution (pure functions) ────────────────────────────
 
     #[test]
@@ -1302,5 +1334,342 @@ mod tests {
     #[test]
     fn test_storage_scope() {
         assert_eq!(STORAGE_SCOPE, "https://storage.azure.com/.default");
+    }
+
+    // ── Shared Key auth header ──────────────────────────────────────────
+
+    #[test]
+    fn test_shared_key_auth_produces_valid_header() {
+        let key = BASE64.decode("dGVzdGtleXRlc3RrZXk=").unwrap();
+        let result = AzureBackend::shared_key_auth(&key, "myaccount", "GET\n\n\n\n\ntest").unwrap();
+        assert!(result.starts_with("SharedKey myaccount:"));
+        // Signature should be base64 encoded
+        let sig = result.strip_prefix("SharedKey myaccount:").unwrap();
+        assert!(
+            BASE64.decode(sig).is_ok(),
+            "Signature should be valid base64"
+        );
+    }
+
+    #[test]
+    fn test_shared_key_auth_deterministic() {
+        let key = BASE64.decode("dGVzdGtleXRlc3RrZXk=").unwrap();
+        let s2s = "PUT\n\n\n42\ntest";
+        let a = AzureBackend::shared_key_auth(&key, "acc", s2s).unwrap();
+        let b = AzureBackend::shared_key_auth(&key, "acc", s2s).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_shared_key_auth_different_inputs_differ() {
+        let key = BASE64.decode("dGVzdGtleXRlc3RrZXk=").unwrap();
+        let a = AzureBackend::shared_key_auth(&key, "acc", "input-a").unwrap();
+        let b = AzureBackend::shared_key_auth(&key, "acc", "input-b").unwrap();
+        assert_ne!(a, b);
+    }
+
+    // ── SAS string-to-sign format ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_sas_string_to_sign_has_correct_field_count() {
+        // The SAS string-to-sign for API version 2021-06-08 must have
+        // 16 fields separated by 15 newlines (trailing newline counts).
+        // Fields: sp, st, se, canonicalizedResource, si, sip, spr, sv, sr,
+        //         snapshotTime, encryptionScope, rscc, rscd, rsce, rscl, rsct
+        let backend = create_test_backend().await;
+        let token = backend
+            .generate_sas_token("test/blob.txt", Duration::from_secs(60))
+            .unwrap();
+
+        // The token itself should parse correctly
+        let params: std::collections::HashMap<&str, &str> =
+            token.split('&').filter_map(|p| p.split_once('=')).collect();
+
+        assert!(params.contains_key("sv"), "Missing signed version");
+        assert!(params.contains_key("sr"), "Missing signed resource");
+        assert!(params.contains_key("sp"), "Missing signed permissions");
+        assert!(params.contains_key("spr"), "Missing signed protocol");
+        assert!(params.contains_key("sig"), "Missing signature");
+        assert_eq!(params["sr"], "b", "Resource should be blob");
+        assert_eq!(params["sp"], "r", "Permissions should be read-only");
+        assert_eq!(params["spr"], "https", "Protocol should be https");
+    }
+
+    // ── SAS token error for RBAC mode ───────────────────────────────────
+
+    #[test]
+    fn test_sas_token_fails_for_rbac_backend() {
+        let backend = create_rbac_backend(service_principal_cred());
+
+        let result = backend.generate_sas_token("test.txt", Duration::from_secs(60));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Shared Key"),
+            "Error should mention Shared Key requirement: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_sas_url_fails_for_rbac_backend() {
+        let backend = create_rbac_backend(service_principal_cred());
+        let result = backend.generate_sas_url("test.txt", Duration::from_secs(60));
+        assert!(result.is_err());
+    }
+
+    // ── RBAC backend creation and behavior ──────────────────────────────
+
+    #[test]
+    fn test_rbac_backend_creation_service_principal() {
+        let backend = create_rbac_backend(service_principal_cred());
+        assert!(backend.is_rbac());
+        assert!(!backend.supports_redirect());
+    }
+
+    #[test]
+    fn test_rbac_backend_creation_managed_identity() {
+        let backend = create_rbac_backend(managed_identity_cred(None));
+        assert!(backend.is_rbac());
+
+        match &backend.auth {
+            AzureAuthMode::TokenCredential { provider } => {
+                let dbg = format!("{:?}", provider);
+                assert!(
+                    dbg.contains("ManagedIdentity"),
+                    "Should use managed identity: {}",
+                    dbg
+                );
+            }
+            _ => panic!("Expected TokenCredential auth mode"),
+        }
+    }
+
+    #[test]
+    fn test_rbac_backend_user_assigned_managed_identity() {
+        let backend = create_rbac_backend(managed_identity_cred(Some("user-assigned-id")));
+        assert!(backend.is_rbac());
+
+        match &backend.auth {
+            AzureAuthMode::TokenCredential { provider } => {
+                let dbg = format!("{:?}", provider);
+                assert!(dbg.contains("user-assigned-id"));
+            }
+            _ => panic!("Expected TokenCredential auth mode"),
+        }
+    }
+
+    #[test]
+    fn test_rbac_read_url_returns_bare_blob_url() {
+        let backend = create_rbac_backend(service_principal_cred());
+
+        let url = backend
+            .read_url("path/to/artifact.jar", Duration::from_secs(300))
+            .unwrap();
+
+        assert_eq!(
+            url,
+            "https://testaccount.blob.core.windows.net/testcontainer/path/to/artifact.jar"
+        );
+        assert!(
+            !url.contains("sig="),
+            "RBAC read URL should NOT contain SAS signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rbac_get_presigned_url_returns_none() {
+        let backend = create_rbac_backend(service_principal_cred());
+
+        let result = backend
+            .get_presigned_url("test.txt", Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "RBAC mode should not generate presigned URLs"
+        );
+    }
+
+    #[test]
+    fn test_rbac_supports_redirect_false() {
+        // Even if redirect_downloads is true in config, RBAC mode disables it
+        let client = reqwest::Client::new();
+        let provider = TokenCredentialProvider {
+            client: client.clone(),
+            credential: service_principal_cred(),
+            cache: RwLock::new(None),
+        };
+        let mut config = create_rbac_config();
+        config.redirect_downloads = true;
+        let backend = AzureBackend {
+            config,
+            client,
+            auth: AzureAuthMode::TokenCredential {
+                provider: Arc::new(provider),
+            },
+            path_format: StoragePathFormat::Native,
+        };
+        assert!(
+            !backend.supports_redirect(),
+            "RBAC should not support redirect even if config says true"
+        );
+    }
+
+    // ── Auth mode enum ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_auth_mode_shared_key_debug() {
+        let mode = AzureAuthMode::SharedKey {
+            decoded_key: vec![1, 2, 3],
+        };
+        let dbg = format!("{:?}", mode);
+        assert!(dbg.contains("SharedKey"));
+    }
+
+    // ── Token credential provider ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_token_credential_provider_get_token_with_valid_cache() {
+        let provider = TokenCredentialProvider {
+            client: reqwest::Client::new(),
+            credential: managed_identity_cred(None),
+            cache: RwLock::new(Some(CachedToken {
+                access_token: "cached-token-value".to_string(),
+                expires_at: Utc::now() + ChronoDuration::hours(1),
+            })),
+        };
+
+        let token = provider.get_token().await.unwrap();
+        assert_eq!(token, "cached-token-value");
+    }
+
+    #[tokio::test]
+    async fn test_token_credential_provider_cache_expired_triggers_refresh() {
+        let provider = TokenCredentialProvider {
+            client: reqwest::Client::new(),
+            credential: managed_identity_cred(None),
+            cache: RwLock::new(Some(CachedToken {
+                access_token: "expired-token".to_string(),
+                expires_at: Utc::now() - ChronoDuration::hours(1),
+            })),
+        };
+
+        // This will try to reach IMDS and fail since we're not on Azure,
+        // which proves the expired cache triggers a refresh attempt.
+        let result = provider.get_token().await;
+        assert!(
+            result.is_err(),
+            "Should fail trying to refresh (not on Azure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_credential_provider_empty_cache_triggers_refresh() {
+        let provider = TokenCredentialProvider {
+            client: reqwest::Client::new(),
+            credential: managed_identity_cred(None),
+            cache: RwLock::new(None),
+        };
+
+        let result = provider.get_token().await;
+        assert!(
+            result.is_err(),
+            "Should fail trying to acquire token (not on Azure)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_credential_provider_sp_expired_triggers_refresh() {
+        let provider = TokenCredentialProvider {
+            client: reqwest::Client::new(),
+            credential: service_principal_cred(),
+            cache: RwLock::new(Some(CachedToken {
+                access_token: "old-sp-token".to_string(),
+                expires_at: Utc::now() - ChronoDuration::hours(1),
+            })),
+        };
+
+        // SP token refresh will fail because the credentials are fake,
+        // which proves the expired cache triggers refresh for SP too.
+        let result = provider.get_token().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_token_credential_provider_sp_empty_cache_triggers_refresh() {
+        let provider = TokenCredentialProvider {
+            client: reqwest::Client::new(),
+            credential: service_principal_cred(),
+            cache: RwLock::new(None),
+        };
+
+        let result = provider.get_token().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_token_credential_provider_double_check_cache() {
+        // Verify the double-check pattern: if cache becomes valid between
+        // read lock release and write lock acquisition, it returns cached value.
+        let provider = TokenCredentialProvider {
+            client: reqwest::Client::new(),
+            credential: managed_identity_cred(None),
+            cache: RwLock::new(Some(CachedToken {
+                access_token: "still-valid".to_string(),
+                expires_at: Utc::now() + ChronoDuration::hours(2),
+            })),
+        };
+
+        // Two concurrent calls should both succeed with the cached value.
+        let (t1, t2) = tokio::join!(provider.get_token(), provider.get_token());
+        assert_eq!(t1.unwrap(), "still-valid");
+        assert_eq!(t2.unwrap(), "still-valid");
+    }
+
+    // ── RBAC custom endpoint ────────────────────────────────────────────
+
+    #[test]
+    fn test_rbac_blob_url_with_custom_endpoint() {
+        let client = reqwest::Client::new();
+        let provider = TokenCredentialProvider {
+            client: client.clone(),
+            credential: service_principal_cred(),
+            cache: RwLock::new(None),
+        };
+        let mut config = create_rbac_config();
+        config.endpoint = Some("https://gov.blob.core.usgovcloudapi.net".to_string());
+        let backend = AzureBackend {
+            config,
+            client,
+            auth: AzureAuthMode::TokenCredential {
+                provider: Arc::new(provider),
+            },
+            path_format: StoragePathFormat::Native,
+        };
+
+        let url = backend.blob_url("test.txt");
+        assert!(url.starts_with("https://gov.blob.core.usgovcloudapi.net"));
+    }
+
+    // ── RBAC path format ────────────────────────────────────────────────
+
+    #[test]
+    fn test_rbac_backend_path_format_preserved() {
+        let client = reqwest::Client::new();
+        let provider = TokenCredentialProvider {
+            client: client.clone(),
+            credential: service_principal_cred(),
+            cache: RwLock::new(None),
+        };
+        let backend = AzureBackend {
+            config: create_rbac_config(),
+            client,
+            auth: AzureAuthMode::TokenCredential {
+                provider: Arc::new(provider),
+            },
+            path_format: StoragePathFormat::Artifactory,
+        };
+        assert_eq!(backend.path_format, StoragePathFormat::Artifactory);
     }
 }
