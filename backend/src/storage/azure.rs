@@ -695,14 +695,23 @@ impl AzureBackend {
             self.config.account_name, self.config.container_name, key
         );
 
+        // Service SAS string-to-sign for API version 2021-06-08 (16 fields, 15 newlines):
+        // sp, st, se, canonicalizedResource, si, sip, spr, sv, sr,
+        // snapshotTime, encryptionScope, rscc, rscd, rsce, rscl, rsct
         let string_to_sign = format!(
-            "{}\n{}\n{}\n{}\n\n{}\n\n\n\n{}\n\n\n\n",
+            "{}\n{}\n{}\n{}\n\n\n{}\n{}\n{}\n\n\n\n\n\n\n",
             signed_permissions,
             signed_start,
             signed_expiry,
             canonicalized_resource,
+            // si (signedIdentifier) - empty
+            // sip (signedIP) - empty
             signed_protocol,
             signed_version,
+            signed_resource,
+            // snapshotTime - empty
+            // encryptionScope - empty
+            // rscc, rscd, rsce, rscl, rsct - empty
         );
 
         let mut mac = HmacSha256::new_from_slice(decoded_key)
