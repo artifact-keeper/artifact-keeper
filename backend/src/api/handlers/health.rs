@@ -288,14 +288,20 @@ async fn check_storage_health(config: &crate::config::Config) -> CheckStatus {
             // Use a fixed probe filename to avoid path injection concerns.
             // storage_path is from server config, not user input, but we
             // canonicalize and verify the probe stays under the base dir.
-            let storage_base = std::path::Path::new(&config.storage_path)
-                .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(&config.storage_path));
+            let storage_base = match std::path::Path::new(&config.storage_path).canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    return CheckStatus {
+                        status: "unhealthy".to_string(),
+                        message: Some(format!("Storage path not accessible: {}", e)),
+                    };
+                }
+            };
             let probe_path = storage_base.join(".health-probe");
             if !probe_path.starts_with(&storage_base) {
                 return CheckStatus {
                     status: "unhealthy".to_string(),
-                    message: Some("Storage path validation failed".to_string()),
+                    message: Some("Storage probe path escaped base directory".to_string()),
                 };
             }
             match tokio::fs::write(&probe_path, b"ok").await {
