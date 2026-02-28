@@ -1439,10 +1439,7 @@ mod tests {
             HeaderValue::from_static("registry.example.com:30443"),
         );
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert_eq!(
-            request_host(&headers),
-            "https://registry.example.com:30443"
-        );
+        assert_eq!(request_host(&headers), "https://registry.example.com:30443");
     }
 
     #[test]
