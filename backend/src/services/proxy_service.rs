@@ -3,6 +3,7 @@
 //! Handles fetching artifacts from upstream repositories with caching support.
 //! Implements cache TTL, ETag validation, and transparent proxying.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,21 +97,41 @@ impl ProxyService {
 
         // Fetch from upstream
         let full_url = Self::build_upstream_url(upstream_url, path);
-        let (content, content_type, etag) = self.fetch_from_upstream(&full_url).await?;
+        let upstream_result = self.fetch_from_upstream(&full_url).await;
 
-        // Cache the artifact
-        let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
-        self.cache_artifact(
-            &cache_key,
-            &metadata_key,
-            &content,
-            content_type.clone(),
-            etag,
-            cache_ttl,
-        )
-        .await?;
+        match upstream_result {
+            Ok((content, content_type, etag)) => {
+                // Cache the artifact
+                let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+                self.cache_artifact(
+                    &cache_key,
+                    &metadata_key,
+                    &content,
+                    content_type.clone(),
+                    etag,
+                    cache_ttl,
+                )
+                .await?;
 
-        Ok((content, content_type))
+                Ok((content, content_type))
+            }
+            Err(upstream_err) => {
+                // Upstream failed. Try serving stale cached content as a fallback.
+                if let Ok(Some((stale_content, stale_content_type))) = self
+                    .get_stale_cached_artifact(&cache_key, &metadata_key)
+                    .await
+                {
+                    tracing::warn!(
+                        "Upstream fetch failed for {}; serving stale cached copy: {}",
+                        full_url,
+                        upstream_err
+                    );
+                    Ok((stale_content, stale_content_type))
+                } else {
+                    Err(upstream_err)
+                }
+            }
+        }
     }
 
     /// Check if upstream has a newer version of the artifact.
@@ -371,6 +392,46 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Attempt to retrieve a cached artifact even if it has expired.
+    /// Used as a fallback when upstream is unavailable.
+    async fn get_stale_cached_artifact(
+        &self,
+        cache_key: &str,
+        metadata_key: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        // Load metadata without checking expiry
+        let metadata = match self.load_cache_metadata(metadata_key).await? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        // Try to get cached content
+        match self.storage.get(cache_key).await {
+            Ok(content) => {
+                // Verify checksum
+                let actual_checksum = StorageService::calculate_hash(&content);
+                if actual_checksum != metadata.checksum_sha256 {
+                    tracing::warn!(
+                        "Stale cache checksum mismatch for {}: expected {}, got {}",
+                        cache_key,
+                        metadata.checksum_sha256,
+                        actual_checksum
+                    );
+                    return Ok(None);
+                }
+
+                tracing::debug!(
+                    "Stale cache hit for {} (expired at {})",
+                    cache_key,
+                    metadata.expires_at
+                );
+                Ok(Some((content, metadata.content_type)))
+            }
+            Err(AppError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Check if upstream ETag has changed (returns true if changed/newer)
     async fn check_etag_changed(&self, url: &str, cached_etag: &str) -> Result<bool> {
         let response = self
@@ -413,6 +474,20 @@ impl ProxyService {
             }
         }
     }
+}
+
+/// Build response headers indicating the content was served from a stale cache.
+/// Returns headers with `X-Cache: STALE` and an RFC 7234 Warning 110 header.
+/// Currently used by tests; HTTP handlers will integrate this in a follow-up.
+#[allow(dead_code)]
+pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("X-Cache".to_string(), "STALE".to_string());
+    headers.insert(
+        "Warning".to_string(),
+        "110 artifact-keeper \"Response is stale\"".to_string(),
+    );
+    headers
 }
 
 #[cfg(test)]
@@ -918,5 +993,85 @@ mod tests {
     #[test]
     fn test_parse_cache_ttl_negative() {
         assert_eq!(parse_cache_ttl(Some("-100")), -100);
+    }
+
+    // =======================================================================
+    // build_stale_cache_headers tests
+    // =======================================================================
+
+    #[test]
+    fn test_build_stale_cache_headers_contains_x_cache() {
+        let headers = build_stale_cache_headers();
+        assert_eq!(headers.get("X-Cache").unwrap(), "STALE");
+    }
+
+    #[test]
+    fn test_build_stale_cache_headers_contains_warning() {
+        let headers = build_stale_cache_headers();
+        assert_eq!(
+            headers.get("Warning").unwrap(),
+            "110 artifact-keeper \"Response is stale\""
+        );
+    }
+
+    #[test]
+    fn test_build_stale_cache_headers_has_exactly_two_entries() {
+        let headers = build_stale_cache_headers();
+        assert_eq!(headers.len(), 2);
+    }
+
+    // =======================================================================
+    // Stale cache detection tests
+    // =======================================================================
+
+    #[test]
+    fn test_expired_metadata_is_stale() {
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now - chrono::Duration::hours(25),
+            upstream_etag: Some("\"old-etag\"".to_string()),
+            expires_at: now - chrono::Duration::hours(1),
+            content_type: Some("application/java-archive".to_string()),
+            size_bytes: 2048,
+            checksum_sha256: "d".repeat(64),
+        };
+
+        // The entry is expired (stale) because expires_at is in the past
+        assert!(is_cache_expired(&metadata.expires_at));
+        // But the metadata and content are still present, so it can be served
+        // as a stale fallback when upstream is down
+        assert!(metadata.content_type.is_some());
+        assert!(metadata.size_bytes > 0);
+    }
+
+    #[test]
+    fn test_valid_metadata_is_not_stale() {
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now,
+            upstream_etag: None,
+            expires_at: now + chrono::Duration::hours(23),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 512,
+            checksum_sha256: "e".repeat(64),
+        };
+
+        // Not expired, so it would be served normally (not as stale)
+        assert!(!is_cache_expired(&metadata.expires_at));
+    }
+
+    #[test]
+    fn test_just_expired_metadata_is_stale() {
+        let now = Utc::now();
+        let metadata = CacheMetadata {
+            cached_at: now - chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS + 1),
+            upstream_etag: None,
+            expires_at: now - chrono::Duration::seconds(1),
+            content_type: Some("application/gzip".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "f".repeat(64),
+        };
+
+        assert!(is_cache_expired(&metadata.expires_at));
     }
 }

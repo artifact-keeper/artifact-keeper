@@ -158,10 +158,76 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build-backend-alpine:
+    name: Backend Alpine (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    outputs:
+      digest-amd64: ${{ steps.build.outputs.digest }}
+      digest-arm64: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.backend.alpine
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=backend-alpine-${{ matrix.platform }}
+          cache-to: type=gha,scope=backend-alpine-${{ matrix.platform }},mode=max
+          sbom: true
+          provenance: mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v6
+        with:
+          name: backend-alpine-digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
   scan-containers:
     name: Security Scan
     runs-on: ubuntu-24.04
-    needs: [build-backend, build-openscap]
+    needs: [build-backend, build-openscap, build-backend-alpine]
     permissions:
       contents: read
       packages: read
@@ -190,13 +256,21 @@ jobs:
           name: openscap-digests-amd64
           path: /tmp/openscap-digests
 
+      - name: Download backend alpine amd64 digest
+        uses: actions/download-artifact@v7
+        with:
+          name: backend-alpine-digests-amd64
+          path: /tmp/backend-alpine-digests
+
       - name: Resolve image references
         id: refs
         run: |
           BACKEND_DIGEST=$(ls /tmp/backend-digests/)
           OPENSCAP_DIGEST=$(ls /tmp/openscap-digests/)
+          BACKEND_ALPINE_DIGEST=$(ls /tmp/backend-alpine-digests/)
           echo "backend=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:${BACKEND_DIGEST}" >> $GITHUB_OUTPUT
           echo "openscap=${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}@sha256:${OPENSCAP_DIGEST}" >> $GITHUB_OUTPUT
+          echo "backend-alpine=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:${BACKEND_ALPINE_DIGEST}" >> $GITHUB_OUTPUT
 
       # --- Trivy CVE scanning ---
       # --ignore-unfixed: only fail on CVEs with available patches.
@@ -226,6 +300,17 @@ jobs:
           ignore-unfixed: true
           exit-code: '0'
 
+      - name: Trivy scan - Backend Alpine
+        uses: aquasecurity/trivy-action@0.34.1
+        if: always()
+        with:
+          image-ref: ${{ steps.refs.outputs.backend-alpine }}
+          format: 'sarif'
+          output: 'backend-alpine-trivy.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '0'
+
       - name: Upload Backend Trivy SARIF
         uses: github/codeql-action/upload-sarif@v4
         if: always()
@@ -240,6 +325,13 @@ jobs:
           sarif_file: 'openscap-trivy.sarif'
           category: 'trivy-openscap'
 
+      - name: Upload Backend Alpine Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: 'backend-alpine-trivy.sarif'
+          category: 'trivy-backend-alpine'
+
       - name: Upload Trivy reports
         uses: actions/upload-artifact@v6
         if: always()
@@ -248,6 +340,7 @@ jobs:
           path: |
             backend-trivy.sarif
             openscap-trivy.sarif
+            backend-alpine-trivy.sarif
           retention-days: 90
 
       # --- OpenSCAP STIG compliance scan ---
@@ -318,10 +411,15 @@ jobs:
           echo "- **Policy**: Fail on CRITICAL or HIGH severity CVEs" >> $GITHUB_STEP_SUMMARY
           echo "- **Backend**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenSCAP**: $([ -f openscap-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backend Alpine**: $([ -f backend-alpine-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### OpenSCAP STIG Compliance" >> $GITHUB_STEP_SUMMARY
           echo "- **Profile**: DISA STIG for RHEL 9" >> $GITHUB_STEP_SUMMARY
           echo "- HTML reports uploaded as workflow artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Alpine CVE Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "- No STIG scan for Alpine variant (no applicable DISA STIG profile)" >> $GITHUB_STEP_SUMMARY
+          echo "- Compare Trivy SARIF results between UBI and Alpine for CVE delta" >> $GITHUB_STEP_SUMMARY
 
   merge-backend:
     name: Backend Multi-Arch Manifest
@@ -544,11 +642,134 @@ jobs:
           push-to-registry: true
         continue-on-error: true
 
+  merge-backend-alpine:
+    name: Backend Alpine Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: [build-backend-alpine]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: /tmp/digests
+          pattern: backend-alpine-digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (ghcr.io)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+          flavor: |
+            suffix=-alpine
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Extract metadata (Docker Hub)
+        id: meta-dockerhub
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ env.DOCKERHUB_BACKEND }}
+          flavor: |
+            suffix=-alpine
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Create manifest list and push (ghcr.io)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+
+      - name: Inspect image
+        id: inspect
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.version }}
+          DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest}}' \
+            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.version }} | jq -r '.digest')
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Copy to Docker Hub
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta-dockerhub.outputs.json }}') \
+            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
+
+      - name: Sign image with cosign (keyless)
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
+          push-to-registry: true
+        continue-on-error: true
+
+      - name: Checkout (for VEX files)
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .vex
+
+      - name: Attach VEX attestations
+        run: |
+          for vex in .vex/*.vex.json; do
+            [ -f "$vex" ] || continue
+            echo "Attaching VEX: $vex"
+            docker scout attestation add \
+              --file "$vex" \
+              --predicate-type https://openvex.dev/ns/v0.2.0 \
+              ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}@${{ steps.inspect.outputs.digest }}
+          done
+        continue-on-error: true
+
   summary:
     name: Publish Summary
     runs-on: ubuntu-latest
     permissions: {}
-    needs: [merge-backend, merge-openscap]
+    needs: [merge-backend, merge-openscap, merge-backend-alpine]
     if: always()
     steps:
       - name: Summary
@@ -558,6 +779,10 @@ jobs:
           echo "### Backend" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`docker.io/${{ env.DOCKERHUB_BACKEND }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Backend (Alpine)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest-alpine\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`docker.io/${{ env.DOCKERHUB_BACKEND }}:latest-alpine\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### OpenSCAP" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY

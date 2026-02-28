@@ -11,10 +11,12 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::str::FromStr;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
+use crate::services::scheduler_service::normalize_cron_expression;
 
 /// A lifecycle policy attached to a repository (or global if repository_id is NULL).
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
@@ -30,6 +32,7 @@ pub struct LifecyclePolicy {
     pub priority: i32,
     pub last_run_at: Option<DateTime<Utc>>,
     pub last_run_items_removed: Option<i64>,
+    pub cron_schedule: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -44,6 +47,7 @@ pub struct CreatePolicyRequest {
     #[schema(value_type = Object)]
     pub config: serde_json::Value,
     pub priority: Option<i32>,
+    pub cron_schedule: Option<String>,
 }
 
 /// Request to update a lifecycle policy.
@@ -55,6 +59,7 @@ pub struct UpdatePolicyRequest {
     #[schema(value_type = Option<Object>)]
     pub config: Option<serde_json::Value>,
     pub priority: Option<i32>,
+    pub cron_schedule: Option<String>,
 }
 
 /// Result of a lifecycle policy dry-run or execution.
@@ -119,13 +124,23 @@ impl LifecycleService {
 
         self.validate_policy_config(&req.policy_type, &req.config)?;
 
+        if let Some(ref cron_expr) = req.cron_schedule {
+            let normalized = normalize_cron_expression(cron_expr);
+            if cron::Schedule::from_str(&normalized).is_err() {
+                return Err(AppError::Validation(format!(
+                    "Invalid cron expression: '{}'",
+                    cron_expr
+                )));
+            }
+        }
+
         let policy = sqlx::query_as::<_, LifecyclePolicy>(
             r#"
-            INSERT INTO lifecycle_policies (repository_id, name, description, policy_type, config, priority)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO lifecycle_policies (repository_id, name, description, policy_type, config, priority, cron_schedule)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, repository_id, name, description, enabled,
                       policy_type, config, priority, last_run_at,
-                      last_run_items_removed, created_at, updated_at
+                      last_run_items_removed, cron_schedule, created_at, updated_at
             "#,
         )
         .bind(req.repository_id)
@@ -134,6 +149,7 @@ impl LifecycleService {
         .bind(&req.policy_type)
         .bind(&req.config)
         .bind(req.priority.unwrap_or(0))
+        .bind(&req.cron_schedule)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -147,7 +163,7 @@ impl LifecycleService {
             r#"
             SELECT id, repository_id, name, description, enabled,
                    policy_type, config, priority, last_run_at,
-                   last_run_items_removed, created_at, updated_at
+                   last_run_items_removed, cron_schedule, created_at, updated_at
             FROM lifecycle_policies
             WHERE ($1::UUID IS NULL OR repository_id = $1 OR repository_id IS NULL)
             ORDER BY priority DESC, created_at ASC
@@ -167,7 +183,7 @@ impl LifecycleService {
             r#"
             SELECT id, repository_id, name, description, enabled,
                    policy_type, config, priority, last_run_at,
-                   last_run_items_removed, created_at, updated_at
+                   last_run_items_removed, cron_schedule, created_at, updated_at
             FROM lifecycle_policies
             WHERE id = $1
             "#,
@@ -192,18 +208,29 @@ impl LifecycleService {
         let enabled = req.enabled.unwrap_or(existing.enabled);
         let config = req.config.unwrap_or(existing.config);
         let priority = req.priority.unwrap_or(existing.priority);
+        let cron_schedule = req.cron_schedule.or(existing.cron_schedule);
 
         self.validate_policy_config(&existing.policy_type, &config)?;
+
+        if let Some(ref cron_expr) = cron_schedule {
+            let normalized = normalize_cron_expression(cron_expr);
+            if cron::Schedule::from_str(&normalized).is_err() {
+                return Err(AppError::Validation(format!(
+                    "Invalid cron expression: '{}'",
+                    cron_expr
+                )));
+            }
+        }
 
         let policy = sqlx::query_as::<_, LifecyclePolicy>(
             r#"
             UPDATE lifecycle_policies
             SET name = $2, description = $3, enabled = $4,
-                config = $5, priority = $6, updated_at = NOW()
+                config = $5, priority = $6, cron_schedule = $7, updated_at = NOW()
             WHERE id = $1
             RETURNING id, repository_id, name, description, enabled,
                       policy_type, config, priority, last_run_at,
-                      last_run_items_removed, created_at, updated_at
+                      last_run_items_removed, cron_schedule, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -212,6 +239,7 @@ impl LifecycleService {
         .bind(enabled)
         .bind(&config)
         .bind(priority)
+        .bind(&cron_schedule)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -280,7 +308,7 @@ impl LifecycleService {
             r#"
             SELECT id, repository_id, name, description, enabled,
                    policy_type, config, priority, last_run_at,
-                   last_run_items_removed, created_at, updated_at
+                   last_run_items_removed, cron_schedule, created_at, updated_at
             FROM lifecycle_policies
             WHERE enabled = true
             ORDER BY priority DESC
@@ -314,6 +342,106 @@ impl LifecycleService {
         }
 
         Ok(results)
+    }
+
+    /// Execute only those enabled policies that are currently due, based on each
+    /// policy's `cron_schedule` (or a default 6-hour cadence when unset).
+    pub async fn execute_due_policies(&self) -> Result<Vec<PolicyExecutionResult>> {
+        let policies = sqlx::query_as::<_, LifecyclePolicy>(
+            r#"
+            SELECT id, repository_id, name, description, enabled,
+                   policy_type, config, priority, last_run_at,
+                   last_run_items_removed, cron_schedule, created_at, updated_at
+            FROM lifecycle_policies
+            WHERE enabled = true
+            ORDER BY priority DESC
+            "#,
+        )
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let now = Utc::now();
+        let default_cadence = chrono::Duration::hours(6);
+        let mut results = Vec::new();
+
+        for policy in policies {
+            let is_due = Self::is_policy_due(
+                policy.cron_schedule.as_deref(),
+                policy.last_run_at,
+                now,
+                default_cadence,
+            );
+
+            if !is_due {
+                continue;
+            }
+
+            match self.execute_policy(policy.id, false).await {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to execute lifecycle policy '{}': {}",
+                        policy.name,
+                        e
+                    );
+                    results.push(PolicyExecutionResult {
+                        policy_id: policy.id,
+                        policy_name: policy.name,
+                        dry_run: false,
+                        artifacts_matched: 0,
+                        artifacts_removed: 0,
+                        bytes_freed: 0,
+                        errors: vec![e.to_string()],
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Check whether a policy without a cron schedule is due based on the
+    /// default cadence (6 hours). A policy that has never run is always due.
+    fn is_due_by_default_cadence(
+        last_run_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        cadence: chrono::Duration,
+    ) -> bool {
+        match last_run_at {
+            None => true,
+            Some(last) => now - last >= cadence,
+        }
+    }
+
+    /// Determine whether a policy is currently due for execution.
+    ///
+    /// When the policy has a `cron_schedule`, checks whether any scheduled
+    /// occurrence falls between `last_run_at` and `now`. If the cron expression
+    /// is invalid, falls back to the default cadence. When there is no cron
+    /// schedule, uses `is_due_by_default_cadence`.
+    fn is_policy_due(
+        cron_schedule: Option<&str>,
+        last_run_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        default_cadence: chrono::Duration,
+    ) -> bool {
+        if let Some(cron_expr) = cron_schedule {
+            let normalized = normalize_cron_expression(cron_expr);
+            match cron::Schedule::from_str(&normalized) {
+                Ok(schedule) => match last_run_at {
+                    None => true,
+                    Some(last_run) => schedule
+                        .after(&last_run)
+                        .take_while(|t| *t <= now)
+                        .next()
+                        .is_some(),
+                },
+                Err(_) => Self::is_due_by_default_cadence(last_run_at, now, default_cadence),
+            }
+        } else {
+            Self::is_due_by_default_cadence(last_run_at, now, default_cadence)
+        }
     }
 
     // --- Policy execution implementations ---
@@ -1070,6 +1198,7 @@ mod tests {
             priority: 10,
             last_run_at: None,
             last_run_items_removed: None,
+            cron_schedule: None,
             created_at: now,
             updated_at: now,
         };
@@ -1094,6 +1223,7 @@ mod tests {
             "priority": 0,
             "last_run_at": null,
             "last_run_items_removed": null,
+            "cron_schedule": null,
             "created_at": now,
             "updated_at": now,
         });
@@ -1305,6 +1435,7 @@ mod tests {
             priority: 0,
             last_run_at: None,
             last_run_items_removed: None,
+            cron_schedule: None,
             created_at: now,
             updated_at: now,
         }
@@ -1776,7 +1907,8 @@ mod tests {
             "description": "Updated Description",
             "enabled": true,
             "config": {"days": 60},
-            "priority": 5
+            "priority": 5,
+            "cron_schedule": "0 0 3 * * *"
         });
         let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
         assert_eq!(req.name, Some("Updated Name".to_string()));
@@ -1785,5 +1917,298 @@ mod tests {
         assert!(req.config.is_some());
         assert_eq!(req.config.unwrap()["days"], 60);
         assert_eq!(req.priority, Some(5));
+        assert_eq!(req.cron_schedule, Some("0 0 3 * * *".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // cron_schedule field tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_policy_request_with_cron_schedule() {
+        let json_val = json!({
+            "name": "Scheduled Policy",
+            "policy_type": "max_age_days",
+            "config": {"days": 7},
+            "cron_schedule": "0 0 2 * * *"
+        });
+        let req: CreatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        assert_eq!(req.cron_schedule, Some("0 0 2 * * *".to_string()));
+    }
+
+    #[test]
+    fn test_create_policy_request_without_cron_schedule() {
+        let json_val = json!({
+            "name": "Unscheduled Policy",
+            "policy_type": "max_age_days",
+            "config": {"days": 7}
+        });
+        let req: CreatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        assert!(req.cron_schedule.is_none());
+    }
+
+    #[test]
+    fn test_update_policy_request_cron_schedule_none() {
+        let json_val = json!({
+            "enabled": true
+        });
+        let req: UpdatePolicyRequest = serde_json::from_value(json_val).unwrap();
+        assert!(req.cron_schedule.is_none());
+    }
+
+    #[test]
+    fn test_lifecycle_policy_serialization_with_cron_schedule() {
+        let now = Utc::now();
+        let policy = LifecyclePolicy {
+            id: Uuid::nil(),
+            repository_id: None,
+            name: "Cron Policy".to_string(),
+            description: None,
+            enabled: true,
+            policy_type: "max_age_days".to_string(),
+            config: json!({"days": 14}),
+            priority: 0,
+            last_run_at: None,
+            last_run_items_removed: None,
+            cron_schedule: Some("0 30 1 * * *".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(json.contains("\"cron_schedule\":\"0 30 1 * * *\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_due_by_default_cadence tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_due_never_run_returns_true() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        assert!(
+            LifecycleService::is_due_by_default_cadence(None, now, cadence),
+            "A policy that has never run should always be due"
+        );
+    }
+
+    #[test]
+    fn test_is_due_recently_run_returns_false() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        let last_run = now - chrono::Duration::hours(1);
+        assert!(
+            !LifecycleService::is_due_by_default_cadence(Some(last_run), now, cadence),
+            "A policy that ran 1 hour ago should not be due with a 6-hour cadence"
+        );
+    }
+
+    #[test]
+    fn test_is_due_old_run_returns_true() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        let last_run = now - chrono::Duration::hours(7);
+        assert!(
+            LifecycleService::is_due_by_default_cadence(Some(last_run), now, cadence),
+            "A policy that ran 7 hours ago should be due with a 6-hour cadence"
+        );
+    }
+
+    #[test]
+    fn test_is_due_exactly_at_cadence_returns_true() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        let last_run = now - chrono::Duration::hours(6);
+        assert!(
+            LifecycleService::is_due_by_default_cadence(Some(last_run), now, cadence),
+            "A policy that ran exactly 6 hours ago should be due"
+        );
+    }
+
+    #[test]
+    fn test_is_due_just_under_cadence_returns_false() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        let last_run = now - chrono::Duration::hours(6) + chrono::Duration::seconds(1);
+        assert!(
+            !LifecycleService::is_due_by_default_cadence(Some(last_run), now, cadence),
+            "A policy that ran just under 6 hours ago should not be due"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cron schedule parsing for policies
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cron_schedule_from_str_valid() {
+        let expr = "0 0 2 * * *"; // daily at 2 AM
+        let schedule = cron::Schedule::from_str(expr);
+        assert!(schedule.is_ok(), "Valid 6-field cron should parse");
+    }
+
+    #[test]
+    fn test_cron_schedule_from_str_invalid() {
+        let expr = "not a cron";
+        let schedule = cron::Schedule::from_str(expr);
+        assert!(schedule.is_err(), "Invalid cron should fail");
+    }
+
+    #[test]
+    fn test_cron_schedule_upcoming_returns_future_time() {
+        let expr = "0 * * * * *"; // every minute
+        let schedule = cron::Schedule::from_str(expr).unwrap();
+        let next = schedule.upcoming(Utc).next();
+        assert!(next.is_some());
+        assert!(next.unwrap() > Utc::now());
+    }
+
+    #[test]
+    fn test_cron_schedule_after_last_run_detects_due() {
+        let expr = "0 * * * * *"; // every minute
+        let schedule = cron::Schedule::from_str(expr).unwrap();
+        // A last_run 2 minutes ago should have at least one scheduled time between then and now
+        let last_run = Utc::now() - chrono::Duration::minutes(2);
+        let now = Utc::now();
+        let has_occurrence = schedule
+            .after(&last_run)
+            .take_while(|t| *t <= now)
+            .next()
+            .is_some();
+        assert!(
+            has_occurrence,
+            "Should find a scheduled time in the last 2 minutes for every-minute cron"
+        );
+    }
+
+    #[test]
+    fn test_create_policy_rejects_invalid_cron() {
+        // Verify the validation logic directly
+        let invalid = "not-a-cron";
+        let normalized = normalize_cron_expression(invalid);
+        assert!(cron::Schedule::from_str(&normalized).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_policy_due (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_policy_due_no_cron_never_run() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        assert!(LifecycleService::is_policy_due(None, None, now, cadence));
+    }
+
+    #[test]
+    fn test_is_policy_due_no_cron_recently_run() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(1);
+        let cadence = chrono::Duration::hours(6);
+        assert!(!LifecycleService::is_policy_due(
+            None,
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_no_cron_overdue() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(7);
+        let cadence = chrono::Duration::hours(6);
+        assert!(LifecycleService::is_policy_due(
+            None,
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_valid_cron_never_run() {
+        let now = Utc::now();
+        let cadence = chrono::Duration::hours(6);
+        // Every minute cron
+        assert!(LifecycleService::is_policy_due(
+            Some("0 * * * * *"),
+            None,
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_valid_cron_recently_run() {
+        // Use a fixed timestamp at minute 45 so the 30-minute window (15..45)
+        // never crosses an hour boundary where the hourly cron fires.
+        // Using Utc::now() caused flaky failures when the current minute < 30.
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2025, 6, 15, 10, 45, 0).unwrap();
+        let last_run = now - chrono::Duration::minutes(30);
+        let cadence = chrono::Duration::hours(6);
+        // Hourly cron: next occurrence after 10:15 is 11:00, which is past 10:45
+        assert!(!LifecycleService::is_policy_due(
+            Some("0 0 * * * *"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_valid_cron_overdue() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::minutes(2);
+        let cadence = chrono::Duration::hours(6);
+        // Every minute cron: should have an occurrence in last 2 minutes
+        assert!(LifecycleService::is_policy_due(
+            Some("0 * * * * *"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_invalid_cron_falls_back_to_cadence_due() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(7);
+        let cadence = chrono::Duration::hours(6);
+        assert!(LifecycleService::is_policy_due(
+            Some("invalid"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_invalid_cron_falls_back_to_cadence_not_due() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::hours(1);
+        let cadence = chrono::Duration::hours(6);
+        assert!(!LifecycleService::is_policy_due(
+            Some("invalid"),
+            Some(last_run),
+            now,
+            cadence
+        ));
+    }
+
+    #[test]
+    fn test_is_policy_due_5_field_cron_normalized() {
+        let now = Utc::now();
+        let last_run = now - chrono::Duration::minutes(6);
+        let cadence = chrono::Duration::hours(6);
+        // 5-field cron "*/5 * * * *" (every 5 minutes) gets normalized to 6-field;
+        // with last_run 6 minutes ago there should be at least one occurrence
+        assert!(LifecycleService::is_policy_due(
+            Some("*/5 * * * *"),
+            Some(last_run),
+            now,
+            cadence
+        ));
     }
 }

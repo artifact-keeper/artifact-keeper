@@ -118,17 +118,22 @@ fn validate_token(
 }
 
 fn request_host(headers: &HeaderMap) -> String {
-    headers
-        .get("host")
+    let scheme = headers
+        .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .map(|h| {
-            if h.contains("://") {
-                h.to_string()
-            } else {
-                format!("http://{}", h)
-            }
-        })
-        .unwrap_or_else(|| "http://localhost".to_string())
+        .unwrap_or("http");
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+
+    if host.contains("://") {
+        host.to_string()
+    } else {
+        format!("{}://{}", scheme, host)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,6 +1420,37 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("localhost:8080"));
         assert_eq!(request_host(&headers), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_request_host_uses_x_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(request_host(&headers), "https://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_host_uses_x_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com:30443"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(request_host(&headers), "https://registry.example.com:30443");
+    }
+
+    #[test]
+    fn test_request_host_forwarded_host_without_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com"),
+        );
+        assert_eq!(request_host(&headers), "http://registry.example.com");
     }
 
     // -----------------------------------------------------------------------

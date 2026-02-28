@@ -79,6 +79,20 @@ jobs:
     name: 📊 Code Coverage
     runs-on: ubuntu-latest
     needs: lint-rust
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v6
 
@@ -92,8 +106,14 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
 
+      - name: Run database migrations
+        run: cargo install sqlx-cli --no-default-features --features postgres && sqlx migrate run --source backend/migrations
+        env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+
       - name: Generate coverage report
         env:
+          DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
         run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
 

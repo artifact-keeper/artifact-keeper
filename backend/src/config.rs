@@ -103,6 +103,12 @@ pub struct Config {
 
     /// OpenTelemetry service name (default: "artifact-keeper").
     pub otel_service_name: String,
+
+    /// Cron expression (6-field) for storage garbage collection (default: hourly).
+    pub gc_schedule: String,
+
+    /// How often (in seconds) the lifecycle scheduler checks for due policies.
+    pub lifecycle_check_interval_secs: u64,
 }
 
 impl Config {
@@ -154,6 +160,8 @@ impl Config {
             otel_exporter_otlp_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
             otel_service_name: env::var("OTEL_SERVICE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper".into()),
+            gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
+            lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
         })
     }
 }
@@ -427,6 +435,130 @@ mod tests {
             env::set_var("JWT_REFRESH_TOKEN_EXPIRY_DAYS", v);
         } else {
             env::remove_var("JWT_REFRESH_TOKEN_EXPIRY_DAYS");
+        }
+    }
+
+    #[test]
+    fn test_config_gc_schedule_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_gc = env::var("GC_SCHEDULE").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("GC_SCHEDULE");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.gc_schedule, "0 0 * * * *");
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_gc {
+            env::set_var("GC_SCHEDULE", v);
+        }
+    }
+
+    #[test]
+    fn test_config_gc_schedule_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_gc = env::var("GC_SCHEDULE").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("GC_SCHEDULE", "0 30 2 * * *");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.gc_schedule, "0 30 2 * * *");
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_gc {
+            env::set_var("GC_SCHEDULE", v);
+        } else {
+            env::remove_var("GC_SCHEDULE");
+        }
+    }
+
+    #[test]
+    fn test_config_lifecycle_check_interval_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("LIFECYCLE_CHECK_INTERVAL_SECS");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.lifecycle_check_interval_secs, 60);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_lc {
+            env::set_var("LIFECYCLE_CHECK_INTERVAL_SECS", v);
+        }
+    }
+
+    #[test]
+    fn test_config_lifecycle_check_interval_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_lc = env::var("LIFECYCLE_CHECK_INTERVAL_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("LIFECYCLE_CHECK_INTERVAL_SECS", "300");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.lifecycle_check_interval_secs, 300);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_lc {
+            env::set_var("LIFECYCLE_CHECK_INTERVAL_SECS", v);
+        } else {
+            env::remove_var("LIFECYCLE_CHECK_INTERVAL_SECS");
         }
     }
 

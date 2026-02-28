@@ -5,7 +5,7 @@
 //! falling back to PostgreSQL full-text search.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     routing::get,
     Json, Router,
 };
@@ -14,9 +14,19 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::search_service::{SearchQuery, SearchService};
+
+// ---------------------------------------------------------------------------
+// Admin Router
+// ---------------------------------------------------------------------------
+
+/// Create admin search routes (mounted under /api/v1/admin/search).
+pub fn admin_router() -> Router<SharedState> {
+    Router::new().route("/reindex", axum::routing::post(trigger_reindex))
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -107,6 +117,7 @@ pub struct QuickSearchResponse {
 )]
 pub async fn quick_search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<QuickSearchQuery>,
 ) -> Result<Json<QuickSearchResponse>> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
@@ -124,6 +135,7 @@ pub async fn quick_search(
         name: None,
         offset: Some(0),
         limit: Some(limit),
+        public_only: auth.is_none(),
     };
 
     let service = SearchService::new(state.db.clone());
@@ -190,6 +202,7 @@ pub struct AdvancedSearchResponse {
 )]
 pub async fn advanced_search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<AdvancedSearchQuery>,
 ) -> Result<Json<AdvancedSearchResponse>> {
     let page = params.page.unwrap_or(1).max(1);
@@ -202,6 +215,7 @@ pub async fn advanced_search(
         name: params.name.clone(),
         offset: Some(offset),
         limit: Some(per_page as i64),
+        public_only: auth.is_none(),
     };
 
     let service = SearchService::new(state.db.clone());
@@ -506,13 +520,14 @@ pub struct TrendingQuery {
 )]
 pub async fn trending(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<TrendingQuery>,
 ) -> Result<Json<Vec<SearchResultItem>>> {
     let days = params.days.unwrap_or(7).clamp(1, 90);
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     let service = SearchService::new(state.db.clone());
-    let results = service.trending(days, limit).await?;
+    let results = service.trending(days, limit, auth.is_none()).await?;
 
     let items = results
         .into_iter()
@@ -554,12 +569,13 @@ pub struct RecentQuery {
 )]
 pub async fn recent(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<RecentQuery>,
 ) -> Result<Json<Vec<SearchResultItem>>> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     let service = SearchService::new(state.db.clone());
-    let results = service.recent(limit).await?;
+    let results = service.recent(limit, auth.is_none()).await?;
 
     let items = results
         .into_iter()
@@ -580,6 +596,51 @@ pub async fn recent(
     Ok(Json(items))
 }
 
+// ---------------------------------------------------------------------------
+// POST /admin/search/reindex
+// ---------------------------------------------------------------------------
+
+/// Response returned when a reindex is triggered.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReindexResponse {
+    pub status: String,
+    pub message: String,
+}
+
+/// Trigger a full reindex of all artifacts and repositories in Meilisearch.
+///
+/// The reindex runs asynchronously in the background. The endpoint returns
+/// immediately with a confirmation that the task was started.
+#[utoipa::path(
+    post,
+    path = "/reindex",
+    context_path = "/api/v1/admin/search",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Reindex started in background", body = ReindexResponse),
+        (status = 500, description = "Meilisearch is not configured"),
+    ),
+)]
+pub async fn trigger_reindex(State(state): State<SharedState>) -> Result<Json<ReindexResponse>> {
+    let meili = state
+        .meili_service
+        .as_ref()
+        .ok_or_else(|| AppError::Config("Meilisearch is not configured".to_string()))?;
+
+    let db = state.db.clone();
+    let meili = meili.clone();
+    tokio::spawn(async move {
+        if let Err(e) = meili.full_reindex(&db).await {
+            tracing::error!("Search reindex failed: {}", e);
+        }
+    });
+
+    Ok(Json(ReindexResponse {
+        status: "started".to_string(),
+        message: "Full reindex of artifacts and repositories triggered in background".to_string(),
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -589,6 +650,7 @@ pub async fn recent(
         suggest,
         trending,
         recent,
+        trigger_reindex,
     ),
     components(schemas(
         SearchResultItem,
@@ -600,6 +662,7 @@ pub async fn recent(
         ChecksumArtifact,
         ChecksumSearchResponse,
         SuggestResponse,
+        ReindexResponse,
     ))
 )]
 pub struct SearchApiDoc;
@@ -1029,5 +1092,20 @@ mod tests {
     fn test_empty_query_text_logic() {
         let query_text = String::new();
         assert!(query_text.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // ReindexResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reindex_response_serialization() {
+        let resp = ReindexResponse {
+            status: "started".to_string(),
+            message: "Full reindex triggered".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "started");
+        assert_eq!(json["message"], "Full reindex triggered");
     }
 }

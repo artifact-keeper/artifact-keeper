@@ -285,6 +285,9 @@ pub async fn liveness_check() -> impl IntoResponse {
 async fn check_storage_health(config: &crate::config::Config) -> CheckStatus {
     match config.storage_backend.as_str() {
         "filesystem" => {
+            // Use a fixed probe filename to avoid path injection concerns.
+            // storage_path is from server config, not user input, but we
+            // canonicalize and verify the probe stays under the base dir.
             let storage_base = match std::path::Path::new(&config.storage_path).canonicalize() {
                 Ok(p) => p,
                 Err(e) => {

@@ -43,10 +43,37 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
     }
 }
 
+/// Ensure a repository is visible to the current user.
+/// Public repos are visible to everyone. Private repos require authentication.
+fn require_visible(
+    repo: &crate::models::repository::Repository,
+    auth: &Option<AuthExtension>,
+) -> Result<()> {
+    if repo.is_public {
+        return Ok(());
+    }
+    match auth {
+        Some(a) => {
+            if a.can_access_repo(repo.id) {
+                Ok(())
+            } else {
+                Err(AppError::NotFound(format!(
+                    "Repository '{}' not found",
+                    repo.key
+                )))
+            }
+        }
+        None => Err(AppError::NotFound(format!(
+            "Repository '{}' not found",
+            repo.key
+        ))),
+    }
+}
+
 /// Create repository routes
 pub fn router() -> Router<SharedState> {
     use axum::extract::DefaultBodyLimit;
-    use axum::routing::delete;
+    use axum::routing::{delete, put};
 
     Router::new()
         .route("/", get(list_repositories).post(create_repository))
@@ -56,6 +83,8 @@ pub fn router() -> Router<SharedState> {
                 .patch(update_repository)
                 .delete(delete_repository),
         )
+        // Cache TTL configuration for proxy/remote repositories
+        .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
         // Virtual repository member management
         .route(
             "/:key/members",
@@ -188,6 +217,124 @@ fn validate_repository_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate that a cache TTL value (in seconds) is within the acceptable range.
+/// Minimum is 1 second, maximum is 30 days (2,592,000 seconds).
+fn validate_cache_ttl(secs: i64) -> bool {
+    (1..=2_592_000).contains(&secs)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetCacheTtlRequest {
+    pub cache_ttl_seconds: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CacheTtlResponse {
+    pub repository_key: String,
+    pub cache_ttl_seconds: i64,
+}
+
+/// Set the proxy cache TTL for a repository
+#[utoipa::path(
+    put,
+    path = "/{key}/cache-ttl",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetCacheTtlRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Cache TTL updated", body = CacheTtlResponse),
+        (status = 400, description = "Invalid TTL value"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_cache_ttl(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetCacheTtlRequest>,
+) -> Result<Json<CacheTtlResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    if !validate_cache_ttl(payload.cache_ttl_seconds) {
+        return Err(AppError::Validation(
+            "cache_ttl_seconds must be between 1 and 2592000 (30 days)".to_string(),
+        ));
+    }
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    // Upsert into repository_config table
+    sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, 'cache_ttl_secs', $2)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = $2, updated_at = NOW()
+        "#,
+    )
+    .bind(repo.id)
+    .bind(payload.cache_ttl_seconds.to_string())
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(CacheTtlResponse {
+        repository_key: key,
+        cache_ttl_seconds: payload.cache_ttl_seconds,
+    }))
+}
+
+/// Get the proxy cache TTL for a repository
+#[utoipa::path(
+    get,
+    path = "/{key}/cache-ttl",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Current cache TTL", body = CacheTtlResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_cache_ttl(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<CacheTtlResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    // Read from repository_config table
+    let result: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT value FROM repository_config
+        WHERE repository_id = $1 AND key = 'cache_ttl_secs'
+        "#,
+    )
+    .bind(repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let ttl = result
+        .and_then(|(v,)| v.parse::<i64>().ok())
+        .unwrap_or(3600); // default 1 hour
+
+    Ok(Json(CacheTtlResponse {
+        repository_key: key,
+        cache_ttl_seconds: ttl,
+    }))
+}
+
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
     match s.to_lowercase().as_str() {
         "maven" => Ok(RepositoryFormat::Maven),
@@ -269,6 +416,7 @@ fn parse_repo_type(s: &str) -> Result<RepositoryType> {
 )]
 pub async fn list_repositories(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(query): Query<ListRepositoriesQuery>,
 ) -> Result<Json<RepositoryListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
@@ -282,6 +430,7 @@ pub async fn list_repositories(
         .map(|t| parse_repo_type(t))
         .transpose()?;
 
+    let public_only = auth.is_none();
     let service = RepositoryService::new(state.db.clone());
     let (repos, total) = service
         .list(
@@ -289,7 +438,7 @@ pub async fn list_repositories(
             per_page as i64,
             format_filter,
             type_filter,
-            false,
+            public_only,
             query.q.as_deref(),
         )
         .await?;
@@ -404,10 +553,12 @@ pub async fn create_repository(
 )]
 pub async fn get_repository(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<RepositoryResponse>> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
     let storage_used = service.get_storage_usage(repo.id).await?;
 
     Ok(Json(repo_to_response(repo, storage_used)))
@@ -565,6 +716,7 @@ pub struct ArtifactListResponse {
 )]
 pub async fn list_artifacts(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
     Query(query): Query<ListArtifactsQuery>,
 ) -> Result<Json<ArtifactListResponse>> {
@@ -574,6 +726,7 @@ pub async fn list_artifacts(
 
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
 
     let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -637,10 +790,12 @@ pub async fn list_artifacts(
 )]
 pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
 ) -> Result<Json<ArtifactResponse>> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
 
     let storage = state.storage_for_repo(&repo.storage_path);
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -878,6 +1033,7 @@ pub async fn download_artifact(
 ) -> Result<impl IntoResponse> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth)?;
 
     // Get client IP for analytics
     let ip_addr = request
@@ -1427,6 +1583,8 @@ pub async fn update_virtual_members(
         get_repository,
         update_repository,
         delete_repository,
+        set_cache_ttl,
+        get_cache_ttl,
         list_artifacts,
         get_artifact_metadata,
         upload_artifact,
@@ -1443,6 +1601,8 @@ pub async fn update_virtual_members(
         UpdateRepositoryRequest,
         RepositoryResponse,
         RepositoryListResponse,
+        SetCacheTtlRequest,
+        CacheTtlResponse,
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
@@ -2343,5 +2503,223 @@ mod tests {
         assert_eq!(response.repo_type, "staging");
         assert_eq!(response.storage_used_bytes, 42);
         assert_eq!(response.quota_bytes, Some(5_000_000_000));
+    }
+
+    // -----------------------------------------------------------------------
+    // require_auth
+    // -----------------------------------------------------------------------
+
+    fn make_auth_ext(repo_ids: Option<Vec<Uuid>>) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "tester".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: repo_ids,
+        }
+    }
+
+    #[test]
+    fn test_require_auth_with_some() {
+        let ext = make_auth_ext(None);
+        let result = require_auth(Some(ext));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().username, "tester");
+    }
+
+    #[test]
+    fn test_require_auth_with_none() {
+        let result = require_auth(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authentication(msg) => assert!(msg.contains("Authentication required")),
+            other => panic!("Expected Authentication error, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // require_repo_access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_require_repo_access_unrestricted() {
+        let ext = make_auth_ext(None);
+        let repo_id = Uuid::new_v4();
+        assert!(require_repo_access(&ext, repo_id).is_ok());
+    }
+
+    #[test]
+    fn test_require_repo_access_allowed() {
+        let repo_id = Uuid::new_v4();
+        let ext = make_auth_ext(Some(vec![repo_id]));
+        assert!(require_repo_access(&ext, repo_id).is_ok());
+    }
+
+    #[test]
+    fn test_require_repo_access_denied() {
+        let allowed = Uuid::new_v4();
+        let denied = Uuid::new_v4();
+        let ext = make_auth_ext(Some(vec![allowed]));
+        let result = require_repo_access(&ext, denied);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authorization(msg) => {
+                assert!(msg.contains("does not have access"))
+            }
+            other => panic!("Expected Authorization error, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // require_visible
+    // -----------------------------------------------------------------------
+
+    fn make_repo(is_public: bool) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository};
+
+        let now = chrono::Utc::now();
+        Repository {
+            id: Uuid::new_v4(),
+            key: "test-repo".to_string(),
+            name: "Test Repo".to_string(),
+            description: None,
+            format: RepositoryFormat::Pypi,
+            repo_type: RepositoryType::Local,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/test-repo".to_string(),
+            upstream_url: None,
+            is_public,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::Scheduled,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn test_require_visible_public_no_auth() {
+        let repo = make_repo(true);
+        assert!(require_visible(&repo, &None).is_ok());
+    }
+
+    #[test]
+    fn test_require_visible_public_with_auth() {
+        let repo = make_repo(true);
+        let auth = Some(make_auth_ext(None));
+        assert!(require_visible(&repo, &auth).is_ok());
+    }
+
+    #[test]
+    fn test_require_visible_private_no_auth() {
+        let repo = make_repo(false);
+        let result = require_visible(&repo, &None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
+            other => panic!("Expected NotFound error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_visible_private_with_unrestricted_auth() {
+        let repo = make_repo(false);
+        let auth = Some(make_auth_ext(None));
+        assert!(require_visible(&repo, &auth).is_ok());
+    }
+
+    #[test]
+    fn test_require_visible_private_with_allowed_repo() {
+        let repo = make_repo(false);
+        let auth = Some(make_auth_ext(Some(vec![repo.id])));
+        assert!(require_visible(&repo, &auth).is_ok());
+    }
+
+    #[test]
+    fn test_require_visible_private_with_different_repo_restriction() {
+        let repo = make_repo(false);
+        let other_repo_id = Uuid::new_v4();
+        let auth = Some(make_auth_ext(Some(vec![other_repo_id])));
+        let result = require_visible(&repo, &auth);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::NotFound(msg) => assert!(msg.contains("test-repo")),
+            other => panic!("Expected NotFound error, got: {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_cache_ttl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_cache_ttl_valid_5_minutes() {
+        assert!(validate_cache_ttl(300));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_1_day() {
+        assert!(validate_cache_ttl(86400));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_1_week() {
+        assert!(validate_cache_ttl(604800));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_minimum() {
+        assert!(validate_cache_ttl(1));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_valid_maximum() {
+        assert!(validate_cache_ttl(2_592_000));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_zero() {
+        assert!(!validate_cache_ttl(0));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_negative() {
+        assert!(!validate_cache_ttl(-1));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_too_large() {
+        assert!(!validate_cache_ttl(2_592_001));
+    }
+
+    #[test]
+    fn test_validate_cache_ttl_invalid_very_negative() {
+        assert!(!validate_cache_ttl(-86400));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache TTL DTO serialization / deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_cache_ttl_request_deserialization() {
+        let json = r#"{"cache_ttl_seconds": 3600}"#;
+        let req: SetCacheTtlRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cache_ttl_seconds, 3600);
+    }
+
+    #[test]
+    fn test_cache_ttl_response_serialization() {
+        let resp = CacheTtlResponse {
+            repository_key: "my-remote-repo".to_string(),
+            cache_ttl_seconds: 7200,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"repository_key\":\"my-remote-repo\""));
+        assert!(json.contains("\"cache_ttl_seconds\":7200"));
     }
 }

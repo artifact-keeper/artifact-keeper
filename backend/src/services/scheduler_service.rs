@@ -106,19 +106,20 @@ pub fn spawn_all(
         });
     }
 
-    // Lifecycle policy execution (every 6 hours)
+    // Lifecycle policy execution (configurable check interval)
     {
         let db = db.clone();
+        let check_secs = config.lifecycle_check_interval_secs;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
             let service = LifecycleService::new(db);
-            let mut ticker = interval(Duration::from_secs(6 * 3600)); // 6 hours
+            let mut ticker = interval(Duration::from_secs(check_secs));
 
             loop {
                 ticker.tick().await;
-                tracing::info!("Running scheduled lifecycle policy execution");
+                tracing::debug!("Checking for due lifecycle policies");
 
-                match service.execute_all_enabled().await {
+                match service.execute_due_policies().await {
                     Ok(results) => {
                         let total_removed: i64 = results.iter().map(|r| r.artifacts_removed).sum();
                         let total_freed: i64 = results.iter().map(|r| r.bytes_freed).sum();
@@ -140,7 +141,7 @@ pub fn spawn_all(
         });
     }
 
-    // Storage garbage collection (every hour)
+    // Storage garbage collection (cron-based, default: hourly)
     {
         let db = db.clone();
         let config_clone = config.clone();
@@ -152,10 +153,29 @@ pub fn spawn_all(
                 gc_storage,
                 config_clone.storage_backend.clone(),
             );
-            let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
+
+            let normalized = normalize_cron_expression(&config_clone.gc_schedule);
+            let gc_schedule = match parse_cron_schedule(&normalized) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        "Invalid GC_SCHEDULE '{}', falling back to hourly",
+                        config_clone.gc_schedule,
+                    );
+                    Schedule::from_str("0 0 * * * *").expect("default hourly cron is valid")
+                }
+            };
 
             loop {
-                ticker.tick().await;
+                let next = gc_schedule
+                    .upcoming(Utc)
+                    .next()
+                    .expect("cron schedule should always have a next occurrence");
+                let delay = (next - Utc::now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::from_secs(3600));
+                tokio::time::sleep(delay).await;
+
                 tracing::info!("Running scheduled storage garbage collection");
 
                 match service.run_gc(false).await {
@@ -223,8 +243,23 @@ pub fn spawn_all(
         });
     }
 
+    // Webhook delivery retry processor (every 30 seconds)
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            let mut ticker = interval(Duration::from_secs(30));
+            loop {
+                ticker.tick().await;
+                if let Err(e) = crate::api::handlers::webhooks::process_webhook_retries(&db).await {
+                    tracing::warn!("Webhook retry processing failed: {}", e);
+                }
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies"
+        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries"
     );
 }
 

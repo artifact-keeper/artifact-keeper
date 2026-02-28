@@ -843,6 +843,8 @@ pub struct ScannerService {
     scanners: Vec<Arc<dyn Scanner>>,
     scan_result_service: Arc<ScanResultService>,
     scan_config_service: Arc<ScanConfigService>,
+    storage: Arc<dyn StorageBackend>,
+    storage_backend_type: String,
     #[allow(dead_code)]
     storage_base_path: String,
     scan_workspace_path: String,
@@ -856,6 +858,8 @@ impl ScannerService {
         scan_result_service: Arc<ScanResultService>,
         scan_config_service: Arc<ScanConfigService>,
         trivy_url: Option<String>,
+        storage: Arc<dyn StorageBackend>,
+        storage_backend_type: String,
         storage_base_path: String,
         scan_workspace_path: String,
         openscap_url: Option<String>,
@@ -902,6 +906,8 @@ impl ScannerService {
             scanners,
             scan_result_service,
             scan_config_service,
+            storage,
+            storage_backend_type,
             storage_base_path,
             scan_workspace_path,
         }
@@ -1129,27 +1135,38 @@ impl ScannerService {
         Ok(count)
     }
 
-    /// Fetch artifact content from filesystem storage.
+    /// Fetch artifact content from the configured storage backend.
     async fn fetch_artifact_content(&self, artifact: &Artifact) -> Result<Bytes> {
-        let storage_path: String =
-            sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
-                .bind(artifact.repository_id)
-                .fetch_one(&self.db)
-                .await
-                .map_err(|e| {
-                    AppError::Database(format!(
-                        "Failed to fetch storage_path for repository {}: {}",
-                        artifact.repository_id, e
-                    ))
-                })?;
-
-        let storage = FilesystemStorage::new(&storage_path);
+        let storage = self.resolve_repo_storage(artifact.repository_id).await?;
         storage.get(&artifact.storage_key).await.map_err(|e| {
             AppError::Storage(format!(
                 "Failed to read artifact {} (key={}): {}",
                 artifact.id, artifact.storage_key, e
             ))
         })
+    }
+
+    /// Resolve the storage backend for a given repository, mirroring
+    /// `AppState::storage_for_repo()`. For S3/Azure/GCS the shared backend
+    /// instance is returned; for filesystem a per-repo instance is created.
+    async fn resolve_repo_storage(&self, repository_id: Uuid) -> Result<Arc<dyn StorageBackend>> {
+        match self.storage_backend_type.as_str() {
+            "s3" | "azure" | "gcs" => Ok(self.storage.clone()),
+            _ => {
+                let storage_path: String =
+                    sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
+                        .bind(repository_id)
+                        .fetch_one(&self.db)
+                        .await
+                        .map_err(|e| {
+                            AppError::Database(format!(
+                                "Failed to fetch storage_path for repository {}: {}",
+                                repository_id, e
+                            ))
+                        })?;
+                Ok(Arc::new(FilesystemStorage::new(&storage_path)))
+            }
+        }
     }
 
     /// Prepare a scan workspace directory with the artifact content.

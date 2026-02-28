@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use bcrypt::{hash, verify, DEFAULT_COST};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -264,11 +264,12 @@ impl AuthService {
 
         let prefix = &token[..8];
 
-        // Find token by prefix
+        // Find token by prefix (includes revoked_at and last_used_at for
+        // revocation check and debounced usage tracking).
         let stored_token = sqlx::query!(
             r#"
             SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,
-                   at.repo_selector
+                   at.repo_selector, at.revoked_at, at.last_used_at
             FROM api_tokens at
             WHERE at.token_prefix = $1
             "#,
@@ -278,6 +279,11 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("Invalid API token".to_string()))?;
+
+        // Check revocation before spending time on hash verification
+        if stored_token.revoked_at.is_some() {
+            return Err(AppError::Unauthorized("Token has been revoked".to_string()));
+        }
 
         // Verify full token hash
         if !Self::verify_password(token, &stored_token.token_hash)? {
@@ -291,14 +297,20 @@ impl AuthService {
             }
         }
 
-        // Update last used timestamp
-        sqlx::query!(
-            "UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1",
-            stored_token.id
-        )
-        .execute(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        // Debounced usage analytics: only update last_used_at if it has been
+        // more than 5 minutes since the last recorded use (or never used).
+        let should_update = should_debounce_usage_update(stored_token.last_used_at);
+
+        if should_update {
+            let token_id = stored_token.id;
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1")
+                    .bind(token_id)
+                    .execute(&db)
+                    .await;
+            });
+        }
 
         // Fetch user
         let user = sqlx::query_as!(
@@ -412,13 +424,13 @@ impl AuthService {
         Ok((token, record.id))
     }
 
-    /// Revoke an API token
+    /// Revoke an API token (soft-revoke: sets revoked_at instead of deleting).
     pub async fn revoke_api_token(&self, token_id: Uuid, user_id: Uuid) -> Result<()> {
-        let result = sqlx::query!(
-            "DELETE FROM api_tokens WHERE id = $1 AND user_id = $2",
-            token_id,
-            user_id
+        let result = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
         )
+        .bind(token_id)
+        .bind(user_id)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -941,6 +953,16 @@ impl AuthService {
     }
 }
 
+/// Determine whether a token's `last_used_at` timestamp is old enough
+/// to warrant a database update. Uses a 5-minute debounce window to
+/// avoid writing to the database on every single token use.
+pub(crate) fn should_debounce_usage_update(last_used_at: Option<DateTime<Utc>>) -> bool {
+    match last_used_at {
+        None => true,
+        Some(lu) => Utc::now() - lu > Duration::minutes(5),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1056,8 @@ mod tests {
             dependency_track_url: None,
             otel_exporter_otlp_endpoint: None,
             otel_service_name: "test".to_string(),
+            gc_schedule: "0 0 * * * *".to_string(),
+            lifecycle_check_interval_secs: 60,
         })
     }
 
@@ -1409,5 +1433,47 @@ mod tests {
             .filter(|r| r.as_str() == "developer")
             .count();
         assert_eq!(dev_count, 1, "developer role should not be duplicated");
+    }
+
+    // -----------------------------------------------------------------------
+    // should_debounce_usage_update (extracted pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_debounce_never_used_returns_true() {
+        assert!(should_debounce_usage_update(None));
+    }
+
+    #[test]
+    fn test_debounce_used_just_now_returns_false() {
+        let last_used = Utc::now() - Duration::seconds(1);
+        assert!(!should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_used_4_min_ago_returns_false() {
+        let last_used = Utc::now() - Duration::minutes(4);
+        assert!(!should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_used_6_min_ago_returns_true() {
+        let last_used = Utc::now() - Duration::minutes(6);
+        assert!(should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_used_1_hour_ago_returns_true() {
+        let last_used = Utc::now() - Duration::hours(1);
+        assert!(should_debounce_usage_update(Some(last_used)));
+    }
+
+    #[test]
+    fn test_debounce_boundary_exactly_5_min() {
+        // The function uses `Utc::now() - lu > Duration::minutes(5)`, so a
+        // last_used value 4 minutes and 59 seconds ago should NOT trigger an
+        // update (the difference is not strictly greater than 5 minutes).
+        let last_used = Utc::now() - Duration::seconds(4 * 60 + 59);
+        assert!(!should_debounce_usage_update(Some(last_used)));
     }
 }

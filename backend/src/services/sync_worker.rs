@@ -66,6 +66,7 @@ struct TaskRow {
     content_type: String,
     checksum_sha256: String,
     task_type: String,
+    replication_filter: Option<serde_json::Value>,
 }
 
 // ── Core logic ──────────────────────────────────────────────────────────────
@@ -146,10 +147,14 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
                 r.id AS repository_id,
                 a.content_type,
                 a.checksum_sha256,
-                st.task_type
+                st.task_type,
+                prs.replication_filter
             FROM sync_tasks st
             JOIN artifacts a ON a.id = st.artifact_id
             JOIN repositories r ON r.id = a.repository_id
+            LEFT JOIN peer_repo_subscriptions prs
+                ON prs.peer_instance_id = st.peer_instance_id
+               AND prs.repository_id = r.id
             WHERE st.peer_instance_id = $1
               AND st.status = 'pending'
             ORDER BY st.priority DESC, st.created_at ASC
@@ -172,8 +177,28 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
             peer.name
         );
 
-        // Spawn each transfer concurrently.
+        // Spawn each transfer concurrently, skipping filtered artifacts.
         for task in tasks {
+            // Build an identifier combining name + version for filter matching.
+            let identifier = match &task.artifact_version {
+                Some(v) if !v.is_empty() => format!("{}:{}", task.artifact_name, v),
+                _ => task.artifact_name.clone(),
+            };
+            if !matches_replication_filter(&identifier, task.replication_filter.as_ref()) {
+                tracing::debug!(
+                    "Artifact '{}' filtered out by replication filter for peer '{}', marking completed",
+                    identifier,
+                    peer.name
+                );
+                let _ = sqlx::query(
+                    "UPDATE sync_tasks SET status = 'completed', completed_at = NOW() WHERE id = $1",
+                )
+                .bind(task.id)
+                .execute(db)
+                .await;
+                continue;
+            }
+
             let db = db.clone();
             let client = client.clone();
             let peer_endpoint = peer.endpoint_url.clone();
@@ -481,6 +506,69 @@ pub(crate) fn compute_available_slots(
 }
 
 // ── Pure helper functions ───────────────────────────────────────────────────
+
+/// Check if an artifact name/version matches the replication filter.
+/// Returns true if the artifact should be replicated.
+///
+/// The filter is a JSON object with optional `include_patterns` and
+/// `exclude_patterns` arrays.  When `include_patterns` is non-empty, at least
+/// one pattern must match.  Any matching `exclude_patterns` entry rejects the
+/// artifact.  A `None` filter (or null JSON) means replicate everything.
+fn matches_replication_filter(
+    artifact_identifier: &str,
+    filter: Option<&serde_json::Value>,
+) -> bool {
+    let filter = match filter {
+        Some(f) => f,
+        None => return true, // No filter = replicate everything
+    };
+
+    // Check include patterns (if specified, at least one must match).
+    if let Some(includes) = filter.get("include_patterns").and_then(|v| v.as_array()) {
+        if !includes.is_empty() {
+            let mut any_match = false;
+            for pattern in includes {
+                if let Some(pat_str) = pattern.as_str() {
+                    match regex::Regex::new(pat_str) {
+                        Ok(re) => {
+                            if re.is_match(artifact_identifier) {
+                                any_match = true;
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Invalid replication filter regex '{}': {}", pat_str, e);
+                            return false;
+                        }
+                    }
+                }
+            }
+            if !any_match {
+                return false;
+            }
+        }
+    }
+
+    // Check exclude patterns (if any match, exclude).
+    if let Some(excludes) = filter.get("exclude_patterns").and_then(|v| v.as_array()) {
+        for pattern in excludes {
+            if let Some(pat_str) = pattern.as_str() {
+                match regex::Regex::new(pat_str) {
+                    Ok(re) => {
+                        if re.is_match(artifact_identifier) {
+                            return false;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Invalid replication filter regex '{}': {}", pat_str, e);
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
 
 /// Calculate exponential backoff duration from consecutive failure count.
 ///
@@ -879,5 +967,64 @@ mod tests {
 
         assert_eq!(local_time, NaiveTime::from_hms_opt(23, 0, 0).unwrap());
         assert!(is_within_sync_window(start, end, local_time));
+    }
+
+    // ── matches_replication_filter ─────────────────────────────────────
+
+    #[test]
+    fn test_matches_replication_filter_no_filter() {
+        assert!(matches_replication_filter("anything", None));
+    }
+
+    #[test]
+    fn test_matches_replication_filter_include_match() {
+        let filter = serde_json::json!({
+            "include_patterns": ["^v\\d+\\."]
+        });
+        assert!(matches_replication_filter("v1.2.3", Some(&filter)));
+        assert!(!matches_replication_filter("snapshot-1.0", Some(&filter)));
+    }
+
+    #[test]
+    fn test_matches_replication_filter_exclude_match() {
+        let filter = serde_json::json!({
+            "exclude_patterns": [".*-SNAPSHOT$"]
+        });
+        assert!(matches_replication_filter("v1.0.0", Some(&filter)));
+        assert!(!matches_replication_filter(
+            "v1.0.0-SNAPSHOT",
+            Some(&filter)
+        ));
+    }
+
+    #[test]
+    fn test_matches_replication_filter_include_and_exclude() {
+        let filter = serde_json::json!({
+            "include_patterns": ["^v\\d+\\."],
+            "exclude_patterns": [".*-SNAPSHOT$"]
+        });
+        assert!(matches_replication_filter("v1.0.0", Some(&filter)));
+        assert!(!matches_replication_filter(
+            "v1.0.0-SNAPSHOT",
+            Some(&filter)
+        ));
+        assert!(!matches_replication_filter("snapshot-1.0", Some(&filter)));
+    }
+
+    #[test]
+    fn test_matches_replication_filter_invalid_regex() {
+        let filter = serde_json::json!({
+            "include_patterns": ["[invalid"]
+        });
+        assert!(!matches_replication_filter("anything", Some(&filter)));
+    }
+
+    #[test]
+    fn test_matches_replication_filter_empty_patterns() {
+        let filter = serde_json::json!({
+            "include_patterns": [],
+            "exclude_patterns": []
+        });
+        assert!(matches_replication_filter("anything", Some(&filter)));
     }
 }

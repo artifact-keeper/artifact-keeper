@@ -4611,4 +4611,259 @@ mod tests {
         let debug_str = format!("{:?}", r);
         assert!(debug_str.contains("MatchedRepo"));
     }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter::matches() — pure matching logic
+    // -----------------------------------------------------------------------
+
+    fn recent_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::hours(1)
+    }
+
+    fn old_time(days: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::days(days)
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_default_passes_everything() {
+        let f = ArtifactFilter::default();
+        assert!(f.matches("any/path/file.jar", 999_999, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_max_age_recent_passes() {
+        let f = ArtifactFilter {
+            max_age_days: Some(30),
+            ..Default::default()
+        };
+        assert!(f.matches("path/file.jar", 100, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_max_age_old_rejected() {
+        let f = ArtifactFilter {
+            max_age_days: Some(30),
+            ..Default::default()
+        };
+        assert!(!f.matches("path/file.jar", 100, old_time(31)));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_max_age_boundary() {
+        let f = ArtifactFilter {
+            max_age_days: Some(30),
+            ..Default::default()
+        };
+        // Exactly 30 days old should pass (not greater than 30)
+        assert!(f.matches("path/file.jar", 100, old_time(30)));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_max_size_within_limit() {
+        let f = ArtifactFilter {
+            max_size_bytes: Some(1_000_000),
+            ..Default::default()
+        };
+        assert!(f.matches("path/file.jar", 999_999, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_max_size_exceeded() {
+        let f = ArtifactFilter {
+            max_size_bytes: Some(1_000_000),
+            ..Default::default()
+        };
+        assert!(!f.matches("path/file.jar", 1_000_001, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_max_size_exact() {
+        let f = ArtifactFilter {
+            max_size_bytes: Some(1_000_000),
+            ..Default::default()
+        };
+        assert!(f.matches("path/file.jar", 1_000_000, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_include_paths_matching() {
+        let f = ArtifactFilter {
+            include_paths: vec!["release/*".to_string()],
+            ..Default::default()
+        };
+        assert!(f.matches("release/artifact.jar", 100, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_include_paths_no_match() {
+        let f = ArtifactFilter {
+            include_paths: vec!["release/*".to_string()],
+            ..Default::default()
+        };
+        assert!(!f.matches("snapshot/artifact.jar", 100, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_include_paths_multiple() {
+        let f = ArtifactFilter {
+            include_paths: vec!["release/*".to_string(), "stable/*".to_string()],
+            ..Default::default()
+        };
+        assert!(f.matches("stable/file.tar", 100, recent_time()));
+        assert!(!f.matches("dev/file.tar", 100, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_exclude_paths() {
+        let f = ArtifactFilter {
+            exclude_paths: vec!["snapshot/*".to_string()],
+            ..Default::default()
+        };
+        assert!(!f.matches("snapshot/artifact.jar", 100, recent_time()));
+        assert!(f.matches("release/artifact.jar", 100, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_include_and_exclude_combined() {
+        let f = ArtifactFilter {
+            include_paths: vec!["libs/*".to_string()],
+            exclude_paths: vec!["libs/test-*".to_string()],
+            ..Default::default()
+        };
+        assert!(f.matches("libs/core.jar", 100, recent_time()));
+        assert!(!f.matches("libs/test-utils.jar", 100, recent_time()));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_all_constraints() {
+        let f = ArtifactFilter {
+            max_age_days: Some(90),
+            max_size_bytes: Some(500_000),
+            include_paths: vec!["release/*".to_string()],
+            exclude_paths: vec!["release/debug-*".to_string()],
+            ..Default::default()
+        };
+        // Passes all constraints
+        assert!(f.matches("release/app.jar", 100_000, recent_time()));
+        // Fails age
+        assert!(!f.matches("release/app.jar", 100_000, old_time(91)));
+        // Fails size
+        assert!(!f.matches("release/app.jar", 500_001, recent_time()));
+        // Fails include
+        assert!(!f.matches("snapshot/app.jar", 100_000, recent_time()));
+        // Fails exclude
+        assert!(!f.matches("release/debug-app.jar", 100_000, recent_time()));
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactFilter::matches_with_tags() — tag matching logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_empty_requirements() {
+        let f = ArtifactFilter::default();
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        assert!(f.matches_with_tags("path/file.jar", 100, recent_time(), &tags));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_exact_match() {
+        let mut match_tags = HashMap::new();
+        match_tags.insert("env".to_string(), "prod".to_string());
+        let f = ArtifactFilter {
+            match_tags,
+            ..Default::default()
+        };
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        assert!(f.matches_with_tags("path/file.jar", 100, recent_time(), &tags));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_value_mismatch() {
+        let mut match_tags = HashMap::new();
+        match_tags.insert("env".to_string(), "prod".to_string());
+        let f = ArtifactFilter {
+            match_tags,
+            ..Default::default()
+        };
+        let tags = vec![("env".to_string(), "staging".to_string())];
+        assert!(!f.matches_with_tags("path/file.jar", 100, recent_time(), &tags));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_key_missing() {
+        let mut match_tags = HashMap::new();
+        match_tags.insert("env".to_string(), "prod".to_string());
+        let f = ArtifactFilter {
+            match_tags,
+            ..Default::default()
+        };
+        let tags = vec![("team".to_string(), "platform".to_string())];
+        assert!(!f.matches_with_tags("path/file.jar", 100, recent_time(), &tags));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_wildcard_value() {
+        // Empty value means "key must exist with any value"
+        let mut match_tags = HashMap::new();
+        match_tags.insert("env".to_string(), "".to_string());
+        let f = ArtifactFilter {
+            match_tags,
+            ..Default::default()
+        };
+        let tags = vec![("env".to_string(), "anything".to_string())];
+        assert!(f.matches_with_tags("path/file.jar", 100, recent_time(), &tags));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_and_semantics() {
+        // All tags must match (AND semantics)
+        let mut match_tags = HashMap::new();
+        match_tags.insert("env".to_string(), "prod".to_string());
+        match_tags.insert("tier".to_string(), "1".to_string());
+        let f = ArtifactFilter {
+            match_tags,
+            ..Default::default()
+        };
+        // Only one tag present
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        assert!(!f.matches_with_tags("path/file.jar", 100, recent_time(), &tags));
+        // Both tags present
+        let both_tags = vec![
+            ("env".to_string(), "prod".to_string()),
+            ("tier".to_string(), "1".to_string()),
+        ];
+        assert!(f.matches_with_tags("path/file.jar", 100, recent_time(), &both_tags));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_base_filter_rejects() {
+        // Even if tags match, base filter must also pass
+        let mut match_tags = HashMap::new();
+        match_tags.insert("env".to_string(), "prod".to_string());
+        let f = ArtifactFilter {
+            max_size_bytes: Some(100),
+            match_tags,
+            ..Default::default()
+        };
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        assert!(!f.matches_with_tags("path/file.jar", 999, recent_time(), &tags));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_empty_artifact_tags() {
+        let mut match_tags = HashMap::new();
+        match_tags.insert("env".to_string(), "prod".to_string());
+        let f = ArtifactFilter {
+            match_tags,
+            ..Default::default()
+        };
+        assert!(!f.matches_with_tags("path/file.jar", 100, recent_time(), &[]));
+    }
+
+    #[test]
+    fn test_artifact_filter_matches_with_tags_no_requirements_empty_tags() {
+        let f = ArtifactFilter::default();
+        assert!(f.matches_with_tags("path/file.jar", 100, recent_time(), &[]));
+    }
 }

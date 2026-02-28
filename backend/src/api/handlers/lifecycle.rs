@@ -432,6 +432,7 @@ mod tests {
             priority: 1,
             last_run_at: None,
             last_run_items_removed: None,
+            cron_schedule: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -455,6 +456,7 @@ mod tests {
             priority: 0,
             last_run_at: None,
             last_run_items_removed: None,
+            cron_schedule: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

@@ -87,22 +87,6 @@ async fn main() -> Result<()> {
     let (plugin_registry, wasm_plugin_service) =
         initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
 
-    // Initialize security scanner service
-    let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
-    let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
-    let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
-    let scanner_service = Arc::new(ScannerService::new(
-        db_pool.clone(),
-        advisory_client,
-        scan_result_service,
-        scan_config_service,
-        config.trivy_url.clone(),
-        config.storage_path.clone(),
-        config.scan_workspace_path.clone(),
-        config.openscap_url.clone(),
-        config.openscap_profile.clone(),
-    ));
-
     // Initialize Meilisearch (optional, graceful fallback)
     let meili_service = match (&config.meilisearch_url, &config.meilisearch_api_key) {
         (Some(url), Some(api_key)) => {
@@ -190,6 +174,24 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    // Initialize security scanner service
+    let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
+    let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
+    let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
+    let scanner_service = Arc::new(ScannerService::new(
+        db_pool.clone(),
+        advisory_client,
+        scan_result_service,
+        scan_config_service,
+        config.trivy_url.clone(),
+        primary_storage.clone(),
+        config.storage_backend.clone(),
+        config.storage_path.clone(),
+        config.scan_workspace_path.clone(),
+        config.openscap_url.clone(),
+        config.openscap_profile.clone(),
+    ));
 
     // Create application state with WASM plugin support
     let scheduler_storage = primary_storage.clone();

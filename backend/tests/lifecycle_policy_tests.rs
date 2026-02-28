@@ -113,6 +113,7 @@ async fn test_tag_pattern_keep_deletes_non_matching_artifacts() {
             policy_type: "tag_pattern_keep".to_string(),
             config: serde_json::json!({"pattern": "^(release-|v)"}),
             priority: None,
+            cron_schedule: None,
         })
         .await
         .expect("failed to create policy");
@@ -193,6 +194,7 @@ async fn test_tag_pattern_keep_all_match_deletes_nothing() {
             policy_type: "tag_pattern_keep".to_string(),
             config: serde_json::json!({"pattern": "^release-"}),
             priority: None,
+            cron_schedule: None,
         })
         .await
         .unwrap();
@@ -231,6 +233,7 @@ async fn test_tag_pattern_keep_none_match_deletes_all() {
             policy_type: "tag_pattern_keep".to_string(),
             config: serde_json::json!({"pattern": "^release-"}),
             priority: None,
+            cron_schedule: None,
         })
         .await
         .unwrap();
@@ -270,6 +273,7 @@ async fn test_tag_pattern_delete_still_works() {
             policy_type: "tag_pattern_delete".to_string(),
             config: serde_json::json!({"pattern": "^snapshot-"}),
             priority: None,
+            cron_schedule: None,
         })
         .await
         .unwrap();
@@ -350,6 +354,7 @@ async fn test_size_quota_lru_evicts_never_downloaded_first() {
             policy_type: "size_quota_bytes".to_string(),
             config: serde_json::json!({"quota_bytes": 200}),
             priority: None,
+            cron_schedule: None,
         })
         .await
         .unwrap();
@@ -417,6 +422,7 @@ async fn test_size_quota_lru_frequently_downloaded_survives() {
             policy_type: "size_quota_bytes".to_string(),
             config: serde_json::json!({"quota_bytes": 100}),
             priority: None,
+            cron_schedule: None,
         })
         .await
         .unwrap();
@@ -467,6 +473,7 @@ async fn test_size_quota_under_limit_evicts_nothing() {
             policy_type: "size_quota_bytes".to_string(),
             config: serde_json::json!({"quota_bytes": 500}),
             priority: None,
+            cron_schedule: None,
         })
         .await
         .unwrap();

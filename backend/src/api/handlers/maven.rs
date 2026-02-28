@@ -576,9 +576,10 @@ async fn upload(
         if !coords.version.contains("SNAPSHOT") {
             return Err((StatusCode::CONFLICT, "Artifact already exists").into_response());
         }
-        // Soft-delete old SNAPSHOT version
+        // Hard-delete old SNAPSHOT version so the UNIQUE(repository_id, path)
+        // constraint allows re-insert. Safe because SNAPSHOTs are mutable by design.
         let _ = sqlx::query!(
-            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2",
             repo.id,
             path,
         )

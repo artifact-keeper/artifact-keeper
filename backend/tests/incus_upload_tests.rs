@@ -57,6 +57,8 @@ fn test_config(storage_path: &str) -> Config {
         dependency_track_url: None,
         otel_exporter_otlp_endpoint: None,
         otel_service_name: "test".into(),
+        gc_schedule: "0 0 * * * *".into(),
+        lifecycle_check_interval_secs: 60,
     }
 }
 

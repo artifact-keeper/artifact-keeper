@@ -390,6 +390,8 @@ pub async fn delete_backup(
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SystemSettings {
+    pub storage_backend: String,
+    pub storage_path: String,
     pub allow_anonymous_download: bool,
     pub max_upload_size_bytes: i64,
     pub retention_days: i32,
@@ -431,6 +433,8 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut result = SystemSettings {
+        storage_backend: state.config.storage_backend.clone(),
+        storage_path: state.config.storage_path.clone(),
         allow_anonymous_download: false,
         max_upload_size_bytes: 100 * 1024 * 1024, // 100MB default
         retention_days: 365,
@@ -905,6 +909,8 @@ mod tests {
     #[test]
     fn test_system_settings_defaults() {
         let settings = SystemSettings {
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/artifacts".to_string(),
             allow_anonymous_download: false,
             max_upload_size_bytes: 100 * 1024 * 1024,
             retention_days: 365,
@@ -918,11 +924,14 @@ mod tests {
         assert_eq!(settings.audit_retention_days, 90);
         assert_eq!(settings.backup_retention_count, 10);
         assert_eq!(settings.edge_stale_threshold_minutes, 5);
+        assert_eq!(settings.storage_backend, "filesystem");
     }
 
     #[test]
     fn test_system_settings_serialization_roundtrip() {
         let settings = SystemSettings {
+            storage_backend: "s3".to_string(),
+            storage_path: "/data/artifacts".to_string(),
             allow_anonymous_download: true,
             max_upload_size_bytes: 500_000_000,
             retention_days: 30,

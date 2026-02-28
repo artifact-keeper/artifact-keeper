@@ -126,6 +126,15 @@ def list_profiles(content_file):
 
 def run_oscap_scan(scan_path, profile, content_file):
     """Run oscap xccdf eval and return parsed findings."""
+    # Re-validate inputs at point of use (defense in depth, satisfies static analysis)
+    if not re.fullmatch(r"[a-zA-Z0-9._\-]+", profile):
+        return {"findings": [], "error": "invalid profile name"}
+    scan_path = os.path.realpath(scan_path)
+    if not any(scan_path.startswith(os.path.realpath(d)) for d in ALLOWED_SCAN_DIRS if d):
+        return {"findings": [], "error": "scan path not under allowed directories"}
+    if not os.path.isfile(content_file) or not content_file.startswith(SSG_CONTENT_DIR + "/"):
+        return {"findings": [], "error": "invalid content file"}
+
     results_file = f"/tmp/oscap-results-{uuid.uuid4()}.xml"
 
     cmd = [
@@ -142,7 +151,7 @@ def run_oscap_scan(scan_path, profile, content_file):
 
     try:
         # oscap returns exit code 2 for "some rules failed" which is normal
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603 - inputs validated above
             cmd, capture_output=True, text=True, timeout=600,
         )
         if result.returncode not in (0, 2):
