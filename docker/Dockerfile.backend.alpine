@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1
+
+# ---------- Base: Rust toolchain on Alpine ----------
+FROM rust:1.93-alpine3.21 AS rust-alpine-base
+RUN apk add --no-cache \
+    build-base pkgconfig perl openssl-dev openssl-libs-static \
+    zlib-dev zlib-static xz-dev xz-static \
+    bzip2-dev bzip2-static protobuf-dev curl
+RUN cargo install cargo-chef --locked
+
+# ---------- Stage 1: Plan dependencies ----------
+FROM rust-alpine-base AS planner
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY backend ./backend
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---------- Stage 2: Build dependencies (cached) ----------
+FROM rust-alpine-base AS deps
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+ENV SQLX_OFFLINE=true
+RUN cargo chef cook --release --features vendored-openssl --recipe-path recipe.json
+
+# ---------- Stage 3: Build binary ----------
+FROM rust-alpine-base AS builder
+WORKDIR /app
+COPY --from=deps /app/target target
+COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
+COPY Cargo.toml Cargo.lock ./
+COPY .sqlx ./.sqlx
+COPY backend ./backend
+ENV SQLX_OFFLINE=true
+RUN cargo build --release --features vendored-openssl --bin artifact-keeper
+
+# ---------- Stage 4: Download scanner CLIs ----------
+FROM alpine:3.21 AS scanners
+ARG TRIVY_VERSION=v0.69.1
+ARG GRYPE_VERSION=v0.109.0
+RUN apk add --no-cache curl tar gzip && \
+    curl --proto '=https' --tlsv1.2 -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin "${TRIVY_VERSION}" && \
+    curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin "${GRYPE_VERSION}" && \
+    rm -rf /var/cache/apk/*
+
+# ---------- Stage 5: Alpine runtime ----------
+FROM alpine:3.21
+
+# Runtime dependencies (no libssl needed - OpenSSL is vendored/static)
+RUN apk add --no-cache ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl
+
+# --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
+
+# Non-root user
+RUN addgroup -g 1001 artifact && \
+    adduser -D -u 1001 -G artifact -h /home/artifact -s /sbin/nologin artifact
+
+# Application directories
+RUN mkdir -p /app /data/storage /data/backups /data/plugins \
+    /scan-workspace /home/artifact/.cache/grype /home/artifact/.cache/trivy && \
+    chown -R 1001:1001 /data /scan-workspace /home/artifact /app
+
+# Disable core dumps (CIS 1.5.1)
+RUN mkdir -p /etc/security/limits.d && \
+    echo "* hard core 0" > /etc/security/limits.d/50-coredump.conf && \
+    echo "ulimit -c 0" > /etc/profile.d/coredump.sh
+
+# Restrictive umask (CIS 5.4.4)
+RUN echo "umask 077" > /etc/profile.d/umask.sh
+
+# Remove SUID/SGID binaries (CIS 6.1.13/6.1.14)
+RUN find / -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
+
+# Remove shell access from system accounts (CIS 5.4.2)
+RUN sed -i 's|/bin/sh$|/sbin/nologin|g' /etc/passwd || true
+
+# Clean machine-id (regenerated at runtime)
+RUN rm -f /etc/machine-id && touch /etc/machine-id && chmod 0444 /etc/machine-id
+
+# Clean caches
+RUN rm -rf /var/cache/apk/* /tmp/*
+
+# --- End CIS hardening ---
+
+# Copy scanner CLIs (statically linked Go binaries)
+COPY --from=scanners /opt/bin/trivy /usr/local/bin/
+COPY --from=scanners /opt/bin/grype /usr/local/bin/
+
+# Copy application binary
+COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
+
+WORKDIR /app
+USER 1001
+
+ENV RUST_LOG=info \
+    DATABASE_URL=postgresql://registry:registry@postgres:5432/artifact_registry \
+    STORAGE_PATH=/data/storage \
+    BACKUP_PATH=/data/backups \
+    HOST=0.0.0.0 \
+    PORT=8080
+
+EXPOSE 8080 9090
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["curl", "-sf", "http://localhost:8080/health"]
+
+CMD ["artifact-keeper"]
