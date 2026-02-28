@@ -2142,10 +2142,13 @@ mod tests {
 
     #[test]
     fn test_is_policy_due_valid_cron_recently_run() {
-        let now = Utc::now();
+        // Use a fixed timestamp at minute 45 so the 30-minute window (15..45)
+        // never crosses an hour boundary where the hourly cron fires.
+        // Using Utc::now() caused flaky failures when the current minute < 30.
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2025, 6, 15, 10, 45, 0).unwrap();
         let last_run = now - chrono::Duration::minutes(30);
         let cadence = chrono::Duration::hours(6);
-        // Hourly cron: no occurrence should fall within 30 minutes
+        // Hourly cron: next occurrence after 10:15 is 11:00, which is past 10:45
         assert!(!LifecycleService::is_policy_due(
             Some("0 0 * * * *"),
             Some(last_run),
