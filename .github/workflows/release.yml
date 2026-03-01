@@ -134,7 +134,7 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-binaries]
+    needs: [build-binaries, release-gate, mesh-e2e-gate]
     if: always() && needs.build-binaries.result == 'success'
     steps:
       - name: Checkout
@@ -157,6 +157,22 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Check gate status
+        id: gates
+        run: |
+          RELEASE_GATE="${{ needs.release-gate.result }}"
+          MESH_GATE="${{ needs.mesh-e2e-gate.result }}"
+          echo "release_gate=${RELEASE_GATE}" >> $GITHUB_OUTPUT
+          echo "mesh_gate=${MESH_GATE}" >> $GITHUB_OUTPUT
+
+          if [[ "$RELEASE_GATE" == "success" && ("$MESH_GATE" == "success" || "$MESH_GATE" == "skipped") ]]; then
+            echo "all_passed=true" >> $GITHUB_OUTPUT
+            echo "Gates passed: release=$RELEASE_GATE mesh=$MESH_GATE"
+          else
+            echo "all_passed=false" >> $GITHUB_OUTPUT
+            echo "::warning::Gates not all green: release=$RELEASE_GATE mesh=$MESH_GATE. Release will be created as DRAFT."
+          fi
+
       - name: Collect release assets
         run: |
           mkdir -p release-assets
@@ -169,20 +185,24 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Artifact Keeper ${{ steps.version.outputs.version }}
           generate_release_notes: true
-          draft: false
+          draft: ${{ steps.gates.outputs.all_passed != 'true' }}
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           files: release-assets/*
           fail_on_unmatched_files: true
 
   # ════════════════════════════════════════════════════════════════════════════
-  # PUBLISH DOCKER IMAGES
+  # PUBLISH DOCKER IMAGES (only when gates pass, release is not draft)
   # ════════════════════════════════════════════════════════════════════════════
 
   docker-release:
     name: Publish Docker Images
     runs-on: ubuntu-latest
-    needs: release
-    if: always() && needs.release.result == 'success'
+    needs: [release, release-gate, mesh-e2e-gate]
+    if: |
+      always() &&
+      needs.release.result == 'success' &&
+      needs.release-gate.result == 'success' &&
+      (needs.mesh-e2e-gate.result == 'success' || needs.mesh-e2e-gate.result == 'skipped')
     steps:
       - name: Checkout
         uses: actions/checkout@v6
