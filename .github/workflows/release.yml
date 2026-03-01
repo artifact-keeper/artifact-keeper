@@ -37,6 +37,14 @@ jobs:
       image_tag: dev
     secrets: inherit
 
+  release-gate:
+    name: Release Gate (Full Suite)
+    uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
+    with:
+      backend_tag: dev
+      test_suite: all
+    secrets: inherit
+
   # ════════════════════════════════════════════════════════════════════════════
   # BUILD BINARIES
   # ════════════════════════════════════════════════════════════════════════════
@@ -44,7 +52,7 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    needs: [e2e-gate]
+    needs: [e2e-gate, release-gate]
     strategy:
       fail-fast: false
       matrix:
