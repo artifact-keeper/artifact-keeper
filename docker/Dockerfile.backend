@@ -113,21 +113,9 @@ RUN if [ -f /mnt/rootfs/etc/dnf/dnf.conf ]; then \
 # Remove any leftover cache/tmp artifacts
 RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
-# ---------- Stage 5: Download scanner CLIs ----------
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7 AS scanners
-ARG TRIVY_VERSION=0.69.1
-ARG GRYPE_VERSION=0.109.0
-ARG TARGETARCH
-RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 tar gzip && \
-    mkdir -p /opt/bin && \
-    ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "ARM64" || echo "64bit") && \
-    curl --proto '=https' --tlsv1.2 -sSfL \
-      "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${ARCH}.tar.gz" \
-      | tar -xz -C /opt/bin trivy && \
-    curl --proto '=https' --tlsv1.2 -sSfL \
-      "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_${TARGETARCH:-amd64}.tar.gz" \
-      | tar -xz -C /opt/bin grype && \
-    microdnf clean all
+# ---------- Stage 5: Copy scanner CLIs from official images ----------
+FROM ghcr.io/aquasecurity/trivy:0.69.1 AS trivy-bin
+FROM ghcr.io/anchore/grype:v0.109.0 AS grype-bin
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
 FROM registry.access.redhat.com/ubi9/ubi-micro:9.7
@@ -135,9 +123,9 @@ FROM registry.access.redhat.com/ubi9/ubi-micro:9.7
 # Copy minimal rootfs (glibc, openssl, ca-certs, curl, user/group, dirs)
 COPY --from=rootfs-builder /mnt/rootfs /
 
-# Copy scanner CLIs (statically linked Go binaries)
-COPY --from=scanners /opt/bin/trivy /usr/local/bin/
-COPY --from=scanners /opt/bin/grype /usr/local/bin/
+# Copy scanner CLIs from official images
+COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
+COPY --from=grype-bin /grype /usr/local/bin/
 
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/

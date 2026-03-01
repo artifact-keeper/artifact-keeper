@@ -33,21 +33,9 @@ COPY backend ./backend
 ENV SQLX_OFFLINE=true
 RUN cargo build --release --features vendored-openssl --bin artifact-keeper
 
-# ---------- Stage 4: Download scanner CLIs ----------
-FROM alpine:3.21 AS scanners
-ARG TRIVY_VERSION=0.69.1
-ARG GRYPE_VERSION=0.109.0
-ARG TARGETARCH
-RUN apk add --no-cache curl tar gzip && \
-    mkdir -p /opt/bin && \
-    ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "ARM64" || echo "64bit") && \
-    curl --proto '=https' --tlsv1.2 -sSfL \
-      "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${ARCH}.tar.gz" \
-      | tar -xz -C /opt/bin trivy && \
-    curl --proto '=https' --tlsv1.2 -sSfL \
-      "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_${TARGETARCH:-amd64}.tar.gz" \
-      | tar -xz -C /opt/bin grype && \
-    rm -rf /var/cache/apk/*
+# ---------- Stage 4: Copy scanner CLIs from official images ----------
+FROM ghcr.io/aquasecurity/trivy:0.69.1 AS trivy-bin
+FROM ghcr.io/anchore/grype:v0.109.0 AS grype-bin
 
 # ---------- Stage 5: Alpine runtime ----------
 FROM alpine:3.21
@@ -89,8 +77,8 @@ RUN rm -rf /var/cache/apk/* /tmp/*
 # --- End CIS hardening ---
 
 # Copy scanner CLIs (statically linked Go binaries)
-COPY --from=scanners /opt/bin/trivy /usr/local/bin/
-COPY --from=scanners /opt/bin/grype /usr/local/bin/
+COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
+COPY --from=grype-bin /grype /usr/local/bin/
 
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
