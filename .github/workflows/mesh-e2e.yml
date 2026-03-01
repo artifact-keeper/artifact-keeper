@@ -57,7 +57,7 @@ jobs:
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
             echo "Syncing $app with image tag ${{ inputs.image_tag || 'dev' }}..."
             argocd app sync "$app" \
-              --parameter "backend.image.tag=${{ inputs.image_tag || 'dev' }}" \
+              --param "backend.image.tag=${{ inputs.image_tag || 'dev' }}" \
               --timeout 300
           done
 
