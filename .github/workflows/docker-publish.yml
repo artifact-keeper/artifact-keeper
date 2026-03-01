@@ -279,6 +279,15 @@ jobs:
       # Trivy scans upload SARIF to GitHub Security tab for visibility.
       # exit-code: 0 means scan results are informational — unfixed base image
       # CVEs (Red Hat's responsibility) should not block image publishing.
+      # NOTE: trivy binary extracted from official GHCR image because the
+      # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
+      - name: Install Trivy
+        run: |
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.1)
+          docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
+          docker rm "$CONTAINER_ID"
+          trivy --version
+
       - name: Trivy scan - Backend
         uses: aquasecurity/trivy-action@0.34.1
         with:
@@ -288,6 +297,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           exit-code: '0'
+          skip-setup-trivy: true
 
       - name: Trivy scan - OpenSCAP
         uses: aquasecurity/trivy-action@0.34.1
@@ -299,6 +309,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           exit-code: '0'
+          skip-setup-trivy: true
 
       - name: Trivy scan - Backend Alpine
         uses: aquasecurity/trivy-action@0.34.1
@@ -310,6 +321,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           exit-code: '0'
+          skip-setup-trivy: true
 
       - name: Upload Backend Trivy SARIF
         uses: github/codeql-action/upload-sarif@v4
