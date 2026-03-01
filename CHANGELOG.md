@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.1.0-rc.6] - 2026-02-28
 
+### Thank You
+- @CJLove for reporting the OCI v2 auth challenge issue behind reverse proxies (#315)
+- @dispalt for identifying the Maven SNAPSHOT re-upload bug and scanner storage backend resolution (#297, #296)
+- @msegura501 for reporting private repository visibility enforcement (#280)
+
 ### Added
 - **Azure RBAC authentication for Blob Storage** (#312) - support managed identity and service principal authentication for Azure Blob Storage, removing the need for connection strings
 - **Alpine-based Docker image variant** (#306) - lighter alternative image based on Alpine Linux alongside the existing UBI image
