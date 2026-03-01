@@ -53,6 +53,10 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: [e2e-gate, release-gate]
+    if: |
+      always() &&
+      needs.e2e-gate.result == 'success' &&
+      (needs.release-gate.result == 'success' || needs.release-gate.result == 'failure')
     strategy:
       fail-fast: false
       matrix:
