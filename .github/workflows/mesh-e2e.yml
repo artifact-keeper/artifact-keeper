@@ -40,9 +40,11 @@ jobs:
 
       - name: Install ArgoCD CLI
         run: |
-          curl -sSL -o /usr/local/bin/argocd \
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL -o "$HOME/.local/bin/argocd" \
             https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x /usr/local/bin/argocd
+          chmod +x "$HOME/.local/bin/argocd"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Sync mesh applications
         if: ${{ !inputs.skip_deploy }}
