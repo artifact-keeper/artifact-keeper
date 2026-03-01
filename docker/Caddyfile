@@ -4,6 +4,8 @@
 
 {$SITE_ADDRESS:localhost} {
 	bind 0.0.0.0
+	reverse_proxy /v2 backend:8080
+	reverse_proxy /v2/* backend:8080
 	reverse_proxy /api/* backend:8080
 	reverse_proxy /health backend:8080
 	reverse_proxy /livez backend:8080
@@ -13,6 +15,8 @@
 }
 
 :80 {
+	reverse_proxy /v2 backend:8080
+	reverse_proxy /v2/* backend:8080
 	reverse_proxy /api/* backend:8080
 	reverse_proxy /health backend:8080
 	reverse_proxy /livez backend:8080
