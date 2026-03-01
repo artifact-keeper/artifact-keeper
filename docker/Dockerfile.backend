@@ -115,11 +115,18 @@ RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # ---------- Stage 5: Download scanner CLIs ----------
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.7 AS scanners
-ARG TRIVY_VERSION=v0.69.1
-ARG GRYPE_VERSION=v0.109.0
+ARG TRIVY_VERSION=0.69.1
+ARG GRYPE_VERSION=0.109.0
+ARG TARGETARCH
 RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 tar gzip && \
-    curl --proto '=https' --tlsv1.2 -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /opt/bin "${TRIVY_VERSION}" && \
-    curl --proto '=https' --tlsv1.2 -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /opt/bin "${GRYPE_VERSION}" && \
+    mkdir -p /opt/bin && \
+    ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "ARM64" || echo "64bit") && \
+    curl --proto '=https' --tlsv1.2 -sSfL \
+      "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${ARCH}.tar.gz" \
+      | tar -xz -C /opt/bin trivy && \
+    curl --proto '=https' --tlsv1.2 -sSfL \
+      "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_${TARGETARCH:-amd64}.tar.gz" \
+      | tar -xz -C /opt/bin grype && \
     microdnf clean all
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
