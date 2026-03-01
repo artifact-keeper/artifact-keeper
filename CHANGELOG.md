@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0-rc.6] - 2026-02-28
+
+### Added
+- **Azure RBAC authentication for Blob Storage** (#312) - support managed identity and service principal authentication for Azure Blob Storage, removing the need for connection strings
+- **Alpine-based Docker image variant** (#306) - lighter alternative image based on Alpine Linux alongside the existing UBI image
+- **Release gate integration** (#317) - backend releases now run the full artifact-keeper-test suite (38 formats, stress, resilience, mesh) before proceeding
+- **Quality of life improvements** (#298) - 9 features: configurable GC/lifecycle cron scheduling, stale proxy cache fallback, deletion replication to peers, webhook delivery retry with exponential backoff, soft token revocation with `last_used_at` tracking, per-repo cache TTL endpoint, search reindex API, quota warning events, and replication filters with regex include/exclude patterns
+
+### Fixed
+- **OCI v2 auth challenge uses wrong scheme/host behind reverse proxy** (#315, #316) - `Www-Authenticate` header now respects `X-Forwarded-Proto` and `X-Forwarded-Host`, fixing `docker login` failures when running behind Caddy, Nginx, or other reverse proxies
+- **Maven SNAPSHOT re-upload and hard-delete** (#297, #301) - SNAPSHOT artifacts can now be re-uploaded (overwritten) as expected, and hard-delete properly removes files from storage
+- **Scanner storage backend resolution** (#296, #301) - security scanners now use the configured storage backend (S3, Azure, GCS) instead of defaulting to filesystem
+- **Format route key extraction** (#302) - fix repo key parsing for format handler routes when the key contains path separators
+- **Private repository visibility enforcement** (#300) - anonymous users can no longer access private repository metadata
+- **Storage probe path traversal** (#293, #308) - validate that health check storage probe paths stay within the base directory
+- **Code scanning alerts** (#307) - address CodeQL alerts #16 and #39 for taint flow and input validation
+- **Wasmtime CVE bump** (#292) - upgrade to wasmtime 24.0.6 for CVE-2026-27572 and CVE-2026-27204
+
+### Tests
+- Unit tests for ArtifactFilter matching logic (#309)
+- E2E tests for Maven SNAPSHOT re-upload and S3 scanner (#304)
+- Flaky cron policy test fix and Postgres added to coverage job (#311)
+- Custom CodeQL workflow replacing default setup (#305)
+
+### Changed
+- Docker Hub documented as alternative registry (#289)
+- Dependency bumps: actions/attest-build-provenance 3 to 4, SonarSource/sonarqube-scan-action 6 to 7
+
 ## [1.1.0-rc.4] - 2026-02-25
 
 ### Added
