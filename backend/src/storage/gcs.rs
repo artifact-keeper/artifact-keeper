@@ -230,10 +230,15 @@ impl GcsBackend {
         })
     }
 
+    /// Return the bucket name this backend is configured to use.
+    pub(crate) fn bucket(&self) -> &str {
+        &self.config.bucket
+    }
+
     /// Fetch a GCP access token, using a cached value if still fresh.
     ///
     /// Tokens are proactively refreshed 60 seconds before their reported expiry.
-    async fn get_token(&self) -> Result<String> {
+    pub(crate) async fn get_token(&self) -> Result<String> {
         // Fast path: check cache under read lock
         {
             let cache = self.token_cache.read().await;

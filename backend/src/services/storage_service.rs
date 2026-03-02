@@ -213,6 +213,171 @@ impl StorageBackend for S3BackendWrapper {
     }
 }
 
+/// GCS storage backend (wrapper for integration with StorageService)
+pub struct GcsBackendWrapper {
+    inner: crate::storage::gcs::GcsBackend,
+    bucket: String,
+    client: reqwest::Client,
+}
+
+impl GcsBackendWrapper {
+    pub async fn from_config(_config: &Config) -> crate::error::Result<Self> {
+        let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
+        let bucket = gcs_config.bucket.clone();
+        let inner = crate::storage::gcs::GcsBackend::new(gcs_config).await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
+        Ok(Self {
+            inner,
+            bucket,
+            client,
+        })
+    }
+}
+
+#[async_trait]
+impl StorageBackend for GcsBackendWrapper {
+    async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+        crate::storage::StorageBackend::put(&self.inner, key, content).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Bytes> {
+        crate::storage::StorageBackend::get(&self.inner, key).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        crate::storage::StorageBackend::exists(&self.inner, key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        crate::storage::StorageBackend::delete(&self.inner, key).await
+    }
+
+    async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct GcsObject {
+            name: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct GcsListResponse {
+            #[serde(default)]
+            items: Vec<GcsObject>,
+        }
+
+        let token = self.inner.get_token().await?;
+        let base = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o",
+            urlencoding::encode(&self.bucket)
+        );
+        let url = match prefix {
+            Some(p) => format!("{}?prefix={}", base, urlencoding::encode(p)),
+            None => base,
+        };
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS list failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCS list failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        let list_response: GcsListResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to parse GCS list response: {}", e)))?;
+
+        Ok(list_response.items.into_iter().map(|o| o.name).collect())
+    }
+
+    async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        let token = self.inner.get_token().await?;
+        let bucket_enc = urlencoding::encode(&self.bucket);
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}/copyTo/b/{}/o/{}",
+            bucket_enc,
+            urlencoding::encode(source),
+            bucket_enc,
+            urlencoding::encode(dest),
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Length", "0")
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS copy failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCS copy failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn size(&self, key: &str) -> Result<u64> {
+        #[derive(serde::Deserialize)]
+        struct GcsObjectMetadata {
+            size: String,
+        }
+
+        let token = self.inner.get_token().await?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
+            urlencoding::encode(&self.bucket),
+            urlencoding::encode(key),
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS size request failed: {}", e)))?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::NotFound(format!("Object not found: {}", key)));
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCS size request failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        let metadata: GcsObjectMetadata = response.json().await.map_err(|e| {
+            AppError::Storage(format!("Failed to parse GCS object metadata: {}", e))
+        })?;
+
+        metadata
+            .size
+            .parse::<u64>()
+            .map_err(|e| AppError::Storage(format!("Failed to parse GCS object size: {}", e)))
+    }
+}
+
 /// Storage service facade
 pub struct StorageService {
     backend: Arc<dyn StorageBackend>,
@@ -230,6 +395,10 @@ impl StorageService {
             "s3" => {
                 let s3_backend = S3BackendWrapper::from_config(config).await?;
                 Arc::new(s3_backend)
+            }
+            "gcs" => {
+                let wrapper = GcsBackendWrapper::from_config(config).await?;
+                Arc::new(wrapper)
             }
             other => {
                 return Err(AppError::Config(format!(
@@ -688,5 +857,106 @@ mod tests {
         // And we can read it back via the same key
         let content = backend.get("../../escape.txt").await.unwrap();
         assert_eq!(content, Bytes::from("should stay inside"));
+    }
+
+    // -----------------------------------------------------------------------
+    // StorageService::from_config() backend selection
+    // -----------------------------------------------------------------------
+
+    // Serialize env-var tests to avoid cross-test interference.
+    static GCS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn gcs_env_lock() -> &'static std::sync::Mutex<()> {
+        GCS_ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn minimal_config(storage_backend: &str) -> crate::config::Config {
+        crate::config::Config {
+            database_url: "postgresql://test/test".to_string(),
+            bind_address: "0.0.0.0:8080".to_string(),
+            log_level: "info".to_string(),
+            storage_backend: storage_backend.to_string(),
+            storage_path: "/tmp/test-storage".to_string(),
+            s3_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret".to_string(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".to_string(),
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/scan-workspace".to_string(),
+            demo_mode: false,
+            peer_instance_name: "test".to_string(),
+            peer_public_endpoint: "http://localhost:8080".to_string(),
+            peer_api_key: "test-api-key".to_string(),
+            dependency_track_url: None,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "artifact-keeper".to_string(),
+            gc_schedule: "0 0 * * * *".to_string(),
+            lifecycle_check_interval_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_from_config_rejects_unknown_backend() {
+        let config = minimal_config("bogus");
+        let result = StorageService::from_config(&config).await;
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("bogus"),
+            "Error should mention the unknown backend name, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gcs_backend_wrapper_from_config_fields() {
+        let _guard = gcs_env_lock().lock().unwrap();
+        std::env::set_var("GCS_BUCKET", "wrapper-test-bucket");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_PROJECT_ID");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+
+        let config = minimal_config("gcs");
+        let result = GcsBackendWrapper::from_config(&config).await;
+        std::env::remove_var("GCS_BUCKET");
+
+        assert!(
+            result.is_ok(),
+            "GcsBackendWrapper should construct without error in ADC mode"
+        );
+        let wrapper = result.unwrap();
+        assert_eq!(wrapper.bucket, "wrapper-test-bucket");
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_from_config_gcs_arm_reached() {
+        let _guard = gcs_env_lock().lock().unwrap();
+        std::env::set_var("GCS_BUCKET", "service-test-bucket");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_PROJECT_ID");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+
+        let config = minimal_config("gcs");
+        let result = StorageService::from_config(&config).await;
+        std::env::remove_var("GCS_BUCKET");
+
+        assert!(
+            result.is_ok(),
+            "StorageService::from_config should succeed with storage_backend=gcs"
+        );
     }
 }
