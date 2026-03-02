@@ -48,14 +48,17 @@ jobs:
           chmod +x "$HOME/.local/bin/argocd"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Configure ArgoCD core access
+        run: |
+          # argocd login --core creates a kubeconfig context from
+          # in-cluster credentials. Then set namespace to argocd so
+          # the CLI can find argocd-cm configmap.
+          argocd login --core
+          kubectl config set-context --current --namespace=argocd
+
       - name: Sync mesh applications
         if: ${{ !inputs.skip_deploy }}
         run: |
-          # Set kubectl context to argocd namespace so ArgoCD CLI
-          # can find argocd-cm configmap in --core mode
-          kubectl config set-context --current --namespace=argocd
-          argocd login --core
-
           TAG="${{ inputs.image_tag || 'dev' }}"
 
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
@@ -68,8 +71,6 @@ jobs:
 
       - name: Wait for healthy
         run: |
-          kubectl config set-context --current --namespace=argocd
-          argocd login --core
 
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
             echo "Waiting for $app to be healthy..."
