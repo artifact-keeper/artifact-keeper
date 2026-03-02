@@ -48,6 +48,8 @@ jobs:
 
       - name: Sync mesh applications
         if: ${{ !inputs.skip_deploy }}
+        env:
+          ARGOCD_NAMESPACE: argocd
         run: |
           argocd login --core
 
@@ -59,6 +61,8 @@ jobs:
           done
 
       - name: Wait for healthy
+        env:
+          ARGOCD_NAMESPACE: argocd
         run: |
           argocd login --core
 
