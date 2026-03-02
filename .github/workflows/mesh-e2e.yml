@@ -50,9 +50,10 @@ jobs:
 
       - name: Sync mesh applications
         if: ${{ !inputs.skip_deploy }}
-        env:
-          ARGOCD_NAMESPACE: argocd
         run: |
+          # Set kubectl context to argocd namespace so ArgoCD CLI
+          # can find argocd-cm configmap in --core mode
+          kubectl config set-context --current --namespace=argocd
           argocd login --core
 
           TAG="${{ inputs.image_tag || 'dev' }}"
@@ -66,9 +67,8 @@ jobs:
           done
 
       - name: Wait for healthy
-        env:
-          ARGOCD_NAMESPACE: argocd
         run: |
+          kubectl config set-context --current --namespace=argocd
           argocd login --core
 
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
