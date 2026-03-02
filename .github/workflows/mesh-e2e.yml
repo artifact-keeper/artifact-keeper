@@ -38,25 +38,6 @@ jobs:
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
-      - name: Install ArgoCD CLI
-        env:
-          ARGOCD_VERSION: v3.3.2
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -sSL -o "$HOME/.local/bin/argocd" \
-            "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
-          chmod +x "$HOME/.local/bin/argocd"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Configure ArgoCD core access
-        run: |
-          # argocd login --core creates a kubeconfig context named
-          # 'kubernetes' but does not set it as current. Explicitly
-          # use it and set namespace to argocd for configmap lookups.
-          argocd login --core
-          kubectl config use-context kubernetes
-          kubectl config set-context --current --namespace=argocd
-
       - name: Sync mesh applications
         if: ${{ !inputs.skip_deploy }}
         run: |
@@ -64,18 +45,55 @@ jobs:
 
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
             echo "Setting image tag $TAG on $app..."
-            argocd app set "$app" -p "backend.image.tag=$TAG"
 
-            echo "Syncing $app..."
-            argocd app sync "$app" --timeout 300
+            # Patch the Application CR to set the image tag parameter.
+            # Uses kubectl directly (no ArgoCD CLI needed on ARC runners).
+            kubectl -n argocd patch application "$app" --type merge \
+              -p "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"backend.image.tag\",\"value\":\"$TAG\"}]}}}}"
+
+            # Trigger a hard refresh to sync the application
+            kubectl -n argocd annotate application "$app" \
+              argocd.argoproj.io/refresh=hard --overwrite
+
+            echo "Waiting for $app to sync..."
+            # Wait for the sync to complete (check .status.sync.status)
+            for i in $(seq 1 60); do
+              SYNC_STATUS=$(kubectl -n argocd get application "$app" \
+                -o jsonpath='{.status.sync.status}' 2>/dev/null)
+              HEALTH_STATUS=$(kubectl -n argocd get application "$app" \
+                -o jsonpath='{.status.health.status}' 2>/dev/null)
+              if [ "$SYNC_STATUS" = "Synced" ] && [ "$HEALTH_STATUS" = "Healthy" ]; then
+                echo "$app is Synced and Healthy"
+                break
+              fi
+              echo "  $app: sync=$SYNC_STATUS health=$HEALTH_STATUS (attempt $i/60)"
+              sleep 5
+            done
+
+            if [ "$SYNC_STATUS" != "Synced" ] || [ "$HEALTH_STATUS" != "Healthy" ]; then
+              echo "::warning::$app did not reach Synced/Healthy within timeout (sync=$SYNC_STATUS health=$HEALTH_STATUS)"
+            fi
           done
 
       - name: Wait for healthy
         run: |
-
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
             echo "Waiting for $app to be healthy..."
-            argocd app wait "$app" --health --timeout 300
+            for i in $(seq 1 60); do
+              HEALTH=$(kubectl -n argocd get application "$app" \
+                -o jsonpath='{.status.health.status}' 2>/dev/null)
+              if [ "$HEALTH" = "Healthy" ]; then
+                echo "$app is Healthy"
+                break
+              fi
+              echo "  $app: health=$HEALTH (attempt $i/60)"
+              sleep 5
+            done
+
+            if [ "$HEALTH" != "Healthy" ]; then
+              echo "::error::$app is not healthy after 5 minutes (health=$HEALTH)"
+              exit 1
+            fi
           done
 
       - name: Checkout IaC repo
