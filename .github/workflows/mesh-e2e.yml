@@ -39,10 +39,12 @@ jobs:
         uses: azure/setup-kubectl@v4
 
       - name: Install ArgoCD CLI
+        env:
+          ARGOCD_VERSION: v3.3.2
         run: |
           mkdir -p "$HOME/.local/bin"
           curl -sSL -o "$HOME/.local/bin/argocd" \
-            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+            "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
           chmod +x "$HOME/.local/bin/argocd"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -53,11 +55,14 @@ jobs:
         run: |
           argocd login --core
 
+          TAG="${{ inputs.image_tag || 'dev' }}"
+
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
-            echo "Syncing $app with image tag ${{ inputs.image_tag || 'dev' }}..."
-            argocd app sync "$app" \
-              --param "backend.image.tag=${{ inputs.image_tag || 'dev' }}" \
-              --timeout 300
+            echo "Setting image tag $TAG on $app..."
+            argocd app set "$app" -p "backend.image.tag=$TAG"
+
+            echo "Syncing $app..."
+            argocd app sync "$app" --timeout 300
           done
 
       - name: Wait for healthy
