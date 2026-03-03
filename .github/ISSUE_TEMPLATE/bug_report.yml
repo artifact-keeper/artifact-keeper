@@ -1,6 +1,5 @@
 name: Bug Report
 description: Report a bug or unexpected behavior in Artifact Keeper
-title: "[BUG] "
 labels: ["bug", "needs-triage"]
 body:
   - type: markdown
@@ -58,7 +57,45 @@ body:
       placeholder: e.g., 1.1.0, 1.0.5, latest, N/A
     validations:
       required: false
-  
+
+  - type: dropdown
+    id: package-format
+    attributes:
+      label: Package Format
+      description: Which package format is this related to? (if applicable)
+      options:
+        - N/A / General
+        - Maven / Gradle
+        - npm
+        - PyPI
+        - Docker / OCI
+        - Cargo (Rust)
+        - NuGet (.NET)
+        - Helm
+        - Go Modules
+        - RubyGems
+        - Composer (PHP)
+        - CocoaPods
+        - Swift Package Manager
+        - Debian / APT
+        - RPM
+        - Conda
+        - Hex (Erlang/Elixir)
+        - Pub (Dart/Flutter)
+        - Terraform
+        - Conan (C/C++)
+        - CRAN (R)
+        - SBT (Scala)
+        - Git LFS
+        - Hugging Face
+        - VS Code Extensions
+        - JetBrains Plugins
+        - Puppet
+        - Protobuf
+        - Other / WASM Plugin
+    validations:
+      required: false
+
   - type: textarea
     id: expected-behavior
     attributes:

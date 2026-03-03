@@ -1,6 +1,5 @@
 name: Feature Request
 description: Suggest a new feature or enhancement for Artifact Keeper
-title: "[FEATURE] "
 labels: ["enhancement", "needs-triage"]
 body:
   - type: markdown
@@ -64,19 +63,6 @@ body:
         - Replication / Mesh Network
         - Authentication / Authorization
         - Other
-    validations:
-      required: false
-  
-  - type: dropdown
-    id: priority
-    attributes:
-      label: Priority (Your Perspective)
-      description: How important is this feature to you?
-      options:
-        - Nice to have
-        - Would improve my workflow
-        - Important for my use case
-        - Blocking my adoption
     validations:
       required: false
   

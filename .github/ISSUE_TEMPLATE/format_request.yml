@@ -1,0 +1,69 @@
+name: Package Format Request
+description: Request support for a new package format
+labels: ["enhancement", "new-format", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a new package format! Artifact Keeper currently supports 45+ formats, and community input helps us prioritize which to add next.
+
+  - type: input
+    id: format-name
+    attributes:
+      label: Format Name
+      description: The name of the package format or ecosystem
+      placeholder: e.g., Bazel, Nix, Flatpak, Vagrant
+    validations:
+      required: true
+
+  - type: input
+    id: package-manager
+    attributes:
+      label: Package Manager / Client Tool
+      description: The client tool users would use to interact with the registry
+      placeholder: e.g., bazel fetch, nix-env, flatpak install
+    validations:
+      required: true
+
+  - type: textarea
+    id: protocol
+    attributes:
+      label: Registry Protocol
+      description: Link to the registry API specification or protocol documentation, if available
+      placeholder: |
+        - Spec: https://...
+        - Existing registries: https://...
+        - Protocol type: HTTP REST, custom binary, etc.
+    validations:
+      required: false
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: Why do you need this format? How would you use it?
+      placeholder: Describe your use case and what you'd store in the registry
+    validations:
+      required: true
+
+  - type: dropdown
+    id: implementation
+    attributes:
+      label: Would you contribute a WASM plugin?
+      description: Artifact Keeper supports custom formats via WASM plugins. Would you be interested in building one?
+      options:
+        - "Yes, I'd like to contribute a plugin"
+        - "Maybe, with guidance"
+        - "No, I'd prefer native support"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have checked the [supported formats list](https://artifactkeeper.com/docs/guides/package-formats) to confirm this format is not already supported
+          required: true
+        - label: I have searched existing issues to ensure this isn't a duplicate
+          required: true
