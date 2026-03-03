@@ -1446,9 +1446,7 @@ impl RepodataEncoding {
 
     fn encode(&self, repodata: &serde_json::Value) -> Result<Vec<u8>, Response> {
         match self {
-            Self::Json => Ok(serde_json::to_string_pretty(repodata)
-                .unwrap()
-                .into_bytes()),
+            Self::Json => Ok(serde_json::to_string_pretty(repodata).unwrap().into_bytes()),
             Self::Bz2 => {
                 let json_bytes = serde_json::to_vec(repodata).unwrap();
                 Ok(bzip2_compress(&json_bytes))
@@ -1526,7 +1524,15 @@ async fn repodata_json(
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    serve_repodata(&state, auth, &headers, &repo_key, &subdir, RepodataEncoding::Json).await
+    serve_repodata(
+        &state,
+        auth,
+        &headers,
+        &repo_key,
+        &subdir,
+        RepodataEncoding::Json,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,7 +1545,15 @@ async fn repodata_json_bz2(
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    serve_repodata(&state, auth, &headers, &repo_key, &subdir, RepodataEncoding::Bz2).await
+    serve_repodata(
+        &state,
+        auth,
+        &headers,
+        &repo_key,
+        &subdir,
+        RepodataEncoding::Bz2,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,7 +1617,15 @@ async fn repodata_json_zst(
     headers: HeaderMap,
     Path((repo_key, subdir)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    serve_repodata(&state, auth, &headers, &repo_key, &subdir, RepodataEncoding::Zst).await
+    serve_repodata(
+        &state,
+        auth,
+        &headers,
+        &repo_key,
+        &subdir,
+        RepodataEncoding::Zst,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
