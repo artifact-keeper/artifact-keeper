@@ -1444,6 +1444,7 @@ impl RepodataEncoding {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn encode(&self, repodata: &serde_json::Value) -> Result<Vec<u8>, Response> {
         match self {
             Self::Json => Ok(serde_json::to_string_pretty(repodata).unwrap().into_bytes()),
