@@ -134,6 +134,182 @@ jobs:
             -Dsonar.organization=artifact-keeper
             -Dsonar.rust.lcov.reportPaths=lcov.info
 
+  # SonarCloud quality gate status — wraps the SonarCloud app check so fork PRs
+  # (where SONAR_TOKEN is unavailable) are not permanently blocked. Posts a PR
+  # comment with coverage/duplication metrics when the gate result is available.
+  sonarcloud-gate:
+    name: SonarCloud Quality Gate
+    runs-on: ubuntu-latest
+    needs: coverage
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check quality gate
+        id: gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [[ "${{ needs.coverage.result }}" != "success" ]]; then
+            echo "Coverage job did not succeed: ${{ needs.coverage.result }}"
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            echo "summary=Coverage job failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          if [[ -z "$SONAR_TOKEN" ]]; then
+            echo "SONAR_TOKEN not available (fork PR). Skipping quality gate check."
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            echo "summary=SonarCloud scan skipped (fork PR, no token available)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Wait for SonarCloud to process the analysis
+          sleep 10
+
+          # Fetch quality gate status
+          GATE_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
+            "https://sonarcloud.io/api/qualitygates/project_status?projectKey=artifact-keeper_artifact-keeper&branch=${{ github.head_ref || github.ref_name }}")
+
+          GATE_STATUS=$(echo "$GATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "UNKNOWN")
+          echo "Quality gate status: $GATE_STATUS"
+
+          # Fetch new code metrics
+          METRICS_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
+            "https://sonarcloud.io/api/measures/component?component=artifact-keeper_artifact-keeper&metricKeys=new_coverage,new_duplicated_lines_density,new_lines&branch=${{ github.head_ref || github.ref_name }}")
+
+          NEW_COVERAGE=$(echo "$METRICS_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for m in data.get('component',{}).get('measures',[]):
+              if m['metric'] == 'new_coverage':
+                  val = m.get('period',{}).get('value', m.get('value','N/A'))
+                  print(val)
+                  break
+          else:
+              print('N/A')
+          " 2>/dev/null || echo "N/A")
+
+          NEW_DUPLICATION=$(echo "$METRICS_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for m in data.get('component',{}).get('measures',[]):
+              if m['metric'] == 'new_duplicated_lines_density':
+                  val = m.get('period',{}).get('value', m.get('value','N/A'))
+                  print(val)
+                  break
+          else:
+              print('N/A')
+          " 2>/dev/null || echo "N/A")
+
+          NEW_LINES=$(echo "$METRICS_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for m in data.get('component',{}).get('measures',[]):
+              if m['metric'] == 'new_lines':
+                  val = m.get('period',{}).get('value', m.get('value','N/A'))
+                  print(val)
+                  break
+          else:
+              print('N/A')
+          " 2>/dev/null || echo "N/A")
+
+          echo "status=${GATE_STATUS}" >> "$GITHUB_OUTPUT"
+          echo "coverage=${NEW_COVERAGE}" >> "$GITHUB_OUTPUT"
+          echo "duplication=${NEW_DUPLICATION}" >> "$GITHUB_OUTPUT"
+          echo "lines=${NEW_LINES}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GATE_STATUS" == "OK" ]]; then
+            echo "summary=Passed (coverage: ${NEW_COVERAGE}%, duplication: ${NEW_DUPLICATION}%)" >> "$GITHUB_OUTPUT"
+          elif [[ "$GATE_STATUS" == "ERROR" ]]; then
+            echo "summary=Failed (coverage: ${NEW_COVERAGE}%, duplication: ${NEW_DUPLICATION}%)" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "summary=Unknown status: ${GATE_STATUS}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.gate.outputs.status }}';
+            const coverage = '${{ steps.gate.outputs.coverage }}';
+            const duplication = '${{ steps.gate.outputs.duplication }}';
+            const lines = '${{ steps.gate.outputs.lines }}';
+
+            const marker = '<!-- sonarcloud-gate -->';
+            let body = '';
+
+            if (status === 'skipped') {
+              body = [
+                marker,
+                '### SonarCloud Quality Gate',
+                '',
+                'SonarCloud scan was **skipped** because `SONAR_TOKEN` is not available for fork PRs.',
+                'Coverage and duplication metrics will be checked after merge.',
+              ].join('\n');
+            } else if (status === 'OK') {
+              body = [
+                marker,
+                '### SonarCloud Quality Gate: Passed',
+                '',
+                '| Metric | Value | Threshold |',
+                '|--------|-------|-----------|',
+                `| Coverage on New Code | ${coverage}% | >= 70% |`,
+                `| Duplication on New Code | ${duplication}% | <= 3% |`,
+                `| New Lines | ${lines} | |`,
+                '',
+                `[View on SonarCloud](https://sonarcloud.io/summary/new_code?id=artifact-keeper_artifact-keeper&branch=${context.payload.pull_request.head.ref})`,
+              ].join('\n');
+            } else if (status === 'ERROR') {
+              body = [
+                marker,
+                '### SonarCloud Quality Gate: Failed',
+                '',
+                '| Metric | Value | Threshold |',
+                '|--------|-------|-----------|',
+                `| Coverage on New Code | ${coverage}% | >= 70% |`,
+                `| Duplication on New Code | ${duplication}% | <= 3% |`,
+                `| New Lines | ${lines} | |`,
+                '',
+                `[View details on SonarCloud](https://sonarcloud.io/summary/new_code?id=artifact-keeper_artifact-keeper&branch=${context.payload.pull_request.head.ref})`,
+              ].join('\n');
+            } else {
+              body = [
+                marker,
+                '### SonarCloud Quality Gate',
+                '',
+                `Coverage job result: ${{ needs.coverage.result }}`,
+                `Quality gate status: ${status}`,
+              ].join('\n');
+            }
+
+            // Find and update existing comment, or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
   # ════════════════════════════════════════════════════════════════════════════
   # TIER 2: INTEGRATION (Main Branch Push Only)
   # ════════════════════════════════════════════════════════════════════════════
@@ -416,7 +592,7 @@ jobs:
   ci-complete:
     name: ✅ CI Complete
     runs-on: ubuntu-latest
-    needs: [lint-rust, test-backend-unit, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [lint-rust, test-backend-unit, coverage, sonarcloud-gate, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
