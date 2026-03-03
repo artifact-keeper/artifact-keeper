@@ -46,12 +46,22 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/api/v1/crates/:name/:version/download",
             get(download),
         )
-        // Sparse index — various path layouts
+        // Sparse index — index/ prefixed paths (legacy / internal)
         .route("/:repo_key/index/1/:name", get(sparse_index_1))
         .route("/:repo_key/index/2/:name", get(sparse_index_2))
         .route("/:repo_key/index/3/:prefix/:name", get(sparse_index_3))
         .route(
             "/:repo_key/index/:prefix1/:prefix2/:name",
+            get(sparse_index_4plus),
+        )
+        // Sparse index — root-level paths (Cargo sparse registry protocol)
+        // Cargo clients expect index files at the registry root, not under index/.
+        // Axum prioritises static segments first so api/v1/crates etc. still win.
+        .route("/:repo_key/1/:name", get(sparse_index_1))
+        .route("/:repo_key/2/:name", get(sparse_index_2))
+        .route("/:repo_key/3/:prefix/:name", get(sparse_index_3))
+        .route(
+            "/:repo_key/:prefix1/:prefix2/:name",
             get(sparse_index_4plus),
         )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
