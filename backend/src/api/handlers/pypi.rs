@@ -873,6 +873,8 @@ async fn upload(
     let artifact_path = format!("{}/{}/{}", normalized, pkg_version, filename);
     let size_bytes = content.len() as i64;
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Insert artifact record
     let artifact_id = sqlx::query_scalar!(
         r#"

@@ -419,6 +419,8 @@ async fn upload_chart(
             .into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the chart package
     let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
     let storage = state.storage_for_repo(&repo.storage_path);

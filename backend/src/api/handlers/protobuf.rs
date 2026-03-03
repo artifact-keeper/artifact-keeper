@@ -1128,6 +1128,8 @@ async fn upload(
 
         let artifact_path = format!("modules/{}/commits/{}", module_name, commit_digest);
 
+        super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
         // Insert artifact record
         let row = sqlx::query(
             r#"INSERT INTO artifacts (

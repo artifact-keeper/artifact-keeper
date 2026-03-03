@@ -1,5 +1,23 @@
 //! HTTP request handlers.
 
+/// Remove any soft-deleted artifact at the given `(repository_id, path)` so
+/// that a subsequent INSERT won't violate the UNIQUE constraint.  This is a
+/// fire-and-forget cleanup: if the DELETE fails or finds nothing we just
+/// continue with the INSERT.
+pub async fn cleanup_soft_deleted_artifact(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    path: &str,
+) {
+    let _ = sqlx::query(
+        "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .execute(db)
+    .await;
+}
+
 pub mod admin;
 pub mod alpine;
 pub mod analytics;

@@ -392,6 +392,8 @@ async fn publish_extension(
         return Err((StatusCode::CONFLICT, "Extension version already exists").into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the file
     let storage_key = format!("vscode/{}/{}/{}", publisher, ext_name, filename);
     let storage = state.storage_for_repo(&repo.storage_path);

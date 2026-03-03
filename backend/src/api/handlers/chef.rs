@@ -564,6 +564,8 @@ async fn upload_cookbook(
         return Err((StatusCode::CONFLICT, "Cookbook version already exists").into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the file
     let storage_key = format!("chef/{}/{}/{}", cookbook_name, cookbook_version, filename);
     let storage = state.storage_for_repo(&repo.storage_path);

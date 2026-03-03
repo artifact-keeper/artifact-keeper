@@ -297,6 +297,8 @@ async fn upload_artifact(
         return Err((StatusCode::CONFLICT, "Artifact already exists at this path").into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Determine content type
     let content_type = if path_info.is_ivy_descriptor {
         "application/xml"

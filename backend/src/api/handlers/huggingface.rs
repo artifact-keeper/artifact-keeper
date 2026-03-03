@@ -450,6 +450,8 @@ async fn upload_file(
         return Err((StatusCode::CONFLICT, "File already exists at this path").into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the file
     let storage_key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
     let storage = state.storage_for_repo(&repo.storage_path);

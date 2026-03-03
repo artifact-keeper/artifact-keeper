@@ -751,6 +751,8 @@ async fn upload(
             .into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the archive
     let storage_key = format!("composer/{}/{}/{}.zip", full_name, version, sha256);
     let storage = state.storage_for_repo(&repo.storage_path);

@@ -508,6 +508,8 @@ async fn upload_object(
     let size_bytes = body.len() as i64;
     let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Insert artifact record
     sqlx::query!(
         r#"

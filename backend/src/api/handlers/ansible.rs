@@ -679,6 +679,8 @@ async fn upload_collection(
         return Err((StatusCode::CONFLICT, "Collection version already exists").into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the file
     let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
     let storage = state.storage_for_repo(&repo.storage_path);

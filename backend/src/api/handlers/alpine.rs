@@ -760,6 +760,8 @@ async fn store_apk(
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the file
     let storage_key = format!("alpine/{}/{}", repo.id, artifact_path);
     let storage = state.storage_for_repo(&repo.storage_path);

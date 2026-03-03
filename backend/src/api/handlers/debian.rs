@@ -774,6 +774,8 @@ async fn pool_upload(
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
 
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Compute SHA256
     let mut hasher = Sha256::new();
     hasher.update(&body);
@@ -937,6 +939,8 @@ async fn upload_raw(
     if existing.is_some() {
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
+
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Compute SHA256
     let mut hasher = Sha256::new();

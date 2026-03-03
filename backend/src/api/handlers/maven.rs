@@ -507,7 +507,7 @@ async fn upload(
     let size_bytes = body.len() as i64;
     let ct = content_type_for_path(&path);
 
-    // Check for duplicate
+    // Check for active (non-deleted) duplicate
     let existing = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
         repo.id,
@@ -536,6 +536,10 @@ async fn upload(
         )
         .execute(&state.db)
         .await;
+    } else {
+        // Clean up any soft-deleted artifact at the same path so the
+        // UNIQUE(repository_id, path) constraint doesn't block re-upload.
+        super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
     }
 
     // Store file
