@@ -747,10 +747,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     // Serialize env-var tests to avoid cross-test interference.
-    static GCS_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    // Uses tokio::sync::Mutex so the guard can be held across .await points
+    // without triggering clippy::await_holding_lock.
+    static GCS_ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-    fn gcs_env_lock() -> &'static std::sync::Mutex<()> {
-        GCS_ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    fn gcs_env_lock() -> &'static tokio::sync::Mutex<()> {
+        GCS_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     fn minimal_config(storage_backend: &str) -> crate::config::Config {
@@ -806,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gcs_backend_wrapper_from_config_fields() {
-        let _guard = gcs_env_lock().lock().unwrap();
+        let _guard = gcs_env_lock().lock().await;
         std::env::set_var("GCS_BUCKET", "wrapper-test-bucket");
         std::env::remove_var("GCS_PRIVATE_KEY");
         std::env::remove_var("GCS_PRIVATE_KEY_PATH");
@@ -827,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_storage_service_from_config_gcs_arm_reached() {
-        let _guard = gcs_env_lock().lock().unwrap();
+        let _guard = gcs_env_lock().lock().await;
         std::env::set_var("GCS_BUCKET", "service-test-bucket");
         std::env::remove_var("GCS_PRIVATE_KEY");
         std::env::remove_var("GCS_PRIVATE_KEY_PATH");

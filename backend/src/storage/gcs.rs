@@ -572,22 +572,22 @@ impl GcsBackend {
         Ok(None)
     }
 
-    /// Try a fallback existence check in migration mode.
+    /// Try a fallback existence check in migration mode. Returns `Ok(true)` if
+    /// found at the fallback path, `Ok(false)` otherwise. Propagates network errors.
     async fn try_fallback_exists(&self, key: &str) -> Result<bool> {
         if !self.path_format.has_fallback() {
             return Ok(false);
         }
         if let Some(fallback_key) = self.try_artifactory_fallback(key) {
             let url = self.object_metadata_url(&fallback_key);
-            if let Ok(response) = self.authorized_get(&url).await {
-                if response.status().is_success() {
-                    tracing::debug!(
-                        key = %key,
-                        fallback = %fallback_key,
-                        "Found artifact at Artifactory fallback path"
-                    );
-                    return Ok(true);
-                }
+            let response = self.authorized_get(&url).await?;
+            if response.status().is_success() {
+                tracing::debug!(
+                    key = %key,
+                    fallback = %fallback_key,
+                    "Found artifact at Artifactory fallback path"
+                );
+                return Ok(true);
             }
         }
         Ok(false)
@@ -880,7 +880,16 @@ impl StorageBackend for GcsBackend {
             return Ok(true);
         }
 
-        self.try_fallback_exists(key).await
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return self.try_fallback_exists(key).await;
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(AppError::Storage(format!(
+            "GCS exists check failed with status {}: {}",
+            status, body
+        )))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
