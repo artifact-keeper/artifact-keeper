@@ -183,9 +183,6 @@ jobs:
     name: 🔥 Smoke E2E Tests
     runs-on: ak-e2e-runners
     needs: [test-backend-unit]
-    # Skip for fork PRs: Docker Hub secrets are unavailable and anonymous
-    # pulls hit rate limits. E2E runs on main after merge.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: read
@@ -236,12 +233,6 @@ jobs:
 
           chmod +x "$COMPOSE_BINARY"
           docker compose version
-
-      - name: Login to Docker Hub
-        if: env.DOCKERHUB_USERNAME != ''
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -441,14 +432,11 @@ jobs:
             fi
           done
 
-          # Smoke E2E (skipped for fork PRs where Docker Hub secrets are unavailable)
-          smoke_result="${{ needs.smoke-e2e.result }}"
-          if [[ "$smoke_result" == "success" ]]; then
+          # Smoke E2E
+          if [[ "${{ needs.smoke-e2e.result }}" == "success" ]]; then
             echo "✅ smoke-e2e" >> $GITHUB_STEP_SUMMARY
-          elif [[ "$smoke_result" == "skipped" ]]; then
-            echo "⏭️ smoke-e2e (fork PR — skipped)" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ smoke-e2e: $smoke_result" >> $GITHUB_STEP_SUMMARY
+            echo "❌ smoke-e2e: ${{ needs.smoke-e2e.result }}" >> $GITHUB_STEP_SUMMARY
             tier1_pass=false
           fi
 
