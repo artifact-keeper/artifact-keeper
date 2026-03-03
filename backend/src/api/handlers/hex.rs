@@ -156,7 +156,7 @@ async fn package_info(
 
         // Virtual: iterate members in priority order, proxy from first remote that has it.
         if repo.repo_type == "virtual" {
-            let upstream_path = format!("api/packages/{}", name);
+            let upstream_path = format!("packages/{}", name);
             if let Some(ref proxy) = state.proxy_service {
                 // Use fetch_virtual_members which is already in the sqlx offline cache.
                 let members =
