@@ -45,6 +45,9 @@ aes-gcm.workspace = true
 # S3 storage using rust-s3 crate
 rust-s3.workspace = true
 
+# TLS (explicit provider selection for rustls 0.23+)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 # Logging/Tracing
 tracing.workspace = true
 tracing-subscriber.workspace = true

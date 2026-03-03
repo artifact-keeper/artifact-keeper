@@ -212,6 +212,7 @@ dependencies = [
  "rmp-serde",
  "rsa",
  "rust-s3",
+ "rustls 0.23.36",
  "serde",
  "serde_json",
  "serde_urlencoded",

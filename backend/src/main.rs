@@ -43,6 +43,14 @@ use tonic::transport::Server as TonicServer;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install a rustls CryptoProvider before any TLS operations.
+    // Required by rustls 0.23+ when multiple providers (ring, aws-lc-rs)
+    // are compiled in via transitive dependencies (rust-s3, reqwest, sqlx).
+    // Without this, IRSA/STS credential fetches panic at startup.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls CryptoProvider");
+
     // Load environment variables
     dotenvy::dotenv().ok();
 
