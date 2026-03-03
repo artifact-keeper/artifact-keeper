@@ -19,6 +19,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use base64::Engine;
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -167,6 +168,19 @@ fn extract_token(request: &Request) -> ExtractedToken<'_> {
     ExtractedToken::None
 }
 
+/// Decode a base64-encoded Basic auth string into (username, password).
+///
+/// Returns `None` if the base64 is invalid, the bytes are not valid UTF-8,
+/// or the decoded string does not contain a `:` separator.
+fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let decoded = String::from_utf8(bytes).ok()?;
+    let (user, pass) = decoded.split_once(':')?;
+    Some((user.to_owned(), pass.to_owned()))
+}
+
 /// Authentication middleware function - requires valid token
 ///
 /// Supports multiple authentication schemes:
@@ -216,7 +230,32 @@ pub async fn auth_middleware(
                 }
             }
         }
-        ExtractedToken::Basic(_) | ExtractedToken::None => {
+        ExtractedToken::Basic(encoded) => {
+            let Some((username, password)) = decode_basic_credentials(encoded) else {
+                return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials")
+                    .into_response();
+            };
+            match auth_service.authenticate(&username, &password).await {
+                Ok((user, _token_pair)) => {
+                    let auth_ext = AuthExtension {
+                        user_id: user.id,
+                        username: user.username,
+                        email: user.email,
+                        is_admin: user.is_admin,
+                        is_api_token: false,
+                        is_service_account: user.is_service_account,
+                        scopes: None,
+                        allowed_repo_ids: None,
+                    };
+                    request.extensions_mut().insert(auth_ext);
+                    next.run(request).await
+                }
+                Err(_) => {
+                    (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+                }
+            }
+        }
+        ExtractedToken::None => {
             (StatusCode::UNAUTHORIZED, "Missing authorization header").into_response()
         }
         ExtractedToken::Invalid => (
@@ -272,7 +311,21 @@ async fn try_resolve_auth(
         ExtractedToken::ApiKey(token) => validate_api_token_with_scopes(auth_service, token)
             .await
             .ok(),
-        ExtractedToken::None | ExtractedToken::Invalid | ExtractedToken::Basic(_) => None,
+        ExtractedToken::Basic(encoded) => {
+            let (username, password) = decode_basic_credentials(encoded)?;
+            let (user, _token_pair) = auth_service.authenticate(&username, &password).await.ok()?;
+            Some(AuthExtension {
+                user_id: user.id,
+                username: user.username,
+                email: user.email,
+                is_admin: user.is_admin,
+                is_api_token: false,
+                is_service_account: user.is_service_account,
+                scopes: None,
+                allowed_repo_ids: None,
+            })
+        }
+        ExtractedToken::None | ExtractedToken::Invalid => None,
     }
 }
 
@@ -322,7 +375,28 @@ pub async fn admin_middleware(
                 }
             }
         }
-        ExtractedToken::Basic(_) | ExtractedToken::None => {
+        ExtractedToken::Basic(encoded) => {
+            let Some((username, password)) = decode_basic_credentials(encoded) else {
+                return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials")
+                    .into_response();
+            };
+            match auth_service.authenticate(&username, &password).await {
+                Ok((user, _token_pair)) => AuthExtension {
+                    user_id: user.id,
+                    username: user.username,
+                    email: user.email,
+                    is_admin: user.is_admin,
+                    is_api_token: false,
+                    is_service_account: user.is_service_account,
+                    scopes: None,
+                    allowed_repo_ids: None,
+                },
+                Err(_) => {
+                    return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
+                }
+            }
+        }
+        ExtractedToken::None => {
             return (StatusCode::UNAUTHORIZED, "Missing authorization header").into_response();
         }
         ExtractedToken::Invalid => {
@@ -729,6 +803,45 @@ mod tests {
 
         let debug_str = format!("{:?}", ext);
         assert!(debug_str.contains("user"));
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_basic_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_basic_credentials_valid() {
+        // "user:pass" in base64
+        let result = decode_basic_credentials("dXNlcjpwYXNz");
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+    }
+
+    #[test]
+    fn test_decode_basic_credentials_with_colon_in_password() {
+        // "user:p:a:ss" in base64
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:p:a:ss");
+        let result = decode_basic_credentials(&encoded);
+        assert_eq!(result, Some(("user".to_string(), "p:a:ss".to_string())));
+    }
+
+    #[test]
+    fn test_decode_basic_credentials_invalid_base64() {
+        let result = decode_basic_credentials("not-valid!!!");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_decode_basic_credentials_no_colon() {
+        // "justusername" in base64
+        let encoded = base64::engine::general_purpose::STANDARD.encode("justusername");
+        let result = decode_basic_credentials(&encoded);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_decode_basic_credentials_empty() {
+        let result = decode_basic_credentials("");
+        assert_eq!(result, None);
     }
 
     // -----------------------------------------------------------------------
