@@ -134,7 +134,7 @@ async fn package_info(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let upstream_path = format!("api/packages/{}", name);
+                let upstream_path = format!("packages/{}", name);
                 let (content, content_type) = proxy_helpers::proxy_fetch(
                     proxy,
                     repo.id,
@@ -1172,8 +1172,8 @@ mod tests {
     #[test]
     fn test_package_info_upstream_path() {
         let name = "phoenix";
-        let path = format!("api/packages/{}", name);
-        assert_eq!(path, "api/packages/phoenix");
+        let path = format!("packages/{}", name);
+        assert_eq!(path, "packages/phoenix");
     }
 
     /// list_names() proxies to the bare `names` endpoint on the upstream.
