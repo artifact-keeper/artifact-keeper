@@ -46,17 +46,32 @@ jobs:
           for app in ak-mesh-main ak-mesh-peer-1 ak-mesh-peer-2 ak-mesh-peer-3; do
             echo "Setting image tag $TAG on $app..."
 
-            # Patch the Application CR to set the image tag parameter.
-            # Uses kubectl directly (no ArgoCD CLI needed on ARC runners).
-            kubectl -n argocd patch application "$app" --type merge \
-              -p "{\"spec\":{\"source\":{\"helm\":{\"parameters\":[{\"name\":\"backend.image.tag\",\"value\":\"$TAG\"}]}}}}"
+            # Update backend.image.tag in the Application's Helm parameters
+            # using JSON patch to preserve all other ApplicationSet-managed parameters.
+            # A merge patch would replace the entire parameters array, wiping out
+            # fullnameOverride, PEER_* env vars, and jwtSecret.
+            PARAM_INDEX=$(kubectl -n argocd get application "$app" \
+              -o jsonpath='{range .spec.source.helm.parameters[*]}{.name}{"\n"}{end}' 2>/dev/null | \
+              grep -n "^backend.image.tag$" | cut -d: -f1 || true)
 
-            # Trigger a hard refresh to sync the application
+            if [ -n "$PARAM_INDEX" ]; then
+              # Update existing parameter (convert to 0-indexed)
+              IDX=$((PARAM_INDEX - 1))
+              echo "  Updating existing backend.image.tag at index $IDX"
+              kubectl -n argocd patch application "$app" --type json \
+                -p "[{\"op\":\"replace\",\"path\":\"/spec/source/helm/parameters/$IDX/value\",\"value\":\"$TAG\"}]"
+            else
+              # Add new parameter to the end of the array
+              echo "  Adding backend.image.tag parameter"
+              kubectl -n argocd patch application "$app" --type json \
+                -p "[{\"op\":\"add\",\"path\":\"/spec/source/helm/parameters/-\",\"value\":{\"name\":\"backend.image.tag\",\"value\":\"$TAG\"}}]"
+            fi
+
+            # Trigger a hard refresh so ArgoCD re-renders manifests with the new tag
             kubectl -n argocd annotate application "$app" \
               argocd.argoproj.io/refresh=hard --overwrite
 
             echo "Waiting for $app to sync..."
-            # Wait for the sync to complete (check .status.sync.status)
             # Allow up to 10 minutes: first deploy includes DB init + image pulls
             for i in $(seq 1 120); do
               SYNC_STATUS=$(kubectl -n argocd get application "$app" \
