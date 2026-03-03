@@ -14,7 +14,7 @@ use axum::{
     extract::{Request, State},
     http::{
         header::{AUTHORIZATION, COOKIE},
-        HeaderName, StatusCode,
+        HeaderMap, HeaderName, StatusCode,
     },
     middleware::Next,
     response::{IntoResponse, Response},
@@ -132,6 +132,66 @@ pub fn require_auth_basic(
             .body(axum::body::Body::from("Authentication required"))
             .unwrap()
     })
+}
+
+/// Extract credentials from a Bearer token that contains base64-encoded user:pass.
+///
+/// Some package managers (npm, cargo, goproxy) send Bearer tokens that are
+/// base64-encoded `username:password` rather than JWTs or API keys.
+pub fn extract_bearer_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or(v.strip_prefix("bearer ")))
+        .and_then(|token| {
+            base64::engine::general_purpose::STANDARD
+                .decode(token)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|s| {
+                    let mut parts = s.splitn(2, ':');
+                    let user = parts.next()?.to_string();
+                    let pass = parts.next()?.to_string();
+                    Some((user, pass))
+                })
+        })
+}
+
+/// Require authentication, with a fallback to Bearer-as-base64 credentials.
+///
+/// Used by format handlers (npm, cargo, goproxy) where clients may send
+/// credentials as a base64-encoded `user:pass` in a Bearer token rather than
+/// using standard Basic auth.
+#[allow(clippy::result_large_err)]
+pub async fn require_auth_with_bearer_fallback(
+    auth: Option<AuthExtension>,
+    headers: &HeaderMap,
+    db: &sqlx::PgPool,
+    config: &crate::config::Config,
+    realm: &str,
+) -> std::result::Result<uuid::Uuid, Response> {
+    if let Some(ext) = auth {
+        return Ok(ext.user_id);
+    }
+    let (username, password) = extract_bearer_credentials(headers).ok_or_else(|| {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", format!("Basic realm=\"{}\"", realm))
+            .body(axum::body::Body::from("Authentication required"))
+            .unwrap()
+    })?;
+    let auth_service = AuthService::new(db.clone(), std::sync::Arc::new(config.clone()));
+    let (user, _) = auth_service
+        .authenticate(&username, &password)
+        .await
+        .map_err(|_| {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("WWW-Authenticate", format!("Basic realm=\"{}\"", realm))
+                .body(axum::body::Body::from("Invalid credentials"))
+                .unwrap()
+        })?;
+    Ok(user.id)
 }
 
 /// Token extraction result
@@ -939,5 +999,73 @@ mod tests {
     #[test]
     fn test_allow_private_with_auth() {
         assert!(should_allow_repo_access(false, true));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_bearer_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_bearer_credentials_valid() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {}", encoded).parse().unwrap(),
+        );
+        let result = extract_bearer_credentials(&headers);
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+    }
+
+    #[test]
+    fn test_extract_bearer_credentials_lowercase() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("bearer {}", encoded).parse().unwrap(),
+        );
+        assert_eq!(
+            extract_bearer_credentials(&headers),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_bearer_credentials_missing() {
+        assert!(extract_bearer_credentials(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn test_extract_bearer_credentials_not_base64() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            "Bearer not-valid-base64!!!!".parse().unwrap(),
+        );
+        assert!(extract_bearer_credentials(&headers).is_none());
+    }
+
+    #[test]
+    fn test_extract_bearer_credentials_no_colon() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("justtoken");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {}", encoded).parse().unwrap(),
+        );
+        assert!(extract_bearer_credentials(&headers).is_none());
+    }
+
+    #[test]
+    fn test_extract_bearer_credentials_colon_in_password() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("user:p:a:s:s");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            format!("Bearer {}", encoded).parse().unwrap(),
+        );
+        let result = extract_bearer_credentials(&headers);
+        assert_eq!(result, Some(("user".to_string(), "p:a:s:s".to_string())));
     }
 }

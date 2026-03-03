@@ -10,8 +10,6 @@
 //!   PUT  /npm/{repo_key}/{package}                    - Publish package
 //!   PUT  /npm/{repo_key}/{@scope}/{package}           - Publish scoped package
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -29,7 +27,6 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::services::auth_service::AuthService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -54,29 +51,7 @@ pub fn router() -> Router<SharedState> {
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB
 }
 
-// ---------------------------------------------------------------------------
-// Auth helpers
-// ---------------------------------------------------------------------------
-
-/// Extract credentials from Bearer token (npm sends base64-encoded user:pass as token).
-fn extract_bearer_credentials(headers: &HeaderMap) -> Option<(String, String)> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or(v.strip_prefix("bearer ")))
-        .and_then(|token| {
-            base64::engine::general_purpose::STANDARD
-                .decode(token)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .and_then(|s| {
-                    let mut parts = s.splitn(2, ':');
-                    let user = parts.next()?.to_string();
-                    let pass = parts.next()?.to_string();
-                    Some((user, pass))
-                })
-        })
-}
+use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 
 // ---------------------------------------------------------------------------
 // Repository resolution
@@ -831,31 +806,8 @@ async fn publish_package(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = match auth {
-        Some(ext) => ext.user_id,
-        None => {
-            // Fallback: npm may send Bearer with base64-encoded user:pass
-            let (username, password) = extract_bearer_credentials(headers).ok_or_else(|| {
-                Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header("WWW-Authenticate", "Basic realm=\"npm\"")
-                    .body(Body::from("Authentication required"))
-                    .unwrap()
-            })?;
-            let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-            let (user, _) = auth_service
-                .authenticate(&username, &password)
-                .await
-                .map_err(|_| {
-                    Response::builder()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .header("WWW-Authenticate", "Basic realm=\"npm\"")
-                        .body(Body::from("Invalid credentials"))
-                        .unwrap()
-                })?;
-            user.id
-        }
-    };
+    let user_id =
+        require_auth_with_bearer_fallback(auth, headers, &state.db, &state.config, "npm").await?;
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
@@ -940,7 +892,6 @@ fn rewrite_npm_tarball_urls(json: &mut serde_json::Value, base_url: &str, repo_k
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (test-only)
@@ -1053,61 +1004,6 @@ mod tests {
         );
 
         version_obj
-    }
-
-    // -----------------------------------------------------------------------
-    // extract_bearer_credentials
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_bearer_credentials_valid() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("npmuser:npmpass");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", encoded)).unwrap(),
-        );
-        let result = extract_bearer_credentials(&headers);
-        assert_eq!(result, Some(("npmuser".to_string(), "npmpass".to_string())));
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_lowercase() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("user:pass");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("bearer {}", encoded)).unwrap(),
-        );
-        let result = extract_bearer_credentials(&headers);
-        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_not_base64() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer not-valid-base64!!!!"),
-        );
-        // Invalid base64 should return None
-        assert!(extract_bearer_credentials(&headers).is_none());
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_missing() {
-        assert!(extract_bearer_credentials(&HeaderMap::new()).is_none());
-    }
-
-    #[test]
-    fn test_extract_bearer_credentials_no_colon() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("justtoken");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", encoded)).unwrap(),
-        );
-        assert!(extract_bearer_credentials(&headers).is_none());
     }
 
     // -----------------------------------------------------------------------
