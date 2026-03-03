@@ -780,7 +780,7 @@ async fn upload_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header::AUTHORIZATION;
+
     #[test]
     fn test_repo_info_struct() {
         let info = RepoInfo {

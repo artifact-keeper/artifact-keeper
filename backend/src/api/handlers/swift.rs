@@ -511,6 +511,7 @@ async fn publish_release_from_wildcard(
 // Publish release implementation
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_release(
     state: SharedState,
     repo_key: String,

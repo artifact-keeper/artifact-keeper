@@ -679,7 +679,7 @@ fn extract_pubspec_from_archive(data: &[u8]) -> Result<crate::formats::r#pub::Pu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header::AUTHORIZATION;
+
     #[test]
     fn test_archive_path_parsing_valid() {
         let archive_path = "my_package/versions/1.0.0.tar.gz";

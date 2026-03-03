@@ -727,7 +727,7 @@ async fn publish_module(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::header::AUTHORIZATION;
+
     #[test]
     fn test_parse_owner_name_valid() {
         let result = parse_owner_name("puppetlabs-stdlib");
