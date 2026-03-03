@@ -213,27 +213,20 @@ impl StorageBackend for S3BackendWrapper {
     }
 }
 
-/// GCS storage backend (wrapper for integration with StorageService)
+/// GCS storage backend (wrapper for integration with StorageService).
+///
+/// Thin wrapper that delegates the `StorageBackend` trait to the inner
+/// `crate::storage` trait and the extra `list`/`copy`/`size` methods to
+/// `GcsBackend`'s inherent methods.
 pub struct GcsBackendWrapper {
     inner: crate::storage::gcs::GcsBackend,
-    bucket: String,
-    client: reqwest::Client,
 }
 
 impl GcsBackendWrapper {
     pub async fn from_config(_config: &Config) -> crate::error::Result<Self> {
         let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
-        let bucket = gcs_config.bucket.clone();
         let inner = crate::storage::gcs::GcsBackend::new(gcs_config).await?;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
-        Ok(Self {
-            inner,
-            bucket,
-            client,
-        })
+        Ok(Self { inner })
     }
 }
 
@@ -256,125 +249,15 @@ impl StorageBackend for GcsBackendWrapper {
     }
 
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
-        #[derive(serde::Deserialize)]
-        struct GcsObject {
-            name: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct GcsListResponse {
-            #[serde(default)]
-            items: Vec<GcsObject>,
-        }
-
-        let token = self.inner.get_token().await?;
-        let base = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o",
-            urlencoding::encode(&self.bucket)
-        );
-        let url = match prefix {
-            Some(p) => format!("{}?prefix={}", base, urlencoding::encode(p)),
-            None => base,
-        };
-
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS list failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "GCS list failed with status {}: {}",
-                status, body
-            )));
-        }
-
-        let list_response: GcsListResponse = response
-            .json()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to parse GCS list response: {}", e)))?;
-
-        Ok(list_response.items.into_iter().map(|o| o.name).collect())
+        self.inner.list(prefix).await
     }
 
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
-        let token = self.inner.get_token().await?;
-        let bucket_enc = urlencoding::encode(&self.bucket);
-        let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}/copyTo/b/{}/o/{}",
-            bucket_enc,
-            urlencoding::encode(source),
-            bucket_enc,
-            urlencoding::encode(dest),
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Length", "0")
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS copy failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "GCS copy failed with status {}: {}",
-                status, body
-            )));
-        }
-
-        Ok(())
+        self.inner.copy(source, dest).await
     }
 
     async fn size(&self, key: &str) -> Result<u64> {
-        #[derive(serde::Deserialize)]
-        struct GcsObjectMetadata {
-            size: String,
-        }
-
-        let token = self.inner.get_token().await?;
-        let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
-            urlencoding::encode(&self.bucket),
-            urlencoding::encode(key),
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS size request failed: {}", e)))?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(AppError::NotFound(format!("Object not found: {}", key)));
-        }
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "GCS size request failed with status {}: {}",
-                status, body
-            )));
-        }
-
-        let metadata: GcsObjectMetadata = response.json().await.map_err(|e| {
-            AppError::Storage(format!("Failed to parse GCS object metadata: {}", e))
-        })?;
-
-        metadata
-            .size
-            .parse::<u64>()
-            .map_err(|e| AppError::Storage(format!("Failed to parse GCS object size: {}", e)))
+        self.inner.size(key).await
     }
 }
 
@@ -939,7 +822,7 @@ mod tests {
             "GcsBackendWrapper should construct without error in ADC mode"
         );
         let wrapper = result.unwrap();
-        assert_eq!(wrapper.bucket, "wrapper-test-bucket");
+        assert_eq!(wrapper.inner.bucket(), "wrapper-test-bucket");
     }
 
     #[tokio::test]

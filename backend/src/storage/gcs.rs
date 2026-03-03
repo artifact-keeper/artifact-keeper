@@ -2,10 +2,13 @@
 //!
 //! Supports two authentication modes:
 //!
-//! ## Mode A — RSA key signing (V4 signed URLs)
+//! ## Mode A: Service Account Key
 //!
 //! Triggered when `GCS_PRIVATE_KEY` or `GCS_PRIVATE_KEY_PATH` is set. Requires
-//! `GCS_PROJECT_ID` and `GCS_SERVICE_ACCOUNT_EMAIL`.
+//! `GCS_PROJECT_ID` and `GCS_SERVICE_ACCOUNT_EMAIL`. Uses the RSA key to mint
+//! self-signed JWTs exchanged for OAuth2 bearer tokens at Google's token
+//! endpoint. All API calls are authenticated. Redirect downloads via V4 signed
+//! URLs are available in this mode.
 //!
 //! ```bash
 //! STORAGE_BACKEND=gcs
@@ -19,11 +22,12 @@
 //! GCS_SIGNED_URL_EXPIRY=3600  # seconds, default 1 hour
 //! ```
 //!
-//! ## Mode B — Application Default Credentials / Workload Identity
+//! ## Mode B: Application Default Credentials / Workload Identity
 //!
 //! Triggered when neither `GCS_PRIVATE_KEY` nor `GCS_PRIVATE_KEY_PATH` is set.
-//! Authenticates via the GCP metadata server (works on GKE with Workload Identity).
-//! Only `GCS_BUCKET` is required. `supports_redirect()` returns `false` in this mode.
+//! Authenticates via the GCP metadata server (works on GKE with Workload
+//! Identity). Only `GCS_BUCKET` is required. `supports_redirect()` returns
+//! `false` in this mode because V4 signed URLs require an RSA private key.
 //!
 //! ```bash
 //! STORAGE_BACKEND=gcs
@@ -38,6 +42,7 @@
 //! ```
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
 use bytes::Bytes;
 use chrono::Utc;
 use rsa::pkcs8::DecodePrivateKey;
@@ -55,37 +60,224 @@ use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend, StoragePa
 const GCP_METADATA_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
-/// Authentication mode for GCS operations.
-#[derive(Debug)]
-enum AuthMode {
-    /// RSA key signing — V4 signed URLs for get/exists; unauthenticated put/delete (Mode A).
-    RsaKey,
-    /// Application Default Credentials via the GCP metadata server (Mode B).
-    Adc,
-}
+/// Google OAuth2 token endpoint.
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-/// Cached GCP access token for ADC mode.
+/// OAuth2 scope for full GCS access.
+const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.full_control";
+
+// ---------------------------------------------------------------------------
+// Token caching
+// ---------------------------------------------------------------------------
+
+/// Cached GCP access token.
 struct CachedToken {
     token: String,
     expires_at: Instant,
 }
 
-/// Google Cloud Storage configuration
+/// Where tokens come from.
+enum TokenSource {
+    /// Self-signed JWT exchanged at Google's token endpoint (service account key).
+    ServiceAccountJwt {
+        service_account_email: String,
+        signing_key: Box<RsaPrivateKey>,
+    },
+    /// GCE metadata server (ADC / Workload Identity).
+    MetadataServer,
+}
+
+/// Token provider with RwLock cache, mirroring Azure's `TokenCredentialProvider`.
+struct GcsTokenProvider {
+    source: TokenSource,
+    cache: RwLock<Option<CachedToken>>,
+    client: reqwest::Client,
+}
+
+impl GcsTokenProvider {
+    fn new(source: TokenSource, client: reqwest::Client) -> Self {
+        Self {
+            source,
+            cache: RwLock::new(None),
+            client,
+        }
+    }
+
+    /// Get a valid access token, refreshing if the cached one expires within 60s.
+    async fn get_token(&self) -> Result<String> {
+        // Fast path: read lock
+        {
+            let cache = self.cache.read().await;
+            if let Some(ref cached) = *cache {
+                if cached.expires_at > Instant::now() + Duration::from_secs(60) {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
+        // Slow path: write lock
+        let mut cache = self.cache.write().await;
+        // Double-check: another task may have refreshed while we waited
+        if let Some(ref cached) = *cache {
+            if cached.expires_at > Instant::now() + Duration::from_secs(60) {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        let (token, expires_in) = match &self.source {
+            TokenSource::ServiceAccountJwt {
+                service_account_email,
+                signing_key,
+            } => {
+                self.fetch_jwt_token(service_account_email, signing_key)
+                    .await?
+            }
+            TokenSource::MetadataServer => self.fetch_metadata_token().await?,
+        };
+
+        *cache = Some(CachedToken {
+            token: token.clone(),
+            expires_at: Instant::now() + Duration::from_secs(expires_in),
+        });
+
+        Ok(token)
+    }
+
+    /// Mint a self-signed JWT and exchange it for an access token.
+    async fn fetch_jwt_token(
+        &self,
+        email: &str,
+        signing_key: &RsaPrivateKey,
+    ) -> Result<(String, u64)> {
+        let now = Utc::now().timestamp();
+
+        let header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let claims = serde_json::json!({
+            "iss": email,
+            "scope": GCS_SCOPE,
+            "aud": GOOGLE_TOKEN_URL,
+            "iat": now,
+            "exp": now + 3600,
+        });
+
+        let header_b64 = BASE64_URL.encode(header.to_string().as_bytes());
+        let claims_b64 = BASE64_URL.encode(claims.to_string().as_bytes());
+        let unsigned = format!("{}.{}", header_b64, claims_b64);
+
+        let signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(signing_key.clone());
+        let signature = signer.sign(unsigned.as_bytes());
+        let jwt = format!("{}.{}", unsigned, BASE64_URL.encode(signature.to_bytes()));
+
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+            expires_in: u64,
+        }
+
+        let response = self
+            .client
+            .post(GOOGLE_TOKEN_URL)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", &jwt),
+            ])
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!("Failed to exchange JWT for access token: {}", e))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Google token endpoint returned {}: {}",
+                status, body
+            )));
+        }
+
+        let token_resp: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to parse token response: {}", e)))?;
+
+        Ok((token_resp.access_token, token_resp.expires_in))
+    }
+
+    /// Fetch a token from the GCE metadata server.
+    async fn fetch_metadata_token(&self) -> Result<(String, u64)> {
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+            expires_in: u64,
+        }
+
+        let response = self
+            .client
+            .get(GCP_METADATA_TOKEN_URL)
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to fetch GCP access token: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCP metadata server returned {}: {}",
+                status, body
+            )));
+        }
+
+        let token_resp: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to parse GCP token response: {}", e)))?;
+
+        Ok((token_resp.access_token, token_resp.expires_in))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth mode
+// ---------------------------------------------------------------------------
+
+/// Authentication mode for GCS operations.
+///
+/// Mirrors `AzureAuthMode` in `azure.rs`: both variants carry a token provider
+/// that acquires OAuth2 bearer tokens. The `ServiceAccountKey` variant also
+/// holds the RSA private key needed for V4 signed URL generation.
+enum GcsAuthMode {
+    /// Service account with RSA key: bearer tokens via JWT exchange, V4 signed
+    /// URLs available.
+    ServiceAccountKey {
+        signing_key: Box<RsaPrivateKey>,
+        provider: GcsTokenProvider,
+    },
+    /// Application Default Credentials via GCE metadata server.
+    Adc { provider: GcsTokenProvider },
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/// Google Cloud Storage configuration.
 #[derive(Debug, Clone)]
 pub struct GcsConfig {
-    /// GCS bucket name
+    /// GCS bucket name.
     pub bucket: String,
-    /// GCP project ID (required in Mode A / RSA key signing, optional in ADC mode)
+    /// GCP project ID (required with private key, optional in ADC mode).
     pub project_id: Option<String>,
-    /// Service account email (required in Mode A / RSA key signing, optional in ADC mode)
+    /// Service account email (required with private key, optional in ADC mode).
     pub service_account_email: Option<String>,
-    /// RSA private key (PEM format)
+    /// RSA private key in PEM format.
     pub private_key: Option<String>,
-    /// Enable redirect downloads via signed URLs
+    /// Enable redirect downloads via V4 signed URLs.
     pub redirect_downloads: bool,
-    /// Signed URL expiry duration
+    /// Signed URL expiry duration.
     pub signed_url_expiry: Duration,
-    /// Storage path format (native, artifactory, or migration)
+    /// Storage path format (native, artifactory, or migration).
     pub path_format: StoragePathFormat,
 }
 
@@ -94,11 +286,12 @@ impl GcsConfig {
     ///
     /// `GCS_BUCKET` is always required.
     ///
-    /// When `GCS_PRIVATE_KEY` or `GCS_PRIVATE_KEY_PATH` is set (Mode A), both
-    /// `GCS_PROJECT_ID` and `GCS_SERVICE_ACCOUNT_EMAIL` are also required.
+    /// When `GCS_PRIVATE_KEY` or `GCS_PRIVATE_KEY_PATH` is set (service account
+    /// key mode), `GCS_PROJECT_ID` and `GCS_SERVICE_ACCOUNT_EMAIL` are also
+    /// required.
     ///
-    /// When neither key variable is set (Mode B / ADC), `GCS_PROJECT_ID` and
-    /// `GCS_SERVICE_ACCOUNT_EMAIL` are optional and may be omitted.
+    /// When neither key variable is set (ADC mode), `GCS_PROJECT_ID` and
+    /// `GCS_SERVICE_ACCOUNT_EMAIL` are optional.
     pub fn from_env() -> Result<Self> {
         let bucket = std::env::var("GCS_BUCKET")
             .map_err(|_| AppError::Config("GCS_BUCKET not set".to_string()))?;
@@ -118,7 +311,7 @@ impl GcsConfig {
         let project_id = std::env::var("GCS_PROJECT_ID").ok();
         let service_account_email = std::env::var("GCS_SERVICE_ACCOUNT_EMAIL").ok();
 
-        // In Mode A (private key present), project_id and service_account_email are required
+        // Service account key mode requires project_id and service_account_email
         if private_key.is_some() {
             if project_id.is_none() {
                 return Err(AppError::Config(
@@ -156,63 +349,74 @@ impl GcsConfig {
         })
     }
 
-    /// Builder: set redirect downloads
+    /// Builder: set redirect downloads.
     pub fn with_redirect_downloads(mut self, enabled: bool) -> Self {
         self.redirect_downloads = enabled;
         self
     }
 
-    /// Builder: set signed URL expiry
+    /// Builder: set signed URL expiry.
     pub fn with_signed_url_expiry(mut self, expiry: Duration) -> Self {
         self.signed_url_expiry = expiry;
         self
     }
 
-    /// Builder: set private key
+    /// Builder: set private key.
     pub fn with_private_key(mut self, key: String) -> Self {
         self.private_key = Some(key);
         self
     }
 }
 
-/// Google Cloud Storage backend
+// ---------------------------------------------------------------------------
+// Backend
+// ---------------------------------------------------------------------------
+
+/// Google Cloud Storage backend.
 pub struct GcsBackend {
     config: GcsConfig,
     client: reqwest::Client,
-    signing_key: Option<RsaPrivateKey>,
+    auth: GcsAuthMode,
     path_format: StoragePathFormat,
-    auth_mode: AuthMode,
-    token_cache: RwLock<Option<CachedToken>>,
 }
 
 impl GcsBackend {
-    /// Create a new GCS backend
+    /// Create a new GCS backend.
     pub async fn new(config: GcsConfig) -> Result<Self> {
-        // Parse private key if provided
-        let signing_key = if let Some(ref key_pem) = config.private_key {
-            // Handle escaped newlines in environment variables
-            let key_pem = key_pem.replace("\\n", "\n");
-
-            let key = RsaPrivateKey::from_pkcs8_pem(&key_pem)
-                .map_err(|e| AppError::Config(format!("Invalid GCS private key: {}", e)))?;
-            Some(key)
-        } else {
-            None
-        };
-
-        let auth_mode = if signing_key.is_some() {
-            AuthMode::RsaKey
-        } else {
-            AuthMode::Adc
-        };
-
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
 
-        let path_format = config.path_format;
+        let auth = if let Some(ref key_pem) = config.private_key {
+            let key_pem = key_pem.replace("\\n", "\n");
+            let signing_key = RsaPrivateKey::from_pkcs8_pem(&key_pem)
+                .map_err(|e| AppError::Config(format!("Invalid GCS private key: {}", e)))?;
 
+            let email = config.service_account_email.clone().ok_or_else(|| {
+                AppError::Config(
+                    "GCS_SERVICE_ACCOUNT_EMAIL required for service account key mode".to_string(),
+                )
+            })?;
+
+            let provider = GcsTokenProvider::new(
+                TokenSource::ServiceAccountJwt {
+                    service_account_email: email,
+                    signing_key: Box::new(signing_key.clone()),
+                },
+                client.clone(),
+            );
+
+            GcsAuthMode::ServiceAccountKey {
+                signing_key: Box::new(signing_key),
+                provider,
+            }
+        } else {
+            let provider = GcsTokenProvider::new(TokenSource::MetadataServer, client.clone());
+            GcsAuthMode::Adc { provider }
+        };
+
+        let path_format = config.path_format;
         if path_format != StoragePathFormat::Native {
             tracing::info!(
                 path_format = %path_format,
@@ -223,81 +427,110 @@ impl GcsBackend {
         Ok(Self {
             config,
             client,
-            signing_key,
+            auth,
             path_format,
-            auth_mode,
-            token_cache: RwLock::new(None),
         })
     }
 
     /// Return the bucket name this backend is configured to use.
+    #[allow(dead_code)] // Used in tests across modules
     pub(crate) fn bucket(&self) -> &str {
         &self.config.bucket
     }
 
-    /// Fetch a GCP access token, using a cached value if still fresh.
-    ///
-    /// Tokens are proactively refreshed 60 seconds before their reported expiry.
-    pub(crate) async fn get_token(&self) -> Result<String> {
-        // Fast path: check cache under read lock
-        {
-            let cache = self.token_cache.read().await;
-            if let Some(ref cached) = *cache {
-                if cached.expires_at > Instant::now() + Duration::from_secs(60) {
-                    return Ok(cached.token.clone());
-                }
-            }
+    // ---- Bearer token ----
+
+    /// Obtain an OAuth2 bearer token from the active auth mode's provider.
+    async fn get_bearer_token(&self) -> Result<String> {
+        match &self.auth {
+            GcsAuthMode::ServiceAccountKey { provider, .. } => provider.get_token().await,
+            GcsAuthMode::Adc { provider } => provider.get_token().await,
         }
-
-        // Slow path: refresh under write lock
-        let mut cache = self.token_cache.write().await;
-        // Double-check — another task may have refreshed while we waited for the write lock
-        if let Some(ref cached) = *cache {
-            if cached.expires_at > Instant::now() + Duration::from_secs(60) {
-                return Ok(cached.token.clone());
-            }
-        }
-
-        #[derive(serde::Deserialize)]
-        struct TokenResponse {
-            access_token: String,
-            expires_in: u64,
-        }
-
-        let response = self
-            .client
-            .get(GCP_METADATA_TOKEN_URL)
-            .header("Metadata-Flavor", "Google")
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch GCP access token: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "GCP metadata server returned {}: {}",
-                status, body
-            )));
-        }
-
-        let token_response: TokenResponse = response
-            .json()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to parse GCP token response: {}", e)))?;
-
-        let expires_at = Instant::now() + Duration::from_secs(token_response.expires_in);
-        let token = token_response.access_token.clone();
-
-        *cache = Some(CachedToken {
-            token: token_response.access_token,
-            expires_at,
-        });
-
-        Ok(token)
     }
 
-    /// Try to generate an Artifactory fallback path from a native path
+    // ---- JSON API URL helpers ----
+
+    /// JSON API URL for downloading object data (`?alt=media`).
+    fn object_download_url(&self, key: &str) -> String {
+        format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}?alt=media",
+            urlencoding::encode(&self.config.bucket),
+            urlencoding::encode(key),
+        )
+    }
+
+    /// JSON API URL for object metadata (also used for DELETE).
+    fn object_metadata_url(&self, key: &str) -> String {
+        format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
+            urlencoding::encode(&self.config.bucket),
+            urlencoding::encode(key),
+        )
+    }
+
+    /// JSON API simple upload URL.
+    fn upload_url(&self, key: &str) -> String {
+        format!(
+            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            urlencoding::encode(&self.config.bucket),
+            urlencoding::encode(key),
+        )
+    }
+
+    /// XML API URL for V4 signed URL generation (not used for bearer-authed calls).
+    #[cfg(test)]
+    fn object_url(&self, key: &str) -> String {
+        format!(
+            "https://storage.googleapis.com/{}/{}",
+            self.config.bucket, key
+        )
+    }
+
+    // ---- Authorized request helpers ----
+
+    /// Upload an object via the JSON API with bearer auth.
+    async fn authorized_put(&self, key: &str, content: Bytes) -> Result<reqwest::Response> {
+        let token = self.get_bearer_token().await?;
+        let url = self.upload_url(key);
+
+        self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/octet-stream")
+            .body(content.to_vec())
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS upload failed: {}", e)))
+    }
+
+    /// GET request with bearer auth. Caller provides the full URL.
+    async fn authorized_get(&self, url: &str) -> Result<reqwest::Response> {
+        let token = self.get_bearer_token().await?;
+
+        self.client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS request failed: {}", e)))
+    }
+
+    /// DELETE request with bearer auth via the JSON API metadata URL.
+    async fn authorized_delete(&self, key: &str) -> Result<reqwest::Response> {
+        let token = self.get_bearer_token().await?;
+        let url = self.object_metadata_url(key);
+
+        self.client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS delete failed: {}", e)))
+    }
+
+    // ---- Fallback helpers ----
+
+    /// Try to generate an Artifactory fallback path from a native path.
     fn try_artifactory_fallback(&self, key: &str) -> Option<String> {
         let parts: Vec<&str> = key.split('/').collect();
         if parts.len() >= 3 {
@@ -309,21 +542,210 @@ impl GcsBackend {
         None
     }
 
-    /// Get the GCS API URL for an object
-    fn object_url(&self, key: &str) -> String {
-        format!(
-            "https://storage.googleapis.com/{}/{}",
-            self.config.bucket, key
-        )
+    /// Try a fallback GET in migration mode. Returns `Ok(Some(bytes))` if found
+    /// at the fallback path, `Ok(None)` otherwise.
+    async fn try_fallback_get(&self, key: &str) -> Result<Option<Bytes>> {
+        if !self.path_format.has_fallback() {
+            return Ok(None);
+        }
+        if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+            tracing::debug!(
+                original = %key,
+                fallback = %fallback_key,
+                "Trying Artifactory fallback path"
+            );
+            let url = self.object_download_url(&fallback_key);
+            let response = self.authorized_get(&url).await?;
+            if response.status().is_success() {
+                tracing::info!(
+                    key = %key,
+                    fallback = %fallback_key,
+                    "Found artifact at Artifactory fallback path"
+                );
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 
-    /// Generate a V4 signed URL for an object
-    ///
-    /// Reference: https://cloud.google.com/storage/docs/access-control/signing-urls-manually
-    pub fn generate_signed_url(&self, key: &str, expires_in: Duration) -> Result<String> {
-        let signing_key = self.signing_key.as_ref().ok_or_else(|| {
-            AppError::Config("GCS private key not configured for signed URLs".to_string())
+    /// Try a fallback existence check in migration mode.
+    async fn try_fallback_exists(&self, key: &str) -> Result<bool> {
+        if !self.path_format.has_fallback() {
+            return Ok(false);
+        }
+        if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+            let url = self.object_metadata_url(&fallback_key);
+            if let Ok(response) = self.authorized_get(&url).await {
+                if response.status().is_success() {
+                    tracing::debug!(
+                        key = %key,
+                        fallback = %fallback_key,
+                        "Found artifact at Artifactory fallback path"
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    // ---- Methods not on the StorageBackend trait (like S3Backend) ----
+
+    /// List objects with optional prefix. Handles pagination via `nextPageToken`.
+    pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct GcsObject {
+            name: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct GcsListResponse {
+            #[serde(default)]
+            items: Vec<GcsObject>,
+            #[serde(rename = "nextPageToken")]
+            next_page_token: Option<String>,
+        }
+
+        let mut all_keys = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let token = self.get_bearer_token().await?;
+            let base = format!(
+                "https://storage.googleapis.com/storage/v1/b/{}/o",
+                urlencoding::encode(&self.config.bucket)
+            );
+
+            let mut params = Vec::new();
+            if let Some(p) = prefix {
+                params.push(format!("prefix={}", urlencoding::encode(p)));
+            }
+            if let Some(ref pt) = page_token {
+                params.push(format!("pageToken={}", urlencoding::encode(pt)));
+            }
+
+            let url = if params.is_empty() {
+                base
+            } else {
+                format!("{}?{}", base, params.join("&"))
+            };
+
+            let response = self
+                .client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+                .map_err(|e| AppError::Storage(format!("GCS list failed: {}", e)))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AppError::Storage(format!(
+                    "GCS list failed with status {}: {}",
+                    status, body
+                )));
+            }
+
+            let list_response: GcsListResponse = response.json().await.map_err(|e| {
+                AppError::Storage(format!("Failed to parse GCS list response: {}", e))
+            })?;
+
+            all_keys.extend(list_response.items.into_iter().map(|o| o.name));
+
+            match list_response.next_page_token {
+                Some(pt) => page_token = Some(pt),
+                None => break,
+            }
+        }
+
+        Ok(all_keys)
+    }
+
+    /// Copy an object within the same bucket.
+    pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
+        let token = self.get_bearer_token().await?;
+        let bucket_enc = urlencoding::encode(&self.config.bucket);
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}/copyTo/b/{}/o/{}",
+            bucket_enc,
+            urlencoding::encode(source),
+            bucket_enc,
+            urlencoding::encode(dest),
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Length", "0")
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS copy failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCS copy failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Get the size of an object in bytes.
+    pub async fn size(&self, key: &str) -> Result<u64> {
+        #[derive(serde::Deserialize)]
+        struct GcsObjectMetadata {
+            size: String,
+        }
+
+        let url = self.object_metadata_url(key);
+        let response = self.authorized_get(&url).await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::NotFound(format!("Object not found: {}", key)));
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCS size request failed with status {}: {}",
+                status, body
+            )));
+        }
+
+        let metadata: GcsObjectMetadata = response.json().await.map_err(|e| {
+            AppError::Storage(format!("Failed to parse GCS object metadata: {}", e))
         })?;
+
+        metadata
+            .size
+            .parse::<u64>()
+            .map_err(|e| AppError::Storage(format!("Failed to parse GCS object size: {}", e)))
+    }
+
+    // ---- V4 signed URL generation ----
+
+    /// Generate a V4 signed URL for an object.
+    ///
+    /// Only available in service account key mode. Used for redirect downloads.
+    ///
+    /// Reference: <https://cloud.google.com/storage/docs/access-control/signing-urls-manually>
+    pub fn generate_signed_url(&self, key: &str, expires_in: Duration) -> Result<String> {
+        let signing_key = match &self.auth {
+            GcsAuthMode::ServiceAccountKey { signing_key, .. } => signing_key,
+            GcsAuthMode::Adc { .. } => {
+                return Err(AppError::Config(
+                    "GCS private key not configured for signed URLs".to_string(),
+                ));
+            }
+        };
 
         let service_account_email =
             self.config
@@ -388,7 +810,8 @@ impl GcsBackend {
         );
 
         // Sign with RSA-SHA256
-        let signing_key_with_digest = rsa::pkcs1v15::SigningKey::<Sha256>::new(signing_key.clone());
+        let signing_key_with_digest =
+            rsa::pkcs1v15::SigningKey::<Sha256>::new(*signing_key.clone());
         let signature = signing_key_with_digest.sign(string_to_sign.as_bytes());
         let signature_hex = hex::encode(signature.to_bytes());
 
@@ -402,26 +825,14 @@ impl GcsBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// StorageBackend trait
+// ---------------------------------------------------------------------------
+
 #[async_trait]
 impl StorageBackend for GcsBackend {
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
-        let url = self.object_url(key);
-
-        let mut request = self
-            .client
-            .put(&url)
-            .header("Content-Type", "application/octet-stream")
-            .body(content.to_vec());
-
-        if let AuthMode::Adc = self.auth_mode {
-            let token = self.get_token().await?;
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS upload failed: {}", e)))?;
+        let response = self.authorized_put(key, content).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -436,231 +847,44 @@ impl StorageBackend for GcsBackend {
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
-        match self.auth_mode {
-            AuthMode::RsaKey => {
-                // For reads, generate a signed URL and fetch
-                let signed_url = self.generate_signed_url(key, Duration::from_secs(300))?;
+        let url = self.object_download_url(key);
+        let response = self.authorized_get(&url).await?;
 
-                let response = self
-                    .client
-                    .get(&signed_url)
-                    .send()
-                    .await
-                    .map_err(|e| AppError::Storage(format!("GCS download failed: {}", e)))?;
-
-                if !response.status().is_success() {
-                    let status = response.status();
-                    if status == reqwest::StatusCode::NOT_FOUND {
-                        // In migration mode, try Artifactory fallback path
-                        if self.path_format.has_fallback() {
-                            if let Some(fallback_key) = self.try_artifactory_fallback(key) {
-                                tracing::debug!(
-                                    original = %key,
-                                    fallback = %fallback_key,
-                                    "Trying Artifactory fallback path"
-                                );
-                                let fallback_url = self
-                                    .generate_signed_url(&fallback_key, Duration::from_secs(300))?;
-                                let fallback_response =
-                                    self.client.get(&fallback_url).send().await.map_err(|e| {
-                                        AppError::Storage(format!(
-                                            "GCS fallback download failed: {}",
-                                            e
-                                        ))
-                                    })?;
-
-                                if fallback_response.status().is_success() {
-                                    tracing::info!(
-                                        key = %key,
-                                        fallback = %fallback_key,
-                                        "Found artifact at Artifactory fallback path"
-                                    );
-                                    let bytes = fallback_response.bytes().await.map_err(|e| {
-                                        AppError::Storage(format!("Failed to read response: {}", e))
-                                    })?;
-                                    return Ok(bytes);
-                                }
-                            }
-                        }
-                        return Err(AppError::NotFound(format!("Object not found: {}", key)));
-                    }
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(AppError::Storage(format!(
-                        "GCS download failed with status {}: {}",
-                        status, body
-                    )));
-                }
-
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
-
-                Ok(bytes)
-            }
-            AuthMode::Adc => {
-                let token = self.get_token().await?;
-                let url = self.object_url(key);
-
-                let response = self
-                    .client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await
-                    .map_err(|e| AppError::Storage(format!("GCS download failed: {}", e)))?;
-
-                if !response.status().is_success() {
-                    let status = response.status();
-                    if status == reqwest::StatusCode::NOT_FOUND {
-                        // In migration mode, try Artifactory fallback path
-                        if self.path_format.has_fallback() {
-                            if let Some(fallback_key) = self.try_artifactory_fallback(key) {
-                                tracing::debug!(
-                                    original = %key,
-                                    fallback = %fallback_key,
-                                    "Trying Artifactory fallback path"
-                                );
-                                let fallback_url = self.object_url(&fallback_key);
-                                let fallback_response = self
-                                    .client
-                                    .get(&fallback_url)
-                                    .header("Authorization", format!("Bearer {}", token))
-                                    .send()
-                                    .await
-                                    .map_err(|e| {
-                                        AppError::Storage(format!(
-                                            "GCS fallback download failed: {}",
-                                            e
-                                        ))
-                                    })?;
-
-                                if fallback_response.status().is_success() {
-                                    tracing::info!(
-                                        key = %key,
-                                        fallback = %fallback_key,
-                                        "Found artifact at Artifactory fallback path"
-                                    );
-                                    let bytes = fallback_response.bytes().await.map_err(|e| {
-                                        AppError::Storage(format!("Failed to read response: {}", e))
-                                    })?;
-                                    return Ok(bytes);
-                                }
-                            }
-                        }
-                        return Err(AppError::NotFound(format!("Object not found: {}", key)));
-                    }
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(AppError::Storage(format!(
-                        "GCS download failed with status {}: {}",
-                        status, body
-                    )));
-                }
-
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
-
-                Ok(bytes)
-            }
+        if response.status().is_success() {
+            return response
+                .bytes()
+                .await
+                .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)));
         }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            if let Some(bytes) = self.try_fallback_get(key).await? {
+                return Ok(bytes);
+            }
+            return Err(AppError::NotFound(format!("Object not found: {}", key)));
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(AppError::Storage(format!(
+            "GCS download failed with status {}: {}",
+            status, body
+        )))
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
-        match self.auth_mode {
-            AuthMode::RsaKey => {
-                let signed_url = self.generate_signed_url(key, Duration::from_secs(60))?;
+        let url = self.object_metadata_url(key);
+        let response = self.authorized_get(&url).await?;
 
-                let response =
-                    self.client.head(&signed_url).send().await.map_err(|e| {
-                        AppError::Storage(format!("GCS HEAD request failed: {}", e))
-                    })?;
-
-                if response.status().is_success() {
-                    return Ok(true);
-                }
-
-                // In migration mode, also check the Artifactory fallback path
-                if self.path_format.has_fallback() {
-                    if let Some(fallback_key) = self.try_artifactory_fallback(key) {
-                        let fallback_url =
-                            self.generate_signed_url(&fallback_key, Duration::from_secs(60))?;
-                        let fallback_response = self.client.head(&fallback_url).send().await.ok();
-                        if let Some(resp) = fallback_response {
-                            if resp.status().is_success() {
-                                tracing::debug!(
-                                    key = %key,
-                                    fallback = %fallback_key,
-                                    "Found artifact at Artifactory fallback path"
-                                );
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-
-                Ok(false)
-            }
-            AuthMode::Adc => {
-                let token = self.get_token().await?;
-                let url = self.object_url(key);
-
-                let response = self
-                    .client
-                    .head(&url)
-                    .header("Authorization", format!("Bearer {}", token))
-                    .send()
-                    .await
-                    .map_err(|e| AppError::Storage(format!("GCS HEAD request failed: {}", e)))?;
-
-                if response.status().is_success() {
-                    return Ok(true);
-                }
-
-                // In migration mode, also check the Artifactory fallback path
-                if self.path_format.has_fallback() {
-                    if let Some(fallback_key) = self.try_artifactory_fallback(key) {
-                        let fallback_url = self.object_url(&fallback_key);
-                        let fallback_response = self
-                            .client
-                            .head(&fallback_url)
-                            .header("Authorization", format!("Bearer {}", token))
-                            .send()
-                            .await
-                            .ok();
-                        if let Some(resp) = fallback_response {
-                            if resp.status().is_success() {
-                                tracing::debug!(
-                                    key = %key,
-                                    fallback = %fallback_key,
-                                    "Found artifact at Artifactory fallback path"
-                                );
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-
-                Ok(false)
-            }
+        if response.status().is_success() {
+            return Ok(true);
         }
+
+        self.try_fallback_exists(key).await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let url = self.object_url(key);
-
-        let mut request = self.client.delete(&url);
-
-        if let AuthMode::Adc = self.auth_mode {
-            let token = self.get_token().await?;
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS delete failed: {}", e)))?;
+        let response = self.authorized_delete(key).await?;
 
         if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
             let status = response.status();
@@ -675,9 +899,7 @@ impl StorageBackend for GcsBackend {
     }
 
     fn supports_redirect(&self) -> bool {
-        matches!(self.auth_mode, AuthMode::RsaKey)
-            && self.config.redirect_downloads
-            && self.signing_key.is_some()
+        matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) && self.config.redirect_downloads
     }
 
     async fn get_presigned_url(
@@ -685,17 +907,11 @@ impl StorageBackend for GcsBackend {
         key: &str,
         expires_in: Duration,
     ) -> Result<Option<PresignedUrl>> {
-        // ADC mode never generates signed URLs
-        if let AuthMode::Adc = self.auth_mode {
+        if !matches!(self.auth, GcsAuthMode::ServiceAccountKey { .. }) {
             return Ok(None);
         }
 
         if !self.config.redirect_downloads {
-            return Ok(None);
-        }
-
-        if self.signing_key.is_none() {
-            tracing::warn!("GCS redirect enabled but private key not configured");
             return Ok(None);
         }
 
@@ -715,11 +931,15 @@ impl StorageBackend for GcsBackend {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Generated test-only RSA key — not used anywhere, safe to commit
+    // Generated test-only RSA key, not used anywhere, safe to commit
     const TEST_PRIVATE_KEY: &str = include_str!("../../test_fixtures/test_rsa_key.pem");
 
     fn create_test_config() -> GcsConfig {
@@ -738,6 +958,8 @@ mod tests {
         GcsBackend::new(create_test_config()).await.unwrap()
     }
 
+    // ---- Backend creation ----
+
     #[tokio::test]
     async fn test_gcs_backend_creation() {
         let backend = GcsBackend::new(create_test_config()).await;
@@ -754,6 +976,27 @@ mod tests {
         assert!(!backend.unwrap().supports_redirect());
     }
 
+    // ---- Auth mode resolution ----
+
+    #[tokio::test]
+    async fn test_auth_mode_service_account_key_with_private_key() {
+        let backend = create_test_backend().await;
+        assert!(matches!(
+            backend.auth,
+            GcsAuthMode::ServiceAccountKey { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_auth_mode_adc_without_private_key() {
+        let mut config = create_test_config();
+        config.private_key = None;
+        let backend = GcsBackend::new(config).await.unwrap();
+        assert!(matches!(backend.auth, GcsAuthMode::Adc { .. }));
+    }
+
+    // ---- V4 signed URL generation ----
+
     #[tokio::test]
     async fn test_signed_url_generation() {
         let backend = create_test_backend().await;
@@ -765,7 +1008,6 @@ mod tests {
         assert!(url.contains("storage.googleapis.com"));
         assert!(url.contains("test-bucket"));
         assert!(url.contains("test/artifact.txt"));
-        // All required V4 signed URL parameters
         assert!(
             url.contains("X-Goog-Algorithm=GOOG4-RSA-SHA256"),
             "Missing algorithm"
@@ -779,6 +1021,41 @@ mod tests {
         );
         assert!(url.contains("X-Goog-Signature="), "Missing signature");
     }
+
+    #[tokio::test]
+    async fn test_expiry_capped_at_7_days() {
+        let backend = create_test_backend().await;
+
+        let url = backend
+            .generate_signed_url("test.txt", Duration::from_secs(30 * 24 * 3600))
+            .unwrap();
+        assert!(url.contains("X-Goog-Expires=604800"));
+    }
+
+    #[tokio::test]
+    async fn test_signed_url_without_key_returns_error() {
+        let mut config = create_test_config();
+        config.private_key = None;
+        let backend = GcsBackend::new(config).await.unwrap();
+        assert!(backend
+            .generate_signed_url("test.txt", Duration::from_secs(3600))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_signed_url_different_keys_different_urls() {
+        let backend = create_test_backend().await;
+
+        let url1 = backend
+            .generate_signed_url("file1.txt", Duration::from_secs(3600))
+            .unwrap();
+        let url2 = backend
+            .generate_signed_url("file2.txt", Duration::from_secs(3600))
+            .unwrap();
+        assert_ne!(url1, url2);
+    }
+
+    // ---- Redirect / presigned URL ----
 
     #[tokio::test]
     async fn test_supports_redirect() {
@@ -800,7 +1077,7 @@ mod tests {
         config.private_key = None;
 
         let backend = GcsBackend::new(config).await.unwrap();
-        assert!(!backend.supports_redirect()); // No key, so no redirect
+        assert!(!backend.supports_redirect());
     }
 
     #[tokio::test]
@@ -829,6 +1106,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_presigned_url_expiry_preserved() {
+        let backend = create_test_backend().await;
+
+        let expires = Duration::from_secs(1800);
+        let presigned = backend
+            .get_presigned_url("test.txt", expires)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(presigned.expires_in, expires);
+    }
+
+    #[tokio::test]
+    async fn test_adc_mode_supports_redirect_false() {
+        let config = GcsConfig {
+            bucket: "test-bucket".to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: true,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: StoragePathFormat::Native,
+        };
+        let backend = GcsBackend::new(config).await.unwrap();
+        assert!(
+            !backend.supports_redirect(),
+            "ADC mode must never return true for supports_redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mode_a_supports_redirect_with_key_and_flag() {
+        let backend = GcsBackend::new(create_test_config()).await.unwrap();
+        assert!(
+            backend.supports_redirect(),
+            "Mode A with key and redirect_downloads=true should support redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adc_mode_get_presigned_url_returns_none() {
+        let config = GcsConfig {
+            bucket: "test-bucket".to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: true,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: StoragePathFormat::Native,
+        };
+        let backend = GcsBackend::new(config).await.unwrap();
+        let result = backend
+            .get_presigned_url("test.txt", Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "ADC mode get_presigned_url must return None"
+        );
+    }
+
+    // ---- URL format ----
+
+    #[tokio::test]
     async fn test_object_url_format() {
         let backend = create_test_backend().await;
         assert_eq!(
@@ -838,58 +1179,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_expiry_capped_at_7_days() {
+    async fn test_object_url_variants() {
         let backend = create_test_backend().await;
 
-        // Request 30 days, should be capped to 7 days (604800 seconds)
-        let url = backend
-            .generate_signed_url("test.txt", Duration::from_secs(30 * 24 * 3600))
-            .unwrap();
-        assert!(url.contains("X-Goog-Expires=604800"));
-    }
+        assert_eq!(
+            backend.object_url("path/with spaces/file.tar.gz"),
+            "https://storage.googleapis.com/test-bucket/path/with spaces/file.tar.gz"
+        );
 
-    #[test]
-    fn test_invalid_private_key() {
-        let mut config = create_test_config();
-        config.private_key = Some("not a valid PEM key".to_string());
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(GcsBackend::new(config));
-        assert!(result.is_err());
+        let nested = backend.object_url("a/b/c/d/e/f.bin");
+        assert!(nested.starts_with("https://storage.googleapis.com/test-bucket/"));
+        assert!(nested.ends_with("a/b/c/d/e/f.bin"));
     }
 
     #[tokio::test]
-    async fn test_escaped_newlines_in_key() {
-        // Simulate environment variable with escaped newlines
-        let mut config = create_test_config();
-        config.private_key = Some(TEST_PRIVATE_KEY.replace('\n', "\\n"));
-
-        let backend = GcsBackend::new(config).await;
-        assert!(backend.is_ok());
+    async fn test_object_download_url_format() {
+        let backend = create_test_backend().await;
+        let url = backend.object_download_url("repos/maven/artifact.jar");
+        assert!(url.contains("/storage/v1/b/"));
+        assert!(url.contains("?alt=media"));
+        assert!(url.contains("repos%2Fmaven%2Fartifact.jar"));
     }
 
-    #[test]
-    fn test_gcs_config_builder_redirect_downloads() {
-        let config = create_test_config().with_redirect_downloads(false);
-        assert!(!config.redirect_downloads);
-        let config = config.with_redirect_downloads(true);
-        assert!(config.redirect_downloads);
+    #[tokio::test]
+    async fn test_object_metadata_url_format() {
+        let backend = create_test_backend().await;
+        let url = backend.object_metadata_url("repos/maven/artifact.jar");
+        assert!(url.contains("/storage/v1/b/"));
+        assert!(!url.contains("alt=media"));
+        assert!(url.contains("repos%2Fmaven%2Fartifact.jar"));
     }
 
-    #[test]
-    fn test_gcs_config_builder_signed_url_expiry() {
-        let config = create_test_config().with_signed_url_expiry(Duration::from_secs(7200));
-        assert_eq!(config.signed_url_expiry, Duration::from_secs(7200));
+    #[tokio::test]
+    async fn test_upload_url_format() {
+        let backend = create_test_backend().await;
+        let url = backend.upload_url("repos/maven/artifact.jar");
+        assert!(url.contains("/upload/storage/v1/b/"));
+        assert!(url.contains("uploadType=media"));
+        assert!(url.contains("name=repos%2Fmaven%2Fartifact.jar"));
     }
 
-    #[test]
-    fn test_gcs_config_builder_private_key() {
-        let mut config = create_test_config();
-        config.private_key = None;
-        assert!(config.private_key.is_none());
-        let config = config.with_private_key("test-key".to_string());
-        assert_eq!(config.private_key, Some("test-key".to_string()));
-    }
+    // ---- Fallback paths ----
 
     #[tokio::test]
     async fn test_try_artifactory_fallback_valid_checksum() {
@@ -924,41 +1254,48 @@ mod tests {
             .is_none());
     }
 
-    #[tokio::test]
-    async fn test_object_url_variants() {
-        let backend = create_test_backend().await;
+    // ---- Key parsing / config ----
 
-        assert_eq!(
-            backend.object_url("path/with spaces/file.tar.gz"),
-            "https://storage.googleapis.com/test-bucket/path/with spaces/file.tar.gz"
-        );
+    #[test]
+    fn test_invalid_private_key() {
+        let mut config = create_test_config();
+        config.private_key = Some("not a valid PEM key".to_string());
 
-        let nested = backend.object_url("a/b/c/d/e/f.bin");
-        assert!(nested.starts_with("https://storage.googleapis.com/test-bucket/"));
-        assert!(nested.ends_with("a/b/c/d/e/f.bin"));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(GcsBackend::new(config));
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_signed_url_without_key_returns_error() {
+    async fn test_escaped_newlines_in_key() {
+        let mut config = create_test_config();
+        config.private_key = Some(TEST_PRIVATE_KEY.replace('\n', "\\n"));
+
+        let backend = GcsBackend::new(config).await;
+        assert!(backend.is_ok());
+    }
+
+    #[test]
+    fn test_gcs_config_builder_redirect_downloads() {
+        let config = create_test_config().with_redirect_downloads(false);
+        assert!(!config.redirect_downloads);
+        let config = config.with_redirect_downloads(true);
+        assert!(config.redirect_downloads);
+    }
+
+    #[test]
+    fn test_gcs_config_builder_signed_url_expiry() {
+        let config = create_test_config().with_signed_url_expiry(Duration::from_secs(7200));
+        assert_eq!(config.signed_url_expiry, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_gcs_config_builder_private_key() {
         let mut config = create_test_config();
         config.private_key = None;
-        let backend = GcsBackend::new(config).await.unwrap();
-        assert!(backend
-            .generate_signed_url("test.txt", Duration::from_secs(3600))
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn test_signed_url_different_keys_different_urls() {
-        let backend = create_test_backend().await;
-
-        let url1 = backend
-            .generate_signed_url("file1.txt", Duration::from_secs(3600))
-            .unwrap();
-        let url2 = backend
-            .generate_signed_url("file2.txt", Duration::from_secs(3600))
-            .unwrap();
-        assert_ne!(url1, url2);
+        assert!(config.private_key.is_none());
+        let config = config.with_private_key("test-key".to_string());
+        assert_eq!(config.private_key, Some("test-key".to_string()));
     }
 
     #[test]
@@ -970,17 +1307,39 @@ mod tests {
         assert_eq!(cloned.service_account_email, config.service_account_email);
     }
 
-    #[tokio::test]
-    async fn test_presigned_url_expiry_preserved() {
-        let backend = create_test_backend().await;
+    // ---- Token cache validity ----
 
-        let expires = Duration::from_secs(1800);
-        let presigned = backend
-            .get_presigned_url("test.txt", expires)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(presigned.expires_in, expires);
+    #[test]
+    fn test_token_cache_validity() {
+        // A token expiring in 120s has >60s buffer: valid
+        let valid = CachedToken {
+            token: "ya29.valid".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(
+            valid.expires_at > Instant::now() + Duration::from_secs(60),
+            "Token with 120s remaining should be considered valid"
+        );
+
+        // A token expiring in 30s has <60s buffer: needs refresh
+        let expiring = CachedToken {
+            token: "ya29.expiring".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        };
+        assert!(
+            expiring.expires_at <= Instant::now() + Duration::from_secs(60),
+            "Token with 30s remaining should trigger a refresh"
+        );
+
+        // An already-expired token also needs refresh
+        let expired = CachedToken {
+            token: "ya29.expired".to_string(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(
+            expired.expires_at <= Instant::now() + Duration::from_secs(60),
+            "Expired token should trigger a refresh"
+        );
     }
 
     // ---- from_env() tests ----
@@ -1038,7 +1397,6 @@ mod tests {
         std::env::remove_var("GCS_PROJECT_ID");
         std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
 
-        // from_env() only reads and validates presence — key parsing happens in GcsBackend::new()
         assert!(
             result.is_ok(),
             "Mode A full config should succeed in from_env"
@@ -1099,104 +1457,4 @@ mod tests {
             "Mode A should fail without GCS_SERVICE_ACCOUNT_EMAIL"
         );
     }
-
-    // ---- ADC mode struct / behaviour tests ----
-
-    #[tokio::test]
-    async fn test_adc_mode_supports_redirect_false() {
-        let config = GcsConfig {
-            bucket: "test-bucket".to_string(),
-            project_id: None,
-            service_account_email: None,
-            private_key: None,
-            redirect_downloads: true,
-            signed_url_expiry: Duration::from_secs(3600),
-            path_format: StoragePathFormat::Native,
-        };
-        let backend = GcsBackend::new(config).await.unwrap();
-        assert!(
-            !backend.supports_redirect(),
-            "ADC mode must never return true for supports_redirect"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mode_a_supports_redirect_with_key_and_flag() {
-        // create_test_config() has redirect_downloads: true and a valid private key
-        let backend = GcsBackend::new(create_test_config()).await.unwrap();
-        assert!(
-            backend.supports_redirect(),
-            "Mode A with key and redirect_downloads=true should support redirect"
-        );
-    }
-
-    /// Token cache validity logic: tokens are considered fresh only when they expire
-    /// more than 60 seconds from now. This test exercises the condition without making
-    /// any network calls.
-    #[test]
-    fn test_token_cache_validity() {
-        // A token expiring in 120s has >60s buffer → valid
-        let valid = CachedToken {
-            token: "ya29.valid".to_string(),
-            expires_at: Instant::now() + Duration::from_secs(120),
-        };
-        assert!(
-            valid.expires_at > Instant::now() + Duration::from_secs(60),
-            "Token with 120s remaining should be considered valid"
-        );
-
-        // A token expiring in 30s has <60s buffer → needs refresh
-        let expiring = CachedToken {
-            token: "ya29.expiring".to_string(),
-            expires_at: Instant::now() + Duration::from_secs(30),
-        };
-        assert!(
-            expiring.expires_at <= Instant::now() + Duration::from_secs(60),
-            "Token with 30s remaining should trigger a refresh"
-        );
-
-        // An already-expired token also needs refresh
-        let expired = CachedToken {
-            token: "ya29.expired".to_string(),
-            expires_at: Instant::now() - Duration::from_secs(1),
-        };
-        assert!(
-            expired.expires_at <= Instant::now() + Duration::from_secs(60),
-            "Expired token should trigger a refresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_adc_mode_get_presigned_url_returns_none() {
-        let config = GcsConfig {
-            bucket: "test-bucket".to_string(),
-            project_id: None,
-            service_account_email: None,
-            private_key: None,
-            // Even with redirect enabled, ADC mode returns None
-            redirect_downloads: true,
-            signed_url_expiry: Duration::from_secs(3600),
-            path_format: StoragePathFormat::Native,
-        };
-        let backend = GcsBackend::new(config).await.unwrap();
-        let result = backend
-            .get_presigned_url("test.txt", Duration::from_secs(3600))
-            .await
-            .unwrap();
-        assert!(
-            result.is_none(),
-            "ADC mode get_presigned_url must return None"
-        );
-    }
-
-    /// A live integration test for `get_token()` would verify that the backend sends
-    /// `GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token`
-    /// with the `Metadata-Flavor: Google` header, parses the JSON response, and stores
-    /// the token in `token_cache` with an expiry derived from `expires_in`. It would
-    /// also verify that a second call within the cache window reuses the stored token
-    /// without making another HTTP request. This test is omitted here because it
-    /// requires either a live GKE/Workload Identity environment or an HTTP mock server
-    /// pointed at a configurable URL.
-    #[allow(dead_code)]
-    fn _doc_get_token_integration_test() {}
 }

@@ -33,6 +33,7 @@ fn test_config(storage_path: &str) -> Config {
         storage_backend: "filesystem".into(),
         storage_path: storage_path.into(),
         s3_bucket: None,
+        gcs_bucket: None,
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
