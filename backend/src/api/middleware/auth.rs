@@ -106,18 +106,25 @@ enum ExtractedToken<'a> {
     Bearer(&'a str),
     /// API token from ApiKey scheme
     ApiKey(&'a str),
+    /// HTTP Basic credentials (base64-encoded user:password)
+    Basic(&'a str),
     /// No token found
     None,
     /// Invalid header format
     Invalid,
 }
 
-/// Extract token from Authorization header (supports Bearer and ApiKey schemes)
+/// Extract token from Authorization header (supports Bearer, ApiKey, and Basic schemes)
 fn extract_token_from_auth_header(auth_header: &str) -> ExtractedToken<'_> {
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
         ExtractedToken::Bearer(token)
     } else if let Some(token) = auth_header.strip_prefix("ApiKey ") {
         ExtractedToken::ApiKey(token)
+    } else if let Some(creds) = auth_header
+        .strip_prefix("Basic ")
+        .or_else(|| auth_header.strip_prefix("basic "))
+    {
+        ExtractedToken::Basic(creds)
     } else {
         ExtractedToken::Invalid
     }
@@ -209,7 +216,7 @@ pub async fn auth_middleware(
                 }
             }
         }
-        ExtractedToken::None => {
+        ExtractedToken::Basic(_) | ExtractedToken::None => {
             (StatusCode::UNAUTHORIZED, "Missing authorization header").into_response()
         }
         ExtractedToken::Invalid => (
@@ -265,7 +272,7 @@ async fn try_resolve_auth(
         ExtractedToken::ApiKey(token) => validate_api_token_with_scopes(auth_service, token)
             .await
             .ok(),
-        ExtractedToken::None | ExtractedToken::Invalid => None,
+        ExtractedToken::None | ExtractedToken::Invalid | ExtractedToken::Basic(_) => None,
     }
 }
 
@@ -315,7 +322,7 @@ pub async fn admin_middleware(
                 }
             }
         }
-        ExtractedToken::None => {
+        ExtractedToken::Basic(_) | ExtractedToken::None => {
             return (StatusCode::UNAUTHORIZED, "Missing authorization header").into_response();
         }
         ExtractedToken::Invalid => {
@@ -435,9 +442,9 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_invalid_scheme() {
+    fn test_extract_basic_scheme_recognized() {
         let result = extract_token_from_auth_header("Basic dXNlcjpwYXNz");
-        assert!(matches!(result, ExtractedToken::Invalid));
+        assert!(matches!(result, ExtractedToken::Basic("dXNlcjpwYXNz")));
     }
 
     #[test]
@@ -540,14 +547,41 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_token_invalid_auth_header_does_not_fall_through() {
+    fn test_extract_token_basic_auth_does_not_fall_through() {
         let request = Request::builder()
             .header(AUTHORIZATION, "Basic dXNlcjpwYXNz")
             .header("x-api-key", "api-key-value")
             .body(axum::body::Body::empty())
             .unwrap();
         let result = extract_token(&request);
-        assert!(matches!(result, ExtractedToken::Invalid));
+        assert!(matches!(result, ExtractedToken::Basic(_)));
+    }
+
+    #[test]
+    fn test_extract_basic_auth_header() {
+        let result = extract_token_from_auth_header("Basic dXNlcjpwYXNz");
+        assert!(matches!(result, ExtractedToken::Basic("dXNlcjpwYXNz")));
+    }
+
+    #[test]
+    fn test_extract_basic_auth_from_request() {
+        let request = Request::builder()
+            .header(AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_token(&request);
+        assert!(matches!(result, ExtractedToken::Basic("dXNlcjpwYXNz")));
+    }
+
+    #[test]
+    fn test_extract_basic_auth_does_not_fall_through_to_x_api_key() {
+        let request = Request::builder()
+            .header(AUTHORIZATION, "Basic dXNlcjpwYXNz")
+            .header("x-api-key", "should-not-be-used")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let result = extract_token(&request);
+        assert!(matches!(result, ExtractedToken::Basic("dXNlcjpwYXNz")));
     }
 
     // -----------------------------------------------------------------------
