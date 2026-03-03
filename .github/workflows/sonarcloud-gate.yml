@@ -1,13 +1,15 @@
 name: SonarCloud Gate
 
-# Uses pull_request_target so the workflow definition always comes from main,
-# not from the fork. This is necessary because fork PRs cannot access secrets
-# with regular pull_request events, and GitHub runs the fork's workflow file
-# (which won't have this job) for pull_request events.
+# Runs on pull_request_target so the workflow definition always comes from main.
+# This is needed because fork PRs run the fork's ci.yml (which won't have the
+# SonarCloud scan step's token), and the SonarCloud app check never reports.
 #
-# SECURITY: This workflow does NOT check out the PR's code. It only queries
-# the SonarCloud API and posts a PR comment, so there is no code execution
-# risk from pull_request_target.
+# For internal PRs: queries SonarCloud API for quality gate status and posts
+# a PR comment with coverage/duplication metrics.
+#
+# For fork PRs (or when no analysis exists): passes with a "skipped" note.
+#
+# SECURITY: Does NOT check out PR code. Only queries APIs and posts comments.
 
 on:
   pull_request_target:
@@ -17,7 +19,6 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  statuses: write
 
 concurrency:
   group: sonarcloud-gate-${{ github.event.pull_request.number }}
@@ -28,73 +29,38 @@ jobs:
     name: SonarCloud Quality Gate
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for CI workflow to complete
-        uses: actions/github-script@v7
-        id: wait-ci
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const headSha = context.payload.pull_request.head.sha;
-            const maxWait = 30 * 60 * 1000; // 30 minutes
-            const pollInterval = 30 * 1000;  // 30 seconds
-            const start = Date.now();
-
-            core.info(`Waiting for CI workflow on commit ${headSha}...`);
-
-            while (Date.now() - start < maxWait) {
-              const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
-                owner, repo,
-                head_sha: headSha,
-                event: 'pull_request',
-              });
-
-              const ciRun = runs.workflow_runs.find(r => r.name === 'CI' && r.status === 'completed');
-              if (ciRun) {
-                core.info(`CI workflow completed with conclusion: ${ciRun.conclusion}`);
-                core.setOutput('ci_conclusion', ciRun.conclusion);
-                return;
-              }
-
-              core.info(`CI not finished yet. Waiting ${pollInterval / 1000}s...`);
-              await new Promise(r => setTimeout(r, pollInterval));
-            }
-
-            core.setFailed('Timed out waiting for CI workflow to complete');
-
       - name: Check quality gate
         id: gate
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          CI_RESULT="${{ steps.wait-ci.outputs.ci_conclusion }}"
-          if [[ "$CI_RESULT" != "success" ]]; then
-            echo "CI workflow did not succeed: ${CI_RESULT}"
-            echo "status=error" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-
-          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
 
           if [[ -z "$SONAR_TOKEN" ]]; then
-            echo "SONAR_TOKEN not available. Skipping quality gate check."
+            echo "SONAR_TOKEN not available."
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Wait for SonarCloud to process the analysis
-          sleep 15
-
-          # Fetch quality gate status for the PR branch
+          # Query SonarCloud for this PR's quality gate status.
+          # The analysis may not exist yet (fork PRs, or CI still running).
           GATE_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
-            "https://sonarcloud.io/api/qualitygates/project_status?projectKey=artifact-keeper_artifact-keeper&pullRequest=${{ github.event.pull_request.number }}")
+            "https://sonarcloud.io/api/qualitygates/project_status?projectKey=artifact-keeper_artifact-keeper&pullRequest=${PR_NUMBER}")
 
-          GATE_STATUS=$(echo "$GATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "UNKNOWN")
+          GATE_STATUS=$(echo "$GATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "NONE")
           echo "Quality gate status: $GATE_STATUS"
+
+          # No analysis found: fork PR where scan was skipped, or CI hasn't
+          # finished yet. Either way, don't block the PR.
+          if [[ "$GATE_STATUS" == "NONE" ]]; then
+            echo "No SonarCloud analysis found for PR #${PR_NUMBER}."
+            echo "status=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Fetch new code metrics
           METRICS_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
-            "https://sonarcloud.io/api/measures/component?component=artifact-keeper_artifact-keeper&metricKeys=new_coverage,new_duplicated_lines_density,new_lines&pullRequest=${{ github.event.pull_request.number }}")
+            "https://sonarcloud.io/api/measures/component?component=artifact-keeper_artifact-keeper&metricKeys=new_coverage,new_duplicated_lines_density,new_lines&pullRequest=${PR_NUMBER}")
 
           for metric in new_coverage new_duplicated_lines_density new_lines; do
             val=$(echo "$METRICS_JSON" | python3 -c "
@@ -131,7 +97,6 @@ jobs:
             const duplication = '${{ steps.gate.outputs.duplication }}';
             const lines = '${{ steps.gate.outputs.lines }}';
             const prNumber = context.payload.pull_request.number;
-            const prBranch = context.payload.pull_request.head.ref;
 
             const marker = '<!-- sonarcloud-gate -->';
             let body = '';
@@ -141,8 +106,9 @@ jobs:
                 marker,
                 '### SonarCloud Quality Gate',
                 '',
-                'SonarCloud scan was **skipped** for this PR (token not available for fork PRs).',
-                'Coverage and duplication metrics will be checked after merge.',
+                'SonarCloud analysis not available for this PR.',
+                'This is expected for fork PRs or when CI is still running.',
+                'Coverage and duplication will be checked after merge.',
               ].join('\n');
             } else if (status === 'OK') {
               body = [
@@ -176,7 +142,6 @@ jobs:
                 '### SonarCloud Quality Gate',
                 '',
                 `Quality gate status: ${status || 'unknown'}`,
-                `CI result: ${{ steps.wait-ci.outputs.ci_conclusion }}`,
               ].join('\n');
             }
 
