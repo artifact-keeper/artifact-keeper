@@ -1,0 +1,47 @@
+name: Mirror Docker Hub Images
+
+on:
+  schedule:
+    # Every Monday at 4 AM UTC
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: Mirror ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: postgres:16-alpine
+            target: ghcr.io/artifact-keeper/mirror/postgres:16-alpine
+          - image: alpine:3.19
+            target: ghcr.io/artifact-keeper/mirror/alpine:3.19
+          - image: python:3.12-slim
+            target: ghcr.io/artifact-keeper/mirror/python:3.12-slim
+          - image: node:20-slim
+            target: ghcr.io/artifact-keeper/mirror/node:20-slim
+          - image: rust:1.75-slim
+            target: ghcr.io/artifact-keeper/mirror/rust:1.75-slim
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull from Docker Hub
+        run: docker pull ${{ matrix.image }}
+
+      - name: Tag for GHCR
+        run: docker tag ${{ matrix.image }} ${{ matrix.target }}
+
+      - name: Push to GHCR
+        run: docker push ${{ matrix.target }}
