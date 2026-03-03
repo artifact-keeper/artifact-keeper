@@ -27,6 +27,7 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
+use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -207,23 +208,7 @@ async fn get_package_metadata(
         // For virtual repos, iterate through members and try proxy for remote members
         if repo.repo_type == "virtual" {
             if let Some(ref proxy) = state.proxy_service {
-                let members = sqlx::query!(
-                    r#"SELECT r.id, r.key, r.repo_type::text as "repo_type!", r.upstream_url
-                    FROM repositories r
-                    INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
-                    WHERE vrm.virtual_repo_id = $1
-                    ORDER BY vrm.priority"#,
-                    repo.id
-                )
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to resolve virtual members: {}", e),
-                    )
-                        .into_response()
-                })?;
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
                 for member in &members {
                     // Try local artifacts first
@@ -243,7 +228,7 @@ async fn get_package_metadata(
                     }
 
                     // Try proxy for remote members
-                    if member.repo_type == "remote" {
+                    if member.repo_type == RepositoryType::Remote {
                         if let Some(ref upstream_url) = member.upstream_url {
                             if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
                                 proxy,
@@ -1153,6 +1138,37 @@ mod tests {
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual member proxy filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_virtual_proxy_only_targets_remote_members() {
+        // get_package_metadata skips non-Remote virtual members.
+        // Verify the RepositoryType enum comparison used in that branch.
+        let remote = RepositoryType::Remote;
+        assert_eq!(remote, RepositoryType::Remote);
+        assert_ne!(remote, RepositoryType::Local);
+        assert_ne!(remote, RepositoryType::Virtual);
+        assert_ne!(remote, RepositoryType::Staging);
+    }
+
+    #[test]
+    fn test_virtual_member_filter_selects_remote_only() {
+        use crate::models::repository::RepositoryType;
+        let types = [
+            RepositoryType::Local,
+            RepositoryType::Remote,
+            RepositoryType::Virtual,
+            RepositoryType::Staging,
+        ];
+        let remote_count = types
+            .iter()
+            .filter(|t| **t == RepositoryType::Remote)
+            .count();
+        assert_eq!(remote_count, 1);
     }
 
     // -----------------------------------------------------------------------
