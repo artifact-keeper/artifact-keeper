@@ -37,11 +37,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull from Docker Hub
-        run: docker pull ${{ matrix.image }}
-
-      - name: Tag for GHCR
-        run: docker tag ${{ matrix.image }} ${{ matrix.target }}
-
-      - name: Push to GHCR
-        run: docker push ${{ matrix.target }}
+      - name: Mirror image to GHCR
+        run: |
+          docker pull ${{ matrix.image }}
+          echo "FROM ${{ matrix.image }}" | docker build \
+            --label "org.opencontainers.image.source=https://github.com/artifact-keeper/artifact-keeper" \
+            -t ${{ matrix.target }} -
+          docker push ${{ matrix.target }}

@@ -29,7 +29,7 @@ services:
   # ==========================================================================
 
   postgres:
-    image: ghcr.io/artifact-keeper/mirror/postgres:16-alpine
+    image: postgres:16-alpine
     container_name: e2e-test-db
     environment:
       POSTGRES_USER: registry
@@ -85,7 +85,7 @@ services:
 
   # Bootstrap: create test repositories after backend is healthy
   setup:
-    image: ghcr.io/artifact-keeper/mirror/alpine:3.19
+    image: alpine:3.19
     container_name: e2e-test-setup
     depends_on:
       backend:
@@ -104,7 +104,7 @@ services:
 
   # PKI service: uses pre-generated files from .pki/ if available (CI), otherwise generates them (local)
   pki:
-    image: ghcr.io/artifact-keeper/mirror/alpine:3.19
+    image: alpine:3.19
     container_name: e2e-test-pki
     command: >
       sh -c "
@@ -141,7 +141,7 @@ services:
   # ==========================================================================
 
   pypi-test:
-    image: ghcr.io/artifact-keeper/mirror/python:3.12-slim
+    image: python:3.12-slim
     container_name: e2e-test-pypi
     depends_on:
       setup:
@@ -161,7 +161,7 @@ services:
     profiles: ["pypi", "smoke", "all"]
 
   npm-test:
-    image: ghcr.io/artifact-keeper/mirror/node:20-slim
+    image: node:20-slim
     container_name: e2e-test-npm
     depends_on:
       setup:
@@ -181,7 +181,7 @@ services:
     profiles: ["npm", "smoke", "all"]
 
   cargo-test:
-    image: ghcr.io/artifact-keeper/mirror/rust:1.75-slim
+    image: rust:1.75-slim
     container_name: e2e-test-cargo
     depends_on:
       setup:
@@ -390,7 +390,7 @@ services:
   # ==========================================================================
 
   proxy-virtual-test:
-    image: ghcr.io/artifact-keeper/mirror/node:20-slim
+    image: node:20-slim
     container_name: e2e-test-proxy-virtual
     depends_on:
       setup:
