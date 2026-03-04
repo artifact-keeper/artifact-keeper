@@ -92,8 +92,12 @@ async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 // Pure (non-async) helper functions for testability
 // ---------------------------------------------------------------------------
 
-/// Determine if a Maven path is for metadata (groupId/artifactId level, no version).
-/// Returns (groupId, artifactId) if the path ends with maven-metadata.xml
+/// Determine if a Maven path is for artifact-level metadata (groupId/artifactId level).
+/// Returns (groupId, artifactId) if the path ends with maven-metadata.xml AND the
+/// segment before it is an artifactId (not a version).
+///
+/// Version-level metadata (groupId/artifactId/version/maven-metadata.xml) returns None
+/// so the caller can serve it from storage instead of generating it dynamically.
 fn parse_metadata_path(path: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     // Minimum: groupSegment/artifactId/maven-metadata.xml
@@ -104,9 +108,22 @@ fn parse_metadata_path(path: &str) -> Option<(String, String)> {
     if filename != "maven-metadata.xml" {
         return None;
     }
-    let artifact_id = parts[parts.len() - 2].to_string();
+    let candidate = parts[parts.len() - 2];
+    // If the segment before maven-metadata.xml looks like a version, this is
+    // version-level metadata (e.g. .../1.0.0-SNAPSHOT/maven-metadata.xml).
+    // Return None so the download handler serves it from storage.
+    if looks_like_maven_version(candidate) {
+        return None;
+    }
+    let artifact_id = candidate.to_string();
     let group_id = parts[..parts.len() - 2].join(".");
     Some((group_id, artifact_id))
+}
+
+/// Heuristic: Maven versions start with a digit (1.0.0, 2.0-rc1, 3.12.0-SNAPSHOT).
+/// Artifact IDs practically never start with a digit.
+fn looks_like_maven_version(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Check if a path is a checksum request. Returns the base path and checksum type.
