@@ -686,6 +686,35 @@ mod tests {
         assert_eq!(result, Some(("com".to_string(), "my-lib".to_string())));
     }
 
+    #[test]
+    fn test_parse_metadata_path_version_level_snapshot() {
+        let result = parse_metadata_path("com/test/artifacthub/0.0.1-SNAPSHOT/maven-metadata.xml");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_metadata_path_version_level_release() {
+        let result = parse_metadata_path("com/example/my-lib/1.0.0/maven-metadata.xml");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_metadata_path_version_level_complex() {
+        let result = parse_metadata_path(
+            "org/apache/commons/commons-lang3/3.12.0-SNAPSHOT/maven-metadata.xml",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_metadata_path_artifact_level_still_works() {
+        let result = parse_metadata_path("com/example/my-lib/maven-metadata.xml");
+        assert_eq!(
+            result,
+            Some(("com.example".to_string(), "my-lib".to_string())),
+        );
+    }
+
     // -----------------------------------------------------------------------
     // parse_checksum_path
     // -----------------------------------------------------------------------
