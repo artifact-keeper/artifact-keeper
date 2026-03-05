@@ -254,11 +254,19 @@ impl AuthService {
             .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))
     }
 
+    /// Dummy bcrypt hash (cost-12) used when no token matches the prefix.
+    /// Running bcrypt verify against this ensures all rejection paths take
+    /// the same wall-clock time, preventing timing side-channel leaks.
+    const DUMMY_BCRYPT_HASH: &'static str =
+        "$2b$12$L9bM5Y91JrjMNH0E6We4Dus/xXhF6gVLHjsP8LlHlyyibxYMRbhjK";
+
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
         // API tokens have format: prefix_secret
         // We store hash of full token and prefix for lookup
         if token.len() < 8 {
+            // Still must burn bcrypt time to avoid leaking token length info
+            let _ = Self::verify_password(token, Self::DUMMY_BCRYPT_HASH);
             return Err(AppError::Authentication("Invalid API token".to_string()));
         }
 
@@ -266,7 +274,7 @@ impl AuthService {
 
         // Find token by prefix (includes revoked_at and last_used_at for
         // revocation check and debounced usage tracking).
-        let stored_token = sqlx::query!(
+        let stored_token_opt = sqlx::query!(
             r#"
             SELECT at.id, at.token_hash, at.user_id, at.scopes, at.expires_at,
                    at.repo_selector, at.revoked_at, at.last_used_at
@@ -277,18 +285,33 @@ impl AuthService {
         )
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::Authentication("Invalid API token".to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Check revocation before spending time on hash verification
-        if stored_token.revoked_at.is_some() {
-            return Err(AppError::Unauthorized("Token has been revoked".to_string()));
-        }
+        // Extract verification inputs. When no token was found, use a dummy
+        // hash so that bcrypt still runs and all code paths take equal time.
+        let (hash_to_verify, token_exists, is_revoked) = match &stored_token_opt {
+            Some(t) => (t.token_hash.clone(), true, t.revoked_at.is_some()),
+            None => (Self::DUMMY_BCRYPT_HASH.to_string(), false, false),
+        };
 
-        // Verify full token hash
-        if !Self::verify_password(token, &stored_token.token_hash)? {
+        // Always run bcrypt verification regardless of token existence.
+        // This is the constant-time core of the fix: an attacker cannot
+        // distinguish "prefix not found" from "wrong secret" by timing.
+        let hash_matches = Self::verify_password(token, &hash_to_verify)?;
+
+        // Check results only after bcrypt has completed
+        if !token_exists {
             return Err(AppError::Authentication("Invalid API token".to_string()));
         }
+        if is_revoked {
+            return Err(AppError::Unauthorized("Token has been revoked".to_string()));
+        }
+        if !hash_matches {
+            return Err(AppError::Authentication("Invalid API token".to_string()));
+        }
+
+        // Unwrap is safe: token_exists is true only when stored_token_opt is Some
+        let stored_token = stored_token_opt.unwrap();
 
         // Check expiration
         if let Some(expires_at) = stored_token.expires_at {
@@ -1476,5 +1499,36 @@ mod tests {
         // update (the difference is not strictly greater than 5 minutes).
         let last_used = Utc::now() - Duration::seconds(4 * 60 + 59);
         assert!(!should_debounce_usage_update(Some(last_used)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Timing side-channel: dummy bcrypt hash for constant-time rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dummy_bcrypt_hash_is_valid_and_never_matches() {
+        // The dummy hash must be a structurally valid bcrypt hash so that
+        // bcrypt::verify runs the full cost-12 computation instead of
+        // returning an immediate error.
+        let result = verify("any-token-value", AuthService::DUMMY_BCRYPT_HASH);
+        assert!(
+            result.is_ok(),
+            "DUMMY_BCRYPT_HASH must be a valid bcrypt hash, got error: {:?}",
+            result.err()
+        );
+        assert!(
+            !result.unwrap(),
+            "DUMMY_BCRYPT_HASH must never match any input"
+        );
+
+        // Also verify with an empty string
+        let result_empty = verify("", AuthService::DUMMY_BCRYPT_HASH);
+        assert!(result_empty.is_ok());
+        assert!(!result_empty.unwrap());
+
+        // And with the hash itself as input (sanity check)
+        let result_self = verify(AuthService::DUMMY_BCRYPT_HASH, AuthService::DUMMY_BCRYPT_HASH);
+        assert!(result_self.is_ok());
+        assert!(!result_self.unwrap());
     }
 }
