@@ -42,7 +42,9 @@ COPY --from=deps /root/.cargo/registry /root/.cargo/registry
 COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
+ARG GIT_SHA=unknown
 ENV SQLX_OFFLINE=true
+ENV GIT_SHA=${GIT_SHA}
 RUN cargo build --release --bin artifact-keeper
 
 # ---------- Stage 4: Build minimal rootfs ----------

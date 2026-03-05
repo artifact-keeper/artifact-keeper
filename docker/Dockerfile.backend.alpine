@@ -30,7 +30,9 @@ COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
+ARG GIT_SHA=unknown
 ENV SQLX_OFFLINE=true
+ENV GIT_SHA=${GIT_SHA}
 RUN cargo build --release --features vendored-openssl --bin artifact-keeper
 
 # ---------- Stage 4: Copy scanner CLIs from official images ----------

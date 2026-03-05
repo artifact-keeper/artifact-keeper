@@ -21,6 +21,10 @@ pub struct HealthResponse {
     pub checks: HealthChecks,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_pool: Option<DbPoolStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -151,6 +155,14 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         size: state.db.size(),
     };
 
+    let git_sha = env!("GIT_SHA");
+    let is_prerelease = env!("CARGO_PKG_VERSION").contains('-');
+    let (commit, dirty) = if git_sha != "unknown" {
+        (Some(git_sha.to_string()), Some(is_prerelease))
+    } else {
+        (None, None)
+    };
+
     let response = HealthResponse {
         status: overall_status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -162,6 +174,8 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
             meilisearch: meili_check,
         },
         db_pool: Some(pool_stats),
+        commit,
+        dirty,
     };
 
     let status_code = if overall_status == "healthy" {
@@ -436,6 +450,8 @@ mod tests {
                 meilisearch: None,
             },
             db_pool: Some(sample_pool_stats()),
+            commit: None,
+            dirty: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -447,6 +463,9 @@ mod tests {
         assert!(json.contains("\"max_connections\":20"));
         // security_scanner is None, should be skipped
         assert!(!json.contains("\"security_scanner\""));
+        // commit/dirty are None, should be skipped
+        assert!(!json.contains("\"commit\""));
+        assert!(!json.contains("\"dirty\""));
     }
 
     #[test]
@@ -462,6 +481,8 @@ mod tests {
                 meilisearch: None,
             },
             db_pool: None,
+            commit: None,
+            dirty: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -481,6 +502,8 @@ mod tests {
                 meilisearch: None,
             },
             db_pool: None,
+            commit: None,
+            dirty: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -520,6 +543,8 @@ mod tests {
                 meilisearch: None,
             },
             db_pool: None,
+            commit: None,
+            dirty: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -623,5 +648,49 @@ mod tests {
         assert!(json.contains("\"idle_connections\":15"));
         assert!(json.contains("\"active_connections\":5"));
         assert!(json.contains("\"size\":20"));
+    }
+
+    #[test]
+    fn test_health_response_with_commit_and_dirty() {
+        let response = HealthResponse {
+            status: "healthy".to_string(),
+            version: "1.1.0-rc.5".to_string(),
+            demo_mode: false,
+            checks: HealthChecks {
+                database: healthy_check(),
+                storage: healthy_check(),
+                security_scanner: None,
+                meilisearch: None,
+            },
+            db_pool: None,
+            commit: Some("abc1234def5678".to_string()),
+            dirty: Some(true),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"commit\":\"abc1234def5678\""));
+        assert!(json.contains("\"dirty\":true"));
+    }
+
+    #[test]
+    fn test_health_response_commit_omitted_when_none() {
+        let response = HealthResponse {
+            status: "healthy".to_string(),
+            version: "1.1.0".to_string(),
+            demo_mode: false,
+            checks: HealthChecks {
+                database: healthy_check(),
+                storage: healthy_check(),
+                security_scanner: None,
+                meilisearch: None,
+            },
+            db_pool: None,
+            commit: None,
+            dirty: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("\"commit\""));
+        assert!(!json.contains("\"dirty\""));
     }
 }

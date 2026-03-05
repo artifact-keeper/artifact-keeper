@@ -77,6 +77,8 @@ jobs:
           cache-to: type=gha,scope=backend-${{ matrix.platform }},mode=max
           sbom: true
           provenance: mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
 
       - name: Export digest
         run: |
@@ -209,6 +211,8 @@ jobs:
           cache-to: type=gha,scope=backend-alpine-${{ matrix.platform }},mode=max
           sbom: true
           provenance: mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
 
       - name: Export digest
         run: |
