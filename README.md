@@ -241,31 +241,7 @@ Extend Artifact Keeper with custom format handlers compiled to WebAssembly.
 
 ## Quick Start
 
-```bash
-mkdir artifact-keeper && cd artifact-keeper
-curl -fsSLO https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker-compose.yml
-mkdir docker
-curl -fsSLo docker/Caddyfile https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker/Caddyfile
-curl -fsSLo docker/init-db.sql https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker/init-db.sql
-curl -fsSLo docker/init-pg-ssl.sh https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker/init-pg-ssl.sh
-curl -fsSLo docker/init-dtrack.sh https://raw.githubusercontent.com/artifact-keeper/artifact-keeper/main/docker/init-dtrack.sh
-docker compose up -d
-```
-
-Open [http://localhost:30080](http://localhost:30080) and follow the first-time setup instructions.
-
-### Accessing from another machine on your network
-
-In development mode (`ENVIRONMENT=development`, the default), CORS automatically allows requests from private-network IPs (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`) and localhost. No extra configuration is needed — just open `http://<server-ip>:30080` from any machine on your LAN.
-
-For production deployments, set `CORS_ORIGINS` in your `.env` to the public URL(s) users will access:
-
-```bash
-ENVIRONMENT=production
-CORS_ORIGINS=https://registry.example.com
-```
-
-**[Full Quickstart Guide →](https://artifactkeeper.com/docs/getting-started/quickstart/)**
+Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artifactkeeper.com/docs/getting-started/quickstart/)**
 
 ## Documentation
 
