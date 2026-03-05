@@ -115,6 +115,7 @@ pub struct IdentityResponse {
     pub peer_id: Uuid,
     pub name: String,
     pub endpoint_url: String,
+    #[serde(skip_serializing)]
     pub api_key: String,
 }
 
@@ -585,7 +586,15 @@ async fn announce_peer(
     ),
     security(("bearer_auth" = []))
 )]
-async fn get_identity(State(state): State<SharedState>) -> Result<Json<IdentityResponse>> {
+async fn get_identity(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<IdentityResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Admin access required".to_string(),
+        ));
+    }
     let svc = PeerInstanceService::new(state.db.clone());
     let local = svc.get_local_instance().await?;
 
@@ -973,7 +982,11 @@ mod tests {
         assert_eq!(json["peer_id"], id.to_string());
         assert_eq!(json["name"], "local-peer");
         assert_eq!(json["endpoint_url"], "https://local.example.com");
-        assert_eq!(json["api_key"], "local-key");
+        // api_key must be hidden from serialized output (defense-in-depth)
+        assert!(
+            json.get("api_key").is_none(),
+            "api_key should not appear in serialized IdentityResponse"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1129,5 +1142,61 @@ mod tests {
             allowed_repo_ids: None,
         };
         assert!(require_admin(&auth).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_identity admin guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_identity_rejects_non_admin() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "user".to_string(),
+            email: "user@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        assert!(!auth.is_admin);
+        let result: std::result::Result<(), AppError> = if !auth.is_admin {
+            Err(AppError::Authorization(
+                "Admin access required".to_string(),
+            ))
+        } else {
+            Ok(())
+        };
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authorization(msg) => {
+                assert_eq!(msg, "Admin access required");
+            }
+            other => panic!("Expected Authorization error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_get_identity_allows_admin() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        assert!(auth.is_admin);
+        let result: std::result::Result<(), AppError> = if !auth.is_admin {
+            Err(AppError::Authorization(
+                "Admin access required".to_string(),
+            ))
+        } else {
+            Ok(())
+        };
+        assert!(result.is_ok());
     }
 }
