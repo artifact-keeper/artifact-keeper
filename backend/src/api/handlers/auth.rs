@@ -137,9 +137,8 @@ pub async fn login(
             // Log failed login attempt
             let _ = audit_service
                 .log(
-                    AuditEntry::new(AuditAction::LoginFailed, ResourceType::User).details(
-                        serde_json::json!({ "username": payload.username }),
-                    ),
+                    AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+                        .details(serde_json::json!({ "username": payload.username })),
                 )
                 .await;
             return Err(err);
