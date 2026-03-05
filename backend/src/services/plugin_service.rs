@@ -131,7 +131,7 @@ pub struct PluginService {
 impl PluginService {
     /// Create a new plugin service.
     pub fn new(db: PgPool) -> Self {
-        let http_client = Client::builder()
+        let http_client = crate::services::http_client::base_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");

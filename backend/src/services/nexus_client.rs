@@ -106,7 +106,7 @@ pub struct NexusChecksum {
 impl NexusClient {
     /// Create a new Nexus client
     pub fn new(config: NexusClientConfig) -> Result<Self, ArtifactoryError> {
-        let client = Client::builder()
+        let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .build()?;
 

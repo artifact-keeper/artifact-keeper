@@ -281,7 +281,7 @@ impl ArtifactoryClient {
             );
         }
 
-        let client = Client::builder()
+        let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .https_only(!allow_http)
             .build()?;

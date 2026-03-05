@@ -14,6 +14,7 @@ pub mod encryption;
 pub mod event_bus;
 pub mod grype_scanner;
 pub mod helm_lint_checker;
+pub mod http_client;
 pub mod image_scanner;
 pub mod incus_scanner;
 pub mod ldap_service;

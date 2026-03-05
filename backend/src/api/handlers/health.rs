@@ -7,7 +7,6 @@
 //! - `/healthz` — alias for `/health`
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use reqwest::Client;
 use serde::Serialize;
 use std::time::Duration;
 use utoipa::{OpenApi, ToSchema};
@@ -76,7 +75,7 @@ async fn check_service_health(
     health_path: &str,
     service_name: &str,
 ) -> CheckStatus {
-    let client = Client::builder()
+    let client = crate::services::http_client::base_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_default();

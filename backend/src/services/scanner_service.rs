@@ -171,7 +171,7 @@ const GITHUB_ADVISORY_URL: &str = "https://api.github.com/advisories";
 impl AdvisoryClient {
     pub fn new(github_token: Option<String>) -> Self {
         Self {
-            http: Client::builder()
+            http: crate::services::http_client::base_client_builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent("artifact-keeper-scanner/1.0")
                 .build()

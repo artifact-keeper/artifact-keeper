@@ -52,7 +52,7 @@ pub struct ProxyService {
 impl ProxyService {
     /// Create a new proxy service
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
-        let http_client = Client::builder()
+        let http_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .user_agent("artifact-keeper-proxy/1.0")
             .build()

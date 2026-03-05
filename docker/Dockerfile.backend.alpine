@@ -41,7 +41,7 @@ FROM ghcr.io/anchore/grype:v0.109.0 AS grype-bin
 FROM alpine:3.21
 
 # Runtime dependencies (no libssl needed - OpenSSL is vendored/static)
-RUN apk add --no-cache ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl
+RUN apk add --no-cache ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl jq
 
 # --- CIS hardening (adapted from CIS Alpine Linux Benchmark) ---
 

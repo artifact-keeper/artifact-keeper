@@ -800,7 +800,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
 
     tracing::debug!("Processing {} webhook deliveries due for retry", rows.len());
 
-    let client = reqwest::Client::builder()
+    let client = crate::services::http_client::base_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;

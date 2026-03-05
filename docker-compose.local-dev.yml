@@ -132,7 +132,7 @@ services:
     restart: unless-stopped
 
   dtrack-init:
-    image: alpine:3.20
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
     container_name: artifact-keeper-dev-dtrack-init
     depends_on:
       postgres:
@@ -142,7 +142,7 @@ services:
     volumes:
       - ./docker/init-dtrack.sh:/init-dtrack.sh:ro
       - dev_shared_config:/shared
-    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl jq >/dev/null 2>&1 && /bin/sh /init-dtrack.sh"]
+    entrypoint: ["/bin/sh", "/init-dtrack.sh"]
     restart: "no"
 
   # Backend with hot-reload using cargo-watch

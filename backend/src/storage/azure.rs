@@ -422,7 +422,7 @@ impl AzureBackend {
         // so the HTTP client must allow non-TLS when RBAC mode might use managed identity.
         let needs_http = allow_http || config.access_key.is_none();
 
-        let client = reqwest::Client::builder()
+        let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(30))
             .https_only(!needs_http)
             .build()

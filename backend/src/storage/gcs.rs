@@ -383,7 +383,7 @@ pub struct GcsBackend {
 impl GcsBackend {
     /// Create a new GCS backend.
     pub async fn new(config: GcsConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;

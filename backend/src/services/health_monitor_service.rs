@@ -87,7 +87,7 @@ pub struct HealthMonitorService {
 
 impl HealthMonitorService {
     pub fn new(db: PgPool, config: MonitorConfig) -> Self {
-        let http_client = Client::builder()
+        let http_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(config.check_timeout_secs))
             .build()
             .unwrap_or_default();

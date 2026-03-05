@@ -56,7 +56,7 @@ pub struct OpenScapScanner {
 
 impl OpenScapScanner {
     pub fn new(openscap_url: String, profile: String, scan_workspace: String) -> Self {
-        let http = Client::builder()
+        let http = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(600))
             .build()
             .expect("failed to build HTTP client");

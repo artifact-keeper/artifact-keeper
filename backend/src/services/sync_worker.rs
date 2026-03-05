@@ -18,7 +18,7 @@ pub async fn spawn_sync_worker(db: PgPool) {
         // Small startup delay so the server can finish initializing.
         tokio::time::sleep(Duration::from_secs(5)).await;
         let mut tick = interval(Duration::from_secs(10));
-        let client = reqwest::Client::builder()
+        let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to build HTTP client for sync worker");

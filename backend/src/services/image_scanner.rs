@@ -57,7 +57,7 @@ impl ImageScanner {
     pub fn new(trivy_url: String) -> Self {
         Self {
             trivy_url,
-            http: reqwest::Client::builder()
+            http: crate::services::http_client::base_client_builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
