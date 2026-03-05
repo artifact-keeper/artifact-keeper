@@ -2,7 +2,7 @@
 //!
 //! Handles user authentication, JWT token management, and password hashing.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{DateTime, Duration, Utc};
@@ -254,19 +254,25 @@ impl AuthService {
             .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))
     }
 
-    /// Dummy bcrypt hash (cost-12) used when no token matches the prefix.
+    /// Returns a dummy bcrypt hash (cost-12) generated once at runtime.
     /// Running bcrypt verify against this ensures all rejection paths take
     /// the same wall-clock time, preventing timing side-channel leaks.
-    const DUMMY_BCRYPT_HASH: &'static str =
-        "$2b$12$L9bM5Y91JrjMNH0E6We4Dus/xXhF6gVLHjsP8LlHlyyibxYMRbhjK";
+    fn dummy_bcrypt_hash() -> &'static str {
+        static HASH: OnceLock<String> = OnceLock::new();
+        HASH.get_or_init(|| {
+            hash("__dummy_timing_pad__", 12)
+                .expect("bcrypt hash generation must not fail")
+        })
+    }
 
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
         // API tokens have format: prefix_secret
         // We store hash of full token and prefix for lookup
+        let dummy = Self::dummy_bcrypt_hash();
         if token.len() < 8 {
             // Still must burn bcrypt time to avoid leaking token length info
-            let _ = Self::verify_password(token, Self::DUMMY_BCRYPT_HASH);
+            let _ = Self::verify_password(token, dummy);
             return Err(AppError::Authentication("Invalid API token".to_string()));
         }
 
@@ -291,7 +297,7 @@ impl AuthService {
         // hash so that bcrypt still runs and all code paths take equal time.
         let (hash_to_verify, token_exists, is_revoked) = match &stored_token_opt {
             Some(t) => (t.token_hash.clone(), true, t.revoked_at.is_some()),
-            None => (Self::DUMMY_BCRYPT_HASH.to_string(), false, false),
+            None => (dummy.to_string(), false, false),
         };
 
         // Always run bcrypt verification regardless of token existence.
@@ -300,15 +306,7 @@ impl AuthService {
         let hash_matches = Self::verify_password(token, &hash_to_verify)?;
 
         // Check results only after bcrypt has completed
-        if !token_exists {
-            return Err(AppError::Authentication("Invalid API token".to_string()));
-        }
-        if is_revoked {
-            return Err(AppError::Unauthorized("Token has been revoked".to_string()));
-        }
-        if !hash_matches {
-            return Err(AppError::Authentication("Invalid API token".to_string()));
-        }
+        check_token_validation_result(token_exists, is_revoked, hash_matches)?;
 
         // Unwrap is safe: token_exists is true only when stored_token_opt is Some
         let stored_token = stored_token_opt.unwrap();
@@ -986,6 +984,26 @@ pub(crate) fn should_debounce_usage_update(last_used_at: Option<DateTime<Utc>>) 
     }
 }
 
+/// Evaluate token validation state after bcrypt verification has completed.
+/// Separated from the async method so all branches can be unit-tested
+/// without a database.
+fn check_token_validation_result(
+    token_exists: bool,
+    is_revoked: bool,
+    hash_matches: bool,
+) -> Result<()> {
+    if !token_exists {
+        return Err(AppError::Authentication("Invalid API token".to_string()));
+    }
+    if is_revoked {
+        return Err(AppError::Unauthorized("Token has been revoked".to_string()));
+    }
+    if !hash_matches {
+        return Err(AppError::Authentication("Invalid API token".to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,31 +1525,82 @@ mod tests {
 
     #[test]
     fn test_dummy_bcrypt_hash_is_valid_and_never_matches() {
+        let dummy = AuthService::dummy_bcrypt_hash();
         // The dummy hash must be a structurally valid bcrypt hash so that
         // bcrypt::verify runs the full cost-12 computation instead of
         // returning an immediate error.
-        let result = verify("any-token-value", AuthService::DUMMY_BCRYPT_HASH);
+        let result = verify("any-token-value", dummy);
         assert!(
             result.is_ok(),
-            "DUMMY_BCRYPT_HASH must be a valid bcrypt hash, got error: {:?}",
+            "dummy_bcrypt_hash must produce a valid bcrypt hash, got error: {:?}",
             result.err()
         );
         assert!(
             !result.unwrap(),
-            "DUMMY_BCRYPT_HASH must never match any input"
+            "dummy_bcrypt_hash must never match any input"
         );
 
         // Also verify with an empty string
-        let result_empty = verify("", AuthService::DUMMY_BCRYPT_HASH);
+        let result_empty = verify("", dummy);
         assert!(result_empty.is_ok());
         assert!(!result_empty.unwrap());
+    }
 
-        // And with the hash itself as input (sanity check)
-        let result_self = verify(
-            AuthService::DUMMY_BCRYPT_HASH,
-            AuthService::DUMMY_BCRYPT_HASH,
+    #[test]
+    fn test_dummy_bcrypt_hash_is_stable() {
+        // OnceLock must return the same value on every call
+        let h1 = AuthService::dummy_bcrypt_hash();
+        let h2 = AuthService::dummy_bcrypt_hash();
+        assert_eq!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_token_validation_result (pure decision logic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_validation_valid() {
+        assert!(check_token_validation_result(true, false, true).is_ok());
+    }
+
+    #[test]
+    fn test_token_validation_not_found() {
+        let err = check_token_validation_result(false, false, false).unwrap_err();
+        assert!(
+            format!("{}", err).contains("Invalid API token"),
+            "Expected 'Invalid API token', got: {}",
+            err
         );
-        assert!(result_self.is_ok());
-        assert!(!result_self.unwrap());
+    }
+
+    #[test]
+    fn test_token_validation_revoked() {
+        let err = check_token_validation_result(true, true, true).unwrap_err();
+        assert!(
+            format!("{}", err).contains("revoked"),
+            "Expected revocation error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_token_validation_hash_mismatch() {
+        let err = check_token_validation_result(true, false, false).unwrap_err();
+        assert!(
+            format!("{}", err).contains("Invalid API token"),
+            "Expected 'Invalid API token', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_token_validation_revoked_takes_priority_over_hash_mismatch() {
+        // If both revoked and hash mismatch, revoked error should come first
+        let err = check_token_validation_result(true, true, false).unwrap_err();
+        assert!(
+            format!("{}", err).contains("revoked"),
+            "Expected revocation error, got: {}",
+            err
+        );
     }
 }
