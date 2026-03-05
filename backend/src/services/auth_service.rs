@@ -260,8 +260,7 @@ impl AuthService {
     fn dummy_bcrypt_hash() -> &'static str {
         static HASH: OnceLock<String> = OnceLock::new();
         HASH.get_or_init(|| {
-            hash("__dummy_timing_pad__", 12)
-                .expect("bcrypt hash generation must not fail")
+            hash("__dummy_timing_pad__", 12).expect("bcrypt hash generation must not fail")
         })
     }
 
