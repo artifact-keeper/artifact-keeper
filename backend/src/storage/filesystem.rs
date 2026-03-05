@@ -22,10 +22,18 @@ impl FilesystemStorage {
         }
     }
 
-    /// Get full path for a key (using first 2 chars as subdirectory for distribution)
+    /// Get full path for a key (using first 2 chars as subdirectory for distribution).
+    ///
+    /// Keys are sanitized to prevent path traversal: only normal path components
+    /// are kept, stripping `..`, `/`, and other special components.
     fn key_to_path(&self, key: &str) -> PathBuf {
-        let prefix = &key[..2.min(key.len())];
-        self.base_path.join(prefix).join(key)
+        let sanitized: PathBuf = std::path::Path::new(key)
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .collect();
+        let sanitized_str = sanitized.to_string_lossy();
+        let prefix = &sanitized_str[..2.min(sanitized_str.len())];
+        self.base_path.join(prefix).join(&sanitized)
     }
 }
 
@@ -133,6 +141,62 @@ mod tests {
         let path2 = storage.key_to_path("ab2222");
         // Same prefix = same subdirectory
         assert_eq!(path1.parent().unwrap(), path2.parent().unwrap());
+    }
+
+    #[test]
+    fn test_key_to_path_traversal_dot_dot() {
+        let storage = FilesystemStorage::new("/data");
+        let path = storage.key_to_path("../../etc/passwd");
+        // "../" components are stripped; only "etc" and "passwd" remain
+        assert!(path.starts_with("/data"));
+        assert!(!path.to_string_lossy().contains(".."));
+        assert_eq!(path, PathBuf::from("/data/et/etc/passwd"));
+    }
+
+    #[test]
+    fn test_key_to_path_absolute_key() {
+        let storage = FilesystemStorage::new("/data");
+        let path = storage.key_to_path("/etc/passwd");
+        // Leading "/" (RootDir component) is stripped; result stays inside base
+        assert!(path.starts_with("/data"));
+        assert_eq!(path, PathBuf::from("/data/et/etc/passwd"));
+    }
+
+    #[test]
+    fn test_key_to_path_mixed_traversal() {
+        let storage = FilesystemStorage::new("/data");
+        let path = storage.key_to_path("maven/../../../etc/passwd");
+        // ".." components stripped, only Normal components kept
+        assert!(path.starts_with("/data"));
+        assert!(!path.to_string_lossy().contains(".."));
+        assert_eq!(path, PathBuf::from("/data/ma/maven/etc/passwd"));
+    }
+
+    #[test]
+    fn test_key_to_path_empty_key() {
+        let storage = FilesystemStorage::new("/data");
+        // Empty key should not panic
+        let path = storage.key_to_path("");
+        // Sanitized string is empty, prefix is empty, result is base_path joined with empties
+        assert!(path.starts_with("/data"));
+    }
+
+    #[test]
+    fn test_key_to_path_only_dots() {
+        let storage = FilesystemStorage::new("/data");
+        let path = storage.key_to_path("../..");
+        // All components are ParentDir, all stripped
+        assert!(path.starts_with("/data"));
+    }
+
+    #[test]
+    fn test_key_to_path_current_dir_traversal() {
+        let storage = FilesystemStorage::new("/data");
+        let path = storage.key_to_path("./secret/../passwords");
+        // "." and ".." are stripped, only "secret" and "passwords" remain
+        assert!(path.starts_with("/data"));
+        assert!(!path.to_string_lossy().contains(".."));
+        assert_eq!(path, PathBuf::from("/data/se/secret/passwords"));
     }
 
     #[tokio::test]
