@@ -258,8 +258,8 @@ impl AuthService {
     /// Running bcrypt verify against this ensures all rejection paths take
     /// the same wall-clock time, preventing timing side-channel leaks.
     fn dummy_bcrypt_hash() -> &'static str {
-        static HASH: OnceLock<String> = OnceLock::new();
-        HASH.get_or_init(|| {
+        static DUMMY: OnceLock<String> = OnceLock::new(); //NOSONAR - intentional dummy hash for constant-time rejection
+        DUMMY.get_or_init(|| {
             hash("__dummy_timing_pad__", 12).expect("bcrypt hash generation must not fail")
         })
     }
