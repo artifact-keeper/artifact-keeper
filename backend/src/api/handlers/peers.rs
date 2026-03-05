@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::services::peer_instance_service::{
     InstanceStatus, PeerInstanceService, RegisterPeerInstanceRequest as ServiceRegisterReq,
     ReplicationMode,
@@ -116,6 +116,15 @@ pub struct IdentityResponse {
     pub name: String,
     pub endpoint_url: String,
     pub api_key: String,
+}
+
+fn require_admin(auth: &AuthExtension) -> Result<()> {
+    if !auth.is_admin {
+        return Err(AppError::Unauthorized(
+            "Admin privileges required".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_status(s: &str) -> Option<InstanceStatus> {
@@ -345,9 +354,12 @@ pub async fn unregister_peer(
 )]
 pub async fn heartbeat(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
     Json(payload): Json<HeartbeatRequest>,
 ) -> Result<()> {
+    require_admin(&auth)?;
+
     let status = payload.status.as_ref().and_then(|s| parse_status(s));
     let service = PeerInstanceService::new(state.db.clone());
     service
@@ -537,8 +549,11 @@ pub async fn unassign_repo(
 )]
 async fn announce_peer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<AnnouncePeerRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    require_admin(&auth)?;
+
     let peer_svc = PeerService::new(state.db.clone());
     let instance_svc = PeerInstanceService::new(state.db.clone());
     let local = instance_svc.get_local_instance().await?;
@@ -1030,5 +1045,89 @@ mod tests {
     fn test_sync_tasks_limit_default() {
         let limit = 50_u32 as i64;
         assert_eq!(limit, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin guard (require_admin) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_require_admin_passes_for_admin() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        assert!(require_admin(&auth).is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_rejects_non_admin() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "regular-user".to_string(),
+            email: "user@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        let err = require_admin(&auth).unwrap_err();
+        assert!(
+            format!("{}", err).contains("Admin privileges required"),
+            "Expected 'Admin privileges required' in error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_require_admin_rejects_non_admin_api_token() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "api-user".to_string(),
+            email: "api@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(vec!["read".to_string(), "write".to_string()]),
+            allowed_repo_ids: None,
+        };
+        assert!(require_admin(&auth).is_err());
+    }
+
+    #[test]
+    fn test_require_admin_passes_for_admin_api_token() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin-api".to_string(),
+            email: "admin-api@example.com".to_string(),
+            is_admin: true,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(vec!["admin".to_string()]),
+            allowed_repo_ids: None,
+        };
+        assert!(require_admin(&auth).is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_rejects_service_account_without_admin() {
+        let auth = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "svc-peer-sync".to_string(),
+            email: "svc@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: true,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        assert!(require_admin(&auth).is_err());
     }
 }
