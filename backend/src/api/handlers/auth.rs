@@ -17,9 +17,49 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
 use std::sync::atomic::Ordering;
+
+/// Fire-and-forget auth audit log. Failures are silently ignored so audit
+/// issues never break the auth flow.
+async fn audit_auth(
+    state: &SharedState,
+    action: AuditAction,
+    user_id: Option<Uuid>,
+    details: serde_json::Value,
+) {
+    let mut entry = AuditEntry::new(action, ResourceType::User).details(details);
+    if let Some(id) = user_id {
+        entry = entry.user(id).resource(id);
+    }
+    let _ = AuditService::new(state.db.clone()).log(entry).await;
+}
+
+/// Build a login/refresh response with auth cookies set.
+fn login_response(
+    tokens: &crate::services::auth_service::TokenPair,
+    must_change_password: bool,
+) -> Response {
+    let body = LoginResponse {
+        access_token: tokens.access_token.clone(),
+        refresh_token: tokens.refresh_token.clone(),
+        expires_in: tokens.expires_in,
+        token_type: "Bearer".to_string(),
+        must_change_password,
+        totp_required: None,
+        totp_token: None,
+    };
+    let mut response = Json(body).into_response();
+    set_auth_cookies(
+        response.headers_mut(),
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+    );
+    response
+}
 
 /// Create public auth routes (no auth required)
 pub fn public_router() -> Router<SharedState> {
@@ -126,9 +166,22 @@ pub async fn login(
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
-    let (user, tokens) = auth_service
+    let (user, tokens) = match auth_service
         .authenticate(&payload.username, &payload.password)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            audit_auth(
+                &state,
+                AuditAction::LoginFailed,
+                None,
+                serde_json::json!({ "username": payload.username }),
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     // If TOTP is enabled, return a pending token instead of real tokens
     if user.totp_enabled {
@@ -145,24 +198,15 @@ pub async fn login(
         return Ok(Json(body).into_response());
     }
 
-    let body = LoginResponse {
-        access_token: tokens.access_token.clone(),
-        refresh_token: tokens.refresh_token.clone(),
-        expires_in: tokens.expires_in,
-        token_type: "Bearer".to_string(),
-        must_change_password: user.must_change_password,
-        totp_required: None,
-        totp_token: None,
-    };
+    audit_auth(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
 
-    let mut response = Json(body).into_response();
-    set_auth_cookies(
-        response.headers_mut(),
-        &tokens.access_token,
-        &tokens.refresh_token,
-        tokens.expires_in,
-    );
-    Ok(response)
+    Ok(login_response(&tokens, user.must_change_password))
 }
 
 /// Logout current session
@@ -175,7 +219,20 @@ pub async fn login(
         (status = 200, description = "Logout successful, auth cookies cleared"),
     )
 )]
-pub async fn logout(State(_state): State<SharedState>) -> Result<Response> {
+pub async fn logout(
+    State(state): State<SharedState>,
+    auth: Option<Extension<AuthExtension>>,
+) -> Result<Response> {
+    if let Some(Extension(auth)) = auth {
+        audit_auth(
+            &state,
+            AuditAction::Logout,
+            Some(auth.user_id),
+            serde_json::json!({}),
+        )
+        .await;
+    }
+
     let mut response = ().into_response();
     clear_auth_cookies(response.headers_mut());
     Ok(response)
@@ -208,24 +265,15 @@ pub async fn refresh_token(
 
     let (user, tokens) = auth_service.refresh_tokens(&refresh_token_str).await?;
 
-    let body = LoginResponse {
-        access_token: tokens.access_token.clone(),
-        refresh_token: tokens.refresh_token.clone(),
-        expires_in: tokens.expires_in,
-        token_type: "Bearer".to_string(),
-        must_change_password: user.must_change_password,
-        totp_required: None,
-        totp_token: None,
-    };
+    audit_auth(
+        &state,
+        AuditAction::Login,
+        Some(user.id),
+        serde_json::json!({ "method": "token_refresh" }),
+    )
+    .await;
 
-    let mut response = Json(body).into_response();
-    set_auth_cookies(
-        response.headers_mut(),
-        &tokens.access_token,
-        &tokens.refresh_token,
-        tokens.expires_in,
-    );
-    Ok(response)
+    Ok(login_response(&tokens, user.must_change_password))
 }
 
 /// Get current user info
