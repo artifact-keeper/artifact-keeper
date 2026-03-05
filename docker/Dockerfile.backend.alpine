@@ -38,7 +38,7 @@ FROM ghcr.io/aquasecurity/trivy:0.69.1 AS trivy-bin
 FROM ghcr.io/anchore/grype:v0.109.0 AS grype-bin
 
 # ---------- Stage 5: Alpine runtime ----------
-FROM alpine:3.21
+FROM alpine:3.23
 
 # Runtime dependencies (no libssl needed - OpenSSL is vendored/static)
 RUN apk add --no-cache ca-certificates libgcc libstdc++ zlib xz-libs libbz2 curl jq
