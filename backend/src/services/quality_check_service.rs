@@ -103,16 +103,17 @@ impl QualityCheckService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // 3. Get repository format
-        let format: String = sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
-            .bind(artifact.repository_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| {
-                AppError::Database(format!(
-                    "Failed to fetch format for repository {}: {}",
-                    artifact.repository_id, e
-                ))
-            })?;
+        let format: String =
+            sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+                .bind(artifact.repository_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| {
+                    AppError::Database(format!(
+                        "Failed to fetch format for repository {}: {}",
+                        artifact.repository_id, e
+                    ))
+                })?;
 
         // 4. Fetch artifact content from storage
         let content = self.fetch_artifact_content(&artifact).await?;
