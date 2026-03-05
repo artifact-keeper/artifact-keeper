@@ -591,9 +591,7 @@ async fn get_identity(
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<IdentityResponse>> {
     if !auth.is_admin {
-        return Err(AppError::Authorization(
-            "Admin access required".to_string(),
-        ));
+        return Err(AppError::Authorization("Admin access required".to_string()));
     }
     let svc = PeerInstanceService::new(state.db.clone());
     let local = svc.get_local_instance().await?;
@@ -1162,9 +1160,7 @@ mod tests {
         };
         assert!(!auth.is_admin);
         let result: std::result::Result<(), AppError> = if !auth.is_admin {
-            Err(AppError::Authorization(
-                "Admin access required".to_string(),
-            ))
+            Err(AppError::Authorization("Admin access required".to_string()))
         } else {
             Ok(())
         };
@@ -1191,9 +1187,7 @@ mod tests {
         };
         assert!(auth.is_admin);
         let result: std::result::Result<(), AppError> = if !auth.is_admin {
-            Err(AppError::Authorization(
-                "Admin access required".to_string(),
-            ))
+            Err(AppError::Authorization("Admin access required".to_string()))
         } else {
             Ok(())
         };
