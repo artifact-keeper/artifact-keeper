@@ -25,7 +25,7 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
-use crate::formats::helm::{generate_index_yaml, ChartYaml, HelmHandler};
+use crate::formats::helm::{generate_index_yaml, ChartYaml, HelmHandler, HelmIndex};
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +102,138 @@ async fn index_yaml(
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
+
+    // Virtual repository: merge index.yaml from all member repositories
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut all_charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
+
+        // Collect index.yaml from remote members and parse chart entries
+        let remote_indexes = proxy_helpers::collect_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            "index.yaml",
+            |bytes, _member_key| async move {
+                let yaml_str = String::from_utf8(bytes.to_vec()).map_err(|_| {
+                    (StatusCode::BAD_GATEWAY, "Invalid UTF-8 from upstream").into_response()
+                })?;
+                let index: HelmIndex = serde_yaml::from_str(&yaml_str).map_err(|_| {
+                    (StatusCode::BAD_GATEWAY, "Invalid index.yaml from upstream").into_response()
+                })?;
+                Ok(index)
+            },
+        )
+        .await?;
+
+        for (_member_key, index) in remote_indexes {
+            for (_chart_name, entries) in index.entries {
+                for entry in entries {
+                    // Rewrite URLs to point through the virtual repo
+                    let filename = format!("{}-{}.tgz", entry.chart.name, entry.chart.version);
+                    let url = format!("/helm/{}/charts/{}", repo_key, filename);
+                    all_charts.push((entry.chart, url, entry.created, entry.digest));
+                }
+            }
+        }
+
+        // Query artifacts from local/hosted members
+        for member in &members {
+            if member.repo_type == RepositoryType::Remote {
+                continue;
+            }
+
+            let rows = sqlx::query(
+                r#"
+                SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
+                       a.created_at,
+                       am.metadata
+                FROM artifacts a
+                LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+                WHERE a.repository_id = $1
+                  AND a.is_deleted = false
+                ORDER BY a.name ASC, a.created_at DESC
+                "#,
+            )
+            .bind(member.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Database error: {}", e),
+                )
+                    .into_response()
+            })?;
+
+            for row in &rows {
+                let name: String = row.get("name");
+                let version: Option<String> = row.get("version");
+                let checksum_sha256: String = row.get("checksum_sha256");
+                let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+                let metadata: Option<serde_json::Value> = row.get("metadata");
+
+                let version = match version {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let chart_yaml = metadata
+                    .as_ref()
+                    .and_then(|m| m.get("chart"))
+                    .and_then(|chart_value| {
+                        serde_json::from_value::<ChartYaml>(chart_value.clone()).ok()
+                    });
+
+                let chart_yaml = chart_yaml.unwrap_or_else(|| ChartYaml {
+                    api_version: "v2".to_string(),
+                    name: name.clone(),
+                    version: version.clone(),
+                    kube_version: None,
+                    description: metadata
+                        .as_ref()
+                        .and_then(|m| m.get("description"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    chart_type: None,
+                    keywords: None,
+                    home: None,
+                    sources: None,
+                    dependencies: None,
+                    maintainers: None,
+                    icon: None,
+                    app_version: metadata
+                        .as_ref()
+                        .and_then(|m| m.get("appVersion"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    deprecated: None,
+                    annotations: None,
+                });
+
+                let filename = format!("{}-{}.tgz", name, version);
+                let url = format!("/helm/{}/charts/{}", repo_key, filename);
+                let created = created_at.to_rfc3339();
+                let digest = checksum_sha256;
+
+                all_charts.push((chart_yaml, url, created, digest));
+            }
+        }
+
+        let index_content = generate_index_yaml(all_charts).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to generate index.yaml: {}", e),
+            )
+                .into_response()
+        })?;
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/x-yaml; charset=utf-8")
+            .body(Body::from(index_content))
+            .unwrap());
+    }
 
     // Query all non-deleted Helm artifacts with their metadata.
     // Using sqlx::query() (non-macro) since this is a new query not in the offline cache.
