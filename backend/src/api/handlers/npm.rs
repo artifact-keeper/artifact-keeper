@@ -205,63 +205,39 @@ async fn get_package_metadata(
                 }
             }
         }
-        // For virtual repos, iterate through members and try proxy for remote members
+        // For virtual repos, iterate through remote members and try proxy
         if repo.repo_type == RepositoryType::Virtual {
-            if let Some(ref proxy) = state.proxy_service {
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-
-                for member in &members {
-                    // Try local artifacts first
-                    let local_count: i64 = sqlx::query_scalar!(
-                        "SELECT COUNT(*) as \"count!\" FROM artifacts WHERE repository_id = $1 AND name = $2 AND is_deleted = false",
-                        member.id,
-                        package_name
-                    )
-                    .fetch_one(&state.db)
-                    .await
-                    .unwrap_or(0);
-
-                    if local_count > 0 {
-                        // Has local artifacts in this member, skip for now
-                        // (would need to build metadata from local artifacts — complex)
-                        continue;
-                    }
-
-                    // Try proxy for remote members
-                    if member.repo_type == RepositoryType::Remote {
-                        if let Some(ref upstream_url) = member.upstream_url {
-                            if let Ok((content, _ct)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                package_name,
-                            )
-                            .await
-                            {
-                                if let Ok(mut json) =
-                                    serde_json::from_slice::<serde_json::Value>(&content)
-                                {
-                                    rewrite_npm_tarball_urls(&mut json, &base_url, repo_key);
-                                    let rewritten =
-                                        serde_json::to_string(&json).unwrap_or_default();
-                                    return Ok(Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header(CONTENT_TYPE, "application/json")
-                                        .body(Body::from(rewritten))
-                                        .unwrap());
-                                }
-
-                                return Ok(Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(CONTENT_TYPE, "application/json")
-                                    .body(Body::from(content))
-                                    .unwrap());
-                            }
+            let base_url = base_url.clone();
+            let repo_key = repo_key.to_string();
+            return proxy_helpers::resolve_virtual_metadata(
+                &state.db,
+                state.proxy_service.as_deref(),
+                repo.id,
+                package_name,
+                |content, _member_key| {
+                    let base_url = base_url.clone();
+                    let repo_key = repo_key.clone();
+                    async move {
+                        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content)
+                        {
+                            rewrite_npm_tarball_urls(&mut json, &base_url, &repo_key);
+                            let rewritten = serde_json::to_string(&json).unwrap_or_default();
+                            Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(rewritten))
+                                .unwrap())
+                        } else {
+                            Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(content))
+                                .unwrap())
                         }
                     }
-                }
-            }
+                },
+            )
+            .await;
         }
 
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
