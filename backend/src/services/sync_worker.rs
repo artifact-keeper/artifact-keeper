@@ -9,10 +9,19 @@ use sqlx::PgPool;
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
+/// Default stale peer threshold in minutes (peers with no heartbeat for this
+/// long are marked offline).  Matches the admin settings default.
+const STALE_PEER_THRESHOLD_MINUTES: i32 = 5;
+
+/// How many ticks (10s each) between stale peer detection runs.
+/// 6 ticks = 60 seconds.
+const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
+
 /// Spawn the background sync worker.
 ///
 /// The worker runs in an infinite loop on a 10-second interval, picking up
-/// pending sync tasks and dispatching transfers to remote peers.
+/// pending sync tasks and dispatching transfers to remote peers.  Every 60
+/// seconds it also checks for stale peers and marks them offline.
 pub async fn spawn_sync_worker(db: PgPool) {
     tokio::spawn(async move {
         // Small startup delay so the server can finish initializing.
@@ -23,13 +32,40 @@ pub async fn spawn_sync_worker(db: PgPool) {
             .build()
             .expect("Failed to build HTTP client for sync worker");
 
+        let mut tick_count: u64 = 0;
+
         loop {
             tick.tick().await;
+            tick_count += 1;
+
+            // Periodically check for stale peers and mark them offline.
+            if tick_count % STALE_CHECK_INTERVAL_TICKS == 0 {
+                run_stale_peer_detection(&db).await;
+            }
+
             if let Err(e) = process_pending_tasks(&db, &client).await {
                 tracing::error!("Sync worker error: {e}");
             }
         }
     });
+}
+
+/// Detect peers that have not sent a heartbeat within the threshold and
+/// mark them offline.
+async fn run_stale_peer_detection(db: &PgPool) {
+    let peer_service = crate::services::peer_instance_service::PeerInstanceService::new(db.clone());
+    match peer_service
+        .mark_stale_offline(STALE_PEER_THRESHOLD_MINUTES)
+        .await
+    {
+        Ok(count) if count > 0 => {
+            tracing::info!("Marked {count} stale peer(s) as offline (no heartbeat for {STALE_PEER_THRESHOLD_MINUTES}+ minutes)");
+        }
+        Ok(_) => {} // No stale peers, nothing to log.
+        Err(e) => {
+            tracing::error!("Failed to run stale peer detection: {e}");
+        }
+    }
 }
 
 // ── Internal row types ──────────────────────────────────────────────────────
