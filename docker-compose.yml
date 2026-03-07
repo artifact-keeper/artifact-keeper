@@ -132,6 +132,7 @@ services:
       # Dependency-Track integration (API key auto-provisioned by dtrack-init)
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-true}
+      ALLOW_HTTP_INTEGRATIONS: "1"
       HOST: 0.0.0.0
       PORT: 8080
     volumes:

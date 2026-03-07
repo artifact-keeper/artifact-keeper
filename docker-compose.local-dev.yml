@@ -181,6 +181,7 @@ services:
       MEILISEARCH_API_KEY: artifact-keeper-dev-key
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: "true"
+      ALLOW_HTTP_INTEGRATIONS: "1"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: artifact-keeper
       HOST: 0.0.0.0
