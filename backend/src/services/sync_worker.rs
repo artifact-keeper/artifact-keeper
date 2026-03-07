@@ -67,6 +67,8 @@ struct TaskRow {
     checksum_sha256: String,
     task_type: String,
     replication_filter: Option<serde_json::Value>,
+    retry_count: i32,
+    max_retries: i32,
 }
 
 // ── Core logic ──────────────────────────────────────────────────────────────
@@ -92,6 +94,33 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
 
     if peers.is_empty() {
         return Ok(());
+    }
+
+    // Reset retriable failed tasks for peers that have recovered (backoff expired).
+    // This runs once per tick for all recovered peers in a single query.
+    let retried = sqlx::query(
+        r#"
+        UPDATE sync_tasks
+        SET status = 'pending', error_message = NULL, started_at = NULL, completed_at = NULL
+        WHERE status = 'failed'
+          AND retry_count < max_retries
+          AND peer_instance_id = ANY(
+              SELECT id FROM peer_instances
+              WHERE is_local = false
+                AND status IN ('online', 'syncing')
+                AND (backoff_until IS NULL OR backoff_until <= NOW())
+          )
+        "#,
+    )
+    .execute(db)
+    .await
+    .map_err(|e| format!("Failed to reset retriable tasks: {e}"))?;
+
+    if retried.rows_affected() > 0 {
+        tracing::info!(
+            "Reset {} failed sync task(s) for retry after peer recovery",
+            retried.rows_affected()
+        );
     }
 
     let now = Utc::now();
@@ -148,7 +177,9 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
                 a.content_type,
                 a.checksum_sha256,
                 st.task_type,
-                prs.replication_filter
+                prs.replication_filter,
+                st.retry_count,
+                st.max_retries
             FROM sync_tasks st
             JOIN artifacts a ON a.id = st.artifact_id
             JOIN repositories r ON r.id = a.repository_id
@@ -429,19 +460,46 @@ async fn handle_transfer_success(db: &PgPool, task: &TaskRow, bytes_transferred:
 }
 
 /// Handle a failed transfer: mark task, apply backoff, update peer counters.
+///
+/// If the task has remaining retries (`retry_count < max_retries`), it is
+/// marked `failed` with an incremented `retry_count`. The peer-recovery
+/// reset at the top of `process_pending_tasks` will flip it back to
+/// `pending` once the peer's backoff expires.
 async fn handle_transfer_failure(db: &PgPool, task: &TaskRow, error_message: &str) {
-    // Mark task as failed.
+    let new_retry_count = task.retry_count + 1;
+
+    // Mark task as failed with updated retry count.
     let _ = sqlx::query(
         r#"
         UPDATE sync_tasks
-        SET status = 'failed', completed_at = NOW(), error_message = $2
+        SET status = 'failed',
+            completed_at = NOW(),
+            error_message = $2,
+            retry_count = $3
         WHERE id = $1
         "#,
     )
     .bind(task.id)
     .bind(error_message)
+    .bind(new_retry_count)
     .execute(db)
     .await;
+
+    if new_retry_count < task.max_retries {
+        tracing::info!(
+            "Sync task {} failed (attempt {}/{}), will retry after peer recovery",
+            task.id,
+            new_retry_count,
+            task.max_retries
+        );
+    } else {
+        tracing::warn!(
+            "Sync task {} permanently failed after {} attempts: {}",
+            task.id,
+            new_retry_count,
+            error_message
+        );
+    }
 
     // Fetch current consecutive_failures to compute backoff.
     let consecutive: i32 =
