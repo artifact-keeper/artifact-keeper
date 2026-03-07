@@ -125,7 +125,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Download PKI assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: pki-assets
 
