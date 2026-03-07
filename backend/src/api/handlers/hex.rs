@@ -158,35 +158,20 @@ async fn package_info(
         // Virtual: iterate members in priority order, proxy from first remote that has it.
         if repo.repo_type == RepositoryType::Virtual {
             let upstream_path = format!("packages/{}", name);
-            if let Some(ref proxy) = state.proxy_service {
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-
-                for member in &members {
-                    if member.repo_type == RepositoryType::Remote {
-                        if let Some(ref upstream_url) = member.upstream_url {
-                            if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &upstream_path,
-                            )
-                            .await
-                            {
-                                return Ok(Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(
-                                        CONTENT_TYPE,
-                                        content_type
-                                            .unwrap_or_else(|| "application/json".to_string()),
-                                    )
-                                    .body(Body::from(content))
-                                    .unwrap());
-                            }
-                        }
-                    }
-                }
-            }
+            return proxy_helpers::resolve_virtual_metadata(
+                &state.db,
+                state.proxy_service.as_deref(),
+                repo.id,
+                &upstream_path,
+                |content, _member_key| async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(content))
+                        .unwrap())
+                },
+            )
+            .await;
         }
 
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
