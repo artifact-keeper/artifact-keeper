@@ -178,12 +178,13 @@ async fn index_yaml(
                     None => continue,
                 };
 
-                let chart_yaml = metadata
-                    .as_ref()
-                    .and_then(|m| m.get("chart"))
-                    .and_then(|chart_value| {
-                        serde_json::from_value::<ChartYaml>(chart_value.clone()).ok()
-                    });
+                let chart_yaml =
+                    metadata
+                        .as_ref()
+                        .and_then(|m| m.get("chart"))
+                        .and_then(|chart_value| {
+                            serde_json::from_value::<ChartYaml>(chart_value.clone()).ok()
+                        });
 
                 let chart_yaml = chart_yaml.unwrap_or_else(|| ChartYaml {
                     api_version: "v2".to_string(),

@@ -2233,11 +2233,7 @@ async fn build_virtual_repodata(
         &upstream_path,
         |bytes, _member_key| async move {
             parse_upstream_repodata(&bytes).ok_or_else(|| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "Failed to parse upstream repodata",
-                )
-                    .into_response()
+                (StatusCode::BAD_GATEWAY, "Failed to parse upstream repodata").into_response()
             })
         },
     )

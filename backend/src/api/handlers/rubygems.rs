@@ -584,7 +584,7 @@ async fn specs_index(
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 let artifacts = sqlx::query!(
-        r#"
+                    r#"
         SELECT name, version
         FROM artifacts
         WHERE repository_id = $1
@@ -623,13 +623,15 @@ async fn specs_index(
                 let mut decoder = GzDecoder::new(&bytes[..]);
                 let mut decompressed = Vec::new();
                 decoder.read_to_end(&mut decompressed).map_err(|_| {
-                    (StatusCode::BAD_GATEWAY, "Failed to decompress upstream specs")
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "Failed to decompress upstream specs",
+                    )
                         .into_response()
                 })?;
-                let parsed: Vec<serde_json::Value> =
-                    serde_json::from_slice(&decompressed).map_err(|_| {
-                        (StatusCode::BAD_GATEWAY, "Failed to parse upstream specs")
-                            .into_response()
+                let parsed: Vec<serde_json::Value> = serde_json::from_slice(&decompressed)
+                    .map_err(|_| {
+                        (StatusCode::BAD_GATEWAY, "Failed to parse upstream specs").into_response()
                     })?;
                 Ok(parsed)
             },
@@ -733,7 +735,7 @@ async fn latest_specs_index(
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 let artifacts = sqlx::query!(
-        r#"
+                    r#"
         SELECT DISTINCT ON (LOWER(name)) name, version
         FROM artifacts
         WHERE repository_id = $1
@@ -778,8 +780,8 @@ async fn latest_specs_index(
                     )
                         .into_response()
                 })?;
-                let parsed: Vec<serde_json::Value> =
-                    serde_json::from_slice(&decompressed).map_err(|_| {
+                let parsed: Vec<serde_json::Value> = serde_json::from_slice(&decompressed)
+                    .map_err(|_| {
                         (
                             StatusCode::BAD_GATEWAY,
                             "Failed to parse upstream latest specs",
