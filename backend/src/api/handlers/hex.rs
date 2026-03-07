@@ -160,7 +160,7 @@ async fn package_info(
             let upstream_path = format!("packages/{}", name);
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
-                state.proxy_service.as_ref().map(|s| s.as_ref()),
+                state.proxy_service.as_deref(),
                 repo.id,
                 &upstream_path,
                 |content, _member_key| async move {

@@ -211,7 +211,7 @@ async fn get_package_metadata(
             let repo_key = repo_key.to_string();
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
-                state.proxy_service.as_ref().map(|s| s.as_ref()),
+                state.proxy_service.as_deref(),
                 repo.id,
                 package_name,
                 |content, _member_key| {
