@@ -24,7 +24,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
 use tracing::info;
@@ -33,7 +33,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::rubygems::RubygemsHandler;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{Repository, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -565,6 +565,66 @@ async fn push_gem(
         .unwrap())
 }
 
+const SPECS_QUERY: &str = r#"
+    SELECT name, version
+    FROM artifacts
+    WHERE repository_id = $1
+      AND is_deleted = false
+    ORDER BY name, created_at DESC
+"#;
+
+const LATEST_SPECS_QUERY: &str = r#"
+    SELECT DISTINCT ON (LOWER(name)) name, version
+    FROM artifacts
+    WHERE repository_id = $1
+      AND is_deleted = false
+    ORDER BY LOWER(name), created_at DESC
+"#;
+
+/// Query gem specs from a single repository using the given SQL.
+async fn query_gem_specs(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
+    let rows = sqlx::query(sql)
+        .bind(repo_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let name: String = r.get("name");
+            let version: Option<String> = r.get("version");
+            serde_json::json!([name, version.unwrap_or_default(), "ruby"])
+        })
+        .collect())
+}
+
+/// Query gem specs from all local (non-remote) virtual members.
+async fn query_local_member_specs(
+    db: &PgPool,
+    members: &[Repository],
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
+    let mut all_specs = Vec::new();
+    for member in members {
+        if member.repo_type != RepositoryType::Remote {
+            let specs = query_gem_specs(db, member.id, sql).await?;
+            all_specs.extend(specs);
+        }
+    }
+    Ok(all_specs)
+}
+
 /// Decompress gzipped upstream spec data and parse as a JSON array of spec tuples.
 #[allow(clippy::result_large_err)]
 fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response> {
@@ -643,73 +703,15 @@ async fn specs_index(
     // Virtual repo: merge specs from all local and remote members
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        let mut all_specs: Vec<serde_json::Value> = Vec::new();
+        let mut all_specs = query_local_member_specs(&state.db, &members, SPECS_QUERY).await?;
 
-        // Local members
-        for member in &members {
-            if member.repo_type != RepositoryType::Remote {
-                let artifacts = sqlx::query!(
-                    r#"
-        SELECT name, version
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-        ORDER BY name, created_at DESC
-        "#,
-                    member.id
-                )
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Database error: {}", e),
-                    )
-                        .into_response()
-                })?;
-
-                for a in &artifacts {
-                    all_specs.push(serde_json::json!([
-                        a.name,
-                        a.version.clone().unwrap_or_default(),
-                        "ruby"
-                    ]));
-                }
-            }
-        }
-
-        // Remote members
         let remote = collect_remote_specs(&state, repo.id, "specs.4.8.gz").await?;
         all_specs.extend(remote);
 
         return specs_to_gzip_response(&all_specs);
     }
 
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT name, version
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-        ORDER BY name, created_at DESC
-        "#,
-        repo.id
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let specs: Vec<serde_json::Value> = artifacts
-        .iter()
-        .map(|a| serde_json::json!([a.name, a.version.clone().unwrap_or_default(), "ruby"]))
-        .collect();
-
+    let specs = query_gem_specs(&state.db, repo.id, SPECS_QUERY).await?;
     specs_to_gzip_response(&specs)
 }
 
@@ -727,42 +729,9 @@ async fn latest_specs_index(
     // then deduplicate by gem name (keep the first occurrence per name).
     if repo.repo_type == RepositoryType::Virtual {
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        let mut all_specs: Vec<serde_json::Value> = Vec::new();
+        let mut all_specs =
+            query_local_member_specs(&state.db, &members, LATEST_SPECS_QUERY).await?;
 
-        // Local members (already deduplicated per-member via DISTINCT ON)
-        for member in &members {
-            if member.repo_type != RepositoryType::Remote {
-                let artifacts = sqlx::query!(
-                    r#"
-        SELECT DISTINCT ON (LOWER(name)) name, version
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-        ORDER BY LOWER(name), created_at DESC
-        "#,
-                    member.id
-                )
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Database error: {}", e),
-                    )
-                        .into_response()
-                })?;
-
-                for a in &artifacts {
-                    all_specs.push(serde_json::json!([
-                        a.name,
-                        a.version.clone().unwrap_or_default(),
-                        "ruby"
-                    ]));
-                }
-            }
-        }
-
-        // Remote members
         let remote = collect_remote_specs(&state, repo.id, "latest_specs.4.8.gz").await?;
         all_specs.extend(remote);
 
@@ -781,32 +750,7 @@ async fn latest_specs_index(
         return specs_to_gzip_response(&all_specs);
     }
 
-    // Get latest version of each gem using DISTINCT ON
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT DISTINCT ON (LOWER(name)) name, version
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-        ORDER BY LOWER(name), created_at DESC
-        "#,
-        repo.id
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let specs: Vec<serde_json::Value> = artifacts
-        .iter()
-        .map(|a| serde_json::json!([a.name, a.version.clone().unwrap_or_default(), "ruby"]))
-        .collect();
-
+    let specs = query_gem_specs(&state.db, repo.id, LATEST_SPECS_QUERY).await?;
     specs_to_gzip_response(&specs)
 }
 

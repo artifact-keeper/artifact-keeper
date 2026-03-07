@@ -93,6 +93,110 @@ async fn resolve_helm_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Resp
     })
 }
 
+/// Query Helm chart artifacts from a repository and append chart entries to `out`.
+async fn query_charts_from_repo(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    out: &mut Vec<(ChartYaml, String, String, String)>,
+) -> Result<(), Response> {
+    let rows = sqlx::query(
+        r#"
+        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.created_at,
+               am.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+        ORDER BY a.name ASC, a.created_at DESC
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    for row in &rows {
+        let name: String = row.get("name");
+        let version: Option<String> = row.get("version");
+        let checksum_sha256: String = row.get("checksum_sha256");
+        let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+        let metadata: Option<serde_json::Value> = row.get("metadata");
+
+        let version = match version {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let chart_yaml = metadata
+            .as_ref()
+            .and_then(|m| m.get("chart"))
+            .and_then(|chart_value| serde_json::from_value::<ChartYaml>(chart_value.clone()).ok());
+
+        let chart_yaml = chart_yaml.unwrap_or_else(|| ChartYaml {
+            api_version: "v2".to_string(),
+            name: name.clone(),
+            version: version.clone(),
+            kube_version: None,
+            description: metadata
+                .as_ref()
+                .and_then(|m| m.get("description"))
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            chart_type: None,
+            keywords: None,
+            home: None,
+            sources: None,
+            dependencies: None,
+            maintainers: None,
+            icon: None,
+            app_version: metadata
+                .as_ref()
+                .and_then(|m| m.get("appVersion"))
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            deprecated: None,
+            annotations: None,
+        });
+
+        let filename = format!("{}-{}.tgz", name, version);
+        let url = format!("/helm/{}/charts/{}", repo_key, filename);
+        let created = created_at.to_rfc3339();
+        let digest = checksum_sha256;
+
+        out.push((chart_yaml, url, created, digest));
+    }
+
+    Ok(())
+}
+
+/// Generate index.yaml content and wrap in a YAML response.
+#[allow(clippy::result_large_err)]
+fn build_index_response(
+    charts: Vec<(ChartYaml, String, String, String)>,
+) -> Result<Response, Response> {
+    let index_content = generate_index_yaml(charts).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to generate index.yaml: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-yaml; charset=utf-8")
+        .body(Body::from(index_content))
+        .unwrap())
+}
+
 // ---------------------------------------------------------------------------
 // GET /helm/{repo_key}/index.yaml -- Helm repository index
 // ---------------------------------------------------------------------------
@@ -129,7 +233,6 @@ async fn index_yaml(
         for (_member_key, index) in remote_indexes {
             for (_chart_name, entries) in index.entries {
                 for entry in entries {
-                    // Rewrite URLs to point through the virtual repo
                     let filename = format!("{}-{}.tgz", entry.chart.name, entry.chart.version);
                     let url = format!("/helm/{}/charts/{}", repo_key, filename);
                     all_charts.push((entry.chart, url, entry.created, entry.digest));
@@ -139,197 +242,17 @@ async fn index_yaml(
 
         // Query artifacts from local/hosted members
         for member in &members {
-            if member.repo_type == RepositoryType::Remote {
-                continue;
-            }
-
-            let rows = sqlx::query(
-                r#"
-                SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
-                       a.created_at,
-                       am.metadata
-                FROM artifacts a
-                LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-                WHERE a.repository_id = $1
-                  AND a.is_deleted = false
-                ORDER BY a.name ASC, a.created_at DESC
-                "#,
-            )
-            .bind(member.id)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Database error: {}", e),
-                )
-                    .into_response()
-            })?;
-
-            for row in &rows {
-                let name: String = row.get("name");
-                let version: Option<String> = row.get("version");
-                let checksum_sha256: String = row.get("checksum_sha256");
-                let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-                let metadata: Option<serde_json::Value> = row.get("metadata");
-
-                let version = match version {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let chart_yaml =
-                    metadata
-                        .as_ref()
-                        .and_then(|m| m.get("chart"))
-                        .and_then(|chart_value| {
-                            serde_json::from_value::<ChartYaml>(chart_value.clone()).ok()
-                        });
-
-                let chart_yaml = chart_yaml.unwrap_or_else(|| ChartYaml {
-                    api_version: "v2".to_string(),
-                    name: name.clone(),
-                    version: version.clone(),
-                    kube_version: None,
-                    description: metadata
-                        .as_ref()
-                        .and_then(|m| m.get("description"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    chart_type: None,
-                    keywords: None,
-                    home: None,
-                    sources: None,
-                    dependencies: None,
-                    maintainers: None,
-                    icon: None,
-                    app_version: metadata
-                        .as_ref()
-                        .and_then(|m| m.get("appVersion"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    deprecated: None,
-                    annotations: None,
-                });
-
-                let filename = format!("{}-{}.tgz", name, version);
-                let url = format!("/helm/{}/charts/{}", repo_key, filename);
-                let created = created_at.to_rfc3339();
-                let digest = checksum_sha256;
-
-                all_charts.push((chart_yaml, url, created, digest));
+            if member.repo_type != RepositoryType::Remote {
+                query_charts_from_repo(&state.db, member.id, &repo_key, &mut all_charts).await?;
             }
         }
 
-        let index_content = generate_index_yaml(all_charts).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to generate index.yaml: {}", e),
-            )
-                .into_response()
-        })?;
-
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/x-yaml; charset=utf-8")
-            .body(Body::from(index_content))
-            .unwrap());
+        return build_index_response(all_charts);
     }
 
-    // Query all non-deleted Helm artifacts with their metadata.
-    // Using sqlx::query() (non-macro) since this is a new query not in the offline cache.
-    let rows = sqlx::query(
-        r#"
-        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               a.created_at,
-               am.metadata
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-        ORDER BY a.name ASC, a.created_at DESC
-        "#,
-    )
-    .bind(repo.id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Build chart entries for index generation
     let mut charts: Vec<(ChartYaml, String, String, String)> = Vec::new();
-
-    for row in &rows {
-        let name: String = row.get("name");
-        let version: Option<String> = row.get("version");
-        let checksum_sha256: String = row.get("checksum_sha256");
-        let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
-        let metadata: Option<serde_json::Value> = row.get("metadata");
-
-        let version = match version {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Try to reconstruct ChartYaml from stored metadata
-        let chart_yaml = metadata
-            .as_ref()
-            .and_then(|m| m.get("chart"))
-            .and_then(|chart_value| serde_json::from_value::<ChartYaml>(chart_value.clone()).ok());
-
-        // Fall back to a minimal ChartYaml if metadata is missing
-        let chart_yaml = chart_yaml.unwrap_or_else(|| ChartYaml {
-            api_version: "v2".to_string(),
-            name: name.clone(),
-            version: version.clone(),
-            kube_version: None,
-            description: metadata
-                .as_ref()
-                .and_then(|m| m.get("description"))
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            chart_type: None,
-            keywords: None,
-            home: None,
-            sources: None,
-            dependencies: None,
-            maintainers: None,
-            icon: None,
-            app_version: metadata
-                .as_ref()
-                .and_then(|m| m.get("appVersion"))
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            deprecated: None,
-            annotations: None,
-        });
-
-        let filename = format!("{}-{}.tgz", name, version);
-        let url = format!("/helm/{}/charts/{}", repo_key, filename);
-        let created = created_at.to_rfc3339();
-        let digest = checksum_sha256;
-
-        charts.push((chart_yaml, url, created, digest));
-    }
-
-    let index_content = generate_index_yaml(charts).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to generate index.yaml: {}", e),
-        )
-            .into_response()
-    })?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/x-yaml; charset=utf-8")
-        .body(Body::from(index_content))
-        .unwrap())
+    query_charts_from_repo(&state.db, repo.id, &repo_key, &mut charts).await?;
+    build_index_response(charts)
 }
 
 // ---------------------------------------------------------------------------
