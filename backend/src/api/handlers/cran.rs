@@ -107,6 +107,53 @@ async fn resolve_cran_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Resp
     })
 }
 
+/// Build a combined PACKAGES index from all virtual repository members.
+/// Collects local member indexes via `build_source_index` and remote
+/// member indexes via proxy, concatenating them with newline separators.
+async fn build_virtual_combined_index(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+) -> Result<String, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    let mut combined = String::new();
+
+    for member in &members {
+        if member.repo_type != RepositoryType::Remote {
+            let local_index = build_source_index(&state.db, member.id).await?;
+            if !local_index.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&local_index);
+            }
+        }
+    }
+
+    let remote_indexes = proxy_helpers::collect_virtual_metadata(
+        &state.db,
+        state.proxy_service.as_deref(),
+        virtual_repo_id,
+        "src/contrib/PACKAGES",
+        |bytes, _member_key| async move {
+            String::from_utf8(bytes.to_vec()).map_err(|_| {
+                (StatusCode::BAD_GATEWAY, "Invalid UTF-8 from upstream").into_response()
+            })
+        },
+    )
+    .await?;
+
+    for (_key, remote_index) in remote_indexes {
+        if !remote_index.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&remote_index);
+        }
+    }
+
+    Ok(combined)
+}
+
 // ---------------------------------------------------------------------------
 // GET /cran/{repo_key}/src/contrib/PACKAGES — Package index (text format)
 // ---------------------------------------------------------------------------
@@ -118,45 +165,7 @@ async fn package_index(
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        let mut combined = String::new();
-
-        // Collect local member indexes
-        for member in &members {
-            if member.repo_type != RepositoryType::Remote {
-                let local_index = build_source_index(&state.db, member.id).await?;
-                if !local_index.is_empty() {
-                    if !combined.is_empty() {
-                        combined.push('\n');
-                    }
-                    combined.push_str(&local_index);
-                }
-            }
-        }
-
-        // Collect remote member indexes
-        let remote_indexes = proxy_helpers::collect_virtual_metadata(
-            &state.db,
-            state.proxy_service.as_deref(),
-            repo.id,
-            "src/contrib/PACKAGES",
-            |bytes, _member_key| async move {
-                String::from_utf8(bytes.to_vec()).map_err(|_| {
-                    (StatusCode::BAD_GATEWAY, "Invalid UTF-8 from upstream").into_response()
-                })
-            },
-        )
-        .await?;
-
-        for (_key, remote_index) in remote_indexes {
-            if !remote_index.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str(&remote_index);
-            }
-        }
-
+        let combined = build_virtual_combined_index(&state, repo.id).await?;
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -186,45 +195,7 @@ async fn package_index_gz(
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
     if repo.repo_type == RepositoryType::Virtual {
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        let mut combined = String::new();
-
-        // Collect local member indexes
-        for member in &members {
-            if member.repo_type != RepositoryType::Remote {
-                let local_index = build_source_index(&state.db, member.id).await?;
-                if !local_index.is_empty() {
-                    if !combined.is_empty() {
-                        combined.push('\n');
-                    }
-                    combined.push_str(&local_index);
-                }
-            }
-        }
-
-        // Collect remote member indexes
-        let remote_indexes = proxy_helpers::collect_virtual_metadata(
-            &state.db,
-            state.proxy_service.as_deref(),
-            repo.id,
-            "src/contrib/PACKAGES",
-            |bytes, _member_key| async move {
-                String::from_utf8(bytes.to_vec()).map_err(|_| {
-                    (StatusCode::BAD_GATEWAY, "Invalid UTF-8 from upstream").into_response()
-                })
-            },
-        )
-        .await?;
-
-        for (_key, remote_index) in remote_indexes {
-            if !remote_index.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str(&remote_index);
-            }
-        }
-
+        let combined = build_virtual_combined_index(&state, repo.id).await?;
         let compressed = gzip_compress(combined.as_bytes()).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

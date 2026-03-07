@@ -565,6 +565,71 @@ async fn push_gem(
         .unwrap())
 }
 
+/// Decompress gzipped upstream spec data and parse as a JSON array of spec tuples.
+#[allow(clippy::result_large_err)]
+fn parse_upstream_specs(bytes: &[u8]) -> Result<Vec<serde_json::Value>, Response> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to decompress upstream specs",
+        )
+            .into_response()
+    })?;
+    serde_json::from_slice(&decompressed)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "Failed to parse upstream specs").into_response())
+}
+
+/// Collect remote specs from virtual members, decompress and parse each one.
+async fn collect_remote_specs(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    upstream_path: &str,
+) -> Result<Vec<serde_json::Value>, Response> {
+    let remote_specs = proxy_helpers::collect_virtual_metadata(
+        &state.db,
+        state.proxy_service.as_deref(),
+        virtual_repo_id,
+        upstream_path,
+        |bytes, _member_key| async move { parse_upstream_specs(&bytes) },
+    )
+    .await?;
+
+    let mut all = Vec::new();
+    for (_key, specs) in remote_specs {
+        all.extend(specs);
+    }
+    Ok(all)
+}
+
+/// Serialize specs to JSON, gzip-compress, and return as a response.
+#[allow(clippy::result_large_err)]
+fn specs_to_gzip_response(specs: &[serde_json::Value]) -> Result<Response, Response> {
+    let json_bytes = serde_json::to_vec(specs).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Serialization error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let compressed = gzip_compress(&json_bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Compression error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/gzip")
+        .header(CONTENT_LENGTH, compressed.len().to_string())
+        .body(Body::from(compressed))
+        .unwrap())
+}
+
 // ---------------------------------------------------------------------------
 // GET /gems/{repo_key}/specs.4.8.gz — Full spec index (gzipped JSON)
 // ---------------------------------------------------------------------------
@@ -614,56 +679,10 @@ async fn specs_index(
         }
 
         // Remote members
-        let remote_specs = proxy_helpers::collect_virtual_metadata(
-            &state.db,
-            state.proxy_service.as_deref(),
-            repo.id,
-            "specs.4.8.gz",
-            |bytes, _member_key| async move {
-                let mut decoder = GzDecoder::new(&bytes[..]);
-                let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed).map_err(|_| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        "Failed to decompress upstream specs",
-                    )
-                        .into_response()
-                })?;
-                let parsed: Vec<serde_json::Value> = serde_json::from_slice(&decompressed)
-                    .map_err(|_| {
-                        (StatusCode::BAD_GATEWAY, "Failed to parse upstream specs").into_response()
-                    })?;
-                Ok(parsed)
-            },
-        )
-        .await?;
+        let remote = collect_remote_specs(&state, repo.id, "specs.4.8.gz").await?;
+        all_specs.extend(remote);
 
-        for (_key, specs) in remote_specs {
-            all_specs.extend(specs);
-        }
-
-        let json_bytes = serde_json::to_vec(&all_specs).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Serialization error: {}", e),
-            )
-                .into_response()
-        })?;
-
-        let compressed = gzip_compress(&json_bytes).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Compression error: {}", e),
-            )
-                .into_response()
-        })?;
-
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/gzip")
-            .header(CONTENT_LENGTH, compressed.len().to_string())
-            .body(Body::from(compressed))
-            .unwrap());
+        return specs_to_gzip_response(&all_specs);
     }
 
     let artifacts = sqlx::query!(
@@ -691,28 +710,7 @@ async fn specs_index(
         .map(|a| serde_json::json!([a.name, a.version.clone().unwrap_or_default(), "ruby"]))
         .collect();
 
-    let json_bytes = serde_json::to_vec(&specs).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Serialization error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let compressed = gzip_compress(&json_bytes).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Compression error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/gzip")
-        .header(CONTENT_LENGTH, compressed.len().to_string())
-        .body(Body::from(compressed))
-        .unwrap())
+    specs_to_gzip_response(&specs)
 }
 
 // ---------------------------------------------------------------------------
@@ -765,37 +763,8 @@ async fn latest_specs_index(
         }
 
         // Remote members
-        let remote_specs = proxy_helpers::collect_virtual_metadata(
-            &state.db,
-            state.proxy_service.as_deref(),
-            repo.id,
-            "latest_specs.4.8.gz",
-            |bytes, _member_key| async move {
-                let mut decoder = GzDecoder::new(&bytes[..]);
-                let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed).map_err(|_| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        "Failed to decompress upstream latest specs",
-                    )
-                        .into_response()
-                })?;
-                let parsed: Vec<serde_json::Value> = serde_json::from_slice(&decompressed)
-                    .map_err(|_| {
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            "Failed to parse upstream latest specs",
-                        )
-                            .into_response()
-                    })?;
-                Ok(parsed)
-            },
-        )
-        .await?;
-
-        for (_key, specs) in remote_specs {
-            all_specs.extend(specs);
-        }
+        let remote = collect_remote_specs(&state, repo.id, "latest_specs.4.8.gz").await?;
+        all_specs.extend(remote);
 
         // Deduplicate by gem name, keeping the first occurrence (higher-priority member wins)
         let mut seen = std::collections::HashSet::new();
@@ -809,28 +778,7 @@ async fn latest_specs_index(
             seen.insert(name)
         });
 
-        let json_bytes = serde_json::to_vec(&all_specs).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Serialization error: {}", e),
-            )
-                .into_response()
-        })?;
-
-        let compressed = gzip_compress(&json_bytes).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Compression error: {}", e),
-            )
-                .into_response()
-        })?;
-
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/gzip")
-            .header(CONTENT_LENGTH, compressed.len().to_string())
-            .body(Body::from(compressed))
-            .unwrap());
+        return specs_to_gzip_response(&all_specs);
     }
 
     // Get latest version of each gem using DISTINCT ON
@@ -859,28 +807,7 @@ async fn latest_specs_index(
         .map(|a| serde_json::json!([a.name, a.version.clone().unwrap_or_default(), "ruby"]))
         .collect();
 
-    let json_bytes = serde_json::to_vec(&specs).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Serialization error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let compressed = gzip_compress(&json_bytes).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Compression error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/gzip")
-        .header(CONTENT_LENGTH, compressed.len().to_string())
-        .body(Body::from(compressed))
-        .unwrap())
+    specs_to_gzip_response(&specs)
 }
 
 // ---------------------------------------------------------------------------
