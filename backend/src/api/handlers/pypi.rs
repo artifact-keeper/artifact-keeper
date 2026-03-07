@@ -244,38 +244,21 @@ async fn simple_project(
         }
         // For virtual repos, iterate through members and try proxy for remote members
         if repo.repo_type == RepositoryType::Virtual {
-            if let Some(ref proxy) = state.proxy_service {
-                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-
-                for member in &members {
-                    // Try proxy for remote members
-                    if member.repo_type == RepositoryType::Remote {
-                        if let Some(ref upstream_url) = member.upstream_url {
-                            let upstream_path = format!("simple/{}/", normalized);
-                            if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &upstream_path,
-                            )
-                            .await
-                            {
-                                return Ok(Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(
-                                        CONTENT_TYPE,
-                                        content_type.unwrap_or_else(|| {
-                                            "text/html; charset=utf-8".to_string()
-                                        }),
-                                    )
-                                    .body(Body::from(content))
-                                    .unwrap());
-                            }
-                        }
-                    }
-                }
-            }
+            let upstream_path = format!("simple/{}/", normalized);
+            return proxy_helpers::resolve_virtual_metadata(
+                &state.db,
+                state.proxy_service.as_deref(),
+                repo.id,
+                &upstream_path,
+                |content, _member_key| async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                        .body(Body::from(content))
+                        .unwrap())
+                },
+            )
+            .await;
         }
 
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
