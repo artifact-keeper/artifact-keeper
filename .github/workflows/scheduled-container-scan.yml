@@ -36,7 +36,7 @@ jobs:
       # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
       - name: Install Trivy
         run: |
-          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.1)
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.3)
           docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
           docker rm "$CONTAINER_ID"
           trivy --version
