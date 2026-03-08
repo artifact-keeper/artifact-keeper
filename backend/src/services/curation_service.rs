@@ -4,7 +4,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::curation::CurationRule;
+use crate::models::curation::{CurationPackage, CurationRule};
 
 /// Result of evaluating a package against curation rules.
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +112,282 @@ impl CurationService {
             reason: format!("No matching rule; default action: {default_action}"),
             rule_id: None,
         })
+    }
+
+    // ---------------------------------------------------------------------------
+    // Rule CRUD
+    // ---------------------------------------------------------------------------
+
+    pub async fn create_rule(
+        &self,
+        staging_repo_id: Option<Uuid>,
+        package_pattern: &str,
+        version_constraint: &str,
+        architecture: &str,
+        action: &str,
+        priority: i32,
+        reason: &str,
+        created_by: Uuid,
+    ) -> Result<CurationRule, sqlx::Error> {
+        sqlx::query_as(
+            r#"INSERT INTO curation_rules
+               (staging_repo_id, package_pattern, version_constraint, architecture, action, priority, reason, created_by)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING *"#,
+        )
+        .bind(staging_repo_id)
+        .bind(package_pattern)
+        .bind(version_constraint)
+        .bind(architecture)
+        .bind(action)
+        .bind(priority)
+        .bind(reason)
+        .bind(created_by)
+        .fetch_one(&self.db)
+        .await
+    }
+
+    pub async fn list_rules(&self, staging_repo_id: Option<Uuid>) -> Result<Vec<CurationRule>, sqlx::Error> {
+        if let Some(repo_id) = staging_repo_id {
+            sqlx::query_as(
+                r#"SELECT * FROM curation_rules
+                   WHERE staging_repo_id = $1 OR staging_repo_id IS NULL
+                   ORDER BY priority ASC, created_at ASC"#,
+            )
+            .bind(repo_id)
+            .fetch_all(&self.db)
+            .await
+        } else {
+            sqlx::query_as(
+                r#"SELECT * FROM curation_rules
+                   ORDER BY priority ASC, created_at ASC"#,
+            )
+            .fetch_all(&self.db)
+            .await
+        }
+    }
+
+    pub async fn update_rule(
+        &self,
+        rule_id: Uuid,
+        package_pattern: &str,
+        version_constraint: &str,
+        architecture: &str,
+        action: &str,
+        priority: i32,
+        reason: &str,
+        enabled: bool,
+    ) -> Result<CurationRule, sqlx::Error> {
+        sqlx::query_as(
+            r#"UPDATE curation_rules SET
+               package_pattern = $2, version_constraint = $3, architecture = $4,
+               action = $5, priority = $6, reason = $7, enabled = $8, updated_at = now()
+               WHERE id = $1
+               RETURNING *"#,
+        )
+        .bind(rule_id)
+        .bind(package_pattern)
+        .bind(version_constraint)
+        .bind(architecture)
+        .bind(action)
+        .bind(priority)
+        .bind(reason)
+        .bind(enabled)
+        .fetch_one(&self.db)
+        .await
+    }
+
+    pub async fn delete_rule(&self, rule_id: Uuid) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM curation_rules WHERE id = $1")
+            .bind(rule_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Package catalog
+    // ---------------------------------------------------------------------------
+
+    pub async fn upsert_package(
+        &self,
+        staging_repo_id: Uuid,
+        remote_repo_id: Uuid,
+        format: &str,
+        package_name: &str,
+        version: &str,
+        release: Option<&str>,
+        architecture: Option<&str>,
+        checksum_sha256: Option<&str>,
+        upstream_path: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<CurationPackage, sqlx::Error> {
+        sqlx::query_as(
+            r#"INSERT INTO curation_packages
+               (staging_repo_id, remote_repo_id, format, package_name, version, release,
+                architecture, checksum_sha256, upstream_path, metadata)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+               ON CONFLICT (staging_repo_id, format, package_name, version,
+                           COALESCE(release, ''), COALESCE(architecture, ''))
+               DO UPDATE SET checksum_sha256 = EXCLUDED.checksum_sha256,
+                            upstream_path = EXCLUDED.upstream_path,
+                            metadata = EXCLUDED.metadata,
+                            upstream_updated_at = now()
+               RETURNING *"#,
+        )
+        .bind(staging_repo_id)
+        .bind(remote_repo_id)
+        .bind(format)
+        .bind(package_name)
+        .bind(version)
+        .bind(release)
+        .bind(architecture)
+        .bind(checksum_sha256)
+        .bind(upstream_path)
+        .bind(metadata)
+        .fetch_one(&self.db)
+        .await
+    }
+
+    pub async fn list_packages(
+        &self,
+        staging_repo_id: Uuid,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CurationPackage>, sqlx::Error> {
+        if let Some(status) = status {
+            sqlx::query_as(
+                r#"SELECT * FROM curation_packages
+                   WHERE staging_repo_id = $1 AND status = $2
+                   ORDER BY package_name ASC, version ASC
+                   LIMIT $3 OFFSET $4"#,
+            )
+            .bind(staging_repo_id)
+            .bind(status)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+        } else {
+            sqlx::query_as(
+                r#"SELECT * FROM curation_packages
+                   WHERE staging_repo_id = $1
+                   ORDER BY package_name ASC, version ASC
+                   LIMIT $2 OFFSET $3"#,
+            )
+            .bind(staging_repo_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+        }
+    }
+
+    pub async fn get_package(&self, id: Uuid) -> Result<CurationPackage, sqlx::Error> {
+        sqlx::query_as("SELECT * FROM curation_packages WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+    }
+
+    pub async fn set_package_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        reason: &str,
+        evaluated_by: Option<Uuid>,
+        rule_id: Option<Uuid>,
+    ) -> Result<CurationPackage, sqlx::Error> {
+        sqlx::query_as(
+            r#"UPDATE curation_packages SET
+               status = $2, evaluation_reason = $3, evaluated_by = $4,
+               rule_id = $5, evaluated_at = now()
+               WHERE id = $1
+               RETURNING *"#,
+        )
+        .bind(id)
+        .bind(status)
+        .bind(reason)
+        .bind(evaluated_by)
+        .bind(rule_id)
+        .fetch_one(&self.db)
+        .await
+    }
+
+    pub async fn bulk_set_status(
+        &self,
+        ids: &[Uuid],
+        status: &str,
+        reason: &str,
+        evaluated_by: Option<Uuid>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"UPDATE curation_packages SET
+               status = $2, evaluation_reason = $3, evaluated_by = $4, evaluated_at = now()
+               WHERE id = ANY($1)"#,
+        )
+        .bind(ids)
+        .bind(status)
+        .bind(reason)
+        .bind(evaluated_by)
+        .execute(&self.db)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn count_by_status(
+        &self,
+        staging_repo_id: Uuid,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"SELECT status, COUNT(*) as count
+               FROM curation_packages
+               WHERE staging_repo_id = $1
+               GROUP BY status"#,
+        )
+        .bind(staging_repo_id)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Evaluate all pending packages against current rules and update their status.
+    pub async fn re_evaluate_pending(
+        &self,
+        staging_repo_id: Uuid,
+        default_action: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let pending: Vec<CurationPackage> = sqlx::query_as(
+            "SELECT * FROM curation_packages WHERE staging_repo_id = $1 AND status = 'pending'",
+        )
+        .bind(staging_repo_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        let mut updated = 0u64;
+        for pkg in &pending {
+            let eval = self
+                .evaluate_package(
+                    staging_repo_id,
+                    default_action,
+                    &pkg.package_name,
+                    &pkg.version,
+                    pkg.architecture.as_deref(),
+                )
+                .await?;
+
+            let new_status = match eval.action.as_str() {
+                "allow" => "approved",
+                "block" => "blocked",
+                _ => "review",
+            };
+
+            self.set_package_status(pkg.id, new_status, &eval.reason, None, eval.rule_id)
+                .await?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 }
 
