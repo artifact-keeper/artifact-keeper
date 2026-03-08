@@ -36,6 +36,24 @@ pub(crate) fn stale_check_period_secs() -> u64 {
     TICK_INTERVAL_SECS * STALE_CHECK_INTERVAL_TICKS
 }
 
+/// Build a log message for a stale peer detection result.
+///
+/// Returns `Some(message)` when peers were marked offline, `None` when
+/// no peers were stale.
+pub(crate) fn format_stale_detection_log(
+    marked_count: u64,
+    threshold_minutes: i32,
+) -> Option<String> {
+    if marked_count > 0 {
+        Some(format!(
+            "Marked {} stale peer(s) as offline (no heartbeat for {}+ minutes)",
+            marked_count, threshold_minutes
+        ))
+    } else {
+        None
+    }
+}
+
 /// Spawn the background sync worker.
 ///
 /// The worker runs in an infinite loop on a 10-second interval, picking up
@@ -77,10 +95,11 @@ async fn run_stale_peer_detection(db: &PgPool) {
         .mark_stale_offline(STALE_PEER_THRESHOLD_MINUTES)
         .await
     {
-        Ok(count) if count > 0 => {
-            tracing::info!("Marked {count} stale peer(s) as offline (no heartbeat for {STALE_PEER_THRESHOLD_MINUTES}+ minutes)");
+        Ok(count) => {
+            if let Some(msg) = format_stale_detection_log(count, STALE_PEER_THRESHOLD_MINUTES) {
+                tracing::info!("{}", msg);
+            }
         }
-        Ok(_) => {} // No stale peers, nothing to log.
         Err(e) => {
             tracing::error!("Failed to run stale peer detection: {e}");
         }
@@ -1155,5 +1174,43 @@ mod tests {
     #[test]
     fn test_tick_interval_constant() {
         assert_eq!(TICK_INTERVAL_SECS, 10);
+    }
+
+    // ── format_stale_detection_log ──────────────────────────────────────
+
+    #[test]
+    fn test_format_stale_log_some_peers() {
+        let msg = format_stale_detection_log(3, 5);
+        assert!(msg.is_some());
+        let text = msg.unwrap();
+        assert!(text.contains("3 stale peer(s)"));
+        assert!(text.contains("5+ minutes"));
+    }
+
+    #[test]
+    fn test_format_stale_log_one_peer() {
+        let msg = format_stale_detection_log(1, 5);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("1 stale peer(s)"));
+    }
+
+    #[test]
+    fn test_format_stale_log_zero_peers() {
+        let msg = format_stale_detection_log(0, 5);
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn test_format_stale_log_custom_threshold() {
+        let msg = format_stale_detection_log(2, 10);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("10+ minutes"));
+    }
+
+    #[test]
+    fn test_format_stale_log_large_count() {
+        let msg = format_stale_detection_log(100, 5);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("100 stale peer(s)"));
     }
 }
