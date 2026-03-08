@@ -459,14 +459,36 @@ async fn handle_transfer_success(db: &PgPool, task: &TaskRow, bytes_transferred:
     .await;
 }
 
-/// Check whether a sync task is eligible for automatic retry.
-///
-/// A task is retriable when it has not yet exhausted its `max_retries` limit.
-/// The `retry_count` passed here should be the **new** count (after incrementing
-/// for the current failure).
-pub(crate) fn is_task_retriable(new_retry_count: i32, max_retries: i32) -> bool {
-    new_retry_count < max_retries
+/// Outcome of evaluating a sync task failure.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RetryDecision {
+    /// Task will be retried once the peer recovers.
+    WillRetry { attempt: i32, max_retries: i32 },
+    /// Task has exhausted all retry attempts and is permanently failed.
+    PermanentlyFailed { total_attempts: i32 },
 }
+
+/// Evaluate the outcome of a sync task failure.
+///
+/// Increments the retry counter and decides whether the task should be
+/// retried or permanently marked as failed.
+pub(crate) fn evaluate_task_failure(retry_count: i32, max_retries: i32) -> RetryDecision {
+    let new_count = retry_count + 1;
+    if new_count < max_retries {
+        RetryDecision::WillRetry {
+            attempt: new_count,
+            max_retries,
+        }
+    } else {
+        RetryDecision::PermanentlyFailed {
+            total_attempts: new_count,
+        }
+    }
+}
+
+/// Default maximum retries for sync tasks (matches migration default).
+#[allow(dead_code)]
+pub(crate) const DEFAULT_MAX_RETRIES: i32 = 3;
 
 /// Handle a failed transfer: mark task, apply backoff, update peer counters.
 ///
@@ -475,7 +497,11 @@ pub(crate) fn is_task_retriable(new_retry_count: i32, max_retries: i32) -> bool 
 /// reset at the top of `process_pending_tasks` will flip it back to
 /// `pending` once the peer's backoff expires.
 async fn handle_transfer_failure(db: &PgPool, task: &TaskRow, error_message: &str) {
-    let new_retry_count = task.retry_count + 1;
+    let decision = evaluate_task_failure(task.retry_count, task.max_retries);
+    let new_retry_count = match &decision {
+        RetryDecision::WillRetry { attempt, .. } => *attempt,
+        RetryDecision::PermanentlyFailed { total_attempts } => *total_attempts,
+    };
 
     // Mark task as failed with updated retry count.
     let _ = sqlx::query(
@@ -494,20 +520,26 @@ async fn handle_transfer_failure(db: &PgPool, task: &TaskRow, error_message: &st
     .execute(db)
     .await;
 
-    if is_task_retriable(new_retry_count, task.max_retries) {
-        tracing::info!(
-            "Sync task {} failed (attempt {}/{}), will retry after peer recovery",
-            task.id,
-            new_retry_count,
-            task.max_retries
-        );
-    } else {
-        tracing::warn!(
-            "Sync task {} permanently failed after {} attempts: {}",
-            task.id,
-            new_retry_count,
-            error_message
-        );
+    match &decision {
+        RetryDecision::WillRetry {
+            attempt,
+            max_retries,
+        } => {
+            tracing::info!(
+                "Sync task {} failed (attempt {}/{}), will retry after peer recovery",
+                task.id,
+                attempt,
+                max_retries
+            );
+        }
+        RetryDecision::PermanentlyFailed { total_attempts } => {
+            tracing::warn!(
+                "Sync task {} permanently failed after {} attempts: {}",
+                task.id,
+                total_attempts,
+                error_message
+            );
+        }
     }
 
     // Fetch current consecutive_failures to compute backoff.
@@ -1095,63 +1127,164 @@ mod tests {
         assert!(matches_replication_filter("anything", Some(&filter)));
     }
 
-    // ── is_task_retriable ─────────────────────────────────────────────────
+    // ── evaluate_task_failure / RetryDecision ───────────────────────────
 
     #[test]
-    fn test_task_retriable_first_failure() {
-        // retry_count=1 (just failed once), max_retries=3 → retriable
-        assert!(is_task_retriable(1, 3));
+    fn test_evaluate_first_failure_will_retry() {
+        let decision = evaluate_task_failure(0, 3);
+        assert_eq!(
+            decision,
+            RetryDecision::WillRetry {
+                attempt: 1,
+                max_retries: 3
+            }
+        );
     }
 
     #[test]
-    fn test_task_retriable_second_failure() {
-        // retry_count=2, max_retries=3 → retriable (one attempt left)
-        assert!(is_task_retriable(2, 3));
+    fn test_evaluate_second_failure_will_retry() {
+        let decision = evaluate_task_failure(1, 3);
+        assert_eq!(
+            decision,
+            RetryDecision::WillRetry {
+                attempt: 2,
+                max_retries: 3
+            }
+        );
     }
 
     #[test]
-    fn test_task_not_retriable_at_max() {
-        // retry_count=3, max_retries=3 → permanently failed
-        assert!(!is_task_retriable(3, 3));
+    fn test_evaluate_at_max_permanently_failed() {
+        let decision = evaluate_task_failure(2, 3);
+        // retry_count=2, after increment=3, matches max_retries=3 → permanently failed
+        assert_eq!(
+            decision,
+            RetryDecision::PermanentlyFailed { total_attempts: 3 }
+        );
     }
 
     #[test]
-    fn test_task_not_retriable_over_max() {
-        // retry_count=5, max_retries=3 → permanently failed
-        assert!(!is_task_retriable(5, 3));
+    fn test_evaluate_over_max_permanently_failed() {
+        let decision = evaluate_task_failure(5, 3);
+        assert_eq!(
+            decision,
+            RetryDecision::PermanentlyFailed { total_attempts: 6 }
+        );
     }
 
     #[test]
-    fn test_task_retriable_with_zero_retries_so_far() {
-        // retry_count=0 (hasn't failed yet, shouldn't happen but handle it)
-        assert!(is_task_retriable(0, 3));
+    fn test_evaluate_zero_max_retries() {
+        // No retries allowed at all.
+        let decision = evaluate_task_failure(0, 0);
+        assert_eq!(
+            decision,
+            RetryDecision::PermanentlyFailed { total_attempts: 1 }
+        );
     }
 
     #[test]
-    fn test_task_not_retriable_with_zero_max() {
-        // max_retries=0 means no retries allowed
-        assert!(!is_task_retriable(1, 0));
+    fn test_evaluate_single_retry_allowed() {
+        // max_retries=1: first failure (0→1) already exhausts the single retry
+        assert_eq!(
+            evaluate_task_failure(0, 1),
+            RetryDecision::PermanentlyFailed { total_attempts: 1 }
+        );
     }
 
     #[test]
-    fn test_task_not_retriable_zero_zero() {
-        // Edge case: no retries configured and no failures yet
-        assert!(!is_task_retriable(0, 0));
+    fn test_evaluate_two_retries_allowed() {
+        // max_retries=2: first failure (0→1) is retriable
+        assert_eq!(
+            evaluate_task_failure(0, 2),
+            RetryDecision::WillRetry {
+                attempt: 1,
+                max_retries: 2
+            }
+        );
+        // second failure (1→2) exhausts retries
+        assert_eq!(
+            evaluate_task_failure(1, 2),
+            RetryDecision::PermanentlyFailed { total_attempts: 2 }
+        );
     }
 
     #[test]
-    fn test_task_retriable_single_retry_allowed() {
-        // max_retries=1, first failure → still retriable
-        assert!(is_task_retriable(0, 1));
-        // After one retry → not retriable
-        assert!(!is_task_retriable(1, 1));
+    fn test_evaluate_high_max_retries() {
+        assert_eq!(
+            evaluate_task_failure(0, 100),
+            RetryDecision::WillRetry {
+                attempt: 1,
+                max_retries: 100
+            }
+        );
+        assert_eq!(
+            evaluate_task_failure(98, 100),
+            RetryDecision::WillRetry {
+                attempt: 99,
+                max_retries: 100
+            }
+        );
+        assert_eq!(
+            evaluate_task_failure(99, 100),
+            RetryDecision::PermanentlyFailed {
+                total_attempts: 100
+            }
+        );
     }
 
     #[test]
-    fn test_task_retriable_high_max() {
-        // Large max_retries, early failure
-        assert!(is_task_retriable(1, 100));
-        assert!(is_task_retriable(99, 100));
-        assert!(!is_task_retriable(100, 100));
+    fn test_evaluate_extracts_correct_attempt_number() {
+        // Verify the attempt number is always retry_count + 1
+        for i in 0..5 {
+            let decision = evaluate_task_failure(i, 10);
+            match decision {
+                RetryDecision::WillRetry { attempt, .. } => assert_eq!(attempt, i + 1),
+                RetryDecision::PermanentlyFailed { total_attempts } => {
+                    assert_eq!(total_attempts, i + 1)
+                }
+            }
+        }
+    }
+
+    // ── RetryDecision helpers ────────────────────────────────────────────
+
+    #[test]
+    fn test_retry_decision_will_retry_matches() {
+        let d = evaluate_task_failure(0, 3);
+        assert!(matches!(d, RetryDecision::WillRetry { .. }));
+    }
+
+    #[test]
+    fn test_retry_decision_permanently_failed_matches() {
+        let d = evaluate_task_failure(2, 3);
+        assert!(matches!(d, RetryDecision::PermanentlyFailed { .. }));
+    }
+
+    #[test]
+    fn test_retry_decision_clone_eq() {
+        let d1 = evaluate_task_failure(0, 3);
+        let d2 = d1.clone();
+        assert_eq!(d1, d2);
+    }
+
+    // ── DEFAULT_MAX_RETRIES ───────────────────────────────────────────────
+
+    #[test]
+    fn test_default_max_retries() {
+        assert_eq!(DEFAULT_MAX_RETRIES, 3);
+        // First two failures are retriable with default max
+        assert!(matches!(
+            evaluate_task_failure(0, DEFAULT_MAX_RETRIES),
+            RetryDecision::WillRetry { .. }
+        ));
+        assert!(matches!(
+            evaluate_task_failure(1, DEFAULT_MAX_RETRIES),
+            RetryDecision::WillRetry { .. }
+        ));
+        // Third failure exhausts retries
+        assert!(matches!(
+            evaluate_task_failure(2, DEFAULT_MAX_RETRIES),
+            RetryDecision::PermanentlyFailed { .. }
+        ));
     }
 }
