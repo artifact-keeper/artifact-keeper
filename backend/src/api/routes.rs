@@ -369,6 +369,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Package curation routes with auth middleware
+        .nest(
+            "/curation",
+            handlers::curation::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Dependency-Track proxy routes with auth middleware
         .nest(
             "/dependency-track",

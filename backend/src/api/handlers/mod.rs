@@ -34,6 +34,7 @@ pub mod composer;
 pub mod conan;
 pub mod conda;
 pub mod cran;
+pub mod curation;
 pub mod debian;
 pub mod dependency_track;
 pub mod events;

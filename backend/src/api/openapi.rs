@@ -128,6 +128,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::promotion_rules::PromotionRulesApiDoc::openapi());
     doc.merge(super::handlers::service_accounts::ServiceAccountsApiDoc::openapi());
     doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());
+    doc.merge(super::handlers::curation::CurationApiDoc::openapi());
 
     doc
 }
@@ -482,6 +483,10 @@ mod tests {
             (
                 "/api/v1/migrations/",
                 vec![include_str!("handlers/migration.rs")],
+            ),
+            (
+                "/api/v1/curation/",
+                vec![include_str!("handlers/curation.rs")],
             ),
         ];
 
