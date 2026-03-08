@@ -175,7 +175,7 @@
       {
         "ordinal": 17,
         "name": "curation_default_action",
-        "type_info": "Varchar"
+        "type_info": "Text"
       },
       {
         "ordinal": 18,
