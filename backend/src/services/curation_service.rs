@@ -9,7 +9,7 @@ use crate::models::curation::{CurationPackage, CurationRule};
 /// Result of evaluating a package against curation rules.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuleEvaluation {
-    pub action: String,       // "allow", "block", or "review"
+    pub action: String, // "allow", "block", or "review"
     pub reason: String,
     pub rule_id: Option<Uuid>, // None if decided by default stance
 }
@@ -147,7 +147,10 @@ impl CurationService {
         .await
     }
 
-    pub async fn list_rules(&self, staging_repo_id: Option<Uuid>) -> Result<Vec<CurationRule>, sqlx::Error> {
+    pub async fn list_rules(
+        &self,
+        staging_repo_id: Option<Uuid>,
+    ) -> Result<Vec<CurationRule>, sqlx::Error> {
         if let Some(repo_id) = staging_repo_id {
             sqlx::query_as(
                 r#"SELECT * FROM curation_rules
@@ -425,7 +428,7 @@ fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bo
     }
 
     if pattern[pi] == '?' || pattern[pi] == text[ti] {
-        return glob_match_inner(pattern, text, pi + 1, ti + 1)
+        return glob_match_inner(pattern, text, pi + 1, ti + 1);
     }
 
     false
@@ -552,8 +555,14 @@ mod tests {
     #[test]
     fn test_version_rpm_style() {
         // RPM versions like 1.24.0-1.el9
-        assert!(CurationService::version_matches(">= 1.24.0", "1.24.0-1.el9"));
-        assert!(!CurationService::version_matches(">= 1.25.0", "1.24.0-1.el9"));
+        assert!(CurationService::version_matches(
+            ">= 1.24.0",
+            "1.24.0-1.el9"
+        ));
+        assert!(!CurationService::version_matches(
+            ">= 1.25.0",
+            "1.24.0-1.el9"
+        ));
     }
 
     #[test]

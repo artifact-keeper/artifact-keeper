@@ -300,7 +300,12 @@ async fn list_packages(
 ) -> Result<Json<Vec<PackageResponse>>, AppError> {
     let svc = CurationService::new(state.db.clone());
     let packages = svc
-        .list_packages(query.staging_repo_id, query.status.as_deref(), query.limit, query.offset)
+        .list_packages(
+            query.staging_repo_id,
+            query.status.as_deref(),
+            query.limit,
+            query.offset,
+        )
         .await?;
     Ok(Json(packages.into_iter().map(pkg_to_response).collect()))
 }
@@ -335,7 +340,13 @@ async fn approve_package(
 ) -> Result<Json<PackageResponse>, AppError> {
     let svc = CurationService::new(state.db.clone());
     let pkg = svc
-        .set_package_status(id, "approved", "Manually approved", Some(auth.user_id), None)
+        .set_package_status(
+            id,
+            "approved",
+            "Manually approved",
+            Some(auth.user_id),
+            None,
+        )
         .await?;
     Ok(Json(pkg_to_response(pkg)))
 }

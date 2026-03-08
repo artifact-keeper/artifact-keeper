@@ -43,9 +43,21 @@ pub fn parse_rpm_primary_xml(xml: &str) -> Vec<CurationPackageEntry> {
             format: "rpm".to_string(),
             package_name: name.clone(),
             version: ver.clone(),
-            release: if rel.is_empty() { None } else { Some(rel.clone()) },
-            architecture: if arch.is_empty() { None } else { Some(arch.clone()) },
-            checksum_sha256: if checksum.is_empty() { None } else { Some(checksum) },
+            release: if rel.is_empty() {
+                None
+            } else {
+                Some(rel.clone())
+            },
+            architecture: if arch.is_empty() {
+                None
+            } else {
+                Some(arch.clone())
+            },
+            checksum_sha256: if checksum.is_empty() {
+                None
+            } else {
+                Some(checksum)
+            },
             upstream_path: href,
             metadata: serde_json::json!({
                 "name": name,
@@ -103,8 +115,16 @@ pub fn parse_deb_packages_index(content: &str, component: &str) -> Vec<CurationP
             package_name: name.clone(),
             version: version.clone(),
             release: None,
-            architecture: if arch.is_empty() { None } else { Some(arch.clone()) },
-            checksum_sha256: if sha256.is_empty() { None } else { Some(sha256) },
+            architecture: if arch.is_empty() {
+                None
+            } else {
+                Some(arch.clone())
+            },
+            checksum_sha256: if sha256.is_empty() {
+                None
+            } else {
+                Some(sha256)
+            },
             upstream_path: filename,
             metadata: serde_json::json!({
                 "name": name,
@@ -187,7 +207,10 @@ mod tests {
         assert_eq!(entries[0].release.as_deref(), Some("1.el9"));
         assert_eq!(entries[0].architecture.as_deref(), Some("x86_64"));
         assert_eq!(entries[0].checksum_sha256.as_deref(), Some("abc123def456"));
-        assert_eq!(entries[0].upstream_path, "Packages/nginx-1.24.0-1.el9.x86_64.rpm");
+        assert_eq!(
+            entries[0].upstream_path,
+            "Packages/nginx-1.24.0-1.el9.x86_64.rpm"
+        );
 
         assert_eq!(entries[1].package_name, "curl");
         assert_eq!(entries[1].version, "8.5.0");
@@ -216,7 +239,10 @@ Description: Command line URL transfer tool
         assert_eq!(entries[0].package_name, "nginx");
         assert_eq!(entries[0].version, "1.24.0-1");
         assert_eq!(entries[0].architecture.as_deref(), Some("amd64"));
-        assert_eq!(entries[0].upstream_path, "pool/main/n/nginx/nginx_1.24.0-1_amd64.deb");
+        assert_eq!(
+            entries[0].upstream_path,
+            "pool/main/n/nginx/nginx_1.24.0-1_amd64.deb"
+        );
 
         assert_eq!(entries[1].package_name, "curl");
         assert_eq!(entries[1].version, "8.5.0-2ubuntu1");

@@ -445,7 +445,9 @@ async fn update_gauge_metrics(db: &PgPool) -> crate::error::Result<()> {
 }
 
 /// Find all staging repos with curation enabled, fetch upstream metadata, and evaluate new packages.
-async fn run_curation_sync_cycle(db: &PgPool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_curation_sync_cycle(
+    db: &PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::services::curation_service::CurationService;
     use crate::services::curation_sync;
 
@@ -475,16 +477,19 @@ async fn run_curation_sync_cycle(db: &PgPool) -> Result<(), Box<dyn std::error::
     for (staging_id, format, remote_id, upstream_url, default_action, _interval) in &repos {
         let entries = match format.as_str() {
             "rpm" => {
-                let repomd_url = format!("{}/repodata/repomd.xml", upstream_url.trim_end_matches('/'));
+                let repomd_url =
+                    format!("{}/repodata/repomd.xml", upstream_url.trim_end_matches('/'));
                 // Try to find primary.xml location from repomd.xml, fall back to default path
                 let primary_path = match client.get(&repomd_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let body = resp.text().await.unwrap_or_default();
-                        extract_primary_href(&body).unwrap_or_else(|| "repodata/primary.xml.gz".to_string())
+                        extract_primary_href(&body)
+                            .unwrap_or_else(|| "repodata/primary.xml.gz".to_string())
                     }
                     _ => "repodata/primary.xml.gz".to_string(),
                 };
-                let primary_url = format!("{}/{}", upstream_url.trim_end_matches('/'), primary_path);
+                let primary_url =
+                    format!("{}/{}", upstream_url.trim_end_matches('/'), primary_path);
                 match client.get(&primary_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let bytes = resp.bytes().await?;
@@ -588,7 +593,11 @@ async fn run_curation_sync_cycle(db: &PgPool) -> Result<(), Box<dyn std::error::
                 }
                 Ok(_) => {} // Already processed
                 Err(e) => {
-                    tracing::warn!("Failed to upsert curation package {}: {}", entry.package_name, e);
+                    tracing::warn!(
+                        "Failed to upsert curation package {}: {}",
+                        entry.package_name,
+                        e
+                    );
                 }
             }
         }
