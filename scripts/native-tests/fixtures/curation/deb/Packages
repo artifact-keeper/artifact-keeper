@@ -1,0 +1,41 @@
+Package: nginx
+Version: 1.24.0-1
+Architecture: amd64
+SHA256: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+Filename: pool/main/n/nginx/nginx_1.24.0-1_amd64.deb
+Description: High performance web server
+
+Package: curl
+Version: 8.5.0-2ubuntu1
+Architecture: amd64
+SHA256: b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3
+Filename: pool/main/c/curl/curl_8.5.0-2ubuntu1_amd64.deb
+Description: Command line URL transfer tool
+
+Package: telnet
+Version: 0.17-44build1
+Architecture: amd64
+SHA256: c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4
+Filename: pool/main/n/netkit-telnet/telnet_0.17-44build1_amd64.deb
+Description: Basic telnet client
+
+Package: wget
+Version: 1.21.4-1ubuntu4
+Architecture: amd64
+SHA256: d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5
+Filename: pool/main/w/wget/wget_1.21.4-1ubuntu4_amd64.deb
+Description: Retrieves files from the web
+
+Package: vim
+Version: 9.0.2081-1
+Architecture: amd64
+SHA256: e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6
+Filename: pool/main/v/vim/vim_9.0.2081-1_amd64.deb
+Description: Enhanced vi editor
+
+Package: nano
+Version: 5.6.1-5
+Architecture: arm64
+SHA256: f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1
+Filename: pool/main/n/nano/nano_5.6.1-5_arm64.deb
+Description: A small text editor
