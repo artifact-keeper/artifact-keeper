@@ -247,19 +247,15 @@ pub async fn get_content(
     Query(params): Query<ContentQuery>,
 ) -> Result<impl IntoResponse> {
     // Verify repository exists and check visibility
-    let repo_row: Option<(Uuid, bool, String)> = sqlx::query_as(
-        "SELECT id, is_public, storage_path FROM repositories WHERE key = $1",
-    )
-    .bind(&params.repository_key)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let repo_row: Option<(Uuid, bool, String)> =
+        sqlx::query_as("SELECT id, is_public, storage_path FROM repositories WHERE key = $1")
+            .bind(&params.repository_key)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
     let (repo_id, is_public, storage_path) = repo_row.ok_or_else(|| {
-        AppError::NotFound(format!(
-            "Repository '{}' not found",
-            params.repository_key
-        ))
+        AppError::NotFound(format!("Repository '{}' not found", params.repository_key))
     })?;
 
     // Private repos require authentication
@@ -298,9 +294,7 @@ pub async fn get_content(
 
     // Truncate to max_bytes if specified
     let body = match params.max_bytes {
-        Some(max) if max >= 0 && (max as usize) < content.len() => {
-            content.slice(..max as usize)
-        }
+        Some(max) if max >= 0 && (max as usize) < content.len() => content.slice(..max as usize),
         _ => content,
     };
 
@@ -322,17 +316,17 @@ pub async fn get_content(
                 header::HeaderName::from_static("x-content-size"),
                 artifact.size_bytes.to_string(),
             ),
-            (
-                header::CACHE_CONTROL,
-                "public, max-age=3600".to_string(),
-            ),
+            (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
         ],
         body,
     ))
 }
 
 #[derive(OpenApi)]
-#[openapi(paths(get_tree, get_content), components(schemas(TreeResponse, TreeNodeResponse,)))]
+#[openapi(
+    paths(get_tree, get_content),
+    components(schemas(TreeResponse, TreeNodeResponse,))
+)]
 pub struct TreeApiDoc;
 
 #[cfg(test)]
@@ -694,8 +688,7 @@ mod tests {
 
     #[test]
     fn test_content_query_with_max_bytes() {
-        let json =
-            r#"{"repository_key": "npm", "path": "lodash/package.json", "max_bytes": 4096}"#;
+        let json = r#"{"repository_key": "npm", "path": "lodash/package.json", "max_bytes": 4096}"#;
         let q: ContentQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.repository_key, "npm");
         assert_eq!(q.path, "lodash/package.json");
