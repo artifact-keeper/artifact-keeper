@@ -12,7 +12,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # Create a temporary GNUPGHOME to avoid polluting user's keyring
 export GNUPGHOME="$(mktemp -d)"
-trap 'rm -rf "$GNUPGHOME"' EXIT
+trap 'gpgconf --kill gpg-agent 2>/dev/null; rm -rf "$GNUPGHOME"' EXIT
 
 echo "==> Generating GPG key pair..."
 

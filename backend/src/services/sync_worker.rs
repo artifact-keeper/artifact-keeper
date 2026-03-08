@@ -9,27 +9,101 @@ use sqlx::PgPool;
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
+/// Default stale peer threshold in minutes (peers with no heartbeat for this
+/// long are marked offline).  Matches the admin settings default.
+const STALE_PEER_THRESHOLD_MINUTES: i32 = 5;
+
+/// How many ticks (10s each) between stale peer detection runs.
+/// 6 ticks = 60 seconds.
+const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
+
+/// Duration of each worker tick in seconds.
+const TICK_INTERVAL_SECS: u64 = 10;
+
+/// Check whether the current tick should trigger a stale peer detection run.
+///
+/// Returns `true` every `interval_ticks` ticks (e.g. every 6th tick = 60s
+/// when each tick is 10s).
+pub(crate) fn should_run_stale_check(tick_count: u64, interval_ticks: u64) -> bool {
+    interval_ticks > 0 && tick_count % interval_ticks == 0
+}
+
+/// Compute the effective stale check period in seconds.
+///
+/// Useful for operators to understand the actual detection delay.
+#[allow(dead_code)]
+pub(crate) fn stale_check_period_secs() -> u64 {
+    TICK_INTERVAL_SECS * STALE_CHECK_INTERVAL_TICKS
+}
+
+/// Build a log message for a stale peer detection result.
+///
+/// Returns `Some(message)` when peers were marked offline, `None` when
+/// no peers were stale.
+pub(crate) fn format_stale_detection_log(
+    marked_count: u64,
+    threshold_minutes: i32,
+) -> Option<String> {
+    if marked_count > 0 {
+        Some(format!(
+            "Marked {} stale peer(s) as offline (no heartbeat for {}+ minutes)",
+            marked_count, threshold_minutes
+        ))
+    } else {
+        None
+    }
+}
+
 /// Spawn the background sync worker.
 ///
 /// The worker runs in an infinite loop on a 10-second interval, picking up
-/// pending sync tasks and dispatching transfers to remote peers.
+/// pending sync tasks and dispatching transfers to remote peers.  Every 60
+/// seconds it also checks for stale peers and marks them offline.
 pub async fn spawn_sync_worker(db: PgPool) {
     tokio::spawn(async move {
         // Small startup delay so the server can finish initializing.
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let mut tick = interval(Duration::from_secs(10));
+        let mut tick = interval(Duration::from_secs(TICK_INTERVAL_SECS));
         let client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(300))
             .build()
             .expect("Failed to build HTTP client for sync worker");
 
+        let mut tick_count: u64 = 0;
+
         loop {
             tick.tick().await;
+            tick_count += 1;
+
+            // Periodically check for stale peers and mark them offline.
+            if should_run_stale_check(tick_count, STALE_CHECK_INTERVAL_TICKS) {
+                run_stale_peer_detection(&db).await;
+            }
+
             if let Err(e) = process_pending_tasks(&db, &client).await {
                 tracing::error!("Sync worker error: {e}");
             }
         }
     });
+}
+
+/// Detect peers that have not sent a heartbeat within the threshold and
+/// mark them offline.
+async fn run_stale_peer_detection(db: &PgPool) {
+    let peer_service = crate::services::peer_instance_service::PeerInstanceService::new(db.clone());
+    match peer_service
+        .mark_stale_offline(STALE_PEER_THRESHOLD_MINUTES)
+        .await
+    {
+        Ok(count) => {
+            if let Some(msg) = format_stale_detection_log(count, STALE_PEER_THRESHOLD_MINUTES) {
+                tracing::info!("{}", msg);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to run stale peer detection: {e}");
+        }
+    }
 }
 
 // ── Internal row types ──────────────────────────────────────────────────────
@@ -1363,5 +1437,117 @@ mod tests {
         assert!(evaluate_task_failure(1, DEFAULT_MAX_RETRIES).is_retriable());
         // Third failure exhausts retries
         assert!(!evaluate_task_failure(2, DEFAULT_MAX_RETRIES).is_retriable());
+    }
+
+    // ── should_run_stale_check ────────────────────────────────────────────
+
+    #[test]
+    fn test_stale_check_fires_on_interval() {
+        // With interval=6, ticks 6, 12, 18 should trigger.
+        assert!(should_run_stale_check(6, 6));
+        assert!(should_run_stale_check(12, 6));
+        assert!(should_run_stale_check(18, 6));
+    }
+
+    #[test]
+    fn test_stale_check_skips_between_intervals() {
+        // Ticks 1-5, 7-11 should not trigger.
+        for tick in 1..6 {
+            assert!(!should_run_stale_check(tick, 6));
+        }
+        for tick in 7..12 {
+            assert!(!should_run_stale_check(tick, 6));
+        }
+    }
+
+    #[test]
+    fn test_stale_check_tick_zero_fires() {
+        // Tick 0 is divisible by any interval, so it triggers.
+        assert!(should_run_stale_check(0, 6));
+    }
+
+    #[test]
+    fn test_stale_check_interval_one_always_fires() {
+        // With interval=1, every tick triggers.
+        assert!(should_run_stale_check(1, 1));
+        assert!(should_run_stale_check(2, 1));
+        assert!(should_run_stale_check(100, 1));
+    }
+
+    #[test]
+    fn test_stale_check_interval_zero_never_fires() {
+        // Interval of 0 should never trigger (division by zero guard).
+        assert!(!should_run_stale_check(0, 0));
+        assert!(!should_run_stale_check(6, 0));
+    }
+
+    #[test]
+    fn test_stale_check_large_tick() {
+        // Large tick counts still work correctly.
+        assert!(should_run_stale_check(600, 6));
+        assert!(!should_run_stale_check(601, 6));
+    }
+
+    #[test]
+    fn test_stale_check_default_interval() {
+        // Verify the actual constant value works as expected.
+        assert_eq!(STALE_CHECK_INTERVAL_TICKS, 6);
+        assert!(should_run_stale_check(6, STALE_CHECK_INTERVAL_TICKS));
+        assert!(!should_run_stale_check(5, STALE_CHECK_INTERVAL_TICKS));
+    }
+
+    #[test]
+    fn test_stale_threshold_default() {
+        // Verify the threshold matches the admin default of 5 minutes.
+        assert_eq!(STALE_PEER_THRESHOLD_MINUTES, 5);
+    }
+
+    #[test]
+    fn test_stale_check_period_secs() {
+        // 10s tick * 6 ticks = 60s check period.
+        assert_eq!(stale_check_period_secs(), 60);
+    }
+
+    #[test]
+    fn test_tick_interval_constant() {
+        assert_eq!(TICK_INTERVAL_SECS, 10);
+    }
+
+    // ── format_stale_detection_log ──────────────────────────────────────
+
+    #[test]
+    fn test_format_stale_log_some_peers() {
+        let msg = format_stale_detection_log(3, 5);
+        assert!(msg.is_some());
+        let text = msg.unwrap();
+        assert!(text.contains("3 stale peer(s)"));
+        assert!(text.contains("5+ minutes"));
+    }
+
+    #[test]
+    fn test_format_stale_log_one_peer() {
+        let msg = format_stale_detection_log(1, 5);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("1 stale peer(s)"));
+    }
+
+    #[test]
+    fn test_format_stale_log_zero_peers() {
+        let msg = format_stale_detection_log(0, 5);
+        assert!(msg.is_none());
+    }
+
+    #[test]
+    fn test_format_stale_log_custom_threshold() {
+        let msg = format_stale_detection_log(2, 10);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("10+ minutes"));
+    }
+
+    #[test]
+    fn test_format_stale_log_large_count() {
+        let msg = format_stale_detection_log(100, 5);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("100 stale peer(s)"));
     }
 }
