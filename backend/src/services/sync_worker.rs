@@ -17,6 +17,14 @@ const STALE_PEER_THRESHOLD_MINUTES: i32 = 5;
 /// 6 ticks = 60 seconds.
 const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
 
+/// Check whether the current tick should trigger a stale peer detection run.
+///
+/// Returns `true` every `interval_ticks` ticks (e.g. every 6th tick = 60s
+/// when each tick is 10s).
+pub(crate) fn should_run_stale_check(tick_count: u64, interval_ticks: u64) -> bool {
+    interval_ticks > 0 && tick_count % interval_ticks == 0
+}
+
 /// Spawn the background sync worker.
 ///
 /// The worker runs in an infinite loop on a 10-second interval, picking up
@@ -39,7 +47,7 @@ pub async fn spawn_sync_worker(db: PgPool) {
             tick_count += 1;
 
             // Periodically check for stale peers and mark them offline.
-            if tick_count % STALE_CHECK_INTERVAL_TICKS == 0 {
+            if should_run_stale_check(tick_count, STALE_CHECK_INTERVAL_TICKS) {
                 run_stale_peer_detection(&db).await;
             }
 
@@ -1062,5 +1070,68 @@ mod tests {
             "exclude_patterns": []
         });
         assert!(matches_replication_filter("anything", Some(&filter)));
+    }
+
+    // ── should_run_stale_check ────────────────────────────────────────────
+
+    #[test]
+    fn test_stale_check_fires_on_interval() {
+        // With interval=6, ticks 6, 12, 18 should trigger.
+        assert!(should_run_stale_check(6, 6));
+        assert!(should_run_stale_check(12, 6));
+        assert!(should_run_stale_check(18, 6));
+    }
+
+    #[test]
+    fn test_stale_check_skips_between_intervals() {
+        // Ticks 1-5, 7-11 should not trigger.
+        for tick in 1..6 {
+            assert!(!should_run_stale_check(tick, 6));
+        }
+        for tick in 7..12 {
+            assert!(!should_run_stale_check(tick, 6));
+        }
+    }
+
+    #[test]
+    fn test_stale_check_tick_zero_fires() {
+        // Tick 0 is divisible by any interval, so it triggers.
+        assert!(should_run_stale_check(0, 6));
+    }
+
+    #[test]
+    fn test_stale_check_interval_one_always_fires() {
+        // With interval=1, every tick triggers.
+        assert!(should_run_stale_check(1, 1));
+        assert!(should_run_stale_check(2, 1));
+        assert!(should_run_stale_check(100, 1));
+    }
+
+    #[test]
+    fn test_stale_check_interval_zero_never_fires() {
+        // Interval of 0 should never trigger (division by zero guard).
+        assert!(!should_run_stale_check(0, 0));
+        assert!(!should_run_stale_check(6, 0));
+    }
+
+    #[test]
+    fn test_stale_check_large_tick() {
+        // Large tick counts still work correctly.
+        assert!(should_run_stale_check(600, 6));
+        assert!(!should_run_stale_check(601, 6));
+    }
+
+    #[test]
+    fn test_stale_check_default_interval() {
+        // Verify the actual constant value works as expected.
+        assert_eq!(STALE_CHECK_INTERVAL_TICKS, 6);
+        assert!(should_run_stale_check(6, STALE_CHECK_INTERVAL_TICKS));
+        assert!(!should_run_stale_check(5, STALE_CHECK_INTERVAL_TICKS));
+    }
+
+    #[test]
+    fn test_stale_threshold_default() {
+        // Verify the threshold matches the admin default of 5 minutes.
+        assert_eq!(STALE_PEER_THRESHOLD_MINUTES, 5);
     }
 }
