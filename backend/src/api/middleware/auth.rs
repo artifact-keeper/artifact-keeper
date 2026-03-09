@@ -617,13 +617,16 @@ pub async fn repo_visibility_middleware(
         return next.run(request).await;
     }
 
-    // Return 401 with a WWW-Authenticate challenge so that package manager
-    // clients (cargo, pip, npm, etc.) that follow the challenge-response
-    // credential flow can retry with credentials.  Using 404 here breaks
-    // cargo's sparse-registry credential provider protocol, which only
-    // injects a Bearer token after receiving a 401.
+    // Return 401 with WWW-Authenticate challenges so that package manager
+    // clients can retry with credentials.  Include both Basic (for Maven,
+    // pip, npm, etc.) and Bearer (for Cargo sparse-registry credential
+    // provider which only injects a Bearer token after receiving a 401).
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
+        .header(
+            "WWW-Authenticate",
+            "Basic realm=\"artifact-keeper\"",
+        )
         .header(
             "WWW-Authenticate",
             "Bearer realm=\"artifact-keeper\", charset=\"UTF-8\"",
