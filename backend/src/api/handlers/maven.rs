@@ -338,9 +338,7 @@ async fn download(
         // If this is a SNAPSHOT path, try the stored checksum under the
         // timestamp-resolved filename before falling through to compute.
         if base_path.contains("-SNAPSHOT") {
-            if let Some(resolved) =
-                resolve_snapshot_artifact(&state.db, repo.id, base_path).await
-            {
+            if let Some(resolved) = resolve_snapshot_artifact(&state.db, repo.id, base_path).await {
                 let resolved_checksum_key =
                     format!("maven/{}.{}", resolved.path, checksum_suffix(checksum_type));
                 if let Ok(content) = storage.get(&resolved_checksum_key).await {
@@ -569,9 +567,7 @@ async fn serve_computed_checksum(
             if base_path.contains("-SNAPSHOT") {
                 let resolved = resolve_snapshot_artifact(&state.db, repo_id, base_path)
                     .await
-                    .ok_or_else(|| {
-                        (StatusCode::NOT_FOUND, "File not found").into_response()
-                    })?;
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response())?;
                 (resolved.storage_key, resolved.checksum_sha256)
             } else {
                 return Err((StatusCode::NOT_FOUND, "File not found").into_response());
@@ -1154,9 +1150,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_like_pattern_pom() {
-        let result = snapshot_like_pattern(
-            "com/example/mylib/1.0.0-SNAPSHOT/mylib-1.0.0-SNAPSHOT.pom",
-        );
+        let result =
+            snapshot_like_pattern("com/example/mylib/1.0.0-SNAPSHOT/mylib-1.0.0-SNAPSHOT.pom");
         assert_eq!(
             result,
             Some("com/example/mylib/1.0.0-SNAPSHOT/mylib-1.0.0-%.pom".to_string())
@@ -1165,9 +1160,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_like_pattern_with_classifier() {
-        let result = snapshot_like_pattern(
-            "com/example/lib/2.0-SNAPSHOT/lib-2.0-SNAPSHOT-sources.jar",
-        );
+        let result =
+            snapshot_like_pattern("com/example/lib/2.0-SNAPSHOT/lib-2.0-SNAPSHOT-sources.jar");
         assert_eq!(
             result,
             Some("com/example/lib/2.0-SNAPSHOT/lib-2.0-%-sources.jar".to_string())
@@ -1176,25 +1170,20 @@ mod tests {
 
     #[test]
     fn test_snapshot_like_pattern_non_snapshot_returns_none() {
-        let result =
-            snapshot_like_pattern("com/example/lib/1.0.0/lib-1.0.0.jar");
+        let result = snapshot_like_pattern("com/example/lib/1.0.0/lib-1.0.0.jar");
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_snapshot_like_pattern_metadata_returns_none() {
         // maven-metadata.xml does not contain -SNAPSHOT in the filename
-        let result = snapshot_like_pattern(
-            "com/example/lib/1.0.0-SNAPSHOT/maven-metadata.xml",
-        );
+        let result = snapshot_like_pattern("com/example/lib/1.0.0-SNAPSHOT/maven-metadata.xml");
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_snapshot_like_pattern_leading_slash() {
-        let result = snapshot_like_pattern(
-            "/com/test/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar",
-        );
+        let result = snapshot_like_pattern("/com/test/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar");
         assert_eq!(
             result,
             Some("com/test/lib/1.0-SNAPSHOT/lib-1.0-%.jar".to_string())
