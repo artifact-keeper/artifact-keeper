@@ -88,6 +88,94 @@ async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 // Path helpers
 // ---------------------------------------------------------------------------
 
+/// Given a `-SNAPSHOT` artifact path, build a SQL LIKE pattern that matches
+/// the corresponding timestamp-resolved filename stored in the database.
+///
+/// Example: `com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar`
+///       -> `com/example/lib/1.0-SNAPSHOT/lib-1.0-%.jar`
+///
+/// Returns `None` if the path does not contain a `-SNAPSHOT` filename segment.
+fn snapshot_like_pattern(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let filename = parts[parts.len() - 1];
+    let version_dir = parts[parts.len() - 2];
+
+    // Only applies when the version directory is a SNAPSHOT version
+    if !version_dir.ends_with("-SNAPSHOT") {
+        return None;
+    }
+
+    // Replace `-SNAPSHOT` in the filename with `-%` for the LIKE pattern.
+    // The filename may be e.g. "lib-1.0-SNAPSHOT.jar" or "lib-1.0-SNAPSHOT-sources.jar".
+    // We want to match   "lib-1.0-20260304.095300-1.jar" / "...-sources.jar".
+    let base_version = version_dir.strip_suffix("-SNAPSHOT").unwrap();
+    let snapshot_token = format!("{}-SNAPSHOT", base_version);
+    let timestamp_wildcard = format!("{}-%", base_version);
+
+    if !filename.contains(&snapshot_token) {
+        return None;
+    }
+
+    let resolved_filename = filename.replace(&snapshot_token, &timestamp_wildcard);
+    let dir = parts[..parts.len() - 1].join("/");
+    Some(format!("{}/{}", dir, resolved_filename))
+}
+
+/// Look up the latest timestamped artifact path matching a SNAPSHOT pattern.
+/// Uses a SQL LIKE query to find artifacts stored under timestamp-resolved names
+/// when the client requests the `-SNAPSHOT` form.
+async fn resolve_snapshot_artifact(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    snapshot_path: &str,
+) -> Option<ResolvedSnapshot> {
+    let pattern = snapshot_like_pattern(snapshot_path)?;
+
+    // Use runtime sqlx::query (not the query! macro) to avoid needing an
+    // offline cache entry. The LIKE pattern matches timestamped filenames
+    // and we pick the latest one by created_at.
+    let row = sqlx::query(
+        r#"
+        SELECT id, storage_key, checksum_sha256, path
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND path LIKE $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(repo_id)
+    .bind(&pattern)
+    .fetch_optional(db)
+    .await
+    .ok()??;
+
+    use sqlx::Row;
+    Some(ResolvedSnapshot {
+        storage_key: row.get("storage_key"),
+        checksum_sha256: row.get("checksum_sha256"),
+        path: row.get("path"),
+    })
+}
+
+struct ResolvedSnapshot {
+    storage_key: String,
+    checksum_sha256: String,
+    path: String,
+}
+
+fn checksum_suffix(ct: ChecksumType) -> &'static str {
+    match ct {
+        ChecksumType::Md5 => "md5",
+        ChecksumType::Sha1 => "sha1",
+        ChecksumType::Sha256 => "sha256",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure (non-async) helper functions for testability
 // ---------------------------------------------------------------------------
@@ -245,6 +333,24 @@ async fn download(
                 .header(CONTENT_TYPE, "text/plain")
                 .body(Body::from(content))
                 .unwrap());
+        }
+
+        // If this is a SNAPSHOT path, try the stored checksum under the
+        // timestamp-resolved filename before falling through to compute.
+        if base_path.contains("-SNAPSHOT") {
+            if let Some(resolved) =
+                resolve_snapshot_artifact(&state.db, repo.id, base_path).await
+            {
+                let resolved_checksum_key =
+                    format!("maven/{}.{}", resolved.path, checksum_suffix(checksum_type));
+                if let Ok(content) = storage.get(&resolved_checksum_key).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+            }
         }
 
         // Otherwise compute from the artifact
@@ -453,15 +559,32 @@ async fn serve_computed_checksum(
             format!("Database error: {}", e),
         )
             .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response())?;
+    })?;
+
+    // If the exact path was not found and this is a SNAPSHOT request, resolve
+    // the `-SNAPSHOT` filename to the latest timestamped version.
+    let (resolved_storage_key, resolved_sha256) = match artifact {
+        Some(a) => (a.storage_key, a.checksum_sha256),
+        None => {
+            if base_path.contains("-SNAPSHOT") {
+                let resolved = resolve_snapshot_artifact(&state.db, repo_id, base_path)
+                    .await
+                    .ok_or_else(|| {
+                        (StatusCode::NOT_FOUND, "File not found").into_response()
+                    })?;
+                (resolved.storage_key, resolved.checksum_sha256)
+            } else {
+                return Err((StatusCode::NOT_FOUND, "File not found").into_response());
+            }
+        }
+    };
 
     // For SHA-256 we already have it stored
     let checksum = match checksum_type {
-        ChecksumType::Sha256 => artifact.checksum_sha256,
+        ChecksumType::Sha256 => resolved_sha256,
         _ => {
             let storage = state.storage_for_repo(storage_path);
-            let content = storage.get(&artifact.storage_key).await.map_err(|e| {
+            let content = storage.get(&resolved_storage_key).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Storage error: {}", e),
@@ -1012,5 +1135,102 @@ mod tests {
             repo.upstream_url.as_deref(),
             Some("https://repo1.maven.org/maven2")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // snapshot_like_pattern
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_snapshot_like_pattern_jar() {
+        let result = snapshot_like_pattern(
+            "com/test/artifacthub/0.0.1-SNAPSHOT/artifacthub-0.0.1-SNAPSHOT.jar",
+        );
+        assert_eq!(
+            result,
+            Some("com/test/artifacthub/0.0.1-SNAPSHOT/artifacthub-0.0.1-%.jar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_pom() {
+        let result = snapshot_like_pattern(
+            "com/example/mylib/1.0.0-SNAPSHOT/mylib-1.0.0-SNAPSHOT.pom",
+        );
+        assert_eq!(
+            result,
+            Some("com/example/mylib/1.0.0-SNAPSHOT/mylib-1.0.0-%.pom".to_string())
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_with_classifier() {
+        let result = snapshot_like_pattern(
+            "com/example/lib/2.0-SNAPSHOT/lib-2.0-SNAPSHOT-sources.jar",
+        );
+        assert_eq!(
+            result,
+            Some("com/example/lib/2.0-SNAPSHOT/lib-2.0-%-sources.jar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_non_snapshot_returns_none() {
+        let result =
+            snapshot_like_pattern("com/example/lib/1.0.0/lib-1.0.0.jar");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_metadata_returns_none() {
+        // maven-metadata.xml does not contain -SNAPSHOT in the filename
+        let result = snapshot_like_pattern(
+            "com/example/lib/1.0.0-SNAPSHOT/maven-metadata.xml",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_leading_slash() {
+        let result = snapshot_like_pattern(
+            "/com/test/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar",
+        );
+        assert_eq!(
+            result,
+            Some("com/test/lib/1.0-SNAPSHOT/lib-1.0-%.jar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_deep_group() {
+        let result = snapshot_like_pattern(
+            "org/apache/commons/commons-lang3/3.12.0-SNAPSHOT/commons-lang3-3.12.0-SNAPSHOT.jar",
+        );
+        assert_eq!(
+            result,
+            Some(
+                "org/apache/commons/commons-lang3/3.12.0-SNAPSHOT/commons-lang3-3.12.0-%.jar"
+                    .to_string()
+            )
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // checksum_suffix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checksum_suffix_md5() {
+        assert_eq!(checksum_suffix(ChecksumType::Md5), "md5");
+    }
+
+    #[test]
+    fn test_checksum_suffix_sha1() {
+        assert_eq!(checksum_suffix(ChecksumType::Sha1), "sha1");
+    }
+
+    #[test]
+    fn test_checksum_suffix_sha256() {
+        assert_eq!(checksum_suffix(ChecksumType::Sha256), "sha256");
     }
 }
