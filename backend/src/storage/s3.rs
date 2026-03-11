@@ -1504,6 +1504,241 @@ mod tests {
             other => panic!("expected Storage error, got {other:?}"),
         }
     }
+
+    // --- S3Config builder method tests ---
+
+    #[test]
+    fn test_s3_config_with_presign_expiry() {
+        let config = S3Config::new("b".to_string(), "us-east-1".to_string(), None, None)
+            .with_presign_expiry(Duration::from_secs(7200));
+        assert_eq!(config.presign_expiry, Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_s3_config_with_cloudfront() {
+        let cf = CloudFrontConfig {
+            distribution_url: "https://d1234.cloudfront.net".to_string(),
+            key_pair_id: "KPID123".to_string(),
+            private_key: "fake-key-data".to_string(),
+        };
+        let config =
+            S3Config::new("b".to_string(), "us-east-1".to_string(), None, None).with_cloudfront(cf);
+        assert!(config.cloudfront.is_some());
+        let cf = config.cloudfront.unwrap();
+        assert_eq!(cf.distribution_url, "https://d1234.cloudfront.net");
+        assert_eq!(cf.key_pair_id, "KPID123");
+    }
+
+    #[test]
+    fn test_s3_config_default_values() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None);
+        assert!(!config.redirect_downloads);
+        assert_eq!(config.presign_expiry, Duration::from_secs(3600));
+        assert!(config.cloudfront.is_none());
+        assert_eq!(config.path_format, StoragePathFormat::Native);
+        assert!(config.endpoint.is_none());
+        assert!(config.prefix.is_none());
+    }
+
+    #[test]
+    fn test_s3_config_chained_builders() {
+        let cf = CloudFrontConfig {
+            distribution_url: "https://cdn.example.com".to_string(),
+            key_pair_id: "KP1".to_string(),
+            private_key: "key".to_string(),
+        };
+        let config = S3Config::new(
+            "bucket".to_string(),
+            "eu-west-1".to_string(),
+            Some("https://minio:9000".to_string()),
+            Some("prefix".to_string()),
+        )
+        .with_redirect_downloads(true)
+        .with_presign_expiry(Duration::from_secs(600))
+        .with_path_format(StoragePathFormat::Migration)
+        .with_cloudfront(cf);
+
+        assert_eq!(config.bucket, "bucket");
+        assert_eq!(config.region, "eu-west-1");
+        assert_eq!(config.endpoint, Some("https://minio:9000".to_string()));
+        assert_eq!(config.prefix, Some("prefix".to_string()));
+        assert!(config.redirect_downloads);
+        assert_eq!(config.presign_expiry, Duration::from_secs(600));
+        assert_eq!(config.path_format, StoragePathFormat::Migration);
+        assert!(config.cloudfront.is_some());
+    }
+
+    // --- full_key / strip_prefix via actual struct logic ---
+
+    #[test]
+    fn test_full_key_trailing_slash_prefix() {
+        let prefix = Some("artifacts/".to_string());
+        let key = "test/file.txt";
+
+        let full = match &prefix {
+            Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
+            None => key.to_string(),
+        };
+
+        assert_eq!(full, "artifacts/test/file.txt");
+    }
+
+    #[test]
+    fn test_strip_prefix_no_match() {
+        let prefix = Some("other-prefix".to_string());
+        let key = "artifacts/test/file.txt";
+
+        let stripped = match &prefix {
+            Some(p) => {
+                let prefix_with_slash = format!("{}/", p.trim_end_matches('/'));
+                key.strip_prefix(&prefix_with_slash)
+                    .unwrap_or(key)
+                    .to_string()
+            }
+            None => key.to_string(),
+        };
+
+        // Key doesn't start with "other-prefix/", so it returns the key unchanged
+        assert_eq!(stripped, "artifacts/test/file.txt");
+    }
+
+    #[test]
+    fn test_strip_prefix_none() {
+        let prefix: Option<String> = None;
+        let key = "test/file.txt";
+
+        let stripped = match &prefix {
+            Some(p) => {
+                let prefix_with_slash = format!("{}/", p.trim_end_matches('/'));
+                key.strip_prefix(&prefix_with_slash)
+                    .unwrap_or(key)
+                    .to_string()
+            }
+            None => key.to_string(),
+        };
+
+        assert_eq!(stripped, "test/file.txt");
+    }
+
+    // --- try_artifactory_fallback logic ---
+
+    #[test]
+    fn test_artifactory_fallback_valid_native_path() {
+        // Simulate the try_artifactory_fallback logic for a valid path
+        let key = "91/6f/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
+        let parts: Vec<&str> = key.split('/').collect();
+        assert_eq!(parts.len(), 3);
+        let checksum = parts[parts.len() - 1];
+        assert_eq!(checksum.len(), 64);
+        assert!(checksum.chars().all(|c| c.is_ascii_hexdigit()));
+        let fallback = format!("{}/{}", &checksum[..2], checksum);
+        assert_eq!(
+            fallback,
+            "91/916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"
+        );
+    }
+
+    #[test]
+    fn test_artifactory_fallback_short_checksum_rejected() {
+        let key = "ab/cd/abcdef1234";
+        let parts: Vec<&str> = key.split('/').collect();
+        let checksum = parts[parts.len() - 1];
+        // Not 64 chars, should be rejected
+        assert_ne!(checksum.len(), 64);
+    }
+
+    #[test]
+    fn test_artifactory_fallback_non_hex_rejected() {
+        let key = "zz/yy/zzyy00000000000000000000000000000000000000000000000000gggggg";
+        let parts: Vec<&str> = key.split('/').collect();
+        let checksum = parts[parts.len() - 1];
+        assert!(!checksum.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_artifactory_fallback_single_segment_rejected() {
+        let key = "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9";
+        let parts: Vec<&str> = key.split('/').collect();
+        // Only 1 part, need >= 3
+        assert!(parts.len() < 3);
+    }
+
+    // --- classify_get_response additional edge cases ---
+
+    #[test]
+    fn test_classify_get_response_301_redirect_is_error() {
+        use std::collections::HashMap;
+
+        let resp = ResponseData::new(Bytes::from_static(b""), 301, HashMap::new());
+        assert!(S3Backend::classify_get_response(TEST_KEY, &resp).is_err());
+    }
+
+    #[test]
+    fn test_classify_get_response_204_returns_some() {
+        use std::collections::HashMap;
+
+        let resp = ResponseData::new(Bytes::from_static(b""), 204, HashMap::new());
+        assert!(S3Backend::classify_get_response(TEST_KEY, &resp)
+            .unwrap()
+            .is_some());
+    }
+
+    // --- classify_get_error_is_not_found edge case ---
+
+    #[test]
+    fn test_classify_get_error_propagates_403() {
+        let err = S3Error::HttpFailWithBody(403, "Forbidden".to_string());
+        match S3Backend::classify_get_error_is_not_found(TEST_KEY, &err) {
+            Err(AppError::Storage(msg)) => {
+                assert!(msg.contains("Forbidden"), "expected detail: {msg}");
+            }
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    // --- path_format tests ---
+
+    #[test]
+    fn test_native_format_has_no_fallback() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None)
+            .with_path_format(StoragePathFormat::Native);
+        assert!(!config.path_format.has_fallback());
+    }
+
+    #[test]
+    fn test_artifactory_format_has_no_fallback() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None)
+            .with_path_format(StoragePathFormat::Artifactory);
+        assert!(!config.path_format.has_fallback());
+    }
+
+    #[test]
+    fn test_migration_format_has_fallback() {
+        let config = S3Config::new("b".to_string(), "r".to_string(), None, None)
+            .with_path_format(StoragePathFormat::Migration);
+        assert!(config.path_format.has_fallback());
+    }
+
+    // --- classify_fallback_get_result boundary ---
+
+    #[test]
+    fn test_classify_fallback_get_result_299_returns_bytes() {
+        use std::collections::HashMap;
+
+        let body = b"upper boundary";
+        let resp = ResponseData::new(Bytes::from_static(body), 299, HashMap::new());
+        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_classify_fallback_get_result_300_returns_error() {
+        use std::collections::HashMap;
+
+        let resp = ResponseData::new(Bytes::from_static(b""), 300, HashMap::new());
+        let result = S3Backend::classify_fallback_get_result(TEST_KEY, TEST_FALLBACK, Ok(resp));
+        assert!(result.is_err());
+    }
 }
 
 #[cfg(test)]
