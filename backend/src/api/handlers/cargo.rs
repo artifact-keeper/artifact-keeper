@@ -900,8 +900,27 @@ fn extract_index_fields(
         );
     };
 
+    // Cargo publish API sends "version_req" but the sparse index format
+    // requires "req".  Rename on the fly so clients can parse the index.
+    // See https://doc.rust-lang.org/cargo/reference/registry-index.html
+    let deps = match meta.get("deps").cloned().unwrap_or(serde_json::json!([])) {
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(|mut dep| {
+                    if let serde_json::Value::Object(ref mut map) = dep {
+                        if let Some(vr) = map.remove("version_req") {
+                            map.entry("req").or_insert(vr);
+                        }
+                    }
+                    dep
+                })
+                .collect(),
+        ),
+        other => other,
+    };
+
     (
-        meta.get("deps").cloned().unwrap_or(serde_json::json!([])),
+        deps,
         meta.get("features")
             .cloned()
             .unwrap_or(serde_json::json!({})),
@@ -1686,6 +1705,64 @@ mod tests {
         let entry_str = build_index_entry("crate", "1.0.0", "cksum", Some(&meta));
         let entry: serde_json::Value = serde_json::from_str(&entry_str).unwrap();
         assert_eq!(entry["yanked"], false);
+    }
+
+    #[test]
+    fn test_build_index_entry_renames_version_req_to_req() {
+        // Cargo publish sends "version_req" in dependency metadata,
+        // but the sparse index format requires the field to be named "req".
+        // See https://doc.rust-lang.org/cargo/reference/registry-index.html
+        let meta = serde_json::json!({
+            "deps": [
+                {
+                    "name": "serde",
+                    "version_req": "^1.0",
+                    "features": ["derive"],
+                    "optional": false,
+                    "default_features": true,
+                    "target": null,
+                    "kind": "normal",
+                    "registry": null
+                }
+            ],
+            "features": {}
+        });
+        let entry_str = build_index_entry("my-crate", "0.1.0", "abc123", Some(&meta));
+        let entry: serde_json::Value = serde_json::from_str(&entry_str).unwrap();
+
+        let dep = &entry["deps"][0];
+        assert!(dep.get("req").is_some(), "dep must have 'req' field");
+        assert_eq!(dep["req"], "^1.0");
+        assert!(
+            dep.get("version_req").is_none(),
+            "dep must not have 'version_req' field"
+        );
+    }
+
+    #[test]
+    fn test_build_index_entry_keeps_req_if_already_correct() {
+        // If metadata already uses "req" (e.g. from a proxied index),
+        // it should pass through unchanged.
+        let meta = serde_json::json!({
+            "deps": [
+                {
+                    "name": "log",
+                    "req": "^0.4",
+                    "features": [],
+                    "optional": false,
+                    "default_features": true,
+                    "target": null,
+                    "kind": "normal"
+                }
+            ],
+            "features": {}
+        });
+        let entry_str = build_index_entry("my-crate", "0.2.0", "def456", Some(&meta));
+        let entry: serde_json::Value = serde_json::from_str(&entry_str).unwrap();
+
+        let dep = &entry["deps"][0];
+        assert_eq!(dep["req"], "^0.4");
+        assert!(dep.get("version_req").is_none());
     }
 
     // -----------------------------------------------------------------------
