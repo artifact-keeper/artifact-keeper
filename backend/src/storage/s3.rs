@@ -1438,12 +1438,11 @@ mod tests {
     #[test]
     fn test_status_code_boundary_300_is_failure() {
         assert!(S3Backend::classify_put_status(TEST_KEY, 300).is_err());
-        assert_eq!(
+        assert!(
             S3Backend::classify_head_status(TEST_KEY, 300)
                 .unwrap_err()
                 .to_string()
-                .contains("300"),
-            true
+                .contains("300")
         );
     }
 
