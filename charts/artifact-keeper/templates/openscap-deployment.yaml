@@ -1,0 +1,91 @@
+{{- if .Values.openscap.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-openscap
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openscap
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "artifact-keeper.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: openscap
+  template:
+    metadata:
+      {{- with .Values.openscap.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "artifact-keeper.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: openscap
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: openscap
+          image: {{ include "artifact-keeper.openscap.image" . }}
+          imagePullPolicy: {{ .Values.openscap.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8091
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.openscap.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: scan-workspace
+              mountPath: /scan-workspace
+              readOnly: true
+      volumes:
+        - name: scan-workspace
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-scan-workspace
+      {{- with .Values.openscap.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.openscap.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.openscap.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-openscap
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: openscap
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.openscap.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "artifact-keeper.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: openscap
+{{- end }}

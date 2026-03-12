@@ -1,0 +1,250 @@
+# =============================================================================
+# Artifact Keeper Helm Chart — values.yaml
+# =============================================================================
+
+# -- Global settings
+global:
+  # -- Image pull secrets for private registries
+  imagePullSecrets: []
+  # -- Storage class for all PVCs (empty = cluster default)
+  storageClass: ""
+
+# =============================================================================
+# Backend (Rust API server)
+# =============================================================================
+backend:
+  image:
+    repository: ghcr.io/artifact-keeper/artifact-keeper-backend
+    tag: ""  # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  # -- Kubernetes service
+  service:
+    type: ClusterIP
+    port: 8080
+    grpcPort: 9090
+  # -- Resource limits
+  resources: {}
+    # requests:
+    #   cpu: 250m
+    #   memory: 512Mi
+    # limits:
+    #   cpu: "1"
+    #   memory: 1Gi
+  # -- Extra environment variables (key-value pairs)
+  extraEnv: {}
+  # -- JWT secret for API authentication
+  jwtSecret: "change-me-in-production-please"
+  # -- Existing secret containing JWT_SECRET key (overrides jwtSecret)
+  existingJwtSecret: ""
+  # -- Admin password for first-boot setup (empty = auto-generated to PVC)
+  adminPassword: ""
+  # -- Log level
+  rustLog: "info,artifact_keeper=debug"
+  # -- Environment name
+  environment: production
+  # -- CORS origins (comma-separated)
+  corsOrigins: ""
+  # -- Storage volumes
+  storage:
+    artifacts:
+      size: 50Gi
+    backups:
+      size: 20Gi
+    plugins:
+      size: 5Gi
+    scanWorkspace:
+      size: 10Gi
+  # -- Pod annotations
+  podAnnotations: {}
+  # -- Node selector
+  nodeSelector: {}
+  # -- Tolerations
+  tolerations: []
+  # -- Affinity rules
+  affinity: {}
+  # -- Liveness probe
+  livenessProbe:
+    httpGet:
+      path: /livez
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 10
+  # -- Readiness probe
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+
+# =============================================================================
+# Web (Next.js frontend)
+# =============================================================================
+web:
+  enabled: true
+  image:
+    repository: ghcr.io/artifact-keeper/artifact-keeper-web
+    tag: ""  # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 3000
+  resources: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# Ingress (replaces Caddy reverse proxy)
+# =============================================================================
+ingress:
+  enabled: true
+  className: ""  # e.g. "nginx", "traefik"
+  annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: artifact-keeper.local
+  tls: []
+    # - secretName: artifact-keeper-tls
+    #   hosts:
+    #     - artifact-keeper.local
+
+# =============================================================================
+# Gateway API (new K8s standard, alternative to Ingress)
+# Use this instead of ingress when your cluster has a Gateway API controller
+# (e.g. Envoy Gateway, Istio, Cilium, Kong, etc.)
+# =============================================================================
+gateway:
+  enabled: false
+  # -- Reference to the parent Gateway resource
+  gatewayRef:
+    name: ""       # e.g. "main-gateway"
+    namespace: ""  # leave empty for same namespace
+    sectionName: "" # optional listener name
+  host: artifact-keeper.local
+  annotations: {}
+
+# =============================================================================
+# Trivy (vulnerability scanner)
+# =============================================================================
+trivy:
+  enabled: true
+  image:
+    repository: aquasec/trivy
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    port: 8090
+  resources: {}
+  cache:
+    size: 10Gi
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# OpenSCAP (compliance scanner)
+# =============================================================================
+openscap:
+  enabled: true
+  image:
+    repository: ghcr.io/artifact-keeper/artifact-keeper-openscap
+    tag: ""  # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  service:
+    port: 8091
+  resources: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# Dependency-Track (SBOM analysis — optional)
+# =============================================================================
+dependencyTrack:
+  enabled: true
+  image:
+    repository: dependencytrack/apiserver
+    tag: "4.11.4"
+    pullPolicy: IfNotPresent
+  service:
+    port: 8080
+  # -- Admin password (changed from default on first boot)
+  adminPassword: "ArtifactKeeper2026!"
+  # -- Existing secret with ADMIN_PASSWORD key
+  existingAdminSecret: ""
+  resources: {}
+  storage:
+    size: 10Gi
+  # -- Optional frontend for direct DTrack access
+  frontend:
+    enabled: false
+    image:
+      repository: dependencytrack/frontend
+      tag: "4.11.4"
+    service:
+      port: 8080
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# =============================================================================
+# PostgreSQL (Bitnami subchart)
+# Set enabled=false and configure externalPostgresql for an existing instance
+# =============================================================================
+postgresql:
+  enabled: true
+  auth:
+    username: registry
+    password: registry
+    database: artifact_registry
+  primary:
+    persistence:
+      size: 20Gi
+    initdb:
+      scripts:
+        init-db.sql: |
+          CREATE DATABASE dependency_track;
+          GRANT ALL PRIVILEGES ON DATABASE dependency_track TO registry;
+
+# -- External PostgreSQL (used when postgresql.enabled=false)
+externalPostgresql:
+  host: ""
+  port: 5432
+  username: registry
+  password: registry
+  database: artifact_registry
+  sslMode: prefer
+  # -- Existing secret with keys: POSTGRES_PASSWORD, DATABASE_URL
+  existingSecret: ""
+
+# =============================================================================
+# Meilisearch (subchart)
+# Set enabled=false and configure externalMeilisearch for an existing instance
+# =============================================================================
+meilisearch:
+  enabled: true
+  environment:
+    MEILI_ENV: production
+  auth:
+    existingMasterKeySecret: ""
+  masterKey: "artifact-keeper-production-key"
+  persistence:
+    enabled: true
+    size: 10Gi
+
+# -- External Meilisearch (used when meilisearch.enabled=false)
+externalMeilisearch:
+  host: ""
+  port: 7700
+  apiKey: ""
+  # -- Existing secret with key: MEILISEARCH_API_KEY
+  existingSecret: ""

@@ -1,0 +1,113 @@
+{{- if .Values.dependencyTrack.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-dtrack-init
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dtrack-init
+  annotations:
+    # Run after the main resources are created
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        {{- include "artifact-keeper.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: dtrack-init
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: OnFailure
+      containers:
+        - name: dtrack-init
+          image: {{ include "artifact-keeper.backend.image" . }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+
+              DT_URL="http://{{ include "artifact-keeper.fullname" . }}-dtrack:{{ .Values.dependencyTrack.service.port }}"
+              DT_ADMIN_USER="admin"
+              DT_DEFAULT_PASS="admin"
+              DT_NEW_PASS="{{ .Values.dependencyTrack.adminPassword }}"
+              API_KEY_FILE="/shared/dtrack-api-key"
+
+              echo "[dtrack-init] Waiting for Dependency-Track at $DT_URL ..."
+              for i in $(seq 1 60); do
+                if curl -sf "$DT_URL/api/version" > /dev/null 2>&1; then
+                  break
+                fi
+                if [ "$i" -eq 60 ]; then
+                  echo "[dtrack-init] ERROR: Dependency-Track did not become ready" >&2
+                  exit 1
+                fi
+                sleep 5
+              done
+              echo "[dtrack-init] Dependency-Track is up"
+
+              # Skip if already provisioned
+              if [ -f "$API_KEY_FILE" ] && [ -s "$API_KEY_FILE" ]; then
+                echo "[dtrack-init] API key already provisioned — skipping"
+                exit 0
+              fi
+
+              # Try login with new password first
+              TOKEN=$(curl -sf -X POST "$DT_URL/api/v1/user/login" \
+                -H "Content-Type: application/x-www-form-urlencoded" \
+                -d "username=${DT_ADMIN_USER}&password=${DT_NEW_PASS}" 2>/dev/null || true)
+
+              if [ -z "$TOKEN" ] || echo "$TOKEN" | grep -qi "FORCE_PASSWORD_CHANGE"; then
+                echo "[dtrack-init] Changing default admin password..."
+                curl -sf -o /dev/null \
+                  -X POST "$DT_URL/api/v1/user/forceChangePassword" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  -d "username=${DT_ADMIN_USER}&password=${DT_DEFAULT_PASS}&newPassword=${DT_NEW_PASS}&confirmPassword=${DT_NEW_PASS}" || true
+
+                TOKEN=$(curl -sf -X POST "$DT_URL/api/v1/user/login" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  -d "username=${DT_ADMIN_USER}&password=${DT_NEW_PASS}" 2>/dev/null || true)
+              fi
+
+              if [ -z "$TOKEN" ]; then
+                echo "[dtrack-init] ERROR: Could not authenticate" >&2
+                exit 1
+              fi
+
+              echo "[dtrack-init] Authenticated successfully"
+
+              API_KEY=$(curl -sf "$DT_URL/api/v1/team" \
+                -H "Authorization: Bearer $TOKEN" | \
+                jq -r '.[] | select(.name == "Automation") | .apiKeys[0].key // empty')
+
+              if [ -z "$API_KEY" ]; then
+                echo "[dtrack-init] ERROR: Could not find Automation team API key" >&2
+                exit 1
+              fi
+
+              echo "$API_KEY" > "$API_KEY_FILE"
+              echo "[dtrack-init] API key written to $API_KEY_FILE"
+
+              # Enable NVD API 2.0
+              curl -sf -o /dev/null \
+                -X POST "$DT_URL/api/v1/configProperty" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d '{"groupName":"vuln-source","propertyName":"nvd.feeds.url","propertyValue":"https://services.nvd.nist.gov/rest/json/cves/2.0"}' || true
+
+              echo "[dtrack-init] Done"
+          volumeMounts:
+            - name: shared-config
+              mountPath: /shared
+      volumes:
+        - name: shared-config
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-shared-config
+{{- end }}

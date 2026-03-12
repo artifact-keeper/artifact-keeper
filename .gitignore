@@ -103,3 +103,5 @@ scripts/sso-e2e/sso-config-ids.env
 
 # Git worktrees
 .worktrees/
+charts/artifact-keeper/charts/*.tgz
+charts/artifact-keeper/Chart.lock

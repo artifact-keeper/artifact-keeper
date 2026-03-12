@@ -1,0 +1,128 @@
+{{- if .Values.dependencyTrack.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-dtrack
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dependency-track
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "artifact-keeper.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: dependency-track
+  template:
+    metadata:
+      {{- with .Values.dependencyTrack.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "artifact-keeper.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: dependency-track
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: apiserver
+          image: "{{ .Values.dependencyTrack.image.repository }}:{{ .Values.dependencyTrack.image.tag }}"
+          imagePullPolicy: {{ .Values.dependencyTrack.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: ALPINE_DATABASE_MODE
+              value: external
+            - name: ALPINE_DATABASE_URL
+              value: {{ include "artifact-keeper.dtrack.databaseUrl" . | quote }}
+            - name: ALPINE_DATABASE_DRIVER
+              value: org.postgresql.Driver
+            - name: ALPINE_DATABASE_USERNAME
+              value: {{ include "artifact-keeper.dtrack.dbUsername" . | quote }}
+            - name: ALPINE_DATABASE_PASSWORD
+              value: {{ include "artifact-keeper.dtrack.dbPassword" . | quote }}
+            - name: ALPINE_DATA_DIRECTORY
+              value: /data
+            - name: ALPINE_ENFORCE_AUTHENTICATION
+              value: "true"
+            - name: ALPINE_CORS_ENABLED
+              value: "true"
+            - name: ALPINE_CORS_ALLOW_ORIGIN
+              value: "*"
+          livenessProbe:
+            httpGet:
+              path: /api/version
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/version
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 10
+          {{- with .Values.dependencyTrack.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: dtrack-data
+              mountPath: /data
+      volumes:
+        - name: dtrack-data
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-dtrack-data
+      {{- with .Values.dependencyTrack.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.dependencyTrack.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.dependencyTrack.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-dtrack
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dependency-track
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.dependencyTrack.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "artifact-keeper.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: dependency-track
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-dtrack-data
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dependency-track
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.dependencyTrack.storage.size }}
+{{- end }}

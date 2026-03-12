@@ -1,0 +1,53 @@
+{{- if and .Values.dependencyTrack.enabled .Values.dependencyTrack.frontend.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-dtrack-frontend
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dtrack-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "artifact-keeper.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: dtrack-frontend
+  template:
+    metadata:
+      labels:
+        {{- include "artifact-keeper.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: dtrack-frontend
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: frontend
+          image: "{{ .Values.dependencyTrack.frontend.image.repository }}:{{ .Values.dependencyTrack.frontend.image.tag }}"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: API_BASE_URL
+              value: {{ printf "http://%s-dtrack:%d" (include "artifact-keeper.fullname" .) (int .Values.dependencyTrack.service.port) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-dtrack-frontend
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dtrack-frontend
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.dependencyTrack.frontend.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "artifact-keeper.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: dtrack-frontend
+{{- end }}

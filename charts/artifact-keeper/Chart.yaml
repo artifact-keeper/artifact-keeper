@@ -1,0 +1,32 @@
+apiVersion: v2
+name: artifact-keeper
+description: A universal artifact registry supporting 25+ package formats with vulnerability scanning and SBOM analysis
+type: application
+version: 0.1.0
+appVersion: "1.1.0"
+home: https://artifactkeeper.com
+sources:
+  - https://github.com/artifact-keeper/artifact-keeper
+maintainers:
+  - name: artifact-keeper
+    url: https://github.com/artifact-keeper
+keywords:
+  - artifact-registry
+  - package-manager
+  - docker-registry
+  - oci
+  - vulnerability-scanning
+  - sbom
+
+dependencies:
+  # PostgreSQL — disable and set externalPostgresql if using an existing instance
+  - name: postgresql
+    version: "16.4.1"
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+
+  # Meilisearch — disable and set externalMeilisearch if using an existing instance
+  - name: meilisearch
+    version: "0.27.0"
+    repository: https://meilisearch.github.io/meilisearch-kubernetes
+    condition: meilisearch.enabled

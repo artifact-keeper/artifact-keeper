@@ -1,0 +1,66 @@
+
+=================================================================
+  Artifact Keeper {{ .Chart.AppVersion }} deployed!
+=================================================================
+
+{{- if .Values.ingress.enabled }}
+
+  Access via Ingress:
+    Host: {{ .Values.ingress.host }}
+    {{- if .Values.ingress.tls }}
+    URL:  https://{{ .Values.ingress.host }}
+    {{- else }}
+    URL:  http://{{ .Values.ingress.host }}
+    {{- end }}
+
+{{- else if .Values.gateway.enabled }}
+
+  Access via Gateway API:
+    Host: {{ .Values.gateway.host }}
+
+{{- else }}
+
+  Access via port-forward:
+    kubectl port-forward svc/{{ include "artifact-keeper.fullname" . }}-backend {{ .Values.backend.service.port }}:{{ .Values.backend.service.port }}
+  {{- if .Values.web.enabled }}
+    kubectl port-forward svc/{{ include "artifact-keeper.fullname" . }}-web {{ .Values.web.service.port }}:{{ .Values.web.service.port }}
+  {{- end }}
+
+{{- end }}
+
+Components:
+  - Backend API:    {{ include "artifact-keeper.fullname" . }}-backend:{{ .Values.backend.service.port }}
+  {{- if .Values.web.enabled }}
+  - Web UI:         {{ include "artifact-keeper.fullname" . }}-web:{{ .Values.web.service.port }}
+  {{- end }}
+  {{- if .Values.trivy.enabled }}
+  - Trivy:          {{ include "artifact-keeper.fullname" . }}-trivy:{{ .Values.trivy.service.port }}
+  {{- end }}
+  {{- if .Values.openscap.enabled }}
+  - OpenSCAP:       {{ include "artifact-keeper.fullname" . }}-openscap:{{ .Values.openscap.service.port }}
+  {{- end }}
+  {{- if .Values.dependencyTrack.enabled }}
+  - Dep-Track:      {{ include "artifact-keeper.fullname" . }}-dtrack:{{ .Values.dependencyTrack.service.port }}
+  {{- end }}
+
+Database:
+  {{- if .Values.postgresql.enabled }}
+  - PostgreSQL (subchart): {{ .Release.Name }}-postgresql:5432
+  {{- else }}
+  - External PostgreSQL: {{ .Values.externalPostgresql.host }}:{{ .Values.externalPostgresql.port }}
+  {{- end }}
+
+Search:
+  {{- if .Values.meilisearch.enabled }}
+  - Meilisearch (subchart): {{ .Release.Name }}-meilisearch:7700
+  {{- else }}
+  - External Meilisearch: {{ .Values.externalMeilisearch.host }}:{{ .Values.externalMeilisearch.port }}
+  {{- end }}
+
+=================================================================
+  IMPORTANT: Change the JWT secret in production!
+  {{- if eq .Values.backend.jwtSecret "change-me-in-production-please" }}
+  WARNING: You are using the default JWT secret. Set backend.jwtSecret
+           or backend.existingJwtSecret for production.
+  {{- end }}
+=================================================================

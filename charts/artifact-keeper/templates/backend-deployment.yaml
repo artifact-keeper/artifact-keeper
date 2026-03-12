@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-backend
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  replicas: {{ .Values.backend.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "artifact-keeper.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/backend-configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/backend-secret.yaml") . | sha256sum }}
+        {{- with .Values.backend.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "artifact-keeper.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: backend
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.dependencyTrack.enabled }}
+      initContainers:
+        - name: wait-for-dtrack
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Dependency-Track API key..."
+              for i in $(seq 1 60); do
+                if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
+                  echo "API key found"
+                  exit 0
+                fi
+                sleep 5
+              done
+              echo "WARNING: Dependency-Track API key not found after 5 min, continuing anyway"
+          volumeMounts:
+            - name: shared-config
+              mountPath: /shared
+              readOnly: true
+      {{- end }}
+      containers:
+        - name: backend
+          image: {{ include "artifact-keeper.backend.image" . }}
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          {{- if .Values.dependencyTrack.enabled }}
+          command:
+            - sh
+            - -c
+            - |
+              if [ -f /shared/dtrack-api-key ] && [ -s /shared/dtrack-api-key ]; then
+                export DEPENDENCY_TRACK_API_KEY="$(cat /shared/dtrack-api-key)"
+              fi
+              exec artifact-keeper
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: grpc
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+            - secretRef:
+                name: {{ .Values.backend.existingJwtSecret | default (printf "%s-backend" (include "artifact-keeper.fullname" .)) }}
+          livenessProbe:
+            {{- toYaml .Values.backend.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.backend.readinessProbe | nindent 12 }}
+          {{- with .Values.backend.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: artifact-storage
+              mountPath: /data/storage
+            - name: backup-storage
+              mountPath: /data/backups
+            - name: plugins-storage
+              mountPath: /data/plugins
+            - name: scan-workspace
+              mountPath: /scan-workspace
+            {{- if .Values.dependencyTrack.enabled }}
+            - name: shared-config
+              mountPath: /shared
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: artifact-storage
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-artifacts
+        - name: backup-storage
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-backups
+        - name: plugins-storage
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-plugins
+        - name: scan-workspace
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-scan-workspace
+        {{- if .Values.dependencyTrack.enabled }}
+        - name: shared-config
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-shared-config
+        {{- end }}
+      {{- with .Values.backend.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

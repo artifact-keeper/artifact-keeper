@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-backend
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+data:
+  STORAGE_PATH: /data/storage
+  BACKUP_PATH: /data/backups
+  PLUGINS_DIR: /data/plugins
+  SCAN_WORKSPACE_PATH: /scan-workspace
+  RUST_LOG: {{ .Values.backend.rustLog | quote }}
+  ENVIRONMENT: {{ .Values.backend.environment | quote }}
+  HOST: "0.0.0.0"
+  PORT: "8080"
+  DATABASE_URL: {{ include "artifact-keeper.databaseUrl" . | quote }}
+  MEILISEARCH_URL: {{ include "artifact-keeper.meilisearch.url" . | quote }}
+  {{- if .Values.backend.corsOrigins }}
+  CORS_ORIGINS: {{ .Values.backend.corsOrigins | quote }}
+  {{- end }}
+  {{- if .Values.trivy.enabled }}
+  TRIVY_URL: {{ printf "http://%s-trivy:%d" (include "artifact-keeper.fullname" .) (int .Values.trivy.service.port) | quote }}
+  {{- end }}
+  {{- if .Values.openscap.enabled }}
+  OPENSCAP_URL: {{ printf "http://%s-openscap:%d" (include "artifact-keeper.fullname" .) (int .Values.openscap.service.port) | quote }}
+  {{- end }}
+  {{- if .Values.dependencyTrack.enabled }}
+  DEPENDENCY_TRACK_URL: {{ printf "http://%s-dtrack:%d" (include "artifact-keeper.fullname" .) (int .Values.dependencyTrack.service.port) | quote }}
+  DEPENDENCY_TRACK_ENABLED: "true"
+  {{- else }}
+  DEPENDENCY_TRACK_ENABLED: "false"
+  {{- end }}
+  {{- range $key, $value := .Values.backend.extraEnv }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

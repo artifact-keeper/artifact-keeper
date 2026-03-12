@@ -1,0 +1,60 @@
+# Example: using external PostgreSQL and Meilisearch instead of subcharts
+# Usage: helm install artifact-keeper ./charts/artifact-keeper -f ./charts/artifact-keeper/values-external-deps.yaml
+
+# Disable subcharts
+postgresql:
+  enabled: false
+meilisearch:
+  enabled: false
+
+# Point to external PostgreSQL (e.g., RDS, Cloud SQL, managed PG)
+externalPostgresql:
+  host: my-postgres.example.com
+  port: 5432
+  username: registry
+  password: ""  # prefer existingSecret
+  database: artifact_registry
+  sslMode: require
+  existingSecret: artifact-keeper-pg-credentials  # must contain POSTGRES_PASSWORD, DATABASE_URL
+
+# Point to external Meilisearch
+externalMeilisearch:
+  host: my-meilisearch.example.com
+  port: 7700
+  apiKey: ""  # prefer existingSecret
+  existingSecret: artifact-keeper-meili-credentials  # must contain MEILISEARCH_API_KEY
+
+# Production-ready settings
+backend:
+  jwtSecret: ""  # prefer existingJwtSecret
+  existingJwtSecret: artifact-keeper-jwt-secret  # must contain JWT_SECRET
+  environment: production
+  corsOrigins: "https://registry.example.com"
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: registry.example.com
+  tls:
+    - secretName: artifact-keeper-tls
+      hosts:
+        - registry.example.com
+
+# Or use Gateway API instead of Ingress:
+# ingress:
+#   enabled: false
+# gateway:
+#   enabled: true
+#   gatewayRef:
+#     name: main-gateway
+#   host: registry.example.com

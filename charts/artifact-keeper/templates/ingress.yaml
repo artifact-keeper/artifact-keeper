@@ -1,0 +1,70 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- toYaml .Values.ingress.tls | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          # API and system endpoints → backend
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # /health, /livez, /readyz, /metrics are internal-only (probes + Prometheus)
+          - path: /swagger-ui
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # OCI / Docker registry
+          - path: /v2
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # Native package format handlers
+          {{- $backendSvc := printf "%s-backend" (include "artifact-keeper.fullname" .) }}
+          {{- $backendPort := int .Values.backend.service.port }}
+          {{- range list "maven" "npm" "pypi" "nuget" "cargo" "gems" "go" "helm" "debian" "rpm" "alpine" "composer" "conan" "conda" "swift" "terraform" "cocoapods" "hex" "pub" "lfs" "ivy" "chef" "puppet" "ansible" "cran" "huggingface" "jetbrains" "vscode" "proto" "incus" "ext" }}
+          - path: /{{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $backendSvc }}
+                port:
+                  number: {{ $backendPort }}
+          {{- end }}
+          # Default: everything else → web frontend
+          {{- if .Values.web.enabled }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "artifact-keeper.fullname" . }}-web
+                port:
+                  number: {{ .Values.web.service.port }}
+          {{- end }}
+{{- end }}

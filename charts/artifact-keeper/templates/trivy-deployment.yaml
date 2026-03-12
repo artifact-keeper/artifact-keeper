@@ -1,0 +1,114 @@
+{{- if .Values.trivy.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-trivy
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trivy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "artifact-keeper.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: trivy
+  template:
+    metadata:
+      {{- with .Values.trivy.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "artifact-keeper.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: trivy
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: trivy
+          image: "{{ .Values.trivy.image.repository }}:{{ .Values.trivy.image.tag }}"
+          imagePullPolicy: {{ .Values.trivy.image.pullPolicy }}
+          args: ["server", "--listen", "0.0.0.0:8090"]
+          ports:
+            - name: http
+              containerPort: 8090
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- with .Values.trivy.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: trivy-cache
+              mountPath: /root/.cache/trivy
+            - name: scan-workspace
+              mountPath: /scan-workspace
+              readOnly: true
+      volumes:
+        - name: trivy-cache
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-trivy-cache
+        - name: scan-workspace
+          persistentVolumeClaim:
+            claimName: {{ include "artifact-keeper.fullname" . }}-scan-workspace
+      {{- with .Values.trivy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.trivy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.trivy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-trivy
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trivy
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.trivy.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "artifact-keeper.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: trivy
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "artifact-keeper.fullname" . }}-trivy-cache
+  labels:
+    {{- include "artifact-keeper.labels" . | nindent 4 }}
+    app.kubernetes.io/component: trivy
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.global.storageClass }}
+  storageClassName: {{ .Values.global.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.trivy.cache.size }}
+{{- end }}

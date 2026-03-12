@@ -1,0 +1,40 @@
+{{- $fullname := include "artifact-keeper.fullname" . }}
+{{- $labels := include "artifact-keeper.labels" . }}
+{{- $sc := .Values.global.storageClass }}
+{{- range $name, $size := dict "artifacts" .Values.backend.storage.artifacts.size "backups" .Values.backend.storage.backups.size "plugins" .Values.backend.storage.plugins.size "scan-workspace" .Values.backend.storage.scanWorkspace.size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-{{ $name }}
+  labels:
+    {{- $labels | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if $sc }}
+  storageClassName: {{ $sc }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $size }}
+{{- end }}
+{{- if .Values.dependencyTrack.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-shared-config
+  labels:
+    {{- $labels | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if $sc }}
+  storageClassName: {{ $sc }}
+  {{- end }}
+  resources:
+    requests:
+      storage: 100Mi
+{{- end }}
