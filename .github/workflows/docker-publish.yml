@@ -60,7 +60,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
 
@@ -128,7 +128,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
 
@@ -194,7 +194,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
 
@@ -476,7 +476,7 @@ jobs:
 
       - name: Extract metadata (ghcr.io)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           tags: |
@@ -491,7 +491,7 @@ jobs:
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: docker.io/${{ env.DOCKERHUB_BACKEND }}
           tags: |
@@ -595,7 +595,7 @@ jobs:
 
       - name: Extract metadata (ghcr.io)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.OPENSCAP_IMAGE }}
           tags: |
@@ -610,7 +610,7 @@ jobs:
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: docker.io/${{ env.DOCKERHUB_OPENSCAP }}
           tags: |
@@ -697,7 +697,7 @@ jobs:
 
       - name: Extract metadata (ghcr.io)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
           flavor: |
@@ -714,7 +714,7 @@ jobs:
 
       - name: Extract metadata (Docker Hub)
         id: meta-dockerhub
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: docker.io/${{ env.DOCKERHUB_BACKEND }}
           flavor: |
