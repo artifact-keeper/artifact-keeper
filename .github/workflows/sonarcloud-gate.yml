@@ -194,7 +194,7 @@ jobs:
       # appear on the PR. We must explicitly post a commit status instead.
       - name: Set commit status
         if: always() && steps.pr.outputs.skip != 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           GATE_STATUS: ${{ steps.gate.outputs.status || steps.check.outputs.status }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -233,7 +233,7 @@ jobs:
       - name: Post PR comment
         if: always() && steps.pr.outputs.skip != 'true'
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           GATE_STATUS: ${{ steps.gate.outputs.status || steps.check.outputs.status }}
           COVERAGE: ${{ steps.gate.outputs.coverage }}
