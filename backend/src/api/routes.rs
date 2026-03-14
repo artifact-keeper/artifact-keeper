@@ -12,6 +12,7 @@ use super::middleware::auth::{
 use super::middleware::demo::demo_guard;
 use super::middleware::rate_limit::{rate_limit_middleware, RateLimiter};
 use super::middleware::setup::setup_guard;
+use super::middleware::tracing::correlation_id_middleware;
 use super::SharedState;
 use crate::services::auth_service::AuthService;
 
@@ -104,6 +105,11 @@ pub fn create_router(state: SharedState) -> Router {
         tracing::info!("Demo mode enabled — write operations will be blocked");
         router = router.layer(middleware::from_fn_with_state(state.clone(), demo_guard));
     }
+
+    // Correlation ID middleware (outermost layer — runs first on every request).
+    // Extracts or generates a correlation ID and sets the X-Correlation-ID
+    // response header.
+    router = router.layer(middleware::from_fn(correlation_id_middleware));
 
     router.with_state(state)
 }

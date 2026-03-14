@@ -962,6 +962,63 @@ async fn upload(
                 .bind(&merged)
                 .execute(&state.db)
                 .await;
+            } else if is_primary && coords.version.contains("SNAPSHOT") {
+                // SNAPSHOT re-upload: a newer build of the same primary artifact
+                // (e.g. a new timestamped JAR replacing the previous one). Update
+                // the artifact record to point to the latest build.
+                let mut updated_meta = existing_meta.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "groupId": coords.group_id,
+                        "artifactId": coords.artifact_id,
+                        "version": coords.version,
+                    })
+                });
+
+                let mut files = updated_meta
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                files.push(new_file);
+                updated_meta["files"] = serde_json::Value::Array(files);
+
+                // Update the artifact record to point to the latest JAR
+                super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
+                let _ = sqlx::query(
+                    r#"
+                    UPDATE artifacts
+                    SET path = $1, size_bytes = $2, checksum_sha256 = $3,
+                        content_type = $4, storage_key = $5, updated_at = NOW()
+                    WHERE id = $6
+                    "#,
+                )
+                .bind(&path)
+                .bind(size_bytes)
+                .bind(&checksum_sha256)
+                .bind(ct)
+                .bind(&storage_key)
+                .bind(existing_id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Database error: {}", e),
+                    )
+                        .into_response()
+                })?;
+
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO artifact_metadata (artifact_id, format, metadata)
+                    VALUES ($1, 'maven', $2)
+                    ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+                    "#,
+                )
+                .bind(existing_id)
+                .bind(&updated_meta)
+                .execute(&state.db)
+                .await;
             } else {
                 // Secondary file (POM when JAR exists, or classifier like sources/javadoc).
                 // Add it to the existing artifact's metadata files array.
