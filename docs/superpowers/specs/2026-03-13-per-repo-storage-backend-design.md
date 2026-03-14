@@ -173,7 +173,7 @@ The following locations that construct `CachedRepo` must be updated to populate 
 
 - Add `storage_backend` field to the `CreateRepositoryRequest` schema with enum constraint (`filesystem`, `s3`, `azure`, `gcs`).
 - Document it as optional, defaulting to the instance setting. Note that non-admin users cannot override the default.
-- Add a new `GET /api/v1/system/storage-backends` endpoint that returns the list of available backend type names (e.g., `["filesystem", "s3"]`). Admin-only. Does not expose bucket names, regions, endpoints, or credentials.
+- Add a new `GET /api/v1/admin/storage-backends` endpoint that returns the list of available backend type names (e.g., `["filesystem", "s3"]`). Admin-only. Does not expose bucket names, regions, endpoints, or credentials.
 
 ## Testing
 
@@ -217,7 +217,7 @@ All existing tests use `storage_backend = "filesystem"` (the default). Filesyste
 ## Operational Notes
 
 - **Credential rotation:** Static credentials (access keys, storage account keys) require a process restart to take effect. Token-based auth (Azure RBAC, GCS Workload Identity) refreshes automatically within the backend implementations.
-- **Backup:** With mixed backends, a complete backup must cover all active storage locations: the filesystem directory, S3 bucket, Azure container, and/or GCS bucket. The `GET /api/v1/system/storage-backends` admin endpoint can be used to inventory which backends are in use.
+- **Backup:** With mixed backends, a complete backup must cover all active storage locations: the filesystem directory, S3 bucket, Azure container, and/or GCS bucket. The `GET /api/v1/admin/storage-backends` admin endpoint can be used to inventory which backends are in use.
 - **Restore:** All backend credentials must be present in the environment before starting the server, or repos on unavailable backends will return 500 errors until credentials are restored.
 
 ## Non-Goals

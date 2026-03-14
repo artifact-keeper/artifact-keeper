@@ -38,6 +38,17 @@ pub fn router() -> Router<SharedState> {
 ///
 /// Returns the names of all configured and available storage backends.
 /// Requires admin privileges.
+#[utoipa::path(
+    get,
+    path = "/storage-backends",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Available storage backends", body = Vec<String>),
+        (status = 403, description = "Admin privileges required"),
+    )
+)]
 pub async fn list_storage_backends(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -806,6 +817,7 @@ pub async fn trigger_reindex(
         get_system_stats,
         run_cleanup,
         trigger_reindex,
+        list_storage_backends,
     ),
     components(schemas(
         ListBackupsQuery,
