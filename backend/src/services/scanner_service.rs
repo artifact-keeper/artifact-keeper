@@ -117,6 +117,10 @@ pub struct AdvisoryClient {
     http: Client,
     cache: RwLock<HashMap<String, CachedAdvisory>>,
     github_token: Option<String>,
+    #[cfg(test)]
+    osv_batch_url: String,
+    #[cfg(test)]
+    cache_ttl: Duration,
 }
 
 struct CachedAdvisory {
@@ -177,7 +181,42 @@ impl AdvisoryClient {
                 .expect("failed to build HTTP client"),
             cache: RwLock::new(HashMap::new()),
             github_token,
+            #[cfg(test)]
+            osv_batch_url: OSV_BATCH_URL.to_string(),
+            #[cfg(test)]
+            cache_ttl: CACHE_TTL,
         }
+    }
+
+    fn cache_ttl(&self) -> Duration {
+        #[cfg(test)]
+        {
+            self.cache_ttl
+        }
+        #[cfg(not(test))]
+        {
+            CACHE_TTL
+        }
+    }
+
+    fn osv_batch_url(&self) -> &str {
+        #[cfg(test)]
+        {
+            &self.osv_batch_url
+        }
+        #[cfg(not(test))]
+        {
+            OSV_BATCH_URL
+        }
+    }
+
+    fn cache_key(dep: &Dependency) -> String {
+        format!(
+            "{}:{}:{}",
+            dep.ecosystem,
+            dep.name,
+            dep.version.as_deref().unwrap_or("*")
+        )
     }
 
     /// Query OSV.dev for advisories affecting the given dependencies.
@@ -186,6 +225,8 @@ impl AdvisoryClient {
             return vec![];
         }
 
+        let cache_ttl = self.cache_ttl();
+
         // Check cache first
         let mut uncached = Vec::new();
         let mut results = Vec::new();
@@ -193,14 +234,9 @@ impl AdvisoryClient {
         {
             let cache = self.cache.read().await;
             for dep in deps {
-                let key = format!(
-                    "{}:{}:{}",
-                    dep.ecosystem,
-                    dep.name,
-                    dep.version.as_deref().unwrap_or("*")
-                );
+                let key = Self::cache_key(dep);
                 if let Some(cached) = cache.get(&key) {
-                    if cached.fetched_at.elapsed() < CACHE_TTL {
+                    if cached.fetched_at.elapsed() < cache_ttl {
                         results.extend(cached.findings.clone());
                         continue;
                     }
@@ -228,45 +264,73 @@ impl AdvisoryClient {
                     .collect(),
             };
 
-            match self.http.post(OSV_BATCH_URL).json(&query).send().await {
+            match self
+                .http
+                .post(self.osv_batch_url())
+                .json(&query)
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
-                    if let Ok(body) = resp.json::<serde_json::Value>().await {
-                        let matches = Self::parse_osv_response(&body, chunk);
-                        // Update cache
-                        let mut cache = self.cache.write().await;
-                        for dep in chunk.iter() {
-                            let key = format!(
-                                "{}:{}:{}",
-                                dep.ecosystem,
-                                dep.name,
-                                dep.version.as_deref().unwrap_or("*")
-                            );
-                            let dep_matches: Vec<_> = matches
-                                .iter()
-                                .filter(|_m| {
-                                    // Match by position in batch response
-                                    true // OSV returns results indexed by query order
-                                })
-                                .cloned()
-                                .collect();
-                            cache.insert(
-                                key,
-                                CachedAdvisory {
-                                    findings: dep_matches,
-                                    fetched_at: Instant::now(),
-                                },
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(body) => {
+                            let matches = Self::parse_osv_response(&body, chunk);
+                            let mut cache = self.cache.write().await;
+                            for dep in chunk.iter() {
+                                let key = Self::cache_key(dep);
+                                let dep_matches: Vec<_> = matches
+                                    .iter()
+                                    .filter(|_m| {
+                                        // Match by position in batch response
+                                        true // OSV returns results indexed by query order
+                                    })
+                                    .cloned()
+                                    .collect();
+                                cache.insert(
+                                    key,
+                                    CachedAdvisory {
+                                        findings: dep_matches,
+                                        fetched_at: Instant::now(),
+                                    },
+                                );
+                            }
+                            results.extend(matches);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse OSV.dev response for batch of {} deps: {}",
+                                chunk.len(),
+                                e
                             );
                         }
-                        results.extend(matches);
                     }
                 }
                 Ok(resp) => {
-                    warn!("OSV.dev returned status {}", resp.status());
+                    warn!(
+                        "OSV.dev returned status {} for batch of {} deps",
+                        resp.status(),
+                        chunk.len()
+                    );
                 }
                 Err(e) => {
-                    warn!("OSV.dev request failed: {}", e);
+                    warn!(
+                        "OSV.dev request failed for batch of {} deps: {}",
+                        chunk.len(),
+                        e
+                    );
                 }
             }
+        }
+
+        // Evict stale entries after all batches complete so the cache does not
+        // grow without bound across long-lived AdvisoryClient instances.
+        // Note: runs after insertion so that freshly fetched entries (which use
+        // Instant::now()) are never mistakenly evicted. A concurrent reader
+        // between batch insertion and this eviction may see a stale entry and
+        // issue a redundant OSV fetch, but this is harmless.
+        {
+            let mut cache = self.cache.write().await;
+            cache.retain(|_, v| v.fetched_at.elapsed() < cache_ttl);
         }
 
         results
@@ -308,11 +372,19 @@ impl AdvisoryClient {
                 .await
             {
                 Ok(resp) if resp.status().is_success() => {
-                    if let Ok(advisories) = resp.json::<Vec<serde_json::Value>>().await {
-                        for adv in advisories {
-                            if let Some(m) = Self::parse_github_advisory(&adv, dep) {
-                                results.push(m);
+                    match resp.json::<Vec<serde_json::Value>>().await {
+                        Ok(advisories) => {
+                            for adv in advisories {
+                                if let Some(m) = Self::parse_github_advisory(&adv, dep) {
+                                    results.push(m);
+                                }
                             }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse GitHub Advisory response for {}: {}",
+                                dep.name, e
+                            );
                         }
                     }
                 }
@@ -1468,12 +1540,7 @@ mod tests {
     }
 
     fn build_osv_cache_key(dep: &Dependency) -> String {
-        format!(
-            "{}:{}:{}",
-            dep.ecosystem,
-            dep.name,
-            dep.version.as_deref().unwrap_or("*")
-        )
+        AdvisoryClient::cache_key(dep)
     }
 
     // -----------------------------------------------------------------------
@@ -2763,6 +2830,253 @@ mod tests {
     #[test]
     fn test_cache_ttl_is_one_hour() {
         assert_eq!(CACHE_TTL, Duration::from_secs(3600));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache eviction on write
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cache_retain_evicts_expired_entries() {
+        let mut cache = HashMap::new();
+
+        // Insert an entry that is still valid (just created)
+        cache.insert(
+            "npm:fresh-pkg:1.0".to_string(),
+            CachedAdvisory {
+                findings: vec![],
+                fetched_at: Instant::now(),
+            },
+        );
+
+        // Insert an entry that is expired (fetched_at far in the past)
+        // We simulate this by using Instant::now() - 2 hours
+        cache.insert(
+            "npm:stale-pkg:0.1".to_string(),
+            CachedAdvisory {
+                findings: vec![],
+                fetched_at: Instant::now() - Duration::from_secs(7200),
+            },
+        );
+
+        assert_eq!(cache.len(), 2);
+
+        // This is the same retain call added to query_osv
+        cache.retain(|_, v| v.fetched_at.elapsed() < CACHE_TTL);
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key("npm:fresh-pkg:1.0"));
+        assert!(!cache.contains_key("npm:stale-pkg:0.1"));
+    }
+
+    #[test]
+    fn test_cache_retain_keeps_all_when_none_expired() {
+        let mut cache = HashMap::new();
+
+        cache.insert(
+            "npm:a:1.0".to_string(),
+            CachedAdvisory {
+                findings: vec![],
+                fetched_at: Instant::now(),
+            },
+        );
+        cache.insert(
+            "npm:b:2.0".to_string(),
+            CachedAdvisory {
+                findings: vec![],
+                fetched_at: Instant::now(),
+            },
+        );
+
+        cache.retain(|_, v| v.fetched_at.elapsed() < CACHE_TTL);
+
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_cache_retain_removes_all_when_all_expired() {
+        let mut cache = HashMap::new();
+        let expired = Instant::now() - Duration::from_secs(7200);
+
+        cache.insert(
+            "npm:old1:1.0".to_string(),
+            CachedAdvisory {
+                findings: vec![],
+                fetched_at: expired,
+            },
+        );
+        cache.insert(
+            "npm:old2:2.0".to_string(),
+            CachedAdvisory {
+                findings: vec![],
+                fetched_at: expired,
+            },
+        );
+
+        cache.retain(|_, v| v.fetched_at.elapsed() < CACHE_TTL);
+
+        assert!(cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_eviction_runs_once_and_fresh_entries_survive_across_batches() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "results": [] })),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let cache_ttl = Duration::from_millis(500);
+
+        // Pre-populate cache with 5 stale entries for deps NOT in the query list.
+        let expired = Instant::now() - (cache_ttl + Duration::from_secs(1));
+        let mut seed = HashMap::new();
+        let stale_keys: Vec<String> = (0..5).map(|i| format!("npm:stale-pkg-{i}:0.0.1")).collect();
+        for key in &stale_keys {
+            seed.insert(
+                key.clone(),
+                CachedAdvisory {
+                    findings: vec![],
+                    fetched_at: expired,
+                },
+            );
+        }
+
+        let client = AdvisoryClient {
+            http: crate::services::http_client::base_client_builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build HTTP client"),
+            cache: RwLock::new(seed),
+            github_token: None,
+            osv_batch_url: format!("{}/v1/querybatch", server.uri()),
+            cache_ttl,
+        };
+
+        let deps: Vec<_> = (0..1001)
+            .map(|i| Dependency {
+                name: format!("dep-{i}"),
+                version: Some("1.0.0".to_string()),
+                ecosystem: "npm".to_string(),
+            })
+            .collect();
+
+        let results = client.query_osv(&deps).await;
+        assert!(results.is_empty());
+
+        let cache = client.cache.read().await;
+        // All 1001 fresh entries survive, stale entries evicted.
+        assert_eq!(cache.len(), 1001);
+        // Stale pre-existing entries must be gone.
+        for key in &stale_keys {
+            assert!(
+                !cache.contains_key(key),
+                "stale key should be evicted: {key}"
+            );
+        }
+        // Both batch-1 and batch-2 keys must be present.
+        assert!(cache.contains_key(&build_osv_cache_key(&deps[0])));
+        assert!(cache.contains_key(&build_osv_cache_key(&deps[999])));
+        assert!(cache.contains_key(&build_osv_cache_key(&deps[1000])));
+    }
+
+    #[tokio::test]
+    async fn test_stale_dep_refetched_with_new_findings() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{
+                    "vulns": [{
+                        "id": "GHSA-new-finding",
+                        "summary": "New vulnerability",
+                        "database_specific": { "severity": "HIGH" },
+                        "aliases": ["CVE-2026-9999"],
+                        "affected": [{
+                            "ranges": [{
+                                "events": [{ "fixed": "2.0.0" }]
+                            }]
+                        }]
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache_ttl = Duration::from_secs(3600);
+
+        // Seed cache with a STALE entry for the dep we're about to query.
+        let stale_findings = vec![AdvisoryMatch {
+            id: "GHSA-old-finding".to_string(),
+            summary: Some("Old vulnerability".to_string()),
+            details: None,
+            severity: "medium".to_string(),
+            aliases: vec![],
+            affected_version: None,
+            fixed_version: None,
+            source: "osv.dev".to_string(),
+            source_url: None,
+        }];
+        let expired = Instant::now() - (cache_ttl + Duration::from_secs(60));
+        let mut seed = HashMap::new();
+        seed.insert(
+            "npm:vulnerable-pkg:1.0.0".to_string(),
+            CachedAdvisory {
+                findings: stale_findings,
+                fetched_at: expired,
+            },
+        );
+
+        let client = AdvisoryClient {
+            http: crate::services::http_client::base_client_builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build HTTP client"),
+            cache: RwLock::new(seed),
+            github_token: None,
+            osv_batch_url: format!("{}/v1/querybatch", server.uri()),
+            cache_ttl,
+        };
+
+        let deps = vec![Dependency {
+            name: "vulnerable-pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            ecosystem: "npm".to_string(),
+        }];
+
+        let results = client.query_osv(&deps).await;
+
+        // Results should contain the NEW finding from OSV, not the old cached one.
+        assert!(
+            results.iter().any(|r| r.id == "GHSA-new-finding"),
+            "expected new finding from OSV, got: {:?}",
+            results.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+        assert!(
+            !results.iter().any(|r| r.id == "GHSA-old-finding"),
+            "stale finding should not appear in results"
+        );
+
+        // Cache should now hold the fresh entry.
+        let cache = client.cache.read().await;
+        let cached = cache
+            .get("npm:vulnerable-pkg:1.0.0")
+            .expect("entry must exist");
+        assert!(
+            cached.fetched_at.elapsed() < Duration::from_secs(5),
+            "cache entry should be fresh"
+        );
     }
 
     // -----------------------------------------------------------------------
