@@ -343,15 +343,7 @@ impl MeiliService {
                 .collect();
 
             last_id = rows.last().map(|row| row.id);
-            let documents: Vec<ArtifactDocument> = rows
-                .into_iter()
-                .map(|row| {
-                    // Artifacts with no download records default to 0,
-                    // matching the previous COALESCE(ds.download_count, 0) behavior.
-                    let download_count = download_counts.get(&row.id).copied().unwrap_or_default();
-                    artifact_document_from_row(row, download_count)
-                })
-                .collect();
+            let documents = build_artifact_batch(rows, &download_counts);
 
             total += documents.len();
             index
@@ -422,8 +414,7 @@ impl MeiliService {
             }
 
             last_id = rows.last().map(|row| row.id);
-            let documents: Vec<RepositoryDocument> =
-                rows.into_iter().map(repository_document_from_row).collect();
+            let documents = build_repository_batch(rows);
 
             total += documents.len();
             index
@@ -493,6 +484,27 @@ struct RepositoryRow {
 struct ArtifactDownloadCountRow {
     artifact_id: Uuid,
     download_count: i64,
+}
+
+/// Build a batch of [`ArtifactDocument`]s from database rows and per-artifact download counts.
+///
+/// Artifacts with no entry in `download_counts` default to 0,
+/// matching the previous `COALESCE(ds.download_count, 0)` behavior.
+fn build_artifact_batch(
+    rows: Vec<ArtifactRow>,
+    download_counts: &HashMap<Uuid, i64>,
+) -> Vec<ArtifactDocument> {
+    rows.into_iter()
+        .map(|row| {
+            let dc = download_counts.get(&row.id).copied().unwrap_or_default();
+            artifact_document_from_row(row, dc)
+        })
+        .collect()
+}
+
+/// Build a batch of [`RepositoryDocument`]s from database rows.
+fn build_repository_batch(rows: Vec<RepositoryRow>) -> Vec<RepositoryDocument> {
+    rows.into_iter().map(repository_document_from_row).collect()
 }
 
 fn artifact_document_from_row(row: ArtifactRow, download_count: i64) -> ArtifactDocument {
@@ -1106,5 +1118,107 @@ mod tests {
         assert_eq!(doc.key, "docker-local");
         assert_eq!(doc.description, Some("Local docker repo".to_string()));
         assert!(doc.is_public);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_artifact_batch tests
+    // -----------------------------------------------------------------------
+
+    fn make_artifact_row(id: Uuid) -> ArtifactRow {
+        ArtifactRow {
+            id,
+            name: format!("artifact-{}", &id.to_string()[..8]),
+            path: format!("pkg/{id}"),
+            version: Some("1.0.0".to_string()),
+            content_type: "application/octet-stream".to_string(),
+            size_bytes: 256,
+            created_at: Utc::now(),
+            repository_id: Uuid::new_v4(),
+            repository_key: "generic-local".to_string(),
+            repository_name: "Generic".to_string(),
+            format: "generic".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_artifact_batch_empty() {
+        let docs = build_artifact_batch(vec![], &HashMap::new());
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_build_artifact_batch_mixed_downloads() {
+        let id_with = Uuid::new_v4();
+        let id_without = Uuid::new_v4();
+        let rows = vec![make_artifact_row(id_with), make_artifact_row(id_without)];
+
+        let mut counts = HashMap::new();
+        counts.insert(id_with, 42);
+
+        let docs = build_artifact_batch(rows, &counts);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].download_count, 42);
+        assert_eq!(
+            docs[1].download_count, 0,
+            "missing download count defaults to 0"
+        );
+    }
+
+    #[test]
+    fn test_build_artifact_batch_all_have_downloads() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let rows = vec![
+            make_artifact_row(id1),
+            make_artifact_row(id2),
+            make_artifact_row(id3),
+        ];
+
+        let mut counts = HashMap::new();
+        counts.insert(id1, 10);
+        counts.insert(id2, 20);
+        counts.insert(id3, 30);
+
+        let docs = build_artifact_batch(rows, &counts);
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].download_count, 10);
+        assert_eq!(docs[1].download_count, 20);
+        assert_eq!(docs[2].download_count, 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_repository_batch tests
+    // -----------------------------------------------------------------------
+
+    fn make_repository_row(id: Uuid) -> RepositoryRow {
+        RepositoryRow {
+            id,
+            name: format!("repo-{}", &id.to_string()[..8]),
+            key: format!("repo-{}", &id.to_string()[..8]),
+            description: None,
+            format: "generic".to_string(),
+            repo_type: "local".to_string(),
+            is_public: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_build_repository_batch_empty() {
+        let docs = build_repository_batch(vec![]);
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_build_repository_batch_multiple() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let rows = vec![make_repository_row(id1), make_repository_row(id2)];
+
+        let docs = build_repository_batch(rows);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].id, id1.to_string());
+        assert_eq!(docs[1].id, id2.to_string());
     }
 }
