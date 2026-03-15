@@ -16,12 +16,16 @@
 //! See: https://docs.dependencytrack.org/integrations/rest-api/
 
 use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 
 use crate::error::{AppError, Result};
+
+const DT_PAGE_SIZE: u32 = 500;
+const DT_MAX_PAGES: u32 = 200; // safety cap: 200 * 500 = 100,000 items
 
 /// Dependency-Track service configuration
 #[derive(Debug, Clone)]
@@ -60,6 +64,7 @@ impl DependencyTrackConfig {
 pub struct DependencyTrackService {
     client: Client,
     config: DependencyTrackConfig,
+    page_size: u32,
 }
 
 /// Dependency-Track project representation
@@ -369,7 +374,11 @@ impl DependencyTrackService {
             "Dependency-Track integration initialized"
         );
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            page_size: DT_PAGE_SIZE,
+        })
     }
 
     /// Create from environment variables, returns None if not enabled
@@ -592,42 +601,111 @@ impl DependencyTrackService {
         Err(AppError::Internal("BOM processing timeout".to_string()))
     }
 
+    /// Generic paginated GET for Dependency-Track list endpoints.
+    ///
+    /// `endpoint` must be a full URL with no query parameters (e.g.,
+    /// `https://dt.example.com/api/v1/project`). Pagination query
+    /// parameters (`pageSize`, `pageNumber`) are appended automatically.
+    ///
+    /// `operation` is a human-readable label used in error messages and
+    /// log lines (e.g., `"DT get findings"`).
+    async fn paginated_get<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        operation: &str,
+    ) -> Result<Vec<T>> {
+        let mut page: u32 = 1;
+        let mut all = Vec::new();
+        let mut pages_fetched: u32 = 0;
+
+        loop {
+            let url = format!(
+                "{}?pageSize={}&pageNumber={}",
+                endpoint, self.page_size, page
+            );
+            let response = self
+                .client
+                .get(&url)
+                .header("X-Api-Key", &self.config.api_key)
+                .send()
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("{} failed on page {}: {}", operation, page, e))
+                })?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<failed to read response body>".to_string());
+                return Err(AppError::Internal(format!(
+                    "{} failed on page {} ({} items fetched): {} - {}",
+                    operation,
+                    page,
+                    all.len(),
+                    status,
+                    body
+                )));
+            }
+
+            let text = response.text().await.map_err(|e| {
+                AppError::Internal(format!(
+                    "{} failed reading response body on page {}: {}",
+                    operation, page, e
+                ))
+            })?;
+
+            let batch: Vec<T> = serde_json::from_str(&text).map_err(|e| {
+                AppError::Internal(format!(
+                    "Failed to parse {} on page {} ({} items fetched so far): {}. Response body (truncated): {}",
+                    operation, page, all.len(), e, &text[..text.len().min(500)]
+                ))
+            })?;
+
+            let batch_len = batch.len();
+            all.extend(batch);
+            pages_fetched += 1;
+
+            if batch_len < self.page_size as usize {
+                break;
+            }
+
+            page += 1;
+
+            if page > DT_MAX_PAGES {
+                error!(
+                    operation = %operation,
+                    max_pages = DT_MAX_PAGES,
+                    items_fetched = all.len(),
+                    "Pagination safety limit reached — results are INCOMPLETE"
+                );
+                return Err(AppError::Internal(format!(
+                    "{}: result set exceeds pagination safety limit ({} pages, {} items fetched)",
+                    operation,
+                    DT_MAX_PAGES,
+                    all.len()
+                )));
+            }
+        }
+
+        debug!(
+            operation = %operation,
+            count = all.len(),
+            pages = pages_fetched,
+            "Paginated GET complete"
+        );
+
+        Ok(all)
+    }
+
     /// Get vulnerability findings for a project
     pub async fn get_findings(&self, project_uuid: &str) -> Result<Vec<DtFinding>> {
-        let url = format!(
+        let base_url = format!(
             "{}/api/v1/finding/project/{}",
             self.config.base_url, project_uuid
         );
-
-        let response: reqwest::Response = self
-            .client
-            .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("DT get findings failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!(
-                "DT get findings failed: {} - {}",
-                status, body
-            )));
-        }
-
-        let findings = response
-            .json::<Vec<DtFinding>>()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse findings: {}", e)))?;
-
-        debug!(
-            project_uuid = %project_uuid,
-            count = findings.len(),
-            "Retrieved vulnerability findings from Dependency-Track"
-        );
-
-        Ok(findings)
+        self.paginated_get(&base_url, "DT get findings").await
     }
 
     /// Get policy violations for a project
@@ -635,69 +713,17 @@ impl DependencyTrackService {
         &self,
         project_uuid: &str,
     ) -> Result<Vec<DtPolicyViolation>> {
-        let url = format!(
+        let base_url = format!(
             "{}/api/v1/violation/project/{}",
             self.config.base_url, project_uuid
         );
-
-        let response: reqwest::Response = self
-            .client
-            .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("DT get violations failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!(
-                "DT get violations failed: {} - {}",
-                status, body
-            )));
-        }
-
-        let violations = response
-            .json::<Vec<DtPolicyViolation>>()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse violations: {}", e)))?;
-
-        debug!(
-            project_uuid = %project_uuid,
-            count = violations.len(),
-            "Retrieved policy violations from Dependency-Track"
-        );
-
-        Ok(violations)
+        self.paginated_get(&base_url, "DT get violations").await
     }
 
     /// Get all projects
     pub async fn list_projects(&self) -> Result<Vec<DtProject>> {
-        let url = format!("{}/api/v1/project", self.config.base_url);
-
-        let response: reqwest::Response = self
-            .client
-            .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("DT list projects failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!(
-                "DT list projects failed: {} - {}",
-                status, body
-            )));
-        }
-
-        let projects = response
-            .json::<Vec<DtProject>>()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse projects: {}", e)))?;
-
-        Ok(projects)
+        let base_url = format!("{}/api/v1/project", self.config.base_url);
+        self.paginated_get(&base_url, "DT list projects").await
     }
 
     /// Delete a project
@@ -917,63 +943,17 @@ impl DependencyTrackService {
 
     /// Get all policies
     pub async fn get_policies(&self) -> Result<Vec<DtPolicyFull>> {
-        let url = format!("{}/api/v1/policy", self.config.base_url);
-
-        let response: reqwest::Response = self
-            .client
-            .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("DT get policies failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!(
-                "DT get policies failed: {} - {}",
-                status, body
-            )));
-        }
-
-        let policies = response
-            .json::<Vec<DtPolicyFull>>()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse policies: {}", e)))?;
-
-        Ok(policies)
+        let base_url = format!("{}/api/v1/policy", self.config.base_url);
+        self.paginated_get(&base_url, "DT get policies").await
     }
 
     /// Get components for a project
     pub async fn get_components(&self, project_uuid: &str) -> Result<Vec<DtComponentFull>> {
-        let url = format!(
+        let base_url = format!(
             "{}/api/v1/component/project/{}",
             self.config.base_url, project_uuid
         );
-
-        let response: reqwest::Response = self
-            .client
-            .get(&url)
-            .header("X-Api-Key", &self.config.api_key)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("DT get components failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Internal(format!(
-                "DT get components failed: {} - {}",
-                status, body
-            )));
-        }
-
-        let components = response
-            .json::<Vec<DtComponentFull>>()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse components: {}", e)))?;
-
-        Ok(components)
+        self.paginated_get(&base_url, "DT get components").await
     }
 
     /// Get the base URL of the Dependency-Track instance
@@ -1637,5 +1617,273 @@ mod tests {
         assert_eq!(json["analysisState"], "NOT_AFFECTED");
         assert!(json.get("analysisDetails").is_none());
         assert_eq!(json["isSuppressed"], true);
+    }
+
+    // ===================================================================
+    // Pagination (wiremock integration tests)
+    // ===================================================================
+
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TEST_PAGE_SIZE: u32 = 2;
+
+    fn make_service(base_url: &str) -> DependencyTrackService {
+        DependencyTrackService {
+            client: Client::new(),
+            config: DependencyTrackConfig {
+                base_url: base_url.to_string(),
+                api_key: "test-key".to_string(),
+                enabled: true,
+            },
+            page_size: TEST_PAGE_SIZE,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_multi_page() {
+        let server = MockServer::start().await;
+
+        // Page 1: 2 items
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "1"))
+            .and(query_param("pageSize", "2"))
+            .and(header("X-Api-Key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                make_finding("HIGH", false),
+                make_finding("MEDIUM", false),
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2: 1 item (< DT_PAGE_SIZE, so early termination — no page 3)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "2"))
+            .and(query_param("pageSize", "2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(vec![make_finding("LOW", false)]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let findings = svc.get_findings("abc-123").await.unwrap();
+
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].vulnerability.severity, "HIGH");
+        assert_eq!(findings[1].vulnerability.severity, "MEDIUM");
+        assert_eq!(findings[2].vulnerability.severity, "LOW");
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_single_page() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid": "p1", "name": "proj1", "version": "1.0"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2 should NOT be fetched (1 item < DT_PAGE_SIZE = early termination)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtProject>::new()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let projects = svc.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "proj1");
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_empty_first_page() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/policy"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtPolicyFull>::new()))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let policies = svc.get_policies().await.unwrap();
+        assert!(policies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_http_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/bad-uuid"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.get_findings("bad-uuid").await;
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("404"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_safety_cap_returns_error() {
+        let server = MockServer::start().await;
+
+        // Always return a full page (TEST_PAGE_SIZE items) — loop never terminates naturally
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid": "p1", "name": "proj1", "version": "1.0"},
+                {"uuid": "p2", "name": "proj2", "version": "2.0"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.list_projects().await;
+
+        // Safety cap must return Err, not silently truncated Ok
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("pagination safety limit"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_early_termination_on_partial_page() {
+        let server = MockServer::start().await;
+
+        // Page 1 returns fewer items than TEST_PAGE_SIZE (1 < 2) — no page 2 request
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid": "p1", "name": "proj1", "version": "1.0"}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2 should never be called
+        Mock::given(method("GET"))
+            .and(path("/api/v1/project"))
+            .and(query_param("pageNumber", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtProject>::new()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let projects = svc.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_mid_pagination_http_error() {
+        let server = MockServer::start().await;
+
+        // Page 1: returns full page (TEST_PAGE_SIZE=2 items) to trigger page 2
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                make_finding("HIGH", false),
+                make_finding("MEDIUM", false),
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Page 2 fails with 500
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "2"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.get_findings("abc-123").await;
+
+        // Must return error, not partial data
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("500"));
+        // Error should include page context
+        assert!(err.contains("page 2"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_malformed_json_response() {
+        let server = MockServer::start().await;
+
+        // Return a JSON object instead of array
+        Mock::given(method("GET"))
+            .and(path("/api/v1/finding/project/abc-123"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"error": "unexpected format"}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let result = svc.get_findings("abc-123").await;
+
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("page 1"));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_violations_url() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/violation/project/proj-1"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtPolicyViolation>::new()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let violations = svc.get_policy_violations("proj-1").await.unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_paginated_get_components_url() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/component/project/proj-1"))
+            .and(query_param("pageNumber", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<DtComponentFull>::new()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let svc = make_service(&server.uri());
+        let components = svc.get_components("proj-1").await.unwrap();
+        assert!(components.is_empty());
     }
 }
