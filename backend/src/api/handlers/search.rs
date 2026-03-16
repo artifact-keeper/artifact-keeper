@@ -631,8 +631,15 @@ pub async fn trigger_reindex(State(state): State<SharedState>) -> Result<Json<Re
     let db = state.db.clone();
     let meili = meili.clone();
     tokio::spawn(async move {
-        if let Err(e) = meili.full_reindex(&db).await {
-            tracing::error!("Search reindex failed: {}", e);
+        match meili.full_reindex(&db).await {
+            Ok((a, r)) => {
+                tracing::info!(
+                    "Search reindex complete: {} artifacts, {} repositories",
+                    a,
+                    r
+                )
+            }
+            Err(e) => tracing::error!("Search reindex failed: {}", e),
         }
     });
 

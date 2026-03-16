@@ -774,31 +774,12 @@ pub async fn trigger_reindex(
         .as_ref()
         .ok_or_else(|| AppError::Internal("Meilisearch is not configured".to_string()))?;
 
-    // Count artifacts and repositories before reindex so we can report counts
-    let artifact_stats = sqlx::query!(
-        r#"
-        SELECT
-            COUNT(*) as "count!",
-            COALESCE(SUM(size_bytes), 0)::BIGINT as "size!"
-        FROM artifacts
-        WHERE is_deleted = false
-        "#
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    let repo_count = sqlx::query_scalar!("SELECT COUNT(*) as \"count!\" FROM repositories")
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    meili.full_reindex(&state.db).await?;
+    let (artifacts, repositories) = meili.full_reindex(&state.db).await?;
 
     Ok(Json(ReindexResponse {
         message: "Full reindex completed successfully".to_string(),
-        artifacts_indexed: artifact_stats.count,
-        repositories_indexed: repo_count,
+        artifacts_indexed: artifacts as i64,
+        repositories_indexed: repositories as i64,
     }))
 }
 

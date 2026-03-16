@@ -101,38 +101,51 @@ async fn main() -> Result<()> {
     let meili_service = match (&config.meilisearch_url, &config.meilisearch_api_key) {
         (Some(url), Some(api_key)) => {
             tracing::info!("Initializing Meilisearch at {}", url);
-            let service = Arc::new(MeiliService::new(url, api_key));
-            match service.configure_indexes().await {
-                Ok(()) => {
-                    tracing::info!("Meilisearch indexes configured");
-                    // Spawn background reindex if the index is empty
-                    let svc = service.clone();
-                    let pool = db_pool.clone();
-                    tokio::spawn(async move {
-                        match svc.is_index_empty().await {
-                            Ok(true) => {
-                                tracing::info!(
-                                    "Meilisearch index is empty, starting background reindex"
-                                );
-                                if let Err(e) = svc.full_reindex(&pool).await {
-                                    tracing::warn!("Background reindex failed: {}", e);
+            match MeiliService::new(url, api_key) {
+                Ok(s) => {
+                    let service = Arc::new(s);
+                    match service.configure_indexes().await {
+                        Ok(()) => {
+                            tracing::info!("Meilisearch indexes configured");
+                            let svc = service.clone();
+                            let pool = db_pool.clone();
+                            tokio::spawn(async move {
+                                match svc.is_index_empty().await {
+                                    Ok(true) => {
+                                        tracing::info!(
+                                            "Meilisearch index is empty, starting background reindex"
+                                        );
+                                        if let Err(e) = svc.full_reindex(&pool).await {
+                                            tracing::error!("Background reindex failed: {}", e);
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        tracing::info!(
+                                            "Meilisearch index already populated, skipping reindex"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to check Meilisearch index status: {}",
+                                            e
+                                        );
+                                    }
                                 }
-                            }
-                            Ok(false) => {
-                                tracing::info!(
-                                    "Meilisearch index already populated, skipping reindex"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to check Meilisearch index status: {}", e);
-                            }
+                            });
+                            Some(service)
                         }
-                    });
-                    Some(service)
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to configure Meilisearch indexes, continuing without search: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to configure Meilisearch indexes, continuing without search: {}",
+                        "Failed to initialize Meilisearch client, continuing without search: {}",
                         e
                     );
                     None
