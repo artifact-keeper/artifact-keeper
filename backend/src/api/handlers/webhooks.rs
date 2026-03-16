@@ -198,9 +198,7 @@ pub async fn create_webhook(
 
     // Hash secret if provided
     let secret_hash = if let Some(ref secret) = payload.secret {
-        Some(crate::services::auth_service::AuthService::hash_password(
-            secret,
-        ).await?)
+        Some(crate::services::auth_service::AuthService::hash_password(secret).await?)
     } else {
         None
     };

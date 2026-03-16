@@ -375,7 +375,10 @@ mod tests {
     fn test_extract_client_ip_uses_first_xff_ip() {
         // When XFF contains multiple IPs, use the first (client IP set by proxy)
         let request = axum::extract::Request::builder()
-            .header("X-Forwarded-For", "203.0.113.50, 70.41.3.18, 150.172.238.178")
+            .header(
+                "X-Forwarded-For",
+                "203.0.113.50, 70.41.3.18, 150.172.238.178",
+            )
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_client_ip(&request), "ip:203.0.113.50");

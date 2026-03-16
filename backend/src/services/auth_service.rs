@@ -1058,7 +1058,9 @@ mod tests {
         let password = "test_password_123";
         let hash = AuthService::hash_password(password).await.unwrap();
         assert!(AuthService::verify_password(password, &hash).await.unwrap());
-        assert!(!AuthService::verify_password("wrong_password", &hash).await.unwrap());
+        assert!(!AuthService::verify_password("wrong_password", &hash)
+            .await
+            .unwrap());
     }
 
     // -----------------------------------------------------------------------
@@ -1069,7 +1071,9 @@ mod tests {
     async fn test_password_hashing_empty_string() {
         let hash = AuthService::hash_password("").await.unwrap();
         assert!(AuthService::verify_password("", &hash).await.unwrap());
-        assert!(!AuthService::verify_password("non-empty", &hash).await.unwrap());
+        assert!(!AuthService::verify_password("non-empty", &hash)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1084,7 +1088,9 @@ mod tests {
         // bcrypt typically truncates at 72 bytes; verify the function works
         let password = "a".repeat(100);
         let hash = AuthService::hash_password(&password).await.unwrap();
-        assert!(AuthService::verify_password(&password, &hash).await.unwrap());
+        assert!(AuthService::verify_password(&password, &hash)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -1095,8 +1101,12 @@ mod tests {
         // bcrypt uses random salts, so hashes should differ
         assert_ne!(hash1, hash2);
         // But both should verify correctly
-        assert!(AuthService::verify_password(password, &hash1).await.unwrap());
-        assert!(AuthService::verify_password(password, &hash2).await.unwrap());
+        assert!(AuthService::verify_password(password, &hash1)
+            .await
+            .unwrap());
+        assert!(AuthService::verify_password(password, &hash2)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
