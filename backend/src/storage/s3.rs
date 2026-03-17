@@ -370,13 +370,23 @@ impl S3Backend {
 
     /// Validate that a put response has a successful status code.
     /// Returns Ok(()) for 2xx, Err(Storage) otherwise.
-    fn classify_put_status(key: &str, status: u16) -> Result<()> {
+    /// The `body` parameter is included in error messages to surface S3 error
+    /// details (e.g. AccessDenied, SignatureDoesNotMatch) for diagnostics.
+    fn classify_put_status(key: &str, status: u16, body: &[u8]) -> Result<()> {
         if (200..300).contains(&status) {
             Ok(())
         } else {
+            let detail = String::from_utf8_lossy(body);
+            let detail = if detail.is_empty() {
+                String::new()
+            } else {
+                // Truncate long XML bodies to a reasonable length
+                let truncated: String = detail.chars().take(512).collect();
+                format!(": {}", truncated)
+            };
             Err(AppError::Storage(format!(
-                "S3 returned status {} for put '{}'",
-                status, key
+                "S3 returned status {} for put '{}'{}",
+                status, key, detail
             )))
         }
     }
@@ -516,9 +526,21 @@ impl super::StorageBackend for S3Backend {
             .bucket
             .put_object(&full_key, &content)
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to put object '{}': {}", key, e)))?;
+            .map_err(|e| {
+                tracing::error!(key = %key, full_key = %full_key, error = %e, "S3 put_object request failed");
+                AppError::Storage(format!("Failed to put object '{}': {}", key, e))
+            })?;
 
-        Self::classify_put_status(key, resp.status_code())?;
+        if let Err(e) = Self::classify_put_status(key, resp.status_code(), resp.bytes()) {
+            tracing::error!(
+                key = %key,
+                full_key = %full_key,
+                status = resp.status_code(),
+                response_body = %String::from_utf8_lossy(resp.bytes()),
+                "S3 put rejected"
+            );
+            return Err(e);
+        }
 
         tracing::debug!(key = %key, "S3 put object successful");
         Ok(())
@@ -1138,25 +1160,30 @@ mod tests {
 
     #[test]
     fn test_classify_put_status_accepts_200() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 200).is_ok());
+        assert!(S3Backend::classify_put_status(TEST_KEY, 200, b"").is_ok());
     }
 
     #[test]
     fn test_classify_put_status_accepts_201() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 201).is_ok());
+        assert!(S3Backend::classify_put_status(TEST_KEY, 201, b"").is_ok());
     }
 
     #[test]
     fn test_classify_put_status_accepts_204() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 204).is_ok());
+        assert!(S3Backend::classify_put_status(TEST_KEY, 204, b"").is_ok());
     }
 
     #[test]
     fn test_classify_put_status_rejects_403() {
-        match S3Backend::classify_put_status(TEST_KEY, 403) {
+        let body = b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
+        match S3Backend::classify_put_status(TEST_KEY, 403, body) {
             Err(AppError::Storage(msg)) => {
                 assert!(msg.contains("403"), "expected 403 in message: {msg}");
                 assert!(msg.contains("put"), "expected 'put' in message: {msg}");
+                assert!(
+                    msg.contains("AccessDenied"),
+                    "expected S3 error detail in message: {msg}"
+                );
             }
             other => panic!("expected Storage error, got {other:?}"),
         }
@@ -1164,7 +1191,21 @@ mod tests {
 
     #[test]
     fn test_classify_put_status_rejects_500() {
-        match S3Backend::classify_put_status(TEST_KEY, 500) {
+        match S3Backend::classify_put_status(TEST_KEY, 500, b"Internal Error") {
+            Err(AppError::Storage(msg)) => {
+                assert!(msg.contains("500"), "expected 500 in message: {msg}");
+                assert!(
+                    msg.contains("Internal Error"),
+                    "expected S3 body in message: {msg}"
+                );
+            }
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_put_status_rejects_500_empty_body() {
+        match S3Backend::classify_put_status(TEST_KEY, 500, b"") {
             Err(AppError::Storage(msg)) => {
                 assert!(msg.contains("500"), "expected 500 in message: {msg}");
             }
@@ -1174,7 +1215,7 @@ mod tests {
 
     #[test]
     fn test_classify_put_status_rejects_301_redirect() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 301).is_err());
+        assert!(S3Backend::classify_put_status(TEST_KEY, 301, b"").is_err());
     }
 
     // --- classify_get_response tests ---
@@ -1427,7 +1468,7 @@ mod tests {
     #[test]
     fn test_status_code_boundary_299_is_success() {
         // 299 is the upper boundary of 2xx
-        assert!(S3Backend::classify_put_status(TEST_KEY, 299).is_ok());
+        assert!(S3Backend::classify_put_status(TEST_KEY, 299, b"").is_ok());
         assert!(S3Backend::classify_delete_status(TEST_KEY, 299).is_ok());
         assert_eq!(
             S3Backend::classify_head_status(TEST_KEY, 299).unwrap(),
@@ -1437,7 +1478,7 @@ mod tests {
 
     #[test]
     fn test_status_code_boundary_300_is_failure() {
-        assert!(S3Backend::classify_put_status(TEST_KEY, 300).is_err());
+        assert!(S3Backend::classify_put_status(TEST_KEY, 300, b"").is_err());
         assert!(S3Backend::classify_head_status(TEST_KEY, 300)
             .unwrap_err()
             .to_string()
@@ -1447,7 +1488,7 @@ mod tests {
     #[test]
     fn test_status_code_boundary_199_is_failure() {
         // Below 200 range
-        assert!(S3Backend::classify_put_status(TEST_KEY, 199).is_err());
+        assert!(S3Backend::classify_put_status(TEST_KEY, 199, b"").is_err());
         assert!(S3Backend::classify_delete_status(TEST_KEY, 199).is_err());
     }
 
@@ -1467,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_classify_put_status_includes_key_in_error() {
-        match S3Backend::classify_put_status("my/custom/key.jar", 502) {
+        match S3Backend::classify_put_status("my/custom/key.jar", 502, b"Bad Gateway") {
             Err(AppError::Storage(msg)) => {
                 assert!(
                     msg.contains("my/custom/key.jar"),
