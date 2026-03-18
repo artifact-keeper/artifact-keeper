@@ -1768,30 +1768,11 @@ pub async fn set_upstream_auth(
         ));
     }
 
-    let credentials_json = match payload.auth_type.as_str() {
-        "basic" => {
-            let username = payload.username.as_deref().ok_or_else(|| {
-                AppError::Validation("username is required for basic auth".to_string())
-            })?;
-            let password = payload.password.as_deref().ok_or_else(|| {
-                AppError::Validation("password is required for basic auth".to_string())
-            })?;
-            serde_json::json!({"username": username, "password": password}).to_string()
-        }
-        "bearer" => {
-            let token = payload.password.as_deref().ok_or_else(|| {
-                AppError::Validation(
-                    "password is required for bearer auth (used as token)".to_string(),
-                )
-            })?;
-            serde_json::json!({"token": token}).to_string()
-        }
-        other => {
-            return Err(AppError::Validation(format!(
-                "Invalid auth_type: {other}. Must be 'basic', 'bearer', or 'none'"
-            )));
-        }
-    };
+    let credentials_json = build_upstream_credentials(
+        &payload.auth_type,
+        payload.username.as_deref(),
+        payload.password.as_deref(),
+    )?;
 
     crate::services::upstream_auth::save_upstream_auth(
         &state.db,
@@ -1931,6 +1912,37 @@ fn resolve_member_priority(explicit: i32, index: usize) -> i32 {
         explicit
     } else {
         (index as i32) + 1
+    }
+}
+
+/// Build a JSON credential string from an upstream auth request.
+/// Validates that the required fields are present for the given auth type.
+fn build_upstream_credentials(
+    auth_type: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> crate::error::Result<String> {
+    match auth_type {
+        "basic" => {
+            let username = username.ok_or_else(|| {
+                AppError::Validation("username is required for basic auth".to_string())
+            })?;
+            let password = password.ok_or_else(|| {
+                AppError::Validation("password is required for basic auth".to_string())
+            })?;
+            Ok(serde_json::json!({"username": username, "password": password}).to_string())
+        }
+        "bearer" => {
+            let token = password.ok_or_else(|| {
+                AppError::Validation(
+                    "password is required for bearer auth (used as token)".to_string(),
+                )
+            })?;
+            Ok(serde_json::json!({"token": token}).to_string())
+        }
+        other => Err(AppError::Validation(format!(
+            "Invalid auth_type: {other}. Must be 'basic', 'bearer', or 'none'"
+        ))),
     }
 }
 
@@ -3360,5 +3372,95 @@ mod tests {
             repo_type: RepositoryType::Local,
         };
         assert_eq!(map_member_row(row).priority, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // UpstreamAuthRequest deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upstream_auth_request_basic() {
+        let json = r#"{"auth_type":"basic","username":"bot","password":"s3cret"}"#;
+        let req: UpstreamAuthRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.auth_type, "basic");
+        assert_eq!(req.username, Some("bot".to_string()));
+        assert_eq!(req.password, Some("s3cret".to_string()));
+    }
+
+    #[test]
+    fn test_upstream_auth_request_bearer() {
+        let json = r#"{"auth_type":"bearer","password":"ghp_token123"}"#;
+        let req: UpstreamAuthRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.auth_type, "bearer");
+        assert!(req.username.is_none());
+        assert_eq!(req.password, Some("ghp_token123".to_string()));
+    }
+
+    #[test]
+    fn test_upstream_auth_request_none() {
+        let json = r#"{"auth_type":"none"}"#;
+        let req: UpstreamAuthRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.auth_type, "none");
+        assert!(req.username.is_none());
+        assert!(req.password.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_upstream_credentials
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_upstream_credentials_basic() {
+        let json = build_upstream_credentials("basic", Some("admin"), Some("pass")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["username"], "admin");
+        assert_eq!(parsed["password"], "pass");
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_bearer() {
+        let json = build_upstream_credentials("bearer", None, Some("tok_abc")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["token"], "tok_abc");
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_basic_missing_username() {
+        let result = build_upstream_credentials("basic", None, Some("pass"));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("username is required"));
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_basic_missing_password() {
+        let result = build_upstream_credentials("basic", Some("user"), None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("password is required"));
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_bearer_missing_token() {
+        let result = build_upstream_credentials("bearer", None, None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("password is required"));
+    }
+
+    #[test]
+    fn test_build_upstream_credentials_invalid_type() {
+        let result = build_upstream_credentials("oauth2", Some("u"), Some("p"));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid auth_type"));
     }
 }

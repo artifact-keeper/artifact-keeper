@@ -274,5 +274,20 @@ mod tests {
             AppError::QuotaExceeded("x".into()).status_and_code().0,
             StatusCode::INSUFFICIENT_STORAGE
         );
+        assert_eq!(
+            AppError::BadGateway("x".into()).status_and_code().0,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            AppError::BadGateway("x".into()).status_and_code().1,
+            "BAD_GATEWAY"
+        );
+    }
+
+    #[test]
+    fn test_bad_gateway_message() {
+        let err = AppError::BadGateway("upstream failed".to_string());
+        assert_eq!(err.user_message(), "upstream failed");
+        assert_eq!(err.to_string(), "Bad gateway: upstream failed");
     }
 }
