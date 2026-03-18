@@ -51,15 +51,9 @@ pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<Ups
         )
     })?;
 
-    let encrypted_bytes = hex::decode(&encrypted_hex)
-        .map_err(|e| AppError::Internal(format!("Failed to decode upstream credentials: {e}")))?;
-    let credentials_json = decrypt_credentials(&encrypted_bytes, &encryption_key())
-        .map_err(|e| AppError::Internal(format!("Failed to decrypt upstream credentials: {e}")))?;
+    let credentials_json = decrypt_credentials_hex(&encrypted_hex, &encryption_key())?;
 
-    let creds: serde_json::Value = serde_json::from_str(&credentials_json)
-        .map_err(|e| AppError::Internal(format!("Invalid upstream credentials JSON: {e}")))?;
-
-    parse_auth_credentials(&auth_type, &creds).map(Some)
+    parse_credentials_json(&auth_type, &credentials_json).map(Some)
 }
 
 /// Parse auth credentials from a JSON value given an auth type string.
@@ -102,8 +96,7 @@ pub async fn save_upstream_auth(
     auth_type: &str,
     credentials_json: &str,
 ) -> Result<()> {
-    let encrypted = encrypt_credentials(credentials_json, &encryption_key());
-    let encrypted_hex = hex::encode(&encrypted);
+    let encrypted_hex = encrypt_credentials_hex(credentials_json, &encryption_key());
 
     // Upsert auth type
     sqlx::query(
@@ -167,6 +160,31 @@ pub(crate) fn filter_auth_type(val: Option<String>) -> Option<String> {
         Some(t) if !t.is_empty() && t != "none" => Some(t),
         _ => None,
     }
+}
+
+/// Encrypt credentials and return hex-encoded ciphertext.
+pub(crate) fn encrypt_credentials_hex(credentials_json: &str, key: &str) -> String {
+    let encrypted = encrypt_credentials(credentials_json, key);
+    hex::encode(&encrypted)
+}
+
+/// Decode hex ciphertext and decrypt to get the original credentials JSON.
+pub(crate) fn decrypt_credentials_hex(hex_str: &str, key: &str) -> Result<String> {
+    let encrypted_bytes = hex::decode(hex_str)
+        .map_err(|e| AppError::Internal(format!("Failed to decode upstream credentials: {e}")))?;
+    decrypt_credentials(&encrypted_bytes, key)
+        .map_err(|e| AppError::Internal(format!("Failed to decrypt upstream credentials: {e}")))
+}
+
+/// Parse a credentials JSON string into an UpstreamAuthType.
+/// Combines JSON parsing with auth type dispatch.
+pub(crate) fn parse_credentials_json(
+    auth_type: &str,
+    credentials_json: &str,
+) -> Result<UpstreamAuthType> {
+    let creds: serde_json::Value = serde_json::from_str(credentials_json)
+        .map_err(|e| AppError::Internal(format!("Invalid upstream credentials JSON: {e}")))?;
+    parse_auth_credentials(auth_type, &creds)
 }
 
 /// Build the JSON credential payload for a given auth type.
@@ -453,5 +471,123 @@ mod tests {
             password: "pass".to_string(),
         };
         assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // encrypt_credentials_hex / decrypt_credentials_hex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encrypt_decrypt_hex_roundtrip_basic() {
+        let key = "test-key-123";
+        let creds = r#"{"username":"admin","password":"secret"}"#;
+        let hex = encrypt_credentials_hex(creds, key);
+        let decrypted = decrypt_credentials_hex(&hex, key).unwrap();
+        assert_eq!(creds, decrypted);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_hex_roundtrip_bearer() {
+        let key = "another-key";
+        let creds = r#"{"token":"ghp_xyz789"}"#;
+        let hex = encrypt_credentials_hex(creds, key);
+        let decrypted = decrypt_credentials_hex(&hex, key).unwrap();
+        assert_eq!(creds, decrypted);
+    }
+
+    #[test]
+    fn test_decrypt_hex_invalid_hex() {
+        let result = decrypt_credentials_hex("not-valid-hex!!", "any-key");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("decode"));
+    }
+
+    #[test]
+    fn test_decrypt_hex_wrong_key() {
+        let hex = encrypt_credentials_hex(r#"{"token":"secret"}"#, "correct-key");
+        let result = decrypt_credentials_hex(&hex, "wrong-key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encrypt_hex_produces_valid_hex() {
+        let hex = encrypt_credentials_hex("test", "key");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!hex.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_credentials_json (JSON string -> UpstreamAuthType)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_credentials_json_basic() {
+        let json = r#"{"username":"bot","password":"s3cret"}"#;
+        let auth = parse_credentials_json("basic", json).unwrap();
+        assert_eq!(
+            auth,
+            UpstreamAuthType::Basic {
+                username: "bot".to_string(),
+                password: "s3cret".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_credentials_json_bearer() {
+        let json = r#"{"token":"ghp_abc"}"#;
+        let auth = parse_credentials_json("bearer", json).unwrap();
+        assert_eq!(
+            auth,
+            UpstreamAuthType::Bearer {
+                token: "ghp_abc".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_credentials_json_invalid_json() {
+        let result = parse_credentials_json("basic", "not-json{{{");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid"));
+    }
+
+    #[test]
+    fn test_parse_credentials_json_unknown_type() {
+        let json = r#"{"key":"val"}"#;
+        let result = parse_credentials_json("apikey", json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Full pipeline: build -> encrypt -> decrypt -> parse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_full_pipeline_basic() {
+        let original = UpstreamAuthType::Basic {
+            username: "deploy-bot".to_string(),
+            password: "p@ss!word#123".to_string(),
+        };
+        let key = "pipeline-test-key";
+        let json = build_credentials_json(&original);
+        let hex = encrypt_credentials_hex(&json, key);
+        let decrypted = decrypt_credentials_hex(&hex, key).unwrap();
+        let restored = parse_credentials_json("basic", &decrypted).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn test_full_pipeline_bearer() {
+        let original = UpstreamAuthType::Bearer {
+            token: "glpat-xxxx-yyyy-zzzz".to_string(),
+        };
+        let key = "pipeline-key-2";
+        let json = build_credentials_json(&original);
+        let hex = encrypt_credentials_hex(&json, key);
+        let decrypted = decrypt_credentials_hex(&hex, key).unwrap();
+        let restored = parse_credentials_json("bearer", &decrypted).unwrap();
+        assert_eq!(original, restored);
     }
 }

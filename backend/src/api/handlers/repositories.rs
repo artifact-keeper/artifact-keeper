@@ -1458,18 +1458,7 @@ pub async fn list_virtual_members(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let members = members
-        .into_iter()
-        .map(|m| VirtualMemberResponse {
-            id: m.id,
-            member_repo_id: m.member_repo_id,
-            member_repo_key: m.member_key,
-            member_repo_name: m.member_name,
-            member_repo_type: format!("{:?}", m.repo_type).to_lowercase(),
-            priority: m.priority,
-            created_at: m.created_at,
-        })
-        .collect();
+    let members = members.into_iter().map(map_member_row).collect();
 
     Ok(Json(VirtualMembersListResponse { members }))
 }
@@ -1712,6 +1701,24 @@ fn resolve_member_priority(explicit: i32, index: usize) -> i32 {
     } else {
         (index as i32) + 1
     }
+}
+
+/// Convert a VirtualMemberRow into a VirtualMemberResponse.
+fn map_member_row(row: VirtualMemberRow) -> VirtualMemberResponse {
+    VirtualMemberResponse {
+        id: row.id,
+        member_repo_id: row.member_repo_id,
+        member_repo_key: row.member_key,
+        member_repo_name: row.member_name,
+        member_repo_type: format_repo_type(&row.repo_type),
+        priority: row.priority,
+        created_at: row.created_at,
+    }
+}
+
+/// Format a RepositoryType as a lowercase string for API responses.
+fn format_repo_type(repo_type: &RepositoryType) -> String {
+    format!("{:?}", repo_type).to_lowercase()
 }
 
 #[cfg(test)]
@@ -3038,5 +3045,87 @@ mod tests {
     fn test_resolve_member_priority_negative_uses_index() {
         assert_eq!(resolve_member_priority(-1, 0), 1);
         assert_eq!(resolve_member_priority(-5, 2), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_repo_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_repo_type_local() {
+        assert_eq!(format_repo_type(&RepositoryType::Local), "local");
+    }
+
+    #[test]
+    fn test_format_repo_type_remote() {
+        assert_eq!(format_repo_type(&RepositoryType::Remote), "remote");
+    }
+
+    #[test]
+    fn test_format_repo_type_virtual() {
+        assert_eq!(format_repo_type(&RepositoryType::Virtual), "virtual");
+    }
+
+    #[test]
+    fn test_format_repo_type_staging() {
+        assert_eq!(format_repo_type(&RepositoryType::Staging), "staging");
+    }
+
+    // -----------------------------------------------------------------------
+    // map_member_row
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_member_row_local() {
+        let id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let row = VirtualMemberRow {
+            id,
+            member_repo_id: member_id,
+            priority: 3,
+            created_at: now,
+            member_key: "maven-local".to_string(),
+            member_name: "Maven Local".to_string(),
+            repo_type: RepositoryType::Local,
+        };
+        let resp = map_member_row(row);
+        assert_eq!(resp.id, id);
+        assert_eq!(resp.member_repo_id, member_id);
+        assert_eq!(resp.member_repo_key, "maven-local");
+        assert_eq!(resp.member_repo_name, "Maven Local");
+        assert_eq!(resp.member_repo_type, "local");
+        assert_eq!(resp.priority, 3);
+        assert_eq!(resp.created_at, now);
+    }
+
+    #[test]
+    fn test_map_member_row_remote() {
+        let row = VirtualMemberRow {
+            id: Uuid::new_v4(),
+            member_repo_id: Uuid::new_v4(),
+            priority: 1,
+            created_at: chrono::Utc::now(),
+            member_key: "maven-central".to_string(),
+            member_name: "Maven Central".to_string(),
+            repo_type: RepositoryType::Remote,
+        };
+        let resp = map_member_row(row);
+        assert_eq!(resp.member_repo_type, "remote");
+        assert_eq!(resp.member_repo_key, "maven-central");
+    }
+
+    #[test]
+    fn test_map_member_row_preserves_priority() {
+        let row = VirtualMemberRow {
+            id: Uuid::new_v4(),
+            member_repo_id: Uuid::new_v4(),
+            priority: 42,
+            created_at: chrono::Utc::now(),
+            member_key: "r".to_string(),
+            member_name: "R".to_string(),
+            repo_type: RepositoryType::Local,
+        };
+        assert_eq!(map_member_row(row).priority, 42);
     }
 }
