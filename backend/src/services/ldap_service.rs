@@ -62,10 +62,25 @@ redacted_debug!(LdapConfig {
 });
 
 impl LdapConfig {
+    /// Read TLS-related settings from environment variables.
+    ///
+    /// `LDAP_CA_CERT_PATH` takes priority, falling back to the shared
+    /// `CUSTOM_CA_CERT_PATH`. `LDAP_INSECURE_TLS=true` skips verification.
+    fn tls_from_env() -> (Option<String>, bool) {
+        let ca_cert_path = std::env::var("LDAP_CA_CERT_PATH")
+            .ok()
+            .or_else(|| std::env::var("CUSTOM_CA_CERT_PATH").ok());
+        let no_tls_verify = std::env::var("LDAP_INSECURE_TLS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        (ca_cert_path, no_tls_verify)
+    }
+
     /// Create LDAP config from application config
     pub fn from_config(config: &Config) -> Option<Self> {
         let url = config.ldap_url.clone()?;
         let base_dn = config.ldap_base_dn.clone()?;
+        let (ca_cert_path, no_tls_verify) = Self::tls_from_env();
 
         Some(Self {
             url,
@@ -85,12 +100,8 @@ impl LdapConfig {
             use_starttls: std::env::var("LDAP_USE_STARTTLS")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
-            ca_cert_path: std::env::var("LDAP_CA_CERT_PATH")
-                .ok()
-                .or_else(|| std::env::var("CUSTOM_CA_CERT_PATH").ok()),
-            no_tls_verify: std::env::var("LDAP_INSECURE_TLS")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            ca_cert_path,
+            no_tls_verify,
         })
     }
 }
@@ -153,6 +164,7 @@ impl LdapService {
         admin_group_dn: Option<&str>,
         use_starttls: bool,
     ) -> Self {
+        let (ca_cert_path, no_tls_verify) = LdapConfig::tls_from_env();
         let config = LdapConfig {
             url: server_url.to_string(),
             base_dn: user_base_dn.to_string(),
@@ -165,12 +177,8 @@ impl LdapService {
             groups_attr: groups_attr.to_string(),
             admin_group_dn: admin_group_dn.map(String::from),
             use_starttls,
-            ca_cert_path: std::env::var("LDAP_CA_CERT_PATH")
-                .ok()
-                .or_else(|| std::env::var("CUSTOM_CA_CERT_PATH").ok()),
-            no_tls_verify: std::env::var("LDAP_INSECURE_TLS")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            ca_cert_path,
+            no_tls_verify,
         };
         Self {
             db,
@@ -371,6 +379,35 @@ impl LdapService {
         pattern.replace("{}", username)
     }
 
+    /// Parse PEM certificates from a byte buffer.
+    ///
+    /// `native_tls::Certificate::from_pem` only handles a single cert, so this
+    /// splits the bundle on PEM boundaries and returns each cert individually.
+    fn parse_pem_certificates(
+        pem_bytes: &[u8],
+        source: &str,
+    ) -> Result<Vec<native_tls::Certificate>> {
+        let pem_str = String::from_utf8_lossy(pem_bytes);
+        let mut certs = Vec::new();
+        for block in pem_str.split("-----END CERTIFICATE-----") {
+            let trimmed = block.trim();
+            if trimmed.is_empty() || !trimmed.contains("-----BEGIN CERTIFICATE-----") {
+                continue;
+            }
+            let pem = format!("{trimmed}\n-----END CERTIFICATE-----\n");
+            let cert = native_tls::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
+                AppError::Config(format!("Failed to parse CA cert from {source}: {e}"))
+            })?;
+            certs.push(cert);
+        }
+        if certs.is_empty() {
+            return Err(AppError::Config(format!(
+                "No valid PEM certificates found in {source}"
+            )));
+        }
+        Ok(certs)
+    }
+
     /// Build LDAP connection settings with TLS configuration.
     ///
     /// Supports custom CA certificates via `LDAP_CA_CERT_PATH` (or the shared
@@ -389,27 +426,10 @@ impl LdapService {
                 AppError::Config(format!("Failed to read LDAP CA cert at {ca_path}: {e}"))
             })?;
 
+            let certs = Self::parse_pem_certificates(&pem_bytes, ca_path)?;
             let mut builder = native_tls::TlsConnector::builder();
-            // Parse PEM certificates from the file. native_tls::Certificate::from_pem
-            // handles a single cert, so split the bundle on PEM boundaries.
-            let pem_str = String::from_utf8_lossy(&pem_bytes);
-            let mut count = 0usize;
-            for block in pem_str.split("-----END CERTIFICATE-----") {
-                let trimmed = block.trim();
-                if trimmed.is_empty() || !trimmed.contains("-----BEGIN CERTIFICATE-----") {
-                    continue;
-                }
-                let pem = format!("{trimmed}\n-----END CERTIFICATE-----\n");
-                let cert = native_tls::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
-                    AppError::Config(format!("Failed to parse LDAP CA cert at {ca_path}: {e}"))
-                })?;
-                builder.add_root_certificate(cert);
-                count += 1;
-            }
-            if count == 0 {
-                return Err(AppError::Config(format!(
-                    "No valid PEM certificates found in {ca_path}"
-                )));
+            for cert in &certs {
+                builder.add_root_certificate(cert.clone());
             }
             if self.config.no_tls_verify {
                 builder.danger_accept_invalid_certs(true);
@@ -418,7 +438,7 @@ impl LdapService {
                 .build()
                 .map_err(|e| AppError::Config(format!("Failed to build TLS connector: {e}")))?;
             settings = settings.set_connector(connector);
-            tracing::info!(path = %ca_path, "Loaded custom CA certificate(s) for LDAP");
+            tracing::info!(path = %ca_path, count = certs.len(), "Loaded custom CA certificate(s) for LDAP");
         }
 
         Ok(settings)
@@ -845,5 +865,146 @@ mod tests {
         };
         let debug = format!("{:?}", config);
         assert!(debug.contains("None"));
+    }
+
+    // --- TLS configuration tests ---
+
+    #[test]
+    fn test_ldap_config_tls_defaults() {
+        let config = make_test_ldap_config();
+        assert!(config.ca_cert_path.is_none());
+        assert!(!config.no_tls_verify);
+    }
+
+    #[test]
+    fn test_ldap_config_with_ca_cert_path() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some("/etc/ssl/certs/ldap-ca.pem".to_string());
+        assert_eq!(
+            config.ca_cert_path.as_deref(),
+            Some("/etc/ssl/certs/ldap-ca.pem")
+        );
+    }
+
+    #[test]
+    fn test_ldap_config_with_insecure_tls() {
+        let mut config = make_test_ldap_config();
+        config.no_tls_verify = true;
+        assert!(config.no_tls_verify);
+    }
+
+    #[test]
+    fn test_parse_pem_single_cert() {
+        let pem = include_bytes!("../../tests/fixtures/test-ca.pem");
+        let certs = LdapService::parse_pem_certificates(pem, "test-ca.pem");
+        assert!(certs.is_ok());
+        let certs = certs.expect("should parse test CA");
+        assert_eq!(certs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_pem_multiple_certs() {
+        let single = include_bytes!("../../tests/fixtures/test-ca.pem");
+        // Concatenate the same cert twice to simulate a bundle
+        let mut bundle = single.to_vec();
+        bundle.extend_from_slice(single);
+        let certs =
+            LdapService::parse_pem_certificates(&bundle, "bundle.pem").expect("should parse");
+        assert_eq!(certs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pem_empty_file() {
+        let result = LdapService::parse_pem_certificates(b"", "empty.pem");
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("No valid PEM certificates")),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pem_garbage_data() {
+        let result = LdapService::parse_pem_certificates(b"not a certificate", "garbage.pem");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_pem_partial_markers() {
+        // Has BEGIN but no END, so no cert block is captured
+        let data = b"-----BEGIN CERTIFICATE-----\ngarbage";
+        let result = LdapService::parse_pem_certificates(data, "partial.pem");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_no_tls() {
+        let config = make_test_ldap_config();
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        assert!(svc.build_conn_settings().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_with_insecure_tls() {
+        let mut config = make_test_ldap_config();
+        config.no_tls_verify = true;
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        assert!(svc.build_conn_settings().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_missing_ca_file() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some("/nonexistent/ca.pem".to_string());
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        let result = svc.build_conn_settings();
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("Failed to read LDAP CA cert")),
+            Ok(_) => panic!("expected error for missing CA file"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_with_valid_ca() {
+        let pem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem");
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some(pem_path.to_string());
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        assert!(svc.build_conn_settings().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_with_starttls() {
+        let mut config = make_test_ldap_config();
+        config.use_starttls = true;
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        assert!(svc.build_conn_settings().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_ca_plus_insecure() {
+        let pem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem");
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some(pem_path.to_string());
+        config.no_tls_verify = true;
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        assert!(svc.build_conn_settings().is_ok());
+    }
+
+    #[test]
+    fn test_ldap_config_debug_shows_tls_fields() {
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some("/etc/ssl/certs/ca.pem".to_string());
+        config.no_tls_verify = true;
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("/etc/ssl/certs/ca.pem"));
+        assert!(debug.contains("no_tls_verify"));
     }
 }
