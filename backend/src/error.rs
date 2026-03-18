@@ -69,6 +69,9 @@ pub enum AppError {
 
     #[error("WASM error: {0}")]
     Wasm(#[from] crate::services::wasm_runtime::WasmError),
+
+    #[error("Bad gateway: {0}")]
+    BadGateway(String),
 }
 
 impl AppError {
@@ -94,6 +97,7 @@ impl AppError {
             Self::Jwt(_) => (StatusCode::UNAUTHORIZED, "JWT_ERROR"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
+            Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
         }
     }
 
@@ -120,7 +124,8 @@ impl AppError {
             | Self::NotFound(msg)
             | Self::Conflict(msg)
             | Self::Validation(msg)
-            | Self::QuotaExceeded(msg) => msg.clone(),
+            | Self::QuotaExceeded(msg)
+            | Self::BadGateway(msg) => msg.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }

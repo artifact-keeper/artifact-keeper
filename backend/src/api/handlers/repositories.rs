@@ -92,7 +92,7 @@ async fn upsert_index_upstream_url(
 /// Create repository routes
 pub fn router() -> Router<SharedState> {
     use axum::extract::DefaultBodyLimit;
-    use axum::routing::{delete, put};
+    use axum::routing::{delete, post, put};
 
     Router::new()
         .route("/", get(list_repositories).post(create_repository))
@@ -104,6 +104,9 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Upstream auth management for remote repositories
+        .route("/:key/upstream-auth", put(set_upstream_auth))
+        .route("/:key/test-upstream", post(test_upstream))
         // Virtual repository member management
         .route(
             "/:key/members",
@@ -168,6 +171,12 @@ pub struct CreateRepositoryRequest {
     /// Member repositories to add when creating a virtual repository.
     /// Each entry specifies a repository key and optional priority.
     pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
+    /// Upstream auth type: "basic" or "bearer". Only valid for remote repos.
+    pub upstream_auth_type: Option<String>,
+    /// Username for basic auth.
+    pub upstream_username: Option<String>,
+    /// Password (basic) or token (bearer). Write-only, never returned in responses.
+    pub upstream_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -204,6 +213,8 @@ pub struct RepositoryResponse {
     pub is_public: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
+    pub upstream_auth_type: Option<String>,
+    pub upstream_auth_configured: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -229,6 +240,8 @@ fn repo_to_response(
         is_public: repo.is_public,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
+        upstream_auth_type: None,
+        upstream_auth_configured: false,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
@@ -620,11 +633,51 @@ pub async fn create_repository(
         }
     }
 
+    // Store upstream auth credentials if provided
+    if let Some(ref auth_type) = payload.upstream_auth_type {
+        let credentials_json = match auth_type.as_str() {
+            "basic" => {
+                let username = payload.upstream_username.as_deref().ok_or_else(|| {
+                    AppError::Validation("upstream_username is required for basic auth".to_string())
+                })?;
+                let password = payload.upstream_password.as_deref().ok_or_else(|| {
+                    AppError::Validation("upstream_password is required for basic auth".to_string())
+                })?;
+                serde_json::json!({"username": username, "password": password}).to_string()
+            }
+            "bearer" => {
+                let token = payload.upstream_password.as_deref().ok_or_else(|| {
+                    AppError::Validation(
+                        "upstream_password is required for bearer auth (used as token)".to_string(),
+                    )
+                })?;
+                serde_json::json!({"token": token}).to_string()
+            }
+            other => {
+                return Err(AppError::Validation(format!(
+                    "Invalid upstream_auth_type: {other}. Must be 'basic' or 'bearer'"
+                )));
+            }
+        };
+        crate::services::upstream_auth::save_upstream_auth(
+            &state.db,
+            repo.id,
+            auth_type,
+            &credentials_json,
+        )
+        .await?;
+    }
+
     state
         .event_bus
         .emit("repository.created", repo.id, Some(auth.username.clone()));
 
-    Ok(Json(repo_to_response(repo, 0)))
+    let mut response = repo_to_response(repo, 0);
+    if let Some(ref at) = payload.upstream_auth_type {
+        response.upstream_auth_type = Some(at.clone());
+        response.upstream_auth_configured = true;
+    }
+    Ok(Json(response))
 }
 
 /// Get repository details
@@ -650,8 +703,13 @@ pub async fn get_repository(
     let repo = service.get_by_key(&key).await?;
     require_visible(&repo, &auth)?;
     let storage_used = service.get_storage_usage(repo.id).await?;
+    let auth_type =
+        crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
-    Ok(Json(repo_to_response(repo, storage_used)))
+    let mut response = repo_to_response(repo, storage_used);
+    response.upstream_auth_configured = auth_type.is_some();
+    response.upstream_auth_type = auth_type;
+    Ok(Json(response))
 }
 
 /// Update repository
@@ -1652,6 +1710,176 @@ pub async fn update_virtual_members(
     list_virtual_members(State(state), Path(key)).await
 }
 
+// ---------------------------------------------------------------------------
+// Upstream auth management
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpstreamAuthRequest {
+    /// Auth type: "basic", "bearer", or "none" to remove.
+    pub auth_type: String,
+    /// Username for basic auth.
+    pub username: Option<String>,
+    /// Password (basic) or token (bearer). Write-only, never returned.
+    pub password: Option<String>,
+}
+
+/// Set or remove upstream auth for a remote repository
+#[utoipa::path(
+    put,
+    path = "/{key}/upstream-auth",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = UpstreamAuthRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream auth updated"),
+        (status = 400, description = "Invalid auth type or missing fields"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_upstream_auth(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<UpstreamAuthRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "Upstream auth is only valid for remote repositories".to_string(),
+        ));
+    }
+
+    if payload.auth_type == "none" {
+        crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
+        return Ok(Json(
+            serde_json::json!({"message": "Upstream auth removed"}),
+        ));
+    }
+
+    let credentials_json = match payload.auth_type.as_str() {
+        "basic" => {
+            let username = payload.username.as_deref().ok_or_else(|| {
+                AppError::Validation("username is required for basic auth".to_string())
+            })?;
+            let password = payload.password.as_deref().ok_or_else(|| {
+                AppError::Validation("password is required for basic auth".to_string())
+            })?;
+            serde_json::json!({"username": username, "password": password}).to_string()
+        }
+        "bearer" => {
+            let token = payload.password.as_deref().ok_or_else(|| {
+                AppError::Validation(
+                    "password is required for bearer auth (used as token)".to_string(),
+                )
+            })?;
+            serde_json::json!({"token": token}).to_string()
+        }
+        other => {
+            return Err(AppError::Validation(format!(
+                "Invalid auth_type: {other}. Must be 'basic', 'bearer', or 'none'"
+            )));
+        }
+    };
+
+    crate::services::upstream_auth::save_upstream_auth(
+        &state.db,
+        repo.id,
+        &payload.auth_type,
+        &credentials_json,
+    )
+    .await?;
+
+    Ok(Json(
+        serde_json::json!({"message": "Upstream auth configured"}),
+    ))
+}
+
+/// Test connectivity to the upstream URL of a remote repository
+#[utoipa::path(
+    post,
+    path = "/{key}/test-upstream",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream reachable"),
+        (status = 400, description = "Repository is not remote or has no upstream URL"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+        (status = 502, description = "Upstream unreachable"),
+    )
+)]
+pub async fn test_upstream(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "Only remote repositories have an upstream URL".to_string(),
+        ));
+    }
+
+    let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
+        AppError::Validation("Repository has no upstream URL configured".to_string())
+    })?;
+
+    let client = crate::services::http_client::base_client_builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
+
+    let mut request = client.head(upstream_url);
+
+    // Apply upstream auth if configured
+    if let Some(upstream_auth) =
+        crate::services::upstream_auth::load_upstream_auth(&state.db, repo.id).await?
+    {
+        request = crate::services::upstream_auth::apply_upstream_auth(request, &upstream_auth);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {e}")))?;
+
+    let status = response.status().as_u16();
+    // 2xx or 404 (root URL may not serve content) are acceptable
+    if response.status().is_success() || status == 404 {
+        Ok(Json(serde_json::json!({
+            "status": "ok",
+            "upstream_status": status,
+            "upstream_url": upstream_url,
+        })))
+    } else {
+        Err(AppError::BadGateway(format!(
+            "Upstream returned HTTP {status}"
+        )))
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -1671,6 +1899,8 @@ pub async fn update_virtual_members(
         add_virtual_member,
         remove_virtual_member,
         update_virtual_members,
+        set_upstream_auth,
+        test_upstream,
     ),
     components(schemas(
         ListRepositoriesQuery,
@@ -1689,6 +1919,7 @@ pub async fn update_virtual_members(
         VirtualMemberResponse,
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
+        UpstreamAuthRequest,
     ))
 )]
 pub struct RepositoriesApiDoc;
@@ -2175,6 +2406,8 @@ mod tests {
             is_public: true,
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
+            upstream_auth_type: None,
+            upstream_auth_configured: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
