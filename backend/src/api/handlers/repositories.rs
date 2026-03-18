@@ -165,6 +165,20 @@ pub struct CreateRepositoryRequest {
     /// the sparse index but `https://crates.io` for tarball downloads).
     /// Stored in `repository_config` under the key `index_upstream_url`.
     pub index_upstream_url: Option<String>,
+    /// Member repositories to add when creating a virtual repository.
+    /// Each entry specifies a repository key and optional priority.
+    pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateVirtualMemberInput {
+    pub repo_key: String,
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+}
+
+fn default_priority() -> i32 {
+    0
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -579,7 +593,7 @@ pub async fn create_repository(
             name: payload.name,
             description: payload.description,
             format,
-            repo_type,
+            repo_type: repo_type.clone(),
             storage_backend,
             storage_path,
             upstream_url: payload.upstream_url,
@@ -591,6 +605,23 @@ pub async fn create_repository(
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
+    }
+
+    // Add virtual repository members if provided
+    if repo_type == RepositoryType::Virtual {
+        if let Some(ref member_inputs) = payload.member_repos {
+            for (idx, input) in member_inputs.iter().enumerate() {
+                let member_repo = service.get_by_key(&input.repo_key).await?;
+                let priority = if input.priority > 0 {
+                    input.priority
+                } else {
+                    (idx as i32) + 1
+                };
+                service
+                    .add_virtual_member(repo.id, member_repo.id, priority)
+                    .await?;
+            }
+        }
     }
 
     state
@@ -1366,7 +1397,7 @@ pub struct VirtualMemberResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VirtualMembersListResponse {
-    pub items: Vec<VirtualMemberResponse>,
+    pub members: Vec<VirtualMemberResponse>,
 }
 
 // Row type for virtual member queries
@@ -1431,7 +1462,7 @@ pub async fn list_virtual_members(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let items = members
+    let members = members
         .into_iter()
         .map(|m| VirtualMemberResponse {
             id: m.id,
@@ -1444,7 +1475,7 @@ pub async fn list_virtual_members(
         })
         .collect();
 
-    Ok(Json(VirtualMembersListResponse { items }))
+    Ok(Json(VirtualMembersListResponse { members }))
 }
 
 /// Add a member to a virtual repository
@@ -1672,6 +1703,7 @@ pub async fn update_virtual_members(
         VirtualMemberPriority,
         VirtualMemberResponse,
         VirtualMembersListResponse,
+        CreateVirtualMemberInput,
     ))
 )]
 pub struct RepositoriesApiDoc;
