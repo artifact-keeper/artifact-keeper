@@ -634,6 +634,11 @@ mod tests {
         }
     }
 
+    fn make_test_service(config: LdapConfig) -> LdapService {
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        LdapService::with_config(db, config)
+    }
+
     #[test]
     fn test_sanitize_ldap_input() {
         assert_eq!(LdapService::sanitize_ldap_input("user"), "user");
@@ -940,8 +945,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_conn_settings_no_tls() {
         let config = make_test_ldap_config();
-        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
-        let svc = LdapService::with_config(db, config);
+        let svc = make_test_service(config);
         assert!(svc.build_conn_settings().is_ok());
     }
 
@@ -949,8 +953,7 @@ mod tests {
     async fn test_build_conn_settings_with_insecure_tls() {
         let mut config = make_test_ldap_config();
         config.no_tls_verify = true;
-        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
-        let svc = LdapService::with_config(db, config);
+        let svc = make_test_service(config);
         assert!(svc.build_conn_settings().is_ok());
     }
 
@@ -958,8 +961,7 @@ mod tests {
     async fn test_build_conn_settings_missing_ca_file() {
         let mut config = make_test_ldap_config();
         config.ca_cert_path = Some("/nonexistent/ca.pem".to_string());
-        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
-        let svc = LdapService::with_config(db, config);
+        let svc = make_test_service(config);
         let result = svc.build_conn_settings();
         assert!(result.is_err());
         match result {
@@ -973,8 +975,7 @@ mod tests {
         let pem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem");
         let mut config = make_test_ldap_config();
         config.ca_cert_path = Some(pem_path.to_string());
-        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
-        let svc = LdapService::with_config(db, config);
+        let svc = make_test_service(config);
         assert!(svc.build_conn_settings().is_ok());
     }
 
@@ -982,8 +983,7 @@ mod tests {
     async fn test_build_conn_settings_with_starttls() {
         let mut config = make_test_ldap_config();
         config.use_starttls = true;
-        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
-        let svc = LdapService::with_config(db, config);
+        let svc = make_test_service(config);
         assert!(svc.build_conn_settings().is_ok());
     }
 
@@ -993,8 +993,7 @@ mod tests {
         let mut config = make_test_ldap_config();
         config.ca_cert_path = Some(pem_path.to_string());
         config.no_tls_verify = true;
-        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
-        let svc = LdapService::with_config(db, config);
+        let svc = make_test_service(config);
         assert!(svc.build_conn_settings().is_ok());
     }
 
@@ -1006,5 +1005,60 @@ mod tests {
         let debug = format!("{:?}", config);
         assert!(debug.contains("/etc/ssl/certs/ca.pem"));
         assert!(debug.contains("no_tls_verify"));
+    }
+
+    #[test]
+    fn test_tls_from_env_defaults() {
+        // Without the env vars set, should return (None, false)
+        let (ca, insecure) = LdapConfig::tls_from_env();
+        // We can't assert exact values since other tests or CI may set
+        // CUSTOM_CA_CERT_PATH, but we can assert the types are correct
+        let _ = ca;
+        assert!(!insecure || std::env::var("LDAP_INSECURE_TLS").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_from_db_config_sets_tls_defaults() {
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::from_db_config(
+            db,
+            "test-ldap",
+            "ldaps://ad.example.com:636",
+            Some("cn=svc,dc=example,dc=com"),
+            Some("password"),
+            "ou=users,dc=example,dc=com",
+            "(sAMAccountName={username})",
+            "sAMAccountName",
+            "mail",
+            "displayName",
+            "memberOf",
+            Some("cn=admins,dc=example,dc=com"),
+            false,
+        );
+        // Verify TLS fields are populated from env (defaults)
+        assert!(!svc.config.no_tls_verify || std::env::var("LDAP_INSECURE_TLS").is_ok());
+        // Verify non-TLS fields passed through
+        assert_eq!(svc.config.url, "ldaps://ad.example.com:636");
+        assert_eq!(svc.config.username_attr, "sAMAccountName");
+        assert_eq!(
+            svc.config.admin_group_dn.as_deref(),
+            Some("cn=admins,dc=example,dc=com")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_invalid_pem_content() {
+        let tmp = std::env::temp_dir().join("bad-ldap-ca.pem");
+        std::fs::write(
+            &tmp,
+            b"-----BEGIN CERTIFICATE-----\nnot-base64\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write temp");
+        let mut config = make_test_ldap_config();
+        config.ca_cert_path = Some(tmp.to_string_lossy().to_string());
+        let svc = make_test_service(config);
+        let result = svc.build_conn_settings();
+        assert!(result.is_err());
+        std::fs::remove_file(&tmp).ok();
     }
 }

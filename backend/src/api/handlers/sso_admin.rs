@@ -952,13 +952,7 @@ mod tests {
 
     #[test]
     fn test_sso_provider_info_serialize() {
-        let info = SsoProviderInfo {
-            id: Uuid::nil(),
-            name: "My OIDC Provider".to_string(),
-            provider_type: "oidc".to_string(),
-            login_url: "/api/v1/auth/sso/oidc/00000000-0000-0000-0000-000000000000/login"
-                .to_string(),
-        };
+        let info = SsoProviderInfo::new(Uuid::nil(), "My OIDC Provider".to_string(), "oidc");
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["provider_type"], "oidc");
         assert!(json["login_url"].as_str().unwrap().contains("/login"));

@@ -280,6 +280,17 @@ pub struct SsoProviderInfo {
     pub login_url: String,
 }
 
+impl SsoProviderInfo {
+    pub fn new(id: Uuid, name: String, provider_type: &str) -> Self {
+        Self {
+            login_url: format!("/api/v1/auth/sso/{provider_type}/{id}/login"),
+            id,
+            name,
+            provider_type: provider_type.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ToggleRequest {
     pub enabled: bool,
@@ -1157,12 +1168,7 @@ impl AuthConfigService {
         .map_err(|e| AppError::Internal(format!("Failed to list OIDC providers: {e}")))?;
 
         for (id, name) in oidc_rows {
-            providers.push(SsoProviderInfo {
-                login_url: format!("/api/v1/auth/sso/oidc/{id}/login"),
-                id,
-                name,
-                provider_type: "oidc".to_string(),
-            });
+            providers.push(SsoProviderInfo::new(id, name, "oidc"));
         }
 
         // LDAP providers (only fetch id and name)
@@ -1174,12 +1180,7 @@ impl AuthConfigService {
         .map_err(|e| AppError::Internal(format!("Failed to list LDAP providers: {e}")))?;
 
         for (id, name) in ldap_rows {
-            providers.push(SsoProviderInfo {
-                login_url: format!("/api/v1/auth/sso/ldap/{id}/login"),
-                id,
-                name,
-                provider_type: "ldap".to_string(),
-            });
+            providers.push(SsoProviderInfo::new(id, name, "ldap"));
         }
 
         // SAML providers (only fetch id and name)
@@ -1191,12 +1192,7 @@ impl AuthConfigService {
         .map_err(|e| AppError::Internal(format!("Failed to list SAML providers: {e}")))?;
 
         for (id, name) in saml_rows {
-            providers.push(SsoProviderInfo {
-                login_url: format!("/api/v1/auth/sso/saml/{id}/login"),
-                id,
-                name,
-                provider_type: "saml".to_string(),
-            });
+            providers.push(SsoProviderInfo::new(id, name, "saml"));
         }
 
         Ok(providers)
@@ -1779,14 +1775,43 @@ mod tests {
     }
 
     #[test]
+    fn test_sso_provider_info_new_oidc() {
+        let id = Uuid::nil();
+        let info = SsoProviderInfo::new(id, "Keycloak".to_string(), "oidc");
+        assert_eq!(info.provider_type, "oidc");
+        assert_eq!(info.name, "Keycloak");
+        assert_eq!(info.id, id);
+        assert_eq!(
+            info.login_url,
+            "/api/v1/auth/sso/oidc/00000000-0000-0000-0000-000000000000/login"
+        );
+    }
+
+    #[test]
+    fn test_sso_provider_info_new_ldap() {
+        let id = Uuid::nil();
+        let info = SsoProviderInfo::new(id, "AD".to_string(), "ldap");
+        assert_eq!(info.provider_type, "ldap");
+        assert_eq!(
+            info.login_url,
+            "/api/v1/auth/sso/ldap/00000000-0000-0000-0000-000000000000/login"
+        );
+    }
+
+    #[test]
+    fn test_sso_provider_info_new_saml() {
+        let id = Uuid::nil();
+        let info = SsoProviderInfo::new(id, "Okta".to_string(), "saml");
+        assert_eq!(info.provider_type, "saml");
+        assert_eq!(
+            info.login_url,
+            "/api/v1/auth/sso/saml/00000000-0000-0000-0000-000000000000/login"
+        );
+    }
+
+    #[test]
     fn test_sso_provider_info_serialization() {
-        let info = SsoProviderInfo {
-            id: Uuid::nil(),
-            name: "My SSO".to_string(),
-            provider_type: "oidc".to_string(),
-            login_url: "/api/v1/auth/sso/oidc/00000000-0000-0000-0000-000000000000/login"
-                .to_string(),
-        };
+        let info = SsoProviderInfo::new(Uuid::nil(), "My SSO".to_string(), "oidc");
         let json_str = serde_json::to_string(&info).unwrap();
         assert!(json_str.contains("\"provider_type\":\"oidc\""));
         assert!(json_str.contains("\"login_url\":\"/api/v1/auth/sso/oidc/"));
