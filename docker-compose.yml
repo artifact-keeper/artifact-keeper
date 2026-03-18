@@ -274,6 +274,12 @@ services:
         condition: service_started
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: "localhost,127.0.0.1"
+      no_proxy: "localhost,127.0.0.1"
     ports:
       - "${HTTP_PORT:-30080}:80"
       - "${HTTPS_PORT:-30443}:443"
