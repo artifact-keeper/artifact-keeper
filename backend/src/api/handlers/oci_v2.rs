@@ -330,18 +330,35 @@ async fn token(
 // Version check
 // ---------------------------------------------------------------------------
 
+fn version_check_ok() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Docker-Distribution-API-Version", "registry/2.0")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
 async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    // Accept Bearer token (standard Docker client flow)
     if validate_token(&state.db, &state.config, &headers).is_ok() {
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("Docker-Distribution-API-Version", "registry/2.0")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from("{}"))
-            .unwrap()
-    } else {
-        let host = request_host(&headers);
-        unauthorized_challenge(&host)
+        return version_check_ok();
     }
+
+    // Accept Basic Auth directly (curl -u user:pass, HTTP clients)
+    if let Some((username, password)) = extract_basic_credentials(&headers) {
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        if auth_service
+            .authenticate(&username, &password)
+            .await
+            .is_ok()
+        {
+            return version_check_ok();
+        }
+    }
+
+    let host = request_host(&headers);
+    unauthorized_challenge(&host)
 }
 
 // ---------------------------------------------------------------------------
@@ -1701,6 +1718,142 @@ mod tests {
         assert_eq!(name, "test/image");
         assert_eq!(op, "manifests");
         assert_eq!(reference, Some("sha256:abc123".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // version_check_ok
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_version_check_ok_status() {
+        let resp = version_check_ok();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_version_check_ok_has_distribution_header() {
+        let resp = version_check_ok();
+        assert_eq!(
+            resp.headers()
+                .get("Docker-Distribution-API-Version")
+                .unwrap(),
+            "registry/2.0"
+        );
+    }
+
+    #[test]
+    fn test_version_check_ok_content_type() {
+        let resp = version_check_ok();
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth dispatch: verify Basic vs Bearer extraction is mutually exclusive
+    // (validate_token depends on extract_bearer_token, which these prove)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_basic_auth_not_extracted_as_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        // Bearer extraction returns None for Basic Auth
+        assert!(extract_bearer_token(&headers).is_none());
+        // Basic extraction returns the credentials
+        assert!(extract_basic_credentials(&headers).is_some());
+    }
+
+    #[test]
+    fn test_bearer_not_extracted_as_basic() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer some-jwt-token"),
+        );
+        // Basic extraction returns None for Bearer
+        assert!(extract_basic_credentials(&headers).is_none());
+        // Bearer extraction returns the token
+        assert!(extract_bearer_token(&headers).is_some());
+    }
+
+    #[test]
+    fn test_no_auth_header_returns_none_for_both() {
+        let headers = HeaderMap::new();
+        assert!(extract_bearer_token(&headers).is_none());
+        assert!(extract_basic_credentials(&headers).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_basic_credentials edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_basic_credentials_empty_password() {
+        let mut headers = HeaderMap::new();
+        // "user:" in base64 = "dXNlcjo="
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjo="));
+        let result = extract_basic_credentials(&headers);
+        assert_eq!(result, Some(("user".to_string(), "".to_string())));
+    }
+
+    #[test]
+    fn test_extract_basic_credentials_bearer_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer some-token"));
+        assert!(extract_basic_credentials(&headers).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_bearer_token edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_bearer_token_empty_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        assert_eq!(extract_bearer_token(&headers), Some("".to_string()));
+    }
+
+    #[test]
+    fn test_extract_bearer_token_with_spaces_in_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer token with spaces"),
+        );
+        assert_eq!(
+            extract_bearer_token(&headers),
+            Some("token with spaces".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // unauthorized_challenge body content
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_unauthorized_challenge_body_contains_error() {
+        let resp = unauthorized_challenge("http://localhost:8080");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(www_auth.contains("realm=\"http://localhost:8080/v2/token\""));
+        assert!(www_auth.contains("service=\"artifact-keeper\""));
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
+        assert_eq!(json["errors"][0]["message"], "authentication required");
     }
 
     // -----------------------------------------------------------------------
