@@ -829,21 +829,11 @@ mod tests {
 
     #[test]
     fn test_ldap_config_debug_redacts_bind_password() {
-        let config = LdapConfig {
-            url: "ldap://ldap.example.com:389".to_string(),
-            base_dn: "dc=example,dc=com".to_string(),
-            user_filter: "(uid={username})".to_string(),
-            bind_dn: Some("cn=admin,dc=example,dc=com".to_string()),
-            bind_password: Some("super-secret-ldap-password".to_string()),
-            username_attr: "uid".to_string(),
-            email_attr: "mail".to_string(),
-            display_name_attr: "cn".to_string(),
-            groups_attr: "memberOf".to_string(),
-            admin_group_dn: None,
-            use_starttls: true,
-            ca_cert_path: None,
-            no_tls_verify: false,
-        };
+        let mut config = make_test_ldap_config();
+        config.bind_dn = Some("cn=admin,dc=example,dc=com".to_string());
+        config.bind_password = Some("super-secret-ldap-password".to_string());
+        config.use_starttls = true;
+        config.admin_group_dn = None;
         let debug = format!("{:?}", config);
         assert!(debug.contains("ldap.example.com"));
         assert!(debug.contains("dc=example,dc=com"));
@@ -853,21 +843,7 @@ mod tests {
 
     #[test]
     fn test_ldap_config_debug_shows_none_for_missing_password() {
-        let config = LdapConfig {
-            url: "ldap://localhost".to_string(),
-            base_dn: "dc=test".to_string(),
-            user_filter: "(uid={username})".to_string(),
-            bind_dn: None,
-            bind_password: None,
-            username_attr: "uid".to_string(),
-            email_attr: "mail".to_string(),
-            display_name_attr: "cn".to_string(),
-            groups_attr: "memberOf".to_string(),
-            admin_group_dn: None,
-            use_starttls: false,
-            ca_cert_path: None,
-            no_tls_verify: false,
-        };
+        let config = make_test_ldap_config();
         let debug = format!("{:?}", config);
         assert!(debug.contains("None"));
     }
