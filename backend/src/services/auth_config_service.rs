@@ -1158,7 +1158,7 @@ impl AuthConfigService {
 
         for (id, name) in oidc_rows {
             providers.push(SsoProviderInfo {
-                login_url: format!("/auth/sso/oidc/{id}/login"),
+                login_url: format!("/api/v1/auth/sso/oidc/{id}/login"),
                 id,
                 name,
                 provider_type: "oidc".to_string(),
@@ -1175,7 +1175,7 @@ impl AuthConfigService {
 
         for (id, name) in ldap_rows {
             providers.push(SsoProviderInfo {
-                login_url: format!("/auth/sso/ldap/{id}/login"),
+                login_url: format!("/api/v1/auth/sso/ldap/{id}/login"),
                 id,
                 name,
                 provider_type: "ldap".to_string(),
@@ -1192,7 +1192,7 @@ impl AuthConfigService {
 
         for (id, name) in saml_rows {
             providers.push(SsoProviderInfo {
-                login_url: format!("/auth/sso/saml/{id}/login"),
+                login_url: format!("/api/v1/auth/sso/saml/{id}/login"),
                 id,
                 name,
                 provider_type: "saml".to_string(),
@@ -1784,11 +1784,11 @@ mod tests {
             id: Uuid::nil(),
             name: "My SSO".to_string(),
             provider_type: "oidc".to_string(),
-            login_url: "/auth/sso/oidc/00000000-0000-0000-0000-000000000000/login".to_string(),
+            login_url: "/api/v1/auth/sso/oidc/00000000-0000-0000-0000-000000000000/login".to_string(),
         };
         let json_str = serde_json::to_string(&info).unwrap();
         assert!(json_str.contains("\"provider_type\":\"oidc\""));
-        assert!(json_str.contains("\"login_url\":\"/auth/sso/oidc/"));
+        assert!(json_str.contains("\"login_url\":\"/api/v1/auth/sso/oidc/"));
     }
 
     #[test]

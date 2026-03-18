@@ -39,6 +39,10 @@ pub struct LdapConfig {
     pub admin_group_dn: Option<String>,
     /// Use STARTTLS
     pub use_starttls: bool,
+    /// Path to a PEM file with custom CA certificates for LDAPS/STARTTLS
+    pub ca_cert_path: Option<String>,
+    /// Skip TLS certificate verification (development only)
+    pub no_tls_verify: bool,
 }
 
 redacted_debug!(LdapConfig {
@@ -53,6 +57,8 @@ redacted_debug!(LdapConfig {
     show groups_attr,
     show admin_group_dn,
     show use_starttls,
+    show ca_cert_path,
+    show no_tls_verify,
 });
 
 impl LdapConfig {
@@ -77,6 +83,12 @@ impl LdapConfig {
                 .unwrap_or_else(|_| "memberOf".to_string()),
             admin_group_dn: std::env::var("LDAP_ADMIN_GROUP_DN").ok(),
             use_starttls: std::env::var("LDAP_USE_STARTTLS")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            ca_cert_path: std::env::var("LDAP_CA_CERT_PATH")
+                .ok()
+                .or_else(|| std::env::var("CUSTOM_CA_CERT_PATH").ok()),
+            no_tls_verify: std::env::var("LDAP_INSECURE_TLS")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
         })
@@ -153,6 +165,12 @@ impl LdapService {
             groups_attr: groups_attr.to_string(),
             admin_group_dn: admin_group_dn.map(String::from),
             use_starttls,
+            ca_cert_path: std::env::var("LDAP_CA_CERT_PATH")
+                .ok()
+                .or_else(|| std::env::var("CUSTOM_CA_CERT_PATH").ok()),
+            no_tls_verify: std::env::var("LDAP_INSECURE_TLS")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         };
         Self {
             db,
@@ -353,14 +371,64 @@ impl LdapService {
         pattern.replace("{}", username)
     }
 
-    /// Validate LDAP credentials via real LDAP simple bind.
-    async fn validate_ldap_credentials(&self, user_dn: &str, password: &str) -> Result<()> {
-        use ldap3::{LdapConnAsync, LdapConnSettings};
+    /// Build LDAP connection settings with TLS configuration.
+    ///
+    /// Supports custom CA certificates via `LDAP_CA_CERT_PATH` (or the shared
+    /// `CUSTOM_CA_CERT_PATH` as fallback) and `LDAP_INSECURE_TLS=true` to skip
+    /// certificate verification for development environments.
+    fn build_conn_settings(&self) -> Result<ldap3::LdapConnSettings> {
         use std::time::Duration;
 
-        let settings = LdapConnSettings::new()
+        let mut settings = ldap3::LdapConnSettings::new()
             .set_conn_timeout(Duration::from_secs(10))
-            .set_starttls(self.config.use_starttls);
+            .set_starttls(self.config.use_starttls)
+            .set_no_tls_verify(self.config.no_tls_verify);
+
+        if let Some(ca_path) = &self.config.ca_cert_path {
+            let pem_bytes = std::fs::read(ca_path).map_err(|e| {
+                AppError::Config(format!("Failed to read LDAP CA cert at {ca_path}: {e}"))
+            })?;
+
+            let mut builder = native_tls::TlsConnector::builder();
+            // Parse PEM certificates from the file. native_tls::Certificate::from_pem
+            // handles a single cert, so split the bundle on PEM boundaries.
+            let pem_str = String::from_utf8_lossy(&pem_bytes);
+            let mut count = 0usize;
+            for block in pem_str.split("-----END CERTIFICATE-----") {
+                let trimmed = block.trim();
+                if trimmed.is_empty() || !trimmed.contains("-----BEGIN CERTIFICATE-----") {
+                    continue;
+                }
+                let pem = format!("{trimmed}\n-----END CERTIFICATE-----\n");
+                let cert = native_tls::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
+                    AppError::Config(format!("Failed to parse LDAP CA cert at {ca_path}: {e}"))
+                })?;
+                builder.add_root_certificate(cert);
+                count += 1;
+            }
+            if count == 0 {
+                return Err(AppError::Config(format!(
+                    "No valid PEM certificates found in {ca_path}"
+                )));
+            }
+            if self.config.no_tls_verify {
+                builder.danger_accept_invalid_certs(true);
+            }
+            let connector = builder
+                .build()
+                .map_err(|e| AppError::Config(format!("Failed to build TLS connector: {e}")))?;
+            settings = settings.set_connector(connector);
+            tracing::info!(path = %ca_path, "Loaded custom CA certificate(s) for LDAP");
+        }
+
+        Ok(settings)
+    }
+
+    /// Validate LDAP credentials via real LDAP simple bind.
+    async fn validate_ldap_credentials(&self, user_dn: &str, password: &str) -> Result<()> {
+        use ldap3::LdapConnAsync;
+
+        let settings = self.build_conn_settings()?;
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
             .await
@@ -383,15 +451,12 @@ impl LdapService {
 
     /// Get user information from LDAP via real search.
     async fn get_user_info(&self, username: &str, user_dn: &str) -> Result<LdapUserInfo> {
-        use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
-        use std::time::Duration;
+        use ldap3::{LdapConnAsync, Scope, SearchEntry};
 
         // If we have a bind DN, use search-then-bind
         // Otherwise return basic info from the DN
         if let (Some(bind_dn), Some(bind_pw)) = (&self.config.bind_dn, &self.config.bind_password) {
-            let settings = LdapConnSettings::new()
-                .set_conn_timeout(Duration::from_secs(10))
-                .set_starttls(self.config.use_starttls);
+            let settings = self.build_conn_settings()?;
 
             let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
                 .await
@@ -544,6 +609,8 @@ mod tests {
             groups_attr: "memberOf".to_string(),
             admin_group_dn: Some("cn=admins,ou=groups,dc=example,dc=com".to_string()),
             use_starttls: false,
+            ca_cert_path: None,
+            no_tls_verify: false,
         }
     }
 
@@ -749,6 +816,8 @@ mod tests {
             groups_attr: "memberOf".to_string(),
             admin_group_dn: None,
             use_starttls: true,
+            ca_cert_path: None,
+            no_tls_verify: false,
         };
         let debug = format!("{:?}", config);
         assert!(debug.contains("ldap.example.com"));
@@ -771,6 +840,8 @@ mod tests {
             groups_attr: "memberOf".to_string(),
             admin_group_dn: None,
             use_starttls: false,
+            ca_cert_path: None,
+            no_tls_verify: false,
         };
         let debug = format!("{:?}", config);
         assert!(debug.contains("None"));

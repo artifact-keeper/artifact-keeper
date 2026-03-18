@@ -199,6 +199,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
+ "native-tls",
  "openssl",
  "opentelemetry",
  "opentelemetry-otlp",
