@@ -635,30 +635,11 @@ pub async fn create_repository(
 
     // Store upstream auth credentials if provided
     if let Some(ref auth_type) = payload.upstream_auth_type {
-        let credentials_json = match auth_type.as_str() {
-            "basic" => {
-                let username = payload.upstream_username.as_deref().ok_or_else(|| {
-                    AppError::Validation("upstream_username is required for basic auth".to_string())
-                })?;
-                let password = payload.upstream_password.as_deref().ok_or_else(|| {
-                    AppError::Validation("upstream_password is required for basic auth".to_string())
-                })?;
-                serde_json::json!({"username": username, "password": password}).to_string()
-            }
-            "bearer" => {
-                let token = payload.upstream_password.as_deref().ok_or_else(|| {
-                    AppError::Validation(
-                        "upstream_password is required for bearer auth (used as token)".to_string(),
-                    )
-                })?;
-                serde_json::json!({"token": token}).to_string()
-            }
-            other => {
-                return Err(AppError::Validation(format!(
-                    "Invalid upstream_auth_type: {other}. Must be 'basic' or 'bearer'"
-                )));
-            }
-        };
+        let credentials_json = build_upstream_credentials(
+            auth_type,
+            payload.upstream_username.as_deref(),
+            payload.upstream_password.as_deref(),
+        )?;
         crate::services::upstream_auth::save_upstream_auth(
             &state.db,
             repo.id,
