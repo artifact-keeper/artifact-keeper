@@ -1155,6 +1155,7 @@ mod tests {
             otel_service_name: "test".to_string(),
             gc_schedule: "0 0 * * * *".to_string(),
             lifecycle_check_interval_secs: 60,
+            allow_local_admin_login: false,
         })
     }
 

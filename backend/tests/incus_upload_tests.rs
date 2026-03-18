@@ -60,6 +60,7 @@ fn test_config(storage_path: &str) -> Config {
         otel_service_name: "test".into(),
         gc_schedule: "0 0 * * * *".into(),
         lifecycle_check_interval_secs: 60,
+        allow_local_admin_login: false,
     }
 }
 

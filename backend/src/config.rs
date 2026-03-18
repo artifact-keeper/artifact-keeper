@@ -112,6 +112,11 @@ pub struct Config {
 
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
+
+    /// When true, the built-in admin account can log in with local credentials
+    /// even when SSO providers are configured. Intended as a break-glass
+    /// recovery mechanism when SSO is misconfigured.
+    pub allow_local_admin_login: bool,
 }
 
 impl Config {
@@ -166,6 +171,10 @@ impl Config {
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
+            allow_local_admin_login: matches!(
+                env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
+                Ok("true" | "1")
+            ),
         })
     }
 }
@@ -391,6 +400,54 @@ mod tests {
             env::set_var("DEMO_MODE", v);
         } else {
             env::remove_var("DEMO_MODE");
+        }
+    }
+
+    #[test]
+    fn test_config_allow_local_admin_login() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("ALLOW_LOCAL_ADMIN_LOGIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+
+        // Default is false
+        env::remove_var("ALLOW_LOCAL_ADMIN_LOGIN");
+        let config = Config::from_env().unwrap();
+        assert!(!config.allow_local_admin_login);
+
+        // "true" enables it
+        env::set_var("ALLOW_LOCAL_ADMIN_LOGIN", "true");
+        let config = Config::from_env().unwrap();
+        assert!(config.allow_local_admin_login);
+
+        // "1" also enables it
+        env::set_var("ALLOW_LOCAL_ADMIN_LOGIN", "1");
+        let config = Config::from_env().unwrap();
+        assert!(config.allow_local_admin_login);
+
+        // "false" does not enable it
+        env::set_var("ALLOW_LOCAL_ADMIN_LOGIN", "false");
+        let config = Config::from_env().unwrap();
+        assert!(!config.allow_local_admin_login);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("ALLOW_LOCAL_ADMIN_LOGIN", v);
+        } else {
+            env::remove_var("ALLOW_LOCAL_ADMIN_LOGIN");
         }
     }
 

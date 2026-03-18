@@ -631,6 +631,7 @@ mod tests {
             otel_service_name: "artifact-keeper".to_string(),
             gc_schedule: "0 0 * * * *".to_string(),
             lifecycle_check_interval_secs: 60,
+            allow_local_admin_login: false,
         };
         let status = check_storage_health(&config).await;
         assert_eq!(status.status, "healthy");

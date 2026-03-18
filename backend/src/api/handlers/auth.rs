@@ -156,12 +156,21 @@ pub async fn login(
     State(state): State<SharedState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response> {
-    // Block local login when SSO providers are configured (issue #213)
+    // Block local login when SSO providers are configured (issue #213),
+    // unless ALLOW_LOCAL_ADMIN_LOGIN is set and the user is the admin account
+    // (break-glass recovery for misconfigured SSO, issue #443).
     let sso_providers = AuthConfigService::list_enabled_providers(&state.db).await?;
     if !sso_providers.is_empty() {
-        return Err(AppError::Authentication(
-            "Local login is disabled when SSO is configured. Use your organization's SSO provider to sign in.".to_string(),
-        ));
+        let is_admin_bypass =
+            state.config.allow_local_admin_login && payload.username == "admin";
+        if !is_admin_bypass {
+            return Err(AppError::Authentication(
+                "Local login is disabled when SSO is configured. Use your organization's SSO provider to sign in.".to_string(),
+            ));
+        }
+        tracing::warn!(
+            "Local admin login allowed via ALLOW_LOCAL_ADMIN_LOGIN while SSO is active"
+        );
     }
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
