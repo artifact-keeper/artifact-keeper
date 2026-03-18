@@ -97,7 +97,7 @@ impl ProxyService {
 
         // Fetch from upstream
         let full_url = Self::build_upstream_url(upstream_url, path);
-        let upstream_result = self.fetch_from_upstream(&full_url).await;
+        let upstream_result = self.fetch_from_upstream(&full_url, repo.id).await;
 
         match upstream_result {
             Ok((content, content_type, etag)) => {
@@ -164,7 +164,7 @@ impl ProxyService {
         // If we have an ETag, do a conditional request
         if let Some(ref etag) = metadata.upstream_etag {
             let full_url = Self::build_upstream_url(upstream_url, path);
-            return self.check_etag_changed(&full_url, etag).await;
+            return self.check_etag_changed(&full_url, etag, repo.id).await;
         }
 
         // No ETag, rely on TTL - cache is still valid
@@ -296,12 +296,19 @@ impl ProxyService {
     async fn fetch_from_upstream(
         &self,
         url: &str,
+        repo_id: Uuid,
     ) -> Result<(Bytes, Option<String>, Option<String>)> {
         tracing::info!("Fetching artifact from upstream: {}", url);
 
-        let response = self
-            .http_client
-            .get(url)
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self.http_client.get(url);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
@@ -433,16 +440,26 @@ impl ProxyService {
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer)
-    async fn check_etag_changed(&self, url: &str, cached_etag: &str) -> Result<bool> {
-        let response = self
+    async fn check_etag_changed(
+        &self,
+        url: &str,
+        cached_etag: &str,
+        repo_id: Uuid,
+    ) -> Result<bool> {
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self
             .http_client
             .head(url)
-            .header(IF_NONE_MATCH, cached_etag)
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::Storage(format!("Failed to check upstream for changes: {}", e))
-            })?;
+            .header(IF_NONE_MATCH, cached_etag);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            AppError::Storage(format!("Failed to check upstream for changes: {}", e))
+        })?;
 
         match response.status() {
             StatusCode::NOT_MODIFIED => {

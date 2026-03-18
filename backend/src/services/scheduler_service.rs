@@ -473,12 +473,21 @@ async fn run_curation_sync_cycle(
         .build()?;
 
     for (staging_id, format, remote_id, upstream_url, default_action, _interval) in &repos {
+        let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, *remote_id)
+            .await
+            .unwrap_or(None);
+
         let entries = match format.as_str() {
             "rpm" => {
                 let repomd_url =
                     format!("{}/repodata/repomd.xml", upstream_url.trim_end_matches('/'));
                 // Try to find primary.xml location from repomd.xml, fall back to default path
-                let primary_path = match client.get(&repomd_url).send().await {
+                let mut repomd_req = client.get(&repomd_url);
+                if let Some(ref auth) = upstream_auth {
+                    repomd_req =
+                        crate::services::upstream_auth::apply_upstream_auth(repomd_req, auth);
+                }
+                let primary_path = match repomd_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let body = resp.text().await.unwrap_or_default();
                         extract_primary_href(&body)
@@ -488,7 +497,12 @@ async fn run_curation_sync_cycle(
                 };
                 let primary_url =
                     format!("{}/{}", upstream_url.trim_end_matches('/'), primary_path);
-                match client.get(&primary_url).send().await {
+                let mut primary_req = client.get(&primary_url);
+                if let Some(ref auth) = upstream_auth {
+                    primary_req =
+                        crate::services::upstream_auth::apply_upstream_auth(primary_req, auth);
+                }
+                match primary_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let bytes = resp.bytes().await?;
                         let xml = if primary_path.ends_with(".gz") {
@@ -514,7 +528,12 @@ async fn run_curation_sync_cycle(
             }
             "debian" => {
                 let packages_url = format!("{}/Packages.gz", upstream_url.trim_end_matches('/'));
-                match client.get(&packages_url).send().await {
+                let mut packages_req = client.get(&packages_url);
+                if let Some(ref auth) = upstream_auth {
+                    packages_req =
+                        crate::services::upstream_auth::apply_upstream_auth(packages_req, auth);
+                }
+                match packages_req.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         let bytes = resp.bytes().await?;
                         use std::io::Read;
@@ -526,7 +545,13 @@ async fn run_curation_sync_cycle(
                     _ => {
                         // Fall back to uncompressed
                         let plain_url = format!("{}/Packages", upstream_url.trim_end_matches('/'));
-                        match client.get(&plain_url).send().await {
+                        let mut plain_req = client.get(&plain_url);
+                        if let Some(ref auth) = upstream_auth {
+                            plain_req = crate::services::upstream_auth::apply_upstream_auth(
+                                plain_req, auth,
+                            );
+                        }
+                        match plain_req.send().await {
                             Ok(resp) if resp.status().is_success() => {
                                 let content = resp.text().await?;
                                 curation_sync::parse_deb_packages_index(&content, "main")

@@ -165,6 +165,20 @@ pub struct CreateRepositoryRequest {
     /// the sparse index but `https://crates.io` for tarball downloads).
     /// Stored in `repository_config` under the key `index_upstream_url`.
     pub index_upstream_url: Option<String>,
+    /// Member repositories to add when creating a virtual repository.
+    /// Each entry specifies a repository key and optional priority.
+    pub member_repos: Option<Vec<CreateVirtualMemberInput>>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateVirtualMemberInput {
+    pub repo_key: String,
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+}
+
+fn default_priority() -> i32 {
+    0
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -579,7 +593,7 @@ pub async fn create_repository(
             name: payload.name,
             description: payload.description,
             format,
-            repo_type,
+            repo_type: repo_type.clone(),
             storage_backend,
             storage_path,
             upstream_url: payload.upstream_url,
@@ -591,6 +605,19 @@ pub async fn create_repository(
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
+    }
+
+    // Add virtual repository members if provided
+    if repo_type == RepositoryType::Virtual {
+        if let Some(ref member_inputs) = payload.member_repos {
+            for (idx, input) in member_inputs.iter().enumerate() {
+                let member_repo = service.get_by_key(&input.repo_key).await?;
+                let priority = resolve_member_priority(input.priority, idx);
+                service
+                    .add_virtual_member(repo.id, member_repo.id, priority)
+                    .await?;
+            }
+        }
     }
 
     state
@@ -1366,7 +1393,7 @@ pub struct VirtualMemberResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VirtualMembersListResponse {
-    pub items: Vec<VirtualMemberResponse>,
+    pub members: Vec<VirtualMemberResponse>,
 }
 
 // Row type for virtual member queries
@@ -1431,20 +1458,9 @@ pub async fn list_virtual_members(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let items = members
-        .into_iter()
-        .map(|m| VirtualMemberResponse {
-            id: m.id,
-            member_repo_id: m.member_repo_id,
-            member_repo_key: m.member_key,
-            member_repo_name: m.member_name,
-            member_repo_type: format!("{:?}", m.repo_type).to_lowercase(),
-            priority: m.priority,
-            created_at: m.created_at,
-        })
-        .collect();
+    let members = members.into_iter().map(map_member_row).collect();
 
-    Ok(Json(VirtualMembersListResponse { items }))
+    Ok(Json(VirtualMembersListResponse { members }))
 }
 
 /// Add a member to a virtual repository
@@ -1672,9 +1688,38 @@ pub async fn update_virtual_members(
         VirtualMemberPriority,
         VirtualMemberResponse,
         VirtualMembersListResponse,
+        CreateVirtualMemberInput,
     ))
 )]
 pub struct RepositoriesApiDoc;
+
+/// Resolve the effective priority for a virtual member.
+/// Uses the explicit priority if > 0, otherwise assigns a 1-based index.
+fn resolve_member_priority(explicit: i32, index: usize) -> i32 {
+    if explicit > 0 {
+        explicit
+    } else {
+        (index as i32) + 1
+    }
+}
+
+/// Convert a VirtualMemberRow into a VirtualMemberResponse.
+fn map_member_row(row: VirtualMemberRow) -> VirtualMemberResponse {
+    VirtualMemberResponse {
+        id: row.id,
+        member_repo_id: row.member_repo_id,
+        member_repo_key: row.member_key,
+        member_repo_name: row.member_name,
+        member_repo_type: format_repo_type(&row.repo_type),
+        priority: row.priority,
+        created_at: row.created_at,
+    }
+}
+
+/// Format a RepositoryType as a lowercase string for API responses.
+fn format_repo_type(repo_type: &RepositoryType) -> String {
+    format!("{:?}", repo_type).to_lowercase()
+}
 
 #[cfg(test)]
 mod tests {
@@ -2822,5 +2867,265 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"repository_key\":\"my-remote-repo\""));
         assert!(json.contains("\"cache_ttl_seconds\":7200"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Virtual repository member list response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_virtual_members_list_response_uses_members_field() {
+        let resp = VirtualMembersListResponse {
+            members: vec![VirtualMemberResponse {
+                id: Uuid::new_v4(),
+                member_repo_id: Uuid::new_v4(),
+                member_repo_key: "local-maven".to_string(),
+                member_repo_name: "Local Maven".to_string(),
+                member_repo_type: "local".to_string(),
+                priority: 1,
+                created_at: chrono::Utc::now(),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains("\"members\""),
+            "response must serialize under 'members', not 'items'"
+        );
+        assert!(
+            !json.contains("\"items\""),
+            "response must not contain 'items' key"
+        );
+        assert!(json.contains("\"member_repo_key\":\"local-maven\""));
+    }
+
+    #[test]
+    fn test_virtual_members_list_response_empty() {
+        let resp = VirtualMembersListResponse { members: vec![] };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"members":[]}"#);
+    }
+
+    #[test]
+    fn test_virtual_members_list_response_preserves_priority_order() {
+        let resp = VirtualMembersListResponse {
+            members: vec![
+                VirtualMemberResponse {
+                    id: Uuid::new_v4(),
+                    member_repo_id: Uuid::new_v4(),
+                    member_repo_key: "first".to_string(),
+                    member_repo_name: "First".to_string(),
+                    member_repo_type: "local".to_string(),
+                    priority: 1,
+                    created_at: chrono::Utc::now(),
+                },
+                VirtualMemberResponse {
+                    id: Uuid::new_v4(),
+                    member_repo_id: Uuid::new_v4(),
+                    member_repo_key: "second".to_string(),
+                    member_repo_name: "Second".to_string(),
+                    member_repo_type: "remote".to_string(),
+                    priority: 2,
+                    created_at: chrono::Utc::now(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let first_pos = json.find("\"first\"").unwrap();
+        let second_pos = json.find("\"second\"").unwrap();
+        assert!(first_pos < second_pos);
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateVirtualMemberInput
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_virtual_member_input_deserialization() {
+        let json = r#"{"repo_key": "maven-central", "priority": 5}"#;
+        let input: CreateVirtualMemberInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.repo_key, "maven-central");
+        assert_eq!(input.priority, 5);
+    }
+
+    #[test]
+    fn test_create_virtual_member_input_default_priority() {
+        let json = r#"{"repo_key": "maven-central"}"#;
+        let input: CreateVirtualMemberInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.repo_key, "maven-central");
+        assert_eq!(input.priority, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateRepositoryRequest with member_repos
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_repository_request_with_member_repos() {
+        let json = r#"{
+            "key": "maven-virtual",
+            "name": "Maven Virtual",
+            "format": "maven",
+            "repo_type": "virtual",
+            "member_repos": [
+                {"repo_key": "maven-local", "priority": 1},
+                {"repo_key": "maven-central", "priority": 2}
+            ]
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.key, "maven-virtual");
+        assert_eq!(req.repo_type, "virtual");
+        let members = req.member_repos.unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].repo_key, "maven-local");
+        assert_eq!(members[0].priority, 1);
+        assert_eq!(members[1].repo_key, "maven-central");
+        assert_eq!(members[1].priority, 2);
+    }
+
+    #[test]
+    fn test_create_repository_request_without_member_repos() {
+        let json = r#"{
+            "key": "npm-local",
+            "name": "NPM Local",
+            "format": "npm",
+            "repo_type": "local"
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert!(req.member_repos.is_none());
+    }
+
+    #[test]
+    fn test_create_repository_request_empty_member_repos() {
+        let json = r#"{
+            "key": "maven-virtual",
+            "name": "Maven Virtual",
+            "format": "maven",
+            "repo_type": "virtual",
+            "member_repos": []
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        let members = req.member_repos.unwrap();
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn test_create_repository_request_member_repos_default_priority() {
+        let json = r#"{
+            "key": "maven-virtual",
+            "name": "Maven Virtual",
+            "format": "maven",
+            "repo_type": "virtual",
+            "member_repos": [
+                {"repo_key": "maven-local"}
+            ]
+        }"#;
+        let req: CreateRepositoryRequest = serde_json::from_str(json).unwrap();
+        let members = req.member_repos.unwrap();
+        assert_eq!(members[0].priority, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_member_priority
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_member_priority_explicit() {
+        assert_eq!(resolve_member_priority(5, 0), 5);
+        assert_eq!(resolve_member_priority(10, 3), 10);
+    }
+
+    #[test]
+    fn test_resolve_member_priority_zero_uses_index() {
+        assert_eq!(resolve_member_priority(0, 0), 1);
+        assert_eq!(resolve_member_priority(0, 1), 2);
+        assert_eq!(resolve_member_priority(0, 4), 5);
+    }
+
+    #[test]
+    fn test_resolve_member_priority_negative_uses_index() {
+        assert_eq!(resolve_member_priority(-1, 0), 1);
+        assert_eq!(resolve_member_priority(-5, 2), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_repo_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_repo_type_local() {
+        assert_eq!(format_repo_type(&RepositoryType::Local), "local");
+    }
+
+    #[test]
+    fn test_format_repo_type_remote() {
+        assert_eq!(format_repo_type(&RepositoryType::Remote), "remote");
+    }
+
+    #[test]
+    fn test_format_repo_type_virtual() {
+        assert_eq!(format_repo_type(&RepositoryType::Virtual), "virtual");
+    }
+
+    #[test]
+    fn test_format_repo_type_staging() {
+        assert_eq!(format_repo_type(&RepositoryType::Staging), "staging");
+    }
+
+    // -----------------------------------------------------------------------
+    // map_member_row
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_member_row_local() {
+        let id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let row = VirtualMemberRow {
+            id,
+            member_repo_id: member_id,
+            priority: 3,
+            created_at: now,
+            member_key: "maven-local".to_string(),
+            member_name: "Maven Local".to_string(),
+            repo_type: RepositoryType::Local,
+        };
+        let resp = map_member_row(row);
+        assert_eq!(resp.id, id);
+        assert_eq!(resp.member_repo_id, member_id);
+        assert_eq!(resp.member_repo_key, "maven-local");
+        assert_eq!(resp.member_repo_name, "Maven Local");
+        assert_eq!(resp.member_repo_type, "local");
+        assert_eq!(resp.priority, 3);
+        assert_eq!(resp.created_at, now);
+    }
+
+    #[test]
+    fn test_map_member_row_remote() {
+        let row = VirtualMemberRow {
+            id: Uuid::new_v4(),
+            member_repo_id: Uuid::new_v4(),
+            priority: 1,
+            created_at: chrono::Utc::now(),
+            member_key: "maven-central".to_string(),
+            member_name: "Maven Central".to_string(),
+            repo_type: RepositoryType::Remote,
+        };
+        let resp = map_member_row(row);
+        assert_eq!(resp.member_repo_type, "remote");
+        assert_eq!(resp.member_repo_key, "maven-central");
+    }
+
+    #[test]
+    fn test_map_member_row_preserves_priority() {
+        let row = VirtualMemberRow {
+            id: Uuid::new_v4(),
+            member_repo_id: Uuid::new_v4(),
+            priority: 42,
+            created_at: chrono::Utc::now(),
+            member_key: "r".to_string(),
+            member_name: "R".to_string(),
+            repo_type: RepositoryType::Local,
+        };
+        assert_eq!(map_member_row(row).priority, 42);
     }
 }
