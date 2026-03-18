@@ -493,8 +493,8 @@ echo "  [4.6] Virtual member listing API..."
 MEMBERS_CODE=$(curl -s -o "$TMPDIR_TEST/members.json" -w "%{http_code}" \
     "$API_URL/repositories/npm-virtual/members" -H "$AUTH")
 if [ "$MEMBERS_CODE" = "200" ]; then
-    # Response format: {"items": [...], "total": N}
-    MEMBER_COUNT=$(jq '.items | length // 0' "$TMPDIR_TEST/members.json" 2>/dev/null || echo "0")
+    # Response format: {"members": [...]}
+    MEMBER_COUNT=$(jq '.members | length // 0' "$TMPDIR_TEST/members.json" 2>/dev/null || echo "0")
     if [ "$MEMBER_COUNT" -ge 2 ]; then
         pass "Virtual member listing: npm-virtual has $MEMBER_COUNT members"
     else
