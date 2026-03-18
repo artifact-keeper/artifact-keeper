@@ -274,6 +274,13 @@ services:
         condition: service_started
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+      # Clear any proxy env vars inherited from the Docker daemon config.
+      # When the daemon is configured with an HTTP proxy (common in
+      # enterprise networks), those vars are injected into all containers.
+      # Caddy (a Go app) honours them and would try to route reverse-proxy
+      # traffic to sibling containers through the external proxy, which
+      # breaks inter-container communication.
+      # See: https://docs.docker.com/engine/daemon/proxy/
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       http_proxy: ""
