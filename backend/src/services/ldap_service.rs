@@ -477,15 +477,24 @@ impl LdapService {
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
             .await
-            .map_err(|e| AppError::Authentication(format!("LDAP connection failed: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(url = %self.config.url, error = %e, "LDAP connection failed");
+                AppError::Internal(format!("LDAP connection failed: {e}"))
+            })?;
 
         ldap3::drive!(conn);
 
         ldap.simple_bind(bind_dn, bind_password)
             .await
-            .map_err(|e| AppError::Authentication(format!("LDAP bind failed: {e}")))?
+            .map_err(|e| {
+                tracing::error!(bind_dn = %bind_dn, error = %e, "LDAP bind request failed");
+                AppError::Authentication("Invalid credentials".into())
+            })?
             .success()
-            .map_err(|e| AppError::Authentication(format!("LDAP bind failed: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(bind_dn = %bind_dn, error = %e, "LDAP bind rejected");
+                AppError::Authentication("Invalid credentials".into())
+            })?;
 
         Ok(ldap)
     }
@@ -571,8 +580,8 @@ impl LdapService {
         let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
             (Some(dn), Some(pw)) => (dn, pw),
             _ => {
-                return Err(AppError::Authentication(
-                    "LDAP bind_dn and bind_password are required for search-then-bind".into(),
+                return Err(AppError::Internal(
+                    "LDAP service account not configured for search-then-bind".into(),
                 ))
             }
         };
@@ -585,9 +594,15 @@ impl LdapService {
         let (results, _) = ldap
             .search(&self.config.base_dn, Scope::Subtree, &search_filter, attrs)
             .await
-            .map_err(|e| AppError::Authentication(format!("LDAP search failed: {e}")))?
+            .map_err(|e| {
+                tracing::error!(base_dn = %self.config.base_dn, filter = %search_filter, error = %e, "LDAP search request failed");
+                AppError::Internal(format!("LDAP search failed: {e}"))
+            })?
             .success()
-            .map_err(|e| AppError::Authentication(format!("LDAP search failed: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(base_dn = %self.config.base_dn, filter = %search_filter, error = %e, "LDAP search rejected");
+                AppError::Internal(format!("LDAP search failed: {e}"))
+            })?;
 
         ldap.unbind().await.ok();
 
