@@ -1644,4 +1644,79 @@ mod tests {
         assert!(info.display_name.is_none());
         assert!(info.groups.is_empty());
     }
+
+    // --- build_search_filter sanitization tests (PR #470 coverage) ---
+
+    #[tokio::test]
+    async fn test_build_search_filter_sanitizes_special_chars() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // Asterisk, parens, and null byte should all be escaped by the
+        // internal sanitize_ldap_input call inside build_search_filter.
+        let filter = svc.build_search_filter("user*(\0)");
+        assert_eq!(filter, "(uid=user\\2a\\28\\00\\29)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_with_zero_placeholder_sanitizes() {
+        let mut config = make_test_ldap_config();
+        config.user_filter = "(sAMAccountName={0})".to_string();
+        let svc = make_test_service(config);
+        let filter = svc.build_search_filter("evil*user");
+        assert_eq!(filter, "(sAMAccountName=evil\\2auser)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_both_placeholders_sanitized() {
+        let mut config = make_test_ldap_config();
+        config.user_filter = "(|(uid={username})(cn={0}))".to_string();
+        let svc = make_test_service(config);
+        let filter = svc.build_search_filter("bad(user)");
+        assert_eq!(filter, "(|(uid=bad\\28user\\29)(cn=bad\\28user\\29))");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_normal_chars_unchanged() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // Dots, @, hyphens, and underscores are not LDAP special chars
+        // and should pass through without escaping.
+        let filter = svc.build_search_filter("john.doe@example.com");
+        assert_eq!(filter, "(uid=john.doe@example.com)");
+    }
+
+    #[tokio::test]
+    async fn test_auth_timeout_constant() {
+        assert_eq!(
+            LdapService::AUTH_TIMEOUT,
+            std::time::Duration::from_secs(15)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_backslash_in_domain_prefix() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // A Windows-style domain login like CORP\jdoe should have the
+        // backslash escaped to \5c in the resulting LDAP filter.
+        let filter = svc.build_search_filter("CORP\\jdoe");
+        assert_eq!(filter, "(uid=CORP\\5cjdoe)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_null_byte() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        let filter = svc.build_search_filter("admin\0extra");
+        assert_eq!(filter, "(uid=admin\\00extra)");
+    }
+
+    #[tokio::test]
+    async fn test_build_search_filter_parentheses_injection() {
+        let config = make_test_ldap_config();
+        let svc = make_test_service(config);
+        // An LDAP injection attempt: )(uid=*)( should be fully escaped.
+        let filter = svc.build_search_filter(")(uid=*)(");
+        assert_eq!(filter, "(uid=\\29\\28uid=\\2a\\29\\28)");
+    }
 }
