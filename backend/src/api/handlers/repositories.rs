@@ -1705,6 +1705,24 @@ pub struct UpstreamAuthRequest {
     pub password: Option<String>,
 }
 
+/// Load a remote repository by key, verifying auth and repo type.
+/// Returns an error if the repo is not a remote repository.
+async fn load_remote_repo(
+    state: &SharedState,
+    auth: &AuthExtension,
+    key: &str,
+) -> Result<crate::models::repository::Repository> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(key).await?;
+    require_repo_access(auth, repo.id)?;
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "This operation is only valid for remote repositories".to_string(),
+        ));
+    }
+    Ok(repo)
+}
+
 /// Set or remove upstream auth for a remote repository
 #[utoipa::path(
     put,
@@ -1731,16 +1749,7 @@ pub async fn set_upstream_auth(
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
-
-    let service = RepositoryService::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
-
-    if repo.repo_type != RepositoryType::Remote {
-        return Err(AppError::Validation(
-            "Upstream auth is only valid for remote repositories".to_string(),
-        ));
-    }
+    let repo = load_remote_repo(&state, &auth, &key).await?;
 
     if payload.auth_type == "none" {
         crate::services::upstream_auth::remove_upstream_auth(&state.db, repo.id).await?;
@@ -1793,16 +1802,7 @@ pub async fn test_upstream(
 ) -> Result<Json<serde_json::Value>> {
     let auth = require_auth(auth)?;
     auth.require_scope("read")?;
-
-    let service = RepositoryService::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
-
-    if repo.repo_type != RepositoryType::Remote {
-        return Err(AppError::Validation(
-            "Only remote repositories have an upstream URL".to_string(),
-        ));
-    }
+    let repo = load_remote_repo(&state, &auth, &key).await?;
 
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
         AppError::Validation("Repository has no upstream URL configured".to_string())

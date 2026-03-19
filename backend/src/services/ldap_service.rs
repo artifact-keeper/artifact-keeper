@@ -918,59 +918,65 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_build_conn_settings_no_tls() {
-        let config = make_test_ldap_config();
+    /// Build conn settings from a config, asserting success or failure.
+    fn assert_conn_settings_ok(config: LdapConfig) {
         let svc = make_test_service(config);
         assert!(svc.build_conn_settings().is_ok());
+    }
+
+    fn assert_conn_settings_err(config: LdapConfig, expected_msg: &str) {
+        let svc = make_test_service(config);
+        let result = svc.build_conn_settings();
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains(expected_msg),
+                "expected error containing '{expected_msg}', got: {e}"
+            ),
+            Ok(_) => panic!("expected error containing '{expected_msg}'"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_conn_settings_no_tls() {
+        assert_conn_settings_ok(make_test_ldap_config());
     }
 
     #[tokio::test]
     async fn test_build_conn_settings_with_insecure_tls() {
         let mut config = make_test_ldap_config();
         config.no_tls_verify = true;
-        let svc = make_test_service(config);
-        assert!(svc.build_conn_settings().is_ok());
+        assert_conn_settings_ok(config);
     }
 
     #[tokio::test]
     async fn test_build_conn_settings_missing_ca_file() {
         let mut config = make_test_ldap_config();
         config.ca_cert_path = Some("/nonexistent/ca.pem".to_string());
-        let svc = make_test_service(config);
-        let result = svc.build_conn_settings();
-        assert!(result.is_err());
-        match result {
-            Err(e) => assert!(e.to_string().contains("Failed to read LDAP CA cert")),
-            Ok(_) => panic!("expected error for missing CA file"),
-        }
+        assert_conn_settings_err(config, "Failed to read LDAP CA cert");
     }
 
     #[tokio::test]
     async fn test_build_conn_settings_with_valid_ca() {
-        let pem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem");
         let mut config = make_test_ldap_config();
-        config.ca_cert_path = Some(pem_path.to_string());
-        let svc = make_test_service(config);
-        assert!(svc.build_conn_settings().is_ok());
+        config.ca_cert_path =
+            Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem").to_string());
+        assert_conn_settings_ok(config);
     }
 
     #[tokio::test]
     async fn test_build_conn_settings_with_starttls() {
         let mut config = make_test_ldap_config();
         config.use_starttls = true;
-        let svc = make_test_service(config);
-        assert!(svc.build_conn_settings().is_ok());
+        assert_conn_settings_ok(config);
     }
 
     #[tokio::test]
     async fn test_build_conn_settings_ca_plus_insecure() {
-        let pem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem");
         let mut config = make_test_ldap_config();
-        config.ca_cert_path = Some(pem_path.to_string());
+        config.ca_cert_path =
+            Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-ca.pem").to_string());
         config.no_tls_verify = true;
-        let svc = make_test_service(config);
-        assert!(svc.build_conn_settings().is_ok());
+        assert_conn_settings_ok(config);
     }
 
     #[test]
