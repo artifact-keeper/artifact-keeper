@@ -72,6 +72,7 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           if [[ -z "$SONAR_TOKEN" ]]; then
             echo "SONAR_TOKEN not configured. Skipping."
@@ -83,11 +84,44 @@ jobs:
             "https://sonarcloud.io/api/qualitygates/project_status?projectKey=artifact-keeper_artifact-keeper&pullRequest=${PR_NUMBER}")
           GATE_STATUS=$(echo "$GATE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['projectStatus']['status'])" 2>/dev/null || echo "NONE")
           echo "Quality gate status from API: $GATE_STATUS"
+
+          # Check if the existing analysis matches the current PR HEAD.
+          # For fork PRs, the CI job skips SonarCloud (no token), so the
+          # analysis may be stale from a previous commit. Detect this by
+          # comparing the analysis revision to the workflow_run HEAD SHA.
+          if [[ "$GATE_STATUS" != "NONE" && "$GATE_STATUS" != "skipped" ]]; then
+            ANALYSIS_REV=$(echo "$GATE_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          conditions = data.get('projectStatus', {})
+          # The revision is not in qualitygates API; check activity API instead.
+          print('check_activity')
+          " 2>/dev/null || echo "check_activity")
+
+            # Query the project activity for the latest PR analysis revision.
+            ACTIVITY_JSON=$(curl -s -u "${SONAR_TOKEN}:" \
+              "https://sonarcloud.io/api/project_analyses/search?project=artifact-keeper_artifact-keeper&category=&ps=1&pullRequest=${PR_NUMBER}")
+            ANALYSIS_REVISION=$(echo "$ACTIVITY_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          analyses = data.get('analyses', [])
+          print(analyses[0].get('revision', '') if analyses else '')
+          " 2>/dev/null || echo "")
+
+            echo "Analysis revision: $ANALYSIS_REVISION"
+            echo "Current HEAD SHA:  $HEAD_SHA"
+
+            if [[ -n "$ANALYSIS_REVISION" && "$ANALYSIS_REVISION" != "$HEAD_SHA" ]]; then
+              echo "Analysis is stale (from a different commit). Will rescan."
+              GATE_STATUS="NONE"
+            fi
+          fi
+
           echo "status=$GATE_STATUS" >> "$GITHUB_OUTPUT"
 
-      # For fork PRs (or when analysis is missing): download coverage and run scan.
-      # Fetches source via git CLI in a run block (not actions/checkout) to avoid
-      # CodeQL's untrusted-checkout flag on workflow_run privileged contexts.
+      # For fork PRs (or when analysis is missing/stale): download coverage and
+      # run scan. Fetches source via git CLI in a run block (not actions/checkout)
+      # to avoid CodeQL's untrusted-checkout flag on workflow_run privileged contexts.
       - name: Fetch PR source
         if: steps.check.outputs.status == 'NONE'
         env:
