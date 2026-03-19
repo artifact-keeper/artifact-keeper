@@ -111,8 +111,8 @@ jobs:
             echo "Analysis revision: $ANALYSIS_REVISION"
             echo "Current HEAD SHA:  $HEAD_SHA"
 
-            if [[ -n "$ANALYSIS_REVISION" && "$ANALYSIS_REVISION" != "$HEAD_SHA" ]]; then
-              echo "Analysis is stale (from a different commit). Will rescan."
+            if [[ -z "$ANALYSIS_REVISION" || "$ANALYSIS_REVISION" != "$HEAD_SHA" ]]; then
+              echo "Analysis is stale or missing revision (from a different commit). Will rescan."
               GATE_STATUS="NONE"
             fi
           fi
