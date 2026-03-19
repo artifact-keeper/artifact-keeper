@@ -161,7 +161,9 @@ impl LdapService {
     pub fn new(db: PgPool, app_config: Arc<Config>) -> Result<Self> {
         let config = LdapConfig::from_config(&app_config)
             .ok_or_else(|| AppError::Config("LDAP configuration not set".into()))?;
-
+        if config.no_tls_verify {
+            tracing::warn!("LDAP TLS verification is disabled (LDAP_INSECURE_TLS=true). Do not use in production.");
+        }
         Ok(Self {
             db,
             config,
@@ -211,6 +213,9 @@ impl LdapService {
 
     /// Create LDAP service from explicit config
     pub fn with_config(db: PgPool, config: LdapConfig) -> Self {
+        if config.no_tls_verify {
+            tracing::warn!("LDAP TLS verification is disabled (LDAP_INSECURE_TLS=true). Do not use in production.");
+        }
         Self {
             db,
             config,
@@ -256,6 +261,7 @@ impl LdapService {
                     .await?;
                 Ok(user_info)
             } else {
+                tracing::debug!(username = %username, "Using direct-bind fallback (no service account configured)");
                 self.validate_ldap_credentials(username, password).await?;
                 self.get_user_info(username, username).await
             }
@@ -496,6 +502,8 @@ impl LdapService {
     async fn connect_and_bind(&self, bind_dn: &str, bind_password: &str) -> Result<ldap3::Ldap> {
         use ldap3::LdapConnAsync;
 
+        tracing::debug!(url = %self.config.url, bind_dn = %bind_dn, "Connecting to LDAP server");
+
         let settings = self.build_conn_settings()?;
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
@@ -509,6 +517,8 @@ impl LdapService {
             .map_err(Self::bind_error)?
             .success()
             .map_err(Self::bind_error)?;
+
+        tracing::debug!("LDAP bind successful");
 
         Ok(ldap)
     }
@@ -592,6 +602,8 @@ impl LdapService {
     async fn search_user_entry(&self, username: &str) -> Result<LdapUserInfo> {
         use ldap3::{Scope, SearchEntry};
 
+        tracing::debug!(username = %username, "Searching for user in LDAP");
+
         let (bind_dn, bind_pw) = match (&self.config.bind_dn, &self.config.bind_password) {
             (Some(dn), Some(pw)) => (dn, pw),
             _ => {
@@ -621,6 +633,8 @@ impl LdapService {
             .ok_or_else(|| AppError::Authentication("User not found in LDAP".into()))?;
 
         let entry = SearchEntry::construct(entry);
+
+        tracing::debug!(username = %username, dn = %entry.dn, "LDAP user found");
 
         Ok(self.extract_user_from_entry(entry, username))
     }
