@@ -154,15 +154,21 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
                     status: "healthy".to_string(),
                     message: None,
                 }),
-                Err(e) => Some(CheckStatus {
-                    status: "unhealthy".to_string(),
-                    message: Some(e.to_string()),
-                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "LDAP health check failed");
+                    Some(CheckStatus {
+                        status: "unhealthy".to_string(),
+                        message: Some("LDAP server unreachable".to_string()),
+                    })
+                }
             },
-            Err(e) => Some(CheckStatus {
-                status: "unhealthy".to_string(),
-                message: Some(format!("LDAP config error: {e}")),
-            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "LDAP configuration error");
+                Some(CheckStatus {
+                    status: "unhealthy".to_string(),
+                    message: Some("LDAP configuration error".to_string()),
+                })
+            }
         }
     } else {
         None
