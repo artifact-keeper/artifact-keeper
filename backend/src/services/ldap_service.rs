@@ -136,6 +136,27 @@ pub struct LdapService {
 impl LdapService {
     const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+    /// Classify an LDAP connection error as an internal server error.
+    fn connection_error(e: impl std::fmt::Display) -> AppError {
+        tracing::error!(error = %e, "LDAP connection failed");
+        AppError::Internal(format!("LDAP connection failed: {e}"))
+    }
+
+    /// Classify an LDAP bind rejection as an authentication error.
+    ///
+    /// The original error is logged but never exposed to the caller,
+    /// preventing credential or server details from leaking.
+    fn bind_error(e: impl std::fmt::Display) -> AppError {
+        tracing::error!(error = %e, "LDAP bind failed");
+        AppError::Authentication("Invalid credentials".into())
+    }
+
+    /// Classify an LDAP search failure as an internal server error.
+    fn search_error(e: impl std::fmt::Display) -> AppError {
+        tracing::error!(error = %e, "LDAP search failed");
+        AppError::Internal(format!("LDAP search failed: {e}"))
+    }
+
     /// Create a new LDAP service
     pub fn new(db: PgPool, app_config: Arc<Config>) -> Result<Self> {
         let config = LdapConfig::from_config(&app_config)
@@ -479,24 +500,15 @@ impl LdapService {
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.config.url)
             .await
-            .map_err(|e| {
-                tracing::error!(url = %self.config.url, error = %e, "LDAP connection failed");
-                AppError::Internal(format!("LDAP connection failed: {e}"))
-            })?;
+            .map_err(Self::connection_error)?;
 
         ldap3::drive!(conn);
 
         ldap.simple_bind(bind_dn, bind_password)
             .await
-            .map_err(|e| {
-                tracing::error!(bind_dn = %bind_dn, error = %e, "LDAP bind request failed");
-                AppError::Authentication("Invalid credentials".into())
-            })?
+            .map_err(Self::bind_error)?
             .success()
-            .map_err(|e| {
-                tracing::error!(bind_dn = %bind_dn, error = %e, "LDAP bind rejected");
-                AppError::Authentication("Invalid credentials".into())
-            })?;
+            .map_err(Self::bind_error)?;
 
         Ok(ldap)
     }
@@ -597,15 +609,9 @@ impl LdapService {
         let (results, _) = ldap
             .search(&self.config.base_dn, Scope::Subtree, &search_filter, attrs)
             .await
-            .map_err(|e| {
-                tracing::error!(base_dn = %self.config.base_dn, filter = %search_filter, error = %e, "LDAP search request failed");
-                AppError::Internal(format!("LDAP search failed: {e}"))
-            })?
+            .map_err(Self::search_error)?
             .success()
-            .map_err(|e| {
-                tracing::error!(base_dn = %self.config.base_dn, filter = %search_filter, error = %e, "LDAP search rejected");
-                AppError::Internal(format!("LDAP search failed: {e}"))
-            })?;
+            .map_err(Self::search_error)?;
 
         ldap.unbind().await.ok();
 
@@ -1718,5 +1724,56 @@ mod tests {
         // An LDAP injection attempt: )(uid=*)( should be fully escaped.
         let filter = svc.build_search_filter(")(uid=*)(");
         assert_eq!(filter, "(uid=\\29\\28uid=\\2a\\29\\28)");
+    }
+
+    // --- error classification helper tests ---
+
+    #[tokio::test]
+    async fn test_connection_error_returns_internal() {
+        let err = LdapService::connection_error("test connection failure");
+        match err {
+            AppError::Internal(msg) => assert!(msg.contains("LDAP connection failed")),
+            other => panic!("expected Internal, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_error_returns_authentication() {
+        let err = LdapService::bind_error("test bind failure");
+        match err {
+            AppError::Authentication(msg) => assert_eq!(msg, "Invalid credentials"),
+            other => panic!("expected Authentication, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_error_returns_internal() {
+        let err = LdapService::search_error("test search failure");
+        match err {
+            AppError::Internal(msg) => assert!(msg.contains("LDAP search failed")),
+            other => panic!("expected Internal, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bind_error_does_not_leak_details() {
+        let err = LdapService::bind_error("secret LDAP server ldap://10.0.0.1 DN cn=admin");
+        match err {
+            AppError::Authentication(msg) => {
+                assert_eq!(msg, "Invalid credentials");
+                assert!(!msg.contains("ldap://"));
+                assert!(!msg.contains("cn=admin"));
+            }
+            other => panic!("expected Authentication, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_error_includes_detail_for_logging() {
+        let err = LdapService::connection_error("io error: Connection refused");
+        match err {
+            AppError::Internal(msg) => assert!(msg.contains("Connection refused")),
+            other => panic!("expected Internal, got {:?}", other),
+        }
     }
 }
