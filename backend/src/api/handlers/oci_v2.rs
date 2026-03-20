@@ -241,6 +241,32 @@ async fn try_upstream_fetch(
         .ok()
 }
 
+/// Build an OCI registry response from proxied upstream content.
+///
+/// Used by both blob and manifest proxy handlers to avoid duplicating the
+/// response-building logic across HEAD and GET variants.
+fn build_oci_proxy_response(
+    content: &Bytes,
+    content_type: Option<String>,
+    digest: &str,
+    default_ct: &str,
+    include_body: bool,
+) -> Response {
+    let ct = content_type.unwrap_or_else(|| default_ct.to_string());
+    let body = if include_body {
+        Body::from(content.clone())
+    } else {
+        Body::empty()
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Docker-Content-Digest", digest)
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .header(CONTENT_TYPE, ct)
+        .body(body)
+        .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Token endpoint
 // ---------------------------------------------------------------------------
@@ -486,16 +512,10 @@ async fn handle_head_blob(
     }
 
     // For remote repos, try fetching blob from upstream
-    if let Some((content, _ct)) =
+    if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
     {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Docker-Content-Digest", digest)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(Body::empty())
-            .unwrap();
+        return build_oci_proxy_response(&content, ct, digest, "application/octet-stream", false);
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -561,17 +581,10 @@ async fn handle_get_blob(
     }
 
     // For remote repos, try fetching blob from upstream
-    if let Some((content, content_type)) =
+    if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
     {
-        let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Docker-Content-Digest", digest)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .header(CONTENT_TYPE, ct)
-            .body(Body::from(content))
-            .unwrap();
+        return build_oci_proxy_response(&content, ct, digest, "application/octet-stream", true);
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -1007,19 +1020,17 @@ async fn handle_head_manifest(
     }
 
     // For remote repos, try fetching manifest from upstream
-    if let Some((content, content_type)) =
+    if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
     {
         let digest = compute_sha256(&content);
-        let ct = content_type
-            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Docker-Content-Digest", digest)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .header(CONTENT_TYPE, ct)
-            .body(Body::empty())
-            .unwrap();
+        return build_oci_proxy_response(
+            &content,
+            ct,
+            &digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            false,
+        );
     }
 
     oci_error(
@@ -1094,19 +1105,17 @@ async fn handle_get_manifest(
     }
 
     // For remote repos, try fetching manifest from upstream
-    if let Some((content, content_type)) =
+    if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
     {
         let digest = compute_sha256(&content);
-        let ct = content_type
-            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("Docker-Content-Digest", digest)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .header(CONTENT_TYPE, ct)
-            .body(Body::from(content))
-            .unwrap();
+        return build_oci_proxy_response(
+            &content,
+            ct,
+            &digest,
+            "application/vnd.oci.image.manifest.v1+json",
+            true,
+        );
     }
 
     oci_error(
@@ -1423,6 +1432,69 @@ mod tests {
     fn test_oci_error_internal() {
         let resp = oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "oops");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_oci_proxy_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_oci_proxy_response_head() {
+        let content = Bytes::from("hello");
+        let resp = build_oci_proxy_response(
+            &content,
+            None,
+            "sha256:abc",
+            "application/octet-stream",
+            false,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Docker-Content-Digest").unwrap(),
+            "sha256:abc"
+        );
+        assert_eq!(resp.headers().get(CONTENT_LENGTH).unwrap(), "5");
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_build_oci_proxy_response_get_with_custom_ct() {
+        let content = Bytes::from("{\"schemaVersion\":2}");
+        let resp = build_oci_proxy_response(
+            &content,
+            Some("application/vnd.docker.distribution.manifest.v2+json".to_string()),
+            "sha256:def",
+            "application/vnd.oci.image.manifest.v1+json",
+            true,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/vnd.docker.distribution.manifest.v2+json"
+        );
+        assert_eq!(
+            resp.headers().get(CONTENT_LENGTH).unwrap(),
+            content.len().to_string().as_str()
+        );
+    }
+
+    #[test]
+    fn test_build_oci_proxy_response_uses_default_ct_when_none() {
+        let content = Bytes::from("data");
+        let resp = build_oci_proxy_response(
+            &content,
+            None,
+            "sha256:000",
+            "application/vnd.oci.image.manifest.v1+json",
+            true,
+        );
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/vnd.oci.image.manifest.v1+json"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1975,19 +2047,33 @@ mod tests {
     // OciRepoInfo
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_oci_repo_info_remote_type() {
-        let info = OciRepoInfo {
+    fn make_repo_info(
+        key: &str,
+        repo_type: &str,
+        upstream_url: Option<&str>,
+        image: &str,
+    ) -> OciRepoInfo {
+        OciRepoInfo {
             id: Uuid::new_v4(),
-            key: "docker-hub".to_string(),
+            key: key.to_string(),
             location: crate::storage::StorageLocation {
                 backend: "filesystem".to_string(),
                 path: "/data/docker".to_string(),
             },
-            repo_type: "remote".to_string(),
-            upstream_url: Some("https://registry-1.docker.io".to_string()),
-            image: "library/nginx".to_string(),
-        };
+            repo_type: repo_type.to_string(),
+            upstream_url: upstream_url.map(String::from),
+            image: image.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_oci_repo_info_remote_type() {
+        let info = make_repo_info(
+            "docker-hub",
+            "remote",
+            Some("https://registry-1.docker.io"),
+            "library/nginx",
+        );
         assert_eq!(info.repo_type, RepositoryType::Remote);
         assert_eq!(
             info.upstream_url.as_deref(),
@@ -1998,17 +2084,7 @@ mod tests {
 
     #[test]
     fn test_oci_repo_info_local_type() {
-        let info = OciRepoInfo {
-            id: Uuid::new_v4(),
-            key: "docker-local".to_string(),
-            location: crate::storage::StorageLocation {
-                backend: "filesystem".to_string(),
-                path: "/data/docker".to_string(),
-            },
-            repo_type: "local".to_string(),
-            upstream_url: None,
-            image: "myapp".to_string(),
-        };
+        let info = make_repo_info("docker-local", "local", None, "myapp");
         assert_ne!(info.repo_type, RepositoryType::Remote);
         assert!(info.upstream_url.is_none());
     }
