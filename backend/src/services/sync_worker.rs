@@ -152,6 +152,19 @@ struct TaskRow {
 /// If the local peer instance is known and scored peers are available for the
 /// artifact, returns the highest-scoring peer's endpoint URL and API key.
 /// Otherwise returns `None`, signalling the caller to use the task's default peer.
+/// Pick the best peer from a list of scored peers.
+///
+/// Returns the peer with the highest score, or `None` if the list is empty.
+fn pick_best_peer(
+    scored: &[crate::services::peer_service::ScoredPeer],
+) -> Option<&crate::services::peer_service::ScoredPeer> {
+    scored.iter().max_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
 async fn resolve_scored_peer(
     db: &PgPool,
     local_peer_id: Option<Uuid>,
@@ -177,11 +190,7 @@ async fn resolve_scored_peer(
     };
 
     // Pick the peer with the highest score.
-    let best = scored.iter().max_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })?;
+    let best = pick_best_peer(&scored)?;
 
     // Look up the API key for the scored peer.
     let api_key: Option<String> =
@@ -1632,5 +1641,66 @@ mod tests {
         let msg = format_stale_detection_log(100, 5);
         assert!(msg.is_some());
         assert!(msg.unwrap().contains("100 stale peer(s)"));
+    }
+
+    // ── pick_best_peer ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pick_best_peer_returns_highest_score() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let peers = vec![
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer1".to_string(),
+                latency_ms: Some(100),
+                bandwidth_estimate_bps: Some(1_000_000),
+                available_chunks: 5,
+                score: 50.0,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer2".to_string(),
+                latency_ms: Some(50),
+                bandwidth_estimate_bps: Some(2_000_000),
+                available_chunks: 10,
+                score: 200.0,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer3".to_string(),
+                latency_ms: Some(200),
+                bandwidth_estimate_bps: Some(500_000),
+                available_chunks: 3,
+                score: 7.5,
+            },
+        ];
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.endpoint_url, "http://peer2");
+        assert!((best.score - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pick_best_peer_empty_returns_none() {
+        let peers: Vec<crate::services::peer_service::ScoredPeer> = vec![];
+        assert!(pick_best_peer(&peers).is_none());
+    }
+
+    #[test]
+    fn test_pick_best_peer_single_peer() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let peers = vec![ScoredPeer {
+            node_id: Uuid::new_v4(),
+            endpoint_url: "http://only-peer".to_string(),
+            latency_ms: Some(100),
+            bandwidth_estimate_bps: Some(1_000_000),
+            available_chunks: 1,
+            score: 10.0,
+        }];
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.endpoint_url, "http://only-peer");
     }
 }
