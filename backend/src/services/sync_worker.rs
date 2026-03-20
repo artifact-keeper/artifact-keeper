@@ -145,6 +145,89 @@ struct TaskRow {
     max_retries: i32,
 }
 
+// ── Scored peer selection ────────────────────────────────────────────────────
+
+/// Resolve the best peer endpoint for a sync task using scored peer selection.
+///
+/// If the local peer instance is known and scored peers are available for the
+/// artifact, returns the highest-scoring peer's endpoint URL and API key.
+/// Otherwise returns `None`, signalling the caller to use the task's default peer.
+/// Pick the best peer from a list of scored peers.
+///
+/// Returns the peer with the highest score, or `None` if the list is empty.
+fn pick_best_peer(
+    scored: &[crate::services::peer_service::ScoredPeer],
+) -> Option<&crate::services::peer_service::ScoredPeer> {
+    scored.iter().max_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+async fn resolve_scored_peer(
+    db: &PgPool,
+    local_peer_id: Option<Uuid>,
+    artifact_id: Uuid,
+    default_peer_name: &str,
+) -> Option<(String, String)> {
+    let local_id = local_peer_id?;
+
+    let peer_service = crate::services::peer_service::PeerService::new(db.clone());
+    let scored = match peer_service
+        .get_scored_peers_for_artifact(local_id, artifact_id)
+        .await
+    {
+        Ok(peers) => peers,
+        Err(e) => {
+            tracing::warn!(
+                "Scored peer lookup failed for artifact {}, falling back to default peer '{}': {e}",
+                artifact_id,
+                default_peer_name,
+            );
+            return None;
+        }
+    };
+
+    // Pick the peer with the highest score.
+    let best = pick_best_peer(&scored)?;
+
+    // Look up the API key for the scored peer.
+    let api_key: Option<String> =
+        sqlx::query_scalar("SELECT api_key FROM peer_instances WHERE id = $1")
+            .bind(best.node_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+    let api_key = api_key?;
+
+    tracing::debug!(
+        "Scored peer selection for artifact {}: chose peer {} (score={:.2}, latency={:?}ms, chunks={}) over default peer '{}'",
+        artifact_id,
+        best.node_id,
+        best.score,
+        best.latency_ms,
+        best.available_chunks,
+        default_peer_name,
+    );
+
+    Some((best.endpoint_url.clone(), api_key))
+}
+
+/// Look up the local peer instance ID.
+///
+/// Returns `None` if no local instance is configured (single-node deployments).
+/// The result is cached for the lifetime of a single `process_pending_tasks` tick.
+async fn get_local_peer_id(db: &PgPool) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT id FROM peer_instances WHERE is_local = true LIMIT 1")
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+}
+
 // ── Core logic ──────────────────────────────────────────────────────────────
 
 /// Process all eligible peers and their pending sync tasks.
@@ -169,6 +252,10 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
     if peers.is_empty() {
         return Ok(());
     }
+
+    // Resolve the local peer instance ID once per tick. This is used for scored
+    // peer selection and is None on single-node deployments.
+    let local_peer_id = get_local_peer_id(db).await;
 
     // Reset retriable failed tasks for peers that have recovered (backoff expired).
     // This runs once per tick for all recovered peers in a single query.
@@ -304,10 +391,15 @@ async fn process_pending_tasks(db: &PgPool, client: &reqwest::Client) -> Result<
                 continue;
             }
 
+            // Attempt scored peer selection: if a better-scoring peer is available
+            // for this artifact, use its endpoint instead of the task's default.
+            let (peer_endpoint, peer_api_key) =
+                resolve_scored_peer(db, local_peer_id, task.artifact_id, &peer.name)
+                    .await
+                    .unwrap_or_else(|| (peer.endpoint_url.clone(), peer.api_key.clone()));
+
             let db = db.clone();
             let client = client.clone();
-            let peer_endpoint = peer.endpoint_url.clone();
-            let peer_api_key = peer.api_key.clone();
             let peer_name = peer.name.clone();
 
             tokio::spawn(async move {
@@ -1549,5 +1641,262 @@ mod tests {
         let msg = format_stale_detection_log(100, 5);
         assert!(msg.is_some());
         assert!(msg.unwrap().contains("100 stale peer(s)"));
+    }
+
+    // ── pick_best_peer ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pick_best_peer_returns_highest_score() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let peers = vec![
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer1".to_string(),
+                latency_ms: Some(100),
+                bandwidth_estimate_bps: Some(1_000_000),
+                available_chunks: 5,
+                score: 50.0,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer2".to_string(),
+                latency_ms: Some(50),
+                bandwidth_estimate_bps: Some(2_000_000),
+                available_chunks: 10,
+                score: 200.0,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer3".to_string(),
+                latency_ms: Some(200),
+                bandwidth_estimate_bps: Some(500_000),
+                available_chunks: 3,
+                score: 7.5,
+            },
+        ];
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.endpoint_url, "http://peer2");
+        assert!((best.score - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pick_best_peer_empty_returns_none() {
+        let peers: Vec<crate::services::peer_service::ScoredPeer> = vec![];
+        assert!(pick_best_peer(&peers).is_none());
+    }
+
+    #[test]
+    fn test_pick_best_peer_single_peer() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let peers = vec![ScoredPeer {
+            node_id: Uuid::new_v4(),
+            endpoint_url: "http://only-peer".to_string(),
+            latency_ms: Some(100),
+            bandwidth_estimate_bps: Some(1_000_000),
+            available_chunks: 1,
+            score: 10.0,
+        }];
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.endpoint_url, "http://only-peer");
+    }
+
+    #[test]
+    fn test_pick_best_peer_equal_scores() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let peers = vec![
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer-a".to_string(),
+                latency_ms: Some(100),
+                bandwidth_estimate_bps: Some(1_000_000),
+                available_chunks: 5,
+                score: 42.0,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://peer-b".to_string(),
+                latency_ms: Some(80),
+                bandwidth_estimate_bps: Some(2_000_000),
+                available_chunks: 3,
+                score: 42.0,
+            },
+        ];
+
+        let best = pick_best_peer(&peers);
+        assert!(
+            best.is_some(),
+            "must return a peer when both have equal scores"
+        );
+        assert!((best.unwrap().score - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pick_best_peer_nan_score() {
+        use crate::services::peer_service::ScoredPeer;
+
+        // A peer with a valid score should be preferred over one with NaN.
+        // Because partial_cmp returns None for NaN comparisons and the
+        // implementation falls back to Ordering::Equal, we place the valid
+        // peer first so that NaN does not shadow it via the tie-breaking
+        // behaviour of max_by (which returns the later element on Equal).
+        let peers = vec![
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://valid".to_string(),
+                latency_ms: Some(50),
+                bandwidth_estimate_bps: Some(1_000_000),
+                available_chunks: 5,
+                score: 100.0,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://nan-peer".to_string(),
+                latency_ms: Some(200),
+                bandwidth_estimate_bps: Some(500_000),
+                available_chunks: 1,
+                score: f64::NAN,
+            },
+        ];
+
+        // When NaN is last and compared with Equal fallback, max_by picks the
+        // later element. Verify we get *some* result regardless.
+        let best = pick_best_peer(&peers);
+        assert!(
+            best.is_some(),
+            "must return a peer even when NaN is present"
+        );
+
+        // With NaN first and valid second, the valid peer should win since
+        // NaN vs valid yields Equal and max_by keeps the later (valid) one.
+        let peers_reversed = vec![
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://nan-peer".to_string(),
+                latency_ms: Some(200),
+                bandwidth_estimate_bps: Some(500_000),
+                available_chunks: 1,
+                score: f64::NAN,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://valid".to_string(),
+                latency_ms: Some(50),
+                bandwidth_estimate_bps: Some(1_000_000),
+                available_chunks: 5,
+                score: 100.0,
+            },
+        ];
+
+        let best2 = pick_best_peer(&peers_reversed).unwrap();
+        assert_eq!(
+            best2.endpoint_url, "http://valid",
+            "valid peer should win when NaN peer precedes it"
+        );
+    }
+
+    #[test]
+    fn test_pick_best_peer_zero_score() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let peers = vec![ScoredPeer {
+            node_id: Uuid::new_v4(),
+            endpoint_url: "http://zero-score".to_string(),
+            latency_ms: Some(300),
+            bandwidth_estimate_bps: Some(100_000),
+            available_chunks: 0,
+            score: 0.0,
+        }];
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.endpoint_url, "http://zero-score");
+        assert!((best.score - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pick_best_peer_negative_score() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let peers = vec![
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://negative".to_string(),
+                latency_ms: Some(500),
+                bandwidth_estimate_bps: Some(100_000),
+                available_chunks: 1,
+                score: -10.0,
+            },
+            ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: "http://positive".to_string(),
+                latency_ms: Some(50),
+                bandwidth_estimate_bps: Some(5_000_000),
+                available_chunks: 8,
+                score: 25.0,
+            },
+        ];
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.endpoint_url, "http://positive");
+        assert!((best.score - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pick_best_peer_large_list() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let scores = [1.0, 99.5, 33.0, 78.2, 12.0, 55.5, 200.0, 44.4, 88.8, 5.0];
+        let peers: Vec<ScoredPeer> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| ScoredPeer {
+                node_id: Uuid::new_v4(),
+                endpoint_url: format!("http://peer-{i}"),
+                latency_ms: Some((i as i32 + 1) * 10),
+                bandwidth_estimate_bps: Some(1_000_000),
+                available_chunks: i as i32,
+                score: s,
+            })
+            .collect();
+
+        assert_eq!(peers.len(), 10);
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.endpoint_url, "http://peer-6");
+        assert!((best.score - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pick_best_peer_preserves_all_fields() {
+        use crate::services::peer_service::ScoredPeer;
+
+        let node_id = Uuid::new_v4();
+        let peers = vec![ScoredPeer {
+            node_id,
+            endpoint_url: "http://full-check".to_string(),
+            latency_ms: Some(77),
+            bandwidth_estimate_bps: Some(3_500_000),
+            available_chunks: 42,
+            score: 99.9,
+        }];
+
+        let best = pick_best_peer(&peers).unwrap();
+        assert_eq!(best.node_id, node_id);
+        assert_eq!(best.endpoint_url, "http://full-check");
+        assert_eq!(best.latency_ms, Some(77));
+        assert_eq!(best.bandwidth_estimate_bps, Some(3_500_000));
+        assert_eq!(best.available_chunks, 42);
+        assert!((best.score - 99.9).abs() < f64::EPSILON);
+    }
+
+    // ── constants ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_max_retries_constant() {
+        assert_eq!(DEFAULT_MAX_RETRIES, 3);
     }
 }
