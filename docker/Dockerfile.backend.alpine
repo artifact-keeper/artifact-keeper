@@ -53,8 +53,8 @@ RUN addgroup -g 1001 artifact && \
 
 # Application directories
 RUN mkdir -p /app /data/storage /data/backups /data/plugins \
-    /scan-workspace /home/artifact/.cache/grype /home/artifact/.cache/trivy && \
-    chown -R 1001:1001 /data /scan-workspace /home/artifact /app
+    /scan-workspace /shared /home/artifact/.cache/grype /home/artifact/.cache/trivy && \
+    chown -R 1001:1001 /data /scan-workspace /home/artifact /app /shared
 
 # Disable core dumps (CIS 1.5.1)
 RUN mkdir -p /etc/security/limits.d && \

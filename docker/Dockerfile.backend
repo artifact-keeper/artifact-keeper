@@ -73,11 +73,13 @@ RUN echo 'artifact:x:1001:0:Artifact Keeper:/home/artifact:/sbin/nologin' >> /mn
              /mnt/rootfs/data/backups \
              /mnt/rootfs/data/plugins \
              /mnt/rootfs/scan-workspace \
+             /mnt/rootfs/shared \
              /mnt/rootfs/home/artifact/.cache/grype \
              /mnt/rootfs/home/artifact/.cache/trivy \
              /mnt/rootfs/usr/local/bin && \
     chown -R 1001:0 /mnt/rootfs/data /mnt/rootfs/scan-workspace \
-                     /mnt/rootfs/home/artifact /mnt/rootfs/app
+                     /mnt/rootfs/home/artifact /mnt/rootfs/app \
+                     /mnt/rootfs/shared
 
 # ---------- STIG hardening (applicable subset for ubi-micro) ----------
 # Derived from DISA STIG controls applied in registry.access.redhat.com/ubi9/ubi-stig

@@ -134,8 +134,6 @@ services:
   dtrack-init:
     image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
     container_name: artifact-keeper-dev-dtrack-init
-    # See docker-compose.yml dtrack-init for explanation of user: "0:0"
-    user: "0:0"
     depends_on:
       postgres:
         condition: service_healthy
