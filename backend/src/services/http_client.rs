@@ -1,8 +1,9 @@
 //! Shared HTTP client builder with custom CA certificate support.
 //!
-//! All code that creates a `reqwest::Client` should use [`base_client_builder`]
-//! instead of `reqwest::Client::builder()` directly. This ensures that custom
-//! CA certificates (configured via `CUSTOM_CA_CERT_PATH`) are loaded
+//! All code that creates a `reqwest::Client` should call [`default_client`] for
+//! a ready-to-use client, or [`base_client_builder`] when extra configuration
+//! (timeouts, user-agent, etc.) is needed before building. This ensures that
+//! custom CA certificates (configured via `CUSTOM_CA_CERT_PATH`) are loaded
 //! consistently across the application.
 
 use reqwest::tls::Certificate;
@@ -88,10 +89,30 @@ pub fn base_client_builder() -> ClientBuilder {
     builder
 }
 
+/// Build and return a ready-to-use [`reqwest::Client`] with custom CA
+/// certificates and proxy support.
+///
+/// Panics if the client cannot be built (should not happen in practice).
+pub fn default_client() -> reqwest::Client {
+    base_client_builder()
+        .build()
+        .expect("failed to build default HTTP client")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::base_client_builder;
+    use super::{base_client_builder, default_client};
     use std::io::Write;
+
+    #[test]
+    fn test_default_client_builds_successfully() {
+        let _client = default_client();
+    }
+
+    #[test]
+    fn test_base_client_builder_builds_successfully() {
+        let _client = base_client_builder().build().unwrap();
+    }
 
     #[test]
     fn test_base_client_builder_no_env() {

@@ -167,9 +167,7 @@ impl LdapService {
         Ok(Self {
             db,
             config,
-            http_client: crate::services::http_client::base_client_builder()
-                .build()
-                .unwrap_or_default(),
+            http_client: crate::services::http_client::default_client(),
         })
     }
 
@@ -209,9 +207,7 @@ impl LdapService {
         Self {
             db,
             config,
-            http_client: crate::services::http_client::base_client_builder()
-                .build()
-                .unwrap_or_default(),
+            http_client: crate::services::http_client::default_client(),
         }
     }
 
@@ -223,9 +219,7 @@ impl LdapService {
         Self {
             db,
             config,
-            http_client: crate::services::http_client::base_client_builder()
-                .build()
-                .unwrap_or_default(),
+            http_client: crate::services::http_client::default_client(),
         }
     }
 
