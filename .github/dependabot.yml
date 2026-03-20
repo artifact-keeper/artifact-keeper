@@ -23,3 +23,13 @@ updates:
       - "ci"
     commit-message:
       prefix: "chore"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "cargo"
+    commit-message:
+      prefix: "chore"

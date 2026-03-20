@@ -22,6 +22,13 @@ RUN mkdir -p /mnt/rootfs && \
     && dnf --installroot /mnt/rootfs clean all \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
+# Force-update python3 to pick up latest security patches
+RUN dnf update --installroot /mnt/rootfs --releasever 9 \
+        --setopt install_weak_deps=0 --nodocs --nogpgcheck -y \
+        python3 \
+    && dnf --installroot /mnt/rootfs clean all \
+    && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
+
 # Create non-root user and scan workspace
 RUN echo 'oscap:x:1001:0:OpenSCAP Scanner:/home/oscap:/sbin/nologin' >> /mnt/rootfs/etc/passwd && \
     echo 'oscap:x:1001:' >> /mnt/rootfs/etc/group && \

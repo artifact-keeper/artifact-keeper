@@ -118,7 +118,7 @@ RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # ---------- Stage 5: Copy scanner CLIs from official images ----------
 FROM ghcr.io/aquasecurity/trivy:0.69.3 AS trivy-bin
-FROM ghcr.io/anchore/grype:v0.109.1 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.110.0 AS grype-bin
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
 FROM registry.access.redhat.com/ubi9/ubi-micro:9.7
