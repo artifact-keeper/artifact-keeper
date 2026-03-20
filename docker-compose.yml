@@ -181,6 +181,12 @@ services:
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-true}
       ALLOW_HTTP_INTEGRATIONS: "1"
+      # Forward host proxy settings so the backend can reach external services
+      # (OIDC providers, remote registries, webhook endpoints) through a
+      # corporate proxy. reqwest honours these natively.
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
       # Prevent host proxy settings (HTTP_PROXY/HTTPS_PROXY) from intercepting
       # container-to-container traffic. Docker and Podman propagate proxy vars
       # from the host, which causes health checks and API calls to route through

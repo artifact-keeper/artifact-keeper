@@ -182,6 +182,11 @@ services:
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: "true"
       ALLOW_HTTP_INTEGRATIONS: "1"
+      # Forward host proxy settings so the backend can reach external services
+      # through a corporate proxy. reqwest honours these natively.
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
       # Prevent host proxy settings from intercepting container-to-container
       # traffic on the compose network. See docker-compose.yml for details.
       no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,meilisearch,trivy,openscap,dependency-track-apiserver"
