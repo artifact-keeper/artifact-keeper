@@ -76,6 +76,7 @@ if [ -z "$API_KEY" ]; then
 fi
 
 echo "$API_KEY" > "$API_KEY_FILE"
+chmod 644 "$API_KEY_FILE"
 echo "[dtrack-init] API key written to $API_KEY_FILE"
 
 # Enable NVD API 2.0 mirroring (NIST retired legacy feeds; DTrack 4.10.0+ supports API 2.0)
