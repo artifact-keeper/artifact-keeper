@@ -134,7 +134,7 @@ pub fn router() -> Router<SharedState> {
         // Label routes nested under repository
         .merge(super::repository_labels::repo_labels_router())
         // Allow up to 512MB uploads (matches format-specific handlers)
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(DefaultBodyLimit::disable())
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
