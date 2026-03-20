@@ -222,6 +222,25 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
     })
 }
 
+/// Try to fetch an OCI resource from the upstream registry for a remote repo.
+/// Returns `None` if the repo is not remote, has no upstream configured, or the
+/// fetch fails.
+async fn try_upstream_fetch(
+    repo: &OciRepoInfo,
+    state: &SharedState,
+    path_suffix: &str,
+) -> Option<(Bytes, Option<String>)> {
+    if repo.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    let upstream_url = repo.upstream_url.as_ref()?;
+    let proxy = state.proxy_service.as_ref()?;
+    let upstream_path = format!("v2/{}/{}", repo.image, path_suffix);
+    proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
+        .await
+        .ok()
+}
+
 // ---------------------------------------------------------------------------
 // Token endpoint
 // ---------------------------------------------------------------------------
@@ -467,24 +486,16 @@ async fn handle_head_blob(
     }
 
     // For remote repos, try fetching blob from upstream
-    if repo.repo_type == RepositoryType::Remote {
-        if let (Some(ref upstream_url), Some(ref proxy)) =
-            (&repo.upstream_url, &state.proxy_service)
-        {
-            let upstream_path = format!("v2/{}/blobs/{}", repo.image, digest);
-            if let Ok((content, _ct)) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
-                    .await
-            {
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Docker-Content-Digest", digest)
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .header(CONTENT_TYPE, "application/octet-stream")
-                    .body(Body::empty())
-                    .unwrap();
-            }
-        }
+    if let Some((content, _ct)) =
+        try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
+    {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Docker-Content-Digest", digest)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::empty())
+            .unwrap();
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -550,25 +561,17 @@ async fn handle_get_blob(
     }
 
     // For remote repos, try fetching blob from upstream
-    if repo.repo_type == RepositoryType::Remote {
-        if let (Some(ref upstream_url), Some(ref proxy)) =
-            (&repo.upstream_url, &state.proxy_service)
-        {
-            let upstream_path = format!("v2/{}/blobs/{}", repo.image, digest);
-            if let Ok((content, content_type)) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
-                    .await
-            {
-                let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Docker-Content-Digest", digest)
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .header(CONTENT_TYPE, ct)
-                    .body(Body::from(content))
-                    .unwrap();
-            }
-        }
+    if let Some((content, content_type)) =
+        try_upstream_fetch(&repo, state, &format!("blobs/{}", digest)).await
+    {
+        let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Docker-Content-Digest", digest)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .header(CONTENT_TYPE, ct)
+            .body(Body::from(content))
+            .unwrap();
     }
 
     oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
@@ -1004,27 +1007,19 @@ async fn handle_head_manifest(
     }
 
     // For remote repos, try fetching manifest from upstream
-    if repo.repo_type == RepositoryType::Remote {
-        if let (Some(ref upstream_url), Some(ref proxy)) =
-            (&repo.upstream_url, &state.proxy_service)
-        {
-            let upstream_path = format!("v2/{}/manifests/{}", repo.image, reference);
-            if let Ok((content, content_type)) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
-                    .await
-            {
-                let digest = compute_sha256(&content);
-                let ct = content_type
-                    .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Docker-Content-Digest", digest)
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .header(CONTENT_TYPE, ct)
-                    .body(Body::empty())
-                    .unwrap();
-            }
-        }
+    if let Some((content, content_type)) =
+        try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
+    {
+        let digest = compute_sha256(&content);
+        let ct = content_type
+            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Docker-Content-Digest", digest)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .header(CONTENT_TYPE, ct)
+            .body(Body::empty())
+            .unwrap();
     }
 
     oci_error(
@@ -1099,27 +1094,19 @@ async fn handle_get_manifest(
     }
 
     // For remote repos, try fetching manifest from upstream
-    if repo.repo_type == RepositoryType::Remote {
-        if let (Some(ref upstream_url), Some(ref proxy)) =
-            (&repo.upstream_url, &state.proxy_service)
-        {
-            let upstream_path = format!("v2/{}/manifests/{}", repo.image, reference);
-            if let Ok((content, content_type)) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
-                    .await
-            {
-                let digest = compute_sha256(&content);
-                let ct = content_type
-                    .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Docker-Content-Digest", digest)
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .header(CONTENT_TYPE, ct)
-                    .body(Body::from(content))
-                    .unwrap();
-            }
-        }
+    if let Some((content, content_type)) =
+        try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
+    {
+        let digest = compute_sha256(&content);
+        let ct = content_type
+            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Docker-Content-Digest", digest)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .header(CONTENT_TYPE, ct)
+            .body(Body::from(content))
+            .unwrap();
     }
 
     oci_error(
