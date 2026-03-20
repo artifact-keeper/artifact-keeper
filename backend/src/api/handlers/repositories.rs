@@ -1076,6 +1076,10 @@ pub async fn upload_artifact(
                 .to_string()
         });
 
+    // Clean up any soft-deleted artifact at the same path so the
+    // UNIQUE(repository_id, path) constraint doesn't block re-upload.
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;
+
     let artifact = artifact_service
         .upload(
             repo.id,
