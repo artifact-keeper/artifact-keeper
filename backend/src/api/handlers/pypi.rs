@@ -19,6 +19,7 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
@@ -190,30 +191,45 @@ async fn simple_project(
                 )
                 .await?;
 
+                // Rewrite absolute download URLs to route through our proxy
+                let ct = content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+                let body = if ct.contains("text/html") {
+                    let html = String::from_utf8_lossy(&content);
+                    let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                    Body::from(rewritten)
+                } else {
+                    Body::from(content)
+                };
+
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string()),
-                    )
-                    .body(Body::from(content))
+                    .header(CONTENT_TYPE, ct)
+                    .body(body)
                     .unwrap());
             }
         }
         // For virtual repos, iterate through members and try proxy for remote members
         if repo.repo_type == RepositoryType::Virtual {
             let upstream_path = format!("simple/{}/", normalized);
+            let rk = repo_key.clone();
+            let proj = project.clone();
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
                 state.proxy_service.as_deref(),
                 repo.id,
                 &upstream_path,
-                |content, _member_key| async move {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "text/html; charset=utf-8")
-                        .body(Body::from(content))
-                        .unwrap())
+                |content, _member_key| {
+                    let rk = rk.clone();
+                    let proj = proj.clone();
+                    async move {
+                        let html = String::from_utf8_lossy(&content);
+                        let rewritten = rewrite_upstream_urls(&html, &rk, &proj);
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                            .body(Body::from(rewritten))
+                            .unwrap())
+                    }
                 },
             )
             .await;
@@ -890,6 +906,51 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Rewrite absolute download URLs in upstream PyPI simple index HTML to route
+/// through Artifact Keeper's proxy endpoint.
+///
+/// Upstream PyPI returns `<a href="https://files.pythonhosted.org/packages/...">`,
+/// which causes pip to download directly from upstream, bypassing the cache.
+/// This function rewrites those URLs to relative paths like
+/// `/pypi/{repo_key}/simple/{project}/{filename}#sha256=...` so downloads
+/// go through Artifact Keeper and get cached.
+///
+/// Only absolute URLs (starting with `http://` or `https://`) are rewritten.
+/// Relative URLs and anchors are left unchanged.
+fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
+    // Match <a href="https://..."> or <a href="http://..."> patterns.
+    // Captures the full URL (possibly with fragment) inside the href attribute.
+    let re = Regex::new(r#"<a\s+([^>]*?)href="(https?://[^"]+)"([^>]*)>"#).unwrap();
+    let normalized = PypiHandler::normalize_name(project);
+
+    re.replace_all(html, |caps: &regex::Captures| {
+        let before_href = &caps[1];
+        let full_url = &caps[2];
+        let after_href = &caps[3];
+
+        // Split off the fragment (#sha256=...) if present
+        let (url_path, fragment) = match full_url.find('#') {
+            Some(pos) => (&full_url[..pos], &full_url[pos..]),
+            None => (full_url, ""),
+        };
+
+        // Extract the filename from the URL path
+        let filename = url_path.rsplit('/').next().unwrap_or(url_path);
+
+        if filename.is_empty() {
+            // Not a file URL, leave unchanged
+            return caps[0].to_string();
+        }
+
+        let rewritten = format!(
+            "/pypi/{}/simple/{}/{}{}",
+            repo_key, normalized, filename, fragment
+        );
+        format!("<a {}href=\"{}\"{}>", before_href, rewritten, after_href)
+    })
+    .into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +1001,155 @@ mod tests {
     fn test_html_escape_requires_python_version() {
         assert_eq!(html_escape(">=3.7"), "&gt;=3.7");
         assert_eq!(html_escape(">=3.7,<4.0"), "&gt;=3.7,&lt;4.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // rewrite_upstream_urls
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_absolute_url_with_hash() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/ab/cd/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
+        assert_eq!(
+            result,
+            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_absolute_url_without_hash() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/numpy-1.3.0.tar.gz">numpy-1.3.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
+        assert_eq!(
+            result,
+            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz">numpy-1.3.0.tar.gz</a>"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_preserves_relative_urls() {
+        let html = r#"<a href="numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
+        // Relative URLs should be left unchanged
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_rewrite_multiple_links() {
+        let html = concat!(
+            r#"<a href="https://files.pythonhosted.org/packages/numpy-1.3.0.tar.gz#sha256=aaa">numpy-1.3.0.tar.gz</a><br/>"#,
+            "\n",
+            r#"<a href="https://files.pythonhosted.org/packages/numpy-1.4.0-cp39-cp39-manylinux1_x86_64.whl#sha256=bbb">numpy-1.4.0-cp39-cp39-manylinux1_x86_64.whl</a><br/>"#,
+        );
+        let result = rewrite_upstream_urls(html, "my-pypi", "numpy");
+        assert!(
+            result.contains(r#"href="/pypi/my-pypi/simple/numpy/numpy-1.3.0.tar.gz#sha256=aaa""#)
+        );
+        assert!(result.contains(
+            r#"href="/pypi/my-pypi/simple/numpy/numpy-1.4.0-cp39-cp39-manylinux1_x86_64.whl#sha256=bbb""#
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_normalizes_project_name() {
+        let html = r#"<a href="https://example.com/My_Package-1.0.tar.gz#sha256=abc">My_Package-1.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "pypi-remote", "My_Package");
+        assert!(result.contains(
+            r#"href="/pypi/pypi-remote/simple/my-package/My_Package-1.0.tar.gz#sha256=abc""#
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_http_url() {
+        let html = r#"<a href="http://example.com/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "repo", "pkg");
+        assert_eq!(
+            result,
+            r#"<a href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#
+        );
+    }
+
+    #[test]
+    fn test_rewrite_preserves_data_attributes() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/numpy-1.3.0.tar.gz#sha256=abc" data-requires-python="&gt;=3.7">numpy-1.3.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
+        assert!(result
+            .contains(r#"href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc""#));
+        assert!(result.contains(r#"data-requires-python="&gt;=3.7""#));
+    }
+
+    #[test]
+    fn test_rewrite_no_links() {
+        let html = "<html><body><h1>No links here</h1></body></html>";
+        let result = rewrite_upstream_urls(html, "repo", "pkg");
+        assert_eq!(result, html);
+    }
+
+    #[test]
+    fn test_rewrite_empty_string() {
+        let result = rewrite_upstream_urls("", "repo", "pkg");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_rewrite_full_simple_index_page() {
+        let html = r#"<!DOCTYPE html>
+<html>
+<head><meta name="pypi:repository-version" content="1.0"/><title>Links for numpy</title></head>
+<body>
+<h1>Links for numpy</h1>
+<a href="https://files.pythonhosted.org/packages/3e/ee/numpy-1.3.0.tar.gz#sha256=aaa111" >numpy-1.3.0.tar.gz</a><br/>
+<a href="https://files.pythonhosted.org/packages/c5/63/numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=bbb222" data-requires-python="&gt;=3.9">numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl</a><br/>
+</body>
+</html>
+"#;
+        let result = rewrite_upstream_urls(html, "pypi-public", "numpy");
+
+        // Absolute URLs should be rewritten
+        assert!(!result.contains("files.pythonhosted.org"));
+        assert!(result
+            .contains(r#"href="/pypi/pypi-public/simple/numpy/numpy-1.3.0.tar.gz#sha256=aaa111""#));
+        assert!(result.contains(
+            r#"href="/pypi/pypi-public/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=bbb222""#
+        ));
+
+        // data-requires-python should be preserved
+        assert!(result.contains("data-requires-python"));
+
+        // Non-link content should be preserved
+        assert!(result.contains("<h1>Links for numpy</h1>"));
+        assert!(result.contains("pypi:repository-version"));
+    }
+
+    #[test]
+    fn test_rewrite_mixed_absolute_and_relative() {
+        let html = concat!(
+            r#"<a href="https://files.pythonhosted.org/pkg-1.0.tar.gz#sha256=aaa">pkg-1.0.tar.gz</a>"#,
+            "\n",
+            r#"<a href="pkg-2.0.tar.gz#sha256=bbb">pkg-2.0.tar.gz</a>"#,
+        );
+        let result = rewrite_upstream_urls(html, "repo", "pkg");
+        // Absolute URL is rewritten
+        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz#sha256=aaa""#));
+        // Relative URL is left unchanged
+        assert!(result.contains(r#"href="pkg-2.0.tar.gz#sha256=bbb""#));
+    }
+
+    #[test]
+    fn test_rewrite_url_with_deep_path() {
+        // URLs from real PyPI have deep paths like /packages/3e/ee/ab/...
+        let html = r#"<a href="https://files.pythonhosted.org/packages/3e/ee/ab/cd/ef/numpy-1.3.0.tar.gz#sha256=abc">numpy-1.3.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "repo", "numpy");
+        assert!(result.contains(r#"href="/pypi/repo/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc""#));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_md5_fragment() {
+        let html =
+            r#"<a href="https://example.com/pkg-1.0.tar.gz#md5=deadbeef">pkg-1.0.tar.gz</a>"#;
+        let result = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz#md5=deadbeef""#));
     }
 
     // -----------------------------------------------------------------------
