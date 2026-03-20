@@ -1811,4 +1811,63 @@ mod tests {
             other => panic!("expected Internal, got {:?}", other),
         }
     }
+
+    // --- check_health() and with_config() coverage tests ---
+
+    #[tokio::test]
+    async fn test_check_health_empty_url_returns_config_error() {
+        let mut config = make_test_ldap_config();
+        config.url = String::new();
+        let svc = make_test_service(config);
+        let result = svc.check_health().await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Config(msg) => assert!(msg.contains("not configured")),
+            other => panic!("expected Config error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_health_no_bind_credentials_with_url_succeeds() {
+        // When URL is set but no bind credentials, check_health just verifies URL is non-empty
+        let config = make_test_ldap_config(); // has URL but no bind_dn/bind_password
+        let svc = make_test_service(config);
+        let result = svc.check_health().await;
+        assert!(
+            result.is_ok(),
+            "health check should pass with URL but no bind credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_config_insecure_tls_creates_valid_service() {
+        let mut config = make_test_ldap_config();
+        config.no_tls_verify = true;
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        // Service created successfully despite insecure TLS (warning logged but no error)
+        assert!(svc.is_configured());
+        assert!(svc.config.no_tls_verify);
+    }
+
+    #[tokio::test]
+    async fn test_with_config_normal_tls_no_warning() {
+        let config = make_test_ldap_config(); // no_tls_verify = false
+        let db = PgPool::connect_lazy("postgres://localhost/fake").expect("lazy pool");
+        let svc = LdapService::with_config(db, config);
+        assert!(svc.is_configured());
+        assert!(!svc.config.no_tls_verify);
+    }
+
+    #[tokio::test]
+    async fn test_check_health_empty_url_with_bind_credentials() {
+        let mut config = make_test_ldap_config();
+        config.url = String::new();
+        config.bind_dn = Some("cn=admin,dc=test".to_string());
+        config.bind_password = Some("secret".to_string());
+        let svc = make_test_service(config);
+        let result = svc.check_health().await;
+        // Should fail on empty URL check before attempting bind
+        assert!(result.is_err());
+    }
 }
