@@ -163,10 +163,7 @@ mod tests {
             .route("/test", get(test_handler))
             .layer(middleware::from_fn(metrics_middleware));
 
-        let request = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);

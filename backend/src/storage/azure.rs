@@ -891,9 +891,10 @@ impl StorageBackend for AzureBackend {
         // reachable and credentials are accepted). Only transport-level or
         // authentication errors indicate an unhealthy backend.
         let url = self.blob_url(".health-probe");
-        let response = self.authorized_head(&url).await.map_err(|e| {
-            AppError::Storage(format!("Azure health check failed: {}", e))
-        })?;
+        let response = self
+            .authorized_head(&url)
+            .await
+            .map_err(|e| AppError::Storage(format!("Azure health check failed: {}", e)))?;
 
         let status = response.status();
         if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {

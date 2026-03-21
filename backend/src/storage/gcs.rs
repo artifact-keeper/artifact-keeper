@@ -910,9 +910,10 @@ impl StorageBackend for GcsBackend {
             self.base_url,
             urlencoding::encode(&self.config.bucket),
         );
-        let response = self.authorized_get(&url).await.map_err(|e| {
-            AppError::Storage(format!("GCS health check failed: {}", e))
-        })?;
+        let response = self
+            .authorized_get(&url)
+            .await
+            .map_err(|e| AppError::Storage(format!("GCS health check failed: {}", e)))?;
 
         if response.status().is_success() {
             return Ok(());

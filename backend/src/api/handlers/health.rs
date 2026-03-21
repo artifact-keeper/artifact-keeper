@@ -177,9 +177,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     };
 
     let storage_healthy = storage_check.status == "healthy";
-    let meilisearch_healthy = meili_check
-        .as_ref()
-        .map_or(true, |m| m.status == "healthy");
+    let meilisearch_healthy = meili_check.as_ref().map_or(true, |m| m.status == "healthy");
 
     let overall_status = if db_check.status == "healthy" && storage_healthy && meilisearch_healthy {
         "healthy"
