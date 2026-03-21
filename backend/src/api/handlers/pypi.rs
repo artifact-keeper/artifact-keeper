@@ -397,13 +397,54 @@ async fn serve_file(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let normalized = PypiHandler::normalize_name(project);
-                    let upstream_path = format!("simple/{}/{}", normalized, filename);
-                    let (content, _content_type) = proxy_helpers::proxy_fetch(
+
+                    // Fetch the simple index page to discover the real download
+                    // URL for this file.  External registries (e.g. pypi.org)
+                    // host files on a different domain (files.pythonhosted.org),
+                    // so we cannot just append the filename to the upstream URL.
+                    let index_path = format!("simple/{}/", normalized);
+                    let (index_bytes, _ct) = proxy_helpers::proxy_fetch(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
-                        &upstream_path,
+                        &index_path,
+                    )
+                    .await?;
+
+                    let index_html = String::from_utf8_lossy(&index_bytes);
+                    let file_url = find_upstream_url_for_file(&index_html, filename);
+
+                    let (fetch_base, fetch_path) = if let Some(ref url) = file_url {
+                        // Absolute URL from the index (e.g. https://files.pythonhosted.org/packages/.../file.whl).
+                        // Split into scheme+host base and path so proxy_fetch
+                        // can cache it under the repo key.
+                        match url
+                            .find("://")
+                            .and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j))
+                        {
+                            Some(pos) => (url[..pos].to_string(), url[pos + 1..].to_string()),
+                            None => (
+                                upstream_url.clone(),
+                                format!("simple/{}/{}", normalized, filename),
+                            ),
+                        }
+                    } else {
+                        // No absolute URL found (the upstream may be another
+                        // AK instance that uses relative paths). Fall back to
+                        // the simple/{project}/{filename} convention.
+                        (
+                            upstream_url.clone(),
+                            format!("simple/{}/{}", normalized, filename),
+                        )
+                    };
+
+                    let (content, _content_type) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        &fetch_base,
+                        &fetch_path,
                     )
                     .await?;
 
@@ -906,6 +947,22 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Look up the original download URL for a given filename in upstream simple
+/// index HTML. Returns the full absolute URL (e.g.,
+/// `https://files.pythonhosted.org/packages/.../six-1.16.0.whl`) or `None` if
+/// no matching link is found. Hash fragments are stripped from the returned URL.
+fn find_upstream_url_for_file(index_html: &str, filename: &str) -> Option<String> {
+    let re = Regex::new(r##"<a\s+[^>]*?href="(https?://[^"#]+)"##).unwrap();
+    for caps in re.captures_iter(index_html) {
+        let url = &caps[1];
+        let url_filename = url.rsplit('/').next().unwrap_or("");
+        if url_filename == filename {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
 /// Rewrite download URLs in upstream PyPI simple index HTML to route through
 /// Artifact Keeper's proxy endpoint.
 ///
@@ -1239,6 +1296,65 @@ mod tests {
         // data-requires-python and other structure should be preserved
         assert!(result.contains("data-requires-python"));
         assert!(result.contains("<h1>Links for mypackage</h1>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // find_upstream_url_for_file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_upstream_url_basic() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=abc">six-1.16.0-py2.py3-none-any.whl</a>"#;
+        let result = find_upstream_url_for_file(html, "six-1.16.0-py2.py3-none-any.whl");
+        assert_eq!(
+            result,
+            Some(
+                "https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_no_match() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/six-1.16.0.tar.gz#sha256=abc">six-1.16.0.tar.gz</a>"#;
+        let result = find_upstream_url_for_file(html, "six-1.15.0.tar.gz");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_upstream_url_relative_ignored() {
+        // Relative URLs (from local AK repos) should not match
+        let html = r#"<a href="/pypi/local/simple/six/six-1.16.0.tar.gz#sha256=abc">six-1.16.0.tar.gz</a>"#;
+        let result = find_upstream_url_for_file(html, "six-1.16.0.tar.gz");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_upstream_url_multiple_files() {
+        let html = concat!(
+            r#"<a href="https://files.pythonhosted.org/packages/a/six-1.15.0.tar.gz#sha256=aaa">six-1.15.0.tar.gz</a>"#,
+            "\n",
+            r#"<a href="https://files.pythonhosted.org/packages/b/six-1.16.0-py2.py3-none-any.whl#sha256=bbb">six-1.16.0-py2.py3-none-any.whl</a>"#,
+        );
+        let result = find_upstream_url_for_file(html, "six-1.16.0-py2.py3-none-any.whl");
+        assert_eq!(
+            result,
+            Some(
+                "https://files.pythonhosted.org/packages/b/six-1.16.0-py2.py3-none-any.whl"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_with_data_attrs() {
+        let html = r#"<a href="https://files.pythonhosted.org/packages/numpy-2.0.0.whl#sha256=abc" data-requires-python="&gt;=3.9">numpy-2.0.0.whl</a>"#;
+        let result = find_upstream_url_for_file(html, "numpy-2.0.0.whl");
+        assert_eq!(
+            result,
+            Some("https://files.pythonhosted.org/packages/numpy-2.0.0.whl".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------
