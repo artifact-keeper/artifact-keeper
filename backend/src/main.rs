@@ -1259,4 +1259,68 @@ mod tests {
     fn test_secure_password_not_flagged() {
         assert!(!is_insecure_default_password("xK9#mP2$vL5nQ8"));
     }
+
+    #[test]
+    fn test_all_insecure_defaults_detected() {
+        let defaults = [
+            "admin",
+            "password",
+            "changeme",
+            "admin123",
+            "Password1",
+            "letmein",
+            "welcome",
+            "123456",
+            "admin1234",
+            "default",
+        ];
+        for pw in defaults {
+            assert!(
+                is_insecure_default_password(pw),
+                "{pw} should be flagged as insecure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_insecure_defaults_mixed_case_variations() {
+        assert!(is_insecure_default_password("ChAnGeMe"));
+        assert!(is_insecure_default_password("LETMEIN"));
+        assert!(is_insecure_default_password("Welcome"));
+        assert!(is_insecure_default_password("Default"));
+        assert!(is_insecure_default_password("ADMIN123"));
+        assert!(is_insecure_default_password("password1"));
+    }
+
+    #[test]
+    fn test_empty_password_not_flagged() {
+        assert!(!is_insecure_default_password(""));
+    }
+
+    #[test]
+    fn test_near_miss_passwords_not_flagged() {
+        // Passwords similar to but not matching the insecure list
+        assert!(!is_insecure_default_password("admin2"));
+        assert!(!is_insecure_default_password("password!"));
+        assert!(!is_insecure_default_password("changeme1"));
+        assert!(!is_insecure_default_password("1234567"));
+        assert!(!is_insecure_default_password("defaults"));
+    }
+
+    #[test]
+    fn test_long_secure_password_not_flagged() {
+        assert!(!is_insecure_default_password("my-secure-p@ssw0rd-2026"));
+        assert!(!is_insecure_default_password(
+            "correct-horse-battery-staple"
+        ));
+        assert!(!is_insecure_default_password("Tr0ub4dor&3"));
+    }
+
+    #[test]
+    fn test_whitespace_password_not_flagged() {
+        // Passwords with leading/trailing whitespace are not in the list
+        assert!(!is_insecure_default_password(" admin"));
+        assert!(!is_insecure_default_password("admin "));
+        assert!(!is_insecure_default_password(" password "));
+    }
 }

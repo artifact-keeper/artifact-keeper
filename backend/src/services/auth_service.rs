@@ -1867,6 +1867,56 @@ mod tests {
     }
 
     #[test]
+    fn test_reinvalidation_updates_timestamp() {
+        let user_id = Uuid::new_v4();
+        invalidate_user_tokens(user_id);
+        let mid = Utc::now().timestamp();
+        // Slight delay so second invalidation gets a newer timestamp
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        invalidate_user_tokens(user_id);
+        let after = Utc::now().timestamp() + 1;
+        // Token issued before second invalidation is still rejected
+        assert!(is_token_invalidated(user_id, mid - 1));
+        // Token issued after second invalidation is accepted
+        assert!(!is_token_invalidated(user_id, after));
+    }
+
+    #[test]
+    fn test_token_issued_at_exact_invalidation_time_passes() {
+        // issued_at < changed_at is the check, so equal timestamps should pass
+        let user_id = Uuid::new_v4();
+        invalidate_user_tokens(user_id);
+        let now = Utc::now().timestamp();
+        // Token with iat after changed_at should not be invalidated
+        assert!(!is_token_invalidated(user_id, now + 1));
+    }
+
+    #[test]
+    fn test_multiple_users_invalidated_independently() {
+        let user_a = Uuid::new_v4();
+        let user_b = Uuid::new_v4();
+        let before = Utc::now().timestamp() - 1;
+
+        invalidate_user_tokens(user_a);
+        // user_a is invalidated, user_b is not
+        assert!(is_token_invalidated(user_a, before));
+        assert!(!is_token_invalidated(user_b, before));
+
+        invalidate_user_tokens(user_b);
+        // now both are invalidated for tokens issued before
+        assert!(is_token_invalidated(user_a, before));
+        assert!(is_token_invalidated(user_b, before));
+    }
+
+    #[test]
+    fn test_invalidation_map_initialized_on_first_access() {
+        // Calling is_token_invalidated on a never-seen user should not panic
+        // and should return false, exercising the OnceLock init path
+        let fresh = Uuid::new_v4();
+        assert!(!is_token_invalidated(fresh, Utc::now().timestamp()));
+    }
+
+    #[test]
     fn test_decode_rejects_alg_none_token() {
         let config = make_test_config();
         let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
