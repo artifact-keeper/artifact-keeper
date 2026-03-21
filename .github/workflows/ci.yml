@@ -182,11 +182,12 @@ jobs:
   smoke-e2e:
     name: 🔥 Smoke E2E Tests
     runs-on: ak-e2e-runners
-    needs: [test-backend-unit]
+    needs: [test-backend-unit, build-backend-image]
+    if: needs.build-backend-image.result == 'success'
     permissions:
       contents: read
       packages: read
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -237,11 +238,16 @@ jobs:
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build backend image from PR source
+      - name: Download backend image from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-image
+          path: /tmp
+
+      - name: Load backend image
         run: |
-          echo "Building backend image from current branch (not pulling :dev from registry)..."
-          docker build -f docker/Dockerfile.backend -t artifact-keeper-backend:test .
-        timeout-minutes: 10
+          gunzip -c /tmp/backend-image.tar.gz | docker load
+          docker tag artifact-keeper-backend:pr-test artifact-keeper-backend:test
 
       - name: Start smoke E2E stack
         run: docker compose -f docker-compose.test.yml --profile smoke up -d
@@ -346,6 +352,18 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           docker images artifact-keeper-backend:pr-test --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Save image for smoke tests
+        run: |
+          docker save artifact-keeper-backend:pr-test | gzip > /tmp/backend-image.tar.gz
+          ls -lh /tmp/backend-image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image
+          path: /tmp/backend-image.tar.gz
+          retention-days: 1
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
