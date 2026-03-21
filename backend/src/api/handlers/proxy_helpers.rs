@@ -162,6 +162,43 @@ pub async fn proxy_fetch(
         })
 }
 
+/// Fetch from upstream directly, bypassing the proxy cache.
+///
+/// Use this instead of [`proxy_fetch`] when the caller needs the raw upstream
+/// response and cannot tolerate locally-transformed cached content (e.g., when
+/// parsing download URLs from a PyPI simple index).
+pub async fn proxy_fetch_uncached(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<(Bytes, Option<String>), Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+
+    proxy_service
+        .fetch_upstream_direct(&repo, path)
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                "Direct upstream fetch failed for {}/{}: {}",
+                repo_key,
+                path,
+                e
+            );
+            match &e {
+                crate::error::AppError::NotFound(_) => {
+                    (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
+                }
+                _ => (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to fetch from upstream: {}", e),
+                )
+                    .into_response(),
+            }
+        })
+}
+
 /// Resolve virtual repository members and attempt to find an artifact.
 /// Iterates through members by priority, trying local storage first,
 /// then proxy for remote members.

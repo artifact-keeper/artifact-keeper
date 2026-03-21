@@ -171,6 +171,32 @@ impl ProxyService {
         Ok(false)
     }
 
+    /// Fetch from upstream without reading or writing the proxy cache.
+    ///
+    /// This is useful when the caller needs the *raw* upstream response (e.g.,
+    /// to parse download URLs from a PyPI simple index) and cannot risk
+    /// receiving a locally-transformed cached copy.
+    pub async fn fetch_upstream_direct(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<(Bytes, Option<String>)> {
+        if repo.repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "Proxy operations only supported for remote repositories".to_string(),
+            ));
+        }
+
+        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
+            AppError::Config("Remote repository missing upstream_url".to_string())
+        })?;
+
+        let full_url = Self::build_upstream_url(upstream_url, path);
+        let (content, content_type, _etag) =
+            self.fetch_from_upstream(&full_url, repo.id).await?;
+        Ok((content, content_type))
+    }
+
     /// Invalidate cached artifact
     pub async fn invalidate_cache(&self, repo: &Repository, path: &str) -> Result<()> {
         let cache_key = Self::cache_storage_key(&repo.key, path);

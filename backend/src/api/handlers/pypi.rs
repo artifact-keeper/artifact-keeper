@@ -398,12 +398,16 @@ async fn serve_file(
                 {
                     let normalized = PypiHandler::normalize_name(project);
 
-                    // Fetch the simple index page to discover the real download
-                    // URL for this file.  External registries (e.g. pypi.org)
-                    // host files on a different domain (files.pythonhosted.org),
-                    // so we cannot just append the filename to the upstream URL.
+                    // Fetch the simple index page directly from the upstream
+                    // (bypassing the proxy cache) to discover the real download
+                    // URL for this file.  The cached copy may contain URLs that
+                    // were rewritten by rewrite_upstream_urls(), so we need the
+                    // raw upstream HTML to find the original absolute URLs.
+                    // External registries (e.g. pypi.org) host files on a
+                    // different domain (files.pythonhosted.org), so we cannot
+                    // just append the filename to the upstream URL.
                     let index_path = format!("simple/{}/", normalized);
-                    let (index_bytes, _ct) = proxy_helpers::proxy_fetch(
+                    let (index_bytes, _ct) = proxy_helpers::proxy_fetch_uncached(
                         proxy,
                         repo.id,
                         repo_key,
@@ -1355,6 +1359,60 @@ mod tests {
             result,
             Some("https://files.pythonhosted.org/packages/numpy-2.0.0.whl".to_string())
         );
+    }
+
+    #[test]
+    fn test_find_upstream_url_raw_index_has_absolute_urls() {
+        // Simulates a real upstream simple index from pypi.org.
+        // find_upstream_url_for_file must find the correct absolute URL
+        // when given the raw (un-rewritten) upstream HTML.
+        let raw_upstream_html = r#"<!DOCTYPE html>
+<html>
+<head><meta name="pypi:repository-version" content="1.0"/><title>Links for six</title></head>
+<body>
+<h1>Links for six</h1>
+<a href="https://files.pythonhosted.org/packages/71/39/six-1.16.0-py2.py3-none-any.whl#sha256=8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254">six-1.16.0-py2.py3-none-any.whl</a><br/>
+<a href="https://files.pythonhosted.org/packages/94/e7/six-1.16.0.tar.gz#sha256=1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926">six-1.16.0.tar.gz</a><br/>
+</body>
+</html>
+"#;
+        let result =
+            find_upstream_url_for_file(raw_upstream_html, "six-1.16.0-py2.py3-none-any.whl");
+        assert_eq!(
+            result,
+            Some(
+                "https://files.pythonhosted.org/packages/71/39/six-1.16.0-py2.py3-none-any.whl"
+                    .to_string()
+            )
+        );
+
+        let result = find_upstream_url_for_file(raw_upstream_html, "six-1.16.0.tar.gz");
+        assert_eq!(
+            result,
+            Some(
+                "https://files.pythonhosted.org/packages/94/e7/six-1.16.0.tar.gz".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_find_upstream_url_fails_on_rewritten_html() {
+        // After rewrite_upstream_urls(), all absolute URLs become local
+        // /pypi/... paths. find_upstream_url_for_file must return None for
+        // these, confirming that the download handler needs the raw upstream
+        // HTML (not the rewritten cached copy) to discover file URLs.
+        let rewritten_html = r#"<!DOCTYPE html>
+<html>
+<head><title>Links for six</title></head>
+<body>
+<a href="/pypi/pypi-proxy/simple/six/six-1.16.0-py2.py3-none-any.whl#sha256=8abb">six-1.16.0-py2.py3-none-any.whl</a><br/>
+<a href="/pypi/pypi-proxy/simple/six/six-1.16.0.tar.gz#sha256=1e61">six-1.16.0.tar.gz</a><br/>
+</body>
+</html>
+"#;
+        let result =
+            find_upstream_url_for_file(rewritten_html, "six-1.16.0-py2.py3-none-any.whl");
+        assert_eq!(result, None);
     }
 
     // -----------------------------------------------------------------------
