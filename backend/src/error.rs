@@ -199,7 +199,7 @@ mod tests {
         let err: jsonwebtoken::errors::Error = jsonwebtoken::decode::<serde_json::Value>(
             "not-a-token",
             &jsonwebtoken::DecodingKey::from_secret(b"x"),
-            &jsonwebtoken::Validation::default(),
+            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
         )
         .unwrap_err();
         let app_err = AppError::Jwt(err);

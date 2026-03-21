@@ -808,6 +808,8 @@ pub async fn change_password(
         return Err(AppError::NotFound("User not found".to_string()));
     }
 
+    crate::services::auth_service::invalidate_user_tokens(id);
+
     // If this user had must_change_password, check if setup mode should be unlocked
     if had_must_change && state.setup_required.load(Ordering::Relaxed) {
         state.setup_required.store(false, Ordering::Relaxed);
@@ -902,6 +904,8 @@ pub async fn reset_password(
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+    crate::services::auth_service::invalidate_user_tokens(id);
 
     Ok(Json(ResetPasswordResponse {
         temporary_password: temp_password,

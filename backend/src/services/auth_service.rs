@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
+use jsonwebtoken::{
+    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -85,6 +87,31 @@ pub struct TokenPair {
 /// performance (cargo makes ~40 authenticated requests per build) against
 /// revocation latency (a revoked token remains valid at most this long).
 const API_TOKEN_CACHE_TTL_SECS: u64 = 300;
+
+static CREDENTIAL_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, i64>>> = OnceLock::new();
+const INVALIDATION_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
+fn invalidation_map() -> &'static RwLock<HashMap<Uuid, i64>> {
+    CREDENTIAL_INVALIDATIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn invalidate_user_tokens(user_id: Uuid) {
+    let now = Utc::now().timestamp();
+    if let Ok(mut map) = invalidation_map().write() {
+        map.insert(user_id, now);
+        let cutoff = now - INVALIDATION_RETENTION_SECS;
+        map.retain(|_, ts| *ts > cutoff);
+    }
+}
+
+fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
+    if let Ok(map) = invalidation_map().read() {
+        if let Some(&changed_at) = map.get(&user_id) {
+            return issued_at < changed_at;
+        }
+    }
+    false
+}
 
 /// Authentication service
 pub struct AuthService {
@@ -205,7 +232,6 @@ impl AuthService {
         })
     }
 
-    /// Validate and decode an access token
     pub fn validate_access_token(&self, token: &str) -> Result<Claims> {
         let token_data = self.decode_token(token)?;
 
@@ -213,12 +239,23 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
+        if is_token_invalidated(token_data.claims.sub, token_data.claims.iat) {
+            return Err(AppError::Authentication(
+                "Token invalidated by credential change".to_string(),
+            ));
+        }
+
         Ok(token_data.claims)
     }
 
-    /// Refresh tokens using a refresh token
     pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<(User, TokenPair)> {
         let token_data = self.decode_token(refresh_token)?;
+
+        if is_token_invalidated(token_data.claims.sub, token_data.claims.iat) {
+            return Err(AppError::Authentication(
+                "Token invalidated by credential change".to_string(),
+            ));
+        }
 
         if token_data.claims.token_type != "refresh" {
             return Err(AppError::Authentication("Invalid token type".to_string()));
@@ -248,9 +285,9 @@ impl AuthService {
         Ok((user, tokens))
     }
 
-    /// Decode and validate a token
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
-        decode::<Claims>(token, &self.decoding_key, &Validation::default())
+        let validation = Validation::new(Algorithm::HS256);
+        decode::<Claims>(token, &self.decoding_key, &validation)
             .map_err(|e| AppError::Authentication(format!("Invalid token: {}", e)))
     }
 
@@ -1223,16 +1260,24 @@ mod tests {
         let refresh_token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
 
         // Validate access token
-        let decoded =
-            decode::<Claims>(&access_token, &decoding_key, &Validation::default()).unwrap();
+        let decoded = decode::<Claims>(
+            &access_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .unwrap();
         assert_eq!(decoded.claims.sub, user.id);
         assert_eq!(decoded.claims.username, "testuser");
         assert_eq!(decoded.claims.token_type, "access");
         assert!(!decoded.claims.is_admin);
 
         // Validate refresh token
-        let decoded =
-            decode::<Claims>(&refresh_token, &decoding_key, &Validation::default()).unwrap();
+        let decoded = decode::<Claims>(
+            &refresh_token,
+            &decoding_key,
+            &Validation::new(Algorithm::HS256),
+        )
+        .unwrap();
         assert_eq!(decoded.claims.sub, user.id);
         assert_eq!(decoded.claims.token_type, "refresh");
     }
@@ -1258,7 +1303,8 @@ mod tests {
         let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
 
         // Decoding succeeds, but validate_access_token should reject
-        let decoded = decode::<Claims>(&token, &decoding_key, &Validation::default()).unwrap();
+        let decoded =
+            decode::<Claims>(&token, &decoding_key, &Validation::new(Algorithm::HS256)).unwrap();
         assert_eq!(decoded.claims.token_type, "refresh");
         // This would fail in validate_access_token because token_type != "access"
     }
@@ -1282,7 +1328,7 @@ mod tests {
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
-        let result = decode::<Claims>(&token, &decoding_key, &Validation::default());
+        let result = decode::<Claims>(&token, &decoding_key, &Validation::new(Algorithm::HS256));
         assert!(result.is_err());
     }
 
@@ -1303,7 +1349,7 @@ mod tests {
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
-        let result = decode::<Claims>(&token, &decoding_key, &Validation::default());
+        let result = decode::<Claims>(&token, &decoding_key, &Validation::new(Algorithm::HS256));
         assert!(result.is_err());
     }
 
@@ -1796,5 +1842,56 @@ mod tests {
             .retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
 
         assert!(cache.read().unwrap().get(&key).is_none());
+    }
+
+    #[test]
+    fn test_invalidate_user_tokens_marks_user() {
+        let user_id = Uuid::new_v4();
+        let before = Utc::now().timestamp();
+        invalidate_user_tokens(user_id);
+        assert!(is_token_invalidated(user_id, before - 1));
+    }
+
+    #[test]
+    fn test_token_issued_after_invalidation_is_accepted() {
+        let user_id = Uuid::new_v4();
+        invalidate_user_tokens(user_id);
+        let after = Utc::now().timestamp() + 1;
+        assert!(!is_token_invalidated(user_id, after));
+    }
+
+    #[test]
+    fn test_unknown_user_is_not_invalidated() {
+        let unknown = Uuid::new_v4();
+        assert!(!is_token_invalidated(unknown, 0));
+    }
+
+    #[test]
+    fn test_decode_rejects_alg_none_token() {
+        let config = make_test_config();
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+        let header_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"alg":"none","typ":"JWT"}"#)
+        };
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            username: "attacker".to_string(),
+            email: "evil@test.com".to_string(),
+            is_admin: true,
+            iat: Utc::now().timestamp(),
+            exp: (Utc::now() + Duration::hours(1)).timestamp(),
+            token_type: "access".to_string(),
+        };
+        let payload_json = serde_json::to_vec(&claims).unwrap();
+        let payload_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload_json)
+        };
+        let forged_token = format!("{}.{}.", header_b64, payload_b64);
+        let validation = Validation::new(Algorithm::HS256);
+        let result = decode::<Claims>(&forged_token, &decoding_key, &validation);
+        assert!(result.is_err(), "alg=none token must be rejected");
     }
 }

@@ -6,7 +6,7 @@
 //! current gRPC services (SBOM, CVE History, Security Policy) are admin-only
 //! operations, matching the HTTP layer's `admin_middleware` behaviour.
 
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use tonic::{Request, Status};
 
 use crate::services::auth_service::Claims;
@@ -48,7 +48,8 @@ impl AuthInterceptor {
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| Status::unauthenticated("Missing or invalid authorization token"))?;
 
-        let token_data = decode::<Claims>(token, &self.decoding_key, &Validation::default())
+        let validation = Validation::new(Algorithm::HS256);
+        let token_data = decode::<Claims>(token, &self.decoding_key, &validation)
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
 
         if token_data.claims.token_type != "access" {
