@@ -3,7 +3,7 @@
 use axum::{
     body::Bytes,
     extract::{Extension, Multipart, Path, Query, State},
-    http::header,
+    http::{header, HeaderMap},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -888,15 +888,39 @@ pub async fn list_artifacts(
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
-    let (artifacts, total) = artifact_service
-        .list(
-            repo.id,
-            query.path_prefix.as_deref(),
-            query.q.as_deref(),
-            offset,
-            per_page as i64,
-        )
-        .await?;
+    let (artifacts, total) = if repo.repo_type == RepositoryType::Virtual {
+        // For virtual repositories, aggregate artifacts from all member repos.
+        // Members are returned in priority order; local/hosted members are
+        // included alongside remote members so that locally published artifacts
+        // appear in the listing.
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+            .await
+            .map_err(|_| {
+                AppError::Internal("Failed to resolve virtual repository members".to_string())
+            })?;
+
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+
+        artifact_service
+            .list_for_repos(
+                &member_ids,
+                query.path_prefix.as_deref(),
+                query.q.as_deref(),
+                offset,
+                per_page as i64,
+            )
+            .await?
+    } else {
+        artifact_service
+            .list(
+                repo.id,
+                query.path_prefix.as_deref(),
+                query.q.as_deref(),
+                offset,
+                per_page as i64,
+            )
+            .await?
+    };
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -1016,6 +1040,7 @@ pub async fn upload_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ArtifactResponse>> {
     let auth = require_auth(auth)?;
@@ -1023,6 +1048,14 @@ pub async fn upload_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
+
+    // Verify declared checksums against actual content before storing anything.
+    let declared_sha256 = headers
+        .get("x-checksum-sha256")
+        .and_then(|v| v.to_str().ok());
+    let declared_sha1 = headers.get("x-checksum-sha1").and_then(|v| v.to_str().ok());
+    let declared_md5 = headers.get("x-checksum-md5").and_then(|v| v.to_str().ok());
+    ArtifactService::verify_checksums(&body, declared_sha256, declared_sha1, declared_md5)?;
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = state.create_artifact_service(storage);
@@ -1117,10 +1150,10 @@ async fn upload_artifact_multipart_with_path(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Json<ArtifactResponse>> {
     let (body, filename) = extract_multipart_file(multipart).await?;
-    // Prefer the URL path; fall back to the filename from the form field
     let artifact_path = if path.is_empty() || path == "/" {
         filename
     } else {
@@ -1130,6 +1163,7 @@ async fn upload_artifact_multipart_with_path(
         State(state),
         Extension(auth),
         Path((key, artifact_path)),
+        headers,
         body,
     )
     .await
@@ -1142,10 +1176,18 @@ async fn upload_artifact_multipart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Json<ArtifactResponse>> {
     let (body, filename) = extract_multipart_file(multipart).await?;
-    upload_artifact(State(state), Extension(auth), Path((key, filename)), body).await
+    upload_artifact(
+        State(state),
+        Extension(auth),
+        Path((key, filename)),
+        headers,
+        body,
+    )
+    .await
 }
 
 /// Extract the first file field from a multipart form.

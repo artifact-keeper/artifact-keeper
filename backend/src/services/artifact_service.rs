@@ -135,6 +135,66 @@ impl ArtifactService {
         format!("{:x}", hasher.finalize())
     }
 
+    /// Calculate SHA-1 checksum of data
+    pub fn calculate_sha1(data: &[u8]) -> String {
+        use sha1::Sha1;
+        let mut hasher = Sha1::new();
+        sha1::Digest::update(&mut hasher, data);
+        format!("{:x}", sha1::Digest::finalize(hasher))
+    }
+
+    /// Calculate MD5 checksum of data
+    pub fn calculate_md5(data: &[u8]) -> String {
+        use md5::Md5;
+        let mut hasher = Md5::new();
+        md5::Digest::update(&mut hasher, data);
+        format!("{:x}", md5::Digest::finalize(hasher))
+    }
+
+    /// Verify declared checksums against the actual content.
+    ///
+    /// If a declared checksum is provided (Some), the corresponding hash is
+    /// computed and compared. Returns `Err(AppError::Validation(...))` on the
+    /// first mismatch. Passing `None` for a checksum skips that algorithm.
+    pub fn verify_checksums(
+        data: &[u8],
+        declared_sha256: Option<&str>,
+        declared_sha1: Option<&str>,
+        declared_md5: Option<&str>,
+    ) -> Result<()> {
+        if let Some(declared) = declared_sha256 {
+            let actual = Self::calculate_sha256(data);
+            if !declared.eq_ignore_ascii_case(&actual) {
+                return Err(AppError::Validation(format!(
+                    "SHA-256 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, actual
+                )));
+            }
+        }
+
+        if let Some(declared) = declared_sha1 {
+            let actual = Self::calculate_sha1(data);
+            if !declared.eq_ignore_ascii_case(&actual) {
+                return Err(AppError::Validation(format!(
+                    "SHA-1 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, actual
+                )));
+            }
+        }
+
+        if let Some(declared) = declared_md5 {
+            let actual = Self::calculate_md5(data);
+            if !declared.eq_ignore_ascii_case(&actual) {
+                return Err(AppError::Validation(format!(
+                    "MD5 checksum mismatch: declared {} but actual content hashes to {}",
+                    declared, actual
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Generate content-addressable storage key from checksum
     pub fn storage_key_from_checksum(checksum: &str) -> String {
         // Use first 4 chars for directory sharding: ab/cd/abcd...
@@ -631,6 +691,92 @@ impl ArtifactService {
         Ok((artifacts, total))
     }
 
+    /// List artifacts across multiple repositories with pagination and optional search.
+    ///
+    /// Used for virtual repository listings that aggregate artifacts from all
+    /// member repositories. Artifacts are de-duplicated by path, with earlier
+    /// entries in `repo_ids` (higher priority members) taking precedence.
+    ///
+    /// Uses runtime query binding (`sqlx::query_as`) rather than the
+    /// compile-time macro so that no `.sqlx` offline cache entry is required.
+    pub async fn list_for_repos(
+        &self,
+        repo_ids: &[Uuid],
+        path_prefix: Option<&str>,
+        search_query: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<Artifact>, i64)> {
+        if repo_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let prefix_pattern = path_prefix.map(|p| format!("{}%", p));
+        let search_pattern = search_query.map(|q| format!("%{}%", q.to_lowercase()));
+
+        // Use DISTINCT ON (path) with priority ordering so that artifacts
+        // from higher-priority member repos shadow lower-priority ones at
+        // the same path. The priority is determined by the position in the
+        // repo_ids slice, which the caller provides in priority order.
+        let artifacts: Vec<Artifact> = sqlx::query_as(
+            r#"
+            SELECT
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_md5, checksum_sha1,
+                content_type, storage_key, is_deleted, uploaded_by,
+                created_at, updated_at
+            FROM (
+                SELECT DISTINCT ON (a.path)
+                    a.id, a.repository_id, a.path, a.name, a.version, a.size_bytes,
+                    a.checksum_sha256, a.checksum_md5, a.checksum_sha1,
+                    a.content_type, a.storage_key, a.is_deleted, a.uploaded_by,
+                    a.created_at, a.updated_at,
+                    array_position($1::uuid[], a.repository_id) as repo_priority
+                FROM artifacts a
+                WHERE a.repository_id = ANY($1)
+                  AND a.is_deleted = false
+                  AND ($2::text IS NULL OR a.path LIKE $2)
+                  AND ($5::text IS NULL OR LOWER(a.name) LIKE $5 OR LOWER(a.path) LIKE $5)
+                ORDER BY a.path, repo_priority
+            ) sub
+            ORDER BY path
+            OFFSET $3
+            LIMIT $4
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(&prefix_pattern)
+        .bind(offset)
+        .bind(limit)
+        .bind(&search_pattern)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT DISTINCT ON (a.path) a.id
+                FROM artifacts a
+                WHERE a.repository_id = ANY($1)
+                  AND a.is_deleted = false
+                  AND ($2::text IS NULL OR a.path LIKE $2)
+                  AND ($3::text IS NULL OR LOWER(a.name) LIKE $3 OR LOWER(a.path) LIKE $3)
+                ORDER BY a.path, array_position($1::uuid[], a.repository_id)
+            ) sub
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(&prefix_pattern)
+        .bind(&search_pattern)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok((artifacts, total))
+    }
+
     /// Soft-delete an artifact
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         // Get artifact info for plugin hooks
@@ -981,6 +1127,143 @@ mod tests {
         let hash1 = ArtifactService::calculate_sha256(b"data A");
         let hash2 = ArtifactService::calculate_sha256(b"data B");
         assert_ne!(hash1, hash2);
+    }
+
+    // -----------------------------------------------------------------------
+    // calculate_sha1 / calculate_md5
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_calculate_sha1_known_value() {
+        let hash = ArtifactService::calculate_sha1(b"test data");
+        assert_eq!(hash.len(), 40);
+        assert_eq!(hash, "f48dd853820860816c75d54d0f584dc863327a7c");
+    }
+
+    #[test]
+    fn test_calculate_md5_known_value() {
+        let hash = ArtifactService::calculate_md5(b"test data");
+        assert_eq!(hash.len(), 32);
+        assert_eq!(hash, "eb733a00c0c9d336e65691a37ab54293");
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_checksums
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_verify_checksums_all_none_passes() {
+        let result = ArtifactService::verify_checksums(b"anything", None, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksums_correct_sha256_passes() {
+        let data = b"hello world";
+        let sha256 = ArtifactService::calculate_sha256(data);
+        let result = ArtifactService::verify_checksums(data, Some(&sha256), None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksums_wrong_sha256_fails() {
+        let result = ArtifactService::verify_checksums(
+            b"hello world",
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SHA-256 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_verify_checksums_correct_sha1_passes() {
+        let data = b"hello world";
+        let sha1 = ArtifactService::calculate_sha1(data);
+        let result = ArtifactService::verify_checksums(data, None, Some(&sha1), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksums_wrong_sha1_fails() {
+        let result = ArtifactService::verify_checksums(
+            b"hello world",
+            None,
+            Some("0000000000000000000000000000000000000000"),
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SHA-1 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_verify_checksums_correct_md5_passes() {
+        let data = b"hello world";
+        let md5 = ArtifactService::calculate_md5(data);
+        let result = ArtifactService::verify_checksums(data, None, None, Some(&md5));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksums_wrong_md5_fails() {
+        let result = ArtifactService::verify_checksums(
+            b"hello world",
+            None,
+            None,
+            Some("00000000000000000000000000000000"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("MD5 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_verify_checksums_case_insensitive() {
+        let data = b"case test";
+        let sha256 = ArtifactService::calculate_sha256(data);
+        let upper = sha256.to_uppercase();
+        let result = ArtifactService::verify_checksums(data, Some(&upper), None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksums_all_three_correct() {
+        let data = b"triple check";
+        let sha256 = ArtifactService::calculate_sha256(data);
+        let sha1 = ArtifactService::calculate_sha1(data);
+        let md5 = ArtifactService::calculate_md5(data);
+        let result =
+            ArtifactService::verify_checksums(data, Some(&sha256), Some(&sha1), Some(&md5));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_checksums_sha256_correct_but_sha1_wrong() {
+        let data = b"partial match";
+        let sha256 = ArtifactService::calculate_sha256(data);
+        let result = ArtifactService::verify_checksums(
+            data,
+            Some(&sha256),
+            Some("0000000000000000000000000000000000000000"),
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SHA-1 checksum mismatch"));
+    }
+
+    #[test]
+    fn test_verify_checksums_empty_data() {
+        let data = b"";
+        let sha256 = ArtifactService::calculate_sha256(data);
+        let sha1 = ArtifactService::calculate_sha1(data);
+        let md5 = ArtifactService::calculate_md5(data);
+        let result =
+            ArtifactService::verify_checksums(data, Some(&sha256), Some(&sha1), Some(&md5));
+        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------
