@@ -237,10 +237,11 @@ jobs:
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Pull backend image
+      - name: Build backend image from PR source
         run: |
-          docker pull ghcr.io/artifact-keeper/artifact-keeper-backend:dev
-          docker tag ghcr.io/artifact-keeper/artifact-keeper-backend:dev artifact-keeper-backend:test
+          echo "Building backend image from current branch (not pulling :dev from registry)..."
+          docker build -f docker/Dockerfile.backend -t artifact-keeper-backend:test .
+        timeout-minutes: 10
 
       - name: Start smoke E2E stack
         run: docker compose -f docker-compose.test.yml --profile smoke up -d
