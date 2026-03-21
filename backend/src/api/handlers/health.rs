@@ -8,10 +8,12 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::Duration;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::api::SharedState;
+use crate::storage::StorageBackend;
 
 #[derive(Serialize, ToSchema)]
 pub struct HealthResponse {
@@ -132,7 +134,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         },
     };
 
-    let storage_check = check_storage_health(&state.config).await;
+    let storage_check = check_storage_health(&state.config, &state.storage).await;
 
     let scanner_check = match &state.config.trivy_url {
         Some(url) => Some(check_service_health(url, "/healthz", "Trivy").await),
@@ -174,7 +176,12 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         None
     };
 
-    let overall_status = if db_check.status == "healthy" {
+    let storage_healthy = storage_check.status == "healthy";
+    let meilisearch_healthy = meili_check
+        .as_ref()
+        .map_or(true, |m| m.status == "healthy");
+
+    let overall_status = if db_check.status == "healthy" && storage_healthy && meilisearch_healthy {
         "healthy"
     } else {
         "unhealthy"
@@ -327,8 +334,15 @@ pub async fn liveness_check() -> impl IntoResponse {
     })
 }
 
-/// Verify storage backend is writable.
-async fn check_storage_health(config: &crate::config::Config) -> CheckStatus {
+/// Verify storage backend connectivity.
+///
+/// Filesystem: write/read/delete a probe file.
+/// S3, GCS, Azure: perform a real API call via the storage backend's
+/// `health_check()` method, with a 5-second timeout.
+async fn check_storage_health(
+    config: &crate::config::Config,
+    storage: &Arc<dyn StorageBackend>,
+) -> CheckStatus {
     match config.storage_backend.as_str() {
         "filesystem" => {
             // Use a fixed probe filename to avoid path injection concerns.
@@ -374,30 +388,29 @@ async fn check_storage_health(config: &crate::config::Config) -> CheckStatus {
                 },
             }
         }
-        "s3" => {
-            if config.s3_bucket.is_some() {
-                CheckStatus {
+        "s3" | "gcs" | "azure" => {
+            // Perform a real connectivity probe with a 5-second timeout so a
+            // slow or hung backend does not block the health endpoint.
+            let probe = storage.health_check();
+            match tokio::time::timeout(Duration::from_secs(5), probe).await {
+                Ok(Ok(())) => CheckStatus {
                     status: "healthy".to_string(),
-                    message: Some("S3 config present (no probe)".to_string()),
-                }
-            } else {
-                CheckStatus {
+                    message: None,
+                },
+                Ok(Err(e)) => CheckStatus {
                     status: "unhealthy".to_string(),
-                    message: Some("S3 bucket not configured".to_string()),
-                }
-            }
-        }
-        "gcs" => {
-            if config.gcs_bucket.is_some() {
-                CheckStatus {
-                    status: "healthy".to_string(),
-                    message: Some("GCS config present (no probe)".to_string()),
-                }
-            } else {
-                CheckStatus {
+                    message: Some(format!(
+                        "{} storage probe failed: {}",
+                        config.storage_backend, e
+                    )),
+                },
+                Err(_) => CheckStatus {
                     status: "unhealthy".to_string(),
-                    message: Some("GCS bucket not configured".to_string()),
-                }
+                    message: Some(format!(
+                        "{} storage probe timed out (5s)",
+                        config.storage_backend
+                    )),
+                },
             }
         }
         _ => CheckStatus {
@@ -632,13 +645,61 @@ mod tests {
         assert!(json.contains("Admin password change required"));
     }
 
-    #[tokio::test]
-    async fn test_check_storage_health_gcs_with_bucket() {
-        let mut config = crate::config::Config {
+    use async_trait::async_trait;
+    use bytes::Bytes;
+
+    /// Mock storage backend that reports healthy.
+    struct HealthyMockBackend;
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for HealthyMockBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Mock storage backend that reports unhealthy.
+    struct UnhealthyMockBackend;
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for UnhealthyMockBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            Ok(Bytes::new())
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn health_check(&self) -> crate::error::Result<()> {
+            Err(crate::error::AppError::Storage(
+                "connection refused".to_string(),
+            ))
+        }
+    }
+
+    fn test_config(backend: &str) -> crate::config::Config {
+        crate::config::Config {
             database_url: "postgresql://test/test".to_string(),
             bind_address: "0.0.0.0:8080".to_string(),
             log_level: "info".to_string(),
-            storage_backend: "gcs".to_string(),
+            storage_backend: backend.to_string(),
             storage_path: "/tmp".to_string(),
             s3_bucket: None,
             gcs_bucket: Some("my-bucket".to_string()),
@@ -670,13 +731,58 @@ mod tests {
             lifecycle_check_interval_secs: 60,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
-        };
-        let status = check_storage_health(&config).await;
-        assert_eq!(status.status, "healthy");
+        }
+    }
 
-        config.gcs_bucket = None;
-        let status = check_storage_health(&config).await;
+    #[tokio::test]
+    async fn test_check_storage_health_gcs_healthy() {
+        let config = test_config("gcs");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+        let status = check_storage_health(&config, &storage).await;
+        assert_eq!(status.status, "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_check_storage_health_gcs_unhealthy() {
+        let config = test_config("gcs");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UnhealthyMockBackend);
+        let status = check_storage_health(&config, &storage).await;
         assert_eq!(status.status, "unhealthy");
+        assert!(status.message.unwrap().contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn test_check_storage_health_s3_healthy() {
+        let config = test_config("s3");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+        let status = check_storage_health(&config, &storage).await;
+        assert_eq!(status.status, "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_check_storage_health_s3_unhealthy() {
+        let config = test_config("s3");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(UnhealthyMockBackend);
+        let status = check_storage_health(&config, &storage).await;
+        assert_eq!(status.status, "unhealthy");
+        assert!(status.message.unwrap().contains("connection refused"));
+    }
+
+    #[tokio::test]
+    async fn test_check_storage_health_azure_healthy() {
+        let config = test_config("azure");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+        let status = check_storage_health(&config, &storage).await;
+        assert_eq!(status.status, "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_check_storage_health_unknown_backend() {
+        let config = test_config("ftp");
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(HealthyMockBackend);
+        let status = check_storage_health(&config, &storage).await;
+        assert_eq!(status.status, "unknown");
+        assert!(status.message.unwrap().contains("Unknown backend: ftp"));
     }
 
     #[test]

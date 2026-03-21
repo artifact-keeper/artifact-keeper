@@ -901,6 +901,30 @@ impl StorageBackend for GcsBackend {
             source: PresignedUrlSource::Gcs,
         }))
     }
+
+    async fn health_check(&self) -> Result<()> {
+        // GET the bucket metadata endpoint. A successful response proves that
+        // the bucket exists, credentials are valid, and the network path works.
+        let url = format!(
+            "{}/storage/v1/b/{}",
+            self.base_url,
+            urlencoding::encode(&self.config.bucket),
+        );
+        let response = self.authorized_get(&url).await.map_err(|e| {
+            AppError::Storage(format!("GCS health check failed: {}", e))
+        })?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(AppError::Storage(format!(
+            "GCS health check failed (status {}): {}",
+            status, body
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------

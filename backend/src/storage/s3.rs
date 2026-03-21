@@ -760,6 +760,43 @@ impl super::StorageBackend for S3Backend {
             source: PresignedUrlSource::S3,
         }))
     }
+
+    async fn health_check(&self) -> Result<()> {
+        // Use head_object on a sentinel key. A 404 (NoSuchKey) proves that the
+        // bucket is reachable and credentials are valid. Only transport-level or
+        // auth errors indicate an unhealthy backend.
+        match self.bucket.head_object(".health-probe").await {
+            Ok(_) => Ok(()),
+            Err(S3Error::HttpFailWithBody(status, _)) if (400..500).contains(&status) => {
+                // 4xx other than auth errors: bucket is reachable.
+                // 403 could mean bad creds, so treat that as unhealthy.
+                if status == 403 {
+                    Err(AppError::Storage(
+                        "S3 health check failed: access denied (403)".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                // 404 / NoSuchKey is expected and proves connectivity
+                if err_str.contains("404")
+                    || err_str.contains("NoSuchKey")
+                    || err_str.contains("Not Found")
+                {
+                    Ok(())
+                } else if err_str.contains("403") || err_str.contains("Access Denied") {
+                    Err(AppError::Storage(format!(
+                        "S3 health check failed: access denied: {}",
+                        e
+                    )))
+                } else {
+                    Err(AppError::Storage(format!("S3 health check failed: {}", e)))
+                }
+            }
+        }
+    }
 }
 
 /// Extended S3 backend operations (for StorageService compatibility)

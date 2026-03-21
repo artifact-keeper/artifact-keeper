@@ -1,14 +1,11 @@
-//! Prometheus metrics collection and HTTP request instrumentation.
+//! Prometheus metrics collection for business-level events.
+//!
+//! HTTP request instrumentation lives in `crate::api::middleware::metrics`.
+//! This module provides helpers for recording domain-specific metrics such as
+//! artifact uploads/downloads, security scans, backups, and storage gauges.
 
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use std::time::Instant;
-
-use axum::{
-    body::Body,
-    http::{Request, Response},
-    middleware::Next,
-};
 
 /// Initialize the Prometheus metrics recorder and return the handle for rendering.
 pub fn init_metrics() -> PrometheusHandle {
@@ -16,52 +13,6 @@ pub fn init_metrics() -> PrometheusHandle {
     builder
         .install_recorder()
         .expect("failed to install Prometheus recorder")
-}
-
-/// Axum middleware that records HTTP request metrics.
-pub async fn metrics_middleware(request: Request<Body>, next: Next) -> Response<Body> {
-    let method = request.method().clone().to_string();
-    let path = request.uri().path().to_string();
-    // Normalize path to avoid high-cardinality labels (strip UUIDs and IDs)
-    let normalized = normalize_path(&path);
-
-    let start = Instant::now();
-    counter!("ak_http_requests_total", "method" => method.clone(), "path" => normalized.clone())
-        .increment(1);
-    gauge!("ak_http_requests_in_flight", "method" => method.clone(), "path" => normalized.clone())
-        .increment(1.0);
-
-    let response = next.run(request).await;
-
-    let duration = start.elapsed().as_secs_f64();
-    let status = response.status().as_u16().to_string();
-
-    histogram!("ak_http_request_duration_seconds", "method" => method.clone(), "path" => normalized.clone(), "status" => status.clone()).record(duration);
-    counter!("ak_http_responses_total", "method" => method.clone(), "path" => normalized.clone(), "status" => status).increment(1);
-    gauge!("ak_http_requests_in_flight", "method" => method, "path" => normalized).decrement(1.0);
-
-    response
-}
-
-/// Normalize URL paths to reduce label cardinality.
-/// Replaces UUIDs, numeric IDs, and package versions with placeholders.
-fn normalize_path(path: &str) -> String {
-    let segments: Vec<&str> = path.split('/').collect();
-    let normalized: Vec<String> = segments
-        .iter()
-        .map(|seg| {
-            if seg.len() == 36 && seg.chars().filter(|c| *c == '-').count() == 4 {
-                // UUID pattern
-                ":id".to_string()
-            } else if seg.parse::<i64>().is_ok() && !seg.is_empty() {
-                // Numeric ID
-                ":id".to_string()
-            } else {
-                seg.to_string()
-            }
-        })
-        .collect();
-    normalized.join("/")
 }
 
 /// Record an artifact upload event.
@@ -131,23 +82,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize_path_uuid() {
-        let path = "/api/v1/repositories/550e8400-e29b-41d4-a716-446655440000/artifacts";
-        let result = normalize_path(path);
-        assert_eq!(result, "/api/v1/repositories/:id/artifacts");
+    fn test_prometheus_builder_can_be_created() {
+        // Verify that PrometheusBuilder::new() compiles and runs. We cannot
+        // call install_recorder() in tests because only one global recorder
+        // is allowed per process.
+        let _builder = PrometheusBuilder::new();
     }
 
     #[test]
-    fn test_normalize_path_numeric() {
-        let path = "/api/v1/users/123";
-        let result = normalize_path(path);
-        assert_eq!(result, "/api/v1/users/:id");
+    fn test_record_artifact_upload_does_not_panic() {
+        // Metrics macros are no-ops when no recorder is installed.
+        record_artifact_upload("my-repo", "maven", 1024);
     }
 
     #[test]
-    fn test_normalize_path_no_change() {
-        let path = "/api/v1/health";
-        let result = normalize_path(path);
-        assert_eq!(result, "/api/v1/health");
+    fn test_record_artifact_download_does_not_panic() {
+        record_artifact_download("my-repo", "npm");
+    }
+
+    #[test]
+    fn test_record_backup_does_not_panic() {
+        record_backup("full", true, 12.5);
+        record_backup("incremental", false, 0.3);
+    }
+
+    #[test]
+    fn test_record_security_scan_does_not_panic() {
+        record_security_scan("trivy", true, 5.0);
+        record_security_scan("openscap", false, 1.2);
+    }
+
+    #[test]
+    fn test_record_webhook_delivery_does_not_panic() {
+        record_webhook_delivery("artifact.created", true);
+        record_webhook_delivery("artifact.deleted", false);
+    }
+
+    #[test]
+    fn test_record_cleanup_does_not_panic() {
+        record_cleanup("temp_files", 42);
+    }
+
+    #[test]
+    fn test_set_storage_gauge_does_not_panic() {
+        set_storage_gauge(1_000_000, 500, 10);
+    }
+
+    #[test]
+    fn test_set_user_gauge_does_not_panic() {
+        set_user_gauge(25);
     }
 }

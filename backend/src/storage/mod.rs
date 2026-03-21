@@ -72,6 +72,15 @@ pub trait StorageBackend: Send + Sync {
         let _ = (key, expires_in); // Suppress unused warnings
         Ok(None)
     }
+
+    /// Perform a lightweight connectivity probe against the storage backend.
+    ///
+    /// Returns `Ok(())` if the backend is reachable and authenticated.
+    /// The default implementation always succeeds; cloud backends (S3, GCS,
+    /// Azure) override this with a real API call.
+    async fn health_check(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

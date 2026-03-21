@@ -41,7 +41,38 @@ use artifact_keeper_backend::{
         wasm_plugin_service::WasmPluginService,
     },
 };
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
+
+/// Wait for a shutdown signal (Ctrl+C or SIGTERM).
+///
+/// Returns once either signal is received. This allows Kubernetes to send
+/// SIGTERM during pod termination while also supporting local Ctrl+C.
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => { tracing::info!("received Ctrl+C, starting graceful shutdown"); },
+        _ = terminate => { tracing::info!("received SIGTERM, starting graceful shutdown"); },
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -347,7 +378,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .merge(api::routes::create_router(state))
         .layer(axum::middleware::from_fn(
-            artifact_keeper_backend::services::metrics_service::metrics_middleware,
+            artifact_keeper_backend::api::middleware::metrics::metrics_middleware,
         ))
         .layer({
             // In production the frontend is served from the same origin, so
@@ -431,6 +462,18 @@ async fn main() -> Result<()> {
         ))
         .layer(TraceLayer::new_for_http());
 
+    // Shared cancellation token: when the shutdown signal fires, both the
+    // HTTP and gRPC servers are notified to stop accepting new connections
+    // and drain in-flight requests before the process exits.
+    let shutdown_token = CancellationToken::new();
+
+    // Spawn a task that waits for SIGTERM or Ctrl+C, then cancels the token.
+    let signal_token = shutdown_token.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_token.cancel();
+    });
+
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
     tracing::info!("HTTP server listening on {}", addr);
@@ -463,6 +506,7 @@ async fn main() -> Result<()> {
     let grpc_auth_sbom = grpc_auth.clone();
     let grpc_auth_cve = grpc_auth.clone();
     let grpc_auth_policy = grpc_auth;
+    let grpc_shutdown_token = shutdown_token.clone();
     tokio::spawn(async move {
         tracing::info!("gRPC server listening on {}", grpc_addr);
         #[allow(clippy::result_large_err)]
@@ -485,15 +529,21 @@ async fn main() -> Result<()> {
                 security_policy_server,
                 policy_interceptor,
             ))
-            .serve(grpc_addr)
+            .serve_with_shutdown(grpc_addr, grpc_shutdown_token.cancelled())
             .await
         {
             tracing::error!("gRPC server error: {}", e);
         }
+        tracing::info!("gRPC server shut down");
     });
 
+    let http_shutdown_token = shutdown_token.clone();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
+        .await?;
+
+    tracing::info!("HTTP server shut down");
 
     Ok(())
 }

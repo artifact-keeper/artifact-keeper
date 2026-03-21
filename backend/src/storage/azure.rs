@@ -885,6 +885,34 @@ impl StorageBackend for AzureBackend {
             source: PresignedUrlSource::Azure,
         }))
     }
+
+    async fn health_check(&self) -> Result<()> {
+        // HEAD a sentinel blob path. A 404 is fine (proves the container is
+        // reachable and credentials are accepted). Only transport-level or
+        // authentication errors indicate an unhealthy backend.
+        let url = self.blob_url(".health-probe");
+        let response = self.authorized_head(&url).await.map_err(|e| {
+            AppError::Storage(format!("Azure health check failed: {}", e))
+        })?;
+
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else if status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::UNAUTHORIZED
+        {
+            Err(AppError::Storage(format!(
+                "Azure health check failed: access denied ({})",
+                status
+            )))
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(AppError::Storage(format!(
+                "Azure health check failed (status {}): {}",
+                status, body
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
