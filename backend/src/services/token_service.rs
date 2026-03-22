@@ -291,6 +291,16 @@ impl TokenService {
     /// # Returns
     /// * `Ok(u64)` - Number of tokens revoked
     pub async fn revoke_all_tokens(&self, user_id: Uuid) -> Result<u64> {
+        // Fetch active token IDs before revoking so we can invalidate the
+        // in-memory cache for each one.
+        let token_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM api_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         let result = sqlx::query(
             "UPDATE api_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
         )
@@ -298,6 +308,10 @@ impl TokenService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        for id in &token_ids {
+            crate::services::auth_service::mark_api_token_revoked(*id);
+        }
 
         Ok(result.rows_affected())
     }
