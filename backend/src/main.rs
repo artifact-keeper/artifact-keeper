@@ -1389,23 +1389,18 @@ mod tests {
         // We cannot actually run it in a unit test because it needs a database,
         // but confirming the function signature accepts Option<CancellationToken>
         // ensures the refactor is correct.
-        let _: fn(
-            Option<CancellationToken>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
-            |token| Box::pin(run_server(token));
+        fn _assert_callable(token: Option<CancellationToken>) {
+            drop(run_server(token));
+        }
     }
 
     #[test]
     fn test_run_server_accepts_some_token() {
         // Verify that run_server compiles with Some(token) (Windows Service mode).
-        let token = CancellationToken::new();
-        let _: fn(
-            Option<CancellationToken>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
-            |token| Box::pin(run_server(token));
-        drop(token);
+        fn _assert_callable_with_token() {
+            let token = CancellationToken::new();
+            drop(run_server(Some(token)));
+        }
     }
 
     // -----------------------------------------------------------------------
