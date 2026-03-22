@@ -980,12 +980,24 @@ fn find_upstream_url_for_file(index_html: &str, filename: &str) -> Option<String
 ///
 /// Absolute URLs (`http://`, `https://`) and root-relative paths starting with
 /// `/pypi/` are rewritten. Plain relative URLs and anchors are left unchanged.
+///
+/// PEP 658 metadata attributes (`data-dist-info-metadata` and
+/// `data-core-metadata`) are stripped from rewritten links because the proxy
+/// cannot serve `.metadata` files for packages it has not stored locally.
+/// Keeping these attributes would cause pip to request a `.metadata` URL that
+/// returns 404, which pip treats as a hard error since the index promised the
+/// metadata was available.
 fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
     // Match <a href="..."> patterns where the URL is either:
     //   1. An absolute URL (http:// or https://)
     //   2. A root-relative path starting with /pypi/ (from a local upstream repo)
     let re = Regex::new(r#"<a\s+([^>]*?)href="(https?://[^"]+|/pypi/[^"]+)"([^>]*)>"#).unwrap();
     let normalized = PypiHandler::normalize_name(project);
+
+    // Matches data-dist-info-metadata="..." and data-core-metadata="..."
+    // attributes that we need to strip from proxied links.
+    let metadata_attr_re =
+        Regex::new(r#"\s*data-(?:dist-info-metadata|core-metadata)="[^"]*""#).unwrap();
 
     re.replace_all(html, |caps: &regex::Captures| {
         let before_href = &caps[1];
@@ -1010,7 +1022,17 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
             "/pypi/{}/simple/{}/{}{}",
             repo_key, normalized, filename, fragment
         );
-        format!("<a {}href=\"{}\"{}>", before_href, rewritten, after_href)
+
+        // Strip PEP 658 metadata attributes. The proxy does not cache or
+        // serve .metadata files, so advertising them causes pip to fail
+        // with a 404 when it tries to fetch the promised metadata.
+        let before_cleaned = metadata_attr_re.replace_all(before_href, "");
+        let after_cleaned = metadata_attr_re.replace_all(after_href, "");
+
+        format!(
+            "<a {}href=\"{}\"{}>",
+            before_cleaned, rewritten, after_cleaned
+        )
     })
     .into_owned()
 }
@@ -1300,6 +1322,77 @@ mod tests {
         // data-requires-python and other structure should be preserved
         assert!(result.contains("data-requires-python"));
         assert!(result.contains("<h1>Links for mypackage</h1>"));
+    }
+
+    #[test]
+    fn test_rewrite_strips_data_dist_info_metadata() {
+        // Real PyPI HTML includes data-dist-info-metadata on .whl links.
+        // The proxy cannot serve .metadata files, so these attributes must
+        // be stripped to prevent pip from requesting them and getting 404.
+        let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=8abb" data-requires-python="&gt;=2.7" data-dist-info-metadata="sha256=5507" data-core-metadata="sha256=5507">six-1.16.0-py2.py3-none-any.whl</a>"#;
+        let result = rewrite_upstream_urls(html, "pypi-proxy", "six");
+        assert!(result.contains(
+            r#"href="/pypi/pypi-proxy/simple/six/six-1.16.0-py2.py3-none-any.whl#sha256=8abb""#
+        ));
+        // data-requires-python should be preserved
+        assert!(result.contains(r#"data-requires-python="&gt;=2.7""#));
+        // PEP 658 metadata attributes must be stripped
+        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(!result.contains("data-core-metadata"));
+    }
+
+    #[test]
+    fn test_rewrite_strips_metadata_attrs_from_real_pypi_html() {
+        // Simulates the actual HTML returned by pypi.org for the `six` package
+        let html = r#"<!DOCTYPE html>
+<html>
+<head><meta name="pypi:repository-version" content="1.4"><title>Links for six</title></head>
+<body>
+<h1>Links for six</h1>
+<a href="https://files.pythonhosted.org/packages/b7/ce/six-1.17.0-py2.py3-none-any.whl#sha256=4721" data-requires-python="!=3.0.*,!=3.1.*,!=3.2.*,&gt;=2.7" data-dist-info-metadata="sha256=5620" data-core-metadata="sha256=5620">six-1.17.0-py2.py3-none-any.whl</a><br />
+<a href="https://files.pythonhosted.org/packages/94/e7/six-1.17.0.tar.gz#sha256=ff70" data-requires-python="!=3.0.*,!=3.1.*,!=3.2.*,&gt;=2.7" >six-1.17.0.tar.gz</a><br />
+</body>
+</html>
+"#;
+        let result = rewrite_upstream_urls(html, "pypi-proxy", "six");
+
+        // URLs should be rewritten
+        assert!(!result.contains("files.pythonhosted.org"));
+        assert!(result.contains(
+            r#"href="/pypi/pypi-proxy/simple/six/six-1.17.0-py2.py3-none-any.whl#sha256=4721""#
+        ));
+        assert!(
+            result.contains(r#"href="/pypi/pypi-proxy/simple/six/six-1.17.0.tar.gz#sha256=ff70""#)
+        );
+
+        // data-requires-python should be preserved on both links
+        assert!(result.contains("data-requires-python"));
+
+        // PEP 658 metadata attributes must be stripped from the .whl link
+        assert!(!result.contains("data-dist-info-metadata"));
+        assert!(!result.contains("data-core-metadata"));
+
+        // Structure should be preserved
+        assert!(result.contains("<h1>Links for six</h1>"));
+    }
+
+    #[test]
+    fn test_rewrite_strips_metadata_attr_before_href() {
+        // Edge case: metadata attribute appears before href
+        let html = r#"<a data-dist-info-metadata="sha256=abc" href="https://example.com/pkg-1.0.whl#sha256=def">pkg-1.0.whl</a>"#;
+        let result = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=def""#));
+        assert!(!result.contains("data-dist-info-metadata"));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_non_metadata_attrs() {
+        // Only PEP 658 attrs should be stripped; other data-* attrs remain
+        let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=abc" data-requires-python="&gt;=3.8" data-dist-info-metadata="sha256=def" data-gpg-sig="true">pkg-1.0.whl</a>"#;
+        let result = rewrite_upstream_urls(html, "repo", "pkg");
+        assert!(result.contains("data-requires-python"));
+        assert!(result.contains("data-gpg-sig"));
+        assert!(!result.contains("data-dist-info-metadata"));
     }
 
     // -----------------------------------------------------------------------
