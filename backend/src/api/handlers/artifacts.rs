@@ -16,26 +16,49 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 
-/// Deny access to private repo artifacts for unauthenticated users.
+/// Check that the caller is allowed to see this artifact.
+///
+/// Unauthenticated requests are rejected for artifacts in private repos.
+/// Authenticated requests with repository-scoped API tokens are rejected
+/// if the artifact's repository is not in the token's allowed set.
 async fn check_artifact_visibility(
     auth: &Option<AuthExtension>,
     artifact_id: Uuid,
     db: &sqlx::PgPool,
 ) -> Result<()> {
-    if auth.is_some() {
-        return Ok(());
-    }
-    let is_public: Option<bool> = sqlx::query_scalar(
-        "SELECT r.is_public FROM repositories r JOIN artifacts a ON a.repository_id = r.id WHERE a.id = $1",
+    // Always fetch repo info so we can check both visibility and token scope.
+    let repo_info: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT r.id, r.is_public FROM repositories r \
+         JOIN artifacts a ON a.repository_id = r.id WHERE a.id = $1",
     )
     .bind(artifact_id)
     .fetch_optional(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
-    if is_public == Some(false) {
-        return Err(AppError::NotFound("Artifact not found".to_string()));
+
+    let Some((repo_id, is_public)) = repo_info else {
+        // No matching repo means the artifact query upstream will 404.
+        return Ok(());
+    };
+
+    match auth {
+        Some(ext) => {
+            // Enforce API token repository scope: if the token is restricted
+            // to specific repos, the artifact's repo must be in that set.
+            if !ext.can_access_repo(repo_id) {
+                return Err(AppError::Authorization(
+                    "Token does not have access to this repository".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        None => {
+            if !is_public {
+                return Err(AppError::NotFound("Artifact not found".to_string()));
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Create artifact routes

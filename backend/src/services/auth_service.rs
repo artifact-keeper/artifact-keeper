@@ -88,6 +88,44 @@ pub struct TokenPair {
 /// revocation latency (a revoked token remains valid at most this long).
 const API_TOKEN_CACHE_TTL_SECS: u64 = 300;
 
+/// Global set of revoked API token IDs. When an API token is revoked, its UUID
+/// is added here so that any in-memory cache hit for that token is rejected
+/// without waiting for the cache TTL to expire. Entries are retained for
+/// twice the cache TTL since after that the cache entry itself will have
+/// expired and the DB query will catch the revocation.
+static REVOKED_API_TOKENS: OnceLock<RwLock<HashMap<Uuid, Instant>>> = OnceLock::new();
+
+fn revoked_api_token_set() -> &'static RwLock<HashMap<Uuid, Instant>> {
+    REVOKED_API_TOKENS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Record an API token as revoked so cached validations are rejected immediately.
+pub fn mark_api_token_revoked(token_id: Uuid) {
+    if let Ok(mut set) = revoked_api_token_set().write() {
+        set.insert(token_id, Instant::now());
+        let cutoff_secs = API_TOKEN_CACHE_TTL_SECS * 2;
+        set.retain(|_, recorded_at| recorded_at.elapsed().as_secs() < cutoff_secs);
+    }
+}
+
+/// Check whether an API token has been marked as revoked.
+fn is_api_token_revoked_in_cache(token_id: Uuid) -> bool {
+    if let Ok(set) = revoked_api_token_set().read() {
+        return set.contains_key(&token_id);
+    }
+    false
+}
+
+/// Cached API token validation entry. Extends `ApiTokenValidation` with
+/// the token's database ID and expiry so that revocation and expiration
+/// can be checked on cache hit without a DB round-trip.
+#[derive(Clone, Debug)]
+struct CachedApiTokenEntry {
+    validation: ApiTokenValidation,
+    token_id: Uuid,
+    expires_at: Option<DateTime<Utc>>,
+}
+
 static CREDENTIAL_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, i64>>> = OnceLock::new();
 const INVALIDATION_RETENTION_SECS: i64 = 7 * 24 * 3600;
 
@@ -122,7 +160,7 @@ pub struct AuthService {
     /// In-memory cache of recently validated API tokens.  Avoids repeating the
     /// expensive bcrypt verification on every request (cargo sends credentials
     /// on every index and download request).
-    token_cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>>,
+    token_cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>>,
 }
 
 impl AuthService {
@@ -336,9 +374,19 @@ impl AuthService {
         // full bcrypt cost (~100-500 ms), which compounds across the many
         // parallel requests in a single build.
         if let Ok(cache) = self.token_cache.read() {
-            if let Some((cached, cached_at)) = cache.get(&cache_key) {
+            if let Some((entry, cached_at)) = cache.get(&cache_key) {
                 if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS {
-                    return Ok(cached.clone());
+                    // Even on cache hit, reject if the token has since been
+                    // revoked (Bug #1) or has expired (Bug #2).
+                    if is_api_token_revoked_in_cache(entry.token_id) {
+                        return Err(AppError::Unauthorized("Token has been revoked".to_string()));
+                    }
+                    if let Some(exp) = entry.expires_at {
+                        if exp < Utc::now() {
+                            return Err(AppError::Authentication("API token expired".to_string()));
+                        }
+                    }
+                    return Ok(entry.validation.clone());
                 }
             }
         }
@@ -472,7 +520,12 @@ impl AuthService {
         // Populate cache; evict stale entries on write to keep memory bounded.
         if let Ok(mut cache) = self.token_cache.write() {
             cache.retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
-            cache.insert(cache_key, (validation.clone(), Instant::now()));
+            let entry = CachedApiTokenEntry {
+                validation: validation.clone(),
+                token_id: stored_token.id,
+                expires_at: stored_token.expires_at,
+            };
+            cache.insert(cache_key, (entry, Instant::now()));
         }
 
         Ok(validation)
@@ -543,6 +596,11 @@ impl AuthService {
         if result.rows_affected() == 0 {
             return Err(AppError::NotFound("API token not found".to_string()));
         }
+
+        // Immediately mark the token as revoked in the global in-memory set so
+        // that any cached validation for this token is rejected without waiting
+        // for the cache TTL to expire.
+        mark_api_token_revoked(token_id);
 
         Ok(())
     }
@@ -1752,14 +1810,14 @@ mod tests {
     #[test]
     fn test_token_cache_construction() {
         // Verify the token_cache field can be constructed and used
-        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+        let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
         assert!(cache.read().unwrap().is_empty());
     }
 
     #[test]
     fn test_token_cache_insert_and_read() {
-        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+        let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
         let key = format!("{:x}", Sha256::digest(b"ak_testtest_token"));
         let validation = ApiTokenValidation {
@@ -1786,20 +1844,25 @@ mod tests {
             scopes: vec!["read:artifacts".to_string()],
             allowed_repo_ids: None,
         };
+        let entry = CachedApiTokenEntry {
+            validation,
+            token_id: Uuid::nil(),
+            expires_at: None,
+        };
         cache
             .write()
             .unwrap()
-            .insert(key.clone(), (validation.clone(), Instant::now()));
+            .insert(key.clone(), (entry, Instant::now()));
 
         let guard = cache.read().unwrap();
         let (cached, at) = guard.get(&key).unwrap();
-        assert_eq!(cached.user.username, "testuser");
+        assert_eq!(cached.validation.user.username, "testuser");
         assert!(at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
     }
 
     #[test]
     fn test_token_cache_eviction() {
-        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+        let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
         let key = format!("{:x}", Sha256::digest(b"ak_stalekey_token"));
         let validation = ApiTokenValidation {
@@ -1826,6 +1889,11 @@ mod tests {
             scopes: vec![],
             allowed_repo_ids: None,
         };
+        let entry = CachedApiTokenEntry {
+            validation,
+            token_id: Uuid::nil(),
+            expires_at: None,
+        };
 
         // Insert with a backdated timestamp
         let expired_at =
@@ -1833,7 +1901,7 @@ mod tests {
         cache
             .write()
             .unwrap()
-            .insert(key.clone(), (validation, expired_at));
+            .insert(key.clone(), (entry, expired_at));
 
         // Evict stale entries
         cache
@@ -1842,6 +1910,87 @@ mod tests {
             .retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
 
         assert!(cache.read().unwrap().get(&key).is_none());
+    }
+
+    #[test]
+    fn test_revoked_token_rejected_from_cache() {
+        let token_id = Uuid::new_v4();
+        mark_api_token_revoked(token_id);
+        assert!(is_api_token_revoked_in_cache(token_id));
+    }
+
+    #[test]
+    fn test_non_revoked_token_not_in_cache() {
+        let token_id = Uuid::new_v4();
+        assert!(!is_api_token_revoked_in_cache(token_id));
+    }
+
+    #[test]
+    fn test_cached_expired_token_detected() {
+        let past = Utc::now() - Duration::seconds(60);
+        let entry = CachedApiTokenEntry {
+            validation: ApiTokenValidation {
+                user: User {
+                    id: Uuid::nil(),
+                    username: "expired".to_string(),
+                    email: "expired@example.com".to_string(),
+                    password_hash: None,
+                    display_name: None,
+                    auth_provider: AuthProvider::Local,
+                    external_id: None,
+                    is_admin: false,
+                    is_active: true,
+                    is_service_account: false,
+                    must_change_password: false,
+                    totp_secret: None,
+                    totp_enabled: false,
+                    totp_backup_codes: None,
+                    totp_verified_at: None,
+                    last_login_at: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                scopes: vec![],
+                allowed_repo_ids: None,
+            },
+            token_id: Uuid::new_v4(),
+            expires_at: Some(past),
+        };
+        assert!(entry.expires_at.unwrap() < Utc::now());
+    }
+
+    #[test]
+    fn test_cached_non_expired_token_ok() {
+        let future = Utc::now() + Duration::days(30);
+        let entry = CachedApiTokenEntry {
+            validation: ApiTokenValidation {
+                user: User {
+                    id: Uuid::nil(),
+                    username: "valid".to_string(),
+                    email: "valid@example.com".to_string(),
+                    password_hash: None,
+                    display_name: None,
+                    auth_provider: AuthProvider::Local,
+                    external_id: None,
+                    is_admin: false,
+                    is_active: true,
+                    is_service_account: false,
+                    must_change_password: false,
+                    totp_secret: None,
+                    totp_enabled: false,
+                    totp_backup_codes: None,
+                    totp_verified_at: None,
+                    last_login_at: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                scopes: vec![],
+                allowed_repo_ids: None,
+            },
+            token_id: Uuid::new_v4(),
+            expires_at: Some(future),
+        };
+        assert!(entry.expires_at.unwrap() > Utc::now());
     }
 
     #[test]
