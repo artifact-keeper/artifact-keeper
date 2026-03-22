@@ -121,7 +121,7 @@ pub fn router() -> Router<SharedState> {
         )
         .route(
             "/:key/artifacts/*path",
-            get(get_artifact_metadata)
+            get(download_artifact)
                 .put(upload_artifact)
                 .post(upload_artifact_multipart_with_path)
                 .delete(delete_artifact),
@@ -1923,7 +1923,6 @@ pub async fn test_upstream(
         set_cache_ttl,
         get_cache_ttl,
         list_artifacts,
-        get_artifact_metadata,
         upload_artifact,
         download_artifact,
         delete_artifact,
