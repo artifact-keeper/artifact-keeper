@@ -29,6 +29,7 @@ use crate::services::saml_service::SamlService;
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/providers", get(list_providers))
+        .route("/oidc/callback", get(oidc_callback_generic))
         .route("/oidc/:id/login", get(oidc_login))
         .route("/oidc/:id/callback", get(oidc_callback))
         .route("/ldap/:id/login", post(ldap_login))
@@ -110,7 +111,7 @@ pub async fn oidc_login(
             AppError::Internal("OIDC discovery missing authorization_endpoint".into())
         })?;
 
-    // 4. Build redirect_uri from attribute_mapping, falling back to relative path
+    // 4. Build redirect_uri from attribute_mapping, falling back to generic path
     let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id);
 
     // 5. Build authorization URL
@@ -163,13 +164,38 @@ pub async fn oidc_callback(
     Path(id): Path<Uuid>,
     Query(params): Query<OidcCallbackQuery>,
 ) -> Result<Redirect> {
-    // 1. Validate SSO session (CSRF check)
+    // Validate SSO session (CSRF check), then delegate to shared logic
     let _session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
+    oidc_callback_inner(state, id, params.code).await
+}
 
-    // 2. Get decrypted OIDC config
-    let (row, client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
+/// Handle OIDC callback without provider UUID in the path.
+///
+/// Identity providers are typically configured with a single, stable redirect
+/// URI like `/api/v1/auth/sso/oidc/callback`. This handler resolves the
+/// correct provider from the `state` query parameter, which maps back to the
+/// SSO session that was created during the login redirect.
+pub async fn oidc_callback_generic(
+    State(state): State<SharedState>,
+    Query(params): Query<OidcCallbackQuery>,
+) -> Result<Redirect> {
+    // Validate SSO session and resolve the provider from the stored state
+    let session = AuthConfigService::validate_sso_session(&state.db, &params.state).await?;
+    oidc_callback_inner(state, session.provider_id, params.code).await
+}
 
-    // 3. Fetch OIDC discovery for token_endpoint
+/// Shared OIDC callback logic used by both the provider-specific and generic
+/// callback handlers. Assumes the SSO session has already been validated.
+async fn oidc_callback_inner(
+    state: SharedState,
+    provider_id: Uuid,
+    authorization_code: String,
+) -> Result<Redirect> {
+    // 1. Get decrypted OIDC config
+    let (row, client_secret) =
+        AuthConfigService::get_oidc_decrypted(&state.db, provider_id).await?;
+
+    // 2. Fetch OIDC discovery for token_endpoint
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
         row.issuer_url.trim_end_matches('/')
@@ -189,15 +215,15 @@ pub async fn oidc_callback(
         .as_str()
         .ok_or_else(|| AppError::Internal("OIDC discovery missing token_endpoint".into()))?;
 
-    // 4. Build redirect_uri (must match the one used in the login request)
-    let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &id);
+    // 3. Build redirect_uri (must match the one used in the login request)
+    let redirect_uri = resolve_oidc_redirect_uri(&row.attribute_mapping, &provider_id);
 
-    // 5. Exchange authorization code for tokens
+    // 4. Exchange authorization code for tokens
     let token_response: serde_json::Value = http_client
         .post(token_endpoint)
         .form(&[
             ("grant_type", "authorization_code"),
-            ("code", &params.code),
+            ("code", &authorization_code),
             ("redirect_uri", &redirect_uri),
             ("client_id", &row.client_id),
             ("client_secret", &client_secret),
@@ -213,10 +239,10 @@ pub async fn oidc_callback(
         .as_str()
         .ok_or_else(|| AppError::Internal("Token response missing id_token".into()))?;
 
-    // 6. Decode JWT payload (base64 decode the middle segment)
+    // 5. Decode JWT payload (base64 decode the middle segment)
     let claims = decode_jwt_payload(id_token)?;
 
-    // 7. Extract user claims (using attribute_mapping overrides when configured)
+    // 6. Extract user claims (using attribute_mapping overrides when configured)
     let attr = &row.attribute_mapping;
 
     let username_claim = resolve_oidc_claim_name(attr, "username_claim", "preferred_username");
@@ -240,7 +266,7 @@ pub async fn oidc_callback(
 
     let groups = extract_oidc_groups(&claims, groups_claim);
 
-    // 8. Authenticate via federated flow (find/create user + generate tokens)
+    // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (_user, tokens) = auth_service
@@ -256,7 +282,7 @@ pub async fn oidc_callback(
         )
         .await?;
 
-    // 9. Create a short-lived exchange code instead of passing raw tokens in the URL
+    // 8. Create a short-lived exchange code instead of passing raw tokens in the URL
     let exchange_code = AuthConfigService::create_exchange_code(
         &state.db,
         &tokens.access_token,
@@ -568,16 +594,21 @@ pub struct SsoApiDoc;
 // ---------------------------------------------------------------------------
 
 /// Resolve the redirect URI from OIDC attribute_mapping, falling back to the
-/// default callback path for the given provider ID.
+/// generic callback path (`/api/v1/auth/sso/oidc/callback`).
+///
+/// The generic callback route resolves the provider from the `state` query
+/// parameter, so the redirect URI no longer needs the provider UUID embedded
+/// in the path. This matches what most identity providers expect: a single,
+/// stable callback URL that does not change per provider.
 pub(crate) fn resolve_oidc_redirect_uri(
     attribute_mapping: &serde_json::Value,
-    provider_id: &uuid::Uuid,
+    _provider_id: &uuid::Uuid,
 ) -> String {
     attribute_mapping
         .get("redirect_uri")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_else(|| format!("/api/v1/auth/sso/oidc/{provider_id}/callback"))
+        .unwrap_or_else(|| "/api/v1/auth/sso/oidc/callback".to_string())
 }
 
 /// Resolve a claim name from OIDC attribute_mapping, returning the configured
@@ -824,9 +855,10 @@ mod tests {
     fn test_redirect_uri_fallback_when_missing() {
         let attr = serde_json::json!({});
         let id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        // Falls back to the generic callback path (no provider UUID)
         assert_eq!(
             resolve_oidc_redirect_uri(&attr, &id),
-            "/api/v1/auth/sso/oidc/550e8400-e29b-41d4-a716-446655440000/callback"
+            "/api/v1/auth/sso/oidc/callback"
         );
     }
 
@@ -836,7 +868,7 @@ mod tests {
         let id = uuid::Uuid::nil();
         assert_eq!(
             resolve_oidc_redirect_uri(&attr, &id),
-            "/api/v1/auth/sso/oidc/00000000-0000-0000-0000-000000000000/callback"
+            "/api/v1/auth/sso/oidc/callback"
         );
     }
 
@@ -844,8 +876,11 @@ mod tests {
     fn test_redirect_uri_fallback_when_non_string() {
         let attr = serde_json::json!({ "redirect_uri": 42 });
         let id = uuid::Uuid::nil();
-        // Non-string value should fall back to default
-        assert!(resolve_oidc_redirect_uri(&attr, &id).starts_with("/api/v1/auth/sso/oidc/"));
+        // Non-string value should fall back to generic callback
+        assert_eq!(
+            resolve_oidc_redirect_uri(&attr, &id),
+            "/api/v1/auth/sso/oidc/callback"
+        );
     }
 
     #[test]
