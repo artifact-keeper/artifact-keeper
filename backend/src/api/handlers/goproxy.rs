@@ -392,8 +392,7 @@ async fn version_info(
                         .status(StatusCode::OK)
                         .header(
                             "Content-Type",
-                            content_type
-                                .unwrap_or_else(|| "application/json".to_string()),
+                            content_type.unwrap_or_else(|| "application/json".to_string()),
                         )
                         .body(Body::from(content))
                         .unwrap());
@@ -786,8 +785,7 @@ async fn latest_version(
                         .status(StatusCode::OK)
                         .header(
                             "Content-Type",
-                            content_type
-                                .unwrap_or_else(|| "application/json".to_string()),
+                            content_type.unwrap_or_else(|| "application/json".to_string()),
                         )
                         .body(Body::from(content))
                         .unwrap());
