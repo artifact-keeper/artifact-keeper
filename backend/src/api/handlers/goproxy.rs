@@ -227,6 +227,65 @@ async fn handle_put(
 // GET /@v/list — List versions
 // ---------------------------------------------------------------------------
 
+/// Proxy a Go metadata request to the upstream for remote repos, or resolve
+/// through virtual repo members. Returns `Ok(response)` if the proxy produced
+/// a result, or `Err(())` if no proxy was available and the caller should fall
+/// back to the local/not-found response.
+async fn try_proxy_go_metadata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    upstream_path: &str,
+    default_content_type: &str,
+) -> Result<Response, ()> {
+    // Remote repo: proxy to upstream
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            if let Ok((content, content_type)) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, upstream_path)
+                    .await
+            {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        "Content-Type",
+                        content_type.unwrap_or_else(|| default_content_type.to_string()),
+                    )
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
+    }
+
+    // Virtual repo: try each member in priority order
+    if repo.repo_type == RepositoryType::Virtual {
+        let ct = default_content_type.to_string();
+        if let Ok(resp) = proxy_helpers::resolve_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            upstream_path,
+            |bytes, _key| {
+                let ct = ct.clone();
+                async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, ct)
+                        .body(Body::from(bytes))
+                        .unwrap())
+                }
+            },
+        )
+        .await
+        {
+            return Ok(resp);
+        }
+    }
+
+    Err(())
+}
+
 async fn list_versions(
     state: &SharedState,
     repo: &RepoInfo,
@@ -262,62 +321,12 @@ async fn list_versions(
         .join("\n");
 
     if body.is_empty() {
-        // Remote repo: proxy to upstream
-        if repo.repo_type == RepositoryType::Remote {
-            if let (Some(ref upstream_url), Some(ref proxy)) =
-                (&repo.upstream_url, &state.proxy_service)
-            {
-                let encoded = encode_module_path(module);
-                let upstream_path = format!("{}/@v/list", encoded);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
-                    proxy,
-                    repo.id,
-                    &repo.key,
-                    upstream_url,
-                    &upstream_path,
-                )
-                .await?;
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "text/plain; charset=utf-8".to_string()),
-                    )
-                    .body(Body::from(content))
-                    .unwrap());
-            }
-        }
-
-        // Virtual repo: collect version lists from remote members and merge
-        if repo.repo_type == RepositoryType::Virtual {
-            let encoded = encode_module_path(module);
-            let upstream_path = format!("{}/@v/list", encoded);
-            let remote_lists = proxy_helpers::collect_virtual_metadata(
-                &state.db,
-                state.proxy_service.as_deref(),
-                repo.id,
-                &upstream_path,
-                |bytes, _key| async move {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    Ok::<String, Response>(text)
-                },
-            )
-            .await?;
-
-            let merged: Vec<&str> = remote_lists
-                .iter()
-                .flat_map(|(_key, text)| text.lines())
-                .filter(|l| !l.is_empty())
-                .collect();
-
-            if !merged.is_empty() {
-                let merged_body = merged.join("\n");
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .body(Body::from(merged_body))
-                    .unwrap());
-            }
+        let encoded = encode_module_path(module);
+        let upstream_path = format!("{}/@v/list", encoded);
+        if let Ok(resp) =
+            try_proxy_go_metadata(state, repo, &upstream_path, "text/plain; charset=utf-8").await
+        {
+            return Ok(resp);
         }
     }
 
@@ -373,52 +382,13 @@ async fn version_info(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
-            // Remote repo: proxy to upstream
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let encoded = encode_module_path(module);
-                    let upstream_path = format!("{}/@v/{}.info", encoded, version);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo.key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/json".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
+            let encoded = encode_module_path(module);
+            let upstream_path = format!("{}/@v/{}.info", encoded, version);
+            if let Ok(resp) =
+                try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
+            {
+                return Ok(resp);
             }
-
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let encoded = encode_module_path(module);
-                let upstream_path = format!("{}/@v/{}.info", encoded, version);
-                return proxy_helpers::resolve_virtual_metadata(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |bytes, _key| async move {
-                        Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/json")
-                            .body(Body::from(bytes))
-                            .unwrap())
-                    },
-                )
-                .await;
-            }
-
             return Err(not_found);
         }
     };
@@ -766,52 +736,13 @@ async fn latest_version(
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
-            // Remote repo: proxy to upstream
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let encoded = encode_module_path(module);
-                    let upstream_path = format!("{}/@latest", encoded);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo.key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/json".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
+            let encoded = encode_module_path(module);
+            let upstream_path = format!("{}/@latest", encoded);
+            if let Ok(resp) =
+                try_proxy_go_metadata(state, repo, &upstream_path, "application/json").await
+            {
+                return Ok(resp);
             }
-
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let encoded = encode_module_path(module);
-                let upstream_path = format!("{}/@latest", encoded);
-                return proxy_helpers::resolve_virtual_metadata(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |bytes, _key| async move {
-                        Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/json")
-                            .body(Body::from(bytes))
-                            .unwrap())
-                    },
-                )
-                .await;
-            }
-
             return Err(not_found);
         }
     };
