@@ -51,6 +51,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Logging/Tracing
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender = "0.2"
 
 # OpenTelemetry
 opentelemetry.workspace = true
@@ -145,6 +146,9 @@ tonic.workspace = true
 tonic-reflection.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
 
 [build-dependencies]
 tonic-build.workspace = true

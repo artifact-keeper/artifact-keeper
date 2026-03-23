@@ -132,8 +132,13 @@ impl Config {
             bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".into()),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into()),
             storage_backend: env::var("STORAGE_BACKEND").unwrap_or_else(|_| "filesystem".into()),
-            storage_path: env::var("STORAGE_PATH")
-                .unwrap_or_else(|_| "/var/lib/artifact-keeper/artifacts".into()),
+            storage_path: env::var("STORAGE_PATH").unwrap_or_else(|_| {
+                if cfg!(windows) {
+                    r"C:\ProgramData\ArtifactKeeper\artifacts".into()
+                } else {
+                    "/var/lib/artifact-keeper/artifacts".into()
+                }
+            }),
             s3_bucket: env::var("S3_BUCKET").ok(),
             gcs_bucket: env::var("GCS_BUCKET").ok(),
             s3_region: env::var("S3_REGION").ok(),
@@ -154,8 +159,13 @@ impl Config {
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
             meilisearch_url: env::var("MEILISEARCH_URL").ok(),
             meilisearch_api_key: env::var("MEILISEARCH_API_KEY").ok(),
-            scan_workspace_path: env::var("SCAN_WORKSPACE_PATH")
-                .unwrap_or_else(|_| "/scan-workspace".into()),
+            scan_workspace_path: env::var("SCAN_WORKSPACE_PATH").unwrap_or_else(|_| {
+                if cfg!(windows) {
+                    r"C:\ProgramData\ArtifactKeeper\scan-workspace".into()
+                } else {
+                    "/scan-workspace".into()
+                }
+            }),
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
@@ -337,7 +347,14 @@ mod tests {
         assert_eq!(config.jwt_access_token_expiry_minutes, 30);
         assert_eq!(config.jwt_refresh_token_expiry_days, 7);
         assert!(!config.demo_mode);
-        assert_eq!(config.scan_workspace_path, "/scan-workspace");
+        if cfg!(windows) {
+            assert_eq!(
+                config.scan_workspace_path,
+                r"C:\ProgramData\ArtifactKeeper\scan-workspace"
+            );
+        } else {
+            assert_eq!(config.scan_workspace_path, "/scan-workspace");
+        }
         assert_eq!(config.peer_instance_name, "artifact-keeper-local");
         assert_eq!(config.peer_public_endpoint, "http://localhost:8080");
         assert_eq!(config.max_upload_size_bytes, 10_737_418_240);

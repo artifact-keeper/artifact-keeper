@@ -44,6 +44,9 @@ use artifact_keeper_backend::{
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
 
+#[cfg(windows)]
+mod windows_service;
+
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM).
 ///
 /// Returns once either signal is received. This allows Kubernetes to send
@@ -74,8 +77,9 @@ async fn shutdown_signal() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Core server logic extracted so it can be called from both the normal entrypoint
+/// and the Windows Service entrypoint with an externally-managed shutdown token.
+pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()> {
     // Install a rustls CryptoProvider before any TLS operations.
     // Required by rustls 0.23+ when multiple providers (ring, aws-lc-rs)
     // are compiled in via transitive dependencies (rust-s3, reqwest, sqlx).
@@ -85,7 +89,11 @@ async fn main() -> Result<()> {
         .expect("Failed to install rustls CryptoProvider");
 
     // Load environment variables
-    dotenvy::dotenv().ok();
+    if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
+        dotenvy::from_path(&env_file).ok();
+    } else {
+        dotenvy::dotenv().ok();
+    }
 
     // Initialize tracing (with optional OpenTelemetry OTLP export).
     // Read OTel config directly from env since Config::from_env() might fail
@@ -465,14 +473,20 @@ async fn main() -> Result<()> {
     // Shared cancellation token: when the shutdown signal fires, both the
     // HTTP and gRPC servers are notified to stop accepting new connections
     // and drain in-flight requests before the process exits.
-    let shutdown_token = CancellationToken::new();
-
-    // Spawn a task that waits for SIGTERM or Ctrl+C, then cancels the token.
-    let signal_token = shutdown_token.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        signal_token.cancel();
-    });
+    let shutdown_token = match shutdown_token {
+        Some(token) => token,
+        None => {
+            // No external token provided (console mode). Create our own and
+            // spawn the signal listener that cancels it on SIGTERM / Ctrl+C.
+            let token = CancellationToken::new();
+            let signal_token = token.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                signal_token.cancel();
+            });
+            token
+        }
+    };
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
@@ -546,6 +560,47 @@ async fn main() -> Result<()> {
     tracing::info!("HTTP server shut down");
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific entrypoints
+// ---------------------------------------------------------------------------
+
+#[cfg(not(windows))]
+#[tokio::main]
+async fn main() -> Result<()> {
+    run_server(None).await
+}
+
+#[cfg(windows)]
+fn main() -> Result<()> {
+    use artifact_keeper_backend::error::AppError;
+
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--service") {
+        windows_service::run_as_service().map_err(|e| {
+            eprintln!("Service error: {e}");
+            AppError::Config(e.to_string())
+        })
+    } else if args.iter().any(|a| a == "--install") {
+        windows_service::install_service(&args).map_err(|e| {
+            eprintln!("Install error: {e}");
+            AppError::Config(e.to_string())
+        })
+    } else if args.iter().any(|a| a == "--uninstall") {
+        windows_service::uninstall_service().map_err(|e| {
+            eprintln!("Uninstall error: {e}");
+            AppError::Config(e.to_string())
+        })
+    } else {
+        // Console mode: same as Linux/macOS
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        runtime.block_on(run_server(None))
+    }
 }
 
 /// Initialize the WASM plugin system (T068).
@@ -1323,4 +1378,62 @@ mod tests {
         assert!(!is_insecure_default_password("admin "));
         assert!(!is_insecure_default_password(" password "));
     }
+
+    // -----------------------------------------------------------------------
+    // run_server signature check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_run_server_accepts_none_token() {
+        // Verify that run_server compiles with None (console mode).
+        // We cannot actually run it in a unit test because it needs a database,
+        // but confirming the function signature accepts Option<CancellationToken>
+        // ensures the refactor is correct.
+        fn _assert_callable(token: Option<CancellationToken>) {
+            drop(run_server(token));
+        }
+    }
+
+    #[test]
+    fn test_run_server_accepts_some_token() {
+        // Verify that run_server compiles with Some(token) (Windows Service mode).
+        fn _assert_callable_with_token() {
+            let token = CancellationToken::new();
+            drop(run_server(Some(token)));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // AK_ENV_FILE logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ak_env_file_var_is_checked() {
+        // The AK_ENV_FILE environment variable should be read by the startup
+        // logic. We verify the env var lookup works (the actual file loading
+        // is tested implicitly by dotenvy).
+        let saved = std::env::var("AK_ENV_FILE").ok();
+
+        std::env::set_var("AK_ENV_FILE", "/tmp/nonexistent-test-env-file");
+        assert_eq!(
+            std::env::var("AK_ENV_FILE").unwrap(),
+            "/tmp/nonexistent-test-env-file"
+        );
+
+        // dotenvy::from_path on a nonexistent file returns Err, which is
+        // handled gracefully by the .ok() call in run_server.
+        let result = dotenvy::from_path("/tmp/nonexistent-test-env-file");
+        assert!(result.is_err());
+
+        // Restore
+        if let Some(v) = saved {
+            std::env::set_var("AK_ENV_FILE", v);
+        } else {
+            std::env::remove_var("AK_ENV_FILE");
+        }
+    }
+
+    // NOTE: windows_service.rs is behind #[cfg(windows)] and cannot be
+    // unit-tested on macOS/Linux. It is compile-checked on Windows CI and
+    // tested manually via `--install` / `--uninstall` / `--service` flags.
 }

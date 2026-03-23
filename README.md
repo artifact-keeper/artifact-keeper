@@ -246,7 +246,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 ## Documentation
 
 - **[Quickstart](https://artifactkeeper.com/docs/getting-started/quickstart/)** — Get running in 5 minutes
-- **[Installation](https://artifactkeeper.com/docs/getting-started/installation/)** — Docker Compose or build from source
+- **[Installation](https://artifactkeeper.com/docs/getting-started/installation/)** — Docker Compose, Windows Service (beta), or build from source
 - **[Configuration](https://artifactkeeper.com/docs/getting-started/configuration/)** — Environment variables reference
 - **[Package Formats](https://artifactkeeper.com/docs/package-formats/)** — All 45+ supported formats
 - **[Docker Deployment](https://artifactkeeper.com/docs/deployment/docker/)** — Production setup guide
