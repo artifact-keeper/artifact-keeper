@@ -62,6 +62,49 @@ pub(crate) fn generate_password() -> String {
         .collect()
 }
 
+/// Validate password strength beyond minimum length.
+fn validate_password(password: &str) -> Result<()> {
+    if password.len() < 8 {
+        return Err(AppError::Validation(
+            "Password must be at least 8 characters".to_string(),
+        ));
+    }
+    if password.len() > 128 {
+        return Err(AppError::Validation(
+            "Password must be at most 128 characters".to_string(),
+        ));
+    }
+    const COMMON_PASSWORDS: &[&str] = &[
+        "password",
+        "12345678",
+        "123456789",
+        "1234567890",
+        "qwerty123",
+        "qwertyui",
+        "password1",
+        "iloveyou",
+        "12341234",
+        "00000000",
+        "abc12345",
+        "11111111",
+        "password123",
+        "admin123",
+        "letmein1",
+        "welcome1",
+        "monkey12",
+        "dragon12",
+        "baseball1",
+        "trustno1",
+    ];
+    let lower = password.to_lowercase();
+    if COMMON_PASSWORDS.contains(&lower.as_str()) {
+        return Err(AppError::Validation(
+            "Password is too common; choose a stronger password".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateUserRequest {
     pub email: Option<String>,
@@ -217,11 +260,9 @@ pub async fn create_user(
 
     // Generate password if not provided, otherwise validate
     let (password, auto_generated) = match payload.password {
-        Some(ref p) if p.len() >= 8 => (p.clone(), false),
-        Some(_) => {
-            return Err(AppError::Validation(
-                "Password must be at least 8 characters".to_string(),
-            ));
+        Some(ref p) => {
+            validate_password(p)?;
+            (p.clone(), false)
         }
         None => (generate_password(), true),
     };
@@ -748,11 +789,7 @@ pub async fn change_password(
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<()> {
     // Validate new password
-    if payload.new_password.len() < 8 {
-        return Err(AppError::Validation(
-            "Password must be at least 8 characters".to_string(),
-        ));
-    }
+    validate_password(&payload.new_password)?;
 
     // For non-admins changing their own password, verify current password
     if auth.user_id == id && !auth.is_admin {
