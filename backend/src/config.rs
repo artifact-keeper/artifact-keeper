@@ -12,7 +12,7 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 /// Application configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Database connection URL
     pub database_url: String,
@@ -122,6 +122,44 @@ pub struct Config {
     /// recovery mechanism when SSO is misconfigured.
     pub allow_local_admin_login: bool,
 }
+
+redacted_debug!(Config {
+    redact database_url,
+    show bind_address,
+    show log_level,
+    show storage_backend,
+    show storage_path,
+    show s3_bucket,
+    show gcs_bucket,
+    show s3_region,
+    show s3_endpoint,
+    redact jwt_secret,
+    show jwt_expiration_secs,
+    show jwt_access_token_expiry_minutes,
+    show jwt_refresh_token_expiry_days,
+    show oidc_issuer,
+    show oidc_client_id,
+    redact_option oidc_client_secret,
+    show ldap_url,
+    show ldap_base_dn,
+    show trivy_url,
+    show openscap_url,
+    show openscap_profile,
+    show meilisearch_url,
+    redact_option meilisearch_api_key,
+    show scan_workspace_path,
+    show demo_mode,
+    show peer_instance_name,
+    show peer_public_endpoint,
+    redact peer_api_key,
+    show dependency_track_url,
+    show otel_exporter_otlp_endpoint,
+    show otel_service_name,
+    show gc_schedule,
+    show lifecycle_check_interval_secs,
+    show max_upload_size_bytes,
+    show allow_local_admin_login,
+});
 
 impl Config {
     /// Load configuration from environment variables
