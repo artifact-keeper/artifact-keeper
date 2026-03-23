@@ -27,6 +27,7 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
+use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
@@ -120,13 +121,7 @@ async fn get_package_metadata(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     if artifacts.is_empty() {
         // For remote repos, proxy the metadata from upstream
@@ -200,7 +195,7 @@ async fn get_package_metadata(
             .await;
         }
 
-        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
     // Build versions map and track the latest version
@@ -324,13 +319,7 @@ async fn serve_tarball(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     // If artifact not found locally, try proxy for remote repos
     let artifact = match artifact {
@@ -401,7 +390,7 @@ async fn serve_tarball(
                     .body(Body::from(content))
                     .unwrap());
             }
-            return Err((StatusCode::NOT_FOUND, "Tarball not found").into_response());
+            return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
         }
     };
 
@@ -409,13 +398,7 @@ async fn serve_tarball(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Record download
     let _ = sqlx::query!(
@@ -484,11 +467,7 @@ fn parse_npm_publish_payload(
     package_name: &str,
 ) -> Result<ParsedNpmPublish, Response> {
     let payload: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid JSON payload: {}", e),
-        )
-            .into_response()
+        AppError::Validation(format!("Invalid JSON payload: {}", e)).into_response()
     })?;
 
     let name = payload
@@ -497,28 +476,25 @@ fn parse_npm_publish_payload(
         .unwrap_or(package_name);
 
     if name != package_name {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Package name mismatch: URL says '{}' but payload says '{}'",
-                package_name, name
-            ),
-        )
-            .into_response());
+        return Err(AppError::Validation(format!(
+            "Package name mismatch: URL says '{}' but payload says '{}'",
+            package_name, name
+        ))
+        .into_response());
     }
 
     let versions_obj = payload
         .get("versions")
         .and_then(|v| v.as_object())
         .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "Missing 'versions' in payload").into_response()
+            AppError::Validation("Missing 'versions' in payload".to_string()).into_response()
         })?;
 
     let attachments_obj = payload
         .get("_attachments")
         .and_then(|v| v.as_object())
         .ok_or_else(|| {
-            (StatusCode::BAD_REQUEST, "Missing '_attachments' in payload").into_response()
+            AppError::Validation("Missing '_attachments' in payload".to_string()).into_response()
         })?;
 
     let mut versions = Vec::new();
@@ -550,26 +526,19 @@ fn extract_version_tarball(
         .get(&tarball_filename)
         .or_else(|| attachments_obj.values().next())
         .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("No attachment found for version {}", version),
-            )
+            AppError::Validation(format!("No attachment found for version {}", version))
                 .into_response()
         })?;
 
     let base64_data = attachment_data
         .get("data")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'data' in attachment").into_response())?;
+        .ok_or_else(|| AppError::Validation("Missing 'data' in attachment".to_string()).into_response())?;
 
     let tarball_bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_data)
         .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Invalid base64 data: {}", e),
-            )
-                .into_response()
+            AppError::Validation(format!("Invalid base64 data: {}", e)).into_response()
         })?;
 
     let mut hasher = Sha256::new();
@@ -607,20 +576,14 @@ async fn store_npm_version(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Version {} of {} already exists", ver.version, package_name),
-        )
-            .into_response());
+        return Err(AppError::Conflict(format!(
+            "Version {} of {} already exists",
+            ver.version, package_name
+        ))
+        .into_response());
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo_id, &artifact_path).await;
@@ -634,13 +597,7 @@ async fn store_npm_version(
     storage
         .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     let size_bytes = ver.tarball_bytes.len() as i64;
 
@@ -666,13 +623,7 @@ async fn store_npm_version(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     // Store metadata
     let npm_metadata = serde_json::json!({
