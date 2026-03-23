@@ -378,6 +378,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         storage_registry.clone(),
     );
 
+    // Keep a handle for the gRPC server before the sync worker consumes db_pool
+    let grpc_db_pool = db_pool.clone();
+
     // Spawn background sync worker for peer replication
     artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
     tracing::info!("Sync worker started");
@@ -499,10 +502,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .unwrap_or(9090);
     let grpc_addr: SocketAddr = format!("0.0.0.0:{}", grpc_port).parse()?;
 
-    let grpc_db = db::create_pool(&config.database_url).await?;
-    let sbom_server = SbomGrpcServer::new(grpc_db.clone());
-    let cve_history_server = CveHistoryGrpcServer::new(grpc_db.clone());
-    let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db);
+    // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
+    let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
+    let cve_history_server = CveHistoryGrpcServer::new(grpc_db_pool.clone());
+    let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db_pool);
 
     // gRPC auth interceptor — validates JWT Bearer tokens
     let grpc_auth =
