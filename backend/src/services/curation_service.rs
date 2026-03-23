@@ -525,6 +525,7 @@ fn version_compare(a: &str, b: &str) -> i32 {
 }
 
 #[cfg(test)]
+#[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
 
