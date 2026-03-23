@@ -509,7 +509,10 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Record download
     let _ = sqlx::query!(
@@ -567,7 +570,10 @@ async fn serve_metadata(
 
     // Try to extract METADATA from the package file
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     let metadata_text = if filename.ends_with(".whl") {
         extract_metadata_from_wheel(&content)
@@ -646,9 +652,11 @@ async fn upload(
     let mut summary: Option<String> = None;
     let mut metadata_fields: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        AppError::Validation(format!("Invalid multipart: {}", e)).into_response()
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Validation(format!("Invalid multipart: {}", e)).into_response())?
+    {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             ":action" => {
@@ -728,10 +736,12 @@ async fn upload(
 
     let pkg_name = pkg_name
         .ok_or_else(|| AppError::Validation("Missing 'name' field".to_string()).into_response())?;
-    let pkg_version = pkg_version
-        .ok_or_else(|| AppError::Validation("Missing 'version' field".to_string()).into_response())?;
-    let content = file_content
-        .ok_or_else(|| AppError::Validation("Missing 'content' field".to_string()).into_response())?;
+    let pkg_version = pkg_version.ok_or_else(|| {
+        AppError::Validation("Missing 'version' field".to_string()).into_response()
+    })?;
+    let content = file_content.ok_or_else(|| {
+        AppError::Validation("Missing 'content' field".to_string()).into_response()
+    })?;
     let filename = file_name.ok_or_else(|| {
         AppError::Validation("Missing filename in content field".to_string()).into_response()
     })?;
