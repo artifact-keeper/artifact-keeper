@@ -376,10 +376,10 @@ fn parse_publish_payload(body: &Bytes) -> Result<ParsedPublishPayload, Response>
 
     let json_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
     if body.len() < 4 + json_len + 4 {
-        return Err(
-            AppError::Validation("Payload too short for metadata + crate length".to_string())
-                .into_response(),
-        );
+        return Err(AppError::Validation(
+            "Payload too short for metadata + crate length".to_string(),
+        )
+        .into_response());
     }
 
     let json_bytes = &body[4..4 + json_len];
@@ -389,12 +389,16 @@ fn parse_publish_payload(body: &Bytes) -> Result<ParsedPublishPayload, Response>
 
     let crate_name = metadata["name"]
         .as_str()
-        .ok_or_else(|| AppError::Validation("Missing 'name' in metadata".to_string()).into_response())?
+        .ok_or_else(|| {
+            AppError::Validation("Missing 'name' in metadata".to_string()).into_response()
+        })?
         .to_string();
 
     let crate_version = metadata["vers"]
         .as_str()
-        .ok_or_else(|| AppError::Validation("Missing 'vers' in metadata".to_string()).into_response())?
+        .ok_or_else(|| {
+            AppError::Validation("Missing 'vers' in metadata".to_string()).into_response()
+        })?
         .to_string();
 
     let crate_len_offset = 4 + json_len;
@@ -407,7 +411,9 @@ fn parse_publish_payload(body: &Bytes) -> Result<ParsedPublishPayload, Response>
 
     let crate_data_offset = crate_len_offset + 4;
     if body.len() < crate_data_offset + crate_len {
-        return Err(AppError::Validation("Payload too short for .crate data".to_string()).into_response());
+        return Err(
+            AppError::Validation("Payload too short for .crate data".to_string()).into_response(),
+        );
     }
 
     let crate_bytes =
@@ -750,7 +756,10 @@ async fn download(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Record download
     let _ = sqlx::query!(
@@ -963,9 +972,10 @@ async fn try_virtual_index(
     };
 
     if members.is_empty() {
-        return Some(Err(
-            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
-        ));
+        return Some(Err(AppError::NotFound(
+            "Virtual repository has no members".to_string(),
+        )
+        .into_response()));
     }
 
     // Batch-fetch index_upstream_url overrides for all members in one query.
@@ -1054,10 +1064,10 @@ async fn try_virtual_index(
         }
     }
 
-    Some(Err(
-        AppError::NotFound("Artifact not found in any member repository".to_string())
-            .into_response(),
-    ))
+    Some(Err(AppError::NotFound(
+        "Artifact not found in any member repository".to_string(),
+    )
+    .into_response()))
 }
 
 /// Serve the sparse index file for a crate (one JSON object per version, per line).
