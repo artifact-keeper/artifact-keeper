@@ -471,7 +471,40 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                let uri = request.uri();
+                let path = uri.path();
+                let sanitized = if let Some(query) = uri.query() {
+                    let redacted: String = query
+                        .split('&')
+                        .map(|pair| {
+                            if let Some((key, _)) = pair.split_once('=') {
+                                let k = key.to_lowercase();
+                                if k == "token"
+                                    || k == "key"
+                                    || k == "api_key"
+                                    || k == "password"
+                                    || k == "secret"
+                                {
+                                    return format!("{}=[REDACTED]", key);
+                                }
+                            }
+                            pair.to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    format!("{}?{}", path, redacted)
+                } else {
+                    path.to_string()
+                };
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    uri = %sanitized,
+                )
+            }),
+        );
 
     // Shared cancellation token: when the shutdown signal fires, both the
     // HTTP and gRPC servers are notified to stop accepting new connections
