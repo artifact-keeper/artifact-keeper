@@ -142,7 +142,7 @@ pub fn invalidate_user_tokens(user_id: Uuid) {
     }
 }
 
-fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
+pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
     if let Ok(map) = invalidation_map().read() {
         if let Some(&changed_at) = map.get(&user_id) {
             return issued_at < changed_at;

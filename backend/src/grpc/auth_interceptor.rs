@@ -56,6 +56,15 @@ impl AuthInterceptor {
             return Err(Status::unauthenticated("Invalid token type"));
         }
 
+        // Check whether the token has been invalidated (e.g. password change,
+        // credential rotation). Mirrors the HTTP auth middleware check.
+        if crate::services::auth_service::is_token_invalidated(
+            token_data.claims.sub,
+            token_data.claims.iat,
+        ) {
+            return Err(Status::unauthenticated("Token has been revoked"));
+        }
+
         // Authorization: reject non-admin users when admin is required.
         // This mirrors the HTTP admin_middleware check.
         if self.require_admin && !token_data.claims.is_admin {
@@ -185,5 +194,40 @@ mod tests {
         let req = request_with_token("garbage");
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    // -----------------------------------------------------------------------
+    // Token invalidation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_revoked_token_rejected() {
+        let user_id = Uuid::new_v4();
+        // Issue the token in the past so invalidation timestamp is strictly later
+        let iat = chrono::Utc::now().timestamp() - 10;
+        let claims = Claims {
+            sub: user_id,
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin: true,
+            iat,
+            exp: iat + 3600,
+            token_type: "access".to_string(),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+
+        // Invalidate the user's tokens (timestamp will be now, after iat)
+        crate::services::auth_service::invalidate_user_tokens(user_id);
+
+        let interceptor = AuthInterceptor::new("secret");
+        let req = request_with_token(&token);
+        let err = interceptor.intercept(req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("revoked"));
     }
 }
