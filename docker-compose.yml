@@ -170,7 +170,7 @@ services:
       # and the API is locked until the admin changes it.
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       RUST_LOG: ${RUST_LOG:-info,artifact_keeper=debug}
-      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,https://localhost}
       TRIVY_URL: http://trivy:8090
       OPENSCAP_URL: http://openscap:8091
