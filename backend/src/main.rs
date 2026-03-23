@@ -114,9 +114,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let db_pool = db::create_pool(&config.database_url).await?;
     tracing::info!("Connected to database");
 
-    // Run migrations
-    sqlx::migrate!("./migrations").run(&db_pool).await?;
-    tracing::info!("Database migrations complete");
+    // Run migrations (skip with SKIP_MIGRATIONS=true for pre-applied migrations)
+    let skip_migrations = std::env::var("SKIP_MIGRATIONS")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("true");
+
+    if skip_migrations {
+        tracing::info!("SKIP_MIGRATIONS=true, skipping automatic database migrations");
+    } else {
+        tracing::info!("Running database migrations...");
+        sqlx::migrate!("./migrations").run(&db_pool).await?;
+        tracing::info!("Database migrations complete");
+    }
 
     // Provision admin user on first boot; returns true when setup lock is needed
     let setup_required = provision_admin_user(&db_pool, &config.storage_path).await?;
