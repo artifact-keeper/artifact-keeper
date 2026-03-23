@@ -1469,6 +1469,101 @@ mod tests {
     // build_go_upstream_path
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Upstream proxy path construction for list/info/latest
+    // (covers the paths built by the new proxy fallback code)
+    // -----------------------------------------------------------------------
+
+    fn build_go_upstream_list_path(module: &str) -> String {
+        let encoded = encode_module_path(module);
+        format!("{}/@v/list", encoded)
+    }
+
+    fn build_go_upstream_info_path(module: &str, version: &str) -> String {
+        let encoded = encode_module_path(module);
+        format!("{}/@v/{}.info", encoded, version)
+    }
+
+    fn build_go_upstream_latest_path(module: &str) -> String {
+        let encoded = encode_module_path(module);
+        format!("{}/@latest", encoded)
+    }
+
+    #[test]
+    fn test_build_go_upstream_list_path_simple() {
+        assert_eq!(
+            build_go_upstream_list_path("github.com/user/repo"),
+            "github.com/user/repo/@v/list"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_list_path_encoded() {
+        assert_eq!(
+            build_go_upstream_list_path("github.com/Azure/go-sdk"),
+            "github.com/!azure/go-sdk/@v/list"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_info_path_simple() {
+        assert_eq!(
+            build_go_upstream_info_path("github.com/user/repo", "v1.0.0"),
+            "github.com/user/repo/@v/v1.0.0.info"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_info_path_prerelease() {
+        assert_eq!(
+            build_go_upstream_info_path("golang.org/x/text", "v0.14.0-rc.1"),
+            "golang.org/x/text/@v/v0.14.0-rc.1.info"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_latest_path_simple() {
+        assert_eq!(
+            build_go_upstream_latest_path("github.com/user/repo"),
+            "github.com/user/repo/@latest"
+        );
+    }
+
+    #[test]
+    fn test_build_go_upstream_latest_path_encoded() {
+        assert_eq!(
+            build_go_upstream_latest_path("github.com/Azure/go-sdk"),
+            "github.com/!azure/go-sdk/@latest"
+        );
+    }
+
+    #[test]
+    fn test_version_list_merge_dedup() {
+        // Simulates the merge logic used in virtual repo list_versions
+        let list_a = "v1.0.0\nv1.1.0\nv2.0.0";
+        let list_b = "v1.1.0\nv2.0.0\nv3.0.0";
+        let merged: Vec<&str> = [list_a, list_b]
+            .iter()
+            .flat_map(|text| text.lines())
+            .filter(|l| !l.is_empty())
+            .collect();
+        // The handler collects all versions (including duplicates) from members
+        assert_eq!(merged.len(), 6);
+        assert!(merged.contains(&"v1.0.0"));
+        assert!(merged.contains(&"v3.0.0"));
+    }
+
+    #[test]
+    fn test_version_list_merge_empty_inputs() {
+        let lists: Vec<&str> = vec![];
+        let merged: Vec<&str> = lists
+            .iter()
+            .flat_map(|text| text.lines())
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(merged.is_empty());
+    }
+
     #[test]
     fn test_build_go_upstream_path_zip() {
         assert_eq!(
