@@ -1,0 +1,123 @@
+# Isolated S3 + Maven test environment for reproducing issue #361
+#
+# Spins up MinIO (S3-compatible), Postgres, and the backend configured
+# to use S3 storage. Maven test container exercises the full deploy flow.
+#
+# Usage:
+#   docker compose -f docker-compose.s3-maven-test.yml up -d minio postgres
+#   docker compose -f docker-compose.s3-maven-test.yml up backend
+#   docker compose -f docker-compose.s3-maven-test.yml run maven-test
+#
+# Teardown:
+#   docker compose -f docker-compose.s3-maven-test.yml down -v
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: s3-maven-test-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - s3_test_minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Create the bucket on startup
+  minio-init:
+    image: minio/mc:latest
+    container_name: s3-maven-test-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb local/artifact-keeper --ignore-existing &&
+      mc anonymous set none local/artifact-keeper &&
+      echo 'Bucket artifact-keeper created'
+      "
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: s3-maven-test-db
+    environment:
+      POSTGRES_USER: registry
+      POSTGRES_PASSWORD: registry
+      POSTGRES_DB: artifact_registry
+    volumes:
+      - s3_test_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "30433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry -d artifact_registry"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:dev
+    container_name: s3-maven-test-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      # S3 storage configuration pointing to MinIO
+      STORAGE_BACKEND: s3
+      S3_BUCKET: artifact-keeper
+      S3_REGION: us-east-1
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      # General config
+      JWT_SECRET: test-secret-for-s3-maven
+      ADMIN_PASSWORD: admin
+      RUST_LOG: info,artifact_keeper=debug,artifact_keeper_backend::storage::s3=trace
+      ENVIRONMENT: development
+      HOST: 0.0.0.0
+      PORT: 8080
+      STORAGE_PATH: /data/storage
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # Maven test container runs the full deploy cycle
+  maven-test:
+    image: maven:3.9-eclipse-temurin-21
+    container_name: s3-maven-test-client
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./scripts/s3-maven-test:/test:ro
+      - s3_test_maven_cache:/root/.m2/repository
+    environment:
+      REGISTRY_URL: http://backend:8080
+      REGISTRY_USER: admin
+      REGISTRY_PASS: admin
+    entrypoint: ["/bin/bash", "/test/run-test.sh"]
+
+volumes:
+  s3_test_minio_data:
+  s3_test_postgres_data:
+  s3_test_maven_cache:
+
+networks:
+  default:
+    name: s3-maven-test-network

@@ -527,7 +527,15 @@ impl super::StorageBackend for S3Backend {
             .put_object(&full_key, &content)
             .await
             .map_err(|e| {
-                tracing::error!(key = %key, full_key = %full_key, error = %e, "S3 put_object request failed");
+                // With fail-on-err, non-2xx responses arrive here as
+                // S3Error::HttpFailWithBody(status, body) which includes the
+                // full S3 error XML (e.g. AccessDenied, SignatureDoesNotMatch).
+                tracing::error!(
+                    key = %key,
+                    full_key = %full_key,
+                    error = %e,
+                    "S3 put_object failed"
+                );
                 AppError::Storage(format!("Failed to put object '{}': {}", key, e))
             })?;
 
