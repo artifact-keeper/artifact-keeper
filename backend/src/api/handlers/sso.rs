@@ -290,8 +290,11 @@ async fn oidc_callback_inner(
     )
     .await?;
 
+    // Next.js route group (auth) does not create a URL segment,
+    // so the frontend page at src/app/(auth)/callback/page.tsx
+    // is served at /callback, not /auth/callback.
     let frontend_url = format!(
-        "/auth/callback?code={}",
+        "/callback?code={}",
         urlencoding::encode(&exchange_code),
     );
 
@@ -513,8 +516,11 @@ pub async fn saml_acs(
     )
     .await?;
 
+    // Next.js route group (auth) does not create a URL segment,
+    // so the frontend page at src/app/(auth)/callback/page.tsx
+    // is served at /callback, not /auth/callback.
     let frontend_url = format!(
-        "/auth/callback?code={}",
+        "/callback?code={}",
         urlencoding::encode(&exchange_code),
     );
 
