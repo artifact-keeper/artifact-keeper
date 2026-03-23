@@ -30,6 +30,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_with_bearer_fallback, AuthExtension};
 use crate::api::SharedState;
 use crate::api::{CachedRepo, IndexCache, RepoCache, REPO_CACHE_TTL_SECS};
+use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
@@ -137,14 +138,11 @@ async fn resolve_cargo_repo(
             if at.elapsed().as_secs() < REPO_CACHE_TTL_SECS {
                 let fmt = entry.format.to_lowercase();
                 if fmt != "cargo" {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "Repository '{}' is not a Cargo repository (format: {})",
-                            repo_key, fmt
-                        ),
-                    )
-                        .into_response());
+                    return Err(AppError::Validation(format!(
+                        "Repository '{}' is not a Cargo repository (format: {})",
+                        repo_key, fmt
+                    ))
+                    .into_response());
                 }
                 return Ok(RepoInfo {
                     id: entry.id,
@@ -173,26 +171,17 @@ async fn resolve_cargo_repo(
     .bind(repo_key)
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?
+    .ok_or_else(|| AppError::NotFound("Repository not found".to_string()).into_response())?;
 
     let fmt: String = repo.get("format");
     let fmt = fmt.to_lowercase();
     if fmt != "cargo" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Repository '{}' is not a Cargo repository (format: {})",
-                repo_key, fmt
-            ),
-        )
-            .into_response());
+        return Err(AppError::Validation(format!(
+            "Repository '{}' is not a Cargo repository (format: {})",
+            repo_key, fmt
+        ))
+        .into_response());
     }
 
     let id: uuid::Uuid = repo.get("id");
@@ -324,13 +313,7 @@ async fn search_crates(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     let crate_list: Vec<serde_json::Value> = crates
         .iter()
@@ -388,35 +371,30 @@ struct ParsedPublishPayload {
 #[allow(clippy::result_large_err)]
 fn parse_publish_payload(body: &Bytes) -> Result<ParsedPublishPayload, Response> {
     if body.len() < 4 {
-        return Err((StatusCode::BAD_REQUEST, "Payload too short").into_response());
+        return Err(AppError::Validation("Payload too short".to_string()).into_response());
     }
 
     let json_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
     if body.len() < 4 + json_len + 4 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Payload too short for metadata + crate length",
-        )
-            .into_response());
+        return Err(
+            AppError::Validation("Payload too short for metadata + crate length".to_string())
+                .into_response(),
+        );
     }
 
     let json_bytes = &body[4..4 + json_len];
     let metadata: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid JSON metadata: {}", e),
-        )
-            .into_response()
+        AppError::Validation(format!("Invalid JSON metadata: {}", e)).into_response()
     })?;
 
     let crate_name = metadata["name"]
         .as_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'name' in metadata").into_response())?
+        .ok_or_else(|| AppError::Validation("Missing 'name' in metadata".to_string()).into_response())?
         .to_string();
 
     let crate_version = metadata["vers"]
         .as_str()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'vers' in metadata").into_response())?
+        .ok_or_else(|| AppError::Validation("Missing 'vers' in metadata".to_string()).into_response())?
         .to_string();
 
     let crate_len_offset = 4 + json_len;
@@ -429,7 +407,7 @@ fn parse_publish_payload(body: &Bytes) -> Result<ParsedPublishPayload, Response>
 
     let crate_data_offset = crate_len_offset + 4;
     if body.len() < crate_data_offset + crate_len {
-        return Err((StatusCode::BAD_REQUEST, "Payload too short for .crate data").into_response());
+        return Err(AppError::Validation("Payload too short for .crate data".to_string()).into_response());
     }
 
     let crate_bytes =
@@ -485,13 +463,7 @@ async fn check_duplicate_crate(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     if existing.is_some() {
         return Err(Response::builder()
@@ -530,13 +502,7 @@ async fn store_crate_artifact(
     storage
         .put(&storage_key, crate_bytes.clone())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
     let size_bytes = crate_bytes.len() as i64;
@@ -564,13 +530,7 @@ async fn store_crate_artifact(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     let _ = sqlx::query!(
         r#"
@@ -704,13 +664,7 @@ async fn download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     // If crate not found locally, try proxy for remote repos
     let artifact = match artifact {
@@ -789,20 +743,14 @@ async fn download(
                     .body(Body::from(content))
                     .unwrap());
             }
-            return Err((StatusCode::NOT_FOUND, "Crate not found").into_response());
+            return Err(AppError::NotFound("Crate not found".to_string()).into_response());
         }
     };
 
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Record download
     let _ = sqlx::query!(
@@ -1015,11 +963,9 @@ async fn try_virtual_index(
     };
 
     if members.is_empty() {
-        return Some(Err((
-            StatusCode::NOT_FOUND,
-            "Virtual repository has no members",
-        )
-            .into_response()));
+        return Some(Err(
+            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
+        ));
     }
 
     // Batch-fetch index_upstream_url overrides for all members in one query.
@@ -1108,11 +1054,10 @@ async fn try_virtual_index(
         }
     }
 
-    Some(Err((
-        StatusCode::NOT_FOUND,
-        "Artifact not found in any member repository",
-    )
-        .into_response()))
+    Some(Err(
+        AppError::NotFound("Artifact not found in any member repository".to_string())
+            .into_response(),
+    ))
 }
 
 /// Serve the sparse index file for a crate (one JSON object per version, per line).
@@ -1146,7 +1091,7 @@ async fn serve_index(
         .await
         {
             Some(result) => result,
-            None => Err((StatusCode::NOT_FOUND, "Crate not found in index").into_response()),
+            None => Err(AppError::NotFound("Crate not found in index".to_string()).into_response()),
         };
     }
     if repo.repo_type == "virtual" {
@@ -1154,7 +1099,7 @@ async fn serve_index(
             .await
         {
             Some(result) => result,
-            None => Err((StatusCode::NOT_FOUND, "Crate not found in index").into_response()),
+            None => Err(AppError::NotFound("Crate not found in index".to_string()).into_response()),
         };
     }
 
@@ -1175,13 +1120,7 @@ async fn serve_index(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     if versions.is_empty() {
         if let Some(result) = try_remote_index(
@@ -1201,7 +1140,7 @@ async fn serve_index(
         {
             return result;
         }
-        return Err((StatusCode::NOT_FOUND, "Crate not found in index").into_response());
+        return Err(AppError::NotFound("Crate not found in index".to_string()).into_response());
     }
 
     // Build index file: one JSON object per line

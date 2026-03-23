@@ -27,6 +27,7 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
+use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::RepositoryType;
 
@@ -83,13 +84,7 @@ async fn simple_root(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?
     .into_iter()
     .flatten()
     .collect();
@@ -167,13 +162,7 @@ async fn simple_project(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     if artifacts.is_empty() {
         // For remote repos, proxy the simple index from upstream
@@ -235,7 +224,7 @@ async fn simple_project(
             .await;
         }
 
-        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
     let accept = headers
@@ -380,13 +369,7 @@ async fn serve_file(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     // If artifact not found locally, try proxy for remote repos
     let artifact = match artifact {
@@ -518,7 +501,7 @@ async fn serve_file(
                     .body(Body::from(content))
                     .unwrap());
             }
-            return Err((StatusCode::NOT_FOUND, "File not found").into_response());
+            return Err(AppError::NotFound("File not found".to_string()).into_response());
         }
     };
 
@@ -526,13 +509,7 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Record download
     let _ = sqlx::query!(
@@ -585,24 +562,12 @@ async fn serve_metadata(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response())?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?
+    .ok_or_else(|| AppError::NotFound("File not found".to_string()).into_response())?;
 
     // Try to extract METADATA from the package file
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     let metadata_text = if filename.ends_with(".whl") {
         extract_metadata_from_wheel(&content)
@@ -618,7 +583,7 @@ async fn serve_metadata(
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(Body::from(text))
             .unwrap()),
-        None => Err((StatusCode::NOT_FOUND, "Metadata not available").into_response()),
+        None => Err(AppError::NotFound("Metadata not available".to_string()).into_response()),
     }
 }
 
@@ -682,49 +647,49 @@ async fn upload(
     let mut metadata_fields: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
+        AppError::Validation(format!("Invalid multipart: {}", e)).into_response()
     })? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             ":action" => {
                 action = Some(field.text().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid field: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid field: {}", e)).into_response()
                 })?);
             }
             "name" => {
                 pkg_name = Some(field.text().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid field: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid field: {}", e)).into_response()
                 })?);
             }
             "version" => {
                 pkg_version = Some(field.text().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid field: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid field: {}", e)).into_response()
                 })?);
             }
             "sha256_digest" => {
                 sha256_digest = Some(field.text().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid field: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid field: {}", e)).into_response()
                 })?);
             }
             "md5_digest" => {
                 _md5_digest = Some(field.text().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid field: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid field: {}", e)).into_response()
                 })?);
             }
             "requires_python" => {
                 requires_python = Some(field.text().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid field: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid field: {}", e)).into_response()
                 })?);
             }
             "summary" => {
                 summary = Some(field.text().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid field: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid field: {}", e)).into_response()
                 })?);
             }
             "content" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 file_content = Some(field.bytes().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Invalid file: {}", e)).into_response()
+                    AppError::Validation(format!("Invalid file: {}", e)).into_response()
                 })?);
             }
             // Capture other metadata fields
@@ -756,21 +721,19 @@ async fn upload(
     // Validate required fields
     let action = action.unwrap_or_default();
     if action != "file_upload" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Unsupported action: {}", action),
-        )
-            .into_response());
+        return Err(
+            AppError::Validation(format!("Unsupported action: {}", action)).into_response(),
+        );
     }
 
     let pkg_name = pkg_name
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'name' field").into_response())?;
+        .ok_or_else(|| AppError::Validation("Missing 'name' field".to_string()).into_response())?;
     let pkg_version = pkg_version
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'version' field").into_response())?;
+        .ok_or_else(|| AppError::Validation("Missing 'version' field".to_string()).into_response())?;
     let content = file_content
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'content' field").into_response())?;
+        .ok_or_else(|| AppError::Validation("Missing 'content' field".to_string()).into_response())?;
     let filename = file_name.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "Missing filename in content field").into_response()
+        AppError::Validation("Missing filename in content field".to_string()).into_response()
     })?;
 
     let normalized = PypiHandler::normalize_name(&pkg_name);
@@ -783,14 +746,11 @@ async fn upload(
     // Verify digest if provided
     if let Some(ref expected) = sha256_digest {
         if !expected.is_empty() && expected != &computed_sha256 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "SHA256 mismatch: expected {} got {}",
-                    expected, computed_sha256
-                ),
-            )
-                .into_response());
+            return Err(AppError::Validation(format!(
+                "SHA256 mismatch: expected {} got {}",
+                expected, computed_sha256
+            ))
+            .into_response());
         }
     }
 
@@ -802,16 +762,10 @@ async fn upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "File already exists").into_response());
+        return Err(AppError::Conflict("File already exists".to_string()).into_response());
     }
 
     // Store the file
@@ -822,13 +776,7 @@ async fn upload(
     storage
         .put(&storage_key, content.clone())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Build metadata JSON
     let mut pkg_metadata = serde_json::json!({
@@ -884,13 +832,7 @@ async fn upload(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
 
     // Store metadata
     let _ = sqlx::query!(

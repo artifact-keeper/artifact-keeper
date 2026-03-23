@@ -2,6 +2,10 @@
 //!
 //! Implements the minimum endpoints required for `docker login`, `docker push`,
 //! and `docker pull` per the OCI Distribution Specification.
+//!
+// TODO(#553): OCI errors use a spec-mandated JSON envelope (oci_error fn) and
+// cannot be converted to AppError without breaking Docker/OCI client compat.
+// Consider wrapping oci_error to also log via tracing for consistency.
 
 use std::sync::Arc;
 
