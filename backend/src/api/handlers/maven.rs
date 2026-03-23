@@ -399,7 +399,10 @@ async fn serve_artifact(
                 let storage = state
                     .storage_for_repo(&repo.storage_location())
                     .map_err(|e| e.into_response())?;
-                let content = storage.get(&resolved.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+                let content = storage
+                    .get(&resolved.storage_key)
+                    .await
+                    .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
                 let ct = content_type_for_path(path);
                 return Ok(Response::builder()
@@ -503,7 +506,10 @@ async fn serve_artifact(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Record download
     let _ = sqlx::query!(
@@ -555,7 +561,9 @@ async fn serve_computed_checksum(
             if base_path.contains("-SNAPSHOT") {
                 let resolved = resolve_snapshot_artifact(&state.db, repo_id, base_path)
                     .await
-                    .ok_or_else(|| AppError::NotFound("File not found".to_string()).into_response())?;
+                    .ok_or_else(|| {
+                        AppError::NotFound("File not found".to_string()).into_response()
+                    })?;
                 (resolved.storage_key, resolved.checksum_sha256)
             } else {
                 return Err(AppError::NotFound("File not found".to_string()).into_response());
@@ -568,7 +576,10 @@ async fn serve_computed_checksum(
         ChecksumType::Sha256 => resolved_sha256,
         _ => {
             let storage = state.storage_for_repo_or_500(location)?;
-            let content = storage.get(&resolved_storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+            let content = storage
+                .get(&resolved_storage_key)
+                .await
+                .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
             compute_checksum(&content, checksum_type)
         }
     };
@@ -709,7 +720,10 @@ async fn upload(
 
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return
     if parse_checksum_path(&path).is_some() {
-        storage.put(&storage_key, body).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        storage
+            .put(&storage_key, body)
+            .await
+            .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -718,7 +732,10 @@ async fn upload(
 
     // If this is a maven-metadata.xml upload, just store it
     if MavenHandler::is_metadata(&path) {
-        storage.put(&storage_key, body).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        storage
+            .put(&storage_key, body)
+            .await
+            .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -726,9 +743,8 @@ async fn upload(
     }
 
     // Parse Maven coordinates from the path
-    let coords = MavenHandler::parse_coordinates(&path).map_err(|e| {
-        AppError::Validation(format!("Invalid Maven path: {}", e)).into_response()
-    })?;
+    let coords = MavenHandler::parse_coordinates(&path)
+        .map_err(|e| AppError::Validation(format!("Invalid Maven path: {}", e)).into_response())?;
 
     // Compute SHA-256
     let mut hasher = Sha256::new();
@@ -768,7 +784,10 @@ async fn upload(
     }
 
     // Store file in object storage regardless of grouping outcome
-    storage.put(&storage_key, body.clone()).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Build metadata JSON for this file
     let handler = MavenHandler::new();

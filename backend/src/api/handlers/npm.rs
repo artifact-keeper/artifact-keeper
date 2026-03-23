@@ -398,7 +398,10 @@ async fn serve_tarball(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
 
     // Record download
     let _ = sqlx::query!(
@@ -533,13 +536,13 @@ fn extract_version_tarball(
     let base64_data = attachment_data
         .get("data")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::Validation("Missing 'data' in attachment".to_string()).into_response())?;
+        .ok_or_else(|| {
+            AppError::Validation("Missing 'data' in attachment".to_string()).into_response()
+        })?;
 
     let tarball_bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_data)
-        .map_err(|e| {
-            AppError::Validation(format!("Invalid base64 data: {}", e)).into_response()
-        })?;
+        .map_err(|e| AppError::Validation(format!("Invalid base64 data: {}", e)).into_response())?;
 
     let mut hasher = Sha256::new();
     hasher.update(&tarball_bytes);

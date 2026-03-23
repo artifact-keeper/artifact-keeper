@@ -92,9 +92,7 @@ impl AuthExtension {
         if self.is_admin {
             Ok(())
         } else {
-            Err(AppError::Authorization(
-                "Admin access required".to_string(),
-            ))
+            Err(AppError::Authorization("Admin access required".to_string()))
         }
     }
 }
