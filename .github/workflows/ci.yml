@@ -451,11 +451,14 @@ jobs:
             fi
           done
 
-          # Smoke E2E
-          if [[ "${{ needs.smoke-e2e.result }}" == "success" ]]; then
+          # Smoke E2E (skipped when backend image build is skipped due to no changes)
+          smoke_result="${{ needs.smoke-e2e.result }}"
+          if [[ "$smoke_result" == "success" ]]; then
             echo "✅ smoke-e2e" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$smoke_result" == "skipped" ]]; then
+            echo "⏭️ smoke-e2e (no backend changes)" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ smoke-e2e: ${{ needs.smoke-e2e.result }}" >> $GITHUB_STEP_SUMMARY
+            echo "❌ smoke-e2e: $smoke_result" >> $GITHUB_STEP_SUMMARY
             tier1_pass=false
           fi
 
