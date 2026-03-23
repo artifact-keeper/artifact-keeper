@@ -331,12 +331,20 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Format handler routes with optional auth (list is public, enable/disable requires auth)
+        // Format handler read-only routes (list, get) with optional auth
         .nest(
             "/formats",
             handlers::plugins::format_router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 optional_auth_middleware,
+            )),
+        )
+        // Format handler mutating routes (enable, disable, test) require admin
+        .nest(
+            "/formats",
+            handlers::plugins::format_admin_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
             )),
         )
         // Webhook routes with auth middleware

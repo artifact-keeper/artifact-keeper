@@ -42,11 +42,16 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/reload", post(reload_plugin))
 }
 
-/// Create format handler routes
+/// Create format handler read-only routes (list, get)
 pub fn format_router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_format_handlers))
         .route("/:format_key", get(get_format_handler))
+}
+
+/// Create format handler admin routes (enable, disable, test)
+pub fn format_admin_router() -> Router<SharedState> {
+    Router::new()
         .route("/:format_key/enable", post(enable_format_handler))
         .route("/:format_key/disable", post(disable_format_handler))
         .route("/:format_key/test", post(test_format_handler))
