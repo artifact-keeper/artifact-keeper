@@ -516,8 +516,6 @@ jobs:
     runs-on: windows-latest
     needs: [lint-rust, test-backend-unit]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -549,19 +547,10 @@ jobs:
           sha256sum artifact-keeper-windows-amd64.exe > artifact-keeper-windows-amd64.exe.sha256
           echo "Built: $(ls -lh artifact-keeper-windows-amd64.exe | awk '{print $5}')"
 
-      - name: Upload dev binary to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          # Create or update the windows-dev release
-          if gh release view windows-dev > /dev/null 2>&1; then
-            gh release delete-asset windows-dev artifact-keeper-windows-amd64.exe --yes || true
-            gh release delete-asset windows-dev artifact-keeper-windows-amd64.exe.sha256 --yes || true
-            gh release upload windows-dev dist/artifact-keeper-windows-amd64.exe dist/artifact-keeper-windows-amd64.exe.sha256 --clobber
-          else
-            gh release create windows-dev dist/artifact-keeper-windows-amd64.exe dist/artifact-keeper-windows-amd64.exe.sha256 \
-              --title "Windows Dev Build" \
-              --notes "Rolling dev build of the Windows binary from main. Updated on every push to main. Not for production use." \
-              --prerelease
-          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifact-keeper-windows-amd64
+          path: |
+            dist/artifact-keeper-windows-amd64.exe
+            dist/artifact-keeper-windows-amd64.exe.sha256
