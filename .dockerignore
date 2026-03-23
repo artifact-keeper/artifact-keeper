@@ -12,7 +12,14 @@ credentials/
 *.pem
 *.key
 test-results/
-scripts/
+scripts/e2e*/
+scripts/native-tests/
+scripts/stress/
+scripts/failure/
+scripts/migration-e2e/
+scripts/sso-e2e/
+scripts/mesh-e2e/
+scripts/devops-agent*
 site/
 CLAUDE.md
 HOUSEKEEPING.md
