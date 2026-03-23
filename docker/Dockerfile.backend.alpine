@@ -89,7 +89,7 @@ WORKDIR /app
 USER 1001
 
 ENV RUST_LOG=info \
-    DATABASE_URL=postgresql://registry:registry@postgres:5432/artifact_registry \
+    DATABASE_URL=postgresql://user:password@host:5432/dbname \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
     HOST=0.0.0.0 \
