@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_with_bearer_fallback, AuthExtension};
 use crate::api::SharedState;
@@ -171,7 +172,7 @@ async fn resolve_cargo_repo(
     .bind(repo_key)
     .fetch_optional(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?
+    .map_err(map_db_err)?
     .ok_or_else(|| AppError::NotFound("Repository not found".to_string()).into_response())?;
 
     let fmt: String = repo.get("format");
@@ -313,7 +314,7 @@ async fn search_crates(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     let crate_list: Vec<serde_json::Value> = crates
         .iter()
@@ -469,7 +470,7 @@ async fn check_duplicate_crate(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     if existing.is_some() {
         return Err(Response::builder()
@@ -508,7 +509,7 @@ async fn store_crate_artifact(
     storage
         .put(&storage_key, crate_bytes.clone())
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     let artifact_path = format!("{}/{}/{}", name_lower, crate_version, filename);
     let size_bytes = crate_bytes.len() as i64;
@@ -536,7 +537,7 @@ async fn store_crate_artifact(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     let _ = sqlx::query!(
         r#"
@@ -670,7 +671,7 @@ async fn download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     // If crate not found locally, try proxy for remote repos
     let artifact = match artifact {
@@ -759,7 +760,7 @@ async fn download(
     let content = storage
         .get(&artifact.storage_key)
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -1130,7 +1131,7 @@ async fn serve_index(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     if versions.is_empty() {
         if let Some(result) = try_remote_index(

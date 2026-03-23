@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -121,7 +122,7 @@ async fn get_package_metadata(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     if artifacts.is_empty() {
         // For remote repos, proxy the metadata from upstream
@@ -319,7 +320,7 @@ async fn serve_tarball(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     // If artifact not found locally, try proxy for remote repos
     let artifact = match artifact {
@@ -401,7 +402,7 @@ async fn serve_tarball(
     let content = storage
         .get(&artifact.storage_key)
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -579,7 +580,7 @@ async fn store_npm_version(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     if existing.is_some() {
         return Err(AppError::Conflict(format!(
@@ -600,7 +601,7 @@ async fn store_npm_version(
     storage
         .put(&storage_key, Bytes::from(ver.tarball_bytes.clone()))
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     let size_bytes = ver.tarball_bytes.len() as i64;
 
@@ -626,7 +627,7 @@ async fn store_npm_version(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     // Store metadata
     let npm_metadata = serde_json::json!({

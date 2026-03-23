@@ -1458,4 +1458,96 @@ mod tests {
         let offset = ((page - 1) * per_page) as i64;
         assert_eq!(offset, 0);
     }
+
+    // -- validate_password tests --
+
+    #[test]
+    fn test_validate_password_too_short() {
+        let result = validate_password("abc");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("at least 8 characters"));
+    }
+
+    #[test]
+    fn test_validate_password_exactly_min_length() {
+        // 8 chars, not a common password
+        let result = validate_password("xK9!mZ2q");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_password_too_long() {
+        let long = "a".repeat(129);
+        let result = validate_password(&long);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("at most 128 characters"));
+    }
+
+    #[test]
+    fn test_validate_password_exactly_max_length() {
+        let long = "aB3!".repeat(32); // 128 chars
+        let result = validate_password(&long);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_password_common_password_rejected() {
+        let result = validate_password("password");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_password_case_insensitive() {
+        // "Password" differs in case but should still be rejected
+        let result = validate_password("Password");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_numeric() {
+        let result = validate_password("12345678");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_qwerty() {
+        let result = validate_password("qwerty123");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_admin123() {
+        let result = validate_password("admin123");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_common_trustno1() {
+        let result = validate_password("trustno1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too common"));
+    }
+
+    #[test]
+    fn test_validate_password_valid_strong_password() {
+        let result = validate_password("Correct-Horse-Battery-Staple!");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_password_seven_chars_rejected() {
+        let result = validate_password("aB3!xYz");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least 8 characters"));
+    }
 }

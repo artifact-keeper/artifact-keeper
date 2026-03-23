@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
@@ -355,7 +356,7 @@ async fn generate_metadata_for_artifact(
     )
     .fetch_all(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     let versions: Vec<String> = rows.into_iter().filter_map(|r| r.version).collect();
 
@@ -389,7 +390,7 @@ async fn serve_artifact(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     // If artifact not found by exact path, try SNAPSHOT resolution
     let artifact = match artifact {
@@ -402,7 +403,7 @@ async fn serve_artifact(
                 let content = storage
                     .get(&resolved.storage_key)
                     .await
-                    .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+                    .map_err(map_storage_err)?;
 
                 let ct = content_type_for_path(path);
                 return Ok(Response::builder()
@@ -509,7 +510,7 @@ async fn serve_artifact(
     let content = storage
         .get(&artifact.storage_key)
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -551,7 +552,7 @@ async fn serve_computed_checksum(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     // If the exact path was not found and this is a SNAPSHOT request, resolve
     // the `-SNAPSHOT` filename to the latest timestamped version.
@@ -579,7 +580,7 @@ async fn serve_computed_checksum(
             let content = storage
                 .get(&resolved_storage_key)
                 .await
-                .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+                .map_err(map_storage_err)?;
             compute_checksum(&content, checksum_type)
         }
     };
@@ -693,7 +694,7 @@ async fn update_artifact_record(
     .bind(artifact_id)
     .execute(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
     Ok(())
 }
 
@@ -723,7 +724,7 @@ async fn upload(
         storage
             .put(&storage_key, body)
             .await
-            .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+            .map_err(map_storage_err)?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -735,7 +736,7 @@ async fn upload(
         storage
             .put(&storage_key, body)
             .await
-            .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+            .map_err(map_storage_err)?;
         return Ok(Response::builder()
             .status(StatusCode::CREATED)
             .body(Body::from("Created"))
@@ -762,7 +763,7 @@ async fn upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     if existing.is_some() {
         if !coords.version.contains("SNAPSHOT") {
@@ -787,7 +788,7 @@ async fn upload(
     storage
         .put(&storage_key, body.clone())
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     // Build metadata JSON for this file
     let handler = MavenHandler::new();
@@ -831,7 +832,7 @@ async fn upload(
         .bind(&coords.version)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+        .map_err(map_db_err)?;
 
         use sqlx::Row;
         row.map(|r| {
@@ -1022,7 +1023,7 @@ async fn upload(
             .bind(user_id)
             .fetch_one(&state.db)
             .await
-            .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+            .map_err(map_db_err)?;
             let artifact_id: uuid::Uuid = row.get("id");
 
             // Initialize empty files array; the primary info lives on the

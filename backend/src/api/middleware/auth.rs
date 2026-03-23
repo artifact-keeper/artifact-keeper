@@ -1369,4 +1369,67 @@ mod tests {
         // JWT sessions have no repo restrictions (allowed_repo_ids is None).
         assert!(ext.can_access_repo(Uuid::new_v4()));
     }
+
+    // -- require_admin tests --
+
+    #[test]
+    fn test_require_admin_passes_for_admin() {
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_fails_for_non_admin() {
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "regular".to_string(),
+            email: "user@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        let err = ext.require_admin().unwrap_err();
+        assert!(err.to_string().contains("Admin access required"));
+    }
+
+    #[test]
+    fn test_require_admin_api_token_admin() {
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "bot".to_string(),
+            email: "bot@example.com".to_string(),
+            is_admin: true,
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["admin".to_string()]),
+            allowed_repo_ids: None,
+        };
+        assert!(ext.require_admin().is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_api_token_non_admin() {
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "bot".to_string(),
+            email: "bot@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["read".to_string()]),
+            allowed_repo_ids: None,
+        };
+        assert!(ext.require_admin().is_err());
+    }
 }

@@ -228,6 +228,37 @@ impl AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// Redact sensitive query-string parameters from a URI path for safe logging.
+///
+/// Parameters named `token`, `key`, `api_key`, `password`, or `secret`
+/// (case-insensitive) have their values replaced with `[REDACTED]`.
+pub fn redact_sensitive_params(path: &str, query: Option<&str>) -> String {
+    match query {
+        Some(q) => {
+            let redacted: String = q
+                .split('&')
+                .map(|pair| {
+                    if let Some((key, _)) = pair.split_once('=') {
+                        let k = key.to_lowercase();
+                        if k == "token"
+                            || k == "key"
+                            || k == "api_key"
+                            || k == "password"
+                            || k == "secret"
+                        {
+                            return format!("{}=[REDACTED]", key);
+                        }
+                    }
+                    pair.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{}?{}", path, redacted)
+        }
+        None => path.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +375,66 @@ mod tests {
             ..make_cached_repo()
         };
         assert!(!repo.is_public);
+    }
+
+    // -- redact_sensitive_params --
+
+    #[test]
+    fn test_redact_no_query_string() {
+        let result = redact_sensitive_params("/api/v1/artifacts", None);
+        assert_eq!(result, "/api/v1/artifacts");
+    }
+
+    #[test]
+    fn test_redact_normal_params_unchanged() {
+        let result = redact_sensitive_params("/api/v1/search", Some("q=nginx&page=1"));
+        assert_eq!(result, "/api/v1/search?q=nginx&page=1");
+    }
+
+    #[test]
+    fn test_redact_token_param() {
+        let result = redact_sensitive_params("/api/v1/download", Some("token=abc123&file=lib.tar"));
+        assert_eq!(result, "/api/v1/download?token=[REDACTED]&file=lib.tar");
+    }
+
+    #[test]
+    fn test_redact_api_key_param() {
+        let result = redact_sensitive_params("/hook", Some("api_key=secret_val&event=push"));
+        assert_eq!(result, "/hook?api_key=[REDACTED]&event=push");
+    }
+
+    #[test]
+    fn test_redact_password_param() {
+        let result = redact_sensitive_params("/login", Some("user=admin&password=hunter2"));
+        assert_eq!(result, "/login?user=admin&password=[REDACTED]");
+    }
+
+    #[test]
+    fn test_redact_secret_param() {
+        let result = redact_sensitive_params("/webhook", Some("secret=s3cr3t&id=42"));
+        assert_eq!(result, "/webhook?secret=[REDACTED]&id=42");
+    }
+
+    #[test]
+    fn test_redact_key_param() {
+        let result = redact_sensitive_params("/auth", Some("key=mykey"));
+        assert_eq!(result, "/auth?key=[REDACTED]");
+    }
+
+    #[test]
+    fn test_redact_mixed_case_param() {
+        // The lowercase comparison should catch "Token" and "API_KEY"
+        let result = redact_sensitive_params("/api", Some("Token=x&API_KEY=y&name=z"));
+        assert_eq!(result, "/api?Token=[REDACTED]&API_KEY=[REDACTED]&name=z");
+    }
+
+    #[test]
+    fn test_redact_multiple_sensitive_params() {
+        let result =
+            redact_sensitive_params("/endpoint", Some("token=a&password=b&secret=c&key=d"));
+        assert_eq!(
+            result,
+            "/endpoint?token=[REDACTED]&password=[REDACTED]&secret=[REDACTED]&key=[REDACTED]"
+        );
     }
 }

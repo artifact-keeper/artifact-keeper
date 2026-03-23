@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
@@ -84,7 +85,7 @@ async fn simple_root(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?
+    .map_err(map_db_err)?
     .into_iter()
     .flatten()
     .collect();
@@ -162,7 +163,7 @@ async fn simple_project(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     if artifacts.is_empty() {
         // For remote repos, proxy the simple index from upstream
@@ -369,7 +370,7 @@ async fn serve_file(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     // If artifact not found locally, try proxy for remote repos
     let artifact = match artifact {
@@ -512,7 +513,7 @@ async fn serve_file(
     let content = storage
         .get(&artifact.storage_key)
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -565,7 +566,7 @@ async fn serve_metadata(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?
+    .map_err(map_db_err)?
     .ok_or_else(|| AppError::NotFound("File not found".to_string()).into_response())?;
 
     // Try to extract METADATA from the package file
@@ -573,7 +574,7 @@ async fn serve_metadata(
     let content = storage
         .get(&artifact.storage_key)
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     let metadata_text = if filename.ends_with(".whl") {
         extract_metadata_from_wheel(&content)
@@ -772,7 +773,7 @@ async fn upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     if existing.is_some() {
         return Err(AppError::Conflict("File already exists".to_string()).into_response());
@@ -786,7 +787,7 @@ async fn upload(
     storage
         .put(&storage_key, content.clone())
         .await
-        .map_err(|e| AppError::Storage(e.to_string()).into_response())?;
+        .map_err(map_storage_err)?;
 
     // Build metadata JSON
     let mut pkg_metadata = serde_json::json!({
@@ -842,7 +843,7 @@ async fn upload(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()).into_response())?;
+    .map_err(map_db_err)?;
 
     // Store metadata
     let _ = sqlx::query!(

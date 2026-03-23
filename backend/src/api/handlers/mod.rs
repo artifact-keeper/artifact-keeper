@@ -18,6 +18,8 @@ pub async fn cleanup_soft_deleted_artifact(
     .await;
 }
 
+pub mod error_helpers;
+
 pub mod admin;
 pub mod alpine;
 pub mod analytics;

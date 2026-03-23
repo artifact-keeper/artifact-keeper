@@ -84,34 +84,13 @@ impl CurationService {
         .fetch_all(&self.db)
         .await?;
 
-        for rule in &rules {
-            if !Self::pattern_matches(&rule.package_pattern, package_name) {
-                continue;
-            }
-            if !Self::version_matches(&rule.version_constraint, version) {
-                continue;
-            }
-            if rule.architecture != "*" {
-                if let Some(arch) = architecture {
-                    if rule.architecture != arch {
-                        continue;
-                    }
-                }
-            }
-
-            return Ok(RuleEvaluation {
-                action: rule.action.clone(),
-                reason: rule.reason.clone(),
-                rule_id: Some(rule.id),
-            });
-        }
-
-        // No rule matched: use default stance
-        Ok(RuleEvaluation {
-            action: default_action.to_string(),
-            reason: format!("No matching rule; default action: {default_action}"),
-            rule_id: None,
-        })
+        Ok(Self::evaluate_package_in_memory(
+            &rules,
+            default_action,
+            package_name,
+            version,
+            architecture,
+        ))
     }
 
     // ---------------------------------------------------------------------------
@@ -648,5 +627,135 @@ mod tests {
         // No operator means exact match
         assert!(CurationService::version_matches("1.2.3", "1.2.3"));
         assert!(!CurationService::version_matches("1.2.3", "1.2.4"));
+    }
+
+    // -- evaluate_package_in_memory --
+
+    fn make_rule(
+        pattern: &str,
+        version_constraint: &str,
+        arch: &str,
+        action: &str,
+    ) -> CurationRule {
+        CurationRule {
+            id: Uuid::new_v4(),
+            staging_repo_id: None,
+            package_pattern: pattern.to_string(),
+            version_constraint: version_constraint.to_string(),
+            architecture: arch.to_string(),
+            action: action.to_string(),
+            priority: 0,
+            reason: format!("{action} by test rule"),
+            enabled: true,
+            created_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_no_rules_uses_default() {
+        let eval =
+            CurationService::evaluate_package_in_memory(&[], "allow", "nginx", "1.0.0", None);
+        assert_eq!(eval.action, "allow");
+        assert!(eval.rule_id.is_none());
+        assert!(eval.reason.contains("No matching rule"));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_matching_rule_blocks() {
+        let rule = make_rule("telnet*", "*", "*", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "telnet-server",
+            "1.0",
+            None,
+        );
+        assert_eq!(eval.action, "block");
+        assert_eq!(eval.rule_id, Some(rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_version_mismatch_skips_rule() {
+        let rule = make_rule("nginx", ">= 2.0", "*", "block");
+        let eval =
+            CurationService::evaluate_package_in_memory(&[rule], "allow", "nginx", "1.5", None);
+        // Version 1.5 does not satisfy >= 2.0, so the rule is skipped
+        assert_eq!(eval.action, "allow");
+        assert!(eval.rule_id.is_none());
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_architecture_filter() {
+        let rule = make_rule("*", "*", "aarch64", "block");
+        // Package has x86_64 architecture, rule requires aarch64
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule],
+            "allow",
+            "nginx",
+            "1.0",
+            Some("x86_64"),
+        );
+        assert_eq!(eval.action, "allow");
+        assert!(eval.rule_id.is_none());
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_architecture_match() {
+        let rule = make_rule("*", "*", "x86_64", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "nginx",
+            "1.0",
+            Some("x86_64"),
+        );
+        assert_eq!(eval.action, "block");
+        assert_eq!(eval.rule_id, Some(rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_wildcard_architecture() {
+        // Rule with "*" architecture matches any package architecture
+        let rule = make_rule("nginx", "*", "*", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[rule.clone()],
+            "allow",
+            "nginx",
+            "1.0",
+            Some("aarch64"),
+        );
+        assert_eq!(eval.action, "block");
+        assert_eq!(eval.rule_id, Some(rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_first_match_wins() {
+        let allow_rule = make_rule("nginx", "*", "*", "allow");
+        let block_rule = make_rule("nginx", "*", "*", "block");
+        let eval = CurationService::evaluate_package_in_memory(
+            &[allow_rule.clone(), block_rule],
+            "block",
+            "nginx",
+            "1.0",
+            None,
+        );
+        // The first matching rule (allow) wins
+        assert_eq!(eval.action, "allow");
+        assert_eq!(eval.rule_id, Some(allow_rule.id));
+    }
+
+    #[test]
+    fn test_evaluate_in_memory_default_action_review() {
+        let eval = CurationService::evaluate_package_in_memory(
+            &[],
+            "review",
+            "unknown-pkg",
+            "0.1.0",
+            None,
+        );
+        assert_eq!(eval.action, "review");
+        assert!(eval.reason.contains("review"));
     }
 }

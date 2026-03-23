@@ -474,30 +474,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
                 let uri = request.uri();
-                let path = uri.path();
-                let sanitized = if let Some(query) = uri.query() {
-                    let redacted: String = query
-                        .split('&')
-                        .map(|pair| {
-                            if let Some((key, _)) = pair.split_once('=') {
-                                let k = key.to_lowercase();
-                                if k == "token"
-                                    || k == "key"
-                                    || k == "api_key"
-                                    || k == "password"
-                                    || k == "secret"
-                                {
-                                    return format!("{}=[REDACTED]", key);
-                                }
-                            }
-                            pair.to_string()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("&");
-                    format!("{}?{}", path, redacted)
-                } else {
-                    path.to_string()
-                };
+                let sanitized =
+                    artifact_keeper_backend::api::redact_sensitive_params(uri.path(), uri.query());
                 tracing::info_span!(
                     "http_request",
                     method = %request.method(),
