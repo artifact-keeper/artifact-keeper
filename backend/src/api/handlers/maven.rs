@@ -281,13 +281,32 @@ async fn download(
         // Fall back to dynamic generation for artifact-level metadata
         if let Some((group_id, artifact_id)) = parse_metadata_path(&path) {
             let xml =
-                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await?;
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/xml")
-                .header(CONTENT_LENGTH, xml.len().to_string())
-                .body(Body::from(xml))
-                .unwrap());
+                generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await;
+            if let Ok(xml) = xml {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/xml")
+                    .header(CONTENT_LENGTH, xml.len().to_string())
+                    .body(Body::from(xml))
+                    .unwrap());
+            }
+        }
+
+        // Fallback: proxy metadata from upstream for remote repos
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let (content, _content_type) =
+                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
+                        .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/xml")
+                    .header(CONTENT_LENGTH, content.len().to_string())
+                    .body(Body::from(content))
+                    .unwrap());
+            }
         }
 
         // Metadata not found anywhere
