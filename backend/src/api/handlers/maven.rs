@@ -316,15 +316,36 @@ async fn download(
             }
         }
 
-        // Otherwise compute from the artifact
-        return serve_computed_checksum(
+        // Otherwise try to compute from a locally-stored artifact
+        if let Ok(response) = serve_computed_checksum(
             &state,
             repo.id,
             &repo.storage_location(),
             base_path,
             checksum_type,
         )
-        .await;
+        .await
+        {
+            return Ok(response);
+        }
+
+        // Fallback: proxy the checksum file from upstream for remote repos
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let (content, _content_type) =
+                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
+                        .await?;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/plain")
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
+
+        return Err(AppError::NotFound("File not found".to_string()).into_response());
     }
 
     // 4. Serve the artifact file
