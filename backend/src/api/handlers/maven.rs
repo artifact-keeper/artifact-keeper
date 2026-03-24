@@ -510,7 +510,9 @@ async fn serve_artifact(
 ) -> Result<Response, Response> {
     let artifact = sqlx::query!(
         r#"
-        SELECT id, path, size_bytes, checksum_sha256, content_type, storage_key
+        SELECT id, path, size_bytes, checksum_sha256,
+               checksum_md5, checksum_sha1,
+               content_type, storage_key
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
@@ -654,13 +656,20 @@ async fn serve_artifact(
 
     let ct = content_type_for_path(path);
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, ct)
         .header(CONTENT_LENGTH, content.len().to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
-        .unwrap())
+        .header("X-Checksum-SHA256", &artifact.checksum_sha256);
+
+    if let Some(ref md5) = artifact.checksum_md5 {
+        builder = builder.header("X-Checksum-MD5", md5);
+    }
+    if let Some(ref sha1) = artifact.checksum_sha1 {
+        builder = builder.header("X-Checksum-SHA1", sha1);
+    }
+
+    Ok(builder.body(Body::from(content)).unwrap())
 }
 
 async fn serve_computed_checksum(
@@ -1738,6 +1747,54 @@ mod tests {
         let coords =
             MavenHandler::parse_coordinates("com/example/mylib/1.0.0/mylib-1.0.0-javadoc.jar")
                 .unwrap();
+        assert!(!is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_aar() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            version: "1.0".into(),
+            classifier: None,
+            extension: "aar".into(),
+        };
+        assert!(is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_pom_only() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "parent".into(),
+            version: "1.0".into(),
+            classifier: None,
+            extension: "pom".into(),
+        };
+        assert!(!is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_sources() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            version: "1.0".into(),
+            classifier: Some("sources".into()),
+            extension: "jar".into(),
+        };
+        assert!(!is_primary_maven_artifact(&coords));
+    }
+
+    #[test]
+    fn test_is_primary_maven_artifact_javadoc() {
+        let coords = MavenCoordinates {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            version: "1.0".into(),
+            classifier: Some("javadoc".into()),
+            extension: "jar".into(),
+        };
         assert!(!is_primary_maven_artifact(&coords));
     }
 

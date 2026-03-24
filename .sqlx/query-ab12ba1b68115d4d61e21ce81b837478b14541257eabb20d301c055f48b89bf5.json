@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, path, size_bytes, checksum_sha256, content_type, storage_key\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path = $2\n        LIMIT 1\n        ",
+  "query": "\n        SELECT id, path, size_bytes, checksum_sha256,\n               checksum_md5, checksum_sha1,\n               content_type, storage_key\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path = $2\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -25,11 +25,21 @@
       },
       {
         "ordinal": 4,
+        "name": "checksum_md5",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "checksum_sha1",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 6,
         "name": "content_type",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 5,
+        "ordinal": 7,
         "name": "storage_key",
         "type_info": "Varchar"
       }
@@ -45,9 +55,11 @@
       false,
       false,
       false,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "85837507ccc5c2fbcb7bd275bfbb63497ec43b81b909e039c86663af57bec47f"
+  "hash": "ab12ba1b68115d4d61e21ce81b837478b14541257eabb20d301c055f48b89bf5"
 }
