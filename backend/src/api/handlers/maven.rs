@@ -199,9 +199,11 @@ enum ChecksumType {
 
 fn content_type_for_path(path: &str) -> &'static str {
     if path.ends_with(".pom") || path.ends_with(".xml") {
-        "application/xml"
-    } else if path.ends_with(".jar") || path.ends_with(".war") {
+        "text/xml"
+    } else if path.ends_with(".jar") || path.ends_with(".war") || path.ends_with(".ear") {
         "application/java-archive"
+    } else if path.ends_with(".asc") {
+        "text/plain"
     } else {
         "application/octet-stream"
     }
@@ -266,7 +268,7 @@ async fn download(
         if let Ok(content) = storage.get(&meta_storage_key).await {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/xml")
+                .header(CONTENT_TYPE, "text/xml")
                 .header(CONTENT_LENGTH, content.len().to_string())
                 .body(Body::from(content))
                 .unwrap());
@@ -278,7 +280,7 @@ async fn download(
                 generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await?;
             return Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/xml")
+                .header(CONTENT_TYPE, "text/xml")
                 .header(CONTENT_LENGTH, xml.len().to_string())
                 .body(Body::from(xml))
                 .unwrap());
@@ -1222,14 +1224,14 @@ mod tests {
 
     #[test]
     fn test_content_type_pom() {
-        assert_eq!(content_type_for_path("artifact.pom"), "application/xml");
+        assert_eq!(content_type_for_path("artifact.pom"), "text/xml");
     }
 
     #[test]
     fn test_content_type_xml() {
         assert_eq!(
             content_type_for_path("maven-metadata.xml"),
-            "application/xml"
+            "text/xml"
         );
     }
 
@@ -1262,6 +1264,19 @@ mod tests {
         assert_eq!(
             content_type_for_path("notes.txt"),
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_content_type_asc() {
+        assert_eq!(content_type_for_path("artifact.jar.asc"), "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_ear() {
+        assert_eq!(
+            content_type_for_path("app-1.0.ear"),
+            "application/java-archive"
         );
     }
 
