@@ -136,6 +136,7 @@ fn checksum_suffix(ct: ChecksumType) -> &'static str {
         ChecksumType::Md5 => "md5",
         ChecksumType::Sha1 => "sha1",
         ChecksumType::Sha256 => "sha256",
+        ChecksumType::Sha512 => "sha512",
     }
 }
 
@@ -179,12 +180,14 @@ fn looks_like_maven_version(s: &str) -> bool {
 
 /// Check if a path is a checksum request. Returns the base path and checksum type.
 fn parse_checksum_path(path: &str) -> Option<(&str, ChecksumType)> {
-    if let Some(base) = path.strip_suffix(".sha1") {
+    if let Some(base) = path.strip_suffix(".sha512") {
+        Some((base, ChecksumType::Sha512))
+    } else if let Some(base) = path.strip_suffix(".sha256") {
+        Some((base, ChecksumType::Sha256))
+    } else if let Some(base) = path.strip_suffix(".sha1") {
         Some((base, ChecksumType::Sha1))
     } else if let Some(base) = path.strip_suffix(".md5") {
         Some((base, ChecksumType::Md5))
-    } else if let Some(base) = path.strip_suffix(".sha256") {
-        Some((base, ChecksumType::Sha256))
     } else {
         None
     }
@@ -195,6 +198,7 @@ enum ChecksumType {
     Md5,
     Sha1,
     Sha256,
+    Sha512,
 }
 
 fn content_type_for_path(path: &str) -> &'static str {
@@ -631,6 +635,12 @@ fn compute_checksum(data: &[u8], checksum_type: ChecksumType) -> String {
         }
         ChecksumType::Sha256 => {
             let mut hasher = Sha256::new();
+            hasher.update(data);
+            format!("{:x}", hasher.finalize())
+        }
+        ChecksumType::Sha512 => {
+            use sha2::Sha512;
+            let mut hasher = Sha512::new();
             hasher.update(data);
             format!("{:x}", hasher.finalize())
         }
@@ -1204,6 +1214,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_checksum_path_sha512() {
+        let result = parse_checksum_path("com/example/my-lib/1.0/my-lib-1.0.jar.sha512");
+        assert!(result.is_some());
+        let (base, ct) = result.unwrap();
+        assert_eq!(base, "com/example/my-lib/1.0/my-lib-1.0.jar");
+        assert!(matches!(ct, ChecksumType::Sha512));
+    }
+
+    #[test]
     fn test_parse_checksum_path_no_checksum_suffix() {
         let result = parse_checksum_path("com/example/my-lib/1.0/my-lib-1.0.jar");
         assert!(result.is_none());
@@ -1294,6 +1313,14 @@ mod tests {
         // Verify determinism
         let result2 = compute_checksum(data, ChecksumType::Sha256);
         assert_eq!(result, result2);
+    }
+
+    #[test]
+    fn test_compute_checksum_sha512() {
+        let data = b"hello maven";
+        let result = compute_checksum(data, ChecksumType::Sha512);
+        assert_eq!(result.len(), 128); // SHA-512 produces 128 hex chars
+        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -1517,6 +1544,11 @@ mod tests {
     #[test]
     fn test_checksum_suffix_sha256() {
         assert_eq!(checksum_suffix(ChecksumType::Sha256), "sha256");
+    }
+
+    #[test]
+    fn test_checksum_suffix_sha512() {
+        assert_eq!(checksum_suffix(ChecksumType::Sha512), "sha512");
     }
 
     // -----------------------------------------------------------------------

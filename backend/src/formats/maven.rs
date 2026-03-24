@@ -75,6 +75,7 @@ impl MavenHandler {
                     || filename.ends_with(".md5")
                     || filename.ends_with(".sha1")
                     || filename.ends_with(".sha256")
+                    || filename.ends_with(".sha512")
                 {
                     return Ok((None, filename.to_string()));
                 }
@@ -89,6 +90,7 @@ impl MavenHandler {
                 || filename.ends_with(".md5")
                 || filename.ends_with(".sha1")
                 || filename.ends_with(".sha256")
+                || filename.ends_with(".sha512")
             {
                 return Ok((None, filename.to_string()));
             }
