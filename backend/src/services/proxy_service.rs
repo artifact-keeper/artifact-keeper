@@ -251,7 +251,7 @@ impl ProxyService {
         format!(
             "proxy-cache/{}/{}/__content__",
             repo_key,
-            path.trim_start_matches('/')
+            path.trim_start_matches('/').trim_end_matches('/')
         )
     }
 
@@ -260,7 +260,7 @@ impl ProxyService {
         format!(
             "proxy-cache/{}/{}/__cache_meta__.json",
             repo_key,
-            path.trim_start_matches('/')
+            path.trim_start_matches('/').trim_end_matches('/')
         )
     }
 
@@ -716,6 +716,34 @@ mod tests {
         assert_eq!(
             ProxyService::cache_metadata_key("repo", "/some/path"),
             "proxy-cache/repo/some/path/__cache_meta__.json"
+        );
+    }
+
+    #[test]
+    fn test_cache_metadata_key_strips_trailing_slash() {
+        assert_eq!(
+            ProxyService::cache_metadata_key("pypi-remote", "simple/numpy/"),
+            "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
+        );
+    }
+
+    #[test]
+    fn test_cache_storage_key_strips_trailing_slash() {
+        assert_eq!(
+            ProxyService::cache_storage_key("pypi-remote", "simple/numpy/"),
+            "proxy-cache/pypi-remote/simple/numpy/__content__"
+        );
+    }
+
+    #[test]
+    fn test_cache_keys_strip_both_slashes() {
+        assert_eq!(
+            ProxyService::cache_metadata_key("pypi-remote", "/simple/numpy/"),
+            "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
+        );
+        assert_eq!(
+            ProxyService::cache_storage_key("pypi-remote", "/simple/numpy/"),
+            "proxy-cache/pypi-remote/simple/numpy/__content__"
         );
     }
 
