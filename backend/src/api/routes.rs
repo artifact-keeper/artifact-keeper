@@ -482,6 +482,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest(
             "/migrations",
             handlers::migration::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // Chunked/resumable upload routes with auth middleware
+        .nest(
+            "/uploads",
+            handlers::upload::router().layer(middleware::from_fn_with_state(
                 auth_service,
                 auth_middleware,
             )),

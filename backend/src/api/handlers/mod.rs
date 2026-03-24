@@ -92,6 +92,7 @@ pub mod terraform;
 pub mod totp;
 pub mod transfer;
 pub mod tree;
+pub mod upload;
 pub mod users;
 pub mod vscode;
 pub mod wasm_proxy;

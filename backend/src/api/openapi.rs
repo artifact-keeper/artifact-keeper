@@ -129,6 +129,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::service_accounts::ServiceAccountsApiDoc::openapi());
     doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());
     doc.merge(super::handlers::curation::CurationApiDoc::openapi());
+    doc.merge(super::handlers::upload::UploadApiDoc::openapi());
 
     doc
 }
@@ -488,6 +489,7 @@ mod tests {
                 "/api/v1/curation/",
                 vec![include_str!("handlers/curation.rs")],
             ),
+            ("/api/v1/uploads/", vec![include_str!("handlers/upload.rs")]),
         ];
 
         // Sort by prefix length descending so longest match wins
