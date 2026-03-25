@@ -617,7 +617,7 @@ mod tests {
     fn test_chunk_size_defaults() {
         let min = MIN_CHUNK_SIZE;
         let max = MAX_CHUNK_SIZE;
-        let default = DEFAULT_CHUNK_SIZE;
+        let default = DEFAULT_CHUNK_SIZE as i64;
         assert!(min <= 1_048_576, "min chunk should be at most 1MB");
         assert!(max >= 268_435_456, "max chunk should be at least 256MB");
         assert!(default >= min, "default should be >= min");
