@@ -242,7 +242,20 @@ impl Config {
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
                 Ok("true" | "1")
             ),
-            metrics_port: env::var("METRICS_PORT").ok().and_then(|v| v.parse().ok()),
+            metrics_port: match env::var("METRICS_PORT") {
+                Ok(val) => match val.parse::<u16>() {
+                    Ok(port) => Some(port),
+                    Err(_) => {
+                        tracing::warn!(
+                            value = %val,
+                            "METRICS_PORT is set but could not be parsed as a valid port \
+                             number; unauthenticated metrics listener is disabled"
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
+            },
         };
 
         config.validate_jwt_secret()?;

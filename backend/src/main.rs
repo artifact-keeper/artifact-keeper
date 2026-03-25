@@ -394,8 +394,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
     tracing::info!("Sync worker started");
 
-    // Clone state for the optional metrics listener before the router consumes it.
-    let metrics_state = state.clone();
+    // Conditionally clone state for the metrics listener before the router takes
+    // ownership. The clone only happens when METRICS_PORT is actually configured.
+    let metrics_state = config.metrics_port.map(|_| state.clone());
 
     // Build router
     let app = Router::new()
@@ -578,7 +579,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     });
 
     // Optionally start an unauthenticated metrics-only listener on METRICS_PORT.
-    if let Some(metrics_port) = config.metrics_port {
+    if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
             "Starting unauthenticated metrics listener — \
