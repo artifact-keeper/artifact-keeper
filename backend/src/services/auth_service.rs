@@ -1252,6 +1252,7 @@ mod tests {
             lifecycle_check_interval_secs: 60,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
+            metrics_port: None,
         })
     }
 

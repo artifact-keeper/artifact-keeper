@@ -394,6 +394,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
     tracing::info!("Sync worker started");
 
+    // Clone state for the optional metrics listener before the router consumes it.
+    let metrics_state = state.clone();
+
     // Build router
     let app = Router::new()
         .merge(api::routes::create_router(state))
@@ -573,6 +576,40 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
         tracing::info!("gRPC server shut down");
     });
+
+    // Optionally start an unauthenticated metrics-only listener on METRICS_PORT.
+    if let Some(metrics_port) = config.metrics_port {
+        tracing::warn!(
+            port = metrics_port,
+            "Starting unauthenticated metrics listener — \
+             ensure this port is not reachable from untrusted networks"
+        );
+        let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
+        let metrics_shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            let metrics_app = Router::new()
+                .route(
+                    "/metrics",
+                    axum::routing::get(api::handlers::health::metrics),
+                )
+                .with_state(metrics_state);
+            match tokio::net::TcpListener::bind(metrics_addr).await {
+                Ok(listener) => {
+                    tracing::info!("Metrics listener on {}", metrics_addr);
+                    if let Err(e) = axum::serve(listener, metrics_app)
+                        .with_graceful_shutdown(async move { metrics_shutdown.cancelled().await })
+                        .await
+                    {
+                        tracing::error!("Metrics listener error: {}", e);
+                    }
+                    tracing::info!("Metrics listener shut down");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to bind metrics listener on {}: {}", metrics_addr, e);
+                }
+            }
+        });
+    }
 
     let http_shutdown_token = shutdown_token.clone();
     let listener = tokio::net::TcpListener::bind(addr).await?;
