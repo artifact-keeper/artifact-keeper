@@ -407,34 +407,15 @@ impl S3Backend {
 impl super::StorageBackend for S3Backend {
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.clone().into();
 
-        let resp = self
-            .bucket
-            .put_object(&full_key, &content)
+        self.store
+            .put(&path, content.into())
             .await
             .map_err(|e| {
-                // With fail-on-err, non-2xx responses arrive here as
-                // S3Error::HttpFailWithBody(status, body) which includes the
-                // full S3 error XML (e.g. AccessDenied, SignatureDoesNotMatch).
-                tracing::error!(
-                    key = %key,
-                    full_key = %full_key,
-                    error = %e,
-                    "S3 put_object failed"
-                );
+                tracing::error!(key = %key, full_key = %full_key, error = %e, "S3 put_object failed");
                 AppError::Storage(format!("Failed to put object '{}': {}", key, e))
             })?;
-
-        if let Err(e) = Self::classify_put_status(key, resp.status_code(), resp.bytes()) {
-            tracing::error!(
-                key = %key,
-                full_key = %full_key,
-                status = resp.status_code(),
-                response_body = %String::from_utf8_lossy(resp.bytes()),
-                "S3 put rejected"
-            );
-            return Err(e);
-        }
 
         tracing::debug!(key = %key, "S3 put object successful");
         Ok(())
@@ -442,105 +423,59 @@ impl super::StorageBackend for S3Backend {
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let response = match self.bucket.get_object(&full_key).await {
-            Ok(resp) => match Self::classify_get_response(key, &resp)? {
-                Some(()) => resp,
-                None => {
-                    // rust-s3 may return Ok with 404 status (e.g. Ceph RGW)
-                    if let Some(bytes) = self
-                        .try_fallback_get(key, "primary returned status 404")
-                        .await?
-                    {
-                        return Ok(bytes);
-                    }
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-            },
-            Err(e) => {
-                if Self::classify_get_error_is_not_found(key, &e)? {
-                    if let Some(bytes) = self
-                        .try_fallback_get(key, "primary returned not found error")
-                        .await?
-                    {
-                        return Ok(bytes);
-                    }
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-                // classify_get_error_is_not_found returns Err for non-not-found errors,
-                // so this is unreachable, but kept for safety.
-                return Err(AppError::Storage(format!(
-                    "Failed to get object '{}': {}",
-                    key, e
-                )));
+        match self.store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await.map_err(|e| {
+                    AppError::Storage(format!("Failed to read object '{}': {}", key, e))
+                })?;
+                tracing::debug!(key = %key, size = bytes.len(), "S3 get object successful");
+                Ok(bytes)
             }
-        };
-
-        tracing::debug!(key = %key, size = response.bytes().len(), "S3 get object successful");
-        Ok(Bytes::from(response.to_vec()))
+            Err(object_store::Error::NotFound { .. }) => {
+                if let Some(bytes) = self.try_fallback_get(key, "primary not found").await? {
+                    return Ok(bytes);
+                }
+                Err(AppError::NotFound(format!("Storage key not found: {}", key)))
+            }
+            Err(e) => Err(AppError::Storage(format!("Failed to get object '{}': {}", key, e))),
+        }
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let is_not_found = match self.bucket.head_object(&full_key).await {
-            Ok((_, status)) => {
-                match Self::classify_head_status(key, status)? {
-                    Some(true) => return Ok(true),
-                    _ => true, // 404 -> not found, try fallback
-                }
-            }
+        match self.store.head(&path).await {
+            Ok(_) => return Ok(true),
+            Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => {
-                let err_str = e.to_string();
-                if Self::is_head_not_found_error(&err_str) {
-                    true
-                } else {
-                    return Err(AppError::Storage(format!(
-                        "Failed to check existence of '{}': {}",
-                        key, e
-                    )));
-                }
+                return Err(AppError::Storage(format!(
+                    "Failed to check existence of '{}': {}", key, e
+                )));
             }
-        };
+        }
 
-        if is_not_found && self.path_format.has_fallback() {
+        if self.path_format.has_fallback() {
             if let Some(fallback_key) = self.try_artifactory_fallback(key) {
                 let fallback_full_key = self.full_key(&fallback_key);
-                match self.bucket.head_object(&fallback_full_key).await {
-                    Ok((_, status)) if (200..300).contains(&status) => {
+                let fallback_path: ObjectPath = fallback_full_key.into();
+                match self.store.head(&fallback_path).await {
+                    Ok(_) => {
                         tracing::debug!(
-                            key = %key,
-                            fallback = %fallback_key,
+                            key = %key, fallback = %fallback_key,
                             "Found artifact at Artifactory fallback path"
                         );
                         return Ok(true);
                     }
-                    Ok((_, status)) if status != 404 => {
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => {
                         tracing::warn!(
-                            key = %key,
-                            fallback = %fallback_key,
-                            status,
-                            "Unexpected status from fallback head_object"
+                            key = %key, fallback = %fallback_key, error = %e,
+                            "Fallback head_object failed with unexpected error"
                         );
                     }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if !Self::is_head_not_found_error(&err_str) {
-                            tracing::warn!(
-                                key = %key,
-                                fallback = %fallback_key,
-                                error = %e,
-                                "Fallback head_object failed with unexpected error"
-                            );
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
@@ -550,13 +485,11 @@ impl super::StorageBackend for S3Backend {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let resp =
-            self.bucket.delete_object(&full_key).await.map_err(|e| {
-                AppError::Storage(format!("Failed to delete object '{}': {}", key, e))
-            })?;
-
-        Self::classify_delete_status(key, resp.status_code())?;
+        self.store.delete(&path).await.map_err(|e| {
+            AppError::Storage(format!("Failed to delete object '{}': {}", key, e))
+        })?;
 
         tracing::debug!(key = %key, "S3 delete object successful");
         Ok(())
@@ -576,15 +509,11 @@ impl super::StorageBackend for S3Backend {
         }
 
         let full_key = self.full_key(key);
-        let expiry_secs = expires_in.as_secs().min(604800) as u32; // Max 7 days for S3
 
-        // If CloudFront is configured, use CloudFront signed URLs
         if let Some(cf) = &self.cloudfront {
             let url = self.generate_cloudfront_signed_url(cf, &full_key, expires_in)?;
             tracing::debug!(
-                key = %key,
-                expires_in_secs = expiry_secs,
-                source = "cloudfront",
+                key = %key, expires_in_secs = expires_in.as_secs(), source = "cloudfront",
                 "Generated CloudFront signed URL"
             );
             return Ok(Some(PresignedUrl {
@@ -594,97 +523,45 @@ impl super::StorageBackend for S3Backend {
             }));
         }
 
-        // Generate S3 presigned URL with fresh or dedicated credentials
-        let presign_result = if let Some(sb) = &self.signing_bucket {
-            // Option B: use dedicated signing credentials (long-lived, no STS expiry concern)
-            sb.presign_get(&full_key, expiry_secs, None).await
-        } else {
-            // Option A: refresh credentials from default chain before signing
-            // This ensures STS/IRSA credentials are current, so the presigned URL
-            // gets the full requested lifetime instead of being limited by
-            // the remaining TTL of stale credentials.
-            match Credentials::default() {
-                Ok(fresh_creds) => {
-                    match Bucket::new(&self.bucket_name, self.region.clone(), fresh_creds) {
-                        Ok(fresh_bucket) => {
-                            let fresh_bucket = if self.use_path_style {
-                                fresh_bucket.with_path_style()
-                            } else {
-                                fresh_bucket
-                            };
-                            fresh_bucket.presign_get(&full_key, expiry_secs, None).await
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to create fresh signing bucket, using cached credentials: {}",
-                                e
-                            );
-                            self.bucket.presign_get(&full_key, expiry_secs, None).await
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to refresh credentials for presigning, using cached credentials: {}",
-                        e
-                    );
-                    self.bucket.presign_get(&full_key, expiry_secs, None).await
-                }
-            }
-        };
+        use object_store::signer::Signer;
 
-        let url = presign_result.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to generate presigned URL for '{}': {}",
-                key, e
-            ))
-        })?;
+        let path: ObjectPath = full_key.into();
+        let signer = self.signing_store.as_ref().unwrap_or(&self.store);
+
+        // S3 enforces a maximum presigned URL expiry of 7 days
+        let clamped_expiry = Duration::from_secs(expires_in.as_secs().min(604800));
+
+        let presigned_url = signer
+            .signed_url(http::Method::GET, &path, clamped_expiry)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to generate presigned URL for '{}': {}", key, e
+                ))
+            })?;
 
         tracing::debug!(
-            key = %key,
-            expires_in_secs = expiry_secs,
-            source = "s3",
-            dedicated_creds = self.signing_bucket.is_some(),
+            key = %key, expires_in_secs = clamped_expiry.as_secs(), source = "s3",
+            dedicated_creds = self.signing_store.is_some(),
             "Generated S3 presigned URL"
         );
 
         Ok(Some(PresignedUrl {
-            url,
-            expires_in,
+            url: presigned_url.to_string(),
+            expires_in: clamped_expiry,
             source: PresignedUrlSource::S3,
         }))
     }
 
     async fn health_check(&self) -> Result<()> {
-        // Use head_object on a sentinel key. A 404 (NoSuchKey) proves that the
-        // bucket is reachable and credentials are valid. Only transport-level or
-        // auth errors indicate an unhealthy backend.
-        match self.bucket.head_object(".health-probe").await {
+        let path: ObjectPath = ".health-probe".into();
+        match self.store.head(&path).await {
             Ok(_) => Ok(()),
-            Err(S3Error::HttpFailWithBody(status, _)) if (400..500).contains(&status) => {
-                // 4xx other than auth errors: bucket is reachable.
-                // 403 could mean bad creds, so treat that as unhealthy.
-                if status == 403 {
-                    Err(AppError::Storage(
-                        "S3 health check failed: access denied (403)".to_string(),
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => {
-                let err_str = e.to_string();
-                // 404 / NoSuchKey is expected and proves connectivity
-                if err_str.contains("404")
-                    || err_str.contains("NoSuchKey")
-                    || err_str.contains("Not Found")
-                {
-                    Ok(())
-                } else if err_str.contains("403") || err_str.contains("Access Denied") {
-                    Err(AppError::Storage(format!(
-                        "S3 health check failed: access denied: {}",
-                        e
-                    )))
+                let msg = e.to_string();
+                if msg.contains("403") || msg.contains("Access Denied") {
+                    Err(AppError::Storage(format!("S3 health check failed: access denied: {}", e)))
                 } else {
                     Err(AppError::Storage(format!("S3 health check failed: {}", e)))
                 }
@@ -704,16 +581,17 @@ impl S3Backend {
             (None, None) => String::new(),
         };
 
-        let results = self
-            .bucket
-            .list(search_prefix, None)
+        let list_path: ObjectPath = search_prefix.into();
+        let objects: Vec<_> = self
+            .store
+            .list(Some(&list_path))
+            .try_collect()
             .await
             .map_err(|e| AppError::Storage(format!("Failed to list objects: {}", e)))?;
 
-        let keys: Vec<String> = results
+        let keys: Vec<String> = objects
             .into_iter()
-            .flat_map(|result| result.contents)
-            .map(|obj| self.strip_prefix(&obj.key))
+            .map(|meta| self.strip_prefix(meta.location.as_ref()))
             .collect();
 
         tracing::debug!(prefix = ?prefix, count = keys.len(), "S3 list objects successful");
@@ -725,15 +603,12 @@ impl S3Backend {
         let source_key = self.full_key(source);
         let dest_key = self.full_key(dest);
 
-        // S3 CopyObject requires source in format "bucket/key"
-        let copy_source = format!("{}/{}", self.bucket.name(), source_key);
+        let from: ObjectPath = source_key.into();
+        let to: ObjectPath = dest_key.into();
 
-        self.bucket
-            .copy_object_internal(&copy_source, &dest_key)
-            .await
-            .map_err(|e| {
-                AppError::Storage(format!("Failed to copy '{}' to '{}': {}", source, dest, e))
-            })?;
+        self.store.copy(&from, &to).await.map_err(|e| {
+            AppError::Storage(format!("Failed to copy '{}' to '{}': {}", source, dest, e))
+        })?;
 
         tracing::debug!(source = %source, dest = %dest, "S3 copy object successful");
         Ok(())
@@ -742,35 +617,20 @@ impl S3Backend {
     /// Get content size without fetching full content
     pub async fn size(&self, key: &str) -> Result<u64> {
         let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
 
-        let (head, status) = match self.bucket.head_object(&full_key).await {
-            Ok((head, status)) => match Self::classify_head_status(key, status)? {
-                Some(true) => (head, status),
-                _ => {
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-            },
-            Err(e) => {
-                let err_str = e.to_string();
-                if Self::is_head_not_found_error(&err_str) {
-                    return Err(AppError::NotFound(format!(
-                        "Storage key not found: {}",
-                        key
-                    )));
-                }
-                return Err(AppError::Storage(format!(
-                    "Failed to get size of '{}': {}",
-                    key, e
-                )));
+        match self.store.head(&path).await {
+            Ok(meta) => {
+                tracing::debug!(key = %key, size = meta.size, "S3 head object successful");
+                Ok(meta.size)
             }
-        };
-
-        let size = head.content_length.unwrap_or(0) as u64;
-        tracing::debug!(key = %key, size = size, status, "S3 head object successful");
-        Ok(size)
+            Err(object_store::Error::NotFound { .. }) => {
+                Err(AppError::NotFound(format!("Storage key not found: {}", key)))
+            }
+            Err(e) => Err(AppError::Storage(format!(
+                "Failed to get size of '{}': {}", key, e
+            ))),
+        }
     }
 
     /// Generate a CloudFront signed URL
