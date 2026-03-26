@@ -226,6 +226,27 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
     })
 }
 
+/// Check whether an upstream URL points to Docker Hub.
+fn is_docker_hub(upstream_url: &str) -> bool {
+    let host = upstream_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    host == "docker.io" || host.ends_with(".docker.io")
+}
+
+/// For Docker Hub upstreams, official images (single name, no slash) live under
+/// the `library/` namespace. This function prepends it when needed.
+fn normalize_docker_image(image: &str, upstream_url: &str) -> String {
+    if !image.contains('/') && is_docker_hub(upstream_url) {
+        format!("library/{}", image)
+    } else {
+        image.to_string()
+    }
+}
+
 /// Try to fetch an OCI resource from the upstream registry for a remote repo.
 /// Returns `None` if the repo is not remote, has no upstream configured, or the
 /// fetch fails.
@@ -239,17 +260,7 @@ async fn try_upstream_fetch(
     }
     let upstream_url = repo.upstream_url.as_ref()?;
     let proxy = state.proxy_service.as_ref()?;
-
-    // Docker Hub stores official images under the "library/" namespace.
-    // When the image name has no slash (e.g., "alpine" not "myorg/myimage"),
-    // and the upstream is Docker Hub, prepend "library/" so the request
-    // resolves correctly.
-    let image = if !repo.image.contains('/') && upstream_url.contains("docker.io") {
-        format!("library/{}", repo.image)
-    } else {
-        repo.image.clone()
-    };
-
+    let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
     proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
         .await
@@ -2116,42 +2127,83 @@ mod tests {
         assert!(info.upstream_url.is_none());
     }
 
+    // --- Docker Hub library/ prefix tests ---
+
     #[test]
-    fn test_docker_hub_library_prefix_for_official_images() {
-        // Official images (no slash) on Docker Hub get "library/" prepended
-        let image = "alpine";
-        let upstream = "https://registry-1.docker.io";
-        let result = if !image.contains('/') && upstream.contains("docker.io") {
-            format!("library/{}", image)
-        } else {
-            image.to_string()
-        };
-        assert_eq!(result, "library/alpine");
+    fn test_is_docker_hub_registry1() {
+        assert!(super::is_docker_hub("https://registry-1.docker.io"));
     }
 
     #[test]
-    fn test_docker_hub_no_prefix_for_namespaced_images() {
-        // Namespaced images (with slash) are not prefixed
-        let image = "myorg/myimage";
-        let upstream = "https://registry-1.docker.io";
-        let result = if !image.contains('/') && upstream.contains("docker.io") {
-            format!("library/{}", image)
-        } else {
-            image.to_string()
-        };
-        assert_eq!(result, "myorg/myimage");
+    fn test_is_docker_hub_plain() {
+        assert!(super::is_docker_hub("https://docker.io"));
     }
 
     #[test]
-    fn test_non_docker_hub_no_library_prefix() {
-        // Non-Docker Hub registries never get the prefix
-        let image = "alpine";
-        let upstream = "https://ghcr.io";
-        let result = if !image.contains('/') && upstream.contains("docker.io") {
-            format!("library/{}", image)
-        } else {
-            image.to_string()
-        };
-        assert_eq!(result, "alpine");
+    fn test_is_docker_hub_index() {
+        assert!(super::is_docker_hub("https://index.docker.io"));
+    }
+
+    #[test]
+    fn test_is_docker_hub_with_path() {
+        assert!(super::is_docker_hub("https://registry-1.docker.io/v2"));
+    }
+
+    #[test]
+    fn test_is_not_docker_hub_ghcr() {
+        assert!(!super::is_docker_hub("https://ghcr.io"));
+    }
+
+    #[test]
+    fn test_is_not_docker_hub_false_positive() {
+        assert!(!super::is_docker_hub("https://not-docker.io.example.com"));
+    }
+
+    #[test]
+    fn test_normalize_official_image_on_docker_hub() {
+        assert_eq!(
+            super::normalize_docker_image("alpine", "https://registry-1.docker.io"),
+            "library/alpine"
+        );
+    }
+
+    #[test]
+    fn test_normalize_namespaced_image_on_docker_hub() {
+        assert_eq!(
+            super::normalize_docker_image("myorg/myimage", "https://registry-1.docker.io"),
+            "myorg/myimage"
+        );
+    }
+
+    #[test]
+    fn test_normalize_multi_level_namespace_on_docker_hub() {
+        assert_eq!(
+            super::normalize_docker_image("myorg/subteam/myimage", "https://registry-1.docker.io"),
+            "myorg/subteam/myimage"
+        );
+    }
+
+    #[test]
+    fn test_normalize_already_prefixed_library() {
+        assert_eq!(
+            super::normalize_docker_image("library/alpine", "https://registry-1.docker.io"),
+            "library/alpine"
+        );
+    }
+
+    #[test]
+    fn test_normalize_official_image_on_non_docker_hub() {
+        assert_eq!(
+            super::normalize_docker_image("alpine", "https://ghcr.io"),
+            "alpine"
+        );
+    }
+
+    #[test]
+    fn test_normalize_on_plain_docker_io() {
+        assert_eq!(
+            super::normalize_docker_image("nginx", "https://docker.io"),
+            "library/nginx"
+        );
     }
 }
