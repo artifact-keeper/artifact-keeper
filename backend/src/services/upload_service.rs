@@ -93,6 +93,25 @@ pub enum UploadError {
 }
 
 // ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Validate that an artifact path is safe (no traversal, not empty).
+pub fn validate_artifact_path(path: &str) -> Result<(), UploadError> {
+    if path.is_empty() {
+        return Err(UploadError::InvalidChunk(
+            "artifact_path cannot be empty".into(),
+        ));
+    }
+    if path.contains("..") || path.starts_with('/') {
+        return Err(UploadError::InvalidChunk(
+            "artifact_path contains invalid characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
