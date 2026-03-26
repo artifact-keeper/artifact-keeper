@@ -81,9 +81,9 @@ impl StorageBackend for FilesystemStorage {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::copy(path, &dest).await.map_err(|e| {
-            AppError::Storage(format!("Failed to copy file to {}: {}", key, e))
-        })?;
+        fs::copy(path, &dest)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to copy file to {}: {}", key, e)))?;
         Ok(())
     }
 }
