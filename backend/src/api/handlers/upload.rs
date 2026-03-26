@@ -497,10 +497,648 @@ fn artifact_name_from_path(path: &str) -> &str {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // artifact_name_from_path
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_artifact_name_from_path() {
         assert_eq!(artifact_name_from_path("images/vm.ova"), "vm.ova");
         assert_eq!(artifact_name_from_path("vm.ova"), "vm.ova");
         assert_eq!(artifact_name_from_path("a/b/c/file.tar.gz"), "file.tar.gz");
+    }
+
+    #[test]
+    fn test_artifact_name_from_path_empty() {
+        assert_eq!(artifact_name_from_path(""), "");
+    }
+
+    #[test]
+    fn test_artifact_name_from_path_trailing_slash() {
+        // rsplit('/').next() on "dir/" gives ""
+        assert_eq!(artifact_name_from_path("dir/"), "");
+    }
+
+    #[test]
+    fn test_artifact_name_from_path_no_slash() {
+        assert_eq!(artifact_name_from_path("standalone.bin"), "standalone.bin");
+    }
+
+    #[test]
+    fn test_artifact_name_from_path_deeply_nested() {
+        assert_eq!(
+            artifact_name_from_path("a/b/c/d/e/f/artifact.tar.gz"),
+            "artifact.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_artifact_name_from_path_with_dots() {
+        assert_eq!(
+            artifact_name_from_path("releases/v1.2.3/app-1.2.3.jar"),
+            "app-1.2.3.jar"
+        );
+    }
+
+    #[test]
+    fn test_artifact_name_from_path_unicode() {
+        assert_eq!(
+            artifact_name_from_path("packages/build-2024.pkg"),
+            "build-2024.pkg"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateSessionRequest deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_session_request_deserialize_full() {
+        let json = r#"{
+            "repository_key": "my-repo",
+            "artifact_path": "images/vm.ova",
+            "total_size": 21474836480,
+            "checksum_sha256": "abc123def456",
+            "chunk_size": 16777216,
+            "content_type": "application/x-ova"
+        }"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repository_key, "my-repo");
+        assert_eq!(req.artifact_path, "images/vm.ova");
+        assert_eq!(req.total_size, 21_474_836_480);
+        assert_eq!(req.checksum_sha256, "abc123def456");
+        assert_eq!(req.chunk_size, Some(16_777_216));
+        assert_eq!(req.content_type.as_deref(), Some("application/x-ova"));
+    }
+
+    #[test]
+    fn test_create_session_request_deserialize_minimal() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "file.bin",
+            "total_size": 1024,
+            "checksum_sha256": "deadbeef"
+        }"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repository_key, "repo");
+        assert_eq!(req.artifact_path, "file.bin");
+        assert_eq!(req.total_size, 1024);
+        assert_eq!(req.checksum_sha256, "deadbeef");
+        assert!(req.chunk_size.is_none());
+        assert!(req.content_type.is_none());
+    }
+
+    #[test]
+    fn test_create_session_request_missing_required_field() {
+        // Missing repository_key
+        let json = r#"{
+            "artifact_path": "file.bin",
+            "total_size": 1024,
+            "checksum_sha256": "deadbeef"
+        }"#;
+        let result: Result<CreateSessionRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_session_request_missing_total_size() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "file.bin",
+            "checksum_sha256": "deadbeef"
+        }"#;
+        let result: Result<CreateSessionRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_session_request_missing_checksum() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "file.bin",
+            "total_size": 1024
+        }"#;
+        let result: Result<CreateSessionRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_session_request_missing_artifact_path() {
+        let json = r#"{
+            "repository_key": "repo",
+            "total_size": 1024,
+            "checksum_sha256": "abc"
+        }"#;
+        let result: Result<CreateSessionRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_session_request_extra_fields_ignored() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "file.bin",
+            "total_size": 1024,
+            "checksum_sha256": "abc",
+            "unknown_field": "should be ignored"
+        }"#;
+        // serde defaults to ignoring unknown fields
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.repository_key, "repo");
+    }
+
+    #[test]
+    fn test_create_session_request_null_optional_fields() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "file.bin",
+            "total_size": 1024,
+            "checksum_sha256": "abc",
+            "chunk_size": null,
+            "content_type": null
+        }"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.chunk_size.is_none());
+        assert!(req.content_type.is_none());
+    }
+
+    #[test]
+    fn test_create_session_request_zero_total_size() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "empty.bin",
+            "total_size": 0,
+            "checksum_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.total_size, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateSessionResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_session_response_serialize() {
+        let resp = CreateSessionResponse {
+            session_id: Uuid::nil(),
+            chunk_count: 3,
+            chunk_size: 8_388_608,
+            expires_at: "2026-03-25T12:00:00Z".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["session_id"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(json["chunk_count"], 3);
+        assert_eq!(json["chunk_size"], 8_388_608);
+        assert_eq!(json["expires_at"], "2026-03-25T12:00:00Z");
+    }
+
+    #[test]
+    fn test_create_session_response_field_names() {
+        // The CLI and web frontend depend on these exact field names
+        let resp = CreateSessionResponse {
+            session_id: Uuid::nil(),
+            chunk_count: 1,
+            chunk_size: 1,
+            expires_at: String::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"session_id\""));
+        assert!(json.contains("\"chunk_count\""));
+        assert!(json.contains("\"chunk_size\""));
+        assert!(json.contains("\"expires_at\""));
+        // Verify no typos in field names (these should NOT appear)
+        assert!(!json.contains("\"sessionId\""));
+        assert!(!json.contains("\"chunkCount\""));
+        assert!(!json.contains("\"chunkSize\""));
+        assert!(!json.contains("\"expiresAt\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // ChunkResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chunk_response_serialize() {
+        let resp = ChunkResponse {
+            chunk_index: 2,
+            bytes_received: 25_165_824,
+            chunks_completed: 3,
+            chunks_remaining: 7,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["chunk_index"], 2);
+        assert_eq!(json["bytes_received"], 25_165_824);
+        assert_eq!(json["chunks_completed"], 3);
+        assert_eq!(json["chunks_remaining"], 7);
+    }
+
+    #[test]
+    fn test_chunk_response_field_names() {
+        let resp = ChunkResponse {
+            chunk_index: 0,
+            bytes_received: 0,
+            chunks_completed: 0,
+            chunks_remaining: 0,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"chunk_index\""));
+        assert!(json.contains("\"bytes_received\""));
+        assert!(json.contains("\"chunks_completed\""));
+        assert!(json.contains("\"chunks_remaining\""));
+    }
+
+    #[test]
+    fn test_chunk_response_zero_remaining() {
+        let resp = ChunkResponse {
+            chunk_index: 9,
+            bytes_received: 104_857_600,
+            chunks_completed: 10,
+            chunks_remaining: 0,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["chunks_remaining"], 0);
+        assert_eq!(json["chunks_completed"], 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionStatusResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_session_status_response_serialize() {
+        let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let resp = SessionStatusResponse {
+            session_id,
+            status: "in_progress".into(),
+            total_size: 104_857_600,
+            bytes_received: 25_165_824,
+            chunks_completed: 3,
+            chunks_total: 13,
+            repository_key: "docker-local".into(),
+            artifact_path: "images/app.tar.gz".into(),
+            created_at: "2026-03-25T10:00:00Z".into(),
+            expires_at: "2026-03-26T10:00:00Z".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["session_id"], "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(json["status"], "in_progress");
+        assert_eq!(json["total_size"], 104_857_600);
+        assert_eq!(json["bytes_received"], 25_165_824);
+        assert_eq!(json["chunks_completed"], 3);
+        assert_eq!(json["chunks_total"], 13);
+        assert_eq!(json["repository_key"], "docker-local");
+        assert_eq!(json["artifact_path"], "images/app.tar.gz");
+    }
+
+    #[test]
+    fn test_session_status_response_field_names() {
+        let resp = SessionStatusResponse {
+            session_id: Uuid::nil(),
+            status: String::new(),
+            total_size: 0,
+            bytes_received: 0,
+            chunks_completed: 0,
+            chunks_total: 0,
+            repository_key: String::new(),
+            artifact_path: String::new(),
+            created_at: String::new(),
+            expires_at: String::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        // Verify snake_case field names (API contract)
+        assert!(json.contains("\"session_id\""));
+        assert!(json.contains("\"status\""));
+        assert!(json.contains("\"total_size\""));
+        assert!(json.contains("\"bytes_received\""));
+        assert!(json.contains("\"chunks_completed\""));
+        assert!(json.contains("\"chunks_total\""));
+        assert!(json.contains("\"repository_key\""));
+        assert!(json.contains("\"artifact_path\""));
+        assert!(json.contains("\"created_at\""));
+        assert!(json.contains("\"expires_at\""));
+    }
+
+    #[test]
+    fn test_session_status_response_pending_state() {
+        let resp = SessionStatusResponse {
+            session_id: Uuid::nil(),
+            status: "pending".into(),
+            total_size: 1024,
+            bytes_received: 0,
+            chunks_completed: 0,
+            chunks_total: 1,
+            repository_key: "test".into(),
+            artifact_path: "f.bin".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2026-01-02T00:00:00Z".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["status"], "pending");
+        assert_eq!(json["bytes_received"], 0);
+        assert_eq!(json["chunks_completed"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // CompleteResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_complete_response_serialize() {
+        let artifact_id = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
+        let resp = CompleteResponse {
+            artifact_id,
+            path: "images/vm.ova".into(),
+            size: 21_474_836_480,
+            checksum_sha256: "abc123".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["artifact_id"], "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+        assert_eq!(json["path"], "images/vm.ova");
+        assert_eq!(json["size"], 21_474_836_480_i64);
+        assert_eq!(json["checksum_sha256"], "abc123");
+    }
+
+    #[test]
+    fn test_complete_response_field_names() {
+        let resp = CompleteResponse {
+            artifact_id: Uuid::nil(),
+            path: String::new(),
+            size: 0,
+            checksum_sha256: String::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"artifact_id\""));
+        assert!(json.contains("\"path\""));
+        assert!(json.contains("\"size\""));
+        assert!(json.contains("\"checksum_sha256\""));
+        // camelCase variants must NOT appear
+        assert!(!json.contains("\"artifactId\""));
+        assert!(!json.contains("\"checksumSha256\""));
+    }
+
+    #[test]
+    fn test_complete_response_large_size() {
+        let resp = CompleteResponse {
+            artifact_id: Uuid::nil(),
+            path: "big-file.iso".into(),
+            size: 107_374_182_400, // 100 GB
+            checksum_sha256: "abc".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["size"], 107_374_182_400_i64);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_upload_err status code mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_upload_err_not_found() {
+        let resp = map_upload_err(UploadError::NotFound);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_map_upload_err_expired() {
+        let resp = map_upload_err(UploadError::Expired);
+        assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    #[test]
+    fn test_map_upload_err_invalid_chunk() {
+        let resp = map_upload_err(UploadError::InvalidChunk("bad".into()));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_map_upload_err_invalid_chunk_size() {
+        let resp = map_upload_err(UploadError::InvalidChunkSize);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_map_upload_err_invalid_status() {
+        let resp = map_upload_err(UploadError::InvalidStatus("completed".into()));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_map_upload_err_checksum_mismatch() {
+        let resp = map_upload_err(UploadError::ChecksumMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_map_upload_err_incomplete_chunks() {
+        let resp = map_upload_err(UploadError::IncompleteChunks {
+            completed: 5,
+            total: 10,
+        });
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_map_upload_err_size_mismatch() {
+        let resp = map_upload_err(UploadError::SizeMismatch {
+            expected: 100,
+            actual: 50,
+        });
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_map_upload_err_repository_not_found() {
+        let resp = map_upload_err(UploadError::RepositoryNotFound("gone-repo".into()));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_map_upload_err_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "disk full");
+        let resp = map_upload_err(UploadError::Io(io_err));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_err helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_err_returns_correct_status() {
+        let resp = map_err(StatusCode::BAD_REQUEST, "something went wrong");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_map_err_internal_server_error() {
+        let resp = map_err(StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_map_err_not_found() {
+        let resp = map_err(StatusCode::NOT_FOUND, "Repository 'x' not found");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-trip: CreateSessionRequest JSON stability
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_session_request_roundtrip_optional_present() {
+        let json_in = serde_json::json!({
+            "repository_key": "npm-local",
+            "artifact_path": "packages/@scope/pkg-1.0.0.tgz",
+            "total_size": 52428800,
+            "checksum_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "chunk_size": 4194304,
+            "content_type": "application/gzip"
+        });
+        let req: CreateSessionRequest = serde_json::from_value(json_in.clone()).unwrap();
+        assert_eq!(req.repository_key, "npm-local");
+        assert_eq!(req.chunk_size, Some(4_194_304));
+        assert_eq!(req.content_type.as_deref(), Some("application/gzip"));
+    }
+
+    #[test]
+    fn test_create_session_request_wrong_type_total_size() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "file.bin",
+            "total_size": "not a number",
+            "checksum_sha256": "abc"
+        }"#;
+        let result: Result<CreateSessionRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug implementations on DTOs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_session_request_debug() {
+        let req = CreateSessionRequest {
+            repository_key: "repo".into(),
+            artifact_path: "file.bin".into(),
+            total_size: 100,
+            checksum_sha256: "abc".into(),
+            chunk_size: None,
+            content_type: None,
+        };
+        let debug = format!("{:?}", req);
+        assert!(debug.contains("CreateSessionRequest"));
+        assert!(debug.contains("repo"));
+    }
+
+    #[test]
+    fn test_create_session_response_debug() {
+        let resp = CreateSessionResponse {
+            session_id: Uuid::nil(),
+            chunk_count: 1,
+            chunk_size: 8388608,
+            expires_at: "2026-01-01".into(),
+        };
+        let debug = format!("{:?}", resp);
+        assert!(debug.contains("CreateSessionResponse"));
+    }
+
+    #[test]
+    fn test_chunk_response_debug() {
+        let resp = ChunkResponse {
+            chunk_index: 0,
+            bytes_received: 0,
+            chunks_completed: 0,
+            chunks_remaining: 0,
+        };
+        let debug = format!("{:?}", resp);
+        assert!(debug.contains("ChunkResponse"));
+    }
+
+    #[test]
+    fn test_session_status_response_debug() {
+        let resp = SessionStatusResponse {
+            session_id: Uuid::nil(),
+            status: "pending".into(),
+            total_size: 0,
+            bytes_received: 0,
+            chunks_completed: 0,
+            chunks_total: 0,
+            repository_key: String::new(),
+            artifact_path: String::new(),
+            created_at: String::new(),
+            expires_at: String::new(),
+        };
+        let debug = format!("{:?}", resp);
+        assert!(debug.contains("SessionStatusResponse"));
+    }
+
+    #[test]
+    fn test_complete_response_debug() {
+        let resp = CompleteResponse {
+            artifact_id: Uuid::nil(),
+            path: String::new(),
+            size: 0,
+            checksum_sha256: String::new(),
+        };
+        let debug = format!("{:?}", resp);
+        assert!(debug.contains("CompleteResponse"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Content-Range header extraction logic
+    // (tests the same parse function but from the handler's perspective)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chunk_index_from_byte_offset() {
+        // The handler computes chunk_index = start / chunk_size
+        let chunk_size: i64 = 8 * 1024 * 1024; // 8 MB
+
+        // First chunk
+        let start: i64 = 0;
+        assert_eq!((start / chunk_size) as i32, 0);
+
+        // Second chunk
+        let start: i64 = 8 * 1024 * 1024;
+        assert_eq!((start / chunk_size) as i32, 1);
+
+        // Third chunk
+        let start: i64 = 16 * 1024 * 1024;
+        assert_eq!((start / chunk_size) as i32, 2);
+
+        // 100th chunk
+        let start: i64 = 99 * 8 * 1024 * 1024;
+        assert_eq!((start / chunk_size) as i32, 99);
+    }
+
+    #[test]
+    fn test_expected_body_length_from_content_range() {
+        // The handler validates: data.len() == (end - start + 1)
+        let (start, end, _total) =
+            upload_service::parse_content_range("bytes 0-8388607/20971520").unwrap();
+        let expected_len = (end - start + 1) as usize;
+        assert_eq!(expected_len, 8_388_608); // 8 MB
+    }
+
+    #[test]
+    fn test_expected_body_length_last_partial_chunk() {
+        // Last chunk of 20 MB file, 8 MB chunks: bytes 16777216-20971519/20971520
+        let (start, end, _total) =
+            upload_service::parse_content_range("bytes 16777216-20971519/20971520").unwrap();
+        let expected_len = (end - start + 1) as usize;
+        assert_eq!(expected_len, 4 * 1024 * 1024); // 4 MB
+    }
+
+    #[test]
+    fn test_expected_body_length_single_byte() {
+        let (start, end, _total) = upload_service::parse_content_range("bytes 0-0/1").unwrap();
+        let expected_len = (end - start + 1) as usize;
+        assert_eq!(expected_len, 1);
     }
 }

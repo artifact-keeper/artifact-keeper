@@ -524,6 +524,10 @@ pub fn parse_content_range(header: &str) -> Result<(i64, i64, i64), String> {
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // parse_content_range: existing tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_parse_content_range_valid() {
         let (start, end, total) = parse_content_range("bytes 0-8388607/21474836480").unwrap();
@@ -589,6 +593,131 @@ mod tests {
         assert!(parse_content_range("bytes 0-999").is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // parse_content_range: additional edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_content_range_single_byte_range() {
+        // Exactly one byte: bytes 0-0/1
+        let (start, end, total) = parse_content_range("bytes 0-0/1").unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn test_parse_content_range_single_byte_in_large_file() {
+        // One byte at offset 500 in a 1000-byte file
+        let (start, end, total) = parse_content_range("bytes 500-500/1000").unwrap();
+        assert_eq!(start, 500);
+        assert_eq!(end, 500);
+        assert_eq!(total, 1000);
+    }
+
+    #[test]
+    fn test_parse_content_range_exactly_at_boundary() {
+        // end == total - 1 (the maximum valid end value)
+        let (start, end, total) = parse_content_range("bytes 0-999/1000").unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 999);
+        assert_eq!(total, 1000);
+    }
+
+    #[test]
+    fn test_parse_content_range_end_equals_total_is_error() {
+        // end == total is invalid (end is inclusive, so this claims byte 1000 in a 1000-byte file)
+        assert!(parse_content_range("bytes 0-1000/1000").is_err());
+    }
+
+    #[test]
+    fn test_parse_content_range_end_exceeds_total() {
+        assert!(parse_content_range("bytes 0-2000/1000").is_err());
+    }
+
+    #[test]
+    fn test_parse_content_range_very_large_numbers() {
+        // 100 GB file, near the end
+        let (start, end, total) =
+            parse_content_range("bytes 107374182300-107374182399/107374182400").unwrap();
+        assert_eq!(start, 107_374_182_300);
+        assert_eq!(end, 107_374_182_399);
+        assert_eq!(total, 107_374_182_400);
+    }
+
+    #[test]
+    fn test_parse_content_range_i64_max_boundary() {
+        // Near i64::MAX
+        let big = i64::MAX - 1; // 9223372036854775806
+        let header = format!("bytes 0-{}/{}", big, big + 1);
+        let (start, end, total) = parse_content_range(&header).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, big);
+        assert_eq!(total, big + 1);
+    }
+
+    #[test]
+    fn test_parse_content_range_leading_trailing_whitespace() {
+        // The function trims the header, so leading/trailing whitespace should work
+        let (start, end, total) = parse_content_range("  bytes 0-99/100  ").unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 99);
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn test_parse_content_range_wrong_unit() {
+        let err = parse_content_range("bits 0-99/100").unwrap_err();
+        assert!(err.contains("bytes"));
+    }
+
+    #[test]
+    fn test_parse_content_range_empty_string() {
+        assert!(parse_content_range("").is_err());
+    }
+
+    #[test]
+    fn test_parse_content_range_only_prefix() {
+        assert!(parse_content_range("bytes ").is_err());
+    }
+
+    #[test]
+    fn test_parse_content_range_missing_dash() {
+        assert!(parse_content_range("bytes 0/1000").is_err());
+    }
+
+    #[test]
+    fn test_parse_content_range_negative_numbers() {
+        // Negative numbers should fail to parse (the parser uses i64, but the string
+        // "-5" in "bytes -5-999/1000" would be misinterpreted by split_once('-'))
+        assert!(parse_content_range("bytes -5-999/1000").is_err());
+    }
+
+    #[test]
+    fn test_parse_content_range_start_equals_end() {
+        // start == end is valid (single byte)
+        let (start, end, total) = parse_content_range("bytes 42-42/100").unwrap();
+        assert_eq!(start, 42);
+        assert_eq!(end, 42);
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn test_parse_content_range_extra_spaces_in_range() {
+        // Extra spaces after "bytes " should cause a parse error
+        assert!(parse_content_range("bytes  0-99/100").is_err());
+    }
+
+    #[test]
+    fn test_parse_content_range_overflow_number() {
+        // A number exceeding i64::MAX
+        assert!(parse_content_range("bytes 0-99/99999999999999999999999").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk count calculation: comprehensive sizes
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_chunk_count_calculation() {
         // Exact multiple: 20 MB / 8 MB = 2.5, rounds up to 3
@@ -614,6 +743,121 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_count_with_min_chunk_size() {
+        // 10 MB file with 1 MB chunks
+        let total_size: i64 = 10 * 1024 * 1024;
+        let chunk_size = MIN_CHUNK_SIZE;
+        let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
+        assert_eq!(total_chunks, 10);
+    }
+
+    #[test]
+    fn test_chunk_count_with_max_chunk_size() {
+        // 1 GB file with 256 MB chunks
+        let total_size: i64 = 1024 * 1024 * 1024;
+        let chunk_size = MAX_CHUNK_SIZE;
+        let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
+        assert_eq!(total_chunks, 4);
+    }
+
+    #[test]
+    fn test_chunk_count_one_byte_over_boundary() {
+        // 8 MB + 1 byte with 8 MB chunks should produce 2 chunks
+        let chunk_size: i64 = 8 * 1024 * 1024;
+        let total_size: i64 = chunk_size + 1;
+        let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
+        assert_eq!(total_chunks, 2);
+    }
+
+    #[test]
+    fn test_chunk_count_one_byte_under_boundary() {
+        // 8 MB - 1 byte with 8 MB chunks should produce 1 chunk
+        let chunk_size: i64 = 8 * 1024 * 1024;
+        let total_size: i64 = chunk_size - 1;
+        let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
+        assert_eq!(total_chunks, 1);
+    }
+
+    #[test]
+    fn test_chunk_count_exact_boundary() {
+        // Exactly 8 MB with 8 MB chunks should produce 1 chunk
+        let chunk_size: i64 = 8 * 1024 * 1024;
+        let total_size: i64 = chunk_size;
+        let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
+        assert_eq!(total_chunks, 1);
+    }
+
+    #[test]
+    fn test_chunk_count_exact_double_boundary() {
+        // Exactly 16 MB with 8 MB chunks should produce 2 chunks
+        let chunk_size: i64 = 8 * 1024 * 1024;
+        let total_size: i64 = 2 * chunk_size;
+        let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
+        assert_eq!(total_chunks, 2);
+    }
+
+    #[test]
+    fn test_last_chunk_size_calculation() {
+        // 20 MB file, 8 MB chunks -> 3 chunks, last is 4 MB
+        let total_size: i64 = 20 * 1024 * 1024;
+        let chunk_size: i32 = 8 * 1024 * 1024;
+        let total_chunks = ((total_size + chunk_size as i64 - 1) / chunk_size as i64) as i32;
+
+        let last_offset = (total_chunks - 1) as i64 * chunk_size as i64;
+        let last_length = (total_size - last_offset) as i32;
+        assert_eq!(last_length, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_last_chunk_size_exact_division() {
+        // 16 MB file, 8 MB chunks -> 2 chunks, last is exactly 8 MB
+        let total_size: i64 = 16 * 1024 * 1024;
+        let chunk_size: i32 = 8 * 1024 * 1024;
+        let total_chunks = ((total_size + chunk_size as i64 - 1) / chunk_size as i64) as i32;
+
+        let last_offset = (total_chunks - 1) as i64 * chunk_size as i64;
+        let last_length = (total_size - last_offset) as i32;
+        assert_eq!(last_length, chunk_size);
+    }
+
+    #[test]
+    fn test_last_chunk_size_single_byte_remainder() {
+        // (8 MB + 1) file, 8 MB chunks -> 2 chunks, last is 1 byte
+        let chunk_size: i32 = 8 * 1024 * 1024;
+        let total_size: i64 = chunk_size as i64 + 1;
+        let total_chunks = ((total_size + chunk_size as i64 - 1) / chunk_size as i64) as i32;
+
+        let last_offset = (total_chunks - 1) as i64 * chunk_size as i64;
+        let last_length = (total_size - last_offset) as i32;
+        assert_eq!(last_length, 1);
+    }
+
+    #[test]
+    fn test_all_chunk_offsets_cover_full_file() {
+        // Verify that iterating all chunks covers every byte exactly once
+        let total_size: i64 = 25 * 1024 * 1024; // 25 MB
+        let chunk_size: i32 = 8 * 1024 * 1024;
+        let total_chunks = ((total_size + chunk_size as i64 - 1) / chunk_size as i64) as i32;
+
+        let mut covered: i64 = 0;
+        for i in 0..total_chunks {
+            let offset = i as i64 * chunk_size as i64;
+            let length = if i == total_chunks - 1 {
+                (total_size - offset) as i32
+            } else {
+                chunk_size
+            };
+            assert_eq!(offset, covered, "chunk {} starts at wrong offset", i);
+            covered += length as i64;
+        }
+        assert_eq!(covered, total_size);
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants and default chunk size validation
+    // -----------------------------------------------------------------------
+
+    #[test]
     fn test_chunk_size_defaults() {
         let min = MIN_CHUNK_SIZE;
         let max = MAX_CHUNK_SIZE;
@@ -622,5 +866,453 @@ mod tests {
         assert!(max >= 268_435_456, "max chunk should be at least 256MB");
         assert!(default >= min, "default should be >= min");
         assert!(default <= max, "default should be <= max");
+    }
+
+    #[test]
+    fn test_constants_are_powers_of_two() {
+        assert!((MIN_CHUNK_SIZE as u64).is_power_of_two());
+        assert!((MAX_CHUNK_SIZE as u64).is_power_of_two());
+        assert!((DEFAULT_CHUNK_SIZE as u64).is_power_of_two());
+    }
+
+    #[test]
+    fn test_sha256_buf_size() {
+        assert_eq!(SHA256_BUF_SIZE, 64 * 1024);
+        // Buffer should be a reasonable size, not too small, not too large
+        assert!(SHA256_BUF_SIZE >= 4096);
+        assert!(SHA256_BUF_SIZE <= 1024 * 1024);
+    }
+
+    #[test]
+    fn test_default_chunk_size_is_8mb() {
+        assert_eq!(DEFAULT_CHUNK_SIZE, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_min_chunk_size_is_1mb() {
+        assert_eq!(MIN_CHUNK_SIZE, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_max_chunk_size_is_256mb() {
+        assert_eq!(MAX_CHUNK_SIZE, 256 * 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk size validation (create_session logic, tested as pure math)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chunk_size_below_min_is_rejected() {
+        let chunk_size: i32 = (MIN_CHUNK_SIZE - 1) as i32;
+        let is_valid =
+            (chunk_size as i64) >= MIN_CHUNK_SIZE && (chunk_size as i64) <= MAX_CHUNK_SIZE;
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn test_chunk_size_above_max_is_rejected() {
+        // 512 MB
+        let chunk_size: i32 = 512 * 1024 * 1024;
+        let is_valid =
+            (chunk_size as i64) >= MIN_CHUNK_SIZE && (chunk_size as i64) <= MAX_CHUNK_SIZE;
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn test_chunk_size_at_min_is_accepted() {
+        let chunk_size: i32 = MIN_CHUNK_SIZE as i32;
+        let is_valid =
+            (chunk_size as i64) >= MIN_CHUNK_SIZE && (chunk_size as i64) <= MAX_CHUNK_SIZE;
+        assert!(is_valid);
+    }
+
+    #[test]
+    fn test_chunk_size_at_max_is_accepted() {
+        let chunk_size: i32 = MAX_CHUNK_SIZE as i32;
+        let is_valid =
+            (chunk_size as i64) >= MIN_CHUNK_SIZE && (chunk_size as i64) <= MAX_CHUNK_SIZE;
+        assert!(is_valid);
+    }
+
+    #[test]
+    fn test_chunk_size_zero_is_rejected() {
+        let chunk_size: i32 = 0;
+        let is_valid =
+            (chunk_size as i64) >= MIN_CHUNK_SIZE && (chunk_size as i64) <= MAX_CHUNK_SIZE;
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn test_chunk_size_negative_is_rejected() {
+        let chunk_size: i32 = -1;
+        let is_valid =
+            (chunk_size as i64) >= MIN_CHUNK_SIZE && (chunk_size as i64) <= MAX_CHUNK_SIZE;
+        assert!(!is_valid);
+    }
+
+    #[test]
+    fn test_default_chunk_size_when_none() {
+        // Simulates the unwrap_or logic in create_session
+        let user_chunk_size: Option<i32> = None;
+        let chunk_size = user_chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+        assert_eq!(chunk_size, DEFAULT_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn test_custom_chunk_size_overrides_default() {
+        let user_chunk_size: Option<i32> = Some(4 * 1024 * 1024); // 4 MB
+        let chunk_size = user_chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+        assert_eq!(chunk_size, 4 * 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------------
+    // Temp file path construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_temp_dir_path_construction() {
+        let storage_path = "/data/artifact-storage";
+        let temp_dir = PathBuf::from(storage_path).join(".uploads");
+        assert_eq!(temp_dir, PathBuf::from("/data/artifact-storage/.uploads"));
+    }
+
+    #[test]
+    fn test_temp_file_path_contains_session_id() {
+        let storage_path = "/data/storage";
+        let session_id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let temp_dir = PathBuf::from(storage_path).join(".uploads");
+        let temp_file_path = temp_dir.join(session_id.to_string());
+        assert_eq!(
+            temp_file_path,
+            PathBuf::from("/data/storage/.uploads/550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn test_temp_dir_is_hidden_directory() {
+        let storage_path = "/data/storage";
+        let temp_dir = PathBuf::from(storage_path).join(".uploads");
+        let dir_name = temp_dir.file_name().unwrap().to_str().unwrap();
+        assert!(
+            dir_name.starts_with('.'),
+            "temp dir should be hidden (dot-prefixed)"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_path_with_trailing_slash_storage() {
+        let storage_path = "/data/storage/";
+        let session_id = Uuid::new_v4();
+        let temp_dir = PathBuf::from(storage_path).join(".uploads");
+        let temp_file_path = temp_dir.join(session_id.to_string());
+        assert!(temp_file_path.to_string_lossy().contains(".uploads/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // UploadError Display implementations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upload_error_not_found_display() {
+        let err = UploadError::NotFound;
+        assert_eq!(err.to_string(), "session not found");
+    }
+
+    #[test]
+    fn test_upload_error_expired_display() {
+        let err = UploadError::Expired;
+        assert_eq!(err.to_string(), "session expired");
+    }
+
+    #[test]
+    fn test_upload_error_invalid_chunk_display() {
+        let err = UploadError::InvalidChunk("chunk_index 5 out of range".into());
+        assert_eq!(err.to_string(), "invalid chunk: chunk_index 5 out of range");
+    }
+
+    #[test]
+    fn test_upload_error_checksum_mismatch_display() {
+        let err = UploadError::ChecksumMismatch {
+            expected: "abc123".into(),
+            actual: "def456".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "checksum mismatch: expected abc123, got def456"
+        );
+    }
+
+    #[test]
+    fn test_upload_error_incomplete_chunks_display() {
+        let err = UploadError::IncompleteChunks {
+            completed: 3,
+            total: 10,
+        };
+        assert_eq!(err.to_string(), "not all chunks completed: 3/10");
+    }
+
+    #[test]
+    fn test_upload_error_size_mismatch_display() {
+        let err = UploadError::SizeMismatch {
+            expected: 1024,
+            actual: 512,
+        };
+        assert_eq!(err.to_string(), "size mismatch: expected 1024, got 512");
+    }
+
+    #[test]
+    fn test_upload_error_invalid_status_display() {
+        let err = UploadError::InvalidStatus("completed".into());
+        assert_eq!(err.to_string(), "invalid session status: completed");
+    }
+
+    #[test]
+    fn test_upload_error_repository_not_found_display() {
+        let err = UploadError::RepositoryNotFound("my-repo".into());
+        assert_eq!(err.to_string(), "repository not found: my-repo");
+    }
+
+    #[test]
+    fn test_upload_error_invalid_chunk_size_display() {
+        let err = UploadError::InvalidChunkSize;
+        assert_eq!(
+            err.to_string(),
+            "invalid chunk size: must be between 1 MB and 256 MB"
+        );
+    }
+
+    #[test]
+    fn test_upload_error_io_display() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
+        let err = UploadError::Io(io_err);
+        assert_eq!(err.to_string(), "I/O error: file gone");
+    }
+
+    #[test]
+    fn test_upload_error_debug_impl() {
+        // Verify Debug is derived on all variants
+        let err = UploadError::NotFound;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("NotFound"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ChunkResult fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chunk_result_fields() {
+        let result = ChunkResult {
+            chunk_index: 2,
+            bytes_received: 16_777_216,
+            chunks_completed: 3,
+            chunks_remaining: 7,
+        };
+        assert_eq!(result.chunk_index, 2);
+        assert_eq!(result.bytes_received, 16_777_216);
+        assert_eq!(result.chunks_completed, 3);
+        assert_eq!(result.chunks_remaining, 7);
+    }
+
+    #[test]
+    fn test_chunk_result_debug() {
+        let result = ChunkResult {
+            chunk_index: 0,
+            bytes_received: 0,
+            chunks_completed: 0,
+            chunks_remaining: 1,
+        };
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("ChunkResult"));
+        assert!(debug.contains("chunk_index"));
+    }
+
+    // -----------------------------------------------------------------------
+    // FinalizeResult fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_finalize_result_fields() {
+        let id = Uuid::new_v4();
+        let result = FinalizeResult {
+            artifact_id: id,
+            path: "images/vm.ova".into(),
+            size: 21_474_836_480,
+            checksum_sha256: "abcdef1234567890".into(),
+        };
+        assert_eq!(result.artifact_id, id);
+        assert_eq!(result.path, "images/vm.ova");
+        assert_eq!(result.size, 21_474_836_480);
+        assert_eq!(result.checksum_sha256, "abcdef1234567890");
+    }
+
+    #[test]
+    fn test_finalize_result_debug() {
+        let result = FinalizeResult {
+            artifact_id: Uuid::nil(),
+            path: String::new(),
+            size: 0,
+            checksum_sha256: String::new(),
+        };
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("FinalizeResult"));
+    }
+
+    // -----------------------------------------------------------------------
+    // UploadSession struct field coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upload_session_debug() {
+        let session = UploadSession {
+            id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            repository_key: "test-repo".into(),
+            artifact_path: "path/to/file.bin".into(),
+            content_type: "application/octet-stream".into(),
+            total_size: 1024,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            total_chunks: 1,
+            completed_chunks: 0,
+            bytes_received: 0,
+            checksum_sha256: "deadbeef".into(),
+            temp_file_path: "/tmp/.uploads/some-id".into(),
+            status: "pending".into(),
+            error_message: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now(),
+        };
+        let debug = format!("{:?}", session);
+        assert!(debug.contains("test-repo"));
+        assert!(debug.contains("pending"));
+    }
+
+    #[test]
+    fn test_upload_session_clone() {
+        let session = UploadSession {
+            id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            repository_key: "repo".into(),
+            artifact_path: "file.bin".into(),
+            content_type: "application/octet-stream".into(),
+            total_size: 100,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            total_chunks: 1,
+            completed_chunks: 0,
+            bytes_received: 0,
+            checksum_sha256: "abc".into(),
+            temp_file_path: "/tmp/x".into(),
+            status: "pending".into(),
+            error_message: Some("test error".into()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now(),
+        };
+        let cloned = session.clone();
+        assert_eq!(session.id, cloned.id);
+        assert_eq!(session.repository_key, cloned.repository_key);
+        assert_eq!(session.error_message, cloned.error_message);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_file_sha256 (async, uses real temp files)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_compute_file_sha256_known_content() {
+        // SHA256 of "hello world\n" is well-known
+        let dir = std::env::temp_dir().join("ak_upload_test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("sha256_test_known.bin");
+        tokio::fs::write(&path, b"hello world\n").await.unwrap();
+
+        let hash = compute_file_sha256(&path).await.unwrap();
+        // sha256sum of "hello world\n"
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_compute_file_sha256_empty_file() {
+        let dir = std::env::temp_dir().join("ak_upload_test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("sha256_test_empty.bin");
+        tokio::fs::write(&path, b"").await.unwrap();
+
+        let hash = compute_file_sha256(&path).await.unwrap();
+        // SHA256 of empty input
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_compute_file_sha256_large_file() {
+        // Create a file larger than SHA256_BUF_SIZE (64 KB) to exercise the loop
+        let dir = std::env::temp_dir().join("ak_upload_test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("sha256_test_large.bin");
+
+        let data = vec![0xABu8; 128 * 1024]; // 128 KB of 0xAB
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let hash = compute_file_sha256(&path).await.unwrap();
+        // Verify by computing with the same hasher inline
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let expected = format!("{:x}", hasher.finalize());
+        assert_eq!(hash, expected);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_compute_file_sha256_nonexistent_file() {
+        let path = PathBuf::from("/tmp/ak_upload_test/nonexistent_file_12345.bin");
+        let result = compute_file_sha256(&path).await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // UploadError From implementations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upload_error_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let upload_err: UploadError = io_err.into();
+        match upload_err {
+            UploadError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("Expected Io variant, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Content type defaulting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_content_type_defaults_to_octet_stream() {
+        let content_type: Option<&str> = None;
+        let resolved = content_type.unwrap_or("application/octet-stream");
+        assert_eq!(resolved, "application/octet-stream");
+    }
+
+    #[test]
+    fn test_content_type_custom_value() {
+        let content_type: Option<&str> = Some("image/png");
+        let resolved = content_type.unwrap_or("application/octet-stream");
+        assert_eq!(resolved, "image/png");
     }
 }
