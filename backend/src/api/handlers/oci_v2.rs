@@ -239,7 +239,18 @@ async fn try_upstream_fetch(
     }
     let upstream_url = repo.upstream_url.as_ref()?;
     let proxy = state.proxy_service.as_ref()?;
-    let upstream_path = format!("v2/{}/{}", repo.image, path_suffix);
+
+    // Docker Hub stores official images under the "library/" namespace.
+    // When the image name has no slash (e.g., "alpine" not "myorg/myimage"),
+    // and the upstream is Docker Hub, prepend "library/" so the request
+    // resolves correctly.
+    let image = if !repo.image.contains('/') && upstream_url.contains("docker.io") {
+        format!("library/{}", repo.image)
+    } else {
+        repo.image.clone()
+    };
+
+    let upstream_path = format!("v2/{}/{}", image, path_suffix);
     proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
         .await
         .ok()
@@ -2103,5 +2114,44 @@ mod tests {
         let info = make_repo_info("docker-local", "local", None, "myapp");
         assert_ne!(info.repo_type, RepositoryType::Remote);
         assert!(info.upstream_url.is_none());
+    }
+
+    #[test]
+    fn test_docker_hub_library_prefix_for_official_images() {
+        // Official images (no slash) on Docker Hub get "library/" prepended
+        let image = "alpine";
+        let upstream = "https://registry-1.docker.io";
+        let result = if !image.contains('/') && upstream.contains("docker.io") {
+            format!("library/{}", image)
+        } else {
+            image.to_string()
+        };
+        assert_eq!(result, "library/alpine");
+    }
+
+    #[test]
+    fn test_docker_hub_no_prefix_for_namespaced_images() {
+        // Namespaced images (with slash) are not prefixed
+        let image = "myorg/myimage";
+        let upstream = "https://registry-1.docker.io";
+        let result = if !image.contains('/') && upstream.contains("docker.io") {
+            format!("library/{}", image)
+        } else {
+            image.to_string()
+        };
+        assert_eq!(result, "myorg/myimage");
+    }
+
+    #[test]
+    fn test_non_docker_hub_no_library_prefix() {
+        // Non-Docker Hub registries never get the prefix
+        let image = "alpine";
+        let upstream = "https://ghcr.io";
+        let result = if !image.contains('/') && upstream.contains("docker.io") {
+            format!("library/{}", image)
+        } else {
+            image.to_string()
+        };
+        assert_eq!(result, "alpine");
     }
 }
