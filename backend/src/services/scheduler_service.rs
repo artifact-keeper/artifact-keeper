@@ -274,8 +274,32 @@ pub fn spawn_all(
         });
     }
 
+    // Chunked upload session cleanup (every hour)
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
+
+            loop {
+                ticker.tick().await;
+                tracing::debug!("Cleaning up expired upload sessions");
+
+                match crate::services::upload_service::UploadService::cleanup_expired(&db).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Cleaned up {} expired upload sessions", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Upload session cleanup failed: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync"
+        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
     );
 }
 

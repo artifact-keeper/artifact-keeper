@@ -75,6 +75,17 @@ impl StorageBackend for FilesystemStorage {
             .map_err(|e| AppError::Storage(format!("Failed to delete {}: {}", key, e)))?;
         Ok(())
     }
+
+    async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let dest = self.key_to_path(key);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(path, &dest)
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to copy file to {}: {}", key, e)))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

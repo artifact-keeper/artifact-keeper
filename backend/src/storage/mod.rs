@@ -73,6 +73,13 @@ pub trait StorageBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Store content from a file. Default reads the whole file into memory;
+    /// backends should override for streaming support.
+    async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let content = tokio::fs::read(path).await?;
+        self.put(key, content.into()).await
+    }
+
     /// Perform a lightweight connectivity probe against the storage backend.
     ///
     /// Returns `Ok(())` if the backend is reachable and authenticated.
