@@ -16,7 +16,7 @@
 # Profiles:
 #   smoke  - Quick tests: Playwright E2E + PyPI, NPM, Cargo native clients (default)
 #   all    - All tests: Playwright E2E + all native clients
-#   pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, hex - Individual native client tests
+#   pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, docker-proxy, hex - Individual native client tests
 #
 
 set -e
@@ -76,7 +76,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --profile PROFILE  Test profile to run (smoke, all, proxy, redteam, storage-gc, curation, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, hex)"
+            echo "  --profile PROFILE  Test profile to run (smoke, all, proxy, docker-proxy, redteam, storage-gc, curation, pypi, npm, cargo, maven, go, rpm, deb, helm, conda, docker, docker-proxy, hex)"
             echo "  --build            Force rebuild all containers"
             echo "  --clean            Clean up containers and volumes after tests"
             echo "  --stress           Run stress tests after E2E tests"
