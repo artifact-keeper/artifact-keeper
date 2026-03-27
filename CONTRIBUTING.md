@@ -8,7 +8,7 @@ Thanks for your interest in contributing! Here's how to get started.
 2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/artifact-keeper.git`
 3. Create a feature branch: `git checkout -b feature/your-feature`
 4. Make your changes
-5. Run checks: `cargo fmt --check && cargo clippy --workspace && cargo test --workspace --lib`
+5. Run checks: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --lib`
 6. Commit and push to your fork
 7. Open a Pull Request against `main`
 

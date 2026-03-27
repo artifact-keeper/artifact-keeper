@@ -60,7 +60,9 @@ for remote in \
   "npm-proxy:NPM Proxy:npm:https://registry.npmjs.org" \
   "pypi-proxy:PyPI Proxy:pypi:https://pypi.org" \
   "maven-proxy:Maven Proxy:maven:https://repo1.maven.org/maven2" \
-  "hex-proxy:Hex Proxy:hex:https://repo.hex.pm"
+  "hex-proxy:Hex Proxy:hex:https://repo.hex.pm" \
+  "dockerhub-proxy:Docker Hub Proxy:docker:https://registry-1.docker.io" \
+  "ghcr-proxy:GHCR Proxy:docker:https://ghcr.io"
 do
   KEY=$(echo "$remote" | cut -d: -f1)
   NAME=$(echo "$remote" | cut -d: -f2)

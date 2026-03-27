@@ -121,6 +121,19 @@ pub struct Config {
     /// even when SSO providers are configured. Intended as a break-glass
     /// recovery mechanism when SSO is misconfigured.
     pub allow_local_admin_login: bool,
+
+    /// Port for the unauthenticated Prometheus metrics-only listener.
+    ///
+    /// When set, a second TCP listener is started on this port serving only
+    /// `GET /metrics` with no authentication. Intended for internal Prometheus
+    /// scraping in environments where the scraper cannot present credentials.
+    /// When absent (default), the secondary listener is not started and metrics
+    /// remain accessible only via the authenticated `GET /api/v1/admin/metrics`
+    /// endpoint.
+    ///
+    /// **Security note:** ensure this port is not reachable from untrusted
+    /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
+    pub metrics_port: Option<u16>,
 }
 
 redacted_debug!(Config {
@@ -159,6 +172,7 @@ redacted_debug!(Config {
     show lifecycle_check_interval_secs,
     show max_upload_size_bytes,
     show allow_local_admin_login,
+    show metrics_port,
 });
 
 impl Config {
@@ -228,6 +242,20 @@ impl Config {
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
                 Ok("true" | "1")
             ),
+            metrics_port: match env::var("METRICS_PORT") {
+                Ok(val) => match val.parse::<u16>() {
+                    Ok(port) => Some(port),
+                    Err(_) => {
+                        tracing::warn!(
+                            value = %val,
+                            "METRICS_PORT is set but could not be parsed as a valid port \
+                             number; unauthenticated metrics listener is disabled"
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
+            },
         };
 
         config.validate_jwt_secret()?;
@@ -825,6 +853,100 @@ mod tests {
             env::set_var("MAX_UPLOAD_SIZE", v);
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
+        }
+    }
+
+    #[test]
+    fn test_config_metrics_port_unset_is_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_port = env::var("METRICS_PORT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("METRICS_PORT");
+
+        let config = Config::from_env().unwrap();
+        assert!(config.metrics_port.is_none());
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_port {
+            env::set_var("METRICS_PORT", v);
+        }
+    }
+
+    #[test]
+    fn test_config_metrics_port_set() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_port = env::var("METRICS_PORT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("METRICS_PORT", "9091");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.metrics_port, Some(9091));
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_port {
+            env::set_var("METRICS_PORT", v);
+        } else {
+            env::remove_var("METRICS_PORT");
+        }
+    }
+
+    #[test]
+    fn test_config_metrics_port_invalid_is_none() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_port = env::var("METRICS_PORT").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("METRICS_PORT", "not-a-port");
+
+        let config = Config::from_env().unwrap();
+        assert!(config.metrics_port.is_none());
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_port {
+            env::set_var("METRICS_PORT", v);
+        } else {
+            env::remove_var("METRICS_PORT");
         }
     }
 
