@@ -1335,4 +1335,47 @@ mod tests {
         let resolved = content_type.unwrap_or("application/octet-stream");
         assert_eq!(resolved, "image/png");
     }
+
+    // --- validate_artifact_path ---
+
+    #[test]
+    fn test_validate_path_valid_simple() {
+        assert!(validate_artifact_path("my-artifact.tar.gz").is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_valid_nested() {
+        assert!(validate_artifact_path("org/project/v1.0/artifact.bin").is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_empty() {
+        assert!(validate_artifact_path("").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_traversal_dotdot() {
+        assert!(validate_artifact_path("../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_traversal_middle() {
+        assert!(validate_artifact_path("a/../b").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_leading_slash() {
+        assert!(validate_artifact_path("/absolute/path").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_single_dot_ok() {
+        // Single dot is not traversal
+        assert!(validate_artifact_path("file.txt").is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_deep_nested() {
+        assert!(validate_artifact_path("a/b/c/d/e/f/g.bin").is_ok());
+    }
 }
