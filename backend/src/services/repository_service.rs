@@ -874,6 +874,34 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_validate_remote_upstream_rejects_ssrf_loopback() {
+        let result = validate_remote_upstream(
+            &RepositoryType::Remote,
+            &Some("http://127.0.0.1:8080/".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_remote_upstream_rejects_ssrf_metadata() {
+        let result = validate_remote_upstream(
+            &RepositoryType::Remote,
+            &Some("http://169.254.169.254/latest/meta-data/".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_remote_upstream_rejects_ssrf_on_local_type() {
+        // Even non-Remote types with an upstream URL get SSRF validation
+        let result = validate_remote_upstream(
+            &RepositoryType::Local,
+            &Some("http://10.0.0.1/internal".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
     // -----------------------------------------------------------------------
     // build_search_pattern (extracted pure function)
     // -----------------------------------------------------------------------
