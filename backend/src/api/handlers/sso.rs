@@ -645,6 +645,54 @@ pub(crate) fn extract_oidc_groups(claims: &serde_json::Value, groups_claim: &str
         .unwrap_or_default()
 }
 
+/// Build a `DecodingKey` from a JWK JSON value based on its key type.
+fn decoding_key_from_jwk(jwk: &serde_json::Value) -> Result<jsonwebtoken::DecodingKey> {
+    use jsonwebtoken::DecodingKey;
+    let kty = jwk["kty"].as_str().unwrap_or("");
+    if kty == "RSA" {
+        let n = jwk["n"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing RSA modulus".into()))?;
+        let e = jwk["e"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing RSA exponent".into()))?;
+        DecodingKey::from_rsa_components(n, e)
+            .map_err(|err| AppError::Internal(format!("Failed to build RSA decoding key: {err}")))
+    } else if kty == "EC" {
+        let x = jwk["x"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing EC x coordinate".into()))?;
+        let y = jwk["y"]
+            .as_str()
+            .ok_or_else(|| AppError::Internal("JWK missing EC y coordinate".into()))?;
+        DecodingKey::from_ec_components(x, y)
+            .map_err(|err| AppError::Internal(format!("Failed to build EC decoding key: {err}")))
+    } else {
+        Err(AppError::Internal(format!(
+            "Unsupported JWK key type: {kty}"
+        )))
+    }
+}
+
+/// Select a JWK from the JWKS keys array, matching by `kid` if present,
+/// otherwise falling back to the first usable key.
+fn select_jwk_key(
+    keys: &[serde_json::Value],
+    kid: Option<&str>,
+) -> Result<jsonwebtoken::DecodingKey> {
+    if let Some(kid) = kid {
+        let jwk = keys
+            .iter()
+            .find(|k| k["kid"].as_str() == Some(kid))
+            .ok_or_else(|| AppError::Authentication("No matching JWK found for kid".into()))?;
+        decoding_key_from_jwk(jwk)
+    } else {
+        keys.iter()
+            .find_map(|k| decoding_key_from_jwk(k).ok())
+            .ok_or_else(|| AppError::Internal("No usable JWK found in JWKS".into()))
+    }
+}
+
 /// Validate an OIDC ID token by verifying its signature against the provider's
 /// JWKS and checking the `iss`, `aud`, `exp`, and `nonce` claims.
 async fn validate_id_token(
@@ -655,7 +703,7 @@ async fn validate_id_token(
     issuer_url: &str,
     session_nonce: Option<&str>,
 ) -> Result<serde_json::Value> {
-    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+    use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 
     let jwks_uri = discovery["jwks_uri"]
         .as_str()
@@ -677,57 +725,7 @@ async fn validate_id_token(
         .as_array()
         .ok_or_else(|| AppError::Internal("JWKS missing keys array".into()))?;
 
-    let decoding_key = if let Some(kid) = &header.kid {
-        keys.iter()
-            .find(|k| k["kid"].as_str() == Some(kid.as_str()))
-            .ok_or_else(|| AppError::Authentication("No matching JWK found for kid".into()))
-            .and_then(|k| {
-                let kty = k["kty"].as_str().unwrap_or("");
-                if kty == "RSA" {
-                    let n = k["n"]
-                        .as_str()
-                        .ok_or_else(|| AppError::Internal("JWK missing RSA modulus".into()))?;
-                    let e = k["e"]
-                        .as_str()
-                        .ok_or_else(|| AppError::Internal("JWK missing RSA exponent".into()))?;
-                    DecodingKey::from_rsa_components(n, e).map_err(|err| {
-                        AppError::Internal(format!("Failed to build RSA decoding key: {err}"))
-                    })
-                } else if kty == "EC" {
-                    let x = k["x"]
-                        .as_str()
-                        .ok_or_else(|| AppError::Internal("JWK missing EC x coordinate".into()))?;
-                    let y = k["y"]
-                        .as_str()
-                        .ok_or_else(|| AppError::Internal("JWK missing EC y coordinate".into()))?;
-                    DecodingKey::from_ec_components(x, y).map_err(|err| {
-                        AppError::Internal(format!("Failed to build EC decoding key: {err}"))
-                    })
-                } else {
-                    Err(AppError::Internal(format!(
-                        "Unsupported JWK key type: {kty}"
-                    )))
-                }
-            })?
-    } else {
-        // No kid: try the first RSA or EC key
-        keys.iter()
-            .find_map(|k| {
-                let kty = k["kty"].as_str().unwrap_or("");
-                if kty == "RSA" {
-                    let n = k["n"].as_str()?;
-                    let e = k["e"].as_str()?;
-                    DecodingKey::from_rsa_components(n, e).ok()
-                } else if kty == "EC" {
-                    let x = k["x"].as_str()?;
-                    let y = k["y"].as_str()?;
-                    DecodingKey::from_ec_components(x, y).ok()
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| AppError::Internal("No usable JWK found in JWKS".into()))?
-    };
+    let decoding_key = select_jwk_key(keys, header.kid.as_deref())?;
 
     let alg = match header.alg {
         jsonwebtoken::Algorithm::RS256 => Algorithm::RS256,
@@ -1301,5 +1299,83 @@ mod tests {
         let jwks = serde_json::json!({"keys": []});
         let keys = jwks["keys"].as_array().unwrap();
         assert!(keys.is_empty());
+    }
+
+    // --- decoding_key_from_jwk ---
+
+    #[test]
+    fn test_decoding_key_from_jwk_unsupported_type() {
+        let jwk = serde_json::json!({"kty": "OKP"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported JWK key type"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_rsa_missing_n() {
+        let jwk = serde_json::json!({"kty": "RSA", "e": "AQAB"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("modulus"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_rsa_missing_e() {
+        let jwk = serde_json::json!({"kty": "RSA", "n": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exponent"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_ec_missing_x() {
+        let jwk = serde_json::json!({"kty": "EC", "y": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("x coordinate"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_ec_missing_y() {
+        let jwk = serde_json::json!({"kty": "EC", "x": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("y coordinate"));
+    }
+
+    #[test]
+    fn test_decoding_key_from_jwk_empty_kty() {
+        let jwk = serde_json::json!({"n": "abc"});
+        let result = super::decoding_key_from_jwk(&jwk);
+        assert!(result.is_err());
+    }
+
+    // --- select_jwk_key ---
+
+    #[test]
+    fn test_select_jwk_key_no_kid_empty_keys() {
+        let keys: Vec<serde_json::Value> = vec![];
+        let result = super::select_jwk_key(&keys, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No usable JWK"));
+    }
+
+    #[test]
+    fn test_select_jwk_key_kid_not_found() {
+        let keys = vec![serde_json::json!({"kid": "key1", "kty": "RSA", "n": "x", "e": "y"})];
+        let result = super::select_jwk_key(&keys, Some("nonexistent"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No matching JWK"));
+    }
+
+    #[test]
+    fn test_select_jwk_key_unsupported_type_with_kid() {
+        let keys = vec![serde_json::json!({"kid": "k1", "kty": "OKP"})];
+        let result = super::select_jwk_key(&keys, Some("k1"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unsupported"));
     }
 }
