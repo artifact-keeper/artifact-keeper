@@ -1264,7 +1264,7 @@ async fn handle_put_manifest(
     let artifact_name = format!("{}:{}", image, reference);
     let checksum = digest.strip_prefix("sha256:").unwrap_or(&digest);
 
-    let _ = sqlx::query!(
+    if let Err(e) = sqlx::query!(
         r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            ON CONFLICT (repository_id, path) DO UPDATE SET
@@ -1274,6 +1274,7 @@ async fn handle_put_manifest(
              content_type = EXCLUDED.content_type,
              storage_key = EXCLUDED.storage_key,
              uploaded_by = EXCLUDED.uploaded_by,
+             is_deleted = false,
              updated_at = NOW()"#,
         repo_id,
         artifact_path,
@@ -1286,11 +1287,14 @@ async fn handle_put_manifest(
         Some(claims.sub),
     )
     .execute(&state.db)
-    .await;
+    .await
+    {
+        tracing::error!("Failed to upsert artifact record for {}: {}", artifact_path, e);
+    }
 
     info!(
-        "Manifest pushed: {}/{}:{} ({})",
-        image_name, image, reference, digest
+        "Manifest pushed: {}:{} ({})",
+        image_name, reference, digest
     );
 
     Response::builder()
