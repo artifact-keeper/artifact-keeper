@@ -76,7 +76,7 @@ services:
       - e2e-test-network
 
   trivy:
-    image: ghcr.io/aquasecurity/trivy:latest
+    image: ghcr.io/aquasecurity/trivy:0.69.3
     container_name: e2e-test-trivy
     command: ["server", "--listen", "0.0.0.0:8090"]
     volumes:
