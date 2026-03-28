@@ -116,10 +116,14 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Install sqlx-cli
-        uses: taiki-e/install-action@sqlx-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli
 
       - name: Run database migrations
         run: sqlx migrate run --source backend/migrations
@@ -130,6 +134,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
+          RUSTC_WRAPPER: ""
         run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
@@ -434,7 +439,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Audit Rust dependencies
         run: cargo audit
