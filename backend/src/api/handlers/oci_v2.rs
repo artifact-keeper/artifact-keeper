@@ -383,28 +383,42 @@ async fn token(
     };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (user, tokens) = match auth_service
+    let (user, tokens, authenticated_via_api_token) = match auth_service
         .authenticate(&credentials.0, &credentials.1)
         .await
     {
-        Ok(result) => result,
+        Ok((user, tokens)) => (user, tokens, false),
         Err(_) => {
             // Fall back to API token in the password field (for service accounts
             // and CI/CD pipelines that use `docker login -p <api-token>`)
             match auth_service.validate_api_token(&credentials.1).await {
                 Ok(validation) => {
+                    // TODO: Enforce token scopes and allowed_repo_ids for OCI
+                    // token exchange. Currently the generated JWT inherits full
+                    // user privileges regardless of token restrictions.
+                    if !validation.scopes.is_empty()
+                        && !validation.scopes.contains(&"*".to_string())
+                    {
+                        warn!(
+                            user = %validation.user.username,
+                            scopes = ?validation.scopes,
+                            allowed_repo_ids = ?validation.allowed_repo_ids,
+                            "API token has scope/repo restrictions that are not \
+                             enforced during OCI token exchange"
+                        );
+                    }
                     let user = validation.user;
                     let tokens = match auth_service.generate_tokens(&user) {
                         Ok(t) => t,
                         Err(_) => {
                             return oci_error(
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                "SERVER_ERROR",
+                                "INTERNAL_ERROR",
                                 "failed to generate tokens",
                             )
                         }
                     };
-                    (user, tokens)
+                    (user, tokens, true)
                 }
                 Err(_) => {
                     return oci_error(
@@ -419,8 +433,10 @@ async fn token(
 
     // Block password-based OCI token requests when the user has TOTP 2FA
     // enabled. Docker CLI cannot perform a TOTP challenge, so the user
-    // must create an API token (which bypasses TOTP) instead.
-    if user.totp_enabled {
+    // must create an API token (which bypasses TOTP) instead. API tokens
+    // are the intended bypass mechanism for non-interactive flows, so skip
+    // the TOTP guard when the user authenticated via one.
+    if user.totp_enabled && !authenticated_via_api_token {
         return oci_error(
             StatusCode::UNAUTHORIZED,
             "UNAUTHORIZED",
@@ -470,6 +486,11 @@ async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> 
             .await
             .is_ok()
         {
+            return version_check_ok();
+        }
+
+        // Fall back to API token in the password field
+        if auth_service.validate_api_token(&password).await.is_ok() {
             return version_check_ok();
         }
     }
