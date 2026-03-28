@@ -1292,10 +1292,7 @@ async fn handle_put_manifest(
         tracing::error!("Failed to upsert artifact record for {}: {}", artifact_path, e);
     }
 
-    info!(
-        "Manifest pushed: {}:{} ({})",
-        image_name, reference, digest
-    );
+    info!("Manifest pushed: {}:{} ({})", image_name, reference, digest);
 
     Response::builder()
         .status(StatusCode::CREATED)
