@@ -227,7 +227,7 @@ impl TokenService {
                    created_by_user_id, description, repo_selector,
                    revoked_at, last_used_ip, last_used_user_agent
             FROM api_tokens
-            WHERE user_id = $1
+            WHERE user_id = $1 AND revoked_at IS NULL
             ORDER BY created_at DESC
             "#,
         )
