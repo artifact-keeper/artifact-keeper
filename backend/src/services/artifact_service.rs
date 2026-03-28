@@ -989,18 +989,21 @@ impl ArtifactService {
     }
 
     /// Get download statistics for multiple artifacts in a single query
-    pub async fn get_download_stats_batch(&self, artifact_ids: &[Uuid]) -> Result<std::collections::HashMap<Uuid, i64>> {
-        let rows = sqlx::query!(
-            r#"SELECT artifact_id, COUNT(*) as "count!" FROM download_statistics WHERE artifact_id = ANY($1) GROUP BY artifact_id"#,
-            artifact_ids
+    pub async fn get_download_stats_batch(
+        &self,
+        artifact_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, i64>> {
+        let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+            "SELECT artifact_id, COUNT(*) FROM download_statistics WHERE artifact_id = ANY($1) GROUP BY artifact_id",
         )
+        .bind(artifact_ids)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut map = std::collections::HashMap::new();
-        for row in rows {
-            map.insert(row.artifact_id, row.count);
+        for (artifact_id, count) in rows {
+            map.insert(artifact_id, count);
         }
         Ok(map)
     }

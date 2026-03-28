@@ -400,7 +400,7 @@ fn filter_repositories<'a>(
 }
 
 /// Run import from Artifactory export directory
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn run_import(
     format: &str,
     verbose: bool,

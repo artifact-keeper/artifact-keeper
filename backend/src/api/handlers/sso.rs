@@ -684,27 +684,29 @@ async fn validate_id_token(
             .and_then(|k| {
                 let kty = k["kty"].as_str().unwrap_or("");
                 if kty == "RSA" {
-                    let n = k["n"].as_str().ok_or_else(|| {
-                        AppError::Internal("JWK missing RSA modulus".into())
-                    })?;
-                    let e = k["e"].as_str().ok_or_else(|| {
-                        AppError::Internal("JWK missing RSA exponent".into())
-                    })?;
+                    let n = k["n"]
+                        .as_str()
+                        .ok_or_else(|| AppError::Internal("JWK missing RSA modulus".into()))?;
+                    let e = k["e"]
+                        .as_str()
+                        .ok_or_else(|| AppError::Internal("JWK missing RSA exponent".into()))?;
                     DecodingKey::from_rsa_components(n, e).map_err(|err| {
                         AppError::Internal(format!("Failed to build RSA decoding key: {err}"))
                     })
                 } else if kty == "EC" {
-                    let x = k["x"].as_str().ok_or_else(|| {
-                        AppError::Internal("JWK missing EC x coordinate".into())
-                    })?;
-                    let y = k["y"].as_str().ok_or_else(|| {
-                        AppError::Internal("JWK missing EC y coordinate".into())
-                    })?;
+                    let x = k["x"]
+                        .as_str()
+                        .ok_or_else(|| AppError::Internal("JWK missing EC x coordinate".into()))?;
+                    let y = k["y"]
+                        .as_str()
+                        .ok_or_else(|| AppError::Internal("JWK missing EC y coordinate".into()))?;
                     DecodingKey::from_ec_components(x, y).map_err(|err| {
                         AppError::Internal(format!("Failed to build EC decoding key: {err}"))
                     })
                 } else {
-                    Err(AppError::Internal(format!("Unsupported JWK key type: {kty}")))
+                    Err(AppError::Internal(format!(
+                        "Unsupported JWK key type: {kty}"
+                    )))
                 }
             })?
     } else {
@@ -770,6 +772,7 @@ async fn validate_id_token(
 ///
 /// WARNING: This function does NOT verify the JWT signature. Use
 /// `validate_id_token` for security-sensitive flows.
+#[cfg(test)]
 pub(crate) fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
