@@ -72,21 +72,50 @@ impl ProxyService {
         repo: &Repository,
         path: &str,
     ) -> Result<(Bytes, Option<String>)> {
-        // Validate repository type
+        self.fetch_artifact_with_cache_path(repo, path, path).await
+    }
+
+    /// Check whether an artifact is already present in the proxy cache
+    /// under the given `path` (without contacting upstream).
+    ///
+    /// Returns `Ok(Some((content, content_type)))` on cache hit, `Ok(None)`
+    /// on cache miss or expired entry.
+    pub async fn get_cached_artifact_by_path(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        let cache_key = Self::cache_storage_key(repo_key, path);
+        let metadata_key = Self::cache_metadata_key(repo_key, path);
+        self.get_cached_artifact(&cache_key, &metadata_key).await
+    }
+
+    /// Fetch artifact from upstream, but use `cache_path` instead of
+    /// `fetch_path` when reading and writing the proxy cache.
+    ///
+    /// This is useful when the upstream download URL is unpredictable (e.g.,
+    /// PyPI hosts files on a different domain) but the caller wants a stable,
+    /// locally-computed cache key so that subsequent requests can hit the
+    /// cache without rediscovering the upstream URL.
+    pub async fn fetch_artifact_with_cache_path(
+        &self,
+        repo: &Repository,
+        fetch_path: &str,
+        cache_path: &str,
+    ) -> Result<(Bytes, Option<String>)> {
         if repo.repo_type != RepositoryType::Remote {
             return Err(AppError::Validation(
                 "Proxy operations only supported for remote repositories".to_string(),
             ));
         }
 
-        // Get upstream URL
         let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
             AppError::Config("Remote repository missing upstream_url".to_string())
         })?;
 
-        // Generate storage key for cached artifact
-        let cache_key = Self::cache_storage_key(&repo.key, path);
-        let metadata_key = Self::cache_metadata_key(&repo.key, path);
+        // Cache keys use the caller-supplied cache_path
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path);
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path);
 
         // Check if we have a valid cached copy
         if let Some((content, content_type)) =
@@ -95,13 +124,12 @@ impl ProxyService {
             return Ok((content, content_type));
         }
 
-        // Fetch from upstream
-        let full_url = Self::build_upstream_url(upstream_url, path);
+        // Fetch from upstream using the real fetch_path
+        let full_url = Self::build_upstream_url(upstream_url, fetch_path);
         let upstream_result = self.fetch_from_upstream(&full_url, repo.id).await;
 
         match upstream_result {
             Ok((content, content_type, etag)) => {
-                // Cache the artifact
                 let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
                 self.cache_artifact(
                     &cache_key,
@@ -116,7 +144,6 @@ impl ProxyService {
                 Ok((content, content_type))
             }
             Err(upstream_err) => {
-                // Upstream failed. Try serving stale cached content as a fallback.
                 if let Ok(Some((stale_content, stale_content_type))) = self
                     .get_stale_cached_artifact(&cache_key, &metadata_key)
                     .await
@@ -1143,5 +1170,54 @@ mod tests {
         };
 
         assert!(is_cache_expired(&metadata.expires_at));
+    }
+
+    // =======================================================================
+    // PyPI-specific cache key derivation
+    // =======================================================================
+
+    #[test]
+    fn test_cache_key_for_pypi_local_path() {
+        let key = ProxyService::cache_storage_key(
+            "my-pypi-remote",
+            "simple/requests/requests-2.31.0.tar.gz",
+        );
+        assert_eq!(
+            key,
+            "proxy-cache/my-pypi-remote/simple/requests/requests-2.31.0.tar.gz/__content__"
+        );
+    }
+
+    #[test]
+    fn test_cache_metadata_key_for_pypi_local_path() {
+        let key = ProxyService::cache_metadata_key(
+            "my-pypi-remote",
+            "simple/requests/requests-2.31.0.tar.gz",
+        );
+        assert_eq!(
+            key,
+            "proxy-cache/my-pypi-remote/simple/requests/requests-2.31.0.tar.gz/__cache_meta__.json"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_for_pypi_wheel() {
+        let key = ProxyService::cache_storage_key(
+            "pypi-proxy",
+            "simple/flask/flask-3.0.0-py3-none-any.whl",
+        );
+        assert!(key.starts_with("proxy-cache/pypi-proxy/simple/flask/"));
+        assert!(key.ends_with("/__content__"));
+    }
+
+    #[test]
+    fn test_cache_key_pypi_and_npm_do_not_collide() {
+        let pypi_key = ProxyService::cache_storage_key(
+            "pypi-remote",
+            "simple/requests/requests-2.31.0.tar.gz",
+        );
+        let npm_key =
+            ProxyService::cache_storage_key("npm-remote", "simple/requests/requests-2.31.0.tar.gz");
+        assert_ne!(pypi_key, npm_key);
     }
 }

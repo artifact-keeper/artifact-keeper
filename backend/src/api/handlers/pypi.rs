@@ -33,6 +33,21 @@ use crate::formats::pypi::PypiHandler;
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Map a PyPI filename to the appropriate MIME content type.
+fn pypi_content_type(filename: &str) -> &'static str {
+    if filename.ends_with(".whl") {
+        "application/zip"
+    } else if filename.ends_with(".tar.gz") {
+        "application/gzip"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -381,15 +396,43 @@ async fn serve_file(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let normalized = PypiHandler::normalize_name(project);
+                    let local_cache_path = format!("simple/{}/{}", normalized, filename);
 
-                    // Fetch the simple index page directly from the upstream
-                    // (bypassing the proxy cache) to discover the real download
-                    // URL for this file.  The cached copy may contain URLs that
-                    // were rewritten by rewrite_upstream_urls(), so we need the
-                    // raw upstream HTML to find the original absolute URLs.
-                    // External registries (e.g. pypi.org) host files on a
-                    // different domain (files.pythonhosted.org), so we cannot
-                    // just append the filename to the upstream URL.
+                    // Try the proxy cache first using a predictable local path.
+                    // This avoids fetching the simple index from upstream just
+                    // to rediscover the download URL when the file is already
+                    // cached from a previous request.
+                    //
+                    // Note: fetch_artifact_with_cache_path also checks the cache
+                    // internally, so on a miss this results in a second storage
+                    // read for the same key. The duplication is intentional: it
+                    // acts as a race-condition guard and the cost of one extra
+                    // storage read is negligible compared to the upstream HTTP
+                    // fetch that follows on a true miss.
+                    if let Some((content, _content_type)) =
+                        proxy_helpers::proxy_check_cache(proxy, repo_key, &local_cache_path).await
+                    {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, pypi_content_type(filename))
+                            .header(
+                                "Content-Disposition",
+                                format!("attachment; filename=\"{}\"", filename),
+                            )
+                            .header(CONTENT_LENGTH, content.len().to_string())
+                            .body(Body::from(content))
+                            .unwrap());
+                    }
+
+                    // Cache miss. Fetch the simple index page directly from
+                    // the upstream (bypassing the proxy cache) to discover the
+                    // real download URL for this file. The cached copy may
+                    // contain URLs that were rewritten by
+                    // rewrite_upstream_urls(), so we need the raw upstream HTML
+                    // to find the original absolute URLs. External registries
+                    // (e.g. pypi.org) host files on a different domain
+                    // (files.pythonhosted.org), so we cannot just append the
+                    // filename to the upstream URL.
                     let index_path = format!("simple/{}/", normalized);
                     let (index_bytes, _ct) = proxy_helpers::proxy_fetch_uncached(
                         proxy,
@@ -405,48 +448,38 @@ async fn serve_file(
 
                     let (fetch_base, fetch_path) = if let Some(ref url) = file_url {
                         // Absolute URL from the index (e.g. https://files.pythonhosted.org/packages/.../file.whl).
-                        // Split into scheme+host base and path so proxy_fetch
-                        // can cache it under the repo key.
+                        // Split into scheme+host base and path so the fetch
+                        // targets the correct upstream server.
                         match url
                             .find("://")
                             .and_then(|i| url[i + 3..].find('/').map(|j| i + 3 + j))
                         {
                             Some(pos) => (url[..pos].to_string(), url[pos + 1..].to_string()),
-                            None => (
-                                upstream_url.clone(),
-                                format!("simple/{}/{}", normalized, filename),
-                            ),
+                            None => (upstream_url.clone(), local_cache_path.clone()),
                         }
                     } else {
                         // No absolute URL found (the upstream may be another
                         // AK instance that uses relative paths). Fall back to
                         // the simple/{project}/{filename} convention.
-                        (
-                            upstream_url.clone(),
-                            format!("simple/{}/{}", normalized, filename),
-                        )
+                        (upstream_url.clone(), local_cache_path.clone())
                     };
 
-                    let (content, _content_type) = proxy_helpers::proxy_fetch(
+                    // Fetch from upstream but cache under the local convention
+                    // path so that subsequent requests hit the cache without
+                    // needing to rediscover the upstream URL.
+                    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
                         proxy,
                         repo.id,
                         repo_key,
                         &fetch_base,
                         &fetch_path,
+                        &local_cache_path,
                     )
                     .await?;
 
-                    let content_type = if filename.ends_with(".whl") {
-                        "application/zip"
-                    } else if filename.ends_with(".tar.gz") {
-                        "application/gzip"
-                    } else {
-                        "application/octet-stream"
-                    };
-
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, content_type)
+                        .header(CONTENT_TYPE, pypi_content_type(filename))
                         .header(
                             "Content-Disposition",
                             format!("attachment; filename=\"{}\"", filename),
@@ -481,15 +514,7 @@ async fn serve_file(
                 )
                 .await?;
 
-                let ct = content_type.unwrap_or_else(|| {
-                    if fname.ends_with(".whl") {
-                        "application/zip".to_string()
-                    } else if fname.ends_with(".tar.gz") {
-                        "application/gzip".to_string()
-                    } else {
-                        "application/octet-stream".to_string()
-                    }
-                });
+                let ct = content_type.unwrap_or_else(|| pypi_content_type(&fname).to_string());
 
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -523,17 +548,9 @@ async fn serve_file(
     .execute(&state.db)
     .await;
 
-    let content_type = if filename.ends_with(".whl") {
-        "application/zip"
-    } else if filename.ends_with(".tar.gz") {
-        "application/gzip"
-    } else {
-        "application/octet-stream"
-    };
-
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_TYPE, pypi_content_type(filename))
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
@@ -807,14 +824,7 @@ async fn upload(
             .insert("summary".to_string(), serde_json::Value::String(s.clone()));
     }
 
-    // Infer content type
-    let content_type = if filename.ends_with(".whl") {
-        "application/zip"
-    } else if filename.ends_with(".tar.gz") {
-        "application/gzip"
-    } else {
-        "application/octet-stream"
-    };
+    let content_type = pypi_content_type(&filename);
 
     let artifact_path = format!("{}/{}/{}", normalized, pkg_version, filename);
     let size_bytes = content.len() as i64;
@@ -1566,5 +1576,46 @@ mod tests {
     fn test_extract_metadata_from_sdist_invalid_data() {
         let result = extract_metadata_from_sdist(b"not a tar.gz");
         assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // pypi_content_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pypi_content_type_wheel() {
+        assert_eq!(
+            pypi_content_type("requests-2.31.0-py3-none-any.whl"),
+            "application/zip"
+        );
+    }
+
+    #[test]
+    fn test_pypi_content_type_sdist() {
+        assert_eq!(
+            pypi_content_type("requests-2.31.0.tar.gz"),
+            "application/gzip"
+        );
+    }
+
+    #[test]
+    fn test_pypi_content_type_zip() {
+        assert_eq!(
+            pypi_content_type("requests-2.31.0.zip"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_pypi_content_type_egg() {
+        assert_eq!(
+            pypi_content_type("requests-2.31.0.egg"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_pypi_content_type_no_extension() {
+        assert_eq!(pypi_content_type("somefile"), "application/octet-stream");
     }
 }

@@ -131,6 +131,24 @@ pub fn reject_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
     }
 }
 
+/// Map a proxy service error to an HTTP error response.
+///
+/// `NotFound` errors become 404; everything else becomes 502 Bad Gateway.
+/// The error is logged at `warn` level with the repo key and path for context.
+fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
+    tracing::warn!("Proxy fetch failed for {}/{}: {}", repo_key, path, e);
+    match &e {
+        crate::error::AppError::NotFound(_) => {
+            (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
+        }
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to fetch from upstream: {}", e),
+        )
+            .into_response(),
+    }
+}
+
 /// Attempt to fetch an artifact from the upstream via the proxy service.
 /// Constructs a minimal `Repository` model from handler-level repo info.
 /// Returns `(content_bytes, content_type)` on success.
@@ -147,19 +165,51 @@ pub async fn proxy_fetch(
     proxy_service
         .fetch_artifact(&repo, path)
         .await
-        .map_err(|e| {
-            tracing::warn!("Proxy fetch failed for {}/{}: {}", repo_key, path, e);
-            match &e {
-                crate::error::AppError::NotFound(_) => {
-                    (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
-                }
-                _ => (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to fetch from upstream: {}", e),
-                )
-                    .into_response(),
-            }
-        })
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
+/// Check whether an artifact is present in the proxy cache under `path`
+/// without contacting upstream. Returns `Ok(Some(...))` on cache hit,
+/// `Ok(None)` on miss or expired entry.
+pub async fn proxy_check_cache(
+    proxy_service: &ProxyService,
+    repo_key: &str,
+    path: &str,
+) -> Option<(Bytes, Option<String>)> {
+    match proxy_service
+        .get_cached_artifact_by_path(repo_key, path)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::debug!(
+                "Cache lookup failed for {}/{}, treating as miss: {}",
+                repo_key,
+                path,
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Fetch from upstream using `fetch_path` for the URL but `cache_path` for
+/// the proxy cache key. This lets callers store content under a predictable
+/// local path even when the upstream download URL varies between requests.
+pub async fn proxy_fetch_with_cache_key(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    fetch_path: &str,
+    cache_path: &str,
+) -> Result<(Bytes, Option<String>), Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+
+    proxy_service
+        .fetch_artifact_with_cache_path(&repo, fetch_path, cache_path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
 }
 
 /// Fetch from upstream directly, bypassing the proxy cache.
@@ -179,24 +229,7 @@ pub async fn proxy_fetch_uncached(
     proxy_service
         .fetch_upstream_direct(&repo, path)
         .await
-        .map_err(|e| {
-            tracing::warn!(
-                "Direct upstream fetch failed for {}/{}: {}",
-                repo_key,
-                path,
-                e
-            );
-            match &e {
-                crate::error::AppError::NotFound(_) => {
-                    (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
-                }
-                _ => (
-                    StatusCode::BAD_GATEWAY,
-                    format!("Failed to fetch from upstream: {}", e),
-                )
-                    .into_response(),
-            }
-        })
+        .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
 /// Resolve virtual repository members and attempt to find an artifact.
@@ -662,5 +695,59 @@ mod tests {
     fn test_internal_error_database_label() {
         let response = internal_error("Database", "connection refused");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ── map_proxy_error tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_map_proxy_error_not_found() {
+        let err = crate::error::AppError::NotFound("missing artifact".to_string());
+        let response = map_proxy_error("repo-key", "path/to/file", err);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_map_proxy_error_internal_becomes_bad_gateway() {
+        let err = crate::error::AppError::Internal("connection failed".to_string());
+        let response = map_proxy_error("repo-key", "path/to/file", err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_proxy_error_storage_becomes_bad_gateway() {
+        let err = crate::error::AppError::Storage("disk full".to_string());
+        let response = map_proxy_error("repo-key", "some/path", err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_proxy_error_bad_gateway_stays_bad_gateway() {
+        let err = crate::error::AppError::BadGateway("upstream timeout".to_string());
+        let response = map_proxy_error("repo-key", "pkg", err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_proxy_error_validation_becomes_bad_gateway() {
+        let err = crate::error::AppError::Validation("bad input".to_string());
+        let response = map_proxy_error("repo-key", "pkg", err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ── RepoInfo::storage_location tests ───────────────────────────────
+
+    #[test]
+    fn test_repo_info_storage_location() {
+        let info = RepoInfo {
+            id: Uuid::new_v4(),
+            key: "my-repo".to_string(),
+            storage_path: "/data/repos/my-repo".to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+        let loc = info.storage_location();
+        assert_eq!(loc.backend, "filesystem");
+        assert_eq!(loc.path, "/data/repos/my-repo");
     }
 }
