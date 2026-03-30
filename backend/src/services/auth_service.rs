@@ -38,8 +38,9 @@ pub struct FederatedCredentials {
 /// Result of group-to-role mapping
 #[derive(Debug, Clone, Default)]
 pub struct RoleMapping {
-    /// Whether the user should be an admin
-    pub is_admin: bool,
+    /// Whether the user should be an admin.
+    /// `None` means no admin group was found in claims — preserve existing value.
+    pub is_admin: Option<bool>,
     /// Additional role names to assign
     pub roles: Vec<String>,
 }
@@ -785,7 +786,7 @@ impl AuthService {
         for group in &normalized_groups {
             for pattern in &admin_patterns {
                 if group.contains(pattern) {
-                    mapping.is_admin = true;
+                    mapping.is_admin = Some(true);
                     mapping.roles.push("admin".to_string());
                     break;
                 }
@@ -821,9 +822,9 @@ impl AuthService {
     ///
     /// Updates the user's is_admin flag and assigns roles based on the mapping.
     pub async fn apply_role_mapping(&self, user_id: Uuid, mapping: &RoleMapping) -> Result<()> {
-        // Update is_admin flag
+        // Update is_admin flag (only if admin group mapping is configured)
         sqlx::query!(
-            "UPDATE users SET is_admin = $2, updated_at = NOW() WHERE id = $1",
+            "UPDATE users SET is_admin = COALESCE($2, is_admin), updated_at = NOW() WHERE id = $1",
             user_id,
             mapping.is_admin
         )
@@ -915,7 +916,7 @@ impl AuthService {
                     username = $2,
                     email = $3,
                     display_name = $4,
-                    is_admin = $5,
+                    is_admin = COALESCE($5, is_admin),
                     is_active = true,
                     updated_at = NOW()
                 WHERE id = $1
@@ -957,7 +958,7 @@ impl AuthService {
                 credentials.display_name,
                 provider as AuthProvider,
                 credentials.external_id,
-                role_mapping.is_admin
+                role_mapping.is_admin.unwrap_or(false)
             )
             .fetch_one(&self.db)
             .await
@@ -1479,7 +1480,7 @@ mod tests {
     #[test]
     fn test_role_mapping_default() {
         let mapping = RoleMapping::default();
-        assert!(!mapping.is_admin);
+        assert!(mapping.is_admin.is_none());
         assert!(mapping.roles.is_empty());
     }
 
@@ -1501,7 +1502,7 @@ mod tests {
         for group in &normalized_groups {
             for pattern in &admin_patterns {
                 if group.contains(pattern) {
-                    mapping.is_admin = true;
+                    mapping.is_admin = Some(true);
                     mapping.roles.push("admin".to_string());
                     break;
                 }
@@ -1533,38 +1534,38 @@ mod tests {
     #[test]
     fn test_map_groups_admin_group() {
         let mapping = test_map_groups_to_roles(&["team-admin".to_string()]);
-        assert!(mapping.is_admin);
+        assert_eq!(mapping.is_admin, Some(true));
         assert!(mapping.roles.contains(&"admin".to_string()));
     }
 
     #[test]
     fn test_map_groups_administrators_group() {
         let mapping = test_map_groups_to_roles(&["CN=Administrators,DC=corp".to_string()]);
-        assert!(mapping.is_admin);
+        assert_eq!(mapping.is_admin, Some(true));
     }
 
     #[test]
     fn test_map_groups_superusers_group() {
         let mapping = test_map_groups_to_roles(&["superusers".to_string()]);
-        assert!(mapping.is_admin);
+        assert_eq!(mapping.is_admin, Some(true));
     }
 
     #[test]
     fn test_map_groups_artifact_admins_group() {
         let mapping = test_map_groups_to_roles(&["artifact-admins".to_string()]);
-        assert!(mapping.is_admin);
+        assert_eq!(mapping.is_admin, Some(true));
     }
 
     #[test]
     fn test_map_groups_case_insensitive_admin() {
         let mapping = test_map_groups_to_roles(&["ADMIN-TEAM".to_string()]);
-        assert!(mapping.is_admin);
+        assert_eq!(mapping.is_admin, Some(true));
     }
 
     #[test]
     fn test_map_groups_developers() {
         let mapping = test_map_groups_to_roles(&["team-developers".to_string()]);
-        assert!(!mapping.is_admin);
+        assert!(mapping.is_admin.is_none());
         assert!(mapping.roles.contains(&"developer".to_string()));
         assert!(mapping.roles.contains(&"user".to_string()));
     }
@@ -1590,14 +1591,14 @@ mod tests {
     #[test]
     fn test_map_groups_no_matching_groups() {
         let mapping = test_map_groups_to_roles(&["random-group".to_string()]);
-        assert!(!mapping.is_admin);
+        assert!(mapping.is_admin.is_none());
         assert_eq!(mapping.roles, vec!["user"]);
     }
 
     #[test]
     fn test_map_groups_empty_groups() {
         let mapping = test_map_groups_to_roles(&[]);
-        assert!(!mapping.is_admin);
+        assert!(mapping.is_admin.is_none());
         assert_eq!(mapping.roles, vec!["user"]);
     }
 
@@ -1613,7 +1614,7 @@ mod tests {
     #[test]
     fn test_map_groups_admin_plus_developer() {
         let mapping = test_map_groups_to_roles(&["admin".to_string(), "developers".to_string()]);
-        assert!(mapping.is_admin);
+        assert_eq!(mapping.is_admin, Some(true));
         assert!(mapping.roles.contains(&"admin".to_string()));
         assert!(mapping.roles.contains(&"developer".to_string()));
         // user role should not be duplicated
