@@ -750,4 +750,85 @@ mod tests {
         assert_eq!(loc.backend, "filesystem");
         assert_eq!(loc.path, "/data/repos/my-repo");
     }
+
+    // --- map_proxy_error ---
+
+    #[test]
+    fn test_map_proxy_error_not_found_returns_404() {
+        let err = crate::error::AppError::NotFound("gone".to_string());
+        let resp = super::map_proxy_error("my-repo", "pkg/v1/file.bin", err);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_map_proxy_error_database_returns_502() {
+        let err = crate::error::AppError::Database("connection refused".to_string());
+        let resp = super::map_proxy_error("my-repo", "pkg/v1/file.bin", err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_proxy_error_storage_returns_502() {
+        let err = crate::error::AppError::Storage("disk full".to_string());
+        let resp = super::map_proxy_error("my-repo", "some/path", err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_proxy_error_internal_returns_502() {
+        let err = crate::error::AppError::Internal("unexpected".to_string());
+        let resp = super::map_proxy_error("repo", "path", err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_map_proxy_error_authentication_returns_502() {
+        let err = crate::error::AppError::Authentication("bad token".to_string());
+        let resp = super::map_proxy_error("repo", "path", err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // --- build_remote_repo ---
+
+    #[test]
+    fn test_build_remote_repo_fields() {
+        let id = uuid::Uuid::new_v4();
+        let repo = super::build_remote_repo(id, "test-repo", "https://upstream.example.com");
+        assert_eq!(repo.id, id);
+        assert_eq!(repo.key, "test-repo");
+        assert_eq!(repo.repo_type, crate::models::repository::RepositoryType::Remote);
+        assert_eq!(
+            repo.upstream_url.as_deref(),
+            Some("https://upstream.example.com")
+        );
+    }
+
+    #[test]
+    fn test_build_remote_repo_always_remote_type() {
+        let id = uuid::Uuid::new_v4();
+        let repo = super::build_remote_repo(id, "any-key", "https://example.com");
+        assert_eq!(repo.repo_type, crate::models::repository::RepositoryType::Remote);
+    }
+
+    // --- reject_write_if_not_hosted ---
+
+    #[test]
+    fn test_reject_write_local_allowed() {
+        assert!(super::reject_write_if_not_hosted("local").is_ok());
+    }
+
+    #[test]
+    fn test_reject_write_hosted_allowed() {
+        assert!(super::reject_write_if_not_hosted("hosted").is_ok());
+    }
+
+    #[test]
+    fn test_reject_write_remote_rejected() {
+        assert!(super::reject_write_if_not_hosted("remote").is_err());
+    }
+
+    #[test]
+    fn test_reject_write_virtual_rejected() {
+        assert!(super::reject_write_if_not_hosted("virtual").is_err());
+    }
 }

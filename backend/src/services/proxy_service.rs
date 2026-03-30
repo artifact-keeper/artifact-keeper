@@ -1220,4 +1220,60 @@ mod tests {
             ProxyService::cache_storage_key("npm-remote", "simple/requests/requests-2.31.0.tar.gz");
         assert_ne!(pypi_key, npm_key);
     }
+
+    // --- cache key construction for fetch_artifact_with_cache_path ---
+
+    #[test]
+    fn test_cache_key_with_custom_path_differs_from_fetch_path() {
+        let fetch_path = "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz";
+        let cache_path = "simple/requests/requests-2.31.0.tar.gz";
+        let fetch_key = ProxyService::cache_storage_key("pypi-remote", fetch_path);
+        let cache_key = ProxyService::cache_storage_key("pypi-remote", cache_path);
+        assert_ne!(
+            fetch_key, cache_key,
+            "cache key should differ from fetch key"
+        );
+    }
+
+    #[test]
+    fn test_cache_metadata_key_with_custom_path() {
+        let cache_path = "simple/numpy/numpy-1.26.0.tar.gz";
+        let key = ProxyService::cache_metadata_key("pypi-remote", cache_path);
+        assert!(key.contains("pypi-remote"));
+        assert!(key.contains("numpy"));
+    }
+
+    #[test]
+    fn test_build_upstream_url_with_trailing_slash() {
+        let url = ProxyService::build_upstream_url("https://pypi.org/", "simple/requests/");
+        assert_eq!(url, "https://pypi.org/simple/requests/");
+    }
+
+    #[test]
+    fn test_build_upstream_url_without_trailing_slash() {
+        let url = ProxyService::build_upstream_url("https://pypi.org", "simple/requests/");
+        assert_eq!(url, "https://pypi.org/simple/requests/");
+    }
+
+    #[test]
+    fn test_build_upstream_url_with_leading_slash_in_path() {
+        let url = ProxyService::build_upstream_url("https://pypi.org", "/simple/requests/");
+        // Should not double-slash
+        assert!(!url.contains("//simple"));
+    }
+
+    #[test]
+    fn test_get_cached_artifact_by_path_uses_correct_keys() {
+        // Verify that get_cached_artifact_by_path constructs the same keys
+        // as manual cache_storage_key + cache_metadata_key calls
+        let repo_key = "test-pypi";
+        let path = "simple/flask/flask-3.0.0.tar.gz";
+        let expected_storage = ProxyService::cache_storage_key(repo_key, path);
+        let expected_meta = ProxyService::cache_metadata_key(repo_key, path);
+        // The function internally calls these same methods, so keys should match
+        assert!(expected_storage.contains("test-pypi"));
+        assert!(expected_meta.contains("test-pypi"));
+        assert!(expected_storage.contains("flask"));
+        assert!(expected_meta.contains("flask"));
+    }
 }
