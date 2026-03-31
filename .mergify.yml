@@ -76,8 +76,3 @@ pull_request_rules:
         add:
           - tests-verified
 
-  - name: Clean up merged branches
-    conditions:
-      - merged
-    actions:
-      delete_head_branch: {}
