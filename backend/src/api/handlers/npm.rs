@@ -62,7 +62,7 @@ use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 /// Normalize an npm package name by URL-decoding any percent-encoded characters.
 ///
 /// npm and yarn clients often encode scoped package names in URLs, turning
-/// `@openai/codex` into `@openai%2fcodex` or `%40openai%2fcodex`. Axum's
+/// `@openai/codex` into `@openai%2Fcodex` or `%40openai%2fcodex`. Axum's
 /// `Path` extractor usually decodes these, but we apply an explicit decode as
 /// a safety net so the name always reaches the database and upstream proxy in
 /// its canonical form (e.g. `@openai/codex`).
@@ -75,14 +75,14 @@ fn normalize_package_name(raw: &str) -> String {
 /// Encode a package name for use in upstream registry URLs.
 ///
 /// Scoped packages like `@openai/codex` must be sent to upstream registries
-/// with the scope separator encoded: `@openai%2fcodex`. The public npm
+/// with the scope separator encoded: `@openai%2Fcodex`. The public npm
 /// registry accepts both forms, but private registries (Nexus, Verdaccio,
 /// GitHub Packages) often require the encoded form. Unscoped packages are
 /// returned unchanged.
 fn encode_package_name_for_upstream(name: &str) -> String {
     if let Some(rest) = name.strip_prefix('@') {
         if let Some((scope, pkg)) = rest.split_once('/') {
-            return format!("@{}%2f{}", scope, pkg);
+            return format!("@{}%2F{}", scope, pkg);
         }
     }
     name.to_string()
@@ -364,6 +364,9 @@ async fn serve_tarball(
     .map_err(map_db_err)?;
 
     // If artifact not found locally, try proxy for remote repos
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    let upstream_path = format!("{}/-/{}", encoded_name, filename);
+
     let artifact = match artifact {
         Some(a) => a,
         None => {
@@ -371,9 +374,6 @@ async fn serve_tarball(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    // Upstream path: {encoded_name}/-/{filename}
-                    let encoded_name = encode_package_name_for_upstream(package_name);
-                    let upstream_path = format!("{}/-/{}", encoded_name, filename);
                     let (content, _content_type) = proxy_helpers::proxy_fetch(
                         proxy,
                         repo.id,
@@ -399,8 +399,6 @@ async fn serve_tarball(
             if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
                 let fname = filename.to_string();
-                let encoded_name = encode_package_name_for_upstream(package_name);
-                let upstream_path = format!("{}/-/{}", encoded_name, filename);
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
@@ -489,6 +487,8 @@ async fn publish_scoped(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     publish_package(&state, auth, &repo_key, &full_name, &headers, body).await
 }
@@ -1760,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_normalize_decodes_slash_only() {
-        assert_eq!(normalize_package_name("@openai%2fcodex"), "@openai/codex");
+        assert_eq!(normalize_package_name("@openai%2Fcodex"), "@openai/codex");
     }
 
     #[test]
@@ -1781,7 +1781,7 @@ mod tests {
     fn test_encode_upstream_scoped_package() {
         assert_eq!(
             encode_package_name_for_upstream("@openai/codex"),
-            "@openai%2fcodex"
+            "@openai%2Fcodex"
         );
     }
 
@@ -1804,16 +1804,16 @@ mod tests {
         // Only the first slash should be encoded
         assert_eq!(
             encode_package_name_for_upstream("@scope/sub/pkg"),
-            "@scope%2fsub/pkg"
+            "@scope%2Fsub/pkg"
         );
     }
 
     #[test]
     fn test_normalize_then_encode_roundtrip() {
-        let from_client = "@openai%2fcodex";
+        let from_client = "@openai%2Fcodex";
         let normalized = normalize_package_name(from_client);
         assert_eq!(normalized, "@openai/codex");
         let for_upstream = encode_package_name_for_upstream(&normalized);
-        assert_eq!(for_upstream, "@openai%2fcodex");
+        assert_eq!(for_upstream, "@openai%2Fcodex");
     }
 }
