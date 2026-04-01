@@ -7,22 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-04-01
+
+This is the first stable release of Artifact Keeper.
+
+### Sponsors
+
+Thank you to our backers for supporting ongoing development of Artifact Keeper:
+
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project.
+
 ### Thank You
-- @pipelineRat for reporting virtual repo member creation and display issues (#461), and the SSO lockout problem (#443)
-- @Lerentis for continued testing and logs on the Maven S3 upload issue (#361)
+
+This release includes fixes reported by the community. A special thanks to everyone who took the time to file detailed issues with reproduction steps:
+
+- @Kimahriman for five high-quality bug reports: PyPI relative URL handling for Nexus/devpi remotes (#610), NPM scoped package encoding for private registries (#616), PyPI remote vs virtual divergence (#625), PyPI proxy cache misses (#603), and PyPI virtual download delegation (#602)
+- @andrlange for four OCI/Docker bugs: manifest push error handling (#594, #595, #596) and API token auth on /v2/token (#593)
+- @mtatheonly for reporting that remote repos don't list cached packages (#624)
+- @gaetanmetzger for the Docker Hub remote proxy support request that led to the token exchange feature (#612)
+- @ivolnistov for the SSO admin permissions fix PR (#609) and the SSO bug report (#608)
+- @todpunk for the metrics endpoint feature (#571) and clippy docs fix (#572)
+- @arnaudmut for reporting the Trivy image tag issue (#585)
+- @myannou for the Docker remote pull failure (#584)
+- @TechEnchante for the chunked upload feature request (#563)
+- @Tartanpion27 for the AWS ECS/Fargate credential chain issue (#613)
+- @injectedfusion for the Cargo remote 404 report (#611)
+- @pipelineRat for reporting virtual repo member display issues (#461) and the SSO lockout problem (#443)
+- @Lerentis for continued testing on the Maven S3 upload issue (#361)
 - @msegura501 for the Caddy proxy env var fix (#445)
 
 ### Added
-- **Upstream authentication for remote repositories** (#451) - remote (proxy) repos can now authenticate against private upstream registries using Basic or Bearer credentials. Credentials are encrypted at rest with AES-256-GCM. Includes API endpoints for managing credentials and testing upstream connectivity, plus web UI fields in the repo create/edit dialogs.
+- **OCI bearer token exchange** (#612, #626) - remote Docker/OCI repos now handle the 401/token handshake required by Docker Hub, GHCR, and private registries. Tokens are cached in memory with TTL-based eviction. Includes SSRF validation on token endpoint URLs.
+- **Chunked/resumable upload API** (#563, #564) - new `/api/v1/uploads` endpoints for multi-GB file uploads. Supports configurable chunk sizes (1 MB to 256 MB), SHA-256 verification, session expiry cleanup, and resume after interruption.
+- **Upstream authentication for remote repositories** (#451) - remote (proxy) repos can now authenticate against private upstream registries using Basic or Bearer credentials. Credentials are encrypted at rest with AES-256-GCM.
 - **ALLOW_LOCAL_ADMIN_LOGIN env var** (#443) - break-glass recovery mechanism that allows the built-in admin account to log in with local credentials even when SSO is configured.
-- **Docker compose guide comments** (#448) - the docker-compose.yml now includes section headers and inline guidance explaining each service, what is optional, and what to change for production use.
+- **Optional unauthenticated metrics endpoint** (#571) - contributed by @todpunk. Configurable via `METRICS_PORT` for Prometheus scraping without auth.
+- **Proxy-cached artifacts in repo listings** (#624, #626) - artifacts fetched through remote proxy repos are now recorded in the database, making them visible in repository listings and storage size calculations.
+- **Docker compose guide comments** (#448) - inline guidance explaining each service, what is optional, and what to change for production.
 
 ### Fixed
-- **S3 PUT errors now surface the actual S3 response** (#361) - when S3 rejects a PUT request (e.g. 403 AccessDenied), the response body is now included in both the error message and structured logs, making permission issues diagnosable without guessing.
-- **Virtual repo members not displayed in UI** (#455) - fixed member panel rendering and OpenAPI spec field mismatch (items vs members).
-- **Caddy proxy env var interference** (#445) - cleared inherited Docker daemon proxy env vars on the Caddy service to prevent broken inter-container routing in enterprise networks.
+- **PyPI relative URL resolution** (#610, #622) - registries like Sonatype Nexus, devpi, and Artifactory that use relative hrefs in their simple index HTML now work correctly. URLs are resolved using the `url` crate's RFC 3986-compliant Url::join method.
+- **PyPI virtual/direct remote parity** (#625, #627) - virtual repos now use the exact same remote proxy logic as direct remote access, including content-type preservation, conditional URL rewriting, and proxy cache checks.
+- **NPM scoped package encoding for remotes** (#616, #622) - scoped packages (`@scope/pkg`) are now URL-encoded (`@scope%2Fpkg`) in upstream requests per the npm registry wire protocol. Private registries (Nexus, Verdaccio, GitHub Packages) that require the encoded form now work.
+- **Chunked upload security hardening** (#621) - six P0 bugs fixed: memory-safe file streaming on complete (C1), bounded chunk body buffering (C2), session ownership verification (C3), strengthened path traversal validation (C4), total_size validation (C5), atomic chunk claim to prevent race conditions (C6).
+- **SSRF protection hardening** (#622) - SSRF blocklist now rejects single-label hostnames and `.svc.cluster.local` Kubernetes addresses. Resolved URLs from upstream index pages are validated before fetch. Non-HTTP schemes rejected after relative URL resolution.
+- **SSO admin permissions preserved on login** (#608, #609) - when an SSO user with admin permissions logs in and no admin group pattern matches, their existing admin flag is no longer reset. Contributed by @ivolnistov.
+- **S3 ECS/EKS credential chain** (#613, #617) - switched to `AmazonS3Builder::from_env()` so ECS task roles, EKS IRSA, and instance profiles are automatically detected.
+- **OCI manifest push bugs** (#594, #595, #596, #600) - three fixes: re-push after delete clears `is_deleted`, INSERT errors are no longer silently swallowed, and duplicate image name in log lines is resolved.
+- **Docker /v2/token accepts API tokens** (#593, #599) - service account API tokens can now be used as Basic Auth passwords for Docker login.
+- **Revoked tokens excluded from listings** (#592, #598) - service account token listing no longer includes revoked tokens.
+- **Trivy image pinned** (#585, #597) - Docker image uses `ghcr.io/aquasecurity/trivy:0.69.3` instead of the removed `latest` tag.
+- **S3 PUT errors surface response body** (#361) - S3 rejection details (e.g. 403 AccessDenied) now appear in error messages and structured logs.
+- **Virtual repo members displayed in UI** (#455, #461) - fixed member panel rendering and OpenAPI spec field mismatch.
+- **Caddy proxy env var interference** (#445) - cleared inherited Docker daemon proxy env vars on the Caddy service.
 - **OCI Basic Auth on /v2 endpoint** (#457) - the `/v2/` version check endpoint now accepts Basic Auth in addition to Bearer tokens.
 - **SSO login redirect URLs** (#454) - corrected OIDC/SAML callback URLs and added LDAP custom CA certificate support.
+
+### Security
+- **OIDC ID token signature verification** (#590) - validates ID token signatures via JWKS, plus nonce/iss/aud/exp claims.
+- **SSRF protection on repository upstream URLs** (#590) - `validate_outbound_url` blocks private IPs, cloud metadata endpoints, and internal hostnames.
+- **NPM package name validation** (#622) - decoded package names are validated for null bytes, path traversal, slash count, and length.
+- **Chunked upload path traversal hardening** (#621) - rejects null bytes, backslashes, percent-encoded traversal, bare dot components, and double slashes.
+
+### Performance
+- **CI pipeline 60% faster** (#591) - sccache, dependency caching, and parallel jobs cut PR check time significantly.
+- **Regex compilation moved to statics** (#622) - three per-request `Regex::new()` calls in PyPI handler replaced with `once_cell::sync::Lazy` statics.
+- **N+1 download stats query eliminated** (#590) - batch query replaces per-artifact loop in artifact listing.
 
 ## [1.1.0-rc.8] - 2026-03-17
 

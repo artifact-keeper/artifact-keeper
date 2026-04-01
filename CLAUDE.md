@@ -186,29 +186,43 @@ Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older releas
 - The release workflow is at `.github/workflows/release.yml`, triggered by `v*` tags.
 - The release-gate (artifact-keeper-test) must pass for a release to be published. If gates fail, the release is created as a **draft** with binaries attached but not published.
 
-### Changelog Thank You Section
+### Changelog and Release Notes
 
-Every CHANGELOG entry must include a **Thank You** section crediting external contributors who filed issues or reported bugs that led to fixes in that release. This is required for every release, no exceptions.
+Every CHANGELOG entry and GitHub Release must include recognition sections. This is required for every release, no exceptions.
 
-**Process when writing a changelog entry:**
+**Process when writing a changelog entry or release notes:**
 1. Look at all PRs/commits since the last tag
 2. For each fix, check the linked issue(s) to find who reported it
-3. Add a `### Thank You` section at the top of the release entry (before Added/Fixed/etc.)
-4. Credit each external contributor with their GitHub handle and what they reported
-5. **Do NOT include maintainer `brandonrc`** in the thank you section, only external contributors
-6. If no external contributors reported issues for this release, omit the section
+3. Check `gh pr list --state merged` for external PR authors (not `brandonrc` or bots)
+4. Check the Sponsors section in README.md for current backers
+5. Add a `### Thank You` section crediting external contributors who filed issues, reported bugs, or submitted PRs
+6. Add a `### Sponsors` section thanking current backers by name and GitHub handle
+7. **Do NOT include maintainer `brandonrc`** in the thank you section, only external contributors
+8. If no external contributors reported issues for this release, omit the Thank You section
+9. The Sponsors section is always included if there are active sponsors
 
 **Example format in CHANGELOG.md:**
 ```markdown
 ## [1.x.x] - YYYY-MM-DD
 
+### Sponsors
+
+Thank you to our backers for supporting ongoing development:
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper)
+
 ### Thank You
 - @username for reporting the OCI auth issue behind reverse proxies (#123)
 - @another-user for identifying the Maven SNAPSHOT re-upload bug (#456)
+- @contributor for the SSO admin fix PR (#609)
 
 ### Added
 ...
 ```
+
+**GitHub Release notes** follow the same structure. The release workflow auto-generates a changelog from merged PRs, but the Sponsors and Thank You sections must be prepended manually (or by the release script) before publishing.
 
 ### Other Git Rules
 
