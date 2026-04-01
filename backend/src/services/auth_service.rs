@@ -39,7 +39,7 @@ pub struct FederatedCredentials {
 #[derive(Debug, Clone, Default)]
 pub struct RoleMapping {
     /// Whether the user should be an admin.
-    /// `None` means no admin group was found in claims — preserve existing value.
+    /// `None` means no admin group was found in claims; preserve existing value.
     pub is_admin: Option<bool>,
     /// Additional role names to assign
     pub roles: Vec<String>,
