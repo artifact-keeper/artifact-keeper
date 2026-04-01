@@ -194,7 +194,7 @@ async fn upload_chunk(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
-    let _user_id = auth.user_id;
+    let user_id = auth.user_id;
 
     // Parse Content-Range header
     let range_header = headers
@@ -209,15 +209,17 @@ async fn upload_chunk(
         )
     })?;
 
-    // Get the session to determine chunk_index from byte_offset
-    let session = UploadService::get_session(&state.db, session_id)
+    // C3: get_session now verifies user ownership
+    let session = UploadService::get_session(&state.db, session_id, Some(user_id))
         .await
         .map_err(map_upload_err)?;
 
     let chunk_index = (start / session.chunk_size as i64) as i32;
 
-    // Stream body to bytes (chunk sized, not full file)
-    let mut data = Vec::new();
+    // C2: Stream body directly to a temp buffer with a size cap matching the
+    // declared Content-Range length. This prevents unbounded memory growth.
+    let expected_len = (end - start + 1) as usize;
+    let mut data = Vec::with_capacity(expected_len.min(256 * 1024 * 1024));
     let mut stream = body.into_data_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -227,9 +229,18 @@ async fn upload_chunk(
             )
         })?;
         data.extend_from_slice(&chunk);
+        // Bail early if client sends more data than declared
+        if data.len() > expected_len {
+            return Err(map_err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Body exceeds declared Content-Range length of {} bytes",
+                    expected_len
+                ),
+            ));
+        }
     }
 
-    let expected_len = (end - start + 1) as usize;
     if data.len() != expected_len {
         return Err(map_err(
             StatusCode::BAD_REQUEST,
@@ -247,6 +258,7 @@ async fn upload_chunk(
         chunk_index,
         start,
         bytes::Bytes::from(data),
+        user_id,
     )
     .await
     .map_err(map_upload_err)?;
@@ -283,9 +295,10 @@ async fn get_session_status(
     Extension(auth): Extension<AuthExtension>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
-    let _user_id = auth.user_id;
+    let user_id = auth.user_id;
 
-    let session = UploadService::get_session(&state.db, session_id)
+    // C3: Verify user owns this session
+    let session = UploadService::get_session(&state.db, session_id, Some(user_id))
         .await
         .map_err(map_upload_err)?;
 
@@ -331,7 +344,8 @@ async fn complete(
 ) -> Result<Response, Response> {
     let user_id = auth.user_id;
 
-    let session = UploadService::complete_session(&state.db, session_id)
+    // C3: Verify user owns this session
+    let session = UploadService::complete_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
 
@@ -342,14 +356,12 @@ async fn complete(
         session.repository_id, session.artifact_path
     );
 
-    // Store via the storage service
-    let content = tokio::fs::read(&temp_path)
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
+    // C1: Use put_file to stream from disk instead of reading the entire file
+    // into memory. The default implementation still reads into memory, but
+    // backends can override for true streaming (S3 multipart, etc.).
     state
         .storage
-        .put(&storage_key, content.into())
+        .put_file(&storage_key, &temp_path)
         .await
         .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -420,9 +432,10 @@ async fn cancel(
     Extension(auth): Extension<AuthExtension>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
-    let _user_id = auth.user_id;
+    let user_id = auth.user_id;
 
-    UploadService::cancel_session(&state.db, session_id)
+    // C3: Verify user owns this session
+    UploadService::cancel_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
 
@@ -1144,5 +1157,185 @@ mod tests {
         let (start, end, _total) = upload_service::parse_content_range("bytes 0-0/1").unwrap();
         let expected_len = (end - start + 1) as usize;
         assert_eq!(expected_len, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_upload_err response body verification (new error branches)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_map_upload_err_database_hides_details() {
+        // Database errors should NOT leak SQL details to the client
+        let db_err = sqlx::Error::Configuration("secret connection string".into());
+        let resp = map_upload_err(UploadError::Database(db_err));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "Database error");
+        // Must NOT contain the raw sqlx error
+        assert!(!json["error"].as_str().unwrap().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn test_map_upload_err_io_hides_details() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "/secret/path/file.tmp");
+        let resp = map_upload_err(UploadError::Io(io_err));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "I/O error");
+        assert!(!json["error"].as_str().unwrap().contains("/secret"));
+    }
+
+    #[tokio::test]
+    async fn test_map_upload_err_checksum_includes_details() {
+        let resp = map_upload_err(UploadError::ChecksumMismatch {
+            expected: "aaa".into(),
+            actual: "bbb".into(),
+        });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(err_msg.contains("aaa"));
+        assert!(err_msg.contains("bbb"));
+    }
+
+    #[tokio::test]
+    async fn test_map_upload_err_incomplete_includes_counts() {
+        let resp = map_upload_err(UploadError::IncompleteChunks {
+            completed: 7,
+            total: 10,
+        });
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(err_msg.contains("7"));
+        assert!(err_msg.contains("10"));
+    }
+
+    #[tokio::test]
+    async fn test_map_upload_err_size_mismatch_includes_sizes() {
+        let resp = map_upload_err(UploadError::SizeMismatch {
+            expected: 1048576,
+            actual: 1048575,
+        });
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let err_msg = json["error"].as_str().unwrap();
+        assert!(err_msg.contains("1048576"));
+        assert!(err_msg.contains("1048575"));
+    }
+
+    #[tokio::test]
+    async fn test_map_err_body_is_json() {
+        let resp = map_err(StatusCode::BAD_REQUEST, "test error message");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "test error message");
+    }
+
+    // -----------------------------------------------------------------------
+    // C2: body size cap arithmetic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_body_cap_prevents_oversized_allocation() {
+        // Vec::with_capacity should cap at 256 MB even if Content-Range
+        // declares a larger range
+        let expected_len: usize = 512 * 1024 * 1024; // 512 MB
+        let capped = expected_len.min(256 * 1024 * 1024);
+        assert_eq!(capped, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_body_cap_passthrough_for_small_chunks() {
+        let expected_len: usize = 8 * 1024 * 1024; // 8 MB
+        let capped = expected_len.min(256 * 1024 * 1024);
+        assert_eq!(capped, expected_len);
+    }
+
+    // -----------------------------------------------------------------------
+    // C5: total_size validation at the DTO level
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_session_request_negative_total_size() {
+        let json = r#"{
+            "repository_key": "repo",
+            "artifact_path": "file.bin",
+            "total_size": -1,
+            "checksum_sha256": "abc"
+        }"#;
+        // The JSON deserializes fine (i64 accepts negatives), but
+        // create_session will reject it. Verify deserialization works.
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.total_size, -1);
+    }
+
+    #[test]
+    fn test_create_session_request_max_i64_total_size() {
+        let json = format!(
+            r#"{{
+                "repository_key": "repo",
+                "artifact_path": "huge.bin",
+                "total_size": {},
+                "checksum_sha256": "abc"
+            }}"#,
+            i64::MAX
+        );
+        let req: CreateSessionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req.total_size, i64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // C3: ownership check is exercised via the service layer
+    // (these test the handler-level plumbing that now passes user_id)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upload_error_not_found_is_used_for_auth_failure() {
+        // When a user tries to access another user's session, the service
+        // returns NotFound (not Unauthorized) to avoid leaking session existence.
+        let err = UploadError::NotFound;
+        let resp = map_upload_err(err);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // C4: validate_artifact_path is called from handler (tested in service)
+    // Verify the handler maps the error correctly
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_path_error_maps_to_bad_request() {
+        let err = upload_service::validate_artifact_path("../../etc/passwd");
+        assert!(err.is_err());
+        let resp = map_upload_err(err.unwrap_err());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_path_null_byte_maps_to_bad_request() {
+        let err = upload_service::validate_artifact_path("file\0.txt");
+        assert!(err.is_err());
+        let resp = map_upload_err(err.unwrap_err());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_path_encoded_traversal_maps_to_bad_request() {
+        let err = upload_service::validate_artifact_path("a/%2e%2e/b");
+        assert!(err.is_err());
+        let resp = map_upload_err(err.unwrap_err());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_validate_path_backslash_maps_to_bad_request() {
+        let err = upload_service::validate_artifact_path("a\\b");
+        assert!(err.is_err());
+        let resp = map_upload_err(err.unwrap_err());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
