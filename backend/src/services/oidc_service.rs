@@ -502,13 +502,15 @@ impl OidcService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         if let Some(mut user) = existing_user {
-            // Update user info from OIDC
+            // Update user info from OIDC.
+            // When no admin group is configured, is_admin is None and COALESCE
+            // preserves the existing value so manually-promoted admins keep their role.
             let is_admin = self.is_admin_from_groups(&oidc_user.groups);
 
             sqlx::query!(
                 r#"
                 UPDATE users
-                SET email = $1, display_name = $2, is_admin = $3,
+                SET email = $1, display_name = $2, is_admin = COALESCE($3, is_admin),
                     last_login_at = NOW(), updated_at = NOW()
                 WHERE id = $4
                 "#,
@@ -523,14 +525,18 @@ impl OidcService {
 
             user.email = oidc_user.email.clone();
             user.display_name = oidc_user.display_name.clone();
-            user.is_admin = is_admin;
+            if let Some(admin) = is_admin {
+                user.is_admin = admin;
+            }
 
             return Ok(user);
         }
 
         // Create new user from OIDC
         let user_id = Uuid::new_v4();
-        let is_admin = self.is_admin_from_groups(&oidc_user.groups);
+        let is_admin = self
+            .is_admin_from_groups(&oidc_user.groups)
+            .unwrap_or(false);
 
         // Generate unique username if conflict exists
         let username = self.generate_unique_username(&oidc_user.username).await?;
@@ -599,14 +605,13 @@ impl OidcService {
     }
 
     /// Check if user is admin based on group memberships
-    fn is_admin_from_groups(&self, groups: &[String]) -> bool {
-        if let Some(admin_group) = &self.config.admin_group {
+    fn is_admin_from_groups(&self, groups: &[String]) -> Option<bool> {
+        let admin_group = self.config.admin_group.as_ref()?;
+        Some(
             groups
                 .iter()
-                .any(|g| g.to_lowercase() == admin_group.to_lowercase())
-        } else {
-            false
-        }
+                .any(|g| g.to_lowercase() == admin_group.to_lowercase()),
+        )
     }
 
     /// Extract group memberships for role mapping
@@ -618,7 +623,7 @@ impl OidcService {
     pub fn map_groups_to_roles(&self, groups: &[String]) -> Vec<String> {
         let mut roles = vec!["user".to_string()];
 
-        if self.is_admin_from_groups(groups) {
+        if self.is_admin_from_groups(groups).unwrap_or(false) {
             roles.push("admin".to_string());
         }
 
@@ -1004,5 +1009,76 @@ mod tests {
         assert!(claims.aud.contains("client-a"));
         assert!(claims.aud.contains("client-b"));
         assert!(!claims.aud.contains("client-c"));
+    }
+
+    // =======================================================================
+    // is_admin_from_groups tests
+    // =======================================================================
+
+    fn make_test_oidc_config() -> OidcConfig {
+        OidcConfig {
+            issuer: "https://idp.example.com".to_string(),
+            client_id: "client-123".to_string(),
+            client_secret: "secret-456".to_string(),
+            redirect_uri: "http://localhost:8080/auth/oidc/callback".to_string(),
+            scopes: vec!["openid".into(), "profile".into(), "email".into()],
+            username_claim: "preferred_username".to_string(),
+            email_claim: "email".to_string(),
+            display_name_claim: "name".to_string(),
+            groups_claim: "groups".to_string(),
+            admin_group: Some("admins".to_string()),
+        }
+    }
+
+    fn make_test_oidc_service() -> OidcService {
+        OidcService::with_config(
+            PgPool::connect_lazy("postgres://invalid:invalid@localhost/invalid").unwrap(),
+            make_test_oidc_config(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_is_admin_from_groups_returns_some_true_when_in_admin_group() {
+        let service = make_test_oidc_service();
+        let groups = vec!["developers".to_string(), "admins".to_string()];
+        assert_eq!(service.is_admin_from_groups(&groups), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_is_admin_from_groups_returns_some_false_when_not_in_admin_group() {
+        let service = make_test_oidc_service();
+        let groups = vec!["developers".to_string(), "users".to_string()];
+        assert_eq!(service.is_admin_from_groups(&groups), Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_is_admin_from_groups_returns_none_when_no_admin_group_configured() {
+        let mut config = make_test_oidc_config();
+        config.admin_group = None;
+        let service = OidcService::with_config(
+            PgPool::connect_lazy("postgres://invalid:invalid@localhost/invalid").unwrap(),
+            config,
+        );
+        let groups = vec!["admins".to_string(), "superadmins".to_string()];
+        assert_eq!(service.is_admin_from_groups(&groups), None);
+    }
+
+    #[tokio::test]
+    async fn test_is_admin_from_groups_case_insensitive() {
+        let service = make_test_oidc_service();
+        assert_eq!(
+            service.is_admin_from_groups(&["ADMINS".to_string()]),
+            Some(true)
+        );
+        assert_eq!(
+            service.is_admin_from_groups(&["Admins".to_string()]),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_admin_from_groups_empty_groups() {
+        let service = make_test_oidc_service();
+        assert_eq!(service.is_admin_from_groups(&[]), Some(false));
     }
 }

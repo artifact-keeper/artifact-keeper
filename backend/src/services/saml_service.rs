@@ -736,13 +736,15 @@ impl SamlService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         if let Some(mut user) = existing_user {
-            // Update user info from SAML
+            // Update user info from SAML.
+            // When no admin group is configured, is_admin is None and COALESCE
+            // preserves the existing value so manually-promoted admins keep their role.
             let is_admin = self.is_admin_from_groups(&saml_user.groups);
 
             sqlx::query!(
                 r#"
                 UPDATE users
-                SET email = $1, display_name = $2, is_admin = $3,
+                SET email = $1, display_name = $2, is_admin = COALESCE($3, is_admin),
                     last_login_at = NOW(), updated_at = NOW()
                 WHERE id = $4
                 "#,
@@ -757,14 +759,18 @@ impl SamlService {
 
             user.email = saml_user.email.clone();
             user.display_name = saml_user.display_name.clone();
-            user.is_admin = is_admin;
+            if let Some(admin) = is_admin {
+                user.is_admin = admin;
+            }
 
             return Ok(user);
         }
 
         // Create new user from SAML
         let user_id = Uuid::new_v4();
-        let is_admin = self.is_admin_from_groups(&saml_user.groups);
+        let is_admin = self
+            .is_admin_from_groups(&saml_user.groups)
+            .unwrap_or(false);
 
         // Generate unique username if conflict exists
         let username = self.generate_unique_username(&saml_user.username).await?;
@@ -833,14 +839,13 @@ impl SamlService {
     }
 
     /// Check if user is admin based on group memberships
-    fn is_admin_from_groups(&self, groups: &[String]) -> bool {
-        if let Some(admin_group) = &self.config.admin_group {
+    fn is_admin_from_groups(&self, groups: &[String]) -> Option<bool> {
+        let admin_group = self.config.admin_group.as_ref()?;
+        Some(
             groups
                 .iter()
-                .any(|g| g.to_lowercase() == admin_group.to_lowercase())
-        } else {
-            false
-        }
+                .any(|g| g.to_lowercase() == admin_group.to_lowercase()),
+        )
     }
 
     /// Extract group memberships for role mapping
@@ -852,7 +857,7 @@ impl SamlService {
     pub fn map_groups_to_roles(&self, groups: &[String]) -> Vec<String> {
         let mut roles = vec!["user".to_string()];
 
-        if self.is_admin_from_groups(groups) {
+        if self.is_admin_from_groups(groups).unwrap_or(false) {
             roles.push("admin".to_string());
         }
 
@@ -1872,31 +1877,31 @@ mod tests {
     async fn test_is_admin_from_groups_matching() {
         let service = make_test_saml_service();
         let groups = vec!["Developers".to_string(), "Admins".to_string()];
-        assert!(service.is_admin_from_groups(&groups));
+        assert_eq!(service.is_admin_from_groups(&groups), Some(true));
     }
 
     #[tokio::test]
     async fn test_is_admin_from_groups_case_insensitive() {
         let service = make_test_saml_service();
         let groups = vec!["admins".to_string()];
-        assert!(service.is_admin_from_groups(&groups));
+        assert_eq!(service.is_admin_from_groups(&groups), Some(true));
 
         let groups = vec!["ADMINS".to_string()];
-        assert!(service.is_admin_from_groups(&groups));
+        assert_eq!(service.is_admin_from_groups(&groups), Some(true));
     }
 
     #[tokio::test]
     async fn test_is_admin_from_groups_not_matching() {
         let service = make_test_saml_service();
         let groups = vec!["Developers".to_string(), "Users".to_string()];
-        assert!(!service.is_admin_from_groups(&groups));
+        assert_eq!(service.is_admin_from_groups(&groups), Some(false));
     }
 
     #[tokio::test]
     async fn test_is_admin_from_groups_empty() {
         let service = make_test_saml_service();
         let groups: Vec<String> = vec![];
-        assert!(!service.is_admin_from_groups(&groups));
+        assert_eq!(service.is_admin_from_groups(&groups), Some(false));
     }
 
     #[tokio::test]
@@ -1911,7 +1916,7 @@ mod tests {
         };
 
         let groups = vec!["Admins".to_string(), "SuperAdmins".to_string()];
-        assert!(!service.is_admin_from_groups(&groups));
+        assert_eq!(service.is_admin_from_groups(&groups), None);
     }
 
     // =======================================================================
@@ -2206,7 +2211,7 @@ mod tests {
         assert!(user_info.groups.contains(&"Developers".to_string()));
 
         // Admin check
-        assert!(service.is_admin_from_groups(&user_info.groups));
+        assert_eq!(service.is_admin_from_groups(&user_info.groups), Some(true));
     }
 
     // =======================================================================

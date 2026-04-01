@@ -303,13 +303,15 @@ impl LdapService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         if let Some(mut user) = existing_user {
-            // Update user info from LDAP
+            // Update user info from LDAP.
+            // When no admin group DN is configured, is_admin is None and COALESCE
+            // preserves the existing value so manually-promoted admins keep their role.
             let is_admin = self.is_admin_from_groups(&ldap_user.groups);
 
             sqlx::query!(
                 r#"
                 UPDATE users
-                SET email = $1, display_name = $2, is_admin = $3,
+                SET email = $1, display_name = $2, is_admin = COALESCE($3, is_admin),
                     last_login_at = NOW(), updated_at = NOW()
                 WHERE id = $4
                 "#,
@@ -324,14 +326,18 @@ impl LdapService {
 
             user.email = ldap_user.email.clone();
             user.display_name = ldap_user.display_name.clone();
-            user.is_admin = is_admin;
+            if let Some(admin) = is_admin {
+                user.is_admin = admin;
+            }
 
             return Ok(user);
         }
 
         // Create new user from LDAP
         let user_id = Uuid::new_v4();
-        let is_admin = self.is_admin_from_groups(&ldap_user.groups);
+        let is_admin = self
+            .is_admin_from_groups(&ldap_user.groups)
+            .unwrap_or(false);
 
         let user = sqlx::query_as!(
             User,
@@ -366,14 +372,13 @@ impl LdapService {
     }
 
     /// Check if user is admin based on group memberships
-    fn is_admin_from_groups(&self, groups: &[String]) -> bool {
-        if let Some(admin_group) = &self.config.admin_group_dn {
+    fn is_admin_from_groups(&self, groups: &[String]) -> Option<bool> {
+        let admin_group = self.config.admin_group_dn.as_ref()?;
+        Some(
             groups
                 .iter()
-                .any(|g| g.to_lowercase() == admin_group.to_lowercase())
-        } else {
-            false
-        }
+                .any(|g| g.to_lowercase() == admin_group.to_lowercase()),
+        )
     }
 
     /// Extract group memberships for role mapping
@@ -385,7 +390,7 @@ impl LdapService {
     pub fn map_groups_to_roles(&self, groups: &[String]) -> Vec<String> {
         let mut roles = vec!["user".to_string()];
 
-        if self.is_admin_from_groups(groups) {
+        if self.is_admin_from_groups(groups).unwrap_or(false) {
             roles.push("admin".to_string());
         }
 
@@ -1447,7 +1452,7 @@ mod tests {
         let config = make_test_ldap_config();
         let svc = make_test_service(config);
         let groups = vec!["cn=admins,ou=groups,dc=example,dc=com".to_string()];
-        assert!(svc.is_admin_from_groups(&groups));
+        assert_eq!(svc.is_admin_from_groups(&groups), Some(true));
     }
 
     #[tokio::test]
@@ -1455,7 +1460,7 @@ mod tests {
         let config = make_test_ldap_config();
         let svc = make_test_service(config);
         let groups = vec!["CN=ADMINS,OU=GROUPS,DC=EXAMPLE,DC=COM".to_string()];
-        assert!(svc.is_admin_from_groups(&groups));
+        assert_eq!(svc.is_admin_from_groups(&groups), Some(true));
     }
 
     #[tokio::test]
@@ -1463,14 +1468,14 @@ mod tests {
         let config = make_test_ldap_config();
         let svc = make_test_service(config);
         let groups = vec!["cn=developers,ou=groups,dc=example,dc=com".to_string()];
-        assert!(!svc.is_admin_from_groups(&groups));
+        assert_eq!(svc.is_admin_from_groups(&groups), Some(false));
     }
 
     #[tokio::test]
     async fn test_is_admin_from_groups_empty_groups() {
         let config = make_test_ldap_config();
         let svc = make_test_service(config);
-        assert!(!svc.is_admin_from_groups(&[]));
+        assert_eq!(svc.is_admin_from_groups(&[]), Some(false));
     }
 
     #[tokio::test]
@@ -1479,7 +1484,7 @@ mod tests {
         config.admin_group_dn = None;
         let svc = make_test_service(config);
         let groups = vec!["cn=admins,ou=groups,dc=example,dc=com".to_string()];
-        assert!(!svc.is_admin_from_groups(&groups));
+        assert_eq!(svc.is_admin_from_groups(&groups), None);
     }
 
     // --- build_search_filter() tests ---
