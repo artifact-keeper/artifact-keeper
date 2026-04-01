@@ -4,8 +4,10 @@
 //! Implements cache TTL, ETag validation, and transparent proxying.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::sync::RwLock;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -44,6 +46,10 @@ pub struct CacheMetadata {
 
 /// Default bearer token TTL when the token endpoint omits `expires_in` (5 minutes).
 const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
+
+/// Maximum bearer token TTL (1 hour). Prevents a malicious token endpoint from
+/// disabling cache eviction or causing integer overflow via a huge `expires_in`.
+const MAX_TOKEN_TTL_SECS: u64 = 3600;
 
 /// JSON response from an OCI registry token endpoint.
 #[derive(Deserialize)]
@@ -404,23 +410,32 @@ impl ProxyService {
                     let scope = params.get("scope").cloned().unwrap_or_default();
                     let service = params.get("service").cloned().unwrap_or_default();
 
+                    // Validate the realm URL against SSRF rules before making
+                    // any outbound request. A malicious upstream could set
+                    // realm to an internal address.
+                    crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
+
                     let token = self
                         .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
                         .await?;
 
-                    // Retry the original request with the bearer token.
-                    let retry_response = self
-                        .http_client
-                        .get(url)
-                        .bearer_auth(&token)
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            AppError::Storage(format!(
-                                "Failed to fetch from upstream after token exchange: {}",
-                                e
-                            ))
-                        })?;
+                    // Retry with both the bearer token and any originally
+                    // configured upstream auth (some private registries
+                    // require both).
+                    let mut retry_request = self.http_client.get(url).bearer_auth(&token);
+                    if let Some(ref auth) = upstream_auth {
+                        retry_request = crate::services::upstream_auth::apply_upstream_auth(
+                            retry_request,
+                            auth,
+                        );
+                    }
+
+                    let retry_response = retry_request.send().await.map_err(|e| {
+                        AppError::Storage(format!(
+                            "Failed to fetch from upstream after token exchange: {}",
+                            e
+                        ))
+                    })?;
 
                     return Self::read_upstream_response(retry_response, url).await;
                 }
@@ -436,6 +451,7 @@ impl ProxyService {
     }
 
     /// Extract content, content-type, and etag from an upstream HTTP response.
+    /// Callers are responsible for handling 401 before invoking this method.
     async fn read_upstream_response(
         response: reqwest::Response,
         url: &str,
@@ -491,10 +507,12 @@ impl ProxyService {
         scope: &str,
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
     ) -> Result<String> {
-        let cache_key = format!("{}\0{}", realm, scope);
+        // Include service in the cache key so tokens for different registries
+        // sharing the same realm endpoint are not mixed up.
+        let cache_key = format!("{}\0{}\0{}", realm, service, scope);
 
         // Check cache first.
-        if let Some(token) = self.get_cached_token(&cache_key) {
+        if let Some(token) = self.get_cached_token(&cache_key).await {
             return Ok(token);
         }
 
@@ -555,10 +573,18 @@ impl ProxyService {
             .or(body.access_token)
             .ok_or_else(|| AppError::Storage("Token endpoint returned no token".to_string()))?;
 
-        let ttl = body.expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS);
+        // Cap TTL to prevent overflow and unreasonably long cache entries.
+        let ttl = body
+            .expires_in
+            .unwrap_or(DEFAULT_TOKEN_TTL_SECS)
+            .min(MAX_TOKEN_TTL_SECS);
 
-        // Cache the token.
-        if let Ok(mut cache) = self.token_cache.write() {
+        // Cache the token, evicting expired entries to prevent unbounded growth.
+        {
+            let mut cache = self.token_cache.write().await;
+            cache.retain(|_, (_, created_at, entry_ttl)| {
+                created_at.elapsed() < Duration::from_secs(*entry_ttl)
+            });
             cache.insert(cache_key, (token.clone(), Instant::now(), ttl));
         }
 
@@ -566,11 +592,12 @@ impl ProxyService {
     }
 
     /// Return a cached bearer token if present and not expired.
-    fn get_cached_token(&self, cache_key: &str) -> Option<String> {
-        let cache = self.token_cache.read().ok()?;
+    async fn get_cached_token(&self, cache_key: &str) -> Option<String> {
+        let cache = self.token_cache.read().await;
         let (token, created_at, ttl_secs) = cache.get(cache_key)?;
         // Use 90% of TTL to avoid edge-case expiry during the request.
-        if created_at.elapsed() < Duration::from_secs(*ttl_secs * 9 / 10) {
+        // saturating_mul prevents overflow on untrusted input.
+        if created_at.elapsed() < Duration::from_secs(ttl_secs.saturating_mul(9) / 10) {
             Some(token.clone())
         } else {
             None
@@ -749,6 +776,17 @@ impl ProxyService {
                         Ok(true)
                     }
                 }
+            }
+            StatusCode::UNAUTHORIZED => {
+                // OCI registries require bearer token exchange even for HEAD
+                // requests. Rather than duplicating the token exchange here,
+                // treat this as "needs re-fetch" and let fetch_from_upstream
+                // handle the full 401 flow on the next access.
+                tracing::debug!(
+                    "Upstream returned 401 for ETag check on {}, will re-fetch with token exchange",
+                    url
+                );
+                Ok(true)
             }
             status => {
                 tracing::warn!(
@@ -1540,13 +1578,13 @@ mod tests {
         assert!(params.is_empty());
     }
 
-    #[test]
-    fn test_token_cache_hit_and_expiry() {
+    #[tokio::test]
+    async fn test_token_cache_hit_and_expiry() {
         let cache: RwLock<HashMap<String, (String, Instant, u64)>> = RwLock::new(HashMap::new());
 
         // Insert a token with 300s TTL
         {
-            let mut c = cache.write().unwrap();
+            let mut c = cache.write().await;
             c.insert(
                 "key".to_string(),
                 ("tok123".to_string(), Instant::now(), 300),
@@ -1555,9 +1593,9 @@ mod tests {
 
         // Should be a cache hit (fresh token)
         let hit = {
-            let c = cache.read().unwrap();
+            let c = cache.read().await;
             let (token, created_at, ttl) = c.get("key").unwrap();
-            if created_at.elapsed() < Duration::from_secs(*ttl * 9 / 10) {
+            if created_at.elapsed() < Duration::from_secs(ttl.saturating_mul(9) / 10) {
                 Some(token.clone())
             } else {
                 None
@@ -1567,7 +1605,7 @@ mod tests {
 
         // Insert an already-expired token
         {
-            let mut c = cache.write().unwrap();
+            let mut c = cache.write().await;
             c.insert(
                 "expired".to_string(),
                 (
@@ -1580,14 +1618,77 @@ mod tests {
 
         // Should be a cache miss (expired)
         let miss = {
-            let c = cache.read().unwrap();
+            let c = cache.read().await;
             let (token, created_at, ttl) = c.get("expired").unwrap();
-            if created_at.elapsed() < Duration::from_secs(*ttl * 9 / 10) {
+            if created_at.elapsed() < Duration::from_secs(ttl.saturating_mul(9) / 10) {
                 Some(token.clone())
             } else {
                 None
             }
         };
         assert!(miss.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_token_cache_eviction_on_write() {
+        let cache: RwLock<HashMap<String, (String, Instant, u64)>> = RwLock::new(HashMap::new());
+
+        // Insert an expired entry and a fresh entry
+        {
+            let mut c = cache.write().await;
+            c.insert(
+                "expired".to_string(),
+                (
+                    "old".to_string(),
+                    Instant::now() - Duration::from_secs(600),
+                    300,
+                ),
+            );
+            c.insert(
+                "fresh".to_string(),
+                ("new".to_string(), Instant::now(), 300),
+            );
+        }
+
+        // Simulate eviction (same logic as obtain_bearer_token)
+        {
+            let mut c = cache.write().await;
+            c.retain(|_, (_, created_at, entry_ttl)| {
+                created_at.elapsed() < Duration::from_secs(*entry_ttl)
+            });
+        }
+
+        let c = cache.read().await;
+        assert!(
+            !c.contains_key("expired"),
+            "expired entry should be evicted"
+        );
+        assert!(c.contains_key("fresh"), "fresh entry should be retained");
+    }
+
+    #[test]
+    fn test_cache_key_includes_service() {
+        let key1 = format!(
+            "{}\0{}\0{}",
+            "https://auth.example.com/token", "registry-a", "repo:img:pull"
+        );
+        let key2 = format!(
+            "{}\0{}\0{}",
+            "https://auth.example.com/token", "registry-b", "repo:img:pull"
+        );
+        assert_ne!(
+            key1, key2,
+            "different services must produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn test_ttl_cap_prevents_overflow() {
+        let huge_ttl: u64 = u64::MAX;
+        let capped = huge_ttl.min(MAX_TOKEN_TTL_SECS);
+        assert_eq!(capped, 3600);
+        // Verify saturating_mul doesn't panic
+        let effective = capped.saturating_mul(9) / 10;
+        assert_eq!(effective, 3240);
     }
 }
