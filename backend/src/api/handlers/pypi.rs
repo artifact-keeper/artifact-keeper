@@ -200,31 +200,71 @@ async fn simple_project(
                     .unwrap());
             }
         }
-        // For virtual repos, iterate through members and try proxy for remote members
+        // For virtual repos, iterate through remote members using the same
+        // proxy logic as the direct Remote path above: preserve the upstream
+        // content-type and only rewrite URLs in HTML responses.
         if repo.repo_type == RepositoryType::Virtual {
             let upstream_path = format!("simple/{}/", normalized);
-            let rk = repo_key.clone();
-            let proj = project.clone();
-            return proxy_helpers::resolve_virtual_metadata(
-                &state.db,
-                state.proxy_service.as_deref(),
-                repo.id,
-                &upstream_path,
-                |content, _member_key| {
-                    let rk = rk.clone();
-                    let proj = proj.clone();
-                    async move {
-                        let html = String::from_utf8_lossy(&content);
-                        let rewritten = rewrite_upstream_urls(&html, &rk, &proj);
-                        Ok(Response::builder()
+            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+            if members.is_empty() {
+                return Err(
+                    AppError::NotFound("Virtual repository has no members".to_string())
+                        .into_response(),
+                );
+            }
+
+            for member in &members {
+                if member.repo_type != RepositoryType::Remote {
+                    continue;
+                }
+                let Some(ref upstream_url) = member.upstream_url else {
+                    continue;
+                };
+                let Some(ref proxy) = state.proxy_service else {
+                    continue;
+                };
+
+                let result = proxy_helpers::proxy_fetch(
+                    proxy,
+                    member.id,
+                    &member.key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await;
+
+                match result {
+                    Ok((content, content_type)) => {
+                        let ct =
+                            content_type.unwrap_or_else(|| "text/html; charset=utf-8".to_string());
+                        let body = if ct.contains("text/html") {
+                            let html = String::from_utf8_lossy(&content);
+                            let rewritten = rewrite_upstream_urls(&html, &repo_key, &project);
+                            Body::from(rewritten)
+                        } else {
+                            Body::from(content)
+                        };
+
+                        return Ok(Response::builder()
                             .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "text/html; charset=utf-8")
-                            .body(Body::from(rewritten))
-                            .unwrap())
+                            .header(CONTENT_TYPE, ct)
+                            .body(body)
+                            .unwrap());
                     }
-                },
+                    Err(_e) => {
+                        debug!(
+                            member_key = %member.key,
+                            "simple index proxy fetch missed for virtual member"
+                        );
+                    }
+                }
+            }
+
+            return Err(AppError::NotFound(
+                "Package not found in any member repository".to_string(),
             )
-            .await;
+            .into_response());
         }
 
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -449,13 +489,31 @@ async fn serve_file(
                         }
                     }
 
-                    // If member is a remote PyPI repo, use the format-specific
-                    // fetch that resolves the real upstream download URL via the
-                    // simple index page.
+                    // If member is a remote PyPI repo, use the same logic as
+                    // the direct Remote path: check the proxy cache first using
+                    // a stable key, then fall back to the format-specific fetch
+                    // that resolves the real download URL via the simple index.
                     if member.repo_type == RepositoryType::Remote {
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
+                            // Check proxy cache first (same optimization as the
+                            // direct Remote path). This avoids re-fetching the
+                            // simple index from upstream when the file is already
+                            // cached from a previous request through this member.
+                            let normalized = PypiHandler::normalize_name(project);
+                            let local_cache_path = format!("simple/{}/{}", normalized, filename);
+
+                            if let Some((content, _ct)) = proxy_helpers::proxy_check_cache(
+                                proxy,
+                                &member.key,
+                                &local_cache_path,
+                            )
+                            .await
+                            {
+                                return Ok(build_file_response(filename, content));
+                            }
+
                             match fetch_from_pypi_remote(
                                 proxy,
                                 member.id,
