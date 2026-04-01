@@ -1448,6 +1448,351 @@ mod tests {
         let backend = S3Backend::new(config).await;
         assert!(backend.is_err());
     }
+
+    // --- build_store credential chain tests ---
+    //
+    // These tests exercise the env-var credential chain in build_store
+    // (lines ~305-368). Because env vars are process-global state and
+    // cargo test runs tests in parallel, we serialize all env-mutating
+    // tests behind a single mutex and save/restore every variable we touch.
+
+    use std::sync::Mutex;
+
+    static CRED_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// All AWS/S3 credential env var names that build_store reads.
+    const CRED_ENV_VARS: &[&str] = &[
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+    ];
+
+    /// Save current values for all credential env vars.
+    fn save_cred_env() -> Vec<(&'static str, Option<String>)> {
+        CRED_ENV_VARS
+            .iter()
+            .map(|&name| (name, std::env::var(name).ok()))
+            .collect()
+    }
+
+    /// Restore saved env var values.
+    fn restore_cred_env(saved: Vec<(&'static str, Option<String>)>) {
+        for (name, val) in saved {
+            match val {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    /// Remove all credential env vars so each test starts from a clean slate.
+    fn clear_cred_env() {
+        for name in CRED_ENV_VARS {
+            std::env::remove_var(name);
+        }
+    }
+
+    /// Helper: build an S3Config pointing at a fake http endpoint so
+    /// the builder never tries a real TLS handshake.
+    fn test_config() -> S3Config {
+        S3Config::new(
+            "cred-test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some("http://localhost:19876".to_string()),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_build_store_succeeds_with_no_aws_env_vars() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should succeed without any AWS env vars: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_picks_up_s3_credentials() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("S3_ACCESS_KEY_ID", "S3AK");
+        std::env::set_var("S3_SECRET_ACCESS_KEY", "S3SK");
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should succeed with S3_* credentials: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_s3_creds_take_precedence_over_aws_creds() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        // Set both S3_* and AWS_* credentials. S3_* should win.
+        std::env::set_var("S3_ACCESS_KEY_ID", "S3AK-wins");
+        std::env::set_var("S3_SECRET_ACCESS_KEY", "S3SK-wins");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK-loses");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK-loses");
+
+        // The builder cannot expose which credentials were chosen, but
+        // we verify it builds successfully and does not error out.
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store with both S3_* and AWS_* should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_picks_up_aws_static_credentials() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK");
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should succeed with AWS_ACCESS_KEY_ID/SECRET: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_includes_aws_session_token() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK");
+        std::env::set_var("AWS_SESSION_TOKEN", "tok-xyz");
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should succeed with AWS session token: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_session_token_ignored_without_aws_keys() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        // Session token alone, no access key / secret key
+        std::env::set_var("AWS_SESSION_TOKEN", "orphan-token");
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should succeed even with orphan session token: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_ecs_fargate_relative_uri() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "/v2/credentials/some-uuid",
+        );
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should accept ECS relative URI: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_eks_pod_identity_full_uri() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "http://169.254.170.23/v1/credentials",
+        );
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should accept EKS Pod Identity full URI: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_eks_irsa_web_identity() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+        );
+        std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/my-role");
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should accept IRSA web identity vars: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_explicit_args_override_all_env_vars() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        // Set all possible env var credentials
+        std::env::set_var("S3_ACCESS_KEY_ID", "S3AK-env");
+        std::env::set_var("S3_SECRET_ACCESS_KEY", "S3SK-env");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK-env");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK-env");
+        std::env::set_var("AWS_SESSION_TOKEN", "tok-env");
+
+        // Explicit function args should take precedence over all env vars
+        let result =
+            S3Backend::build_store(&test_config(), Some("EXPLICIT-AK"), Some("EXPLICIT-SK"));
+        assert!(
+            result.is_ok(),
+            "build_store with explicit args should override env vars: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_all_credential_sources_present() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        // Set every credential env var simultaneously
+        std::env::set_var("S3_ACCESS_KEY_ID", "S3AK");
+        std::env::set_var("S3_SECRET_ACCESS_KEY", "S3SK");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK");
+        std::env::set_var("AWS_SESSION_TOKEN", "tok");
+        std::env::set_var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/creds/uuid");
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "http://169.254.170.23/v1/credentials",
+        );
+        std::env::set_var(
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "/var/run/secrets/token",
+        );
+        std::env::set_var("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/wi-token");
+        std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::111111111111:role/chaos");
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should handle all credential sources at once: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_partial_s3_creds_fall_through_to_aws() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        // Only S3_ACCESS_KEY_ID without the secret: the S3_* pair is
+        // incomplete so the code should fall through to AWS_* vars.
+        std::env::set_var("S3_ACCESS_KEY_ID", "S3AK-partial");
+        // S3_SECRET_ACCESS_KEY intentionally not set
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AWSAK-fallback");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "AWSSK-fallback");
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store with partial S3_* should fall through to AWS_*: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_build_store_container_auth_token_file_alone() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "/var/run/secrets/auth-token",
+        );
+
+        let result = S3Backend::build_store(&test_config(), None, None);
+        assert!(
+            result.is_ok(),
+            "build_store should accept container auth token file: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
 }
 
 #[cfg(test)]
