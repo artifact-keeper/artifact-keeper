@@ -4,12 +4,12 @@
 //! Implements cache TTL, ETag validation, and transparent proxying.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use reqwest::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use reqwest::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -42,11 +42,25 @@ pub struct CacheMetadata {
     pub checksum_sha256: String,
 }
 
+/// Default bearer token TTL when the token endpoint omits `expires_in` (5 minutes).
+const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
+
+/// JSON response from an OCI registry token endpoint.
+#[derive(Deserialize)]
+struct RegistryTokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
 /// Proxy service for fetching and caching artifacts from upstream repositories
 pub struct ProxyService {
     db: PgPool,
     storage: Arc<StorageService>,
     http_client: Client,
+    /// In-memory cache for OCI registry bearer tokens.
+    /// Key: "{realm}\0{scope}", Value: (token, created_at, ttl_secs)
+    token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
 }
 
 impl ProxyService {
@@ -62,6 +76,7 @@ impl ProxyService {
             db,
             storage,
             http_client,
+            token_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -344,7 +359,13 @@ impl ProxyService {
         }
     }
 
-    /// Fetch artifact from upstream URL
+    /// Fetch artifact from upstream URL.
+    ///
+    /// Handles OCI registry bearer token exchange: when the upstream returns
+    /// 401 with a `WWW-Authenticate: Bearer` challenge, the service requests
+    /// a token from the indicated realm and retries the request. Tokens are
+    /// cached in memory with their advertised TTL so subsequent requests to
+    /// the same registry/scope don't repeat the exchange.
     async fn fetch_from_upstream(
         &self,
         url: &str,
@@ -366,6 +387,60 @@ impl ProxyService {
             .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
 
         let status = response.status();
+
+        // Handle 401 with bearer token exchange (required by Docker Hub and
+        // other OCI registries, even for anonymous/public pulls).
+        if status == StatusCode::UNAUTHORIZED {
+            let challenge = response
+                .headers()
+                .get(WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            if challenge.starts_with("Bearer ") {
+                let params = Self::parse_bearer_challenge(&challenge);
+                if let Some(realm) = params.get("realm") {
+                    let scope = params.get("scope").cloned().unwrap_or_default();
+                    let service = params.get("service").cloned().unwrap_or_default();
+
+                    let token = self
+                        .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
+                        .await?;
+
+                    // Retry the original request with the bearer token.
+                    let retry_response = self
+                        .http_client
+                        .get(url)
+                        .bearer_auth(&token)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            AppError::Storage(format!(
+                                "Failed to fetch from upstream after token exchange: {}",
+                                e
+                            ))
+                        })?;
+
+                    return Self::read_upstream_response(retry_response, url).await;
+                }
+            }
+
+            return Err(AppError::Storage(format!(
+                "Upstream returned error status {}: {}",
+                status, url
+            )));
+        }
+
+        Self::read_upstream_response(response, url).await
+    }
+
+    /// Extract content, content-type, and etag from an upstream HTTP response.
+    async fn read_upstream_response(
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<(Bytes, Option<String>, Option<String>)> {
+        let status = response.status();
         if status == StatusCode::NOT_FOUND {
             return Err(AppError::NotFound(format!(
                 "Artifact not found at upstream: {}",
@@ -380,7 +455,6 @@ impl ProxyService {
             )));
         }
 
-        // Extract headers before consuming response
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -406,6 +480,149 @@ impl ProxyService {
         );
 
         Ok((content, content_type, etag))
+    }
+
+    /// Obtain a bearer token for an OCI registry, using the in-memory cache
+    /// when possible.
+    async fn obtain_bearer_token(
+        &self,
+        realm: &str,
+        service: &str,
+        scope: &str,
+        upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
+    ) -> Result<String> {
+        let cache_key = format!("{}\0{}", realm, scope);
+
+        // Check cache first.
+        if let Some(token) = self.get_cached_token(&cache_key) {
+            return Ok(token);
+        }
+
+        // Build token request URL with query parameters.
+        let token_url = {
+            let mut parts = Vec::new();
+            if !service.is_empty() {
+                parts.push(format!("service={}", urlencoding::encode(service)));
+            }
+            if !scope.is_empty() {
+                parts.push(format!("scope={}", urlencoding::encode(scope)));
+            }
+            if parts.is_empty() {
+                realm.to_string()
+            } else {
+                let sep = if realm.contains('?') { "&" } else { "?" };
+                format!("{}{}{}", realm, sep, parts.join("&"))
+            }
+        };
+        let mut token_request = self.http_client.get(&token_url);
+
+        // Forward configured Basic credentials for private registries.
+        if let Some(crate::services::upstream_auth::UpstreamAuthType::Basic {
+            username,
+            password,
+        }) = upstream_auth
+        {
+            token_request = token_request.basic_auth(username, Some(password));
+        }
+
+        tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
+
+        let token_response = token_request.send().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to request bearer token from {}: {}",
+                realm, e
+            ))
+        })?;
+
+        if !token_response.status().is_success() {
+            return Err(AppError::Storage(format!(
+                "Token endpoint {} returned status {}",
+                realm,
+                token_response.status()
+            )));
+        }
+
+        let body: RegistryTokenResponse = token_response.json().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to parse token response from {}: {}",
+                realm, e
+            ))
+        })?;
+
+        // The spec uses `token`, but some registries return `access_token`.
+        let token = body
+            .token
+            .or(body.access_token)
+            .ok_or_else(|| AppError::Storage("Token endpoint returned no token".to_string()))?;
+
+        let ttl = body.expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS);
+
+        // Cache the token.
+        if let Ok(mut cache) = self.token_cache.write() {
+            cache.insert(cache_key, (token.clone(), Instant::now(), ttl));
+        }
+
+        Ok(token)
+    }
+
+    /// Return a cached bearer token if present and not expired.
+    fn get_cached_token(&self, cache_key: &str) -> Option<String> {
+        let cache = self.token_cache.read().ok()?;
+        let (token, created_at, ttl_secs) = cache.get(cache_key)?;
+        // Use 90% of TTL to avoid edge-case expiry during the request.
+        if created_at.elapsed() < Duration::from_secs(*ttl_secs * 9 / 10) {
+            Some(token.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Parse a `WWW-Authenticate: Bearer realm="...",service="...",scope="..."`
+    /// header into a map of key-value pairs.
+    fn parse_bearer_challenge(header: &str) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        let bearer_params = match header.strip_prefix("Bearer ") {
+            Some(p) => p,
+            None => return params,
+        };
+
+        // Simple parser for key="value" pairs separated by commas.
+        // Handles quoted values with commas inside.
+        let mut remaining = bearer_params.trim();
+        while !remaining.is_empty() {
+            let eq_pos = match remaining.find('=') {
+                Some(p) => p,
+                None => break,
+            };
+            let key = remaining[..eq_pos].trim().to_lowercase();
+            remaining = remaining[eq_pos + 1..].trim();
+
+            let value;
+            if remaining.starts_with('"') {
+                // Quoted value: find closing quote.
+                remaining = &remaining[1..];
+                let end = remaining.find('"').unwrap_or(remaining.len());
+                value = remaining[..end].to_string();
+                remaining = if end + 1 < remaining.len() {
+                    remaining[end + 1..].trim_start_matches(',').trim()
+                } else {
+                    ""
+                };
+            } else {
+                // Unquoted value: ends at comma or end of string.
+                let end = remaining.find(',').unwrap_or(remaining.len());
+                value = remaining[..end].trim().to_string();
+                remaining = if end < remaining.len() {
+                    remaining[end + 1..].trim()
+                } else {
+                    ""
+                };
+            }
+
+            params.insert(key, value);
+        }
+
+        params
     }
 
     /// Cache artifact content and metadata
@@ -1275,5 +1492,102 @@ mod tests {
         assert!(expected_meta.contains("test-pypi"));
         assert!(expected_storage.contains("flask"));
         assert!(expected_meta.contains("flask"));
+    }
+
+    // =======================================================================
+    // Bearer challenge parser tests
+    // =======================================================================
+
+    #[test]
+    fn test_parse_bearer_challenge_docker_hub() {
+        let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull""#;
+        let params = ProxyService::parse_bearer_challenge(header);
+        assert_eq!(params.get("realm").unwrap(), "https://auth.docker.io/token");
+        assert_eq!(params.get("service").unwrap(), "registry.docker.io");
+        assert_eq!(
+            params.get("scope").unwrap(),
+            "repository:library/alpine:pull"
+        );
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_ghcr() {
+        let header = r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:org/image:pull""#;
+        let params = ProxyService::parse_bearer_challenge(header);
+        assert_eq!(params.get("realm").unwrap(), "https://ghcr.io/token");
+        assert_eq!(params.get("service").unwrap(), "ghcr.io");
+        assert_eq!(params.get("scope").unwrap(), "repository:org/image:pull");
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_realm_only() {
+        let header = r#"Bearer realm="https://example.com/token""#;
+        let params = ProxyService::parse_bearer_challenge(header);
+        assert_eq!(params.get("realm").unwrap(), "https://example.com/token");
+        assert!(!params.contains_key("service"));
+        assert!(!params.contains_key("scope"));
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_not_bearer() {
+        let params = ProxyService::parse_bearer_challenge("Basic realm=\"test\"");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_bearer_challenge_empty() {
+        let params = ProxyService::parse_bearer_challenge("");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_token_cache_hit_and_expiry() {
+        let cache: RwLock<HashMap<String, (String, Instant, u64)>> = RwLock::new(HashMap::new());
+
+        // Insert a token with 300s TTL
+        {
+            let mut c = cache.write().unwrap();
+            c.insert(
+                "key".to_string(),
+                ("tok123".to_string(), Instant::now(), 300),
+            );
+        }
+
+        // Should be a cache hit (fresh token)
+        let hit = {
+            let c = cache.read().unwrap();
+            let (token, created_at, ttl) = c.get("key").unwrap();
+            if created_at.elapsed() < Duration::from_secs(*ttl * 9 / 10) {
+                Some(token.clone())
+            } else {
+                None
+            }
+        };
+        assert_eq!(hit, Some("tok123".to_string()));
+
+        // Insert an already-expired token
+        {
+            let mut c = cache.write().unwrap();
+            c.insert(
+                "expired".to_string(),
+                (
+                    "old".to_string(),
+                    Instant::now() - Duration::from_secs(600),
+                    300,
+                ),
+            );
+        }
+
+        // Should be a cache miss (expired)
+        let miss = {
+            let c = cache.read().unwrap();
+            let (token, created_at, ttl) = c.get("expired").unwrap();
+            if created_at.elapsed() < Duration::from_secs(*ttl * 9 / 10) {
+                Some(token.clone())
+            } else {
+                None
+            }
+        };
+        assert!(miss.is_none());
     }
 }
