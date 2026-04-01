@@ -27,6 +27,7 @@ use tracing::{debug, info};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
@@ -556,15 +557,28 @@ async fn fetch_from_pypi_remote(
         )
     };
 
+    // Validate resolved URL against SSRF before making the outbound request.
+    // A malicious upstream index could contain hrefs pointing to internal
+    // addresses (169.254.169.254, localhost, Docker service names, etc.).
+    if let Some(ref url) = file_url {
+        if let Err(e) = validate_outbound_url(url, "PyPI upstream file URL") {
+            tracing::warn!(
+                "SSRF check rejected resolved file URL '{}' from upstream index: {}",
+                url,
+                e
+            );
+            // Fall through to the fallback path instead of fetching the
+            // potentially malicious URL.
+            return Err(AppError::Validation(format!(
+                "Upstream index contains a disallowed URL: {}",
+                e
+            ))
+            .into_response());
+        }
+    }
+
     let (fetch_base, fetch_path) = match file_url.as_deref().and_then(split_url_base_and_path) {
-        // Absolute URL from the index (e.g.
-        // https://files.pythonhosted.org/packages/.../file.whl).
-        // Split into scheme+host base and path so proxy_fetch can
-        // cache it under the repo key.
         Some(pair) => pair,
-        // No absolute URL found, or the URL had no path component.
-        // The upstream may be another AK instance that uses relative
-        // paths. Fall back to the simple/{project}/{filename} convention.
         None => fallback(),
     };
 
@@ -1009,10 +1023,15 @@ fn find_upstream_url_for_file(
         }
 
         // Relative or root-relative path: resolve against the index page URL.
+        // Only return HTTP/HTTPS results to prevent javascript:, data:, file://
+        // and other non-HTTP schemes from being promoted to fetch targets.
         if let Some(base) = index_url {
             if let Ok(base_url) = url::Url::parse(base) {
                 if let Ok(resolved) = base_url.join(href) {
-                    return Some(resolved.as_str().to_string());
+                    if resolved.scheme() == "http" || resolved.scheme() == "https" {
+                        return Some(resolved.as_str().to_string());
+                    }
+                    continue;
                 }
             }
         }
@@ -1723,6 +1742,23 @@ mod tests {
         let html = r#"<a href="../../packages/other-1.0.tar.gz#sha256=abc">other-1.0.tar.gz</a>"#;
         let index_url = "https://nexus.example.com/repository/pypi/simple/other/";
         let result = find_upstream_url_for_file(html, "nonexistent-1.0.tar.gz", Some(index_url));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_upstream_url_rejects_javascript_scheme() {
+        let html = r#"<a href="javascript:fetch('http://internal/secret')/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#;
+        let index_url = "https://registry.example.com/simple/pkg/";
+        let result = find_upstream_url_for_file(html, "pkg-1.0.tar.gz", Some(index_url));
+        // javascript: hrefs must not produce a fetchable URL
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_upstream_url_rejects_data_scheme() {
+        let html = r#"<a href="data:application/octet-stream;base64,abc/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#;
+        let index_url = "https://registry.example.com/simple/pkg/";
+        let result = find_upstream_url_for_file(html, "pkg-1.0.tar.gz", Some(index_url));
         assert_eq!(result, None);
     }
 
