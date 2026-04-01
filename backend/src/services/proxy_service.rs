@@ -138,6 +138,8 @@ impl ProxyService {
                     content_type.clone(),
                     etag,
                     cache_ttl,
+                    repo.id,
+                    cache_path,
                 )
                 .await?;
 
@@ -417,7 +419,9 @@ impl ProxyService {
         Ok((content, content_type, etag, effective_url))
     }
 
-    /// Cache artifact content and metadata
+    /// Cache artifact content and metadata, and record the artifact in the
+    /// database so that it appears in repository listings and storage usage.
+    #[allow(clippy::too_many_arguments)]
     async fn cache_artifact(
         &self,
         cache_key: &str,
@@ -426,6 +430,8 @@ impl ProxyService {
         content_type: Option<String>,
         etag: Option<String>,
         ttl_secs: i64,
+        repository_id: Uuid,
+        artifact_path: &str,
     ) -> Result<()> {
         // Calculate checksum
         let checksum = StorageService::calculate_hash(content);
@@ -438,7 +444,7 @@ impl ProxyService {
             expires_at: now + chrono::Duration::seconds(ttl_secs),
             content_type,
             size_bytes: content.len() as i64,
-            checksum_sha256: checksum,
+            checksum_sha256: checksum.clone(),
         };
 
         // Store content
@@ -449,6 +455,55 @@ impl ProxyService {
         self.storage
             .put(metadata_key, Bytes::from(metadata_json))
             .await?;
+
+        // Record the cached artifact in the database so it shows up in
+        // repository listings and storage size calculations.
+        let normalized_path = artifact_path.trim_start_matches('/');
+        let artifact_name = normalized_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(normalized_path);
+        let ct = metadata
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let size = content.len() as i64;
+
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, version, size_bytes,
+                checksum_sha256, content_type, storage_key
+            )
+            VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)
+            ON CONFLICT (repository_id, path) DO UPDATE SET
+                size_bytes = EXCLUDED.size_bytes,
+                checksum_sha256 = EXCLUDED.checksum_sha256,
+                content_type = EXCLUDED.content_type,
+                storage_key = EXCLUDED.storage_key,
+                is_deleted = false,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(repository_id)
+        .bind(normalized_path)
+        .bind(artifact_name)
+        .bind(size)
+        .bind(&checksum)
+        .bind(&ct)
+        .bind(cache_key)
+        .execute(&self.db)
+        .await
+        {
+            // Log the error but don't fail the cache operation. The content is
+            // already stored and usable; the DB record is a best-effort addition
+            // for listing/size purposes.
+            tracing::warn!(
+                "Failed to record cached artifact in database for {}: {}",
+                cache_key,
+                e
+            );
+        }
 
         tracing::debug!(
             "Cached artifact {} ({} bytes, expires at {})",
