@@ -56,6 +56,39 @@ pub fn router() -> Router<SharedState> {
 use crate::api::middleware::auth::require_auth_with_bearer_fallback;
 
 // ---------------------------------------------------------------------------
+// Package name normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize an npm package name by URL-decoding any percent-encoded characters.
+///
+/// npm and yarn clients often encode scoped package names in URLs, turning
+/// `@openai/codex` into `@openai%2fcodex` or `%40openai%2fcodex`. Axum's
+/// `Path` extractor usually decodes these, but we apply an explicit decode as
+/// a safety net so the name always reaches the database and upstream proxy in
+/// its canonical form (e.g. `@openai/codex`).
+fn normalize_package_name(raw: &str) -> String {
+    urlencoding::decode(raw)
+        .map(|cow| cow.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// Encode a package name for use in upstream registry URLs.
+///
+/// Scoped packages like `@openai/codex` must be sent to upstream registries
+/// with the scope separator encoded: `@openai%2fcodex`. The public npm
+/// registry accepts both forms, but private registries (Nexus, Verdaccio,
+/// GitHub Packages) often require the encoded form. Unscoped packages are
+/// returned unchanged.
+fn encode_package_name_for_upstream(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('@') {
+        if let Some((scope, pkg)) = rest.split_once('/') {
+            return format!("@{}%2f{}", scope, pkg);
+        }
+    }
+    name.to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
 
@@ -73,6 +106,7 @@ async fn get_metadata(
     Path((repo_key, package)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
     get_package_metadata(&state, &repo_key, &package, &headers).await
 }
 
@@ -81,6 +115,8 @@ async fn get_scoped_metadata(
     Path((repo_key, scope, package)): Path<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     get_package_metadata(&state, &repo_key, &full_name, &headers).await
 }
@@ -129,12 +165,13 @@ async fn get_package_metadata(
         if repo.repo_type == RepositoryType::Remote {
             if let Some(ref upstream_url) = repo.upstream_url {
                 if let Some(ref proxy) = state.proxy_service {
+                    let encoded_name = encode_package_name_for_upstream(package_name);
                     let (content, content_type) = proxy_helpers::proxy_fetch(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
-                        package_name,
+                        &encoded_name,
                     )
                     .await?;
 
@@ -165,11 +202,12 @@ async fn get_package_metadata(
         if repo.repo_type == RepositoryType::Virtual {
             let base_url = base_url.clone();
             let repo_key = repo_key.to_string();
+            let encoded_name = encode_package_name_for_upstream(package_name);
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
                 state.proxy_service.as_deref(),
                 repo.id,
-                package_name,
+                &encoded_name,
                 |content, _member_key| {
                     let base_url = base_url.clone();
                     let repo_key = repo_key.clone();
@@ -286,6 +324,7 @@ async fn download_tarball(
     State(state): State<SharedState>,
     Path((repo_key, package, filename)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
     serve_tarball(&state, &repo_key, &package, &filename).await
 }
 
@@ -293,6 +332,8 @@ async fn download_scoped_tarball(
     State(state): State<SharedState>,
     Path((repo_key, scope, package, filename)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     serve_tarball(&state, &repo_key, &full_name, &filename).await
 }
@@ -330,8 +371,9 @@ async fn serve_tarball(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    // Upstream path: {package_name}/-/{filename}
-                    let upstream_path = format!("{}/-/{}", package_name, filename);
+                    // Upstream path: {encoded_name}/-/{filename}
+                    let encoded_name = encode_package_name_for_upstream(package_name);
+                    let upstream_path = format!("{}/-/{}", encoded_name, filename);
                     let (content, _content_type) = proxy_helpers::proxy_fetch(
                         proxy,
                         repo.id,
@@ -357,7 +399,8 @@ async fn serve_tarball(
             if repo.repo_type == RepositoryType::Virtual {
                 let db = state.db.clone();
                 let fname = filename.to_string();
-                let upstream_path = format!("{}/-/{}", package_name, filename);
+                let encoded_name = encode_package_name_for_upstream(package_name);
+                let upstream_path = format!("{}/-/{}", encoded_name, filename);
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
                     state.proxy_service.as_deref(),
@@ -435,6 +478,7 @@ async fn publish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
     publish_package(&state, auth, &repo_key, &package, &headers, body).await
 }
 
@@ -1703,5 +1747,73 @@ mod tests {
         let version_names: Vec<&str> = parsed.versions.iter().map(|v| v.version.as_str()).collect();
         assert!(version_names.contains(&"1.0.0"));
         assert!(version_names.contains(&"2.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_package_name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_decodes_scoped_package() {
+        assert_eq!(normalize_package_name("%40openai%2fcodex"), "@openai/codex");
+    }
+
+    #[test]
+    fn test_normalize_decodes_slash_only() {
+        assert_eq!(normalize_package_name("@openai%2fcodex"), "@openai/codex");
+    }
+
+    #[test]
+    fn test_normalize_unscoped_unchanged() {
+        assert_eq!(normalize_package_name("express"), "express");
+    }
+
+    #[test]
+    fn test_normalize_already_decoded() {
+        assert_eq!(normalize_package_name("@openai/codex"), "@openai/codex");
+    }
+
+    // -----------------------------------------------------------------------
+    // encode_package_name_for_upstream
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_upstream_scoped_package() {
+        assert_eq!(
+            encode_package_name_for_upstream("@openai/codex"),
+            "@openai%2fcodex"
+        );
+    }
+
+    #[test]
+    fn test_encode_upstream_unscoped_unchanged() {
+        assert_eq!(encode_package_name_for_upstream("express"), "express");
+    }
+
+    #[test]
+    fn test_encode_upstream_at_without_slash() {
+        // Edge case: starts with @ but has no slash (not a valid scope, but handle gracefully)
+        assert_eq!(
+            encode_package_name_for_upstream("@noscopepkg"),
+            "@noscopepkg"
+        );
+    }
+
+    #[test]
+    fn test_encode_upstream_deeply_scoped() {
+        // Only the first slash should be encoded
+        assert_eq!(
+            encode_package_name_for_upstream("@scope/sub/pkg"),
+            "@scope%2fsub/pkg"
+        );
+    }
+
+    #[test]
+    fn test_normalize_then_encode_roundtrip() {
+        let from_client = "@openai%2fcodex";
+        let normalized = normalize_package_name(from_client);
+        assert_eq!(normalized, "@openai/codex");
+        let for_upstream = encode_package_name_for_upstream(&normalized);
+        assert_eq!(for_upstream, "@openai%2fcodex");
     }
 }
