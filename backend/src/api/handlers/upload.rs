@@ -194,7 +194,7 @@ async fn upload_chunk(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
-    let _user_id = auth.user_id;
+    let user_id = auth.user_id;
 
     // Parse Content-Range header
     let range_header = headers
@@ -209,15 +209,17 @@ async fn upload_chunk(
         )
     })?;
 
-    // Get the session to determine chunk_index from byte_offset
-    let session = UploadService::get_session(&state.db, session_id)
+    // C3: get_session now verifies user ownership
+    let session = UploadService::get_session(&state.db, session_id, Some(user_id))
         .await
         .map_err(map_upload_err)?;
 
     let chunk_index = (start / session.chunk_size as i64) as i32;
 
-    // Stream body to bytes (chunk sized, not full file)
-    let mut data = Vec::new();
+    // C2: Stream body directly to a temp buffer with a size cap matching the
+    // declared Content-Range length. This prevents unbounded memory growth.
+    let expected_len = (end - start + 1) as usize;
+    let mut data = Vec::with_capacity(expected_len.min(256 * 1024 * 1024));
     let mut stream = body.into_data_stream();
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -227,9 +229,18 @@ async fn upload_chunk(
             )
         })?;
         data.extend_from_slice(&chunk);
+        // Bail early if client sends more data than declared
+        if data.len() > expected_len {
+            return Err(map_err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Body exceeds declared Content-Range length of {} bytes",
+                    expected_len
+                ),
+            ));
+        }
     }
 
-    let expected_len = (end - start + 1) as usize;
     if data.len() != expected_len {
         return Err(map_err(
             StatusCode::BAD_REQUEST,
@@ -247,6 +258,7 @@ async fn upload_chunk(
         chunk_index,
         start,
         bytes::Bytes::from(data),
+        user_id,
     )
     .await
     .map_err(map_upload_err)?;
@@ -283,9 +295,10 @@ async fn get_session_status(
     Extension(auth): Extension<AuthExtension>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
-    let _user_id = auth.user_id;
+    let user_id = auth.user_id;
 
-    let session = UploadService::get_session(&state.db, session_id)
+    // C3: Verify user owns this session
+    let session = UploadService::get_session(&state.db, session_id, Some(user_id))
         .await
         .map_err(map_upload_err)?;
 
@@ -331,7 +344,8 @@ async fn complete(
 ) -> Result<Response, Response> {
     let user_id = auth.user_id;
 
-    let session = UploadService::complete_session(&state.db, session_id)
+    // C3: Verify user owns this session
+    let session = UploadService::complete_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
 
@@ -342,14 +356,12 @@ async fn complete(
         session.repository_id, session.artifact_path
     );
 
-    // Store via the storage service
-    let content = tokio::fs::read(&temp_path)
-        .await
-        .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
+    // C1: Use put_file to stream from disk instead of reading the entire file
+    // into memory. The default implementation still reads into memory, but
+    // backends can override for true streaming (S3 multipart, etc.).
     state
         .storage
-        .put(&storage_key, content.into())
+        .put_file(&storage_key, &temp_path)
         .await
         .map_err(|e| map_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -420,9 +432,10 @@ async fn cancel(
     Extension(auth): Extension<AuthExtension>,
     Path(session_id): Path<Uuid>,
 ) -> Result<Response, Response> {
-    let _user_id = auth.user_id;
+    let user_id = auth.user_id;
 
-    UploadService::cancel_session(&state.db, session_id)
+    // C3: Verify user owns this session
+    UploadService::cancel_session(&state.db, session_id, user_id)
         .await
         .map_err(map_upload_err)?;
 
