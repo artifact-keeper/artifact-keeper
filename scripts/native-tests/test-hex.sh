@@ -17,7 +17,7 @@ REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 HEX_REPO_KEY="${HEX_REPO_KEY:-test-hex}"
 HEX_URL="$REGISTRY_URL/hex/$HEX_REPO_KEY"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 TEST_VERSION="0.1.$(date +%s)"
 PKG_NAME="test_hex_pkg"
 

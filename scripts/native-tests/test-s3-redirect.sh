@@ -16,7 +16,7 @@
 #   S3_BUCKET       - S3 bucket name (required, or will create temporary one)
 #   S3_REGION       - AWS region (default: us-east-1)
 #   ADMIN_USER      - Admin username (default: admin)
-#   ADMIN_PASS      - Admin password (default: admin123)
+#   ADMIN_PASS      - Admin password (default: TestRunner!2026secure)
 #   CLOUDFRONT_URL  - CloudFront distribution URL (optional)
 #   SKIP_CLEANUP    - Set to "true" to skip cleanup (for debugging)
 #
@@ -35,7 +35,7 @@ API_URL="${API_URL:-http://localhost:8080}"
 S3_BUCKET="${S3_BUCKET:-}"
 S3_REGION="${S3_REGION:-us-east-1}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 CLOUDFRONT_URL="${CLOUDFRONT_URL:-}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
 

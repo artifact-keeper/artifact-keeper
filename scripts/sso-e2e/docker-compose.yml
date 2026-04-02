@@ -77,7 +77,7 @@ services:
     environment:
       DATABASE_URL: postgres://registry:registry@postgres:5432/artifact_registry
       JWT_SECRET: test-jwt-secret-for-sso-e2e-testing-only
-      ADMIN_PASSWORD: admin123
+      ADMIN_PASSWORD: TestRunner!2026secure
       STORAGE_PATH: /data/storage
       PLUGINS_ENABLED: "false"
       RUST_LOG: info,artifact_keeper=debug

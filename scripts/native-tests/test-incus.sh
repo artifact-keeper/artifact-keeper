@@ -14,7 +14,7 @@ set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 REPO_KEY="test-incus-$(date +%s)"
 
 echo "==> Incus/LXC E2E Test"

@@ -7,7 +7,7 @@ REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 PYPI_REPO_KEY="${PYPI_REPO_KEY:-test-pypi}"
 PYPI_URL="$REGISTRY_URL/pypi/$PYPI_REPO_KEY"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 TEST_VERSION="1.0.$(date +%s)"
 
 echo "==> PyPI Native Client Test (PEP 503)"

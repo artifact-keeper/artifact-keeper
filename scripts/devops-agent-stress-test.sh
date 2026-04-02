@@ -18,7 +18,7 @@ rate_wait() { sleep "$RATE_DELAY"; }
 
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/devops-stress-results}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 

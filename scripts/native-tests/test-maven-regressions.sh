@@ -4,7 +4,7 @@ set -euo pipefail
 BACKEND="${BACKEND_URL:-http://localhost:8080}"
 REPO="maven-regression-$$"
 USER="${ADMIN_USER:-admin}"
-PASS="${ADMIN_PASS:-password}"
+PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 
 echo "=== Maven Regression Tests ==="
 

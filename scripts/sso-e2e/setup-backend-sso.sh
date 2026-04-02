@@ -9,7 +9,7 @@ cd "$SCRIPT_DIR"
 
 BACKEND_URL="http://localhost:8080"
 ADMIN_USER="admin"
-ADMIN_PASSWORD="admin123"
+ADMIN_PASSWORD="TestRunner!2026secure"
 
 echo "Configuring SSO providers in Artifact Keeper backend..."
 

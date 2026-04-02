@@ -61,7 +61,7 @@ services:
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: e2e-test-secret-key-32-bytes-long
-      ADMIN_PASSWORD: E2eTest!Secure#2026
+      ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info
       TRIVY_URL: http://trivy:8090
       HOST: 0.0.0.0
@@ -97,7 +97,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/.setup-done"]
       interval: 2s
@@ -156,7 +156,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -178,7 +178,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -200,7 +200,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
@@ -409,7 +409,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["bash", "-c", "apt-get update -qq && apt-get install -y -qq curl jq python3 python3-pip >/dev/null 2>&1 && bash /scripts/test-proxy-virtual.sh"]
@@ -426,7 +426,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["sh", "-c", "apk add --no-cache curl jq bash >/dev/null 2>&1 && bash /scripts/test-docker-proxy.sh"]
@@ -447,7 +447,7 @@ services:
     environment:
       API_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["bash", "/scripts/test-tag-replication.sh"]
@@ -468,7 +468,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
     volumes:
       - ./scripts/native-tests:/scripts:ro
     command: ["sh", "-c", "apk add --no-cache bash curl jq >/dev/null 2>&1 && bash /scripts/test-storage-gc.sh"]
@@ -492,7 +492,7 @@ services:
       REGISTRY_URL: http://backend:8080
       GRPC_URL: backend:9090
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: registry
@@ -541,7 +541,7 @@ services:
     environment:
       REGISTRY_URL: http://backend:8080
       ADMIN_USER: admin
-      ADMIN_PASS: E2eTest!Secure#2026
+      ADMIN_PASS: TestRunner!2026secure
       MOCK_UPSTREAM_URL: http://mock-upstream
       PGHOST: postgres
       PGPORT: "5432"

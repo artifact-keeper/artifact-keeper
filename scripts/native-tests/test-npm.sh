@@ -44,7 +44,7 @@ EOF
 # Configure npm registry
 echo "==> Configuring npm registry..."
 npm config set registry "$NPM_REGISTRY"
-npm config set //${NPM_REGISTRY#http*://}:_auth "$(echo -n "${ADMIN_USER:-admin}:${ADMIN_PASS:-admin123}" | base64)"
+npm config set //${NPM_REGISTRY#http*://}:_auth "$(echo -n "${ADMIN_USER:-admin}:${ADMIN_PASS:-TestRunner!2026secure}" | base64)"
 
 if [ -n "$CA_CERT" ] && [ -f "$CA_CERT" ]; then
     npm config set cafile "$CA_CERT"

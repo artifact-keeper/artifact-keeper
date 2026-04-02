@@ -26,7 +26,7 @@
 #   S3_REGION        - AWS region (default: us-east-1)
 #   API_URL          - Backend URL (default: http://localhost:8080)
 #   ADMIN_USER       - Admin username (default: admin)
-#   ADMIN_PASS       - Admin password (default: admin123)
+#   ADMIN_PASS       - Admin password (default: TestRunner!2026secure)
 #   DATABASE_URL     - PostgreSQL URL
 #   DB_CONTAINER     - Docker container for psql fallback (default: artifact-keeper-dev-db)
 #   BACKEND_BIN      - Path to backend binary (default: auto-detect from cargo)
@@ -64,7 +64,7 @@ STS_ROLE_ARN="${STS_ROLE_ARN:-}"
 S3_REGION="${S3_REGION:-us-east-1}"
 API_URL="${API_URL:-http://localhost:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 DATABASE_URL="${DATABASE_URL:-postgresql://registry:registry@localhost:30432/artifact_registry}"
 BACKEND_BIN="${BACKEND_BIN:-}"
 STS_DURATION="${STS_DURATION:-900}"

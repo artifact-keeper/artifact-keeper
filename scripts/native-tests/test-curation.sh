@@ -16,7 +16,7 @@ set -uo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 MOCK_UPSTREAM_URL="${MOCK_UPSTREAM_URL:-http://localhost:9999}"
 API_URL="$REGISTRY_URL/api/v1"
 CURATION_URL="$API_URL/curation"
