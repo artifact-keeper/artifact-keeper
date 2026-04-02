@@ -112,7 +112,7 @@ toml = "0.8"
 serde_yaml = "0.9"
 regex = "1.11"
 once_cell = "1"
-bzip2 = "0.5"
+bzip2 = "0.6"
 zstd = "0.13"
 rmp-serde = "1.3"
 
