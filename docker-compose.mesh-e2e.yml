@@ -69,7 +69,7 @@ services:
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: mesh-e2e-secret-key-32-bytes-long
-      ADMIN_PASSWORD: admin123
+      ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info,artifact_keeper=debug
       HOST: 0.0.0.0
       PORT: 8080
@@ -106,7 +106,7 @@ services:
       BACKUP_PATH: /data/backups
       PLUGINS_DIR: /data/plugins
       JWT_SECRET: mesh-e2e-secret-key-32-bytes-long
-      ADMIN_PASSWORD: admin123
+      ADMIN_PASSWORD: TestRunner!2026secure
       RUST_LOG: info,artifact_keeper=debug
       HOST: 0.0.0.0
       PORT: 8080

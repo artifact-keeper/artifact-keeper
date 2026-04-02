@@ -13,7 +13,7 @@ NC='\033[0m'
 REGISTRY_URL="${REGISTRY_URL:-http://backend:8080}"
 GRPC_URL="${GRPC_URL:-backend:9090}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 RESULTS_DIR="${RESULTS_DIR:-/results}"
 REPORT_FILE="${RESULTS_DIR}/redteam-report.json"
 

@@ -8,12 +8,12 @@
 # Environment:
 #   REGISTRY_URL  - Backend URL (default: http://localhost:30080)
 #   ADMIN_USER    - Admin username (default: admin)
-#   ADMIN_PASS    - Admin password (default: admin123)
+#   ADMIN_PASS    - Admin password (default: TestRunner!2026secure)
 set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:30080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 
 echo "==> Storage GC E2E Tests"
 echo "Registry: $REGISTRY_URL"

@@ -4,12 +4,12 @@
 # Verifies that after an artifact is soft-deleted, re-uploading the same
 # path succeeds instead of hitting UNIQUE(repository_id, path) constraint.
 #
-# Prerequisites: backend running at localhost:8080 with admin/admin credentials
+# Prerequisites: backend running at localhost:8080 with admin credentials
 set -euo pipefail
 
 BACKEND_URL="${BACKEND_URL:-http://localhost:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 
 PASS_COUNT=0
 FAIL_COUNT=0

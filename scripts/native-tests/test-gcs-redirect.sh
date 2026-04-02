@@ -20,7 +20,7 @@
 #   GCS_SERVICE_ACCOUNT_EMAIL     - Service account email (required)
 #   GCS_PRIVATE_KEY_PATH          - Path to private key PEM file (required)
 #   ADMIN_USER                    - Admin username (default: admin)
-#   ADMIN_PASS                    - Admin password (default: admin123)
+#   ADMIN_PASS                    - Admin password (default: TestRunner!2026secure)
 #   SKIP_CLEANUP                  - Set to "true" to skip cleanup
 #
 # Usage:
@@ -40,7 +40,7 @@ GCS_PROJECT_ID="${GCS_PROJECT_ID:-}"
 GCS_SERVICE_ACCOUNT_EMAIL="${GCS_SERVICE_ACCOUNT_EMAIL:-}"
 GCS_PRIVATE_KEY_PATH="${GCS_PRIVATE_KEY_PATH:-}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
 
 TEST_REPO="gcs-redirect-test-$$"

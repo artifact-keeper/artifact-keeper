@@ -7,12 +7,12 @@
 # Environment:
 #   REGISTRY_URL  - Backend URL (default: http://backend:8080)
 #   ADMIN_USER    - Admin username (default: admin)
-#   ADMIN_PASS    - Admin password (default: admin123)
+#   ADMIN_PASS    - Admin password (default: TestRunner!2026secure)
 set -e
 
 REGISTRY_URL="${REGISTRY_URL:-http://backend:8080}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 
 # Install deps only if missing (Alpine in Docker vs Ubuntu on ARC runners)
 if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then

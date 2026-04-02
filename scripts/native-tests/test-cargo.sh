@@ -62,7 +62,7 @@ default = "test-registry"
 EOF
 
 # Set token (Basic auth encoded as expected by the backend)
-export CARGO_REGISTRIES_TEST_REGISTRY_TOKEN="Basic $(echo -n "${ADMIN_USER:-admin}:${ADMIN_PASS:-admin123}" | base64)"
+export CARGO_REGISTRIES_TEST_REGISTRY_TOKEN="Basic $(echo -n "${ADMIN_USER:-admin}:${ADMIN_PASS:-TestRunner!2026secure}" | base64)"
 
 # Package the crate
 echo "==> Packaging crate..."

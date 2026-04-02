@@ -18,7 +18,7 @@
 #   AZURE_STORAGE_CONTAINER    - Container name (required)
 #   AZURE_STORAGE_ACCESS_KEY   - Account access key (required)
 #   ADMIN_USER                 - Admin username (default: admin)
-#   ADMIN_PASS                 - Admin password (default: admin123)
+#   ADMIN_PASS                 - Admin password (default: TestRunner!2026secure)
 #   SKIP_CLEANUP               - Set to "true" to skip cleanup
 #
 # Usage:
@@ -36,7 +36,7 @@ AZURE_STORAGE_ACCOUNT="${AZURE_STORAGE_ACCOUNT:-}"
 AZURE_STORAGE_CONTAINER="${AZURE_STORAGE_CONTAINER:-}"
 AZURE_STORAGE_ACCESS_KEY="${AZURE_STORAGE_ACCESS_KEY:-}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 SKIP_CLEANUP="${SKIP_CLEANUP:-false}"
 
 TEST_REPO="azure-redirect-test-$$"

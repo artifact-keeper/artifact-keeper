@@ -7,7 +7,7 @@ set -euo pipefail
 REGISTRY_URL="${REGISTRY_URL:-http://localhost:8080}"
 REPO_KEY="${REPO_KEY:-test-protobuf}"
 ADMIN_USER="${ADMIN_USER:-admin}"
-ADMIN_PASS="${ADMIN_PASS:-admin123}"
+ADMIN_PASS="${ADMIN_PASS:-TestRunner!2026secure}"
 
 echo "==> Protobuf / BSR Native Client Test"
 echo "Registry: $REGISTRY_URL"
