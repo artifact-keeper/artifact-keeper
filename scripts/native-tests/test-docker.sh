@@ -5,10 +5,13 @@ set -euo pipefail
 
 REGISTRY_URL="${REGISTRY_URL:-localhost:30080}"
 REGISTRY_USER="${REGISTRY_USER:-admin}"
-REGISTRY_PASS="${REGISTRY_PASS:-admin123}"
+REGISTRY_PASS="${REGISTRY_PASS:-TestRunner!2026secure}"
 REPO_KEY="${REPO_KEY:-test-docker}"
 TEST_VERSION="1.0.$(date +%s)"
 FAILURES=0
+REGISTRY_SCHEME="${REGISTRY_SCHEME:-http}"
+REGISTRY_BASE_URL="${REGISTRY_SCHEME}://$REGISTRY_URL"
+HTTP_CODE_FORMAT="%{http_code}"
 
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; FAILURES=$((FAILURES + 1)); }
@@ -22,7 +25,7 @@ echo ""
 # 1. Test V2 version check (unauthenticated should return 401)
 # --------------------------------------------------------------------------
 echo "--- Test: V2 version check (unauthenticated) ---"
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$REGISTRY_URL/v2/")
+HTTP_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" "$REGISTRY_BASE_URL/v2/")
 if [ "$HTTP_CODE" = "401" ]; then
     pass "GET /v2/ returns 401 without auth"
 else
@@ -30,7 +33,7 @@ else
 fi
 
 # Check WWW-Authenticate header
-WWW_AUTH=$(curl -s -D - -o /dev/null "http://$REGISTRY_URL/v2/" | grep -i "www-authenticate" || true)
+WWW_AUTH=$(curl -s -D - -o /dev/null "$REGISTRY_BASE_URL/v2/" | grep -i "www-authenticate" || true)
 if echo "$WWW_AUTH" | grep -q "Bearer"; then
     pass "WWW-Authenticate header contains Bearer challenge"
 else
@@ -42,7 +45,7 @@ fi
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Test: Token endpoint ---"
-TOKEN_RESP=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "http://$REGISTRY_URL/v2/token")
+TOKEN_RESP=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "$REGISTRY_BASE_URL/v2/token")
 TOKEN=$(echo "$TOKEN_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))' 2>/dev/null || echo "")
 if [ -n "$TOKEN" ] && [ "$TOKEN" != "None" ]; then
     pass "Token endpoint returns JWT"
@@ -51,7 +54,7 @@ else
 fi
 
 # Test invalid credentials
-BAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "baduser:badpass" "http://$REGISTRY_URL/v2/token")
+BAD_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -u "baduser:badpass" "$REGISTRY_BASE_URL/v2/token")
 if [ "$BAD_CODE" = "401" ]; then
     pass "Token endpoint rejects invalid credentials"
 else
@@ -63,7 +66,7 @@ fi
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Test: V2 version check (authenticated) ---"
-AUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "http://$REGISTRY_URL/v2/")
+AUTH_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -H "Authorization: Bearer $TOKEN" "$REGISTRY_BASE_URL/v2/")
 if [ "$AUTH_CODE" = "200" ]; then
     pass "GET /v2/ returns 200 with valid token"
 else
@@ -114,11 +117,11 @@ fi
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Test: Verify manifest via API ---"
-TOKEN=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "http://$REGISTRY_URL/v2/token" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
-MANIFEST_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+TOKEN=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "$REGISTRY_BASE_URL/v2/token" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+MANIFEST_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" \
     -H "Authorization: Bearer $TOKEN" \
     -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-    "http://$REGISTRY_URL/v2/$REPO_KEY/e2e-test/manifests/$TEST_VERSION")
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/manifests/$TEST_VERSION")
 if [ "$MANIFEST_CODE" = "200" ]; then
     pass "Manifest GET returns 200"
 else
@@ -126,10 +129,10 @@ else
 fi
 
 # HEAD request
-MANIFEST_HEAD=$(curl -s -o /dev/null -w "%{http_code}" -X HEAD \
+MANIFEST_HEAD=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" --head \
     -H "Authorization: Bearer $TOKEN" \
     -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
-    "http://$REGISTRY_URL/v2/$REPO_KEY/e2e-test/manifests/$TEST_VERSION")
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/manifests/$TEST_VERSION")
 if [ "$MANIFEST_HEAD" = "200" ]; then
     pass "Manifest HEAD returns 200"
 else
@@ -180,13 +183,129 @@ docker rmi "$ALPINE_IMAGE" 2>/dev/null || true
 # --------------------------------------------------------------------------
 echo ""
 echo "--- Test: Non-existent manifest returns 404 ---"
-NOT_FOUND=$(curl -s -o /dev/null -w "%{http_code}" \
+NOT_FOUND=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" \
     -H "Authorization: Bearer $TOKEN" \
-    "http://$REGISTRY_URL/v2/$REPO_KEY/nonexistent/manifests/notreal")
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/nonexistent/manifests/notreal")
 if [ "$NOT_FOUND" = "404" ]; then
     pass "Non-existent manifest returns 404"
 else
     fail "Non-existent manifest returned $NOT_FOUND, expected 404"
+fi
+
+# --------------------------------------------------------------------------
+# 11. Test tags/list endpoint
+# --------------------------------------------------------------------------
+echo ""
+echo "--- Test: Tags list ---"
+# Refresh token
+TOKEN=$(curl -s -u "$REGISTRY_USER:$REGISTRY_PASS" "$REGISTRY_BASE_URL/v2/token" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])' 2>/dev/null)
+
+TAGS_FULL=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/tags/list")
+TAGS_CODE=$(echo "$TAGS_FULL" | tail -1)
+TAGS_RESP=$(echo "$TAGS_FULL" | sed '$d')
+if [[ "$TAGS_CODE" = "200" ]]; then
+    pass "Tags list returns 200"
+else
+    fail "Tags list returned $TAGS_CODE, expected 200"
+fi
+
+# Verify response contains the pushed tag
+if echo "$TAGS_RESP" | python3 -c "import sys,json; tags=json.load(sys.stdin)['tags']; assert '$TEST_VERSION' in tags" 2>/dev/null; then
+    pass "Tags list contains pushed tag $TEST_VERSION"
+else
+    fail "Tags list does not contain expected tag: $TAGS_RESP"
+fi
+
+# Verify response has correct name field
+if echo "$TAGS_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['name']=='e2e-test'" 2>/dev/null; then
+    pass "Tags list has correct name field"
+else
+    fail "Tags list name field incorrect: $TAGS_RESP"
+fi
+
+# Test pagination with n=1
+TAGS_PAGE=$(curl -s -D /tmp/tags_headers -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/tags/list?n=1")
+if ! PAGE_TAGS=$(echo "$TAGS_PAGE" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['tags']))" 2>/dev/null); then
+    echo "error" >&2
+    PAGE_TAGS="error"
+fi
+if [[ "$PAGE_TAGS" = "1" ]]; then
+    pass "Tags list pagination returns exactly 1 tag with n=1"
+else
+    fail "Tags list pagination returned $PAGE_TAGS tags, expected 1"
+fi
+
+# Test n=0 returns empty
+TAGS_ZERO=$(curl -s -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/tags/list?n=0")
+if ! ZERO_COUNT=$(echo "$TAGS_ZERO" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['tags']))" 2>/dev/null); then
+    echo "error" >&2
+    ZERO_COUNT="error"
+fi
+if [[ "$ZERO_COUNT" = "0" ]]; then
+    pass "Tags list with n=0 returns empty list"
+else
+    fail "Tags list with n=0 returned $ZERO_COUNT tags, expected 0"
+fi
+
+# Test non-existent image returns 404
+TAGS_404=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/nonexistent/tags/list")
+if [[ "$TAGS_404" = "404" ]]; then
+    pass "Tags list for non-existent image returns 404"
+else
+    fail "Tags list for non-existent image returned $TAGS_404, expected 404"
+fi
+
+# Test unauthenticated access returns 401
+TAGS_NOAUTH=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" \
+    "$REGISTRY_BASE_URL/v2/$REPO_KEY/e2e-test/tags/list")
+if [[ "$TAGS_NOAUTH" = "401" ]]; then
+    pass "Tags list without auth returns 401"
+else
+    fail "Tags list without auth returned $TAGS_NOAUTH, expected 401"
+fi
+
+# --------------------------------------------------------------------------
+# 12. Test catalog endpoint
+# --------------------------------------------------------------------------
+echo ""
+echo "--- Test: Catalog ---"
+CATALOG_FULL=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/_catalog")
+CATALOG_CODE=$(echo "$CATALOG_FULL" | tail -1)
+CATALOG_RESP=$(echo "$CATALOG_FULL" | sed '$d')
+if [[ "$CATALOG_CODE" = "200" ]]; then
+    pass "Catalog returns 200"
+else
+    fail "Catalog returned $CATALOG_CODE, expected 200"
+fi
+
+# Verify response contains the pushed image
+if echo "$CATALOG_RESP" | python3 -c "import sys,json; repos=json.load(sys.stdin)['repositories']; assert any('e2e-test' in r for r in repos)" 2>/dev/null; then
+    pass "Catalog contains e2e-test image"
+else
+    fail "Catalog does not contain e2e-test: $CATALOG_RESP"
+fi
+
+# Test catalog pagination with n=1
+CATALOG_PAGE_CODE=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" -H "Authorization: Bearer $TOKEN" \
+    "$REGISTRY_BASE_URL/v2/_catalog?n=1")
+if [[ "$CATALOG_PAGE_CODE" = "200" ]]; then
+    pass "Catalog pagination returns 200"
+else
+    fail "Catalog pagination returned $CATALOG_PAGE_CODE, expected 200"
+fi
+
+# Test catalog unauthenticated returns 401
+CATALOG_NOAUTH=$(curl -s -o /dev/null -w "$HTTP_CODE_FORMAT" \
+    "$REGISTRY_BASE_URL/v2/_catalog")
+if [[ "$CATALOG_NOAUTH" = "401" ]]; then
+    pass "Catalog without auth returns 401"
+else
+    fail "Catalog without auth returned $CATALOG_NOAUTH, expected 401"
 fi
 
 # --------------------------------------------------------------------------
