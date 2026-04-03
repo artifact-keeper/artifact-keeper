@@ -155,7 +155,7 @@ async fn simple_project(
         }
     } else if repo.repo_type == RepositoryType::Remote {
         return proxy_simple_project_response(
-            state.proxy_service.as_ref().map(|proxy| &**proxy),
+            state.proxy_service.as_deref(),
             repo.id,
             &repo_key,
             repo.upstream_url.as_deref(),
@@ -192,7 +192,7 @@ async fn simple_project(
             }
 
             match proxy_simple_project_response(
-                state.proxy_service.as_ref().map(|proxy| &**proxy),
+                state.proxy_service.as_deref(),
                 member.id,
                 &repo_key,
                 member.upstream_url.as_deref(),
