@@ -405,21 +405,33 @@ async fn apk_index(
             )
             .await;
 
-            if let Ok((content, content_type)) = result {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/gzip".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+            match result {
+                Ok((content, content_type)) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            CONTENT_TYPE,
+                            content_type.unwrap_or_else(|| "application/gzip".to_string()),
+                        )
+                        .header(CONTENT_LENGTH, content.len().to_string())
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+                Err(_e) => {
+                    tracing::debug!(
+                        member_key = %member.key,
+                        "APKINDEX proxy fetch failed for virtual member, trying next"
+                    );
+                    continue;
+                }
             }
         }
     }
 
     // Hosted repos (and virtual fallback): generate APKINDEX from local artifacts.
+    // TODO: For virtual repos this fallback queries `repo.id` (the virtual repo itself),
+    // which won't find artifacts stored under hosted members. A follow-up should aggregate
+    // artifacts from all hosted members of the virtual repo.
     let artifacts = list_alpine_artifacts(&state.db, repo.id, &branch, &repository, &arch).await?;
 
     let apkindex_text = generate_apkindex_text(&artifacts, &arch);
