@@ -354,6 +354,84 @@ async fn apk_index(
     Path((repo_key, branch, repository, arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
+
+    // For remote repos, proxy the APKINDEX.tar.gz from upstream as-is so that
+    // the upstream cryptographic signatures are preserved. Generating a local
+    // index would break apk's signature verification.
+    if repo.repo_type == RepositoryType::Remote {
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let upstream_path = build_apk_index_upstream_path(&branch, &repository, &arch);
+            let (content, content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path)
+                    .await?;
+
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/gzip".to_string()),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .body(Body::from(content))
+                .unwrap());
+        }
+    }
+
+    // For virtual repos, try each remote member in priority order so that
+    // upstream-signed indexes are returned when available.
+    if repo.repo_type == RepositoryType::Virtual {
+        let upstream_path = build_apk_index_upstream_path(&branch, &repository, &arch);
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+        for member in &members {
+            if member.repo_type != RepositoryType::Remote {
+                continue;
+            }
+            let Some(ref upstream_url) = member.upstream_url else {
+                continue;
+            };
+            let Some(ref proxy) = state.proxy_service else {
+                continue;
+            };
+
+            let result = proxy_helpers::proxy_fetch(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                &upstream_path,
+            )
+            .await;
+
+            match result {
+                Ok((content, content_type)) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            CONTENT_TYPE,
+                            content_type.unwrap_or_else(|| "application/gzip".to_string()),
+                        )
+                        .header(CONTENT_LENGTH, content.len().to_string())
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+                Err(_e) => {
+                    tracing::debug!(
+                        member_key = %member.key,
+                        "APKINDEX proxy fetch failed for virtual member, trying next"
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+
+    // Hosted repos (and virtual fallback): generate APKINDEX from local artifacts.
+    // TODO: For virtual repos this fallback queries `repo.id` (the virtual repo itself),
+    // which won't find artifacts stored under hosted members. A follow-up should aggregate
+    // artifacts from all hosted members of the virtual repo.
     let artifacts = list_alpine_artifacts(&state.db, repo.id, &branch, &repository, &arch).await?;
 
     let apkindex_text = generate_apkindex_text(&artifacts, &arch);
@@ -825,6 +903,16 @@ async fn store_apk(
 // ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
+
+/// Build the upstream path for an APKINDEX request.
+///
+/// Alpine mirrors structure their content as:
+///   `{branch}/{repository}/{arch}/APKINDEX.tar.gz`
+///
+/// For example, `v3.22/main/x86_64/APKINDEX.tar.gz`.
+fn build_apk_index_upstream_path(branch: &str, repository: &str, arch: &str) -> String {
+    format!("{}/{}/{}/APKINDEX.tar.gz", branch, repository, arch)
+}
 
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -1332,5 +1420,48 @@ mod tests {
     #[test]
     fn test_parse_apk_filename_no_apk_extension() {
         assert_eq!(parse_apk_filename("curl-8.5.0-r0.tar.gz"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_apk_index_upstream_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_apk_index_upstream_path_versioned() {
+        assert_eq!(
+            build_apk_index_upstream_path("v3.22", "main", "x86_64"),
+            "v3.22/main/x86_64/APKINDEX.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_build_apk_index_upstream_path_edge() {
+        assert_eq!(
+            build_apk_index_upstream_path("edge", "community", "aarch64"),
+            "edge/community/aarch64/APKINDEX.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_build_apk_index_upstream_path_testing() {
+        assert_eq!(
+            build_apk_index_upstream_path("v3.21", "testing", "armv7"),
+            "v3.21/testing/armv7/APKINDEX.tar.gz"
+        );
+    }
+
+    /// Verify the upstream path matches the real Alpine mirror structure.
+    /// Given upstream_url = "https://dl-cdn.alpinelinux.org/alpine", the
+    /// full URL must be:
+    ///   https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz
+    #[test]
+    fn test_build_apk_index_upstream_path_matches_alpine_mirror_structure() {
+        let path = build_apk_index_upstream_path("v3.22", "main", "x86_64");
+        let upstream = "https://dl-cdn.alpinelinux.org/alpine";
+        let full_url = format!("{}/{}", upstream.trim_end_matches('/'), path);
+        assert_eq!(
+            full_url,
+            "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz"
+        );
     }
 }
