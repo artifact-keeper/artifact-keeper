@@ -26,6 +26,15 @@ const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
 /// HTTP client timeout in seconds
 const HTTP_TIMEOUT_SECS: u64 = 60;
 
+/// Response from an upstream registry fetch.
+struct UpstreamResponse {
+    content: Bytes,
+    content_type: Option<String>,
+    etag: Option<String>,
+    effective_url: String,
+    link: Option<String>,
+}
+
 /// Cache metadata for a proxied artifact
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {
@@ -149,21 +158,21 @@ impl ProxyService {
         let upstream_result = self.fetch_from_upstream(&full_url, repo.id).await;
 
         match upstream_result {
-            Ok((content, content_type, etag, _effective_url)) => {
+            Ok(resp) => {
                 let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
                 self.cache_artifact(
                     &cache_key,
                     &metadata_key,
-                    &content,
-                    content_type.clone(),
-                    etag,
+                    &resp.content,
+                    resp.content_type.clone(),
+                    resp.etag,
                     cache_ttl,
                     repo.id,
                     cache_path,
                 )
                 .await?;
 
-                Ok((content, content_type))
+                Ok((resp.content, resp.content_type))
             }
             Err(upstream_err) => {
                 if let Ok(Some((stale_content, stale_content_type))) = self
@@ -246,9 +255,33 @@ impl ProxyService {
         })?;
 
         let full_url = Self::build_upstream_url(upstream_url, path);
-        let (content, content_type, _etag, effective_url) =
-            self.fetch_from_upstream(&full_url, repo.id).await?;
-        Ok((content, content_type, effective_url))
+        let resp = self.fetch_from_upstream(&full_url, repo.id).await?;
+        Ok((resp.content, resp.content_type, resp.effective_url))
+    }
+
+    /// Fetch from upstream directly, preserving the upstream `Link` header.
+    ///
+    /// OCI tag pagination relies on the upstream continuation cursor when the
+    /// registry enforces its own page-size cap. Callers that need to reconstruct
+    /// pagination accurately should use this instead of [`fetch_upstream_direct`].
+    pub async fn fetch_upstream_direct_with_link(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<(Bytes, Option<String>, Option<String>)> {
+        if repo.repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "Proxy operations only supported for remote repositories".to_string(),
+            ));
+        }
+
+        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
+            AppError::Config("Remote repository missing upstream_url".to_string())
+        })?;
+
+        let full_url = Self::build_upstream_url(upstream_url, path);
+        let resp = self.fetch_from_upstream(&full_url, repo.id).await?;
+        Ok((resp.content, resp.content_type, resp.link))
     }
 
     /// Invalidate cached artifact
@@ -379,11 +412,7 @@ impl ProxyService {
     /// a token from the indicated realm and retries the request. Tokens are
     /// cached in memory with their advertised TTL so subsequent requests to
     /// the same registry/scope don't repeat the exchange.
-    async fn fetch_from_upstream(
-        &self,
-        url: &str,
-        repo_id: Uuid,
-    ) -> Result<(Bytes, Option<String>, Option<String>, String)> {
+    async fn fetch_from_upstream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamResponse> {
         tracing::info!("Fetching artifact from upstream: {}", url);
 
         let upstream_auth =
@@ -426,15 +455,11 @@ impl ProxyService {
                         .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
                         .await?;
 
-                    // Retry with both the bearer token and any originally
-                    // configured upstream auth.
-                    let mut retry_request = self.http_client.get(url).bearer_auth(&token);
-                    if let Some(ref auth) = upstream_auth {
-                        retry_request = crate::services::upstream_auth::apply_upstream_auth(
-                            retry_request,
-                            auth,
-                        );
-                    }
+                    // Retry with the bearer token only. The original upstream
+                    // Basic credentials were already forwarded to the token
+                    // endpoint in obtain_bearer_token(); adding them here
+                    // would produce two Authorization headers.
+                    let retry_request = self.http_client.get(url).bearer_auth(&token);
 
                     let retry_response = retry_request.send().await.map_err(|e| {
                         AppError::Storage(format!(
@@ -456,12 +481,13 @@ impl ProxyService {
         Self::read_upstream_response(response, url).await
     }
 
-    /// Extract content, content-type, etag, and effective URL from an upstream
-    /// HTTP response. Callers are responsible for handling 401 before invoking.
+    /// Extract content, content-type, etag, effective URL, and Link header from
+    /// an upstream HTTP response. Callers are responsible for handling 401 before
+    /// invoking.
     async fn read_upstream_response(
         response: reqwest::Response,
         url: &str,
-    ) -> Result<(Bytes, Option<String>, Option<String>, String)> {
+    ) -> Result<UpstreamResponse> {
         let status = response.status();
         let effective_url = response.url().to_string();
 
@@ -491,19 +517,32 @@ impl ProxyService {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let link = response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
         let content = response
             .bytes()
             .await
             .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
 
         tracing::info!(
-            "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?})",
+            "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?}, link: {:?})",
             content.len(),
             content_type,
-            etag
+            etag,
+            link
         );
 
-        Ok((content, content_type, etag, effective_url))
+        Ok(UpstreamResponse {
+            content,
+            content_type,
+            etag,
+            effective_url,
+            link,
+        })
     }
 
     /// Obtain a bearer token for an OCI registry, using the in-memory cache
