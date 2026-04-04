@@ -56,6 +56,18 @@ pub fn router() -> Router<SharedState> {
 }
 
 // ---------------------------------------------------------------------------
+// Internal struct used to decouple DB query results from response rendering.
+// ---------------------------------------------------------------------------
+
+struct SimpleProjectArtifact {
+    path: String,
+    version: Option<String>,
+    size_bytes: i64,
+    checksum_sha256: String,
+    metadata: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Repository resolution
 // ---------------------------------------------------------------------------
 
@@ -167,7 +179,18 @@ async fn simple_project(
     .await
     .map_err(map_db_err)?;
 
-    if artifacts.is_empty() {
+    let simple_artifacts: Vec<SimpleProjectArtifact> = artifacts
+        .into_iter()
+        .map(|a| SimpleProjectArtifact {
+            path: a.path,
+            version: a.version,
+            size_bytes: a.size_bytes,
+            checksum_sha256: a.checksum_sha256,
+            metadata: a.metadata,
+        })
+        .collect();
+
+    if simple_artifacts.is_empty() {
         // For remote repos, proxy the simple index from upstream
         if repo.repo_type == RepositoryType::Remote {
             if let (Some(ref upstream_url), Some(ref proxy)) =
@@ -200,9 +223,8 @@ async fn simple_project(
                     .unwrap());
             }
         }
-        // For virtual repos, iterate through remote members using the same
-        // proxy logic as the direct Remote path above: preserve the upstream
-        // content-type and only rewrite URLs in HTML responses.
+        // For virtual repos, iterate through members in priority order.
+        // Local/staging members are queried via DB; remote members use proxy.
         if repo.repo_type == RepositoryType::Virtual {
             let upstream_path = format!("simple/{}/", normalized);
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
@@ -215,6 +237,51 @@ async fn simple_project(
             }
 
             for member in &members {
+                // For local and staging repos, query the DB for matching
+                // artifacts, the same way we do for the top-level repo.
+                if member.repo_type == RepositoryType::Local
+                    || member.repo_type == RepositoryType::Staging
+                {
+                    let member_rows = sqlx::query!(
+                        r#"
+        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2
+        ORDER BY a.created_at DESC
+        "#,
+                        member.id,
+                        normalized
+                    )
+                    .fetch_all(&state.db)
+                    .await
+                    .map_err(map_db_err)?;
+
+                    if !member_rows.is_empty() {
+                        let member_artifacts: Vec<SimpleProjectArtifact> = member_rows
+                            .into_iter()
+                            .map(|a| SimpleProjectArtifact {
+                                path: a.path,
+                                version: a.version,
+                                size_bytes: a.size_bytes,
+                                checksum_sha256: a.checksum_sha256,
+                                metadata: a.metadata,
+                            })
+                            .collect();
+                        return build_simple_project_response(
+                            &headers,
+                            &repo_key,
+                            &normalized,
+                            &member_artifacts,
+                        );
+                    }
+                    continue;
+                }
+
+                // For remote repos, proxy the simple index from upstream.
                 if member.repo_type != RepositoryType::Remote {
                     continue;
                 }
@@ -270,6 +337,24 @@ async fn simple_project(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
+    build_simple_project_response(&headers, &repo_key, &normalized, &simple_artifacts)
+}
+
+// ---------------------------------------------------------------------------
+// Shared response builder for simple project listings (HTML + PEP 691 JSON)
+// ---------------------------------------------------------------------------
+
+/// Render the simple project index for a given set of artifacts, using either
+/// HTML (PEP 503) or JSON (PEP 691) based on the Accept header.
+/// URLs in the response always point through `repo_key` (the virtual or
+/// direct repo the client originally requested).
+#[allow(clippy::result_large_err)]
+fn build_simple_project_response(
+    headers: &HeaderMap,
+    repo_key: &str,
+    normalized: &str,
+    artifacts: &[SimpleProjectArtifact],
+) -> Result<Response, Response> {
     let accept = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
@@ -330,7 +415,7 @@ async fn simple_project(
     html.push_str("</head>\n<body>\n");
     html.push_str(&format!("<h1>Links for {}</h1>\n", normalized));
 
-    for a in &artifacts {
+    for a in artifacts {
         let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
         let url = format!(
             "/pypi/{}/simple/{}/{}#sha256={}",
@@ -2099,5 +2184,242 @@ mod tests {
     fn test_split_url_no_scheme() {
         let result = split_url_base_and_path("not-a-url");
         assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_simple_project_response — HTML (PEP 503)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_simple_project_response_html_single_artifact() {
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "my-package/my_package-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 12345,
+            checksum_sha256: "abc123def456".to_string(),
+            metadata: None,
+        }];
+
+        let headers = HeaderMap::new();
+        let result =
+            build_simple_project_response(&headers, "my-virtual", "my-package", &artifacts);
+        assert!(result.is_ok());
+
+        let response = result.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn test_build_simple_project_response_html_uses_virtual_repo_key() {
+        // Reproducer for #643: when a local repo is part of a virtual repo,
+        // the simple index URLs must use the virtual repo key, not the member's.
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "packages/my_package-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 5000,
+            checksum_sha256: "aaa111bbb222".to_string(),
+            metadata: None,
+        }];
+
+        let headers = HeaderMap::new();
+        let result =
+            build_simple_project_response(&headers, "pypi-virtual", "my-package", &artifacts);
+        let response = result.unwrap();
+
+        // Read the body to verify URLs point through the virtual repo
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("/pypi/pypi-virtual/simple/my-package/my_package-1.0.0.tar.gz"),
+            "URL should use the virtual repo key, got: {}",
+            html
+        );
+        assert!(
+            html.contains("sha256=aaa111bbb222"),
+            "URL should include sha256 hash"
+        );
+        assert!(
+            html.contains("<h1>Links for my-package</h1>"),
+            "HTML should include package heading"
+        );
+    }
+
+    #[test]
+    fn test_build_simple_project_response_html_with_requires_python() {
+        let metadata = serde_json::json!({
+            "pkg_info": {
+                "requires_python": ">=3.8"
+            }
+        });
+
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "pkg-1.0.0-py3-none-any.whl".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 4000,
+            checksum_sha256: "deadbeef".to_string(),
+            metadata: Some(metadata),
+        }];
+
+        let headers = HeaderMap::new();
+        let result = build_simple_project_response(&headers, "virt", "pkg", &artifacts);
+        let response = result.unwrap();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(
+            html.contains("data-requires-python=\"&gt;=3.8\""),
+            "HTML should include escaped requires-python attribute"
+        );
+    }
+
+    #[test]
+    fn test_build_simple_project_response_html_multiple_artifacts() {
+        let artifacts = vec![
+            SimpleProjectArtifact {
+                path: "pkg-1.0.0.tar.gz".to_string(),
+                version: Some("1.0.0".to_string()),
+                size_bytes: 1000,
+                checksum_sha256: "aaa".to_string(),
+                metadata: None,
+            },
+            SimpleProjectArtifact {
+                path: "pkg-2.0.0.tar.gz".to_string(),
+                version: Some("2.0.0".to_string()),
+                size_bytes: 2000,
+                checksum_sha256: "bbb".to_string(),
+                metadata: None,
+            },
+        ];
+
+        let headers = HeaderMap::new();
+        let result = build_simple_project_response(&headers, "vrepo", "pkg", &artifacts);
+        let response = result.unwrap();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("/pypi/vrepo/simple/pkg/pkg-1.0.0.tar.gz#sha256=aaa"));
+        assert!(html.contains("/pypi/vrepo/simple/pkg/pkg-2.0.0.tar.gz#sha256=bbb"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_simple_project_response — JSON (PEP 691)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_simple_project_response_json_uses_virtual_repo_key() {
+        // PEP 691 variant of the #643 reproducer: JSON response should also
+        // route URLs through the virtual repo.
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "packages/my_package-1.0.0.tar.gz".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 5000,
+            checksum_sha256: "abc123".to_string(),
+            metadata: None,
+        }];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+
+        let result =
+            build_simple_project_response(&headers, "pypi-virtual", "my-package", &artifacts);
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/vnd.pypi.simple.v1+json");
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["name"], "my-package");
+        assert_eq!(json["meta"]["api-version"], "1.1");
+
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["filename"], "my_package-1.0.0.tar.gz");
+        assert!(
+            files[0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("/pypi/pypi-virtual/simple/my-package/"),
+            "JSON URL should use virtual repo key"
+        );
+        assert_eq!(files[0]["hashes"]["sha256"], "abc123");
+        assert_eq!(files[0]["size"], 5000);
+
+        let versions = json["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0], "1.0.0");
+    }
+
+    #[test]
+    fn test_build_simple_project_response_json_with_requires_python() {
+        let metadata = serde_json::json!({
+            "pkg_info": {
+                "requires_python": ">=3.9,<4.0"
+            }
+        });
+
+        let artifacts = vec![SimpleProjectArtifact {
+            path: "pkg-1.0.0-py3-none-any.whl".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 3000,
+            checksum_sha256: "cafe".to_string(),
+            metadata: Some(metadata),
+        }];
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+
+        let result = build_simple_project_response(&headers, "repo", "pkg", &artifacts);
+        let response = result.unwrap();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files[0]["requires-python"], ">=3.9,<4.0");
     }
 }
