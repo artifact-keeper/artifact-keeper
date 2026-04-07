@@ -661,6 +661,17 @@ fn build_worker_config(config: &MigrationConfig) -> WorkerConfig {
     }
 }
 
+/// Parse a `MigrationConfig` from the JSON value stored on a job row, falling
+/// back to defaults when the value cannot be deserialized.
+fn parse_migration_config(config_json: &serde_json::Value) -> MigrationConfig {
+    serde_json::from_value(config_json.clone()).unwrap_or_default()
+}
+
+/// Extract the `ConflictResolution` strategy from a `MigrationConfig`.
+fn resolve_conflict_strategy(config: &MigrationConfig) -> ConflictResolution {
+    ConflictResolution::from_str(&config.conflict_resolution)
+}
+
 /// Mark a migration job as failed in the database. Best-effort: errors are
 /// logged but not propagated because this is typically called from a spawned
 /// task that has no caller to return an error to.
@@ -690,6 +701,71 @@ async fn fetch_connection_and_client(
 
     create_source_client(&connection)
         .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))
+}
+
+/// Which migration worker method to invoke inside the spawned task.
+enum MigrationAction {
+    Start,
+    Resume,
+}
+
+/// Spawn a migration worker on a background task. This is the single place
+/// that creates a `MigrationWorker`, runs either `process_job` or
+/// `resume_job`, and marks the job as failed when an error occurs. Callers
+/// only need to specify the action (start vs. resume).
+fn spawn_migration_worker(
+    db: sqlx::PgPool,
+    job_id: Uuid,
+    client: Arc<dyn SourceRegistry>,
+    storage: Arc<dyn crate::storage::StorageBackend>,
+    worker_config: WorkerConfig,
+    conflict_resolution: ConflictResolution,
+    action: MigrationAction,
+) {
+    tokio::spawn(async move {
+        let cancel_token = CancellationToken::new();
+        let worker = MigrationWorker::new(db.clone(), storage, worker_config, cancel_token);
+        let result = match action {
+            MigrationAction::Start => {
+                worker
+                    .process_job(job_id, client, conflict_resolution, None)
+                    .await
+            }
+            MigrationAction::Resume => {
+                worker
+                    .resume_job(job_id, client, conflict_resolution, None)
+                    .await
+            }
+        };
+        if let Err(e) = result {
+            tracing::error!(job_id = %job_id, error = %e, "Migration worker failed");
+            mark_job_failed(&db, job_id, &e.to_string()).await;
+        }
+    });
+}
+
+/// Execute a pre-migration assessment. This is the core logic that runs inside
+/// the spawned task; extracting it into its own function makes the assessment
+/// pipeline unit-testable without requiring a real database or tokio::spawn.
+async fn execute_assessment(
+    db: sqlx::PgPool,
+    job_id: Uuid,
+    connection_id: Uuid,
+    client: Arc<dyn SourceRegistry>,
+) {
+    let service = MigrationService::new(db.clone());
+    match service.run_assessment(connection_id, client.as_ref()).await {
+        Ok(result) => {
+            if let Err(e) = service.save_assessment(job_id, &result).await {
+                tracing::error!(job_id = %job_id, error = %e, "Failed to save assessment results");
+                mark_job_failed(&db, job_id, &format!("Failed to save assessment: {}", e)).await;
+            }
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job_id, error = %e, "Assessment worker failed");
+            mark_job_failed(&db, job_id, &e.to_string()).await;
+        }
+    }
 }
 
 /// Create the appropriate source registry client based on connection type
@@ -1066,31 +1142,23 @@ async fn start_migration(
 
     let client = fetch_connection_and_client(&state.db, job.source_connection_id).await?;
 
-    // Parse migration config for conflict resolution
-    let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
-    let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
-
-    // Create storage backend
+    let config = parse_migration_config(&job.config);
+    let conflict_resolution = resolve_conflict_strategy(&config);
     let storage = state.storage_for_repo(&crate::storage::StorageLocation {
         backend: state.config.storage_backend.clone(),
         path: state.config.storage_path.clone(),
     })?;
-
-    let cancel_token = CancellationToken::new();
     let worker_config = build_worker_config(&config);
 
-    let db = state.db.clone();
-    let job_id = job.id;
-    tokio::spawn(async move {
-        let worker = MigrationWorker::new(db.clone(), storage, worker_config, cancel_token);
-        if let Err(e) = worker
-            .process_job(job_id, client, conflict_resolution, None)
-            .await
-        {
-            tracing::error!(job_id = %job_id, error = %e, "Migration worker failed");
-            mark_job_failed(&db, job_id, &e.to_string()).await;
-        }
-    });
+    spawn_migration_worker(
+        state.db.clone(),
+        job.id,
+        client,
+        storage,
+        worker_config,
+        conflict_resolution,
+        MigrationAction::Start,
+    );
 
     Ok(Json(job.into()))
 }
@@ -1174,28 +1242,23 @@ async fn resume_migration(
 
     let client = fetch_connection_and_client(&state.db, job.source_connection_id).await?;
 
-    let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
-    let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
-
+    let config = parse_migration_config(&job.config);
+    let conflict_resolution = resolve_conflict_strategy(&config);
     let storage = state.storage_for_repo(&crate::storage::StorageLocation {
         backend: state.config.storage_backend.clone(),
         path: state.config.storage_path.clone(),
     })?;
-    let cancel_token = CancellationToken::new();
     let worker_config = build_worker_config(&config);
 
-    let db = state.db.clone();
-    let job_id = job.id;
-    tokio::spawn(async move {
-        let worker = MigrationWorker::new(db.clone(), storage, worker_config, cancel_token);
-        if let Err(e) = worker
-            .resume_job(job_id, client, conflict_resolution, None)
-            .await
-        {
-            tracing::error!(job_id = %job_id, error = %e, "Migration resume failed");
-            mark_job_failed(&db, job_id, &e.to_string()).await;
-        }
-    });
+    spawn_migration_worker(
+        state.db.clone(),
+        job.id,
+        client,
+        storage,
+        worker_config,
+        conflict_resolution,
+        MigrationAction::Resume,
+    );
 
     Ok(Json(job.into()))
 }
@@ -1504,22 +1567,7 @@ async fn run_assessment(
     let db = state.db.clone();
     let job_id = job.id;
     let connection_id = job.source_connection_id;
-    tokio::spawn(async move {
-        let service = MigrationService::new(db.clone());
-        match service.run_assessment(connection_id, client.as_ref()).await {
-            Ok(result) => {
-                if let Err(e) = service.save_assessment(job_id, &result).await {
-                    tracing::error!(job_id = %job_id, error = %e, "Failed to save assessment results");
-                    mark_job_failed(&db, job_id, &format!("Failed to save assessment: {}", e))
-                        .await;
-                }
-            }
-            Err(e) => {
-                tracing::error!(job_id = %job_id, error = %e, "Assessment worker failed");
-                mark_job_failed(&db, job_id, &e.to_string()).await;
-            }
-        }
-    });
+    tokio::spawn(execute_assessment(db, job_id, connection_id, client));
 
     Ok((StatusCode::ACCEPTED, Json(job.into())))
 }
@@ -2125,6 +2173,435 @@ mod tests {
         };
         let wc = build_worker_config(&config);
         assert_eq!(wc.concurrency, 1, "concurrency of 0 should be clamped to 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_migration_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_migration_config_valid_json() {
+        let json = serde_json::json!({
+            "include_repos": ["docker-local", "npm-remote"],
+            "dry_run": true,
+            "concurrent_transfers": 16,
+            "throttle_delay_ms": 100,
+            "conflict_resolution": "overwrite"
+        });
+        let config = parse_migration_config(&json);
+        assert_eq!(config.include_repos, vec!["docker-local", "npm-remote"]);
+        assert!(config.dry_run);
+        assert_eq!(config.concurrent_transfers, 16);
+        assert_eq!(config.throttle_delay_ms, 100);
+        assert_eq!(config.conflict_resolution, "overwrite");
+    }
+
+    #[test]
+    fn test_parse_migration_config_empty_json() {
+        let json = serde_json::json!({});
+        let config = parse_migration_config(&json);
+        // Should produce defaults
+        assert!(config.include_repos.is_empty());
+        assert!(!config.dry_run);
+        assert!(config.include_users);
+        assert!(config.include_groups);
+        assert!(config.include_permissions);
+    }
+
+    #[test]
+    fn test_parse_migration_config_invalid_json() {
+        let json = serde_json::json!("not an object");
+        let config = parse_migration_config(&json);
+        // Falls back to Default
+        assert!(!config.dry_run);
+        assert!(config.include_repos.is_empty());
+    }
+
+    #[test]
+    fn test_parse_migration_config_partial_fields() {
+        let json = serde_json::json!({
+            "dry_run": true
+        });
+        let config = parse_migration_config(&json);
+        assert!(config.dry_run);
+        // Other fields get defaults
+        assert!(config.include_users);
+        assert_eq!(config.conflict_resolution, "skip");
+    }
+
+    #[test]
+    fn test_parse_migration_config_null_value() {
+        let json = serde_json::Value::Null;
+        let config = parse_migration_config(&json);
+        // Null cannot be deserialized into MigrationConfig, falls back to default
+        assert!(!config.dry_run);
+    }
+
+    #[test]
+    fn test_parse_migration_config_with_dates() {
+        let json = serde_json::json!({
+            "date_from": "2025-01-01T00:00:00Z",
+            "date_to": "2025-12-31T23:59:59Z",
+            "exclude_repos": ["cache-repo"]
+        });
+        let config = parse_migration_config(&json);
+        assert!(config.date_from.is_some());
+        assert!(config.date_to.is_some());
+        assert_eq!(config.exclude_repos, vec!["cache-repo"]);
+    }
+
+    #[test]
+    fn test_parse_migration_config_exclude_paths() {
+        let json = serde_json::json!({
+            "exclude_paths": ["/tmp/**", "*.bak"],
+            "include_cached_remote": true
+        });
+        let config = parse_migration_config(&json);
+        assert_eq!(config.exclude_paths.len(), 2);
+        assert!(config.include_cached_remote);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_conflict_strategy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_conflict_strategy_skip() {
+        let config = MigrationConfig {
+            conflict_resolution: "skip".to_string(),
+            ..Default::default()
+        };
+        let strategy = resolve_conflict_strategy(&config);
+        assert!(matches!(strategy, ConflictResolution::Skip));
+    }
+
+    #[test]
+    fn test_resolve_conflict_strategy_overwrite() {
+        let config = MigrationConfig {
+            conflict_resolution: "overwrite".to_string(),
+            ..Default::default()
+        };
+        let strategy = resolve_conflict_strategy(&config);
+        assert!(matches!(strategy, ConflictResolution::Overwrite));
+    }
+
+    #[test]
+    fn test_resolve_conflict_strategy_rename() {
+        let config = MigrationConfig {
+            conflict_resolution: "rename".to_string(),
+            ..Default::default()
+        };
+        let strategy = resolve_conflict_strategy(&config);
+        assert!(matches!(strategy, ConflictResolution::Rename));
+    }
+
+    #[test]
+    fn test_resolve_conflict_strategy_unknown_defaults_to_skip() {
+        let config = MigrationConfig {
+            conflict_resolution: "unknown_strategy".to_string(),
+            ..Default::default()
+        };
+        let strategy = resolve_conflict_strategy(&config);
+        assert!(matches!(strategy, ConflictResolution::Skip));
+    }
+
+    #[test]
+    fn test_resolve_conflict_strategy_case_insensitive() {
+        let config = MigrationConfig {
+            conflict_resolution: "OVERWRITE".to_string(),
+            ..Default::default()
+        };
+        let strategy = resolve_conflict_strategy(&config);
+        assert!(matches!(strategy, ConflictResolution::Overwrite));
+    }
+
+    #[test]
+    fn test_resolve_conflict_strategy_empty_string() {
+        let config = MigrationConfig {
+            conflict_resolution: String::new(),
+            ..Default::default()
+        };
+        let strategy = resolve_conflict_strategy(&config);
+        assert!(matches!(strategy, ConflictResolution::Skip));
+    }
+
+    // -----------------------------------------------------------------------
+    // Combined parse + resolve (integration of the two helpers)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_and_resolve_roundtrip() {
+        let json = serde_json::json!({
+            "conflict_resolution": "rename",
+            "concurrent_transfers": 4,
+            "dry_run": false
+        });
+        let config = parse_migration_config(&json);
+        let strategy = resolve_conflict_strategy(&config);
+        let wc = build_worker_config(&config);
+
+        assert!(matches!(strategy, ConflictResolution::Rename));
+        assert_eq!(wc.concurrency, 4);
+        assert!(!wc.dry_run);
+    }
+
+    #[test]
+    fn test_parse_and_resolve_defaults_roundtrip() {
+        let json = serde_json::json!({});
+        let config = parse_migration_config(&json);
+        let strategy = resolve_conflict_strategy(&config);
+        let wc = build_worker_config(&config);
+
+        // Default conflict resolution is "skip"
+        assert!(matches!(strategy, ConflictResolution::Skip));
+        assert!(wc.concurrency >= 1);
+        assert!(!wc.dry_run);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_worker_config with parsed config (end-to-end from JSON)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_worker_config_from_parsed_json() {
+        let json = serde_json::json!({
+            "concurrent_transfers": 12,
+            "throttle_delay_ms": 500,
+            "dry_run": true
+        });
+        let config = parse_migration_config(&json);
+        let wc = build_worker_config(&config);
+        assert_eq!(wc.concurrency, 12);
+        assert_eq!(wc.throttle_delay_ms, 500);
+        assert!(wc.dry_run);
+    }
+
+    #[test]
+    fn test_build_worker_config_from_empty_json() {
+        let json = serde_json::json!({});
+        let config = parse_migration_config(&json);
+        let wc = build_worker_config(&config);
+        // Default concurrent_transfers is 4 via default_concurrent_transfers()
+        assert_eq!(wc.concurrency, 4);
+        assert!(!wc.dry_run);
+    }
+
+    // -----------------------------------------------------------------------
+    // MigrationJobResponse edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_migration_job_response_assessment_status() {
+        let row = MigrationJobRow {
+            id: Uuid::new_v4(),
+            source_connection_id: Uuid::new_v4(),
+            status: "assessing".to_string(),
+            job_type: "assessment".to_string(),
+            config: serde_json::json!({}),
+            total_items: 0,
+            completed_items: 0,
+            failed_items: 0,
+            skipped_items: 0,
+            total_bytes: 0,
+            transferred_bytes: 0,
+            started_at: None,
+            finished_at: None,
+            created_at: chrono::Utc::now(),
+            created_by: None,
+            error_summary: None,
+        };
+        let response: MigrationJobResponse = row.into();
+        assert_eq!(response.status, "assessing");
+        assert_eq!(response.job_type, "assessment");
+        assert_eq!(response.progress_percent, 0.0);
+    }
+
+    #[test]
+    fn test_migration_job_response_with_all_skipped() {
+        let row = MigrationJobRow {
+            id: Uuid::new_v4(),
+            source_connection_id: Uuid::new_v4(),
+            status: "completed".to_string(),
+            job_type: "full".to_string(),
+            config: serde_json::json!({}),
+            total_items: 50,
+            completed_items: 0,
+            failed_items: 0,
+            skipped_items: 50,
+            total_bytes: 10000,
+            transferred_bytes: 0,
+            started_at: Some(chrono::Utc::now()),
+            finished_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            created_by: None,
+            error_summary: None,
+        };
+        let response: MigrationJobResponse = row.into();
+        assert!((response.progress_percent - 100.0).abs() < f64::EPSILON);
+        assert_eq!(response.transferred_bytes, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // AssessmentResult with populated data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_assessment_result_with_repos_and_warnings() {
+        let result = AssessmentResult {
+            job_id: Uuid::new_v4(),
+            status: "completed".to_string(),
+            repositories: vec![
+                RepositoryAssessment {
+                    key: "docker-local".to_string(),
+                    repo_type: "local".to_string(),
+                    package_type: "docker".to_string(),
+                    artifact_count: 200,
+                    total_size_bytes: 1024 * 1024 * 500,
+                    compatibility: "full".to_string(),
+                    warnings: vec![],
+                },
+                RepositoryAssessment {
+                    key: "pypi-remote".to_string(),
+                    repo_type: "remote".to_string(),
+                    package_type: "pypi".to_string(),
+                    artifact_count: 50,
+                    total_size_bytes: 1024 * 1024 * 10,
+                    compatibility: "partial".to_string(),
+                    warnings: vec!["Remote cache not included".to_string()],
+                },
+            ],
+            users_count: 15,
+            groups_count: 5,
+            permissions_count: 30,
+            total_artifacts: 250,
+            total_size_bytes: 1024 * 1024 * 510,
+            estimated_duration_seconds: 3600,
+            warnings: vec!["Large migration".to_string()],
+            blockers: vec![],
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["repositories"].as_array().unwrap().len(), 2);
+        assert_eq!(json["users_count"], 15);
+        assert_eq!(json["total_artifacts"], 250);
+        assert_eq!(json["estimated_duration_seconds"], 3600);
+        assert!(json["blockers"].as_array().unwrap().is_empty());
+        assert_eq!(json["warnings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_assessment_result_with_blockers() {
+        let result = AssessmentResult {
+            job_id: Uuid::new_v4(),
+            status: "failed".to_string(),
+            repositories: vec![],
+            users_count: 0,
+            groups_count: 0,
+            permissions_count: 0,
+            total_artifacts: 0,
+            total_size_bytes: 0,
+            estimated_duration_seconds: 0,
+            warnings: vec![],
+            blockers: vec![
+                "Unsupported package format: custom-format".to_string(),
+                "Source version too old".to_string(),
+            ],
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["blockers"].as_array().unwrap().len(), 2);
+        assert_eq!(json["status"], "failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // ListResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_response_with_pagination() {
+        let response = ListResponse {
+            items: vec!["a".to_string(), "b".to_string()],
+            pagination: Some(PaginationInfo {
+                page: 1,
+                per_page: 10,
+                total: 2,
+                total_pages: 1,
+            }),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 2);
+        assert_eq!(json["pagination"]["total"], 2);
+    }
+
+    #[test]
+    fn test_list_response_without_pagination() {
+        let response: ListResponse<String> = ListResponse {
+            items: vec![],
+            pagination: None,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json["items"].as_array().unwrap().is_empty());
+        assert!(json["pagination"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateMigrationRequest deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_migration_request_full() {
+        let json = serde_json::json!({
+            "source_connection_id": "550e8400-e29b-41d4-a716-446655440000",
+            "job_type": "assessment",
+            "config": {
+                "include_repos": ["maven-local"],
+                "dry_run": true
+            }
+        });
+        let req: CreateMigrationRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.job_type, Some("assessment".to_string()));
+        assert!(req.config.dry_run);
+    }
+
+    #[test]
+    fn test_create_migration_request_minimal() {
+        let json = serde_json::json!({
+            "source_connection_id": "550e8400-e29b-41d4-a716-446655440000",
+            "config": {}
+        });
+        let req: CreateMigrationRequest = serde_json::from_value(json).unwrap();
+        assert!(req.job_type.is_none());
+        assert!(!req.config.dry_run);
+    }
+
+    // -----------------------------------------------------------------------
+    // CreateConnectionRequest deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_connection_request_artifactory() {
+        let json = serde_json::json!({
+            "name": "Production Artifactory",
+            "url": "https://artifactory.example.com",
+            "auth_type": "api_token",
+            "credentials": { "token": "my-token" }
+        });
+        let req: CreateConnectionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.name, "Production Artifactory");
+        assert!(req.source_type.is_none());
+        assert_eq!(req.credentials.token, Some("my-token".to_string()));
+    }
+
+    #[test]
+    fn test_create_connection_request_nexus() {
+        let json = serde_json::json!({
+            "name": "Nexus Server",
+            "url": "https://nexus.example.com",
+            "auth_type": "basic_auth",
+            "credentials": { "username": "admin", "password": "secret" },
+            "source_type": "nexus"
+        });
+        let req: CreateConnectionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.source_type, Some("nexus".to_string()));
+        assert_eq!(req.credentials.username, Some("admin".to_string()));
     }
 }
 
