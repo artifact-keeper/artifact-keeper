@@ -1,6 +1,6 @@
 //! Shared helpers for remote repository proxying and virtual repository resolution.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
@@ -13,6 +13,39 @@ use crate::models::repository::{
 };
 use crate::services::proxy_service::ProxyService;
 use crate::storage::StorageLocation;
+
+// ---------------------------------------------------------------------------
+// Base URL from request headers
+// ---------------------------------------------------------------------------
+
+/// Derive the external base URL from reverse-proxy headers.
+///
+/// Checks `X-Forwarded-Proto` for the scheme (defaults to `"http"`) and
+/// `X-Forwarded-Host` then `Host` for the hostname (defaults to
+/// `"localhost"`). If the host value already contains a scheme prefix it is
+/// returned as-is to avoid duplication.
+///
+/// Most format handlers need to construct absolute URLs for clients (OCI,
+/// NuGet, npm, Cargo, Git LFS, SSO/OIDC). This function centralizes the
+/// header inspection logic so each handler does not duplicate it.
+pub fn request_base_url(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+
+    if host.contains("://") {
+        host.to_string()
+    } else {
+        format!("{}://{}", scheme, host)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared RepoInfo
@@ -573,7 +606,76 @@ fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderValue, StatusCode};
+
+    // ── request_base_url tests ──────────────────────────────────────
+
+    #[test]
+    fn test_request_base_url_no_headers() {
+        let headers = HeaderMap::new();
+        assert_eq!(request_base_url(&headers), "http://localhost");
+    }
+
+    #[test]
+    fn test_request_base_url_host_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        assert_eq!(request_base_url(&headers), "http://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_host_with_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("localhost:8080"));
+        assert_eq!(request_base_url(&headers), "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("registry.example.com"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(request_base_url(&headers), "https://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com:30443"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(
+            request_base_url(&headers),
+            "https://registry.example.com:30443"
+        );
+    }
+
+    #[test]
+    fn test_request_base_url_forwarded_host_without_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("backend:8080"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("registry.example.com"),
+        );
+        assert_eq!(request_base_url(&headers), "http://registry.example.com");
+    }
+
+    #[test]
+    fn test_request_base_url_host_with_embedded_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            HeaderValue::from_static("https://already-absolute.example.com"),
+        );
+        assert_eq!(
+            request_base_url(&headers),
+            "https://already-absolute.example.com"
+        );
+    }
 
     // ── build_remote_repo tests ──────────────────────────────────────
 

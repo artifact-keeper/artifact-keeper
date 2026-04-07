@@ -124,22 +124,7 @@ fn validate_token(
 }
 
 fn request_host(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-
-    if host.contains("://") {
-        host.to_string()
-    } else {
-        format!("{}://{}", scheme, host)
-    }
+    proxy_helpers::request_base_url(headers)
 }
 
 // ---------------------------------------------------------------------------

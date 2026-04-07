@@ -87,18 +87,12 @@ async fn service_index(
 ) -> Result<Response, Response> {
     let _repo = resolve_nuget_repo(&state.db, &repo_key).await?;
 
-    // Determine the base URL from the Host header or fall back to config.
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-
-    let base = format!("{}://{}/nuget/{}", scheme, host, repo_key);
+    // Determine the base URL from reverse-proxy / Host headers.
+    let base = format!(
+        "{}/nuget/{}",
+        proxy_helpers::request_base_url(&headers),
+        repo_key
+    );
 
     let index = serde_json::json!({
         "version": "3.0.0",
@@ -180,15 +174,11 @@ async fn search_packages(
     let _prerelease = params.prerelease.unwrap_or(false);
 
     // Determine base URL for building resource links.
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    let base = format!("{}://{}/nuget/{}", scheme, host, repo_key);
+    let base = format!(
+        "{}/nuget/{}",
+        proxy_helpers::request_base_url(&headers),
+        repo_key
+    );
 
     // Search distinct package names matching the query term.
     let search_pattern = format!("%{}%", query_term.to_lowercase());
@@ -292,15 +282,11 @@ async fn registration_index(
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;
     let package_id_lower = package_id.to_lowercase();
 
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    let base = format!("{}://{}/nuget/{}", scheme, host, repo_key);
+    let base = format!(
+        "{}/nuget/{}",
+        proxy_helpers::request_base_url(&headers),
+        repo_key
+    );
 
     // Fetch all versions of this package.
     let artifacts = sqlx::query!(

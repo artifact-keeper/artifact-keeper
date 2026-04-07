@@ -421,17 +421,11 @@ async fn batch(
 }
 
 fn build_base_url(headers: &HeaderMap, repo_key: &str) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-
-    format!("{}://{}/lfs/{}", scheme, host, repo_key)
+    format!(
+        "{}/lfs/{}",
+        proxy_helpers::request_base_url(headers),
+        repo_key
+    )
 }
 
 // ---------------------------------------------------------------------------

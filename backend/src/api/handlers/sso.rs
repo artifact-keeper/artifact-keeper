@@ -640,30 +640,7 @@ pub(crate) fn resolve_oidc_redirect_uri(
         })
 }
 
-/// Derive the external base URL from reverse-proxy headers.
-///
-/// Checks `X-Forwarded-Proto` for the scheme (defaults to "http") and
-/// `X-Forwarded-Host` then `Host` for the hostname (defaults to
-/// "localhost"). If the host value already contains a scheme prefix it is
-/// returned as-is to avoid duplication.
-fn request_base_url(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-
-    if host.contains("://") {
-        host.to_string()
-    } else {
-        format!("{}://{}", scheme, host)
-    }
-}
+use super::proxy_helpers::request_base_url;
 
 /// Resolve a claim name from OIDC attribute_mapping, returning the configured
 /// value or the provided default.

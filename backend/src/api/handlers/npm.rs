@@ -190,15 +190,7 @@ async fn get_package_metadata(
     package_name: &str,
     headers: &HeaderMap,
 ) -> Result<Response, Response> {
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    let base_url = format!("{}://{}", scheme, host);
+    let base_url = proxy_helpers::request_base_url(headers);
 
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 

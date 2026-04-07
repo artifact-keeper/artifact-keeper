@@ -243,18 +243,8 @@ async fn config_json(
         .and_then(|c| c.get(&repo_key).map(|(r, _)| r.is_public))
         .unwrap_or(true);
 
-    // Determine the host from the request headers or fall back to config
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost");
-
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-
-    let base_url = format!("{}://{}", scheme, host);
+    // Determine the base URL from reverse-proxy / Host headers.
+    let base_url = proxy_helpers::request_base_url(&headers);
 
     let config = serde_json::json!({
         "dl": format!("{}/cargo/{}/api/v1/crates", base_url, repo_key),
