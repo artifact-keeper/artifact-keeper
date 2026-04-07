@@ -22,7 +22,7 @@ use base64::Engine;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
@@ -183,6 +183,96 @@ async fn get_scoped_metadata(
     get_package_metadata(&state, &repo_key, &full_name, &headers).await
 }
 
+/// Minimal artifact info needed to construct npm package metadata.
+struct NpmMetadataArtifact {
+    path: String,
+    version: Option<String>,
+    checksum_sha256: String,
+    metadata: Option<serde_json::Value>,
+}
+
+/// Build an npm package metadata JSON response from a set of artifacts.
+///
+/// `repo_key` should be the key visible to the client (the virtual repo key
+/// when serving through a virtual repository, or the repo's own key otherwise).
+fn build_npm_metadata_response(
+    artifacts: &[NpmMetadataArtifact],
+    package_name: &str,
+    base_url: &str,
+    repo_key: &str,
+) -> Result<Response, Response> {
+    let mut versions = serde_json::Map::new();
+    let mut latest_version: Option<String> = None;
+
+    for artifact in artifacts {
+        let version = match &artifact.version {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+
+        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
+
+        let tarball_url = format!(
+            "{}/npm/{}/{}/-/{}",
+            base_url, repo_key, package_name, filename
+        );
+
+        let version_metadata = artifact
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("version_data").cloned())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let mut version_obj = if version_metadata.is_object() {
+            version_metadata
+        } else {
+            serde_json::json!({})
+        };
+
+        let obj = version_obj.as_object_mut().unwrap();
+        obj.entry("name".to_string())
+            .or_insert_with(|| serde_json::Value::String(package_name.to_string()));
+        obj.entry("version".to_string())
+            .or_insert_with(|| serde_json::Value::String(version.clone()));
+
+        let hex = &artifact.checksum_sha256;
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect();
+        let integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+        obj.insert(
+            "dist".to_string(),
+            serde_json::json!({
+                "tarball": tarball_url,
+                "integrity": integrity,
+            }),
+        );
+
+        versions.insert(version.clone(), version_obj);
+        latest_version = Some(version);
+    }
+
+    let dist_tags = serde_json::json!({
+        "latest": latest_version.unwrap_or_default()
+    });
+
+    let response = serde_json::json!({
+        "name": package_name,
+        "versions": versions,
+        "dist-tags": dist_tags,
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&response).unwrap()))
+        .unwrap())
+}
+
 /// Build and return the npm package metadata JSON for all versions.
 async fn get_package_metadata(
     state: &SharedState,
@@ -243,39 +333,109 @@ async fn get_package_metadata(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
-    // For virtual repos, iterate through remote members and try proxy
+    // For virtual repos, iterate through members in priority order.
+    // Local/Staging members are checked first (query DB for artifacts),
+    // then Remote members are proxied from upstream. First match wins.
     if repo.repo_type == RepositoryType::Virtual {
-        let base_url = base_url.clone();
-        let repo_key = repo_key.to_string();
-        let encoded_name = encode_package_name_for_upstream(package_name);
-        return proxy_helpers::resolve_virtual_metadata(
-            &state.db,
-            state.proxy_service.as_deref(),
-            repo.id,
-            &encoded_name,
-            |content, _member_key| {
-                let base_url = base_url.clone();
-                let repo_key = repo_key.clone();
-                async move {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+        if members.is_empty() {
+            return Err(
+                AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
+            );
+        }
+
+        for member in &members {
+            // For Local/Staging members, query artifacts from the DB.
+            if member.repo_type == RepositoryType::Local
+                || member.repo_type == RepositoryType::Staging
+            {
+                let member_rows = sqlx::query!(
+                    r#"
+        SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
+               a.storage_key, a.created_at,
+               am.metadata as "metadata?"
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND a.name = $2
+        ORDER BY a.created_at ASC
+        "#,
+                    member.id,
+                    package_name
+                )
+                .fetch_all(&state.db)
+                .await
+                .map_err(map_db_err)?;
+
+                if !member_rows.is_empty() {
+                    let meta: Vec<NpmMetadataArtifact> = member_rows
+                        .into_iter()
+                        .map(|a| NpmMetadataArtifact {
+                            path: a.path,
+                            version: a.version,
+                            checksum_sha256: a.checksum_sha256,
+                            metadata: a.metadata,
+                        })
+                        .collect();
+                    return build_npm_metadata_response(&meta, package_name, &base_url, repo_key);
+                }
+                continue;
+            }
+
+            // For Remote members, proxy metadata from upstream.
+            if member.repo_type != RepositoryType::Remote {
+                continue;
+            }
+            let Some(ref upstream_url) = member.upstream_url else {
+                continue;
+            };
+            let Some(ref proxy) = state.proxy_service else {
+                continue;
+            };
+
+            let encoded_name = encode_package_name_for_upstream(package_name);
+            let result = proxy_helpers::proxy_fetch(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                &encoded_name,
+            )
+            .await;
+
+            match result {
+                Ok((content, _content_type)) => {
                     if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
-                        rewrite_npm_tarball_urls(&mut json, &base_url, &repo_key);
+                        rewrite_npm_tarball_urls(&mut json, &base_url, repo_key);
                         let rewritten = serde_json::to_string(&json).unwrap_or_default();
-                        Ok(Response::builder()
+                        return Ok(Response::builder()
                             .status(StatusCode::OK)
                             .header(CONTENT_TYPE, "application/json")
                             .body(Body::from(rewritten))
-                            .unwrap())
-                    } else {
-                        Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/json")
-                            .body(Body::from(content))
-                            .unwrap())
+                            .unwrap());
                     }
+
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(content))
+                        .unwrap());
                 }
-            },
-        )
-        .await;
+                Err(_e) => {
+                    debug!(
+                        member_key = %member.key,
+                        "npm metadata proxy fetch missed for virtual member"
+                    );
+                }
+            }
+        }
+
+        return Err(
+            AppError::NotFound("Package not found in any member repository".to_string())
+                .into_response(),
+        );
     }
 
     // For local/staged repos, build metadata from stored artifacts
@@ -302,83 +462,17 @@ async fn get_package_metadata(
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
     }
 
-    // Build versions map and track the latest version
-    let mut versions = serde_json::Map::new();
-    let mut latest_version: Option<String> = None;
+    let meta_artifacts: Vec<NpmMetadataArtifact> = artifacts
+        .into_iter()
+        .map(|a| NpmMetadataArtifact {
+            path: a.path,
+            version: a.version,
+            checksum_sha256: a.checksum_sha256,
+            metadata: a.metadata,
+        })
+        .collect();
 
-    for artifact in &artifacts {
-        let version = match &artifact.version {
-            Some(v) => v.clone(),
-            None => continue,
-        };
-
-        // Extract the filename from the path
-        let filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-
-        // Build the tarball URL
-        let tarball_url = format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        );
-
-        // Get version-specific metadata from artifact_metadata if available
-        let version_metadata = artifact
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("version_data").cloned())
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let mut version_obj = if version_metadata.is_object() {
-            version_metadata
-        } else {
-            serde_json::json!({})
-        };
-
-        // Ensure required fields are set
-        let obj = version_obj.as_object_mut().unwrap();
-        obj.entry("name".to_string())
-            .or_insert_with(|| serde_json::Value::String(package_name.to_string()));
-        obj.entry("version".to_string())
-            .or_insert_with(|| serde_json::Value::String(version.clone()));
-        // npm expects shasum (SHA-1) or integrity (subresource integrity hash).
-        // We only store SHA-256, so provide it via the integrity field.
-        use base64::Engine;
-        let hex = &artifact.checksum_sha256;
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-            .collect();
-        let integrity = format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        );
-        obj.insert(
-            "dist".to_string(),
-            serde_json::json!({
-                "tarball": tarball_url,
-                "integrity": integrity,
-            }),
-        );
-
-        versions.insert(version.clone(), version_obj);
-        latest_version = Some(version);
-    }
-
-    let dist_tags = serde_json::json!({
-        "latest": latest_version.unwrap_or_default()
-    });
-
-    let response = serde_json::json!({
-        "name": package_name,
-        "versions": versions,
-        "dist-tags": dist_tags,
-    });
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&response).unwrap()))
-        .unwrap())
+    build_npm_metadata_response(&meta_artifacts, package_name, &base_url, repo_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,5 +1976,222 @@ mod tests {
         assert_eq!(normalized, "@openai/codex");
         let for_upstream = encode_package_name_for_upstream(&normalized);
         assert_eq!(for_upstream, "@openai%2Fcodex");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_npm_metadata_response (used by virtual local/staging members)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_single_version() {
+        let artifacts = vec![NpmMetadataArtifact {
+            path: "mylib/1.0.0/mylib-1.0.0.tgz".to_string(),
+            version: Some("1.0.0".to_string()),
+            checksum_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let resp = build_npm_metadata_response(
+            &artifacts,
+            "mylib",
+            "http://localhost:8080",
+            "npm-virtual",
+        )
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(body["name"], "mylib");
+        assert_eq!(body["dist-tags"]["latest"], "1.0.0");
+        let v = &body["versions"]["1.0.0"];
+        assert_eq!(v["name"], "mylib");
+        assert_eq!(v["version"], "1.0.0");
+        assert_eq!(
+            v["dist"]["tarball"],
+            "http://localhost:8080/npm/npm-virtual/mylib/-/mylib-1.0.0.tgz"
+        );
+        assert!(v["dist"]["integrity"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256-"));
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_multiple_versions() {
+        let artifacts = vec![
+            NpmMetadataArtifact {
+                path: "lodash/4.17.20/lodash-4.17.20.tgz".to_string(),
+                version: Some("4.17.20".to_string()),
+                checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                metadata: None,
+            },
+            NpmMetadataArtifact {
+                path: "lodash/4.17.21/lodash-4.17.21.tgz".to_string(),
+                version: Some("4.17.21".to_string()),
+                checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_string(),
+                metadata: None,
+            },
+        ];
+
+        let resp = build_npm_metadata_response(
+            &artifacts,
+            "lodash",
+            "https://my.registry.com",
+            "npm-virtual",
+        )
+        .unwrap();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(body["name"], "lodash");
+        assert_eq!(body["dist-tags"]["latest"], "4.17.21");
+        assert!(body["versions"]["4.17.20"].is_object());
+        assert!(body["versions"]["4.17.21"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_scoped_package() {
+        let artifacts = vec![NpmMetadataArtifact {
+            path: "@babel/core/7.24.0/core-7.24.0.tgz".to_string(),
+            version: Some("7.24.0".to_string()),
+            checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let resp = build_npm_metadata_response(
+            &artifacts,
+            "@babel/core",
+            "http://localhost:8080",
+            "npm-virtual",
+        )
+        .unwrap();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(body["name"], "@babel/core");
+        assert_eq!(
+            body["versions"]["7.24.0"]["dist"]["tarball"],
+            "http://localhost:8080/npm/npm-virtual/@babel/core/-/core-7.24.0.tgz"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_uses_virtual_repo_key() {
+        // The key point of the virtual repo fix: tarball URLs use the virtual
+        // repo key, not the underlying member repo key.
+        let artifacts = vec![NpmMetadataArtifact {
+            path: "express/4.18.2/express-4.18.2.tgz".to_string(),
+            version: Some("4.18.2".to_string()),
+            checksum_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let resp = build_npm_metadata_response(
+            &artifacts,
+            "express",
+            "http://localhost:8080",
+            "my-virtual-repo",
+        )
+        .unwrap();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let tarball = body["versions"]["4.18.2"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert!(
+            tarball.contains("my-virtual-repo"),
+            "tarball URL should use virtual repo key, got: {}",
+            tarball
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_with_version_metadata() {
+        let meta = serde_json::json!({
+            "version_data": {
+                "description": "A fast library",
+                "license": "MIT",
+                "main": "index.js"
+            }
+        });
+        let artifacts = vec![NpmMetadataArtifact {
+            path: "fastlib/2.0.0/fastlib-2.0.0.tgz".to_string(),
+            version: Some("2.0.0".to_string()),
+            checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            metadata: Some(meta),
+        }];
+
+        let resp = build_npm_metadata_response(
+            &artifacts,
+            "fastlib",
+            "http://localhost:8080",
+            "npm-hosted",
+        )
+        .unwrap();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let v = &body["versions"]["2.0.0"];
+        assert_eq!(v["description"], "A fast library");
+        assert_eq!(v["license"], "MIT");
+        assert_eq!(v["main"], "index.js");
+        assert_eq!(v["name"], "fastlib");
+        assert_eq!(v["version"], "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_skips_versionless_artifacts() {
+        let artifacts = vec![
+            NpmMetadataArtifact {
+                path: "pkg/1.0.0/pkg-1.0.0.tgz".to_string(),
+                version: Some("1.0.0".to_string()),
+                checksum_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                metadata: None,
+            },
+            NpmMetadataArtifact {
+                path: "pkg/unknown/pkg-unknown.tgz".to_string(),
+                version: None,
+                checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    .to_string(),
+                metadata: None,
+            },
+        ];
+
+        let resp =
+            build_npm_metadata_response(&artifacts, "pkg", "http://localhost:8080", "npm-hosted")
+                .unwrap();
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let versions = body["versions"].as_object().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions.contains_key("1.0.0"));
     }
 }
