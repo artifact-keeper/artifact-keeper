@@ -90,6 +90,13 @@ enum GoProxyRequest {
     Zip { module: String, version: String },
     /// `/@latest` — latest version info
     Latest { module: String },
+    /// `sumdb/...` — checksum database verification proxy
+    SumDb {
+        /// The sumdb host, e.g. `sum.golang.org`
+        host: String,
+        /// The remaining path after the host, e.g. `lookup/...` or `tile/...`
+        path: String,
+    },
 }
 
 /// Parse the wildcard path segment into a GoProxyRequest.
@@ -98,10 +105,36 @@ enum GoProxyRequest {
 ///   `github.com/!azure/go-sdk/@v/list`
 ///   `github.com/!azure/go-sdk/@v/v1.0.0.info`
 ///   `github.com/!azure/go-sdk/@latest`
+///   `sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0`
 #[allow(clippy::result_large_err)]
 fn parse_path(raw_path: &str) -> Result<GoProxyRequest, Response> {
     // Strip leading slash if present (axum wildcard may include it)
     let path = raw_path.strip_prefix('/').unwrap_or(raw_path);
+
+    // Check for sumdb/ prefix — go.sum verification requests.
+    // When GOPROXY is set, the Go toolchain sends checksum database queries
+    // through the proxy at paths like sumdb/sum.golang.org/lookup/...
+    if let Some(rest) = path.strip_prefix("sumdb/") {
+        // Expected format: sumdb/{host}/{remaining_path}
+        // e.g. sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0
+        // e.g. sumdb/sum.golang.org/tile/8/0/000
+        // e.g. sumdb/sum.golang.org/supported
+        if let Some(slash_pos) = rest.find('/') {
+            let host = rest[..slash_pos].to_string();
+            let remaining = rest[slash_pos + 1..].to_string();
+            if !host.is_empty() && !remaining.is_empty() {
+                return Ok(GoProxyRequest::SumDb {
+                    host,
+                    path: remaining,
+                });
+            }
+        }
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid sumdb path: expected sumdb/{host}/{path}",
+        )
+            .into_response());
+    }
 
     // Check for /@latest suffix
     if let Some(module_encoded) = path.strip_suffix("/@latest") {
@@ -187,7 +220,57 @@ async fn handle_get(
             download_zip(&state, &repo, &module, &version).await
         }
         GoProxyRequest::Latest { module } => latest_version(&state, &repo, &module).await,
+        GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET sumdb/... — Proxy to upstream checksum database
+// ---------------------------------------------------------------------------
+
+/// Proxy a sumdb request to the upstream checksum database.
+///
+/// The Go toolchain performs go.sum verification by querying
+/// `$GOPROXY/sumdb/sum.golang.org/{path}`. We forward these requests
+/// to `https://{host}/{path}` (defaulting to sum.golang.org).
+async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
+    let url = format!("https://{}/{}", host, path);
+
+    tracing::debug!("Proxying sumdb request to {}", url);
+
+    let client = reqwest::Client::new();
+    let upstream_resp = client.get(&url).send().await.map_err(|e| {
+        tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to reach checksum database: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let status = upstream_resp.status();
+    let content_type = upstream_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let body = upstream_resp.bytes().await.map_err(|e| {
+        tracing::warn!("sumdb proxy response read failed for {}: {}", url, e);
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read checksum database response: {}", e),
+        )
+            .into_response()
+    })?;
+
+    // Forward the upstream status code (200, 404, etc.)
+    Ok(Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,6 +1299,97 @@ mod tests {
     #[test]
     fn test_parse_path_invalid() {
         assert!(parse_path("github.com/user/repo/invalid").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // sumdb path parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_sumdb_lookup() {
+        let req = parse_path("sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "lookup/golang.org/x/text@v0.14.0");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_tile() {
+        let req = parse_path("sumdb/sum.golang.org/tile/8/0/000").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "tile/8/0/000");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_supported() {
+        let req = parse_path("sumdb/sum.golang.org/supported").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "supported");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_latest() {
+        let req = parse_path("sumdb/sum.golang.org/latest").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "latest");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_with_leading_slash() {
+        let req = parse_path("/sumdb/sum.golang.org/lookup/example.com/pkg@v1.0.0").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "sum.golang.org");
+                assert_eq!(path, "lookup/example.com/pkg@v1.0.0");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_custom_host() {
+        let req = parse_path("sumdb/custom.sumdb.example.com/lookup/mod@v1.0.0").unwrap();
+        match req {
+            GoProxyRequest::SumDb { host, path } => {
+                assert_eq!(host, "custom.sumdb.example.com");
+                assert_eq!(path, "lookup/mod@v1.0.0");
+            }
+            _ => panic!("Expected SumDb"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sumdb_no_path_returns_error() {
+        assert!(parse_path("sumdb/sum.golang.org").is_err());
+    }
+
+    #[test]
+    fn test_parse_sumdb_empty_host_returns_error() {
+        assert!(parse_path("sumdb//lookup").is_err());
+    }
+
+    #[test]
+    fn test_parse_sumdb_only_prefix_returns_error() {
+        assert!(parse_path("sumdb/").is_err());
     }
 
     // -----------------------------------------------------------------------
