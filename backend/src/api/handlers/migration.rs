@@ -651,6 +651,47 @@ async fn test_connection(
     Ok(Json(result))
 }
 
+/// Build a `WorkerConfig` from a `MigrationConfig`, clamping values to sane minimums.
+fn build_worker_config(config: &MigrationConfig) -> WorkerConfig {
+    WorkerConfig {
+        concurrency: config.concurrent_transfers.max(1) as usize,
+        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
+        dry_run: config.dry_run,
+        ..Default::default()
+    }
+}
+
+/// Mark a migration job as failed in the database. Best-effort: errors are
+/// logged but not propagated because this is typically called from a spawned
+/// task that has no caller to return an error to.
+async fn mark_job_failed(db: &sqlx::PgPool, job_id: Uuid, error_msg: &str) {
+    let _ = sqlx::query(
+        "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1",
+    )
+    .bind(job_id)
+    .bind(error_msg)
+    .execute(db)
+    .await;
+}
+
+/// Fetch a source connection by ID and construct the appropriate registry
+/// client (Artifactory or Nexus). Returns the client wrapped in an `Arc`.
+async fn fetch_connection_and_client(
+    db: &sqlx::PgPool,
+    connection_id: Uuid,
+) -> Result<Arc<dyn SourceRegistry>> {
+    let connection: SourceConnectionRow = sqlx::query_as(
+        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
+    )
+    .bind(connection_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+
+    create_source_client(&connection)
+        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))
+}
+
 /// Create the appropriate source registry client based on connection type
 fn create_source_client(
     connection: &SourceConnectionRow,
@@ -1023,17 +1064,7 @@ async fn start_migration(
         AppError::Conflict("Migration cannot be started (wrong state or not found)".into())
     })?;
 
-    // Fetch connection to create Artifactory client
-    let connection: SourceConnectionRow = sqlx::query_as(
-        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
-    )
-    .bind(job.source_connection_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
-
-    let client = create_source_client(&connection)
-        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
+    let client = fetch_connection_and_client(&state.db, job.source_connection_id).await?;
 
     // Parse migration config for conflict resolution
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
@@ -1045,34 +1076,19 @@ async fn start_migration(
         path: state.config.storage_path.clone(),
     })?;
 
-    // Create cancellation token for this job
     let cancel_token = CancellationToken::new();
-
-    // Create and spawn the migration worker
-    let worker_config = WorkerConfig {
-        concurrency: config.concurrent_transfers.max(1) as usize,
-        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
-        dry_run: config.dry_run,
-        ..Default::default()
-    };
+    let worker_config = build_worker_config(&config);
 
     let db = state.db.clone();
-    let fail_db = state.db.clone();
     let job_id = job.id;
     tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
+        let worker = MigrationWorker::new(db.clone(), storage, worker_config, cancel_token);
         if let Err(e) = worker
             .process_job(job_id, client, conflict_resolution, None)
             .await
         {
             tracing::error!(job_id = %job_id, error = %e, "Migration worker failed");
-            let _ = sqlx::query(
-                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
-            )
-            .bind(job_id)
-            .bind(e.to_string())
-            .execute(&fail_db)
-            .await;
+            mark_job_failed(&db, job_id, &e.to_string()).await;
         }
     });
 
@@ -1156,17 +1172,7 @@ async fn resume_migration(
         AppError::Conflict("Migration cannot be resumed (wrong state or not found)".into())
     })?;
 
-    // Fetch connection and spawn worker (same as start)
-    let connection: SourceConnectionRow = sqlx::query_as(
-        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
-    )
-    .bind(job.source_connection_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
-
-    let client = create_source_client(&connection)
-        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
+    let client = fetch_connection_and_client(&state.db, job.source_connection_id).await?;
 
     let config: MigrationConfig = serde_json::from_value(job.config.clone()).unwrap_or_default();
     let conflict_resolution = ConflictResolution::from_str(&config.conflict_resolution);
@@ -1176,31 +1182,18 @@ async fn resume_migration(
         path: state.config.storage_path.clone(),
     })?;
     let cancel_token = CancellationToken::new();
-
-    let worker_config = WorkerConfig {
-        concurrency: config.concurrent_transfers.max(1) as usize,
-        throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
-        dry_run: config.dry_run,
-        ..Default::default()
-    };
+    let worker_config = build_worker_config(&config);
 
     let db = state.db.clone();
-    let fail_db = state.db.clone();
     let job_id = job.id;
     tokio::spawn(async move {
-        let worker = MigrationWorker::new(db, storage, worker_config, cancel_token);
+        let worker = MigrationWorker::new(db.clone(), storage, worker_config, cancel_token);
         if let Err(e) = worker
             .resume_job(job_id, client, conflict_resolution, None)
             .await
         {
             tracing::error!(job_id = %job_id, error = %e, "Migration resume failed");
-            let _ = sqlx::query(
-                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
-            )
-            .bind(job_id)
-            .bind(e.to_string())
-            .execute(&fail_db)
-            .await;
+            mark_job_failed(&db, job_id, &e.to_string()).await;
         }
     });
 
@@ -1505,47 +1498,25 @@ async fn run_assessment(
         AppError::Conflict("Cannot start assessment (wrong state or not found)".into())
     })?;
 
-    // Fetch source connection to create the appropriate client
-    let connection: SourceConnectionRow = sqlx::query_as(
-        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
-    )
-    .bind(job.source_connection_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+    let client = fetch_connection_and_client(&state.db, job.source_connection_id).await?;
 
-    let client = create_source_client(&connection)
-        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
-
-    // Spawn the assessment worker following the same pattern as start_migration
+    // Spawn the assessment worker
     let db = state.db.clone();
-    let fail_db = state.db.clone();
     let job_id = job.id;
     let connection_id = job.source_connection_id;
     tokio::spawn(async move {
-        let service = MigrationService::new(db);
+        let service = MigrationService::new(db.clone());
         match service.run_assessment(connection_id, client.as_ref()).await {
             Ok(result) => {
                 if let Err(e) = service.save_assessment(job_id, &result).await {
                     tracing::error!(job_id = %job_id, error = %e, "Failed to save assessment results");
-                    let _ = sqlx::query(
-                        "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
-                    )
-                    .bind(job_id)
-                    .bind(format!("Failed to save assessment: {}", e))
-                    .execute(&fail_db)
-                    .await;
+                    mark_job_failed(&db, job_id, &format!("Failed to save assessment: {}", e))
+                        .await;
                 }
             }
             Err(e) => {
                 tracing::error!(job_id = %job_id, error = %e, "Assessment worker failed");
-                let _ = sqlx::query(
-                    "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
-                )
-                .bind(job_id)
-                .bind(e.to_string())
-                .execute(&fail_db)
-                .await;
+                mark_job_failed(&db, job_id, &e.to_string()).await;
             }
         }
     });
@@ -2105,6 +2076,55 @@ mod tests {
             let err_msg = format!("{}", result.unwrap_err());
             assert!(err_msg.contains("MIGRATION_ENCRYPTION_KEY"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_worker_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_worker_config_defaults() {
+        let config = MigrationConfig::default();
+        let wc = build_worker_config(&config);
+        // Default concurrent_transfers is 0 via Default, clamped to 1
+        assert!(wc.concurrency >= 1);
+        assert!(!wc.dry_run);
+    }
+
+    #[test]
+    fn test_build_worker_config_custom_values() {
+        let config = MigrationConfig {
+            concurrent_transfers: 8,
+            throttle_delay_ms: 250,
+            dry_run: true,
+            ..Default::default()
+        };
+        let wc = build_worker_config(&config);
+        assert_eq!(wc.concurrency, 8);
+        assert_eq!(wc.throttle_delay_ms, 250);
+        assert!(wc.dry_run);
+    }
+
+    #[test]
+    fn test_build_worker_config_clamps_negative_concurrency() {
+        let config = MigrationConfig {
+            concurrent_transfers: -5,
+            throttle_delay_ms: -10,
+            ..Default::default()
+        };
+        let wc = build_worker_config(&config);
+        assert_eq!(wc.concurrency, 1);
+        assert_eq!(wc.throttle_delay_ms, 0);
+    }
+
+    #[test]
+    fn test_build_worker_config_zero_concurrency() {
+        let config = MigrationConfig {
+            concurrent_transfers: 0,
+            ..Default::default()
+        };
+        let wc = build_worker_config(&config);
+        assert_eq!(wc.concurrency, 1, "concurrency of 0 should be clamped to 1");
     }
 }
 
