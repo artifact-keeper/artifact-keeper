@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-04-09
+
+### Sponsors
+
+Thank you to our backers for supporting ongoing development:
+
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper)
+
+### Thank You
+
+- @feicipet for reporting the Maven checksum validation failure on virtual repos (#660)
+- @ReneBeszon for reporting the Nexus migration stall (#654) and npm virtual repo metadata issue (#652)
+- @m1m1x for reporting the APK remote repo multi-version failure (#653)
+- @thonby for reporting the OIDC redirect_uri issue behind reverse proxies (#655)
+- @jamie-kemp for reporting the Go proxy `go get` failure (#651)
+
+### Fixed
+- **Maven checksum 404 on virtual repos** (#660) - checksum requests (.sha1, .md5, .sha256) through virtual Maven repositories now traverse member repos and proxy from upstream, matching the behavior of artifact downloads.
+- **Migration assessment stalls forever** (#654) - the assessment handler now spawns a background worker to run the assessment. Previously it set the job status to "assessing" but never executed the work. Assessment results are stored and retrievable via the GET endpoint.
+- **APK remote proxy 500 across Alpine versions** (#653) - when a proxy-cached artifact's storage key is inaccessible, the handler now falls through to re-fetch from upstream instead of returning HTTP 500.
+- **OIDC redirect_uri behind reverse proxy** (#655, #657) - the redirect URI is now constructed as an absolute URL using the request's Host header, fixing Keycloak/OIDC callbacks that failed when running behind a reverse proxy.
+- **npm virtual repo metadata for local members** (#652, #659) - virtual npm repositories now include metadata from local and staging member repos, not just remote members.
+- **Go proxy sumdb verification paths** (#651, #658) - `go get` through proxy repos no longer fails with "Bad Request" when the Go toolchain requests sumdb verification paths.
+
+### Dependencies
+- bergshamra 0.3.1 -> 0.4.0
+- quick-xml 0.39.0 -> 0.39.2
+- zip 2.4.2 -> 8.5.1
+- docker/login-action 4.0.0 -> 4.1.0
+- aws-actions/configure-aws-credentials 6.0.0 -> 6.1.0
+
 ## [1.1.0] - 2026-04-01
 
 This is the first stable release of Artifact Keeper.
