@@ -446,6 +446,49 @@ async fn download(
             }
         }
 
+        // Virtual repo: try each member in priority order
+        if repo.repo_type == RepositoryType::Virtual {
+            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+            for member in &members {
+                // Try computing the checksum from the member's stored artifact
+                if let Ok(response) = serve_computed_checksum(
+                    &state,
+                    member.id,
+                    &member.storage_location(),
+                    base_path,
+                    checksum_type,
+                )
+                .await
+                {
+                    return Ok(response);
+                }
+
+                // If member is remote, try proxying the checksum file from upstream
+                if member.repo_type == RepositoryType::Remote {
+                    if let (Some(ref upstream_url), Some(ref proxy)) =
+                        (&member.upstream_url, &state.proxy_service)
+                    {
+                        if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            &path,
+                        )
+                        .await
+                        {
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "text/plain")
+                                .body(Body::from(content))
+                                .unwrap());
+                        }
+                    }
+                }
+            }
+        }
+
         return Err(AppError::NotFound("File not found".to_string()).into_response());
     }
 
@@ -1822,5 +1865,33 @@ mod tests {
         );
         assert_eq!(entry["classifier"], "sources");
         assert_eq!(entry["extension"], "jar");
+    }
+
+    // -----------------------------------------------------------------------
+    // checksum_suffix (used in virtual repo checksum resolution, #660)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checksum_suffix_mapping() {
+        assert_eq!(checksum_suffix(ChecksumType::Sha1), "sha1");
+        assert_eq!(checksum_suffix(ChecksumType::Md5), "md5");
+        assert_eq!(checksum_suffix(ChecksumType::Sha256), "sha256");
+        assert_eq!(checksum_suffix(ChecksumType::Sha512), "sha512");
+    }
+
+    #[test]
+    fn test_checksum_path_round_trip() {
+        // Verify that parsing a checksum path and re-appending the suffix
+        // yields the original path (important for virtual repo resolution).
+        let paths = vec![
+            "org/junit/junit/4.13.2/junit-4.13.2.jar.sha1",
+            "com/example/lib/1.0/lib-1.0.pom.md5",
+            "org/apache/maven/maven-core/3.9.6/maven-core-3.9.6.jar.sha256",
+        ];
+        for path in paths {
+            let (base, ct) = parse_checksum_path(path).unwrap();
+            let reconstructed = format!("{}.{}", base, checksum_suffix(ct));
+            assert_eq!(reconstructed, path);
+        }
     }
 }

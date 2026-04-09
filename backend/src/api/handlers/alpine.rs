@@ -543,26 +543,18 @@ async fn download_package(
         Ok(a) => a,
         Err(not_found) => {
             if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
+                if let Some(response) = try_proxy_apk(
+                    &state,
+                    &repo,
+                    &repo_key,
+                    &branch,
+                    &repository,
+                    &arch,
+                    &filename,
+                )
+                .await?
                 {
-                    let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
+                    return Ok(response);
                 }
             }
 
@@ -609,33 +601,92 @@ async fn download_package(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    match storage.get(&artifact.storage_key).await {
+        Ok(content) => {
+            // Record download
+            let _ = sqlx::query!(
+                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+                artifact.id
+            )
+            .execute(&state.db)
+            .await;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/vnd.alpine.package")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+                .body(Body::from(content))
+                .unwrap())
+        }
+        Err(e) => {
+            // Storage retrieval failed. For remote repos, the DB record may
+            // have been created by the proxy cache with a storage key that
+            // is not accessible via the repo's own storage backend. Fall
+            // through to proxy fetch to re-download from upstream.
+            tracing::warn!(
+                "Storage get failed for artifact {} (key: {}): {}. Falling through to proxy.",
+                artifact.id,
+                artifact.storage_key,
+                e,
+            );
+            if repo.repo_type == RepositoryType::Remote {
+                if let Some(response) = try_proxy_apk(
+                    &state,
+                    &repo,
+                    &repo_key,
+                    &branch,
+                    &repository,
+                    &arch,
+                    &filename,
+                )
+                .await?
+                {
+                    return Ok(response);
+                }
+            }
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response())
+        }
+    }
+}
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/vnd.alpine.package")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
-        .unwrap())
+/// Attempt to proxy-fetch an APK package from the upstream remote repository.
+/// Returns `Ok(Some(response))` on success, `Ok(None)` if the repo has no
+/// upstream or proxy configured, or `Err(response)` on proxy failure.
+async fn try_proxy_apk(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    branch: &str,
+    repository: &str,
+    arch: &str,
+    filename: &str,
+) -> Result<Option<Response>, Response> {
+    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+        (Some(u), Some(p)) => (u, p),
+        _ => return Ok(None),
+    };
+    let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
+    let (content, content_type) =
+        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path).await?;
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                "Content-Type",
+                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+            )
+            .body(Body::from(content))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,5 +1514,39 @@ mod tests {
             full_url,
             "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-version path differentiation (#653)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_paths_differ_across_alpine_versions() {
+        // The same package name must produce different artifact paths for
+        // different Alpine versions, preventing cross-version collisions.
+        let path_v322 = build_alpine_artifact_path("v3.22", "main", "x86_64", "curl-8.5.0-r0.apk");
+        let path_v323 = build_alpine_artifact_path("v3.23", "main", "x86_64", "curl-8.5.0-r0.apk");
+        assert_ne!(path_v322, path_v323);
+        assert!(path_v322.starts_with("v3.22/"));
+        assert!(path_v323.starts_with("v3.23/"));
+    }
+
+    #[test]
+    fn test_artifact_path_includes_all_components() {
+        let path =
+            build_alpine_artifact_path("v3.21", "community", "aarch64", "nginx-1.26.0-r0.apk");
+        assert_eq!(path, "v3.21/community/aarch64/nginx-1.26.0-r0.apk");
+    }
+
+    #[test]
+    fn test_storage_keys_differ_across_alpine_versions() {
+        let repo_id = uuid::Uuid::new_v4();
+        let path_v322 =
+            build_alpine_artifact_path("v3.22", "main", "x86_64", "busybox-1.37.0-r10.apk");
+        let path_v323 =
+            build_alpine_artifact_path("v3.23", "main", "x86_64", "busybox-1.37.0-r10.apk");
+        let key_v322 = build_alpine_storage_key(repo_id, &path_v322);
+        let key_v323 = build_alpine_storage_key(repo_id, &path_v323);
+        assert_ne!(key_v322, key_v323);
     }
 }

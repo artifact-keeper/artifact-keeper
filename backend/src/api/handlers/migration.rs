@@ -40,6 +40,7 @@ fn migration_encryption_key() -> Result<String> {
         )
     })
 }
+use crate::services::migration_service::MigrationService;
 use crate::services::migration_worker::{ConflictResolution, MigrationWorker, WorkerConfig};
 use crate::services::nexus_client::{NexusAuth, NexusClient, NexusClientConfig};
 use crate::services::source_registry::SourceRegistry;
@@ -1504,7 +1505,46 @@ async fn run_assessment(
         AppError::Conflict("Cannot start assessment (wrong state or not found)".into())
     })?;
 
-    // TODO: Spawn assessment worker
+    // Fetch source connection to create client
+    let connection: SourceConnectionRow = sqlx::query_as(
+        "SELECT id, name, url, auth_type, credentials_enc, source_type, created_at, created_by, verified_at FROM source_connections WHERE id = $1",
+    )
+    .bind(job.source_connection_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Source connection not found".into()))?;
+
+    let client = create_source_client(&connection)
+        .map_err(|e| AppError::Internal(format!("Failed to create client: {}", e)))?;
+
+    let db = state.db.clone();
+    let job_id = job.id;
+    let connection_id = job.source_connection_id;
+    tokio::spawn(async move {
+        let service = MigrationService::new(db.clone());
+        let err = match service.run_assessment(connection_id, &*client).await {
+            Ok(result) => match service.save_assessment(job_id, &result).await {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::error!(job_id = %job_id, error = %e, "Failed to save assessment results");
+                    Some(e.to_string())
+                }
+            },
+            Err(e) => {
+                tracing::error!(job_id = %job_id, error = %e, "Assessment worker failed");
+                Some(e.to_string())
+            }
+        };
+        if let Some(msg) = err {
+            let _ = sqlx::query(
+                "UPDATE migration_jobs SET status = 'failed', finished_at = NOW(), error_summary = $2 WHERE id = $1"
+            )
+            .bind(job_id)
+            .bind(msg)
+            .execute(&db)
+            .await;
+        }
+    });
 
     Ok((StatusCode::ACCEPTED, Json(job.into())))
 }
@@ -1544,7 +1584,42 @@ async fn get_assessment(
     .await?
     .ok_or_else(|| AppError::NotFound("Migration job not found".into()))?;
 
-    // TODO: Return actual assessment results from database/cache
+    // Extract assessment results from the job's config JSON (saved by save_assessment)
+    let assessment_json = job.config.get("assessment");
+    if let Some(assessment) = assessment_json {
+        if let Ok(service_result) = serde_json::from_value::<
+            crate::services::migration_service::AssessmentResult,
+        >(assessment.clone())
+        {
+            return Ok(Json(AssessmentResult {
+                job_id: job.id,
+                status: job.status,
+                repositories: service_result
+                    .repositories
+                    .into_iter()
+                    .map(|r| RepositoryAssessment {
+                        key: r.key,
+                        repo_type: r.repo_type,
+                        package_type: r.package_type,
+                        artifact_count: r.artifact_count,
+                        total_size_bytes: r.total_size_bytes,
+                        compatibility: r.compatibility,
+                        warnings: r.warnings,
+                    })
+                    .collect(),
+                users_count: service_result.users_count,
+                groups_count: service_result.groups_count,
+                permissions_count: service_result.permissions_count,
+                total_artifacts: service_result.total_artifacts,
+                total_size_bytes: service_result.total_size_bytes,
+                estimated_duration_seconds: service_result.estimated_duration_seconds,
+                warnings: service_result.warnings,
+                blockers: service_result.blockers,
+            }));
+        }
+    }
+
+    // Assessment not yet completed or results not available
     Ok(Json(AssessmentResult {
         job_id: job.id,
         status: job.status,
