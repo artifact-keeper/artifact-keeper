@@ -113,4 +113,4 @@ tonic-build = "0.12"
 url = "2.5"
 
 # XML Digital Signatures (SAML signature verification)
-bergshamra = "0.3"
+bergshamra = "0.4"
