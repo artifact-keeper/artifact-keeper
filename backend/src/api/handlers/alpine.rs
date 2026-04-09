@@ -609,33 +609,69 @@ async fn download_package(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    match storage.get(&artifact.storage_key).await {
+        Ok(content) => {
+            // Record download
+            let _ = sqlx::query!(
+                "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+                artifact.id
+            )
+            .execute(&state.db)
+            .await;
 
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/vnd.alpine.package")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
-        .unwrap())
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/vnd.alpine.package")
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+                .body(Body::from(content))
+                .unwrap())
+        }
+        Err(e) => {
+            // Storage retrieval failed. For remote repos, the DB record may
+            // have been created by the proxy cache with a storage key that
+            // is not accessible via the repo's own storage backend. Fall
+            // through to proxy fetch to re-download from upstream.
+            tracing::warn!(
+                "Storage get failed for artifact {} (key: {}): {}. Falling through to proxy.",
+                artifact.id,
+                artifact.storage_key,
+                e,
+            );
+            if repo.repo_type == RepositoryType::Remote {
+                if let (Some(ref upstream_url), Some(ref proxy)) =
+                    (&repo.upstream_url, &state.proxy_service)
+                {
+                    let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
+                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        &upstream_path,
+                    )
+                    .await?;
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            "Content-Type",
+                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                        )
+                        .body(Body::from(content))
+                        .unwrap());
+                }
+            }
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage error: {}", e),
+            )
+                .into_response())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
