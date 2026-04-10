@@ -103,7 +103,7 @@ utoipa-axum = "0.1"
 utoipa-swagger-ui = { version = "8", features = ["axum"] }
 
 # gRPC
-tonic = "0.12"
+tonic = "0.14"
 tonic-reflection = "0.12"
 prost = "0.13"
 prost-types = "0.13"
