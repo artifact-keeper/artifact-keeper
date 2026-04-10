@@ -35,11 +35,12 @@ Thank you to our backers for supporting ongoing development:
 - **Go proxy sumdb verification paths** (#651, #658) - `go get` through proxy repos no longer fails with "Bad Request" when the Go toolchain requests sumdb verification paths.
 
 ### Dependencies
-- bergshamra 0.3.1 -> 0.4.0
 - quick-xml 0.39.0 -> 0.39.2
 - zip 2.4.2 -> 8.5.1
 - docker/login-action 4.0.0 -> 4.1.0
 - aws-actions/configure-aws-credentials 6.0.0 -> 6.1.0
+
+Note: bergshamra was held at 0.3.x in this release. See #691 for upgrade blocker tracking.
 
 ## [1.1.0] - 2026-04-01
 
