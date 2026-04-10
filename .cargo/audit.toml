@@ -12,4 +12,26 @@ ignore = [
     # 3. The server to be using RSA for authentication
     # Risk is low for our use case as we don't use MySQL or RSA authentication.
     "RUSTSEC-2023-0071",
+
+    # wasmtime 24.0.7 - Winch compiler backend advisories (2026-04-09 batch)
+    # These four advisories only affect users of the Winch compiler backend.
+    # We use the default Cranelift backend and never call Strategy::Winch.
+    # Tracked for future upgrade evaluation in issue #691.
+    "RUSTSEC-2026-0086", # Host data leakage with 64-bit tables and Winch (low, 2.3)
+    "RUSTSEC-2026-0089", # Host panic when Winch compiler executes table.fill (medium, 5.9)
+    "RUSTSEC-2026-0094", # Improperly masked return value from table.grow with Winch (medium, 6.1)
+    "RUSTSEC-2026-0095", # Winch sandbox-escaping memory access (critical, 9.0)
+
+    # wasmtime 24.0.7 - Pooling allocator data leakage (2026-04-09 batch)
+    # Only affects users of the pooling allocation strategy. We use the
+    # default on-demand allocator. Tracked in issue #691.
+    "RUSTSEC-2026-0088", # Data leakage between pooling allocator instances (low, 2.3)
+
+    # wasmtime 24.0.7 - aarch64 Cranelift sandbox escape (2026-04-09 batch)
+    # CRITICAL on aarch64 deployments. Fix requires upgrading to wasmtime
+    # >=36.0.7, which is a major version jump requiring code changes across
+    # the plugin system. WASM plugins can only be uploaded by authenticated
+    # admin users (not from untrusted sources), limiting exposure. Tracked
+    # for immediate follow-up in issue #691.
+    "RUSTSEC-2026-0096", # Miscompiled guest heap access, aarch64 Cranelift (critical, 9.0)
 ]
