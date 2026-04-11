@@ -43,11 +43,39 @@ impl Default for WorkerConfig {
             concurrency: 4,
             throttle_delay_ms: 100,
             max_retries: 3,
-            batch_size: 100,
+            // AQL default page size. Kept at 1000 (Artifactory's typical
+            // ceiling) so a single page can cover most repositories without
+            // hammering the source API. The migration worker still paginates
+            // through as many pages as needed to enumerate every artifact.
+            batch_size: 1000,
             verify_checksums: true,
             dry_run: false,
         }
     }
+}
+
+/// Maximum number of AQL pages a single repository migration is allowed to
+/// fetch. Acts as a safety guard against an infinite pagination loop if the
+/// source API misbehaves (for example, by always returning a full page of
+/// results regardless of offset). At the default batch size of 1000 this
+/// still lets a single repository contain up to 100 million artifacts.
+pub(crate) const MAX_ARTIFACT_PAGES: usize = 100_000;
+
+/// Decide whether artifact pagination should continue after processing a
+/// page. The Artifactory AQL `range.total` field reports the number of rows
+/// in the current page (not the overall result set), so the termination
+/// decision must be based on page shape, not on a running total.
+///
+/// Returns `true` when the caller should fetch the next page, `false` when
+/// the enumeration is complete.
+pub(crate) fn should_fetch_next_page(page_len: usize, limit: i64) -> bool {
+    if page_len == 0 {
+        return false;
+    }
+    // A short page means we've reached the end of the result set. AQL always
+    // fills pages up to the requested limit unless there are no more rows.
+    let limit_usize = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+    page_len >= limit_usize
 }
 
 /// Conflict resolution strategy
@@ -247,13 +275,29 @@ impl MigrationWorker {
         progress_tx: Option<mpsc::Sender<ProgressUpdate>>,
     ) -> Result<(), MigrationError> {
         let mut offset = 0i64;
-        let limit = self.config.batch_size;
+        let limit = self.config.batch_size.max(1);
+        let mut pages_fetched = 0usize;
 
         loop {
+            // Safety guard: refuse to keep paginating forever if the source
+            // API repeatedly returns full pages without advancing.
+            if pages_fetched >= MAX_ARTIFACT_PAGES {
+                tracing::warn!(
+                    job_id = %job_id,
+                    repo = %repo_key,
+                    pages = pages_fetched,
+                    "Reached MAX_ARTIFACT_PAGES while listing artifacts; stopping pagination"
+                );
+                break;
+            }
+
             // List artifacts with pagination
             let artifacts = client.list_artifacts(repo_key, offset, limit).await?;
+            pages_fetched += 1;
 
-            if artifacts.results.is_empty() {
+            let page_len = artifacts.results.len();
+
+            if page_len == 0 {
                 break;
             }
 
@@ -325,12 +369,29 @@ impl MigrationWorker {
                 self.apply_throttle().await;
             }
 
-            // Check if we've processed all artifacts
-            if (offset + artifacts.results.len() as i64) >= artifacts.range.total {
+            // Advance the cursor. AQL's `range.total` reports the count of
+            // rows in the current page (matching `end_pos - start_pos`), so
+            // termination must be decided from the page shape, not from a
+            // running total. A short page (fewer rows than `limit`) means
+            // the result set is exhausted.
+            if !should_fetch_next_page(page_len, limit) {
                 break;
             }
 
-            offset += limit;
+            // Guard against a pathological source that returns full pages
+            // without advancing the cursor. This prevents an infinite loop
+            // if the offset fails to move forward.
+            let new_offset = offset.saturating_add(page_len as i64);
+            if new_offset <= offset {
+                tracing::warn!(
+                    job_id = %job_id,
+                    repo = %repo_key,
+                    offset,
+                    "AQL pagination cursor failed to advance; stopping to avoid infinite loop"
+                );
+                break;
+            }
+            offset = new_offset;
         }
 
         Ok(())
@@ -1151,9 +1212,50 @@ mod tests {
         assert_eq!(config.concurrency, 4);
         assert_eq!(config.throttle_delay_ms, 100);
         assert_eq!(config.max_retries, 3);
-        assert_eq!(config.batch_size, 100);
+        assert_eq!(config.batch_size, 1000);
         assert!(config.verify_checksums);
         assert!(!config.dry_run);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_fetch_next_page (#671 pagination fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_fetch_next_page_full_page_continues() {
+        // A full page (page_len == limit) means more rows are likely available
+        assert!(should_fetch_next_page(1000, 1000));
+        assert!(should_fetch_next_page(100, 100));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_short_page_terminates() {
+        // A short page (page_len < limit) means the result set is exhausted
+        assert!(!should_fetch_next_page(42, 1000));
+        assert!(!should_fetch_next_page(999, 1000));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_empty_terminates() {
+        // An empty page always terminates
+        assert!(!should_fetch_next_page(0, 1000));
+        assert!(!should_fetch_next_page(0, 1));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_negative_limit_handled() {
+        // Defensive: negative or zero limits should not panic
+        assert!(!should_fetch_next_page(0, -1));
+        assert!(should_fetch_next_page(5, -1));
+    }
+
+    #[test]
+    fn test_max_artifact_pages_constant_is_safety_guard() {
+        // Sanity check the safety guard is reasonable: with 1000 rows per
+        // page, this allows enumerating up to 100M artifacts in a single
+        // repository before bailing out.
+        let min_pages = 10_000;
+        assert!(MAX_ARTIFACT_PAGES >= min_pages);
     }
 
     #[test]
