@@ -262,6 +262,8 @@ mod tests {
             storage_key: String::new(),
             is_deleted: false,
             uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO artifacts (\n                repository_id, path, name, version, size_bytes,\n                checksum_sha256, content_type, storage_key, uploaded_by\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            ON CONFLICT (repository_id, path) DO UPDATE SET\n                name = EXCLUDED.name,\n                version = EXCLUDED.version,\n                size_bytes = EXCLUDED.size_bytes,\n                checksum_sha256 = EXCLUDED.checksum_sha256,\n                content_type = EXCLUDED.content_type,\n                storage_key = EXCLUDED.storage_key,\n                uploaded_by = EXCLUDED.uploaded_by,\n                is_deleted = false,\n                updated_at = NOW()\n            RETURNING\n                id, repository_id, path, name, version, size_bytes,\n                checksum_sha256, checksum_md5, checksum_sha1,\n                content_type, storage_key, is_deleted, uploaded_by,\n                created_at, updated_at\n            ",
+  "query": "\n            SELECT id, repository_id, path, name, version, size_bytes,\n                   checksum_sha256, checksum_md5, checksum_sha1,\n                   content_type, storage_key, is_deleted, uploaded_by,\n                   quarantine_status, quarantine_until,\n                   created_at, updated_at\n            FROM artifacts\n            WHERE id = $1 AND is_deleted = false\n            ",
   "describe": {
     "columns": [
       {
@@ -70,25 +70,27 @@
       },
       {
         "ordinal": 13,
+        "name": "quarantine_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "quarantine_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 14,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Int8",
-        "Bpchar",
-        "Varchar",
-        "Varchar",
         "Uuid"
       ]
     },
@@ -106,9 +108,11 @@
       false,
       false,
       true,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "05ffc53ac0c7649ec607a90f7f71ee7cef00141e4c78234fbb411a9d12b27562"
+  "hash": "b9d877b561e22a14df12f0b9368fce7522598b64b422106f6f391121343b3b86"
 }

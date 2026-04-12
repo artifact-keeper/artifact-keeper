@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, repository_id, path, name, version, size_bytes,\n            checksum_sha256, checksum_md5, checksum_sha1,\n            content_type, storage_key, is_deleted, uploaded_by,\n            created_at, updated_at\n        FROM artifacts\n        WHERE repository_id = $1 AND path = $2 AND is_deleted = false\n        ",
+  "query": "\n            SELECT\n                id, repository_id, path, name, version, size_bytes,\n                checksum_sha256, checksum_md5, checksum_sha1,\n                content_type, storage_key, is_deleted, uploaded_by,\n                quarantine_status, quarantine_until,\n                created_at, updated_at\n            FROM artifacts\n            WHERE id = $1 AND repository_id = $2 AND is_deleted = false\n            ",
   "describe": {
     "columns": [
       {
@@ -70,11 +70,21 @@
       },
       {
         "ordinal": 13,
+        "name": "quarantine_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "quarantine_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 14,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -82,7 +92,7 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -99,9 +109,11 @@
       false,
       false,
       true,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "0473ee960369d526e6411adafefa60ca500febf7ea0c6ca271129dc723565242"
+  "hash": "e3ff56c317454630e9cf4d5d2a452b4e0ee67acfe10227dbaee6c2fa1218344b"
 }

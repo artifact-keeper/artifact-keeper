@@ -172,6 +172,15 @@ pub struct Config {
     /// Duration in minutes that a locked account remains locked before the
     /// user can try again. Default: 30.
     pub account_lockout_duration_minutes: i64,
+
+    /// When true, newly uploaded artifacts are held in quarantine until
+    /// security scanning completes or the hold period expires. Repositories
+    /// can override this via repository_config keys. Default: false.
+    pub quarantine_enabled: bool,
+
+    /// Default quarantine hold period in minutes. Repositories can override
+    /// this via repository_config keys. Default: 60.
+    pub quarantine_duration_minutes: i64,
 }
 
 redacted_debug!(Config {
@@ -223,6 +232,8 @@ redacted_debug!(Config {
     show rate_limit_exempt_service_accounts,
     show account_lockout_threshold,
     show account_lockout_duration_minutes,
+    show quarantine_enabled,
+    show quarantine_duration_minutes,
 });
 
 impl Config {
@@ -329,6 +340,11 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            quarantine_enabled: matches!(
+                env::var("QUARANTINE_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60),
         };
 
         config.validate_jwt_secret()?;

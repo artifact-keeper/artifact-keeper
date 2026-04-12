@@ -449,6 +449,14 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
+        // Quarantine management routes with auth middleware
+        .nest(
+            "/quarantine",
+            handlers::quarantine::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // Quality gates and health scoring routes with auth middleware
         .nest(
             "/quality",
