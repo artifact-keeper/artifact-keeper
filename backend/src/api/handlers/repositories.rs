@@ -134,6 +134,8 @@ pub fn router() -> Router<SharedState> {
         .merge(super::security::repo_security_router())
         // Label routes nested under repository
         .merge(super::repository_labels::repo_labels_router())
+        // Token management routes nested under repository
+        .merge(super::repo_tokens::repo_tokens_router())
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]

@@ -72,6 +72,7 @@ pub mod puppet;
 pub mod pypi;
 pub mod quality_gates;
 pub mod remote_instances;
+pub mod repo_tokens;
 pub mod repositories;
 pub mod repository_labels;
 pub mod rpm;
