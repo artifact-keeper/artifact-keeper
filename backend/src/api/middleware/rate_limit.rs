@@ -2,7 +2,7 @@
 //!
 //! Provides per-IP and per-user rate limiting with configurable limits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,43 @@ use axum::{
 use tokio::sync::RwLock;
 
 use super::auth::AuthExtension;
+
+/// Set of users and service account flags that bypass rate limiting.
+#[derive(Debug, Clone)]
+pub struct RateLimitExemptions {
+    pub usernames: HashSet<String>,
+    pub exempt_service_accounts: bool,
+}
+
+impl RateLimitExemptions {
+    pub fn new(usernames: Vec<String>, exempt_service_accounts: bool) -> Self {
+        Self {
+            usernames: usernames.into_iter().collect(),
+            exempt_service_accounts,
+        }
+    }
+
+    pub fn is_exempt(&self, auth: &AuthExtension) -> bool {
+        if self.usernames.contains(&auth.username) {
+            return true;
+        }
+        if self.exempt_service_accounts && auth.is_service_account {
+            return true;
+        }
+        false
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.usernames.is_empty() && !self.exempt_service_accounts
+    }
+}
+
+/// Combines a rate limiter with exemption rules, passed as shared state to the middleware.
+#[derive(Debug, Clone)]
+pub struct RateLimitState {
+    pub limiter: Arc<RateLimiter>,
+    pub exemptions: Arc<RateLimitExemptions>,
+}
 
 /// Per-instance, in-memory rate limiter that tracks requests per key (IP or user ID).
 ///
@@ -94,29 +131,49 @@ impl RateLimiter {
 /// Returns 429 Too Many Requests when the limit is exceeded,
 /// with a Retry-After header indicating when to retry.
 pub async fn rate_limit_middleware(
-    State(limiter): State<Arc<RateLimiter>>,
+    State(state): State<RateLimitState>,
     request: Request,
     next: Next,
 ) -> Response {
+    // Extract auth from extensions (required or optional middleware)
+    let auth = request
+        .extensions()
+        .get::<AuthExtension>()
+        .cloned()
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<Option<AuthExtension>>()
+                .and_then(|opt| opt.clone())
+        });
+
+    // Check exemptions before rate limiting
+    if let Some(ref auth) = auth {
+        if state.exemptions.is_exempt(auth) {
+            let mut response = next.run(request).await;
+            if let Ok(value) = HeaderValue::from_str("true") {
+                response.headers_mut().insert("X-RateLimit-Exempt", value);
+            }
+            return response;
+        }
+    }
+
     // Determine the rate limit key
     // Priority: authenticated user ID > IP address
-    let key = if let Some(auth) = request.extensions().get::<AuthExtension>() {
-        format!("user:{}", auth.user_id)
-    } else if let Some(Some(auth)) = request.extensions().get::<Option<AuthExtension>>() {
-        // Handle optional auth middleware case
+    let key = if let Some(ref auth) = auth {
         format!("user:{}", auth.user_id)
     } else {
         extract_client_ip(&request)
     };
 
     // Check rate limit
-    match limiter.check_rate_limit(&key).await {
+    match state.limiter.check_rate_limit(&key).await {
         Ok(remaining) => {
             let mut response = next.run(request).await;
 
             // Add rate limit headers to successful responses
             let headers = response.headers_mut();
-            if let Ok(value) = HeaderValue::from_str(&limiter.max_requests.to_string()) {
+            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
                 headers.insert("X-RateLimit-Limit", value);
             }
             if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
@@ -126,6 +183,12 @@ pub async fn rate_limit_middleware(
             response
         }
         Err(retry_after) => {
+            tracing::debug!(
+                key = %key,
+                retry_after = retry_after,
+                "rate limit exceeded"
+            );
+
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Rate limit exceeded. Please try again later.",
@@ -137,7 +200,7 @@ pub async fn rate_limit_middleware(
             if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
                 headers.insert("Retry-After", value);
             }
-            if let Ok(value) = HeaderValue::from_str(&limiter.max_requests.to_string()) {
+            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
                 headers.insert("X-RateLimit-Limit", value);
             }
             if let Ok(value) = HeaderValue::from_str("0") {
@@ -434,5 +497,52 @@ mod tests {
             .insert(axum::extract::ConnectInfo(addr));
         // ConnectInfo takes priority over spoofable headers
         assert_eq!(extract_client_ip(&request), "ip:10.0.0.5");
+    }
+
+    // -----------------------------------------------------------------------
+    // RateLimitExemptions
+    // -----------------------------------------------------------------------
+
+    fn make_auth(username: &str, is_service_account: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: uuid::Uuid::new_v4(),
+            username: username.to_string(),
+            email: format!("{}@test.com", username),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_exemptions_by_username() {
+        let ex = RateLimitExemptions::new(vec!["ci-bot".into()], false);
+        assert!(ex.is_exempt(&make_auth("ci-bot", false)));
+        assert!(!ex.is_exempt(&make_auth("alice", false)));
+    }
+
+    #[test]
+    fn test_exemptions_service_accounts() {
+        let ex = RateLimitExemptions::new(Vec::new(), true);
+        assert!(ex.is_exempt(&make_auth("deploy-sa", true)));
+        assert!(!ex.is_exempt(&make_auth("alice", false)));
+    }
+
+    #[test]
+    fn test_exemptions_empty() {
+        let ex = RateLimitExemptions::new(Vec::new(), false);
+        assert!(ex.is_empty());
+        assert!(!ex.is_exempt(&make_auth("alice", true)));
+    }
+
+    #[test]
+    fn test_exemptions_combined() {
+        let ex = RateLimitExemptions::new(vec!["ci-bot".into()], true);
+        assert!(!ex.is_empty());
+        assert!(ex.is_exempt(&make_auth("ci-bot", false)));
+        assert!(ex.is_exempt(&make_auth("deploy-sa", true)));
+        assert!(!ex.is_exempt(&make_auth("alice", false)));
     }
 }

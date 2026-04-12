@@ -762,6 +762,11 @@ mod tests {
             database_acquire_timeout_secs: 30,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 5000,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -814,6 +819,11 @@ mod tests {
             database_acquire_timeout_secs: 30,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 5000,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
         }
     }
 

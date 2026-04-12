@@ -158,6 +158,12 @@ pub struct Config {
     /// lifetime policy or when running behind a TCP load balancer with an
     /// idle disconnect.
     pub database_max_lifetime_secs: u64,
+
+    pub rate_limit_auth_per_window: u32,
+    pub rate_limit_api_per_window: u32,
+    pub rate_limit_window_secs: u64,
+    pub rate_limit_exempt_usernames: Vec<String>,
+    pub rate_limit_exempt_service_accounts: bool,
 }
 
 redacted_debug!(Config {
@@ -202,6 +208,11 @@ redacted_debug!(Config {
     show database_acquire_timeout_secs,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
+    show rate_limit_auth_per_window,
+    show rate_limit_api_per_window,
+    show rate_limit_window_secs,
+    show rate_limit_exempt_usernames,
+    show rate_limit_exempt_service_accounts,
 });
 
 impl Config {
@@ -290,6 +301,22 @@ impl Config {
             database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 30),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
+            rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
+            rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 5000),
+            rate_limit_window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60),
+            rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            rate_limit_exempt_service_accounts: matches!(
+                env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
+                Ok("true" | "1")
+            ),
         };
 
         config.validate_jwt_secret()?;

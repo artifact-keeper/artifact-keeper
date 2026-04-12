@@ -10,7 +10,9 @@ use super::middleware::auth::{
     RepoVisibilityState,
 };
 use super::middleware::demo::demo_guard;
-use super::middleware::rate_limit::{rate_limit_middleware, RateLimiter};
+use super::middleware::rate_limit::{
+    rate_limit_middleware, RateLimitExemptions, RateLimitState, RateLimiter,
+};
 use super::middleware::setup::setup_guard;
 use super::middleware::tracing::correlation_id_middleware;
 use super::SharedState;
@@ -148,25 +150,29 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
 
     let upload_limit = state.config.max_upload_size_bytes;
 
-    // Rate limiters, configurable via environment variables:
-    //   RATE_LIMIT_AUTH_PER_MIN  - max auth requests per window (default: 120)
-    //   RATE_LIMIT_API_PER_MIN   - max API requests per window  (default: 5000)
-    //   RATE_LIMIT_WINDOW_SECS   - window duration in seconds   (default: 60)
-    let auth_rate_limit = std::env::var("RATE_LIMIT_AUTH_PER_MIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120);
-    let api_rate_limit = std::env::var("RATE_LIMIT_API_PER_MIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5000);
-    let rate_limit_window = std::env::var("RATE_LIMIT_WINDOW_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60u64);
+    // Rate limiters and exemptions, driven by Config fields.
+    let exemptions = Arc::new(RateLimitExemptions::new(
+        state.config.rate_limit_exempt_usernames.clone(),
+        state.config.rate_limit_exempt_service_accounts,
+    ));
 
-    let auth_rate_limiter = Arc::new(RateLimiter::new(auth_rate_limit, rate_limit_window));
-    let api_rate_limiter = Arc::new(RateLimiter::new(api_rate_limit, rate_limit_window));
+    let auth_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_auth_per_window,
+        state.config.rate_limit_window_secs,
+    ));
+    let api_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_api_per_window,
+        state.config.rate_limit_window_secs,
+    ));
+
+    let auth_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&auth_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+    };
+    let api_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&api_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+    };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
@@ -190,7 +196,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest(
             "/auth",
             handlers::auth::public_router().layer(middleware::from_fn_with_state(
-                auth_rate_limiter,
+                auth_rate_limit_state,
                 rate_limit_middleware,
             )),
         )
@@ -496,7 +502,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         )
         // General API rate limiting (100 req/min per IP/user)
         .layer(middleware::from_fn_with_state(
-            api_rate_limiter,
+            api_rate_limit_state,
             rate_limit_middleware,
         ))
 }
