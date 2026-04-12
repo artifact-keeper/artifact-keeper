@@ -164,6 +164,16 @@ pub struct Config {
     pub rate_limit_window_secs: u64,
     pub rate_limit_exempt_usernames: Vec<String>,
     pub rate_limit_exempt_service_accounts: bool,
+
+    /// When true, newly uploaded artifacts are placed in quarantine until
+    /// security scans complete or the quarantine timeout expires. Disabled
+    /// by default so existing deployments are unaffected.
+    pub quarantine_enabled: bool,
+
+    /// Duration in minutes that a quarantined artifact is held before
+    /// automatic release. Only used when quarantine_enabled is true.
+    /// Default: 60.
+    pub quarantine_duration_minutes: u64,
 }
 
 redacted_debug!(Config {
@@ -213,6 +223,8 @@ redacted_debug!(Config {
     show rate_limit_window_secs,
     show rate_limit_exempt_usernames,
     show rate_limit_exempt_service_accounts,
+    show quarantine_enabled,
+    show quarantine_duration_minutes,
 });
 
 impl Config {
@@ -317,6 +329,11 @@ impl Config {
                 env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
                 Ok("true" | "1")
             ),
+            quarantine_enabled: matches!(
+                env::var("QUARANTINE_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60),
         };
 
         config.validate_jwt_secret()?;

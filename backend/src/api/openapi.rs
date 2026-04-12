@@ -47,6 +47,7 @@ use utoipa::{Modify, OpenApi};
         (name = "sso", description = "Single sign-on configuration"),
         (name = "migration", description = "Data migration and import"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
+        (name = "quarantine", description = "Artifact quarantine management"),
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
         (name = "system", description = "Public system configuration"),
@@ -132,6 +133,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::curation::CurationApiDoc::openapi());
     doc.merge(super::handlers::upload::UploadApiDoc::openapi());
     doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
+    doc.merge(super::handlers::quarantine::QuarantineApiDoc::openapi());
 
     doc
 }

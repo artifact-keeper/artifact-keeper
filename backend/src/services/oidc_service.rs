@@ -767,6 +767,8 @@ mod tests {
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -824,6 +826,8 @@ mod tests {
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
         }
     }
 

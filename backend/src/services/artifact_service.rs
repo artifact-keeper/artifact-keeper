@@ -15,6 +15,7 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::services::meili_service::{ArtifactDocument, MeiliService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
+use crate::services::quarantine_service::QuarantineConfig;
 use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
 use crate::storage::StorageBackend;
@@ -28,6 +29,7 @@ pub struct ArtifactService {
     scanner_service: Option<Arc<ScannerService>>,
     quality_check_service: Option<Arc<QualityCheckService>>,
     meili_service: Option<Arc<MeiliService>>,
+    quarantine_config: QuarantineConfig,
 }
 
 impl ArtifactService {
@@ -42,6 +44,7 @@ impl ArtifactService {
             scanner_service: None,
             quality_check_service: None,
             meili_service: None,
+            quarantine_config: QuarantineConfig::default(),
         }
     }
 
@@ -60,6 +63,7 @@ impl ArtifactService {
             scanner_service: None,
             quality_check_service: None,
             meili_service,
+            quarantine_config: QuarantineConfig::default(),
         }
     }
 
@@ -78,6 +82,7 @@ impl ArtifactService {
             scanner_service: None,
             quality_check_service: None,
             meili_service: None,
+            quarantine_config: QuarantineConfig::default(),
         }
     }
 
@@ -94,6 +99,11 @@ impl ArtifactService {
     /// Set the quality check service for quality-on-upload.
     pub fn set_quality_check_service(&mut self, qc_service: Arc<QualityCheckService>) {
         self.quality_check_service = Some(qc_service);
+    }
+
+    /// Set the quarantine configuration for upload-time quarantine enforcement.
+    pub fn set_quarantine_config(&mut self, config: QuarantineConfig) {
+        self.quarantine_config = config;
     }
 
     /// Set the Meilisearch service for search indexing.
@@ -312,6 +322,35 @@ impl ArtifactService {
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Set quarantine status if quarantine is enabled
+        if self.quarantine_config.enabled {
+            let now = chrono::Utc::now();
+            let until = crate::services::quarantine_service::compute_quarantine_until(
+                &self.quarantine_config,
+                now,
+            );
+            if let Err(e) = crate::services::quarantine_service::set_quarantine(
+                &self.db,
+                artifact.id,
+                crate::services::quarantine_service::STATUS_QUARANTINED,
+                Some(until),
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to set quarantine on artifact {}: {}",
+                    artifact.id,
+                    e
+                );
+            } else {
+                tracing::info!(
+                    artifact_id = %artifact.id,
+                    quarantine_until = %until,
+                    "Artifact placed in quarantine"
+                );
+            }
+        }
 
         // Check quota warning threshold after successful upload
         if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
@@ -578,6 +617,58 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+        // Check quarantine status before allowing download
+        if self.quarantine_config.enabled {
+            if let Ok(Some((status, until))) =
+                crate::services::quarantine_service::get_quarantine_info(&self.db, artifact.id)
+                    .await
+            {
+                let now = chrono::Utc::now();
+                let decision = crate::services::quarantine_service::is_quarantine_blocked(
+                    status.as_deref(),
+                    until,
+                    now,
+                );
+                match decision {
+                    crate::services::quarantine_service::QuarantineDecision::Blocked {
+                        expires_at,
+                    } => {
+                        return Err(AppError::Conflict(format!(
+                            "Artifact is under quarantine review until {}",
+                            expires_at.to_rfc3339()
+                        )));
+                    }
+                    crate::services::quarantine_service::QuarantineDecision::Rejected => {
+                        return Err(AppError::Conflict(
+                            "Artifact was rejected by security scans and is not available for download"
+                                .to_string(),
+                        ));
+                    }
+                    crate::services::quarantine_service::QuarantineDecision::Expired => {
+                        // Auto-release: quarantine period has passed without a scan verdict.
+                        if let Err(e) = crate::services::quarantine_service::release_quarantine(
+                            &self.db,
+                            artifact.id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Failed to auto-release quarantine for artifact {}: {}",
+                                artifact.id,
+                                e
+                            );
+                        } else {
+                            tracing::info!(
+                                artifact_id = %artifact.id,
+                                "Quarantine expired, artifact auto-released"
+                            );
+                        }
+                    }
+                    crate::services::quarantine_service::QuarantineDecision::Allowed => {}
+                }
+            }
+        }
 
         // Trigger BeforeDownload hooks - validators can reject the download
         let artifact_info = ArtifactInfo::from(&artifact);
