@@ -26,7 +26,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::hex::HexHandler;
-use crate::models::repository::RepositoryType;
+use crate::models::repository::{Repository, RepositoryType};
 
 // ---------------------------------------------------------------------------
 // Router
@@ -535,8 +535,32 @@ async fn list_names(
                 .unwrap());
         }
     }
-    // Virtual: merging names lists across multiple upstreams is out of scope;
-    // return whatever local artifacts exist (may be empty).
+    // Virtual: merge package names from all member repositories (local DB + remote proxy).
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut merged = query_local_member_names(&state.db, &members).await?;
+
+        let remote_results = proxy_helpers::collect_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            "names",
+            |bytes, _member_key| async move { parse_upstream_names(&bytes) },
+        )
+        .await?;
+        for (_key, remote_names) in remote_results {
+            merged.extend(remote_names);
+        }
+
+        let deduped = merge_and_sort_names(merged);
+        let json = serde_json::json!(deduped);
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&json).unwrap()))
+            .unwrap());
+    }
 
     let json = serde_json::json!(names);
 
@@ -606,8 +630,32 @@ async fn list_versions(
                 .unwrap());
         }
     }
-    // Virtual: merging versions lists across multiple upstreams is out of scope;
-    // return whatever local artifacts exist (may be empty).
+    // Virtual: merge versions from all member repositories (local DB + remote proxy).
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut merged = query_local_member_versions(&state.db, &members).await?;
+
+        let remote_results = proxy_helpers::collect_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            "versions",
+            |bytes, _member_key| async move { parse_upstream_versions(&bytes) },
+        )
+        .await?;
+        for (_key, remote_versions) in remote_results {
+            for (name, versions) in remote_versions {
+                merged.entry(name).or_default().extend(versions);
+            }
+        }
+
+        let result = build_versions_response(merged);
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&result).unwrap()))
+            .unwrap());
+    }
 
     let result: Vec<serde_json::Value> = packages
         .into_iter()
@@ -624,6 +672,169 @@ async fn list_versions(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&result).unwrap()))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Virtual repo merging helpers
+// ---------------------------------------------------------------------------
+
+/// Query distinct package names from all local (non-remote) virtual members.
+async fn query_local_member_names(
+    db: &PgPool,
+    members: &[Repository],
+) -> Result<Vec<String>, Response> {
+    let mut all_names = Vec::new();
+    for member in members {
+        if member.repo_type == RepositoryType::Remote {
+            continue;
+        }
+        let names = sqlx::query_scalar!(
+            r#"
+        SELECT DISTINCT name
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+        ORDER BY name
+        "#,
+            member.id
+        )
+        .fetch_all(db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+        all_names.extend(names);
+    }
+    Ok(all_names)
+}
+
+/// Query name/version pairs from all local (non-remote) virtual members,
+/// grouped by package name.
+async fn query_local_member_versions(
+    db: &PgPool,
+    members: &[Repository],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, Response> {
+    let mut packages: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for member in members {
+        if member.repo_type == RepositoryType::Remote {
+            continue;
+        }
+        let artifacts = sqlx::query!(
+            r#"
+        SELECT name, version
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+        ORDER BY name, created_at DESC
+        "#,
+            member.id
+        )
+        .fetch_all(db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+                .into_response()
+        })?;
+        for a in &artifacts {
+            let name = a.name.clone();
+            let version = a.version.clone().unwrap_or_default();
+            packages.entry(name).or_default().push(version);
+        }
+    }
+    Ok(packages)
+}
+
+/// Parse an upstream JSON names response.
+///
+/// Artifact Keeper hex repos return a JSON array of strings: `["phoenix", "ecto"]`.
+/// If the upstream returns non-JSON (e.g. hex.pm's signed protobuf), parsing
+/// fails gracefully and the member is skipped by `collect_virtual_metadata`.
+#[allow(clippy::result_large_err)]
+fn parse_upstream_names(bytes: &[u8]) -> Result<Vec<String>, Response> {
+    serde_json::from_slice::<Vec<String>>(bytes).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to parse upstream names response as JSON",
+        )
+            .into_response()
+    })
+}
+
+/// Parse an upstream JSON versions response.
+///
+/// Artifact Keeper hex repos return an array of objects:
+/// `[{"name": "phoenix", "versions": ["1.7.0", "1.7.1"]}]`.
+/// Returns a map of name to versions for merging.
+#[allow(clippy::result_large_err)]
+fn parse_upstream_versions(
+    bytes: &[u8],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, Response> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(bytes).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to parse upstream versions response as JSON",
+        )
+            .into_response()
+    })?;
+
+    let mut packages: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for entry in &entries {
+        let name = entry["name"].as_str().unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let versions: Vec<String> = entry["versions"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        packages.entry(name).or_default().extend(versions);
+    }
+    Ok(packages)
+}
+
+/// Deduplicate and sort a list of package names (case-insensitive dedup).
+fn merge_and_sort_names(names: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<String> = names
+        .into_iter()
+        .filter(|n| seen.insert(n.to_lowercase()))
+        .collect();
+    unique.sort();
+    unique
+}
+
+/// Build the versions response array from a merged BTreeMap, deduplicating
+/// version strings within each package.
+fn build_versions_response(
+    packages: std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<serde_json::Value> {
+    packages
+        .into_iter()
+        .map(|(name, versions)| {
+            let mut seen = std::collections::HashSet::new();
+            let unique: Vec<String> = versions
+                .into_iter()
+                .filter(|v| seen.insert(v.clone()))
+                .collect();
+            serde_json::json!({
+                "name": name,
+                "versions": unique,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,5 +1409,209 @@ mod tests {
             upstream_url: None,
         };
         assert_eq!(repo.repo_type, "virtual");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_upstream_names
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_upstream_names_valid_json() {
+        let data = br#"["phoenix","ecto","plug"]"#;
+        let result = parse_upstream_names(data);
+        assert!(result.is_ok());
+        let names = result.unwrap();
+        assert_eq!(names, vec!["phoenix", "ecto", "plug"]);
+    }
+
+    #[test]
+    fn test_parse_upstream_names_empty_array() {
+        let data = b"[]";
+        let result = parse_upstream_names(data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_upstream_names_invalid_json() {
+        let data = b"not json at all";
+        let result = parse_upstream_names(data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_upstream_names_protobuf_bytes_fail() {
+        // Simulates a hex.pm signed protobuf response, which should fail
+        // gracefully since it is not valid JSON.
+        let data: Vec<u8> = vec![
+            0x08, 0x01, 0x12, 0x07, 0x70, 0x68, 0x6f, 0x65, 0x6e, 0x69, 0x78,
+        ];
+        let result = parse_upstream_names(&data);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_upstream_versions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_upstream_versions_valid_json() {
+        let data = br#"[{"name":"phoenix","versions":["1.7.0","1.7.1"]},{"name":"ecto","versions":["3.11.0"]}]"#;
+        let result = parse_upstream_versions(data);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["phoenix"], vec!["1.7.0", "1.7.1"]);
+        assert_eq!(map["ecto"], vec!["3.11.0"]);
+    }
+
+    #[test]
+    fn test_parse_upstream_versions_empty_array() {
+        let data = b"[]";
+        let result = parse_upstream_versions(data);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_upstream_versions_invalid_json() {
+        let data = b"this is not json";
+        let result = parse_upstream_versions(data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_upstream_versions_skips_empty_names() {
+        let data = br#"[{"name":"","versions":["1.0.0"]},{"name":"plug","versions":["2.0.0"]}]"#;
+        let result = parse_upstream_versions(data);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("plug"));
+    }
+
+    #[test]
+    fn test_parse_upstream_versions_missing_versions_field() {
+        let data = br#"[{"name":"phoenix"}]"#;
+        let result = parse_upstream_versions(data);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map["phoenix"].is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_and_sort_names
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_and_sort_names_basic() {
+        let names = vec![
+            "ecto".to_string(),
+            "phoenix".to_string(),
+            "plug".to_string(),
+        ];
+        let result = merge_and_sort_names(names);
+        assert_eq!(result, vec!["ecto", "phoenix", "plug"]);
+    }
+
+    #[test]
+    fn test_merge_and_sort_names_deduplicates() {
+        let names = vec![
+            "phoenix".to_string(),
+            "ecto".to_string(),
+            "phoenix".to_string(),
+            "plug".to_string(),
+            "ecto".to_string(),
+        ];
+        let result = merge_and_sort_names(names);
+        assert_eq!(result, vec!["ecto", "phoenix", "plug"]);
+    }
+
+    #[test]
+    fn test_merge_and_sort_names_case_insensitive_dedup() {
+        let names = vec![
+            "Phoenix".to_string(),
+            "phoenix".to_string(),
+            "PHOENIX".to_string(),
+        ];
+        let result = merge_and_sort_names(names);
+        // Keeps the first occurrence
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "Phoenix");
+    }
+
+    #[test]
+    fn test_merge_and_sort_names_empty() {
+        let result = merge_and_sort_names(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_merge_and_sort_names_single() {
+        let result = merge_and_sort_names(vec!["plug".to_string()]);
+        assert_eq!(result, vec!["plug"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_versions_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_versions_response_basic() {
+        let mut packages = std::collections::BTreeMap::new();
+        packages.insert(
+            "phoenix".to_string(),
+            vec!["1.7.0".to_string(), "1.7.1".to_string()],
+        );
+        packages.insert("ecto".to_string(), vec!["3.11.0".to_string()]);
+
+        let result = build_versions_response(packages);
+        assert_eq!(result.len(), 2);
+        // BTreeMap iterates in sorted order: ecto before phoenix
+        assert_eq!(result[0]["name"], "ecto");
+        assert_eq!(result[0]["versions"], serde_json::json!(["3.11.0"]));
+        assert_eq!(result[1]["name"], "phoenix");
+        assert_eq!(result[1]["versions"], serde_json::json!(["1.7.0", "1.7.1"]));
+    }
+
+    #[test]
+    fn test_build_versions_response_deduplicates_versions() {
+        let mut packages = std::collections::BTreeMap::new();
+        packages.insert(
+            "plug".to_string(),
+            vec![
+                "1.0.0".to_string(),
+                "2.0.0".to_string(),
+                "1.0.0".to_string(),
+            ],
+        );
+
+        let result = build_versions_response(packages);
+        assert_eq!(result.len(), 1);
+        let versions = result[0]["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0], "1.0.0");
+        assert_eq!(versions[1], "2.0.0");
+    }
+
+    #[test]
+    fn test_build_versions_response_empty() {
+        let packages = std::collections::BTreeMap::new();
+        let result = build_versions_response(packages);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_versions_response_preserves_order() {
+        let mut packages = std::collections::BTreeMap::new();
+        packages.insert("zlib".to_string(), vec!["1.0.0".to_string()]);
+        packages.insert("absinthe".to_string(), vec!["1.7.0".to_string()]);
+        packages.insert("jason".to_string(), vec!["1.4.0".to_string()]);
+
+        let result = build_versions_response(packages);
+        assert_eq!(result[0]["name"], "absinthe");
+        assert_eq!(result[1]["name"], "jason");
+        assert_eq!(result[2]["name"], "zlib");
     }
 }
