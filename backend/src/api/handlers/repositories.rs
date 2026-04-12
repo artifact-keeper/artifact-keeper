@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
@@ -19,6 +20,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::repository_service::{
@@ -832,6 +834,10 @@ pub struct ListArtifactsQuery {
     pub per_page: Option<u32>,
     pub q: Option<String>,
     pub path_prefix: Option<String>,
+    /// When set to `maven_component`, Maven/Gradle artifacts are grouped by
+    /// groupId, artifactId, and version.  Individual files (jar, pom, checksums)
+    /// appear in the `artifact_files` array of each component.
+    pub group_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -854,6 +860,37 @@ pub struct ArtifactResponse {
 pub struct ArtifactListResponse {
     pub items: Vec<ArtifactResponse>,
     pub pagination: Pagination,
+    /// Maven component grouping.  Only present when `group_by=maven_component`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub components: Option<Vec<MavenComponentResponse>>,
+}
+
+/// A Maven component grouped by GAV (groupId, artifactId, version).
+///
+/// Each component collects the individual files (jar, pom, checksums, etc.)
+/// that share the same Maven coordinates.
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct MavenComponentResponse {
+    /// Representative artifact ID (the first file in the group).
+    pub id: Uuid,
+    /// Maven groupId with dots (e.g. `org.junit.jupiter`).
+    pub group_id: String,
+    /// Maven artifactId (e.g. `junit-jupiter-api`).
+    pub artifact_id: String,
+    /// Maven version string (e.g. `5.11.0`).
+    pub version: String,
+    /// Repository key this component belongs to.
+    pub repository_key: String,
+    /// Repository format (always `maven` or `gradle`).
+    pub format: String,
+    /// Total size in bytes across all files in this component.
+    pub size_bytes: i64,
+    /// Total download count across all files in this component.
+    pub download_count: i64,
+    /// Earliest creation timestamp among the component files.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Individual filenames belonging to this component.
+    pub artifact_files: Vec<String>,
 }
 
 /// List artifacts in repository
@@ -887,6 +924,27 @@ pub async fn list_artifacts(
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
+
+    let is_maven_format = matches!(
+        repo.format,
+        RepositoryFormat::Maven | RepositoryFormat::Gradle
+    );
+    let want_component_grouping =
+        query.group_by.as_deref() == Some("maven_component") && is_maven_format;
+
+    if want_component_grouping {
+        return list_artifacts_grouped_by_maven_component(
+            &artifact_service,
+            &state,
+            &repo,
+            &key,
+            query.path_prefix.as_deref(),
+            query.q.as_deref(),
+            page,
+            per_page,
+        )
+        .await;
+    }
 
     let (artifacts, total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
@@ -954,7 +1012,146 @@ pub async fn list_artifacts(
             total,
             total_pages,
         },
+        components: None,
     }))
+}
+
+/// Build a grouped-by-component response for Maven/Gradle repositories.
+///
+/// Fetches all matching artifacts (up to 10 000), groups them by Maven GAV
+/// coordinates (groupId, artifactId, version), then paginates the resulting
+/// component list.  Files that cannot be parsed as Maven coordinates (e.g.
+/// top-level metadata) are silently skipped.
+#[allow(clippy::too_many_arguments)]
+async fn list_artifacts_grouped_by_maven_component(
+    artifact_service: &ArtifactService,
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    repo_key: &str,
+    path_prefix: Option<&str>,
+    search_query: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<Json<ArtifactListResponse>> {
+    // Fetch a large batch so we can group in-memory.  10 000 individual files
+    // is generous; most Maven repos have far fewer cached artifacts.
+    const MAX_FETCH: i64 = 10_000;
+
+    let (artifacts, _total_files) = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id)
+            .await
+            .map_err(|_| {
+                AppError::Internal("Failed to resolve virtual repository members".to_string())
+            })?;
+        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+        artifact_service
+            .list_for_repos(&member_ids, path_prefix, search_query, 0, MAX_FETCH)
+            .await?
+    } else {
+        artifact_service
+            .list(repo.id, path_prefix, search_query, 0, MAX_FETCH)
+            .await?
+    };
+
+    let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
+    let download_counts = artifact_service
+        .get_download_stats_batch(&artifact_ids)
+        .await?;
+
+    let components = group_maven_artifacts(
+        &artifacts,
+        &download_counts,
+        repo_key,
+        &format!("{:?}", repo.format).to_lowercase(),
+    );
+
+    let total_components = components.len() as i64;
+    let total_pages = ((total_components as f64) / (per_page as f64)).ceil() as u32;
+    let offset = ((page - 1) * per_page) as usize;
+    let page_components: Vec<MavenComponentResponse> = components
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+
+    Ok(Json(ArtifactListResponse {
+        items: Vec::new(),
+        pagination: Pagination {
+            page,
+            per_page,
+            total: total_components,
+            total_pages,
+        },
+        components: Some(page_components),
+    }))
+}
+
+/// GAV key used to group Maven artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct GavKey {
+    group_id: String,
+    artifact_id: String,
+    version: String,
+}
+
+/// Group a flat list of Maven artifacts by GAV coordinates.
+///
+/// Returns a sorted `Vec` of `MavenComponentResponse` items. Artifacts whose
+/// paths cannot be parsed as Maven coordinates are skipped.
+fn group_maven_artifacts(
+    artifacts: &[crate::models::artifact::Artifact],
+    download_counts: &std::collections::HashMap<Uuid, i64>,
+    repo_key: &str,
+    format: &str,
+) -> Vec<MavenComponentResponse> {
+    let mut groups: BTreeMap<GavKey, MavenComponentResponse> = BTreeMap::new();
+
+    for artifact in artifacts {
+        let coords = match MavenHandler::parse_coordinates(&artifact.path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let key = GavKey {
+            group_id: coords.group_id.clone(),
+            artifact_id: coords.artifact_id.clone(),
+            version: coords.version.clone(),
+        };
+
+        let filename = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.name)
+            .to_string();
+
+        let downloads = *download_counts.get(&artifact.id).unwrap_or(&0);
+
+        groups
+            .entry(key)
+            .and_modify(|comp| {
+                comp.size_bytes += artifact.size_bytes;
+                comp.download_count += downloads;
+                if artifact.created_at < comp.created_at {
+                    comp.created_at = artifact.created_at;
+                }
+                comp.artifact_files.push(filename.clone());
+            })
+            .or_insert_with(|| MavenComponentResponse {
+                id: artifact.id,
+                group_id: coords.group_id,
+                artifact_id: coords.artifact_id,
+                version: coords.version,
+                repository_key: repo_key.to_string(),
+                format: format.to_string(),
+                size_bytes: artifact.size_bytes,
+                download_count: downloads,
+                created_at: artifact.created_at,
+                artifact_files: vec![filename],
+            });
+    }
+
+    groups.into_values().collect()
 }
 
 /// Get artifact metadata
@@ -1961,6 +2158,7 @@ pub async fn test_upstream(
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
+        MavenComponentResponse,
         AddVirtualMemberRequest,
         UpdateVirtualMembersRequest,
         VirtualMemberPriority,
@@ -2556,6 +2754,262 @@ mod tests {
         assert!(query.per_page.is_none());
         assert!(query.q.is_none());
         assert!(query.path_prefix.is_none());
+        assert!(query.group_by.is_none());
+    }
+
+    #[test]
+    fn test_list_artifacts_query_group_by() {
+        let json = r#"{"group_by": "maven_component"}"#;
+        let query: ListArtifactsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.group_by.as_deref(), Some("maven_component"));
+    }
+
+    // -----------------------------------------------------------------------
+    // group_maven_artifacts
+    // -----------------------------------------------------------------------
+
+    /// Helper to build an Artifact fixture for grouping tests.
+    fn maven_artifact(path: &str, name: &str, size: i64) -> crate::models::artifact::Artifact {
+        crate::models::artifact::Artifact {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            path: path.to_string(),
+            name: name.to_string(),
+            version: None,
+            size_bytes: size,
+            checksum_sha256: "sha256".to_string(),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: "application/octet-stream".to_string(),
+            storage_key: path.to_string(),
+            is_deleted: false,
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_single_component() {
+        let artifacts = vec![
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar",
+                "junit-jupiter-api-5.11.0.jar",
+                50_000,
+            ),
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.pom",
+                "junit-jupiter-api-5.11.0.pom",
+                2_000,
+            ),
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar.sha1",
+                "junit-jupiter-api-5.11.0.jar.sha1",
+                40,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+
+        assert_eq!(result.len(), 1);
+        let comp = &result[0];
+        assert_eq!(comp.group_id, "org.junit.jupiter");
+        assert_eq!(comp.artifact_id, "junit-jupiter-api");
+        assert_eq!(comp.version, "5.11.0");
+        assert_eq!(comp.repository_key, "maven-central");
+        assert_eq!(comp.format, "maven");
+        assert_eq!(comp.size_bytes, 52_040);
+        assert_eq!(comp.artifact_files.len(), 3);
+        assert!(comp
+            .artifact_files
+            .contains(&"junit-jupiter-api-5.11.0.jar".to_string()));
+        assert!(comp
+            .artifact_files
+            .contains(&"junit-jupiter-api-5.11.0.pom".to_string()));
+        assert!(comp
+            .artifact_files
+            .contains(&"junit-jupiter-api-5.11.0.jar.sha1".to_string()));
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_multiple_components() {
+        let artifacts = vec![
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.jar",
+                "junit-jupiter-api-5.11.0.jar",
+                50_000,
+            ),
+            maven_artifact(
+                "org/junit/jupiter/junit-jupiter-api/5.11.0/junit-jupiter-api-5.11.0.pom",
+                "junit-jupiter-api-5.11.0.pom",
+                2_000,
+            ),
+            maven_artifact(
+                "com/google/guava/guava/33.0.0/guava-33.0.0.jar",
+                "guava-33.0.0.jar",
+                100_000,
+            ),
+            maven_artifact(
+                "com/google/guava/guava/33.0.0/guava-33.0.0.pom",
+                "guava-33.0.0.pom",
+                3_000,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "maven-central", "maven");
+
+        assert_eq!(result.len(), 2);
+        // BTreeMap ordering: "com.google.guava" < "org.junit.jupiter"
+        assert_eq!(result[0].group_id, "com.google.guava");
+        assert_eq!(result[0].artifact_id, "guava");
+        assert_eq!(result[0].version, "33.0.0");
+        assert_eq!(result[0].artifact_files.len(), 2);
+
+        assert_eq!(result[1].group_id, "org.junit.jupiter");
+        assert_eq!(result[1].artifact_id, "junit-jupiter-api");
+        assert_eq!(result[1].version, "5.11.0");
+        assert_eq!(result[1].artifact_files.len(), 2);
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_different_versions() {
+        let artifacts = vec![
+            maven_artifact(
+                "org/example/lib/1.0.0/lib-1.0.0.jar",
+                "lib-1.0.0.jar",
+                10_000,
+            ),
+            maven_artifact(
+                "org/example/lib/2.0.0/lib-2.0.0.jar",
+                "lib-2.0.0.jar",
+                20_000,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].version, "1.0.0");
+        assert_eq!(result[1].version, "2.0.0");
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_skips_unparseable_paths() {
+        let artifacts = vec![
+            maven_artifact("some-random-file.txt", "some-random-file.txt", 100),
+            maven_artifact(
+                "org/example/lib/1.0.0/lib-1.0.0.jar",
+                "lib-1.0.0.jar",
+                10_000,
+            ),
+        ];
+
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&artifacts, &downloads, "repo", "maven");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].artifact_id, "lib");
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_download_counts_aggregated() {
+        let a1 = maven_artifact(
+            "org/example/lib/1.0.0/lib-1.0.0.jar",
+            "lib-1.0.0.jar",
+            10_000,
+        );
+        let a2 = maven_artifact("org/example/lib/1.0.0/lib-1.0.0.pom", "lib-1.0.0.pom", 500);
+
+        let mut downloads = std::collections::HashMap::new();
+        downloads.insert(a1.id, 100);
+        downloads.insert(a2.id, 25);
+
+        let result = group_maven_artifacts(&[a1, a2], &downloads, "repo", "maven");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].download_count, 125);
+        assert_eq!(result[0].size_bytes, 10_500);
+    }
+
+    #[test]
+    fn test_group_maven_artifacts_empty_input() {
+        let downloads = std::collections::HashMap::new();
+        let result = group_maven_artifacts(&[], &downloads, "repo", "maven");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_maven_component_response_serialization() {
+        let comp = MavenComponentResponse {
+            id: Uuid::new_v4(),
+            group_id: "org.junit.jupiter".to_string(),
+            artifact_id: "junit-jupiter-api".to_string(),
+            version: "5.11.0".to_string(),
+            repository_key: "maven-central".to_string(),
+            format: "maven".to_string(),
+            size_bytes: 52_040,
+            download_count: 42,
+            created_at: chrono::Utc::now(),
+            artifact_files: vec![
+                "junit-jupiter-api-5.11.0.jar".to_string(),
+                "junit-jupiter-api-5.11.0.pom".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&comp).unwrap();
+        assert!(json.contains("\"group_id\":\"org.junit.jupiter\""));
+        assert!(json.contains("\"artifact_id\":\"junit-jupiter-api\""));
+        assert!(json.contains("\"version\":\"5.11.0\""));
+        assert!(json.contains("\"artifact_files\":["));
+        assert!(json.contains("junit-jupiter-api-5.11.0.jar"));
+    }
+
+    #[test]
+    fn test_artifact_list_response_without_components() {
+        let resp = ArtifactListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 0,
+                total_pages: 0,
+            },
+            components: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        // components field should be omitted when None
+        assert!(!json.contains("\"components\""));
+    }
+
+    #[test]
+    fn test_artifact_list_response_with_components() {
+        let comp = MavenComponentResponse {
+            id: Uuid::new_v4(),
+            group_id: "org.example".to_string(),
+            artifact_id: "mylib".to_string(),
+            version: "1.0.0".to_string(),
+            repository_key: "repo".to_string(),
+            format: "maven".to_string(),
+            size_bytes: 1024,
+            download_count: 0,
+            created_at: chrono::Utc::now(),
+            artifact_files: vec!["mylib-1.0.0.jar".to_string()],
+        };
+        let resp = ArtifactListResponse {
+            items: vec![],
+            pagination: Pagination {
+                page: 1,
+                per_page: 20,
+                total: 1,
+                total_pages: 1,
+            },
+            components: Some(vec![comp]),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"components\":["));
+        assert!(json.contains("\"group_id\":\"org.example\""));
     }
 
     #[test]
