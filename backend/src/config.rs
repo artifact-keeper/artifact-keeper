@@ -134,6 +134,30 @@ pub struct Config {
     /// **Security note:** ensure this port is not reachable from untrusted
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
+
+    /// Maximum number of connections in the PostgreSQL pool.
+    /// Defaults to 20. Increase for higher concurrency, decrease for
+    /// databases with restricted connection budgets (e.g., shared RDS).
+    pub database_max_connections: u32,
+
+    /// Minimum number of idle connections kept in the PostgreSQL pool.
+    /// Defaults to 5. Set to 0 to allow the pool to scale down completely.
+    pub database_min_connections: u32,
+
+    /// Timeout in seconds for acquiring a connection from the pool before
+    /// returning an error. Defaults to 30.
+    pub database_acquire_timeout_secs: u64,
+
+    /// Idle timeout in seconds. Connections idle longer than this will be
+    /// closed. Defaults to 600 (10 minutes).
+    pub database_idle_timeout_secs: u64,
+
+    /// Maximum lifetime in seconds for a pooled connection. Connections
+    /// older than this are recycled even if still healthy. Defaults to
+    /// 1800 (30 minutes). Useful when the database has a connection
+    /// lifetime policy or when running behind a TCP load balancer with an
+    /// idle disconnect.
+    pub database_max_lifetime_secs: u64,
 }
 
 redacted_debug!(Config {
@@ -173,6 +197,11 @@ redacted_debug!(Config {
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show metrics_port,
+    show database_max_connections,
+    show database_min_connections,
+    show database_acquire_timeout_secs,
+    show database_idle_timeout_secs,
+    show database_max_lifetime_secs,
 });
 
 impl Config {
@@ -256,6 +285,11 @@ impl Config {
                 },
                 Err(_) => None,
             },
+            database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 20),
+            database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
+            database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 30),
+            database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
+            database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
         };
 
         config.validate_jwt_secret()?;
@@ -459,6 +493,13 @@ mod tests {
         assert_eq!(config.peer_public_endpoint, "http://localhost:8080");
         assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
 
+        // Database pool defaults (#678)
+        assert_eq!(config.database_max_connections, 20);
+        assert_eq!(config.database_min_connections, 5);
+        assert_eq!(config.database_acquire_timeout_secs, 30);
+        assert_eq!(config.database_idle_timeout_secs, 600);
+        assert_eq!(config.database_max_lifetime_secs, 1800);
+
         // Restore
         if let Some(v) = saved_db {
             env::set_var("DATABASE_URL", v);
@@ -481,6 +522,96 @@ mod tests {
         }
         if let Some(v) = saved_demo {
             env::set_var("DEMO_MODE", v);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Database pool configuration (#678)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_database_pool_env_overrides() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
+        let saved_min = env::var("DATABASE_MIN_CONNECTIONS").ok();
+        let saved_acq = env::var("DATABASE_ACQUIRE_TIMEOUT_SECS").ok();
+        let saved_idle = env::var("DATABASE_IDLE_TIMEOUT_SECS").ok();
+        let saved_life = env::var("DATABASE_MAX_LIFETIME_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "50");
+        env::set_var("DATABASE_MIN_CONNECTIONS", "10");
+        env::set_var("DATABASE_ACQUIRE_TIMEOUT_SECS", "15");
+        env::set_var("DATABASE_IDLE_TIMEOUT_SECS", "300");
+        env::set_var("DATABASE_MAX_LIFETIME_SECS", "900");
+
+        let config = Config::from_env().expect("Config should load");
+
+        assert_eq!(config.database_max_connections, 50);
+        assert_eq!(config.database_min_connections, 10);
+        assert_eq!(config.database_acquire_timeout_secs, 15);
+        assert_eq!(config.database_idle_timeout_secs, 300);
+        assert_eq!(config.database_max_lifetime_secs, 900);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        for (k, v) in [
+            ("DATABASE_MAX_CONNECTIONS", saved_max),
+            ("DATABASE_MIN_CONNECTIONS", saved_min),
+            ("DATABASE_ACQUIRE_TIMEOUT_SECS", saved_acq),
+            ("DATABASE_IDLE_TIMEOUT_SECS", saved_idle),
+            ("DATABASE_MAX_LIFETIME_SECS", saved_life),
+        ] {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn test_config_database_pool_invalid_value_falls_back_to_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_max = env::var("DATABASE_MAX_CONNECTIONS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "super-secret");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "not-a-number");
+
+        let config = Config::from_env().expect("Config should load even with invalid pool setting");
+
+        // env_parse falls back to the default when the value cannot be parsed
+        assert_eq!(config.database_max_connections, 20);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_max {
+            env::set_var("DATABASE_MAX_CONNECTIONS", v);
+        } else {
+            env::remove_var("DATABASE_MAX_CONNECTIONS");
         }
     }
 

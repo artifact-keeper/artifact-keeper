@@ -757,6 +757,11 @@ mod tests {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             metrics_port: None,
+            database_max_connections: 20,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 30,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -804,6 +809,11 @@ mod tests {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             metrics_port: None,
+            database_max_connections: 20,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 30,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
         }
     }
 
