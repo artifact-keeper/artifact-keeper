@@ -27,6 +27,7 @@ use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
+use crate::services::routing_rules::{self, RoutingRule};
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -120,6 +121,13 @@ pub fn router() -> Router<SharedState> {
         )
         // Cache TTL configuration for proxy/remote repositories
         .route("/:key/cache-ttl", put(set_cache_ttl).get(get_cache_ttl))
+        // Routing rules for path rewriting on remote repositories
+        .route(
+            "/:key/routing-rules",
+            get(get_routing_rules)
+                .post(set_routing_rules)
+                .delete(delete_routing_rules),
+        )
         // Upstream auth management for remote repositories
         .route("/:key/upstream-auth", put(set_upstream_auth))
         .route("/:key/test-upstream", post(test_upstream))
@@ -1636,8 +1644,13 @@ pub async fn download_artifact(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
+                // Apply routing rules to rewrite the path before upstream fetch
+                let rules = load_routing_rules(&state.db, repo.id).await;
+                let fetch_path = routing_rules::apply_routing_rules(&path, &rules)
+                    .unwrap_or_else(|| path.clone());
+
                 let (content, content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &key, upstream_url, &path)
+                    proxy_helpers::proxy_fetch(proxy, repo.id, &key, upstream_url, &fetch_path)
                         .await
                         .map_err(|_| {
                             AppError::NotFound("Artifact not found upstream".to_string())
@@ -2203,6 +2216,194 @@ pub async fn test_upstream(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Routing rules CRUD
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetRoutingRulesRequest {
+    /// Ordered list of routing rules. Each rule specifies a regex pattern and
+    /// a rewrite template. Rules are evaluated in order during proxy requests.
+    pub rules: Vec<RoutingRule>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RoutingRulesResponse {
+    pub repository_key: String,
+    pub rules: Vec<RoutingRule>,
+}
+
+/// Get routing rules for a repository
+#[utoipa::path(
+    get,
+    path = "/{key}/routing-rules",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Current routing rules", body = RoutingRulesResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn get_routing_rules(
+    State(state): State<SharedState>,
+    Path(key): Path<String>,
+) -> Result<Json<RoutingRulesResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+
+    let result: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT value FROM repository_config
+        WHERE repository_id = $1 AND key = 'routing_rules'
+        "#,
+    )
+    .bind(repo.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let rules: Vec<RoutingRule> = result
+        .and_then(|(v,)| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+
+    Ok(Json(RoutingRulesResponse {
+        repository_key: key,
+        rules,
+    }))
+}
+
+/// Set routing rules for a repository
+///
+/// Routing rules rewrite the request path before it is forwarded to the
+/// upstream server. This is useful for proxying resources like GitHub Releases
+/// where the client-facing path structure differs from the upstream URL
+/// layout. Rules are evaluated in order and the first match wins.
+#[utoipa::path(
+    post,
+    path = "/{key}/routing-rules",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetRoutingRulesRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Routing rules saved", body = RoutingRulesResponse),
+        (status = 400, description = "Invalid rule (bad regex or capture reference)"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_routing_rules(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetRoutingRulesRequest>,
+) -> Result<Json<RoutingRulesResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    // Validate every rule before persisting
+    for (i, rule) in payload.rules.iter().enumerate() {
+        if let Err(msg) = routing_rules::validate_routing_rule(rule) {
+            return Err(AppError::Validation(format!(
+                "routing rule [{}]: {}",
+                i, msg
+            )));
+        }
+    }
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    let value = serde_json::to_string(&payload.rules)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize routing rules: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO repository_config (repository_id, key, value)
+        VALUES ($1, 'routing_rules', $2)
+        ON CONFLICT (repository_id, key)
+        DO UPDATE SET value = $2, updated_at = NOW()
+        "#,
+    )
+    .bind(repo.id)
+    .bind(&value)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(RoutingRulesResponse {
+        repository_key: key,
+        rules: payload.rules,
+    }))
+}
+
+/// Delete all routing rules for a repository
+#[utoipa::path(
+    delete,
+    path = "/{key}/routing-rules",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Routing rules deleted"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn delete_routing_rules(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM repository_config
+        WHERE repository_id = $1 AND key = 'routing_rules'
+        "#,
+    )
+    .bind(repo.id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(
+        serde_json::json!({"message": "Routing rules deleted"}),
+    ))
+}
+
+/// Load routing rules from repository_config for a given repository ID.
+/// Returns an empty Vec if no rules are configured.
+async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule> {
+    let result: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'routing_rules'",
+    )
+    .bind(repo_id)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None);
+
+    result
+        .and_then(|(v,)| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -2224,6 +2425,9 @@ pub async fn test_upstream(
         update_virtual_members,
         set_upstream_auth,
         test_upstream,
+        get_routing_rules,
+        set_routing_rules,
+        delete_routing_rules,
     ),
     components(schemas(
         ListRepositoriesQuery,
@@ -2244,6 +2448,9 @@ pub async fn test_upstream(
         VirtualMembersListResponse,
         CreateVirtualMemberInput,
         UpstreamAuthRequest,
+        SetRoutingRulesRequest,
+        RoutingRulesResponse,
+        RoutingRule,
     ))
 )]
 pub struct RepositoriesApiDoc;
