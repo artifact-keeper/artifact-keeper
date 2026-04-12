@@ -111,7 +111,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     tracing::info!("Starting Artifact Keeper");
 
     // Connect to database
-    let db_pool = db::create_pool(&config.database_url).await?;
+    let db_pool = db::create_pool(&config).await?;
     tracing::info!("Connected to database");
 
     // Run migrations (skip with SKIP_MIGRATIONS=true for pre-applied migrations)
