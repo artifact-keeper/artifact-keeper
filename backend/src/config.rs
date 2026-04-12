@@ -172,6 +172,10 @@ pub struct Config {
     /// Duration in minutes that a locked account remains locked before the
     /// user can try again. Default: 30.
     pub account_lockout_duration_minutes: i64,
+
+    /// Number of days after which a local user's password expires and must
+    /// be changed. Set to 0 to disable password expiration. Default: 0.
+    pub password_expiry_days: u32,
 }
 
 redacted_debug!(Config {
@@ -223,6 +227,7 @@ redacted_debug!(Config {
     show rate_limit_exempt_service_accounts,
     show account_lockout_threshold,
     show account_lockout_duration_minutes,
+    show password_expiry_days,
 });
 
 impl Config {
@@ -329,6 +334,7 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0),
         };
 
         config.validate_jwt_secret()?;
@@ -538,6 +544,9 @@ mod tests {
         assert_eq!(config.database_acquire_timeout_secs, 30);
         assert_eq!(config.database_idle_timeout_secs, 600);
         assert_eq!(config.database_max_lifetime_secs, 1800);
+
+        // Password expiration default (disabled)
+        assert_eq!(config.password_expiry_days, 0);
 
         // Restore
         if let Some(v) = saved_db {

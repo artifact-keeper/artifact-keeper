@@ -185,7 +185,7 @@ pub async fn list_users(
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             failed_login_attempts, locked_until, last_failed_login_at,
-            last_login_at, created_at, updated_at
+            password_changed_at, last_login_at, created_at, updated_at
         FROM users
         WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
           AND ($2::boolean IS NULL OR is_active = $2)
@@ -282,7 +282,7 @@ pub async fn create_user(
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             failed_login_attempts, locked_until, last_failed_login_at,
-            last_login_at, created_at, updated_at
+            password_changed_at, last_login_at, created_at, updated_at
         "#,
         payload.username,
         payload.email,
@@ -346,7 +346,7 @@ pub async fn get_user(
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             failed_login_attempts, locked_until, last_failed_login_at,
-            last_login_at, created_at, updated_at
+            password_changed_at, last_login_at, created_at, updated_at
         FROM users
         WHERE id = $1
         "#,
@@ -399,7 +399,7 @@ pub async fn update_user(
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
             failed_login_attempts, locked_until, last_failed_login_at,
-            last_login_at, created_at, updated_at
+            password_changed_at, last_login_at, created_at, updated_at
         "#,
         id,
         payload.email,
@@ -837,7 +837,7 @@ pub async fn change_password(
 
     // Update password and clear must_change_password flag
     let result = sqlx::query!(
-        "UPDATE users SET password_hash = $2, must_change_password = false, updated_at = NOW() WHERE id = $1",
+        "UPDATE users SET password_hash = $2, must_change_password = false, password_changed_at = NOW(), updated_at = NOW() WHERE id = $1",
         id,
         new_hash
     )
@@ -939,7 +939,7 @@ pub async fn reset_password(
     let password_hash = AuthService::hash_password(&temp_password).await?;
 
     // Update password and set must_change_password=true
-    sqlx::query("UPDATE users SET password_hash = $1, must_change_password = true, updated_at = NOW() WHERE id = $2")
+    sqlx::query("UPDATE users SET password_hash = $1, must_change_password = true, password_changed_at = NOW(), updated_at = NOW() WHERE id = $2")
         .bind(&password_hash)
         .bind(id)
         .execute(&state.db)
@@ -1067,6 +1067,7 @@ mod tests {
             failed_login_attempts: 0,
             locked_until: None,
             last_failed_login_at: None,
+            password_changed_at: Utc::now(),
             last_login_at: Some(now),
             created_at: now,
             updated_at: now,

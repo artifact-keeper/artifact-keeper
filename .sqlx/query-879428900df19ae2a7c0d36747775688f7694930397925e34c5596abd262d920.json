@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = 'saml'\n            ",
+  "query": "SELECT id, username, email, password_hash, display_name,\n                       auth_provider as \"auth_provider: crate::models::user::AuthProvider\",\n                       external_id, is_admin, is_active, is_service_account, must_change_password,\n                       totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                       failed_login_attempts, locked_until, last_failed_login_at,\n                       password_changed_at, last_login_at, created_at, updated_at\n                       FROM users WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -30,7 +30,7 @@
       },
       {
         "ordinal": 5,
-        "name": "auth_provider: AuthProvider",
+        "name": "auth_provider: crate::models::user::AuthProvider",
         "type_info": {
           "Custom": {
             "name": "auth_provider",
@@ -107,23 +107,28 @@
       },
       {
         "ordinal": 18,
-        "name": "last_login_at",
+        "name": "password_changed_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 19,
-        "name": "created_at",
+        "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -145,10 +150,11 @@
       false,
       true,
       true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "496f4be0d87fc0a3e361c88516b06f6ec86f7932fd230e116b45bf8baca61012"
+  "hash": "879428900df19ae2a7c0d36747775688f7694930397925e34c5596abd262d920"
 }

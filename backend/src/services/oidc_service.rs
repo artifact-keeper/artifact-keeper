@@ -492,7 +492,7 @@ impl OidcService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE external_id = $1 AND auth_provider = 'oidc'
             "#,
@@ -547,7 +547,7 @@ impl OidcService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             "#,
             user_id,
             username,
@@ -771,6 +771,7 @@ mod tests {
             rate_limit_exempt_service_accounts: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
+            password_expiry_days: 0,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -830,6 +831,7 @@ mod tests {
             rate_limit_exempt_service_accounts: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
+            password_expiry_days: 0,
         }
     }
 
