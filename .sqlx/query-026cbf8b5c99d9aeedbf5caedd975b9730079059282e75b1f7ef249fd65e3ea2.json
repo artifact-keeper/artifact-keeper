@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users\n            SET last_login_at = NOW(),\n                failed_login_attempts = 0,\n                locked_until = NULL,\n                last_failed_login_at = NULL\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "026cbf8b5c99d9aeedbf5caedd975b9730079059282e75b1f7ef249fd65e3ea2"
+}

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO users (id, username, email, display_name, auth_provider, external_id, is_admin, is_active, is_service_account)\n            VALUES ($1, $2, $3, $4, 'saml', $5, $6, true, false)\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                last_login_at, created_at, updated_at\n            ",
+  "query": "SELECT id, username, email, password_hash, display_name,\n                       auth_provider as \"auth_provider: crate::models::user::AuthProvider\",\n                       external_id, is_admin, is_active, is_service_account, must_change_password,\n                       totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                       failed_login_attempts, locked_until, last_failed_login_at,\n                       last_login_at, created_at, updated_at\n                       FROM users WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -30,7 +30,7 @@
       },
       {
         "ordinal": 5,
-        "name": "auth_provider: AuthProvider",
+        "name": "auth_provider: crate::models::user::AuthProvider",
         "type_info": {
           "Custom": {
             "name": "auth_provider",
@@ -92,28 +92,38 @@
       },
       {
         "ordinal": 15,
-        "name": "last_login_at",
-        "type_info": "Timestamptz"
+        "name": "failed_login_attempts",
+        "type_info": "Int4"
       },
       {
         "ordinal": 16,
-        "name": "created_at",
+        "name": "locked_until",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 17,
+        "name": "last_failed_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -132,10 +142,13 @@
       false,
       true,
       true,
+      false,
+      true,
+      true,
       true,
       false,
       false
     ]
   },
-  "hash": "df995bf28036ac65abf2a4aa1d7a5ceea6aa0374676fbed752c5dad4e5bc032e"
+  "hash": "8dd8d58a2a6503d92e345dac69fdd29bcca9ef4a1db2514819ac221ed6a42176"
 }

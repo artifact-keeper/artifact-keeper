@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO users (id, username, email, display_name, auth_provider, external_id, is_admin, is_active, is_service_account)\n            VALUES ($1, $2, $3, $4, 'oidc', $5, $6, true, false)\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                last_login_at, created_at, updated_at\n            ",
+  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, is_service_account, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            failed_login_attempts, locked_until, last_failed_login_at,\n            last_login_at, created_at, updated_at\n        FROM users\n        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)\n          AND ($2::boolean IS NULL OR is_active = $2)\n          AND ($3::boolean IS NULL OR is_admin = $3)\n        ORDER BY username\n        OFFSET $4\n        LIMIT $5\n        ",
   "describe": {
     "columns": [
       {
@@ -92,28 +92,42 @@
       },
       {
         "ordinal": 15,
-        "name": "last_login_at",
-        "type_info": "Timestamptz"
+        "name": "failed_login_attempts",
+        "type_info": "Int4"
       },
       {
         "ordinal": 16,
-        "name": "created_at",
+        "name": "locked_until",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 17,
+        "name": "last_failed_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Bool"
+        "Text",
+        "Bool",
+        "Bool",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -132,10 +146,13 @@
       false,
       true,
       true,
+      false,
+      true,
+      true,
       true,
       false,
       false
     ]
   },
-  "hash": "569bac6873379d2f247803729748a8a71a53c55e8ddf02be6562004622aa6949"
+  "hash": "55a1a3f683b74b8069a83f2fb4adb1eabc1bf2f6d51d5474e2b26b0767540686"
 }

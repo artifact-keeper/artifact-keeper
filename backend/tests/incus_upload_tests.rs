@@ -73,6 +73,8 @@ fn test_config(storage_path: &str) -> Config {
         rate_limit_window_secs: 60,
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
+        account_lockout_threshold: 5,
+        account_lockout_duration_minutes: 30,
     }
 }
 

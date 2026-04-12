@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, email, password_hash, display_name,\n                       auth_provider as \"auth_provider: crate::models::user::AuthProvider\",\n                       external_id, is_admin, is_active, is_service_account, must_change_password,\n                       totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                       last_login_at, created_at, updated_at\n                       FROM users WHERE id = $1",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE id = $1 AND is_service_account = true\n            ",
   "describe": {
     "columns": [
       {
@@ -30,7 +30,7 @@
       },
       {
         "ordinal": 5,
-        "name": "auth_provider: crate::models::user::AuthProvider",
+        "name": "auth_provider: AuthProvider",
         "type_info": {
           "Custom": {
             "name": "auth_provider",
@@ -92,16 +92,31 @@
       },
       {
         "ordinal": 15,
-        "name": "last_login_at",
-        "type_info": "Timestamptz"
+        "name": "failed_login_attempts",
+        "type_info": "Int4"
       },
       {
         "ordinal": 16,
-        "name": "created_at",
+        "name": "locked_until",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 17,
+        "name": "last_failed_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -127,10 +142,13 @@
       false,
       true,
       true,
+      false,
+      true,
+      true,
       true,
       false,
       false
     ]
   },
-  "hash": "225e9bb128ca0dafdddce8032b6101a42af197588cb55f3d104cb3768ac4972e"
+  "hash": "d437fedb2757800413c33496c12fbec2ce2c1874046f474b7d7fe558b6b1d45f"
 }

@@ -306,6 +306,7 @@ pub async fn verify_totp(
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+            failed_login_attempts, locked_until, last_failed_login_at,
             last_login_at, created_at, updated_at
         FROM users
         WHERE id = $1 AND is_active = true

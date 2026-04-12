@@ -184,6 +184,7 @@ pub async fn list_users(
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+            failed_login_attempts, locked_until, last_failed_login_at,
             last_login_at, created_at, updated_at
         FROM users
         WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
@@ -280,6 +281,7 @@ pub async fn create_user(
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+            failed_login_attempts, locked_until, last_failed_login_at,
             last_login_at, created_at, updated_at
         "#,
         payload.username,
@@ -343,6 +345,7 @@ pub async fn get_user(
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+            failed_login_attempts, locked_until, last_failed_login_at,
             last_login_at, created_at, updated_at
         FROM users
         WHERE id = $1
@@ -395,6 +398,7 @@ pub async fn update_user(
             auth_provider as "auth_provider: AuthProvider",
             external_id, is_admin, is_active, is_service_account, must_change_password,
             totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+            failed_login_attempts, locked_until, last_failed_login_at,
             last_login_at, created_at, updated_at
         "#,
         id,
@@ -1060,6 +1064,9 @@ mod tests {
             totp_enabled: false,
             totp_backup_codes: None,
             totp_verified_at: None,
+            failed_login_attempts: 0,
+            locked_until: None,
+            last_failed_login_at: None,
             last_login_at: Some(now),
             created_at: now,
             updated_at: now,

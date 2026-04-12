@@ -164,6 +164,14 @@ pub struct Config {
     pub rate_limit_window_secs: u64,
     pub rate_limit_exempt_usernames: Vec<String>,
     pub rate_limit_exempt_service_accounts: bool,
+
+    /// Number of consecutive failed login attempts before a local account is
+    /// locked. Set to 0 to disable account lockout. Default: 5.
+    pub account_lockout_threshold: u32,
+
+    /// Duration in minutes that a locked account remains locked before the
+    /// user can try again. Default: 30.
+    pub account_lockout_duration_minutes: i64,
 }
 
 redacted_debug!(Config {
@@ -213,6 +221,8 @@ redacted_debug!(Config {
     show rate_limit_window_secs,
     show rate_limit_exempt_usernames,
     show rate_limit_exempt_service_accounts,
+    show account_lockout_threshold,
+    show account_lockout_duration_minutes,
 });
 
 impl Config {
@@ -317,6 +327,8 @@ impl Config {
                 env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
                 Ok("true" | "1")
             ),
+            account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
+            account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
         };
 
         config.validate_jwt_secret()?;

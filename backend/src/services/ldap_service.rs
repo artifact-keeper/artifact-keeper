@@ -292,6 +292,7 @@ impl LdapService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
                 last_login_at, created_at, updated_at
             FROM users
             WHERE external_id = $1 AND auth_provider = 'ldap'
@@ -343,6 +344,7 @@ impl LdapService {
                 auth_provider as "auth_provider: AuthProvider",
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+                failed_login_attempts, locked_until, last_failed_login_at,
                 last_login_at, created_at, updated_at
             "#,
             user_id,
@@ -776,6 +778,8 @@ mod tests {
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            account_lockout_threshold: 5,
+            account_lockout_duration_minutes: 30,
         }
     }
 

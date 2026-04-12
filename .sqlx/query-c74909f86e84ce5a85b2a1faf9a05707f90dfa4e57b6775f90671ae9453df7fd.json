@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                INSERT INTO users (\n                    username, email, display_name, auth_provider,\n                    external_id, is_admin, is_active, is_service_account, must_change_password\n                )\n                VALUES ($1, $2, $3, $4, $5, $6, true, false, false)\n                RETURNING\n                    id, username, email, password_hash, display_name,\n                    auth_provider as \"auth_provider: AuthProvider\",\n                    external_id, is_admin, is_active, is_service_account, must_change_password,\n                    totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                    last_login_at, created_at, updated_at\n                ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = 'ldap'\n            ",
   "describe": {
     "columns": [
       {
@@ -92,40 +92,38 @@
       },
       {
         "ordinal": 15,
-        "name": "last_login_at",
-        "type_info": "Timestamptz"
+        "name": "failed_login_attempts",
+        "type_info": "Int4"
       },
       {
         "ordinal": 16,
-        "name": "created_at",
+        "name": "locked_until",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 17,
+        "name": "last_failed_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "last_login_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        {
-          "Custom": {
-            "name": "auth_provider",
-            "kind": {
-              "Enum": [
-                "local",
-                "ldap",
-                "saml",
-                "oidc"
-              ]
-            }
-          }
-        },
-        "Varchar",
-        "Bool"
+        "Text"
       ]
     },
     "nullable": [
@@ -144,10 +142,13 @@
       false,
       true,
       true,
+      false,
+      true,
+      true,
       true,
       false,
       false
     ]
   },
-  "hash": "15945647f0c9e4c3f09ed35c881cdb6200189767dd1cd6fdfdb3bb462fe2f202"
+  "hash": "c74909f86e84ce5a85b2a1faf9a05707f90dfa4e57b6775f90671ae9453df7fd"
 }
