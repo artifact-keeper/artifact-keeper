@@ -1250,12 +1250,43 @@ mod tests {
     }
 
     #[test]
+    fn test_should_fetch_next_page_boundary_limit_of_one() {
+        // A single-row page with limit=1 means more rows could exist
+        assert!(should_fetch_next_page(1, 1));
+        // Zero rows with limit=1 means empty result set
+        assert!(!should_fetch_next_page(0, 1));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_limit_zero_always_continues() {
+        // Zero limit collapses to max usize so any non-empty page continues
+        assert!(should_fetch_next_page(1, 0));
+        assert!(!should_fetch_next_page(0, 0));
+    }
+
+    #[test]
+    fn test_should_fetch_next_page_page_larger_than_limit() {
+        // Defensive: if the server returns more rows than requested,
+        // treat it as a full page (continue fetching)
+        assert!(should_fetch_next_page(200, 100));
+    }
+
+    #[test]
     fn test_max_artifact_pages_constant_is_safety_guard() {
         // Sanity check the safety guard is reasonable: with 1000 rows per
         // page, this allows enumerating up to 100M artifacts in a single
         // repository before bailing out.
         let min_pages = 10_000;
         assert!(MAX_ARTIFACT_PAGES >= min_pages);
+    }
+
+    #[test]
+    fn test_default_batch_size_is_reasonable_for_aql() {
+        // Default batch size should be large enough to avoid excessive
+        // round trips but not so large it stresses the source API.
+        let config = WorkerConfig::default();
+        assert!(config.batch_size >= 100);
+        assert!(config.batch_size <= 10_000);
     }
 
     #[test]
