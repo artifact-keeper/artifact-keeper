@@ -16,6 +16,7 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::auth_service::AuthService;
+use crate::services::password_policy::PasswordPolicyConfig;
 use std::sync::atomic::Ordering;
 
 /// Create user routes
@@ -62,47 +63,13 @@ pub(crate) fn generate_password() -> String {
         .collect()
 }
 
-/// Validate password strength beyond minimum length.
-fn validate_password(password: &str) -> Result<()> {
-    if password.len() < 8 {
-        return Err(AppError::Validation(
-            "Password must be at least 8 characters".to_string(),
-        ));
-    }
-    if password.len() > 128 {
-        return Err(AppError::Validation(
-            "Password must be at most 128 characters".to_string(),
-        ));
-    }
-    const COMMON_PASSWORDS: &[&str] = &[
-        "password",
-        "12345678",
-        "123456789",
-        "1234567890",
-        "qwerty123",
-        "qwertyui",
-        "password1",
-        "iloveyou",
-        "12341234",
-        "00000000",
-        "abc12345",
-        "11111111",
-        "password123",
-        "admin123",
-        "letmein1",
-        "welcome1",
-        "monkey12",
-        "dragon12",
-        "baseball1",
-        "trustno1",
-    ];
-    let lower = password.to_lowercase();
-    if COMMON_PASSWORDS.contains(&lower.as_str()) {
-        return Err(AppError::Validation(
-            "Password is too common; choose a stronger password".to_string(),
-        ));
-    }
-    Ok(())
+/// Validate a password against the configurable password policy.
+///
+/// Delegates to [`crate::services::password_policy::validate_password`] and
+/// converts the list of violations into a single [`AppError::Validation`].
+fn validate_password_with_policy(password: &str, policy: &PasswordPolicyConfig) -> Result<()> {
+    crate::services::password_policy::validate_password(password, policy)
+        .map_err(|violations| AppError::Validation(violations.join("; ")))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -259,10 +226,13 @@ pub async fn create_user(
         ));
     }
 
+    // Build the password policy from config
+    let policy = PasswordPolicyConfig::from_config(&state.config);
+
     // Generate password if not provided, otherwise validate
     let (password, auto_generated) = match payload.password {
         Some(ref p) => {
-            validate_password(p)?;
+            validate_password_with_policy(p, &policy)?;
             (p.clone(), false)
         }
         None => (generate_password(), true),
@@ -792,8 +762,9 @@ pub async fn change_password(
     Path(id): Path<Uuid>,
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<()> {
-    // Validate new password
-    validate_password(&payload.new_password)?;
+    // Validate new password against configurable policy
+    let policy = PasswordPolicyConfig::from_config(&state.config);
+    validate_password_with_policy(&payload.new_password, &policy)?;
 
     // For non-admins changing their own password, verify current password
     if auth.user_id == id && !auth.is_admin {
@@ -1466,11 +1437,18 @@ mod tests {
         assert_eq!(offset, 0);
     }
 
-    // -- validate_password tests --
+    // -- validate_password_with_policy tests --
+    // (Comprehensive policy rule tests live in services::password_policy::tests.
+    //  These handler-level tests verify that the wrapper correctly converts
+    //  violations into AppError::Validation.)
+
+    fn default_policy() -> PasswordPolicyConfig {
+        PasswordPolicyConfig::default()
+    }
 
     #[test]
     fn test_validate_password_too_short() {
-        let result = validate_password("abc");
+        let result = validate_password_with_policy("abc", &default_policy());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("at least 8 characters"));
@@ -1478,15 +1456,14 @@ mod tests {
 
     #[test]
     fn test_validate_password_exactly_min_length() {
-        // 8 chars, not a common password
-        let result = validate_password("xK9!mZ2q");
+        let result = validate_password_with_policy("xK9!mZ2q", &default_policy());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_password_too_long() {
         let long = "a".repeat(129);
-        let result = validate_password(&long);
+        let result = validate_password_with_policy(&long, &default_policy());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("at most 128 characters"));
@@ -1495,62 +1472,62 @@ mod tests {
     #[test]
     fn test_validate_password_exactly_max_length() {
         let long = "aB3!".repeat(32); // 128 chars
-        let result = validate_password(&long);
+        let result = validate_password_with_policy(&long, &default_policy());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_password_common_password_rejected() {
-        let result = validate_password("password");
+        let result = validate_password_with_policy("password", &default_policy());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too common"));
     }
 
     #[test]
     fn test_validate_password_common_password_case_insensitive() {
-        // "Password" differs in case but should still be rejected
-        let result = validate_password("Password");
+        let result = validate_password_with_policy("Password", &default_policy());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too common"));
     }
 
     #[test]
     fn test_validate_password_common_numeric() {
-        let result = validate_password("12345678");
+        let result = validate_password_with_policy("12345678", &default_policy());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too common"));
     }
 
     #[test]
     fn test_validate_password_common_qwerty() {
-        let result = validate_password("qwerty123");
+        let result = validate_password_with_policy("qwerty123", &default_policy());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too common"));
     }
 
     #[test]
     fn test_validate_password_common_admin123() {
-        let result = validate_password("admin123");
+        let result = validate_password_with_policy("admin123", &default_policy());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too common"));
     }
 
     #[test]
     fn test_validate_password_common_trustno1() {
-        let result = validate_password("trustno1");
+        let result = validate_password_with_policy("trustno1", &default_policy());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("too common"));
     }
 
     #[test]
     fn test_validate_password_valid_strong_password() {
-        let result = validate_password("Correct-Horse-Battery-Staple!");
+        let result =
+            validate_password_with_policy("Correct-Horse-Battery-Staple!", &default_policy());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_password_seven_chars_rejected() {
-        let result = validate_password("aB3!xYz");
+        let result = validate_password_with_policy("aB3!xYz", &default_policy());
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
