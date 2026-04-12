@@ -87,6 +87,7 @@ pub mod sso_admin;
 pub mod storage_gc;
 pub mod swift;
 pub mod sync_policies;
+pub mod system_config;
 pub mod telemetry;
 pub mod terraform;
 pub mod totp;

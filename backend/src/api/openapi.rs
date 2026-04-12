@@ -49,6 +49,7 @@ use utoipa::{Modify, OpenApi};
         (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
+        (name = "system", description = "Public system configuration"),
     ),
     components(schemas(ErrorResponse))
 )]
@@ -130,6 +131,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());
     doc.merge(super::handlers::curation::CurationApiDoc::openapi());
     doc.merge(super::handlers::upload::UploadApiDoc::openapi());
+    doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
 
     doc
 }
@@ -490,6 +492,13 @@ mod tests {
                 vec![include_str!("handlers/curation.rs")],
             ),
             ("/api/v1/uploads/", vec![include_str!("handlers/upload.rs")]),
+            (
+                "/api/v1/system/",
+                vec![
+                    include_str!("handlers/system_config.rs"),
+                    include_str!("routes.rs"),
+                ],
+            ),
         ];
 
         // Sort by prefix length descending so longest match wins

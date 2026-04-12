@@ -190,6 +190,11 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     }
 
     Router::new()
+        // Public system configuration (no auth required)
+        .route(
+            "/system/config",
+            get(handlers::system_config::get_system_config),
+        )
         // Setup status (public, no auth)
         .nest("/setup", handlers::auth::setup_router())
         // Auth routes - split into public and protected (rate limited)
