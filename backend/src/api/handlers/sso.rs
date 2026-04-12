@@ -312,10 +312,7 @@ async fn oidc_callback_inner(
     )
     .await?;
 
-    let frontend_url = format!(
-        "/auth/callback?code={}",
-        urlencoding::encode(&exchange_code),
-    );
+    let frontend_url = build_frontend_callback_url(&exchange_code);
 
     Ok(Redirect::temporary(&frontend_url))
 }
@@ -535,10 +532,7 @@ pub async fn saml_acs(
     )
     .await?;
 
-    let frontend_url = format!(
-        "/auth/callback?code={}",
-        urlencoding::encode(&exchange_code),
-    );
+    let frontend_url = build_frontend_callback_url(&exchange_code);
 
     Ok(Redirect::temporary(&frontend_url))
 }
@@ -614,6 +608,15 @@ pub struct SsoApiDoc;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build the frontend callback URL for the SSO exchange code flow.
+///
+/// The Next.js frontend serves the callback page at `/callback` (the `(auth)`
+/// route group does not add a URL prefix). The exchange code is URL-encoded
+/// and passed as a query parameter so the frontend can exchange it for tokens.
+pub(crate) fn build_frontend_callback_url(exchange_code: &str) -> String {
+    format!("/callback?code={}", urlencoding::encode(exchange_code))
+}
 
 /// Resolve the redirect URI from OIDC attribute_mapping, falling back to an
 /// absolute URL built from request headers.
@@ -986,6 +989,43 @@ mod tests {
         assert_eq!(json["access_token"], "at_123");
         assert_eq!(json["refresh_token"], "rt_456");
         assert_eq!(json["token_type"], "Bearer");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_frontend_callback_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_frontend_callback_url_simple_code() {
+        let url = build_frontend_callback_url("abc123");
+        assert_eq!(url, "/callback?code=abc123");
+    }
+
+    #[test]
+    fn test_frontend_callback_url_does_not_use_auth_prefix() {
+        let url = build_frontend_callback_url("test");
+        assert!(url.starts_with("/callback?"));
+        assert!(!url.contains("/auth/callback"));
+    }
+
+    #[test]
+    fn test_frontend_callback_url_encodes_special_chars() {
+        let url = build_frontend_callback_url("code with spaces&symbols=yes");
+        assert_eq!(url, "/callback?code=code%20with%20spaces%26symbols%3Dyes");
+    }
+
+    #[test]
+    fn test_frontend_callback_url_empty_code() {
+        let url = build_frontend_callback_url("");
+        assert_eq!(url, "/callback?code=");
+    }
+
+    #[test]
+    fn test_frontend_callback_url_unicode_code() {
+        let url = build_frontend_callback_url("token-\u{00e9}\u{00e8}");
+        // urlencoding will percent-encode the non-ASCII bytes
+        assert!(url.starts_with("/callback?code="));
+        assert!(!url.contains('\u{00e9}'));
     }
 
     // -----------------------------------------------------------------------
