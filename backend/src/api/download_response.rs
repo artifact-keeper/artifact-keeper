@@ -170,6 +170,46 @@ pub async fn serve_from_storage_with_expiry<S: StorageBackend + ?Sized>(
     })
 }
 
+/// Try to generate a presigned redirect response for a storage key.
+///
+/// Returns `Some(Response)` with a 302 redirect if `presigned_enabled` is true
+/// and the storage backend supports presigned URLs. Returns `None` otherwise,
+/// signaling the caller should fall back to streaming the content.
+///
+/// This is the primary entry point for format handlers that want to opt in to
+/// presigned download redirects without restructuring their response logic.
+pub async fn try_presigned_redirect<S: StorageBackend + ?Sized>(
+    storage: &S,
+    key: &str,
+    presigned_enabled: bool,
+    expiry: Duration,
+) -> Option<axum::response::Response> {
+    if !presigned_enabled || !storage.supports_redirect() {
+        return None;
+    }
+
+    match storage.get_presigned_url(key, expiry).await {
+        Ok(Some(presigned)) => {
+            tracing::debug!(
+                key = %key,
+                source = ?presigned.source,
+                expiry_secs = expiry.as_secs(),
+                "Serving artifact via presigned redirect"
+            );
+            Some(DownloadResponse::redirect(presigned).into_response())
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                key = %key,
+                error = %e,
+                "Failed to generate presigned URL, falling back to proxy"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +439,133 @@ mod tests {
     #[test]
     fn test_x_artifact_storage_header_constant() {
         assert_eq!(X_ARTIFACT_STORAGE, "x-artifact-storage");
+    }
+
+    // -- try_presigned_redirect tests -----------------------------------------
+
+    use crate::error::Result as AppResult;
+    use crate::storage::PresignedUrl as PU;
+    use async_trait::async_trait;
+
+    /// A mock backend that supports presigned URLs.
+    struct RedirectBackend;
+
+    #[async_trait]
+    impl StorageBackend for RedirectBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> AppResult<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> AppResult<Bytes> {
+            Ok(Bytes::from_static(b"data"))
+        }
+        async fn exists(&self, _key: &str) -> AppResult<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> AppResult<()> {
+            Ok(())
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: Duration,
+        ) -> AppResult<Option<PU>> {
+            Ok(Some(PU {
+                url: format!("https://s3.example.com/{}", key),
+                expires_in,
+                source: PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    /// A mock backend that does not support presigned URLs.
+    struct NoRedirectBackend;
+
+    #[async_trait]
+    impl StorageBackend for NoRedirectBackend {
+        async fn put(&self, _key: &str, _content: Bytes) -> AppResult<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> AppResult<Bytes> {
+            Ok(Bytes::from_static(b"data"))
+        }
+        async fn exists(&self, _key: &str) -> AppResult<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_presigned_redirect_enabled_and_supported() {
+        let backend = RedirectBackend;
+        let result = super::try_presigned_redirect(
+            &backend,
+            "cas/ab/cd/abcdef",
+            true,
+            Duration::from_secs(300),
+        )
+        .await;
+
+        assert!(result.is_some(), "Should return a redirect response");
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.contains("s3.example.com"));
+        assert!(location.contains("cas/ab/cd/abcdef"));
+    }
+
+    #[tokio::test]
+    async fn test_try_presigned_redirect_disabled() {
+        let backend = RedirectBackend;
+        let result = super::try_presigned_redirect(
+            &backend,
+            "cas/ab/cd/abcdef",
+            false,
+            Duration::from_secs(300),
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "Should return None when feature is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_presigned_redirect_backend_no_support() {
+        let backend = NoRedirectBackend;
+        let result = super::try_presigned_redirect(
+            &backend,
+            "cas/ab/cd/abcdef",
+            true,
+            Duration::from_secs(300),
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "Should return None when backend does not support redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_presigned_redirect_uses_configured_expiry() {
+        let backend = RedirectBackend;
+        let result =
+            super::try_presigned_redirect(&backend, "test-key", true, Duration::from_secs(600))
+                .await;
+
+        let resp = result.unwrap();
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, "private, max-age=600");
     }
 }

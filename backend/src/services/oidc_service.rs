@@ -782,6 +782,8 @@ mod tests {
             password_require_digit: false,
             password_require_special: false,
             password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -852,6 +854,8 @@ mod tests {
             password_require_digit: false,
             password_require_special: false,
             password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
         }
     }
 

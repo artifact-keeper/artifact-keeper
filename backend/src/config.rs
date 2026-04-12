@@ -215,6 +215,16 @@ pub struct Config {
     /// When set to a value > 0, passwords are evaluated by the zxcvbn estimator
     /// and must meet or exceed the given score.
     pub password_min_strength: u8,
+
+    /// When true, artifact downloads served from storage backends that support
+    /// presigned URLs (S3, GCS, Azure) will return a 302 redirect to a
+    /// presigned URL instead of proxying the bytes through the backend. This
+    /// reduces bandwidth and CPU usage on the backend server. Default: false.
+    pub presigned_downloads_enabled: bool,
+
+    /// Expiry in seconds for presigned download URLs. Only used when
+    /// `presigned_downloads_enabled` is true. Default: 300 (5 minutes).
+    pub presigned_download_expiry_secs: u64,
 }
 
 redacted_debug!(Config {
@@ -277,6 +287,8 @@ redacted_debug!(Config {
     show password_require_digit,
     show password_require_special,
     show password_min_strength,
+    show presigned_downloads_enabled,
+    show presigned_download_expiry_secs,
 });
 
 impl Config {
@@ -412,6 +424,11 @@ impl Config {
                 let raw = env_parse::<u8>("PASSWORD_MIN_STRENGTH", 0);
                 raw.min(4)
             },
+            presigned_downloads_enabled: matches!(
+                env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            presigned_download_expiry_secs: env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300),
         };
 
         config.validate_jwt_secret()?;
@@ -1293,5 +1310,59 @@ mod tests {
         let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
         assert_eq!(result, 10);
         env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    // ── presigned downloads config tests ──────────────────────────────
+
+    #[test]
+    fn test_presigned_downloads_disabled_by_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(!enabled);
+    }
+
+    #[test]
+    fn test_presigned_downloads_enabled_true() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOADS_ENABLED", "true");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(enabled);
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+    }
+
+    #[test]
+    fn test_presigned_downloads_enabled_one() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOADS_ENABLED", "1");
+        let enabled = matches!(
+            env::var("PRESIGNED_DOWNLOADS_ENABLED").as_deref(),
+            Ok("true" | "1")
+        );
+        assert!(enabled);
+        env::remove_var("PRESIGNED_DOWNLOADS_ENABLED");
+    }
+
+    #[test]
+    fn test_presigned_download_expiry_default() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
+        let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
+        assert_eq!(expiry, 300);
+    }
+
+    #[test]
+    fn test_presigned_download_expiry_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS", "600");
+        let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
+        assert_eq!(expiry, 600);
+        env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
     }
 }
