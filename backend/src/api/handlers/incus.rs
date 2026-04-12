@@ -571,9 +571,15 @@ async fn download_image(
     .map_err(db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Image file not found").into_response())?;
 
+    let artifact_id: uuid::Uuid = artifact.get("id");
     let storage_key: String = artifact.get("storage_key");
     let size_bytes: i64 = artifact.get("size_bytes");
     let checksum: String = artifact.get("checksum_sha256");
+
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
+        .await
+        .map_err(|e| e.into_response())?;
 
     let storage = state
         .storage_for_repo(&repo.storage_location())

@@ -90,7 +90,7 @@ pub fn check_download_allowed(
                 "Artifact is quarantined and pending security review".to_string(),
             ))
         }
-        Some("rejected") => Err(AppError::Conflict(
+        Some("rejected") => Err(AppError::Authorization(
             "Artifact was rejected during security review".to_string(),
         )),
         // 'released', 'clean', 'unscanned', 'flagged', or NULL are all downloadable
@@ -160,7 +160,7 @@ pub async fn resolve_config(db: &PgPool, repository_id: Uuid) -> QuarantineConfi
 
     QuarantineConfig {
         enabled,
-        duration_minutes: duration,
+        duration_minutes: validate_duration(duration),
     }
 }
 
@@ -182,15 +182,40 @@ pub async fn set_quarantine(
 }
 
 /// Transition a quarantined artifact to released or rejected.
+///
+/// Only the transition `quarantined -> released` or `quarantined -> rejected`
+/// is allowed. Returns 409 Conflict if the artifact is not currently
+/// quarantined (e.g. already released or rejected).
 pub async fn transition(db: &PgPool, artifact_id: Uuid, new_status: QuarantineState) -> Result<()> {
-    sqlx::query(
-        "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL WHERE id = $1",
+    // Validate: only quarantined -> released/rejected is allowed
+    match new_status {
+        QuarantineState::Released | QuarantineState::Rejected => {}
+        QuarantineState::Quarantined => {
+            return Err(AppError::Conflict(
+                "Cannot transition to quarantined state".to_string(),
+            ));
+        }
+    }
+
+    // Use conditional UPDATE to ensure the artifact is currently quarantined.
+    // This also prevents race conditions where a scanner tries to overwrite
+    // a rejection set by an admin.
+    let result = sqlx::query(
+        "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL \
+         WHERE id = $1 AND quarantine_status = 'quarantined'",
     )
     .bind(artifact_id)
     .bind(new_status.as_str())
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict(
+            "Artifact is not in quarantined state; transition not allowed".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -215,6 +240,73 @@ pub async fn get_status(
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
     Ok((row.quarantine_status, row.quarantine_until))
+}
+
+/// Fetch quarantine status along with the artifact's repository_id.
+///
+/// Used by the quarantine status endpoint to enforce repository visibility.
+pub async fn get_status_with_repo(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<(Option<String>, Option<DateTime<Utc>>, Uuid)> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        quarantine_status: Option<String>,
+        quarantine_until: Option<DateTime<Utc>>,
+        repository_id: Uuid,
+    }
+
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT quarantine_status, quarantine_until, repository_id \
+         FROM artifacts WHERE id = $1 AND is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+    Ok((
+        row.quarantine_status,
+        row.quarantine_until,
+        row.repository_id,
+    ))
+}
+
+/// Check quarantine status for an artifact before serving it.
+///
+/// This is the common quarantine gate for all download paths. It queries the
+/// artifact's quarantine fields and returns an error if the artifact is
+/// quarantined (409 Conflict) or rejected (403 Forbidden).
+pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<()> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        quarantine_status: Option<String>,
+        quarantine_until: Option<DateTime<Utc>>,
+    }
+
+    let row = sqlx::query_as::<_, Row>(
+        "SELECT quarantine_status, quarantine_until FROM artifacts WHERE id = $1 AND is_deleted = false",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if let Some(row) = row {
+        check_download_allowed(
+            row.quarantine_status.as_deref(),
+            row.quarantine_until,
+            Utc::now(),
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Validate that a quarantine duration is at least 1 minute.
+pub fn validate_duration(minutes: i64) -> i64 {
+    minutes.max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -381,5 +473,56 @@ mod tests {
         let config = QuarantineConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.duration_minutes, 60);
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_duration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_duration_positive() {
+        assert_eq!(validate_duration(30), 30);
+        assert_eq!(validate_duration(1), 1);
+        assert_eq!(validate_duration(1440), 1440);
+    }
+
+    #[test]
+    fn test_validate_duration_zero_clamped() {
+        assert_eq!(validate_duration(0), 1);
+    }
+
+    #[test]
+    fn test_validate_duration_negative_clamped() {
+        assert_eq!(validate_duration(-10), 1);
+        assert_eq!(validate_duration(-1), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // rejected returns 403 (Authorization error), not 409 (Conflict)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rejected_returns_forbidden() {
+        let now = Utc::now();
+        let result = check_download_allowed(Some("rejected"), None, now);
+        let err = result.unwrap_err();
+        // AppError::Authorization maps to 403 FORBIDDEN
+        match err {
+            crate::error::AppError::Authorization(_) => {}
+            other => panic!("Expected Authorization error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_quarantined_returns_conflict() {
+        let now = Utc::now();
+        let until = now + Duration::minutes(30);
+        let result = check_download_allowed(Some("quarantined"), Some(until), now);
+        let err = result.unwrap_err();
+        // AppError::Conflict maps to 409 CONFLICT
+        match err {
+            crate::error::AppError::Conflict(_) => {}
+            other => panic!("Expected Conflict error, got: {other:?}"),
+        }
     }
 }

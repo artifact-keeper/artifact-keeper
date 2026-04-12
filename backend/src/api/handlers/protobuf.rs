@@ -1379,6 +1379,15 @@ async fn download(
             }
         };
 
+        // Check quarantine status before serving
+        let artifact_id_for_check: uuid::Uuid = artifact_row.get("id");
+        crate::services::quarantine_service::check_artifact_download(
+            &state.db,
+            artifact_id_for_check,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+
         // Read bundle from local storage
         let storage_key: String = artifact_row.get("storage_key");
         let storage = state

@@ -1127,13 +1127,19 @@ impl ScannerService {
                         .await?;
 
                     // Mark as flagged on failure (conservative)
-                    sqlx::query!(
+                    if let Err(e) = sqlx::query!(
                         "UPDATE artifacts SET quarantine_status = 'flagged' WHERE id = $1",
                         artifact_id,
                     )
                     .execute(&self.db)
                     .await
-                    .ok();
+                    {
+                        tracing::error!(
+                            artifact_id = %artifact_id,
+                            error = %e,
+                            "Failed to set flagged status after scan failure"
+                        );
+                    }
                 }
             }
         }
@@ -1360,7 +1366,9 @@ impl ScannerService {
     ///
     /// For quarantine-period artifacts (status is 'quarantined'), this
     /// transitions to 'released' (clean scan) or 'rejected' (findings found),
-    /// and clears the quarantine_until timestamp.
+    /// and clears the quarantine_until timestamp. Uses a conditional UPDATE
+    /// (`WHERE quarantine_status = 'quarantined'`) to prevent a clean scan
+    /// from overwriting a rejection set by an admin or another scanner.
     async fn update_quarantine_status(&self, artifact_id: Uuid, findings_count: i32) -> Result<()> {
         // Check if the artifact is currently in quarantine-period mode
         let current_status: Option<String> =
@@ -1390,14 +1398,26 @@ impl ScannerService {
         };
 
         if clear_until {
-            sqlx::query(
-                "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL WHERE id = $1",
+            // Use conditional UPDATE to prevent race conditions: only update
+            // if the artifact is still in 'quarantined' state. If an admin
+            // already rejected it, this UPDATE will affect 0 rows (which is fine).
+            let result = sqlx::query(
+                "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL \
+                 WHERE id = $1 AND quarantine_status = 'quarantined'",
             )
             .bind(artifact_id)
             .bind(&new_status)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if result.rows_affected() == 0 {
+                tracing::info!(
+                    artifact_id = %artifact_id,
+                    attempted_status = %new_status,
+                    "Quarantine transition skipped: artifact is no longer in quarantined state"
+                );
+            }
         } else {
             sqlx::query!(
                 "UPDATE artifacts SET quarantine_status = $2 WHERE id = $1",

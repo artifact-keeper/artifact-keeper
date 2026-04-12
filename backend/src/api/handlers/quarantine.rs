@@ -77,10 +77,21 @@ pub async fn get_quarantine_status(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<QuarantineStatusResponse>> {
-    let _auth =
+    let auth_ext =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
 
-    let (status, until) = quarantine_service::get_status(&state.db, artifact_id).await?;
+    // Fetch quarantine status along with the artifact's repository to check visibility
+    let (status, until, repository_id) =
+        quarantine_service::get_status_with_repo(&state.db, artifact_id).await?;
+
+    // Check that the user has access to the artifact's repository.
+    // For private repos, unauthenticated or unauthorized users get 404.
+    let repo_service =
+        crate::services::repository_service::RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_id(repository_id).await?;
+    if !repo.is_public && !auth_ext.can_access_repo(repository_id) {
+        return Err(AppError::NotFound("Artifact not found".to_string()));
+    }
 
     let now = chrono::Utc::now();
     let is_blocked =
@@ -109,6 +120,7 @@ pub async fn get_quarantine_status(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Admin access required"),
         (status = 404, description = "Artifact not found"),
+        (status = 409, description = "Artifact is not in quarantined state"),
     )
 )]
 pub async fn release_artifact(
@@ -165,6 +177,7 @@ pub async fn release_artifact(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Admin access required"),
         (status = 404, description = "Artifact not found"),
+        (status = 409, description = "Artifact is not in quarantined state"),
     )
 )]
 pub async fn reject_artifact(

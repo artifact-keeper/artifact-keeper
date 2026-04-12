@@ -480,6 +480,26 @@ pub async fn fetch_virtual_members(
     })
 }
 
+/// Row type for local artifact fetch queries, including quarantine fields.
+#[derive(sqlx::FromRow)]
+struct LocalArtifactRow {
+    storage_key: String,
+    content_type: String,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Check quarantine status on a fetched artifact row, mapping errors to Response.
+#[allow(clippy::result_large_err)]
+fn check_quarantine(row: &LocalArtifactRow) -> Result<(), Response> {
+    crate::services::quarantine_service::check_download_allowed(
+        row.quarantine_status.as_deref(),
+        row.quarantine_until,
+        chrono::Utc::now(),
+    )
+    .map_err(|e| e.into_response())
+}
+
 /// Generic local artifact fetch by exact path match.
 /// Used as a `local_fetch` callback for [`resolve_virtual_download`].
 pub async fn local_fetch_by_path(
@@ -489,18 +509,20 @@ pub async fn local_fetch_by_path(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        LIMIT 1"#,
-        repo_id,
-        artifact_path
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+         LIMIT 1",
     )
+    .bind(repo_id)
+    .bind(artifact_path)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -521,19 +543,21 @@ pub async fn local_fetch_by_name_version(
     name: &str,
     version: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
-        WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false
-        LIMIT 1"#,
-        repo_id,
-        name,
-        version
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
+         LIMIT 1",
     )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -553,18 +577,20 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
-        WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false
-        LIMIT 1"#,
-        repo_id,
-        path_suffix
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false \
+         LIMIT 1",
     )
+    .bind(repo_id)
+    .bind(path_suffix)
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage

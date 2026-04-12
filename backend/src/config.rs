@@ -375,7 +375,7 @@ impl Config {
                 env::var("QUARANTINE_ENABLED").as_deref(),
                 Ok("true" | "1")
             ),
-            quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60),
+            quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60).max(1),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
             password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
             password_require_uppercase: matches!(

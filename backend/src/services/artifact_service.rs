@@ -321,19 +321,26 @@ impl ArtifactService {
             if quarantine_service::should_quarantine(&qconfig) {
                 let now = chrono::Utc::now();
                 let until = quarantine_service::quarantine_until(&qconfig, now);
-                quarantine_service::set_quarantine(
+                if let Err(e) = quarantine_service::set_quarantine(
                     &self.db,
                     artifact.id,
                     "quarantined",
                     Some(until),
                 )
                 .await
-                .ok(); // Non-fatal: log but don't block upload
-                tracing::info!(
-                    artifact_id = %artifact.id,
-                    quarantine_until = %until,
-                    "Artifact quarantined on upload"
-                );
+                {
+                    tracing::error!(
+                        artifact_id = %artifact.id,
+                        error = %e,
+                        "Failed to set quarantine status on uploaded artifact"
+                    );
+                } else {
+                    tracing::info!(
+                        artifact_id = %artifact.id,
+                        quarantine_until = %until,
+                        "Artifact quarantined on upload"
+                    );
+                }
             }
         }
 
@@ -603,6 +610,13 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+        // Check quarantine status before serving the artifact
+        crate::services::quarantine_service::check_download_allowed(
+            artifact.quarantine_status.as_deref(),
+            artifact.quarantine_until,
+            chrono::Utc::now(),
+        )?;
 
         // Trigger BeforeDownload hooks - validators can reject the download
         let artifact_info = ArtifactInfo::from(&artifact);

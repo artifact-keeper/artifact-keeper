@@ -270,6 +270,7 @@ pub async fn get_content(
     // Look up the artifact by repository_id + path
     #[derive(sqlx::FromRow)]
     struct ArtifactRow {
+        id: uuid::Uuid,
         size_bytes: i64,
         content_type: String,
         storage_key: String,
@@ -277,7 +278,7 @@ pub async fn get_content(
 
     let artifact = sqlx::query_as::<_, ArtifactRow>(
         r#"
-        SELECT size_bytes, content_type, storage_key
+        SELECT id, size_bytes, content_type, storage_key
         FROM artifacts
         WHERE repository_id = $1 AND path = $2 AND is_deleted = false
         "#,
@@ -295,6 +296,9 @@ pub async fn get_content(
         path: storage_path,
     };
     let storage = state.storage_for_repo(&location)?;
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id).await?;
+
     let content = storage.get(&artifact.storage_key).await?;
 
     // Truncate to max_bytes if specified
