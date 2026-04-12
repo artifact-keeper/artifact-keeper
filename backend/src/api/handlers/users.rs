@@ -30,6 +30,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/tokens/:token_id", delete(revoke_api_token))
         .route("/:id/password", post(change_password))
         .route("/:id/password/reset", post(reset_password))
+        .route("/:id/force-password-change", post(force_password_change))
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -924,6 +925,75 @@ pub async fn reset_password(
     }))
 }
 
+/// Response for force password change
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ForcePasswordChangeResponse {
+    pub message: String,
+}
+
+/// Force a user to change their password on next login (admin only).
+/// Sets must_change_password=true and invalidates existing sessions so the
+/// user is prompted immediately on their next login.
+#[utoipa::path(
+    post,
+    path = "/{id}/force-password-change",
+    context_path = "/api/v1/users",
+    tag = "users",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 200, description = "Flag set successfully", body = ForcePasswordChangeResponse),
+        (status = 403, description = "Only administrators can force password changes"),
+        (status = 404, description = "User not found"),
+        (status = 422, description = "Cannot force password change for SSO users"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn force_password_change(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ForcePasswordChangeResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Only administrators can force password changes".to_string(),
+        ));
+    }
+
+    // Verify user exists and is a local user
+    let user = sqlx::query!("SELECT password_hash FROM users WHERE id = $1", id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    if user.password_hash.is_none() {
+        return Err(AppError::Validation(
+            "Cannot force password change for SSO users".to_string(),
+        ));
+    }
+
+    sqlx::query("UPDATE users SET must_change_password = true, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Invalidate existing sessions so the user must re-authenticate
+    crate::services::auth_service::invalidate_user_tokens(id);
+
+    state.event_bus.emit(
+        "user.force_password_change",
+        id,
+        Some(auth.username.clone()),
+    );
+
+    Ok(Json(ForcePasswordChangeResponse {
+        message: "User will be required to change password on next login".to_string(),
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -940,6 +1010,7 @@ pub async fn reset_password(
         revoke_api_token,
         change_password,
         reset_password,
+        force_password_change,
     ),
     components(schemas(
         ListUsersQuery,
@@ -957,6 +1028,7 @@ pub async fn reset_password(
         ApiTokenListResponse,
         ChangePasswordRequest,
         ResetPasswordResponse,
+        ForcePasswordChangeResponse,
     ))
 )]
 pub struct UsersApiDoc;
@@ -1533,5 +1605,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at least 8 characters"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ForcePasswordChangeResponse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_force_password_change_response_serialize() {
+        let resp = ForcePasswordChangeResponse {
+            message: "User will be required to change password on next login".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["message"],
+            "User will be required to change password on next login"
+        );
+    }
+
+    #[test]
+    fn test_force_password_change_response_fields() {
+        let resp = ForcePasswordChangeResponse {
+            message: "test message".to_string(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let obj = json.as_object().unwrap();
+        // Response should contain exactly the message field
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key("message"));
     }
 }
