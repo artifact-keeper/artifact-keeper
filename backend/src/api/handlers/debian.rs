@@ -370,29 +370,50 @@ fn pgp_clearsign(content: &str, signature: &[u8]) -> String {
 // GET /debian/{repo_key}/dists/{distribution}/Release
 // ---------------------------------------------------------------------------
 
-/// Attempt to proxy a metadata file (Release, InRelease, Release.gpg,
-/// Packages, Packages.gz) from the upstream for remote Debian repos.
-/// Returns `Ok(Some(response))` on a successful proxy fetch, `Ok(None)` if
-/// the repo is not configured for proxying, or `Err(response)` on proxy
-/// failure (which the caller should surface to the client).
-async fn try_proxy_debian_metadata(
-    state: &SharedState,
-    repo: &RepoInfo,
-    repo_key: &str,
-    upstream_path: &str,
-    content_type: &'static str,
-) -> Result<Option<Response>, Response> {
-    if repo.repo_type != RepositoryType::Remote {
-        return Ok(None);
+/// Handles resolving a Debian repo and proxying dists metadata from
+/// upstream for remote repos. Captures the per-request context so each
+/// handler only needs to call `proxy.dists("suffix", "ct").await?`.
+struct DebianProxy<'a> {
+    state: &'a SharedState,
+    repo_key: &'a str,
+    distribution: &'a str,
+}
+
+impl<'a> DebianProxy<'a> {
+    async fn resolve(
+        state: &'a SharedState,
+        repo_key: &'a str,
+        distribution: &'a str,
+    ) -> Result<(Self, RepoInfo), Response> {
+        let repo = resolve_debian_repo(&state.db, repo_key).await?;
+        Ok((
+            Self {
+                state,
+                repo_key,
+                distribution,
+            },
+            repo,
+        ))
     }
-    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
-        (Some(u), Some(p)) => (u, p),
-        _ => return Ok(None),
-    };
-    let (content, upstream_ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, upstream_path).await?;
-    Ok(Some(
-        Response::builder()
+
+    async fn dists(
+        &self,
+        suffix: &str,
+        content_type: &'static str,
+        repo: &RepoInfo,
+    ) -> Result<(), Response> {
+        if repo.repo_type != RepositoryType::Remote {
+            return Ok(());
+        }
+        let (upstream_url, proxy) = match (&repo.upstream_url, &self.state.proxy_service) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return Ok(()),
+        };
+        let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+        let (content, upstream_ct) =
+            proxy_helpers::proxy_fetch(proxy, repo.id, self.repo_key, upstream_url, &upstream_path)
+                .await?;
+        Err(Response::builder()
             .status(StatusCode::OK)
             .header(
                 CONTENT_TYPE,
@@ -400,51 +421,32 @@ async fn try_proxy_debian_metadata(
             )
             .header(CONTENT_LENGTH, content.len().to_string())
             .body(Body::from(content))
-            .unwrap(),
-    ))
+            .unwrap())
+    }
 }
 
-/// Resolve a Debian repo and, when it is a remote proxy, attempt to fetch
-/// the given dists file from upstream. Returns `Ok(Some(response))` when the
-/// upstream proxy succeeds, `Ok(None)` for local/staging repos (so the
-/// caller can generate the file locally), or `Err(response)` on failure.
-///
-/// This is a thin wrapper around [`try_proxy_debian_metadata`] that builds
-/// the upstream path from the distribution name and filename suffix,
-/// eliminating repeated `format!` + `try_proxy_debian_metadata` blocks
-/// across the Release, InRelease, and Release.gpg handlers.
-async fn try_proxy_dists_file(
+/// Generate the Release content locally (shared by Release, InRelease,
+/// and Release.gpg handlers). Returns the text and the repo for signing.
+async fn local_release_content(
     state: &SharedState,
-    repo: &RepoInfo,
     repo_key: &str,
     distribution: &str,
-    filename: &str,
-    content_type: &'static str,
-) -> Result<Option<Response>, Response> {
-    let upstream_path = format!("dists/{}/{}", distribution, filename);
-    try_proxy_debian_metadata(state, repo, repo_key, &upstream_path, content_type).await
+) -> Result<(String, RepoInfo), Response> {
+    let repo = resolve_debian_repo(&state.db, repo_key).await?;
+    let release = generate_release_content(state, repo.id, distribution).await?;
+    Ok((release, repo))
 }
 
 async fn release_file(
     State(state): State<SharedState>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    proxy
+        .dists("Release", "text/plain; charset=utf-8", &repo)
+        .await?;
 
-    if let Some(response) = try_proxy_dists_file(
-        &state,
-        &repo,
-        &repo_key,
-        &distribution,
-        "Release",
-        "text/plain; charset=utf-8",
-    )
-    .await?
-    {
-        return Ok(response);
-    }
-
-    let release = generate_release_content(&state, repo.id, &distribution).await?;
+    let (release, _) = local_release_content(&state, &repo_key, &distribution).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -461,24 +463,13 @@ async fn in_release_file(
     State(state): State<SharedState>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    proxy
+        .dists("InRelease", "text/plain; charset=utf-8", &repo)
+        .await?;
 
-    if let Some(response) = try_proxy_dists_file(
-        &state,
-        &repo,
-        &repo_key,
-        &distribution,
-        "InRelease",
-        "text/plain; charset=utf-8",
-    )
-    .await?
-    {
-        return Ok(response);
-    }
+    let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
-    let release = generate_release_content(&state, repo.id, &distribution).await?;
-
-    // Attempt to sign the release content
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     let signature = signing_svc
         .sign_data(repo.id, release.as_bytes())
@@ -505,22 +496,12 @@ async fn release_gpg(
     State(state): State<SharedState>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    proxy
+        .dists("Release.gpg", "application/pgp-signature", &repo)
+        .await?;
 
-    if let Some(response) = try_proxy_dists_file(
-        &state,
-        &repo,
-        &repo_key,
-        &distribution,
-        "Release.gpg",
-        "application/pgp-signature",
-    )
-    .await?
-    {
-        return Ok(response);
-    }
-
-    let release = generate_release_content(&state, repo.id, &distribution).await?;
+    let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     let signature = signing_svc
@@ -589,22 +570,11 @@ async fn packages_index(
     State(state): State<SharedState>,
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
-
-    // For remote repos, proxy the upstream Packages index.
+    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_suffix = format!("{}/{}/Packages", component, binary_arch);
-    if let Some(response) = try_proxy_dists_file(
-        &state,
-        &repo,
-        &repo_key,
-        &distribution,
-        &packages_suffix,
-        "text/plain; charset=utf-8",
-    )
-    .await?
-    {
-        return Ok(response);
-    }
+    proxy
+        .dists(&packages_suffix, "text/plain; charset=utf-8", &repo)
+        .await?;
 
     // binary_arch is like "binary-amd64", strip the "binary-" prefix
     let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
@@ -628,22 +598,11 @@ async fn packages_index_gz(
     State(state): State<SharedState>,
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
-    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
-
-    // For remote repos, proxy the upstream compressed Packages index.
+    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     let packages_gz_suffix = format!("{}/{}/Packages.gz", component, binary_arch);
-    if let Some(response) = try_proxy_dists_file(
-        &state,
-        &repo,
-        &repo_key,
-        &distribution,
-        &packages_gz_suffix,
-        "application/gzip",
-    )
-    .await?
-    {
-        return Ok(response);
-    }
+    proxy
+        .dists(&packages_gz_suffix, "application/gzip", &repo)
+        .await?;
 
     let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
 
