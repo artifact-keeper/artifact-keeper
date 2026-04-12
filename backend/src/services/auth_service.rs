@@ -14,6 +14,7 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -185,6 +186,23 @@ impl AuthService {
         locked_until.is_some_and(|t| t > now)
     }
 
+    /// Check whether a user's password has expired.
+    ///
+    /// Returns `true` when `password_expiry_days` is non-zero and the
+    /// password was last changed more than that many days ago. This is a
+    /// pure function so it can be tested without a database.
+    pub fn is_password_expired(
+        password_changed_at: DateTime<Utc>,
+        password_expiry_days: u32,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if password_expiry_days == 0 {
+            return false;
+        }
+        let expiry = password_changed_at + Duration::days(password_expiry_days as i64);
+        now >= expiry
+    }
+
     /// Decide whether a failed attempt should trigger a lockout.
     ///
     /// `attempts_after_failure` is the count *after* incrementing (i.e., the
@@ -219,7 +237,7 @@ impl AuthService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE username = $1 AND is_active = true
             "#,
@@ -303,6 +321,33 @@ impl AuthService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Check password expiration for local users
+        let mut user = user;
+        if !user.must_change_password
+            && Self::is_password_expired(
+                user.password_changed_at,
+                self.config.password_expiry_days,
+                Utc::now(),
+            )
+        {
+            user.must_change_password = true;
+
+            // Persist the flag so it survives across requests
+            sqlx::query!(
+                r#"
+            UPDATE users
+            SET must_change_password = true
+            WHERE id = $1
+            "#,
+                user.id
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            info!(user_id = %user.id, "password expired, forcing change on next login");
+        }
 
         // Generate tokens
         let tokens = self.generate_tokens(&user)?;
@@ -388,7 +433,7 @@ impl AuthService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true
             "#,
@@ -547,7 +592,7 @@ impl AuthService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_active = true
             "#,
@@ -774,7 +819,7 @@ impl AuthService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE username = $1 AND auth_provider = 'ldap' AND is_active = true
             "#,
@@ -977,7 +1022,7 @@ impl AuthService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE external_id = $1 AND auth_provider = $2
             "#,
@@ -1008,7 +1053,7 @@ impl AuthService {
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     failed_login_attempts, locked_until, last_failed_login_at,
-                    last_login_at, created_at, updated_at
+                    password_changed_at, last_login_at, created_at, updated_at
                 "#,
                 existing.id,
                 credentials.username,
@@ -1035,7 +1080,7 @@ impl AuthService {
                     external_id, is_admin, is_active, is_service_account, must_change_password,
                     totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                     failed_login_attempts, locked_until, last_failed_login_at,
-                    last_login_at, created_at, updated_at
+                    password_changed_at, last_login_at, created_at, updated_at
                 "#,
                 credentials.username,
                 credentials.email,
@@ -1130,7 +1175,7 @@ impl AuthService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             "#,
             external_id,
             provider as AuthProvider
@@ -1156,7 +1201,7 @@ impl AuthService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE auth_provider = $1 AND is_active = true
             ORDER BY username
@@ -1354,6 +1399,8 @@ mod tests {
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
             quarantine_duration_minutes: 60,
+            password_history_count: 0,
+            password_expiry_days: 0,
             password_min_length: 8,
             password_max_length: 128,
             password_require_uppercase: false,
@@ -1384,6 +1431,7 @@ mod tests {
             failed_login_attempts: 0,
             locked_until: None,
             last_failed_login_at: None,
+            password_changed_at: Utc::now(),
             last_login_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1952,6 +2000,7 @@ mod tests {
                 failed_login_attempts: 0,
                 locked_until: None,
                 last_failed_login_at: None,
+                password_changed_at: Utc::now(),
                 last_login_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -2000,6 +2049,7 @@ mod tests {
                 failed_login_attempts: 0,
                 locked_until: None,
                 last_failed_login_at: None,
+                password_changed_at: Utc::now(),
                 last_login_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
@@ -2067,6 +2117,7 @@ mod tests {
                     failed_login_attempts: 0,
                     locked_until: None,
                     last_failed_login_at: None,
+                    password_changed_at: Utc::now(),
                     last_login_at: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -2104,6 +2155,7 @@ mod tests {
                     failed_login_attempts: 0,
                     locked_until: None,
                     last_failed_login_at: None,
+                    password_changed_at: Utc::now(),
                     last_login_at: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
@@ -2291,5 +2343,51 @@ mod tests {
         // Lock after a single failed attempt
         let result = AuthService::should_lock(1, 1, 10, now);
         assert!(result.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_password_expired
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_expiry_disabled_when_zero() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(365);
+        assert!(!AuthService::is_password_expired(changed_at, 0, now));
+    }
+
+    #[test]
+    fn test_password_not_expired_within_window() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(10);
+        assert!(!AuthService::is_password_expired(changed_at, 90, now));
+    }
+
+    #[test]
+    fn test_password_expired_after_window() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(91);
+        assert!(AuthService::is_password_expired(changed_at, 90, now));
+    }
+
+    #[test]
+    fn test_password_expired_exactly_on_boundary() {
+        let now = Utc::now();
+        let changed_at = now - Duration::days(90);
+        // Password changed exactly 90 days ago with a 90-day policy: expired
+        assert!(AuthService::is_password_expired(changed_at, 90, now));
+    }
+
+    #[test]
+    fn test_password_just_changed_not_expired() {
+        let now = Utc::now();
+        assert!(!AuthService::is_password_expired(now, 1, now));
+    }
+
+    #[test]
+    fn test_password_expiry_one_day_policy() {
+        let now = Utc::now();
+        let changed_at = now - Duration::hours(25);
+        assert!(AuthService::is_password_expired(changed_at, 1, now));
     }
 }

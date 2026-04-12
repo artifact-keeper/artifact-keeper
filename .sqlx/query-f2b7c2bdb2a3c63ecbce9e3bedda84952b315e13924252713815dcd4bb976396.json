@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE users\n        SET\n            email = COALESCE($2, email),\n            display_name = COALESCE($3, display_name),\n            is_active = COALESCE($4, is_active),\n            is_admin = COALESCE($5, is_admin),\n            updated_at = NOW()\n        WHERE id = $1\n        RETURNING\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, is_service_account, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            failed_login_attempts, locked_until, last_failed_login_at,\n            last_login_at, created_at, updated_at\n        ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                password_changed_at, last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = 'saml'\n            ",
   "describe": {
     "columns": [
       {
@@ -107,27 +107,28 @@
       },
       {
         "ordinal": 18,
-        "name": "last_login_at",
+        "name": "password_changed_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 19,
-        "name": "created_at",
+        "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Bool",
-        "Bool"
+        "Text"
       ]
     },
     "nullable": [
@@ -149,10 +150,11 @@
       false,
       true,
       true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "abdfb518dff862eb0cebf0ed511c2e71a3a1c63a6f4fd7223d4bd959c660db9f"
+  "hash": "f2b7c2bdb2a3c63ecbce9e3bedda84952b315e13924252713815dcd4bb976396"
 }

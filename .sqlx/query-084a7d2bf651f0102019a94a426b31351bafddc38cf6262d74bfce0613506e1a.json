@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users\n            SET display_name = COALESCE($2, display_name),\n                is_active = COALESCE($3, is_active),\n                updated_at = NOW()\n            WHERE id = $1 AND is_service_account = true\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                last_login_at, created_at, updated_at\n            ",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, auth_provider, external_id, is_admin, is_active, is_service_account)\n            VALUES ($1, $2, $3, $4, 'ldap', $5, $6, true, false)\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                password_changed_at, last_login_at, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -107,16 +107,21 @@
       },
       {
         "ordinal": 18,
-        "name": "last_login_at",
+        "name": "password_changed_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 19,
-        "name": "created_at",
+        "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -124,6 +129,9 @@
     "parameters": {
       "Left": [
         "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
         "Varchar",
         "Bool"
       ]
@@ -147,10 +155,11 @@
       false,
       true,
       true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "381b9ab2621f8fba794ddbff2a7a0712eee7d58440d3252d4e82829556e84e10"
+  "hash": "084a7d2bf651f0102019a94a426b31351bafddc38cf6262d74bfce0613506e1a"
 }

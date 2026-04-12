@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, is_service_account, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            failed_login_attempts, locked_until, last_failed_login_at,\n            last_login_at, created_at, updated_at\n        FROM users\n        WHERE ($1::text IS NULL OR username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)\n          AND ($2::boolean IS NULL OR is_active = $2)\n          AND ($3::boolean IS NULL OR is_admin = $3)\n        ORDER BY username\n        OFFSET $4\n        LIMIT $5\n        ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                password_changed_at, last_login_at, created_at, updated_at\n            FROM users\n            WHERE external_id = $1 AND auth_provider = 'ldap'\n            ",
   "describe": {
     "columns": [
       {
@@ -107,27 +107,28 @@
       },
       {
         "ordinal": 18,
-        "name": "last_login_at",
+        "name": "password_changed_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 19,
-        "name": "created_at",
+        "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Bool",
-        "Bool",
-        "Int8",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -149,10 +150,11 @@
       false,
       true,
       true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "55a1a3f683b74b8069a83f2fb4adb1eabc1bf2f6d51d5474e2b26b0767540686"
+  "hash": "8d2aa0c023a10b56cb38adfbc590365e12bb6e0a1476759a2cd6c43bd2cab939"
 }

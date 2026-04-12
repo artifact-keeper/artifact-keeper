@@ -182,6 +182,16 @@ pub struct Config {
     /// this via repository_config keys. Default: 60.
     pub quarantine_duration_minutes: i64,
 
+    /// Number of previous passwords to remember per user. When a user changes
+    /// their password, the new password is checked against the last N hashes
+    /// and rejected if it matches any of them. Set to 0 to disable password
+    /// history checking. Default: 0 (disabled).
+    pub password_history_count: u32,
+
+    /// Number of days after which a local user's password expires and must
+    /// be changed. Set to 0 to disable password expiration. Default: 0.
+    pub password_expiry_days: u32,
+
     // -- Password policy (local users) --
     /// Minimum password length (default: 8).
     pub password_min_length: usize,
@@ -258,6 +268,8 @@ redacted_debug!(Config {
     show account_lockout_duration_minutes,
     show quarantine_enabled,
     show quarantine_duration_minutes,
+    show password_history_count,
+    show password_expiry_days,
     show password_min_length,
     show password_max_length,
     show password_require_uppercase,
@@ -376,6 +388,8 @@ impl Config {
                 Ok("true" | "1")
             ),
             quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60).max(1),
+            password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
+            password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
             password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
             password_require_uppercase: matches!(
@@ -607,6 +621,9 @@ mod tests {
         assert_eq!(config.database_acquire_timeout_secs, 30);
         assert_eq!(config.database_idle_timeout_secs, 600);
         assert_eq!(config.database_max_lifetime_secs, 1800);
+
+        // Password expiration default (disabled)
+        assert_eq!(config.password_expiry_days, 0);
 
         // Restore
         if let Some(v) = saved_db {
@@ -1219,5 +1236,62 @@ mod tests {
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PASSWORD_HISTORY_COUNT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_history_count_default_zero() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_password_history_count_parsed() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "12");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 12);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_invalid_falls_back() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "not-a-number");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_clamped_to_max_24() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "100");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_at_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "24");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_below_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "10");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 10);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
     }
 }
