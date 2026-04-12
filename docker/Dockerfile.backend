@@ -62,6 +62,8 @@ RUN mkdir -p /mnt/rootfs && \
         bzip2-libs \
         curl-minimal \
         jq \
+        tar \
+        gzip \
     && dnf --installroot /mnt/rootfs clean all \
     && rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
