@@ -370,11 +370,61 @@ fn pgp_clearsign(content: &str, signature: &[u8]) -> String {
 // GET /debian/{repo_key}/dists/{distribution}/Release
 // ---------------------------------------------------------------------------
 
+/// Attempt to proxy a metadata file (Release, InRelease, Release.gpg,
+/// Packages, Packages.gz) from the upstream for remote Debian repos.
+/// Returns `Ok(Some(response))` on a successful proxy fetch, `Ok(None)` if
+/// the repo is not configured for proxying, or `Err(response)` on proxy
+/// failure (which the caller should surface to the client).
+async fn try_proxy_debian_metadata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    upstream_path: &str,
+    content_type: &'static str,
+) -> Result<Option<Response>, Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return Ok(None);
+    }
+    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+        (Some(u), Some(p)) => (u, p),
+        _ => return Ok(None),
+    };
+    let (content, upstream_ct) =
+        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, upstream_path).await?;
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                CONTENT_TYPE,
+                upstream_ct.unwrap_or_else(|| content_type.to_string()),
+            )
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .body(Body::from(content))
+            .unwrap(),
+    ))
+}
+
 async fn release_file(
     State(state): State<SharedState>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    // For remote repos, proxy the upstream Release file unchanged so the
+    // GPG signature and checksums match what apt expects from the mirror.
+    let upstream_path = format!("dists/{}/Release", distribution);
+    if let Some(response) = try_proxy_debian_metadata(
+        &state,
+        &repo,
+        &repo_key,
+        &upstream_path,
+        "text/plain; charset=utf-8",
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     let release = generate_release_content(&state, repo.id, &distribution).await?;
 
     Ok(Response::builder()
@@ -393,6 +443,23 @@ async fn in_release_file(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    // For remote repos, proxy the upstream InRelease file unchanged. We
+    // cannot re-sign with our own GPG key because apt validates the
+    // signature against the upstream mirror's key.
+    let upstream_path = format!("dists/{}/InRelease", distribution);
+    if let Some(response) = try_proxy_debian_metadata(
+        &state,
+        &repo,
+        &repo_key,
+        &upstream_path,
+        "text/plain; charset=utf-8",
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     let release = generate_release_content(&state, repo.id, &distribution).await?;
 
     // Attempt to sign the release content
@@ -423,6 +490,21 @@ async fn release_gpg(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    // For remote repos, proxy the upstream detached signature.
+    let upstream_path = format!("dists/{}/Release.gpg", distribution);
+    if let Some(response) = try_proxy_debian_metadata(
+        &state,
+        &repo,
+        &repo_key,
+        &upstream_path,
+        "application/pgp-signature",
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     let release = generate_release_content(&state, repo.id, &distribution).await?;
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
@@ -490,9 +572,27 @@ async fn gpg_key_asc(
 
 async fn packages_index(
     State(state): State<SharedState>,
-    Path((repo_key, _distribution, component, binary_arch)): Path<(String, String, String, String)>,
+    Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    // For remote repos, proxy the upstream Packages index so the hashes
+    // inside match what the signed Release file advertises.
+    let upstream_path = format!(
+        "dists/{}/{}/{}/Packages",
+        distribution, component, binary_arch
+    );
+    if let Some(response) = try_proxy_debian_metadata(
+        &state,
+        &repo,
+        &repo_key,
+        &upstream_path,
+        "text/plain; charset=utf-8",
+    )
+    .await?
+    {
+        return Ok(response);
+    }
 
     // binary_arch is like "binary-amd64", strip the "binary-" prefix
     let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
@@ -514,9 +614,21 @@ async fn packages_index(
 
 async fn packages_index_gz(
     State(state): State<SharedState>,
-    Path((repo_key, _distribution, component, binary_arch)): Path<(String, String, String, String)>,
+    Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    // For remote repos, proxy the upstream compressed Packages index.
+    let upstream_path = format!(
+        "dists/{}/{}/{}/Packages.gz",
+        distribution, component, binary_arch
+    );
+    if let Some(response) =
+        try_proxy_debian_metadata(&state, &repo, &repo_key, &upstream_path, "application/gzip")
+            .await?
+    {
+        return Ok(response);
+    }
 
     let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
 
@@ -1182,5 +1294,111 @@ mod tests {
         let sig = b"sig";
         let result = pgp_clearsign(content, sig);
         assert!(result.contains("Line 1\nLine 2\nLine 3\n"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream path construction for APT remote proxy (#674)
+    // -----------------------------------------------------------------------
+
+    fn build_release_upstream_path(distribution: &str) -> String {
+        format!("dists/{}/Release", distribution)
+    }
+
+    fn build_inrelease_upstream_path(distribution: &str) -> String {
+        format!("dists/{}/InRelease", distribution)
+    }
+
+    fn build_release_gpg_upstream_path(distribution: &str) -> String {
+        format!("dists/{}/Release.gpg", distribution)
+    }
+
+    fn build_packages_upstream_path(
+        distribution: &str,
+        component: &str,
+        binary_arch: &str,
+    ) -> String {
+        format!(
+            "dists/{}/{}/{}/Packages",
+            distribution, component, binary_arch
+        )
+    }
+
+    fn build_packages_gz_upstream_path(
+        distribution: &str,
+        component: &str,
+        binary_arch: &str,
+    ) -> String {
+        format!(
+            "dists/{}/{}/{}/Packages.gz",
+            distribution, component, binary_arch
+        )
+    }
+
+    #[test]
+    fn test_upstream_path_release_matches_debian_mirror_layout() {
+        assert_eq!(
+            build_release_upstream_path("trixie"),
+            "dists/trixie/Release"
+        );
+        assert_eq!(
+            build_release_upstream_path("trixie-updates"),
+            "dists/trixie-updates/Release"
+        );
+    }
+
+    #[test]
+    fn test_upstream_path_inrelease_matches_debian_mirror_layout() {
+        assert_eq!(
+            build_inrelease_upstream_path("bookworm"),
+            "dists/bookworm/InRelease"
+        );
+        assert_eq!(
+            build_inrelease_upstream_path("bookworm-security"),
+            "dists/bookworm-security/InRelease"
+        );
+    }
+
+    #[test]
+    fn test_upstream_path_release_gpg_matches_debian_mirror_layout() {
+        assert_eq!(
+            build_release_gpg_upstream_path("trixie"),
+            "dists/trixie/Release.gpg"
+        );
+    }
+
+    #[test]
+    fn test_upstream_path_packages_matches_debian_mirror_layout() {
+        assert_eq!(
+            build_packages_upstream_path("trixie", "main", "binary-amd64"),
+            "dists/trixie/main/binary-amd64/Packages"
+        );
+        assert_eq!(
+            build_packages_upstream_path("trixie", "non-free", "binary-arm64"),
+            "dists/trixie/non-free/binary-arm64/Packages"
+        );
+    }
+
+    #[test]
+    fn test_upstream_path_packages_gz_matches_debian_mirror_layout() {
+        assert_eq!(
+            build_packages_gz_upstream_path("trixie", "main", "binary-amd64"),
+            "dists/trixie/main/binary-amd64/Packages.gz"
+        );
+    }
+
+    /// Verify the upstream URL ends up pointing at the real Debian mirror
+    /// path for a full apt-get update flow. Given
+    /// upstream_url = "http://deb.debian.org/debian", the fetched URL for
+    /// the trixie InRelease file must be:
+    ///   http://deb.debian.org/debian/dists/trixie/InRelease
+    #[test]
+    fn test_upstream_inrelease_url_matches_debian_org() {
+        let upstream = "http://deb.debian.org/debian";
+        let path = build_inrelease_upstream_path("trixie");
+        let full_url = format!("{}/{}", upstream.trim_end_matches('/'), path);
+        assert_eq!(
+            full_url,
+            "http://deb.debian.org/debian/dists/trixie/InRelease"
+        );
     }
 }
