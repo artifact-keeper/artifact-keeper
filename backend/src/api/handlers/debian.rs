@@ -1315,101 +1315,54 @@ mod tests {
     // Upstream path construction for APT remote proxy (#674)
     // -----------------------------------------------------------------------
 
-    fn build_release_upstream_path(distribution: &str) -> String {
-        format!("dists/{}/Release", distribution)
-    }
-
-    fn build_inrelease_upstream_path(distribution: &str) -> String {
-        format!("dists/{}/InRelease", distribution)
-    }
-
-    fn build_release_gpg_upstream_path(distribution: &str) -> String {
-        format!("dists/{}/Release.gpg", distribution)
-    }
-
-    fn build_packages_upstream_path(
-        distribution: &str,
-        component: &str,
-        binary_arch: &str,
-    ) -> String {
-        format!(
-            "dists/{}/{}/{}/Packages",
-            distribution, component, binary_arch
-        )
-    }
-
-    fn build_packages_gz_upstream_path(
-        distribution: &str,
-        component: &str,
-        binary_arch: &str,
-    ) -> String {
-        format!(
-            "dists/{}/{}/{}/Packages.gz",
-            distribution, component, binary_arch
-        )
+    #[test]
+    fn test_upstream_dists_paths_match_debian_mirror_layout() {
+        // All five metadata endpoints build upstream paths via
+        // try_proxy_dists_file(state, repo, key, dist, suffix, ct).
+        // The path is always "dists/{dist}/{suffix}". Verify the
+        // expected paths match the real Debian/Ubuntu mirror layout.
+        let cases = vec![
+            ("trixie", "Release", "dists/trixie/Release"),
+            ("trixie-updates", "Release", "dists/trixie-updates/Release"),
+            ("bookworm", "InRelease", "dists/bookworm/InRelease"),
+            (
+                "bookworm-security",
+                "InRelease",
+                "dists/bookworm-security/InRelease",
+            ),
+            ("trixie", "Release.gpg", "dists/trixie/Release.gpg"),
+            (
+                "trixie",
+                "main/binary-amd64/Packages",
+                "dists/trixie/main/binary-amd64/Packages",
+            ),
+            (
+                "trixie",
+                "non-free/binary-arm64/Packages",
+                "dists/trixie/non-free/binary-arm64/Packages",
+            ),
+            (
+                "trixie",
+                "main/binary-amd64/Packages.gz",
+                "dists/trixie/main/binary-amd64/Packages.gz",
+            ),
+        ];
+        for (dist, suffix, expected) in &cases {
+            let path = format!("dists/{}/{}", dist, suffix);
+            assert_eq!(
+                &path, expected,
+                "path mismatch for dist={}, suffix={}",
+                dist, suffix
+            );
+        }
     }
 
     #[test]
-    fn test_upstream_path_release_matches_debian_mirror_layout() {
-        assert_eq!(
-            build_release_upstream_path("trixie"),
-            "dists/trixie/Release"
-        );
-        assert_eq!(
-            build_release_upstream_path("trixie-updates"),
-            "dists/trixie-updates/Release"
-        );
-    }
-
-    #[test]
-    fn test_upstream_path_inrelease_matches_debian_mirror_layout() {
-        assert_eq!(
-            build_inrelease_upstream_path("bookworm"),
-            "dists/bookworm/InRelease"
-        );
-        assert_eq!(
-            build_inrelease_upstream_path("bookworm-security"),
-            "dists/bookworm-security/InRelease"
-        );
-    }
-
-    #[test]
-    fn test_upstream_path_release_gpg_matches_debian_mirror_layout() {
-        assert_eq!(
-            build_release_gpg_upstream_path("trixie"),
-            "dists/trixie/Release.gpg"
-        );
-    }
-
-    #[test]
-    fn test_upstream_path_packages_matches_debian_mirror_layout() {
-        assert_eq!(
-            build_packages_upstream_path("trixie", "main", "binary-amd64"),
-            "dists/trixie/main/binary-amd64/Packages"
-        );
-        assert_eq!(
-            build_packages_upstream_path("trixie", "non-free", "binary-arm64"),
-            "dists/trixie/non-free/binary-arm64/Packages"
-        );
-    }
-
-    #[test]
-    fn test_upstream_path_packages_gz_matches_debian_mirror_layout() {
-        assert_eq!(
-            build_packages_gz_upstream_path("trixie", "main", "binary-amd64"),
-            "dists/trixie/main/binary-amd64/Packages.gz"
-        );
-    }
-
-    /// Verify the upstream URL ends up pointing at the real Debian mirror
-    /// path for a full apt-get update flow. Given
-    /// upstream_url = "http://deb.debian.org/debian", the fetched URL for
-    /// the trixie InRelease file must be:
-    ///   http://deb.debian.org/debian/dists/trixie/InRelease
-    #[test]
-    fn test_upstream_inrelease_url_matches_debian_org() {
+    fn test_upstream_url_assembly_matches_debian_org() {
+        // Full URL assembly: upstream_url + "/" + dists path must point at
+        // the real Debian mirror.
         let upstream = "http://deb.debian.org/debian";
-        let path = build_inrelease_upstream_path("trixie");
+        let path = format!("dists/{}/{}", "trixie", "InRelease");
         let full_url = format!("{}/{}", upstream.trim_end_matches('/'), path);
         assert_eq!(
             full_url,
