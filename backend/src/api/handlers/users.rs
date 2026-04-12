@@ -767,68 +767,73 @@ pub async fn change_password(
     let policy = PasswordPolicyConfig::from_config(&state.config);
     validate_password_with_policy(&payload.new_password, &policy)?;
 
+    // Non-admin trying to change another user's password
+    if auth.user_id != id && !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Cannot change other users' passwords".to_string(),
+        ));
+    }
+
+    // Fetch user row once: password_hash + must_change_password
+    let user_row = sqlx::query_as::<_, (Option<String>, bool)>(
+        "SELECT password_hash, must_change_password FROM users WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let current_hash = user_row
+        .0
+        .ok_or_else(|| AppError::Validation("Cannot change password for SSO users".to_string()))?;
+
     // For non-admins changing their own password, verify current password
     if auth.user_id == id && !auth.is_admin {
         let current_password = payload
             .current_password
             .ok_or_else(|| AppError::Validation("Current password required".to_string()))?;
 
-        let user = sqlx::query!("SELECT password_hash FROM users WHERE id = $1", id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-            .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
-
-        let hash = user.password_hash.ok_or_else(|| {
-            AppError::Validation("Cannot change password for SSO users".to_string())
-        })?;
-
-        if !AuthService::verify_password(&current_password, &hash).await? {
+        if !AuthService::verify_password(&current_password, &current_hash).await? {
             return Err(AppError::Authentication(
                 "Current password is incorrect".to_string(),
             ));
         }
-    } else if auth.user_id != id && !auth.is_admin {
-        // Non-admin trying to change another user's password
-        return Err(AppError::Authorization(
-            "Cannot change other users' passwords".to_string(),
-        ));
     }
 
-    // Check password history if enabled
-    let history_count = state.config.password_history_count;
-    if history_count > 0 {
-        check_password_history(&state.db, id, &payload.new_password, history_count).await?;
-    }
-
-    // Hash new password
+    // Hash new password before entering the transaction
     let new_hash = AuthService::hash_password(&payload.new_password).await?;
 
-    // Fetch the current hash before overwriting so we can record it in history
-    let old_hash_row =
-        sqlx::query_scalar::<_, Option<String>>("SELECT password_hash FROM users WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-            .flatten();
+    let history_count = state.config.password_history_count;
+    let had_must_change = user_row.1;
 
-    // Check if this user had must_change_password set (for setup mode unlock)
-    let had_must_change: bool =
-        sqlx::query_scalar("SELECT must_change_password FROM users WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-            .unwrap_or(false);
+    // Wrap the history check, password UPDATE, and history recording in a
+    // single transaction to prevent TOCTOU races.
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Check password history if enabled (uses current_hash + history table)
+    if history_count > 0 {
+        check_password_history(
+            &mut *tx,
+            id,
+            &payload.new_password,
+            history_count,
+            Some(&current_hash),
+        )
+        .await?;
+    }
 
     // Update password and clear must_change_password flag
-    let result = sqlx::query!(
+    let result = sqlx::query(
         "UPDATE users SET password_hash = $2, must_change_password = false, updated_at = NOW() WHERE id = $1",
-        id,
-        new_hash
     )
-    .execute(&state.db)
+    .bind(id)
+    .bind(&new_hash)
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -838,10 +843,12 @@ pub async fn change_password(
 
     // Record the old password hash in history and trim excess entries
     if history_count > 0 {
-        if let Some(old_hash) = old_hash_row {
-            record_password_history(&state.db, id, &old_hash, history_count).await?;
-        }
+        record_password_history(&mut tx, id, &current_hash, history_count).await?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     crate::services::auth_service::invalidate_user_tokens(id);
 
@@ -935,19 +942,31 @@ pub async fn reset_password(
     let temp_password = generate_password();
     let password_hash = AuthService::hash_password(&temp_password).await?;
 
+    let history_count = state.config.password_history_count;
+
+    // Wrap the UPDATE and history recording in a transaction
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
     // Update password and set must_change_password=true
     sqlx::query("UPDATE users SET password_hash = $1, must_change_password = true, updated_at = NOW() WHERE id = $2")
         .bind(&password_hash)
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     // Record the old password hash in history so the user cannot reuse it
-    let history_count = state.config.password_history_count;
     if history_count > 0 {
-        record_password_history(&state.db, id, &old_hash, history_count).await?;
+        record_password_history(&mut tx, id, &old_hash, history_count).await?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     crate::services::auth_service::invalidate_user_tokens(id);
 
@@ -962,12 +981,24 @@ pub async fn reset_password(
 
 /// Check the new password against the user's most recent password hashes.
 /// Returns an error if the new password matches any of them.
-async fn check_password_history(
-    db: &sqlx::PgPool,
+///
+/// When `current_hash` is provided the caller has already fetched the user's
+/// active password hash, so we skip an extra round-trip to the users table.
+///
+/// To avoid a timing side-channel, every hash in the list is checked even
+/// after a match is found. This makes response time constant regardless of
+/// which position matched (bcrypt is slow, but password changes are
+/// infrequent so the extra CPU cost is acceptable).
+async fn check_password_history<'e, E>(
+    executor: E,
     user_id: Uuid,
     new_password: &str,
     history_count: u32,
-) -> Result<()> {
+    current_hash: Option<&str>,
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT password_hash FROM password_history \
          WHERE user_id = $1 \
@@ -976,32 +1007,31 @@ async fn check_password_history(
     )
     .bind(user_id)
     .bind(history_count as i64)
-    .fetch_all(db)
+    .fetch_all(executor)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Also check the user's current password hash, which is not yet in the
-    // history table (it gets recorded after a successful change).
-    let current_hash: Option<String> =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?
-            .flatten();
-
-    let mut hashes_to_check: Vec<String> = Vec::with_capacity(rows.len() + 1);
+    let mut hashes_to_check: Vec<&str> = Vec::with_capacity(rows.len() + 1);
     if let Some(h) = current_hash {
         hashes_to_check.push(h);
     }
-    hashes_to_check.extend(rows);
+    for row in &rows {
+        hashes_to_check.push(row.as_str());
+    }
 
-    for h in hashes_to_check {
-        if AuthService::verify_password(new_password, &h).await? {
-            return Err(AppError::Validation(
-                "Password was used recently. Please choose a different password.".to_string(),
-            ));
+    // Check ALL hashes to prevent timing side-channel (constant-time over
+    // the number of stored hashes regardless of match position).
+    let mut matched = false;
+    for h in &hashes_to_check {
+        if AuthService::verify_password(new_password, h).await? {
+            matched = true;
         }
+    }
+
+    if matched {
+        return Err(AppError::Validation(
+            "Password was used recently. Please choose a different password.".to_string(),
+        ));
     }
 
     Ok(())
@@ -1009,8 +1039,11 @@ async fn check_password_history(
 
 /// Insert the old password hash into the history table and remove entries
 /// that exceed the configured retention count.
+///
+/// Accepts any SQLx executor (pool or transaction) so callers can include
+/// this operation inside an existing transaction.
 async fn record_password_history(
-    db: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     user_id: Uuid,
     old_hash: &str,
     history_count: u32,
@@ -1018,7 +1051,7 @@ async fn record_password_history(
     sqlx::query("INSERT INTO password_history (user_id, password_hash) VALUES ($1, $2)")
         .bind(user_id)
         .bind(old_hash)
-        .execute(db)
+        .execute(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1035,7 +1068,7 @@ async fn record_password_history(
     )
     .bind(user_id)
     .bind(history_count as i64)
-    .execute(db)
+    .execute(&mut *conn)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 

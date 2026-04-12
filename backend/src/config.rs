@@ -367,7 +367,7 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
-            password_history_count: env_parse("PASSWORD_HISTORY_COUNT", 0),
+            password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
             password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
             password_require_uppercase: matches!(
@@ -1240,6 +1240,33 @@ mod tests {
         env::set_var("PASSWORD_HISTORY_COUNT", "not-a-number");
         let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
         assert_eq!(result, 0);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_clamped_to_max_24() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "100");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_at_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "24");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 24);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_below_max_not_clamped() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "10");
+        let result: u32 = env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24);
+        assert_eq!(result, 10);
         env::remove_var("PASSWORD_HISTORY_COUNT");
     }
 }
