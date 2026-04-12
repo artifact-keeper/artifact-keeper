@@ -404,20 +404,39 @@ async fn try_proxy_debian_metadata(
     ))
 }
 
+/// Resolve a Debian repo and, when it is a remote proxy, attempt to fetch
+/// the given dists file from upstream. Returns `Ok(Some(response))` when the
+/// upstream proxy succeeds, `Ok(None)` for local/staging repos (so the
+/// caller can generate the file locally), or `Err(response)` on failure.
+///
+/// This is a thin wrapper around [`try_proxy_debian_metadata`] that builds
+/// the upstream path from the distribution name and filename suffix,
+/// eliminating repeated `format!` + `try_proxy_debian_metadata` blocks
+/// across the Release, InRelease, and Release.gpg handlers.
+async fn try_proxy_dists_file(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+    distribution: &str,
+    filename: &str,
+    content_type: &'static str,
+) -> Result<Option<Response>, Response> {
+    let upstream_path = format!("dists/{}/{}", distribution, filename);
+    try_proxy_debian_metadata(state, repo, repo_key, &upstream_path, content_type).await
+}
+
 async fn release_file(
     State(state): State<SharedState>,
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    // For remote repos, proxy the upstream Release file unchanged so the
-    // GPG signature and checksums match what apt expects from the mirror.
-    let upstream_path = format!("dists/{}/Release", distribution);
-    if let Some(response) = try_proxy_debian_metadata(
+    if let Some(response) = try_proxy_dists_file(
         &state,
         &repo,
         &repo_key,
-        &upstream_path,
+        &distribution,
+        "Release",
         "text/plain; charset=utf-8",
     )
     .await?
@@ -444,15 +463,12 @@ async fn in_release_file(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    // For remote repos, proxy the upstream InRelease file unchanged. We
-    // cannot re-sign with our own GPG key because apt validates the
-    // signature against the upstream mirror's key.
-    let upstream_path = format!("dists/{}/InRelease", distribution);
-    if let Some(response) = try_proxy_debian_metadata(
+    if let Some(response) = try_proxy_dists_file(
         &state,
         &repo,
         &repo_key,
-        &upstream_path,
+        &distribution,
+        "InRelease",
         "text/plain; charset=utf-8",
     )
     .await?
@@ -491,13 +507,12 @@ async fn release_gpg(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    // For remote repos, proxy the upstream detached signature.
-    let upstream_path = format!("dists/{}/Release.gpg", distribution);
-    if let Some(response) = try_proxy_debian_metadata(
+    if let Some(response) = try_proxy_dists_file(
         &state,
         &repo,
         &repo_key,
-        &upstream_path,
+        &distribution,
+        "Release.gpg",
         "application/pgp-signature",
     )
     .await?
@@ -576,17 +591,14 @@ async fn packages_index(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    // For remote repos, proxy the upstream Packages index so the hashes
-    // inside match what the signed Release file advertises.
-    let upstream_path = format!(
-        "dists/{}/{}/{}/Packages",
-        distribution, component, binary_arch
-    );
-    if let Some(response) = try_proxy_debian_metadata(
+    // For remote repos, proxy the upstream Packages index.
+    let packages_suffix = format!("{}/{}/Packages", component, binary_arch);
+    if let Some(response) = try_proxy_dists_file(
         &state,
         &repo,
         &repo_key,
-        &upstream_path,
+        &distribution,
+        &packages_suffix,
         "text/plain; charset=utf-8",
     )
     .await?
@@ -619,13 +631,16 @@ async fn packages_index_gz(
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
     // For remote repos, proxy the upstream compressed Packages index.
-    let upstream_path = format!(
-        "dists/{}/{}/{}/Packages.gz",
-        distribution, component, binary_arch
-    );
-    if let Some(response) =
-        try_proxy_debian_metadata(&state, &repo, &repo_key, &upstream_path, "application/gzip")
-            .await?
+    let packages_gz_suffix = format!("{}/{}/Packages.gz", component, binary_arch);
+    if let Some(response) = try_proxy_dists_file(
+        &state,
+        &repo,
+        &repo_key,
+        &distribution,
+        &packages_gz_suffix,
+        "application/gzip",
+    )
+    .await?
     {
         return Ok(response);
     }
