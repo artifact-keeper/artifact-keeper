@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users\n            SET is_active = true, updated_at = NOW()\n            WHERE external_id = $1 AND auth_provider = $2\n            RETURNING\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                last_login_at, created_at, updated_at\n            ",
+  "query": "\n        UPDATE users\n        SET\n            email = COALESCE($2, email),\n            display_name = COALESCE($3, display_name),\n            is_active = COALESCE($4, is_active),\n            is_admin = COALESCE($5, is_admin),\n            updated_at = NOW()\n        WHERE id = $1\n        RETURNING\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, is_service_account, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            failed_login_attempts, locked_until, last_failed_login_at,\n            password_changed_at, last_login_at, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -107,36 +107,32 @@
       },
       {
         "ordinal": 18,
-        "name": "last_login_at",
+        "name": "password_changed_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 19,
-        "name": "created_at",
+        "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        {
-          "Custom": {
-            "name": "auth_provider",
-            "kind": {
-              "Enum": [
-                "local",
-                "ldap",
-                "saml",
-                "oidc"
-              ]
-            }
-          }
-        }
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Bool"
       ]
     },
     "nullable": [
@@ -158,10 +154,11 @@
       false,
       true,
       true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "85763117e501f102fac46becc31f5faf0ce3bb87ab20112717a8358bbb17a7bb"
+  "hash": "474d51349cf9846d6eaddc99c42c07c005feced66cf2ddb97fe12260f471bf84"
 }

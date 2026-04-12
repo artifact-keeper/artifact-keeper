@@ -75,6 +75,7 @@ fn test_config(storage_path: &str) -> Config {
         rate_limit_exempt_service_accounts: false,
         account_lockout_threshold: 5,
         account_lockout_duration_minutes: 30,
+        password_expiry_days: 0,
         password_min_length: 8,
         password_max_length: 128,
         password_require_uppercase: false,
