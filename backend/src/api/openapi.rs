@@ -132,6 +132,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::curation::CurationApiDoc::openapi());
     doc.merge(super::handlers::upload::UploadApiDoc::openapi());
     doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
+    doc.merge(super::handlers::repo_tokens::RepoTokensApiDoc::openapi());
 
     doc
 }
@@ -390,6 +391,7 @@ mod tests {
                     include_str!("handlers/repositories.rs"),
                     include_str!("handlers/repository_labels.rs"),
                     include_str!("handlers/security.rs"),
+                    include_str!("handlers/repo_tokens.rs"),
                 ],
             ),
             (
