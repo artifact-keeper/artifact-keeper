@@ -73,22 +73,32 @@ fn require_visible(
 }
 
 /// Upsert the `index_upstream_url` key in `repository_config` for a given repository.
+async fn upsert_repo_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (repository_id, key) DO UPDATE SET value = $3, updated_at = NOW()",
+    )
+    .bind(repo_id)
+    .bind(key)
+    .bind(value)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 async fn upsert_index_upstream_url(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     index_url: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO repository_config (repository_id, key, value) \
-         VALUES ($1, 'index_upstream_url', $2) \
-         ON CONFLICT (repository_id, key) DO UPDATE SET value = $2, updated_at = NOW()",
-    )
-    .bind(repo_id)
-    .bind(index_url)
-    .execute(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
+    upsert_repo_config(db, repo_id, "index_upstream_url", index_url).await
 }
 
 /// Create repository routes
@@ -201,6 +211,13 @@ pub struct UpdateRepositoryRequest {
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
+    /// Enable or disable quarantine for this repository. When enabled,
+    /// newly uploaded artifacts are held until security scans complete or
+    /// the quarantine timeout expires. Overrides the global default.
+    pub quarantine_enabled: Option<bool>,
+    /// Quarantine hold duration in minutes for this repository.
+    /// Overrides the global QUARANTINE_DURATION_MINUTES default.
+    pub quarantine_duration_minutes: Option<u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -784,6 +801,25 @@ pub async fn update_repository(
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
+    }
+
+    if let Some(quarantine_enabled) = payload.quarantine_enabled {
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "quarantine_enabled",
+            &quarantine_enabled.to_string(),
+        )
+        .await?;
+    }
+    if let Some(quarantine_duration) = payload.quarantine_duration_minutes {
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "quarantine_duration_minutes",
+            &quarantine_duration.to_string(),
+        )
+        .await?;
     }
 
     let storage_used = service.get_storage_usage(repo.id).await?;

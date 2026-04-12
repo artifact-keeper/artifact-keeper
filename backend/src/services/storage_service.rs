@@ -780,6 +780,8 @@ mod tests {
             rate_limit_exempt_service_accounts: false,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
         }
     }
 

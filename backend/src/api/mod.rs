@@ -217,6 +217,10 @@ impl AppState {
         if let Some(ref qc) = self.quality_check_service {
             svc.set_quality_check_service(qc.clone());
         }
+        svc.set_quarantine_config(crate::services::quarantine_service::QuarantineConfig {
+            enabled: self.config.quarantine_enabled,
+            duration_minutes: self.config.quarantine_duration_minutes,
+        });
         svc
     }
 

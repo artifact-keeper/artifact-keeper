@@ -1125,10 +1125,29 @@ impl ScannerService {
                         .fail_scan(scan_result.id, &e.to_string())
                         .await?;
 
-                    // Mark as flagged on failure (conservative)
+                    // Mark as flagged/rejected on failure (conservative).
+                    // If under quarantine period hold, reject the artifact.
+                    let current_qs: Option<Option<String>> =
+                        sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                            .bind(artifact_id)
+                            .fetch_optional(&self.db)
+                            .await
+                            .ok()
+                            .flatten();
+
+                    let fail_status = if matches!(
+                        current_qs.as_ref().and_then(|s| s.as_deref()),
+                        Some("quarantined")
+                    ) {
+                        "rejected"
+                    } else {
+                        "flagged"
+                    };
+
                     sqlx::query!(
-                        "UPDATE artifacts SET quarantine_status = 'flagged' WHERE id = $1",
+                        "UPDATE artifacts SET quarantine_status = $2 WHERE id = $1",
                         artifact_id,
+                        fail_status,
                     )
                     .execute(&self.db)
                     .await
@@ -1353,12 +1372,36 @@ impl ScannerService {
     }
 
     /// Update artifact quarantine_status based on scan findings.
+    ///
+    /// If the artifact is currently in the 'quarantined' state (quality gate
+    /// quarantine period), the scan verdict transitions it to 'released' or
+    /// 'rejected'. Otherwise the legacy 'clean'/'flagged' statuses are used.
     async fn update_quarantine_status(&self, artifact_id: Uuid, findings_count: i32) -> Result<()> {
-        let status = if findings_count > 0 {
-            "flagged"
+        // Check if the artifact is currently under quarantine period hold
+        let current_status: Option<Option<String>> =
+            sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let is_quarantined = matches!(
+            current_status.as_ref().and_then(|s| s.as_deref()),
+            Some("quarantined")
+        );
+
+        let status = if is_quarantined {
+            // Quarantine period: use released/rejected to lift or block the hold
+            crate::services::quarantine_service::status_after_scan(findings_count)
         } else {
-            "clean"
+            // Legacy scan-based status: clean/flagged
+            if findings_count > 0 {
+                "flagged"
+            } else {
+                "clean"
+            }
         };
+
         sqlx::query!(
             "UPDATE artifacts SET quarantine_status = $2 WHERE id = $1",
             artifact_id,
@@ -1367,6 +1410,16 @@ impl ScannerService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Clear the quarantine_until deadline when releasing or rejecting
+        if is_quarantined {
+            sqlx::query("UPDATE artifacts SET quarantine_until = NULL WHERE id = $1")
+                .bind(artifact_id)
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
         Ok(())
     }
 }
