@@ -37,6 +37,7 @@ pub struct User {
     pub failed_login_attempts: i32,
     pub locked_until: Option<DateTime<Utc>>,
     pub last_failed_login_at: Option<DateTime<Utc>>,
+    pub password_changed_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

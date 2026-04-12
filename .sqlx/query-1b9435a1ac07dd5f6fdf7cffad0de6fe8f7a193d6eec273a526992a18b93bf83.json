@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, email, password_hash, display_name,\n            auth_provider as \"auth_provider: AuthProvider\",\n            external_id, is_admin, is_active, is_service_account, must_change_password,\n            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n            failed_login_attempts, locked_until, last_failed_login_at,\n            last_login_at, created_at, updated_at\n        FROM users\n        WHERE id = $1\n        ",
+  "query": "\n            SELECT\n                id, username, email, password_hash, display_name,\n                auth_provider as \"auth_provider: AuthProvider\",\n                external_id, is_admin, is_active, is_service_account, must_change_password,\n                totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,\n                failed_login_attempts, locked_until, last_failed_login_at,\n                password_changed_at, last_login_at, created_at, updated_at\n            FROM users\n            WHERE id = $1 AND is_service_account = true\n            ",
   "describe": {
     "columns": [
       {
@@ -107,16 +107,21 @@
       },
       {
         "ordinal": 18,
-        "name": "last_login_at",
+        "name": "password_changed_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 19,
-        "name": "created_at",
+        "name": "last_login_at",
         "type_info": "Timestamptz"
       },
       {
         "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
@@ -145,10 +150,11 @@
       false,
       true,
       true,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "188031bd7ca1105882741390828251b387ef32dd7b52d72f4694410edcd8c9ae"
+  "hash": "1b9435a1ac07dd5f6fdf7cffad0de6fe8f7a193d6eec273a526992a18b93bf83"
 }

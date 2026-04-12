@@ -71,7 +71,7 @@ impl ServiceAccountService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             "#,
             id,
             username,
@@ -134,7 +134,7 @@ impl ServiceAccountService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE id = $1 AND is_service_account = true
             "#,
@@ -172,7 +172,7 @@ impl ServiceAccountService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             "#,
             id,
             display_name,

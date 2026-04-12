@@ -293,7 +293,7 @@ impl LdapService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             FROM users
             WHERE external_id = $1 AND auth_provider = 'ldap'
             "#,
@@ -345,7 +345,7 @@ impl LdapService {
                 external_id, is_admin, is_active, is_service_account, must_change_password,
                 totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                 failed_login_attempts, locked_until, last_failed_login_at,
-                last_login_at, created_at, updated_at
+                password_changed_at, last_login_at, created_at, updated_at
             "#,
             user_id,
             ldap_user.username,
@@ -781,6 +781,7 @@ mod tests {
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             password_history_count: 0,
+            password_expiry_days: 0,
             password_min_length: 8,
             password_max_length: 128,
             password_require_uppercase: false,
