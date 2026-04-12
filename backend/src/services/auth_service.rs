@@ -1264,6 +1264,13 @@ mod tests {
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            password_min_length: 8,
+            password_max_length: 128,
+            password_require_uppercase: false,
+            password_require_lowercase: false,
+            password_require_digit: false,
+            password_require_special: false,
+            password_min_strength: 0,
         })
     }
 
