@@ -172,6 +172,12 @@ pub struct Config {
     /// Duration in minutes that a locked account remains locked before the
     /// user can try again. Default: 30.
     pub account_lockout_duration_minutes: i64,
+
+    /// Number of previous passwords to remember per user. When a user changes
+    /// their password, the new password is checked against the last N hashes
+    /// and rejected if it matches any of them. Set to 0 to disable password
+    /// history checking. Default: 0 (disabled).
+    pub password_history_count: u32,
 }
 
 redacted_debug!(Config {
@@ -223,6 +229,7 @@ redacted_debug!(Config {
     show rate_limit_exempt_service_accounts,
     show account_lockout_threshold,
     show account_lockout_duration_minutes,
+    show password_history_count,
 });
 
 impl Config {
@@ -329,6 +336,7 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            password_history_count: env_parse("PASSWORD_HISTORY_COUNT", 0),
         };
 
         config.validate_jwt_secret()?;
@@ -1150,5 +1158,35 @@ mod tests {
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PASSWORD_HISTORY_COUNT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_password_history_count_default_zero() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_password_history_count_parsed() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "12");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 12);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
+    }
+
+    #[test]
+    fn test_password_history_count_invalid_falls_back() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        env::set_var("PASSWORD_HISTORY_COUNT", "not-a-number");
+        let result: u32 = env_parse("PASSWORD_HISTORY_COUNT", 0);
+        assert_eq!(result, 0);
+        env::remove_var("PASSWORD_HISTORY_COUNT");
     }
 }
