@@ -41,6 +41,7 @@ pub mod remote_instance_service;
 pub mod repo_selector_service;
 pub mod repository_label_service;
 pub mod repository_service;
+pub mod routing_rules;
 pub mod saml_service;
 pub mod sbom_service;
 pub mod scan_config_service;
