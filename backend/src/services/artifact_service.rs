@@ -297,6 +297,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             "#,
             repository_id,
@@ -312,6 +313,36 @@ impl ArtifactService {
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Apply quarantine hold if enabled for this repository
+        {
+            use crate::services::quarantine_service;
+            let qconfig = quarantine_service::resolve_config(&self.db, repository_id).await;
+            if quarantine_service::should_quarantine(&qconfig) {
+                let now = chrono::Utc::now();
+                let until = quarantine_service::quarantine_until(&qconfig, now);
+                if let Err(e) = quarantine_service::set_quarantine(
+                    &self.db,
+                    artifact.id,
+                    "quarantined",
+                    Some(until),
+                )
+                .await
+                {
+                    tracing::error!(
+                        artifact_id = %artifact.id,
+                        error = %e,
+                        "Failed to set quarantine status on uploaded artifact"
+                    );
+                } else {
+                    tracing::info!(
+                        artifact_id = %artifact.id,
+                        quarantine_until = %until,
+                        "Artifact quarantined on upload"
+                    );
+                }
+            }
+        }
 
         // Check quota warning threshold after successful upload
         if let Ok(repo) = self.repo_service.get_by_id(repository_id).await {
@@ -567,6 +598,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE repository_id = $1 AND path = $2 AND is_deleted = false
@@ -578,6 +610,13 @@ impl ArtifactService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+
+        // Check quarantine status before serving the artifact
+        crate::services::quarantine_service::check_download_allowed(
+            artifact.quarantine_status.as_deref(),
+            artifact.quarantine_until,
+            chrono::Utc::now(),
+        )?;
 
         // Trigger BeforeDownload hooks - validators can reject the download
         let artifact_info = ArtifactInfo::from(&artifact);
@@ -618,6 +657,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE id = $1 AND is_deleted = false
@@ -651,6 +691,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE repository_id = $1
@@ -724,12 +765,14 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM (
                 SELECT DISTINCT ON (a.path)
                     a.id, a.repository_id, a.path, a.name, a.version, a.size_bytes,
                     a.checksum_sha256, a.checksum_md5, a.checksum_sha1,
                     a.content_type, a.storage_key, a.is_deleted, a.uploaded_by,
+                    a.quarantine_status, a.quarantine_until,
                     a.created_at, a.updated_at,
                     array_position($1::uuid[], a.repository_id) as repo_priority
                 FROM artifacts a
@@ -916,6 +959,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE is_deleted = false
@@ -961,6 +1005,7 @@ impl ArtifactService {
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE checksum_sha256 = $1 AND is_deleted = false
@@ -1486,6 +1531,8 @@ mod tests {
             storage_key: "sh/a2/sha256hash".to_string(),
             is_deleted: false,
             uploaded_by: Some(user_id),
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1522,6 +1569,8 @@ mod tests {
             storage_key: "em/pt/empty".to_string(),
             is_deleted: false,
             uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

@@ -173,6 +173,15 @@ pub struct Config {
     /// user can try again. Default: 30.
     pub account_lockout_duration_minutes: i64,
 
+    /// When true, newly uploaded artifacts are held in quarantine until
+    /// security scanning completes or the hold period expires. Repositories
+    /// can override this via repository_config keys. Default: false.
+    pub quarantine_enabled: bool,
+
+    /// Default quarantine hold period in minutes. Repositories can override
+    /// this via repository_config keys. Default: 60.
+    pub quarantine_duration_minutes: i64,
+
     /// Number of previous passwords to remember per user. When a user changes
     /// their password, the new password is checked against the last N hashes
     /// and rejected if it matches any of them. Set to 0 to disable password
@@ -257,6 +266,8 @@ redacted_debug!(Config {
     show rate_limit_exempt_service_accounts,
     show account_lockout_threshold,
     show account_lockout_duration_minutes,
+    show quarantine_enabled,
+    show quarantine_duration_minutes,
     show password_history_count,
     show password_expiry_days,
     show password_min_length,
@@ -372,6 +383,11 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            quarantine_enabled: matches!(
+                env::var("QUARANTINE_ENABLED").as_deref(),
+                Ok("true" | "1")
+            ),
+            quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60).max(1),
             password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
             password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),

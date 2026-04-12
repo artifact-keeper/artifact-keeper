@@ -73,23 +73,38 @@ fn require_visible(
     }
 }
 
+/// Generic upsert helper for repository_config key-value pairs.
+///
+/// Inserts a new row or updates an existing one for the given repository and
+/// config key. Used by multiple update paths (index_upstream_url, quarantine
+/// settings, etc.).
+async fn upsert_repo_config(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (repository_id, key) DO UPDATE SET value = $3, updated_at = NOW()",
+    )
+    .bind(repo_id)
+    .bind(key)
+    .bind(value)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Upsert the `index_upstream_url` key in `repository_config` for a given repository.
 async fn upsert_index_upstream_url(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     index_url: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO repository_config (repository_id, key, value) \
-         VALUES ($1, 'index_upstream_url', $2) \
-         ON CONFLICT (repository_id, key) DO UPDATE SET value = $2, updated_at = NOW()",
-    )
-    .bind(repo_id)
-    .bind(index_url)
-    .execute(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    Ok(())
+    upsert_repo_config(db, repo_id, "index_upstream_url", index_url).await
 }
 
 /// Create repository routes
@@ -209,6 +224,13 @@ pub struct UpdateRepositoryRequest {
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
+    /// Enable or disable quarantine period for this repository.
+    /// When enabled, newly uploaded artifacts are held until scanned.
+    /// Stored in `repository_config` under `quarantine_enabled`.
+    pub quarantine_enabled: Option<bool>,
+    /// Quarantine hold duration in minutes for this repository.
+    /// Stored in `repository_config` under `quarantine_duration_minutes`.
+    pub quarantine_duration_minutes: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -794,6 +816,31 @@ pub async fn update_repository(
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
 
+    if let Some(enabled) = payload.quarantine_enabled {
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "quarantine_enabled",
+            if enabled { "true" } else { "false" },
+        )
+        .await?;
+    }
+
+    if let Some(duration) = payload.quarantine_duration_minutes {
+        if duration < 0 {
+            return Err(AppError::Validation(
+                "quarantine_duration_minutes must be non-negative".to_string(),
+            ));
+        }
+        upsert_repo_config(
+            &state.db,
+            repo.id,
+            "quarantine_duration_minutes",
+            &duration.to_string(),
+        )
+        .await?;
+    }
+
     let storage_used = service.get_storage_usage(repo.id).await?;
 
     state
@@ -1199,6 +1246,7 @@ pub async fn get_artifact_metadata(
             id, repository_id, path, name, version, size_bytes,
             checksum_sha256, checksum_md5, checksum_sha1,
             content_type, storage_key, is_deleted, uploaded_by,
+            quarantine_status, quarantine_until,
             created_at, updated_at
         FROM artifacts
         WHERE repository_id = $1 AND path = $2 AND is_deleted = false
@@ -1460,6 +1508,34 @@ pub async fn download_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth)?;
+
+    // Check quarantine status before serving the artifact.
+    // If the artifact is quarantined or rejected, return 409 Conflict.
+    {
+        #[derive(sqlx::FromRow)]
+        struct QuarantineRow {
+            quarantine_status: Option<String>,
+            quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+        }
+
+        if let Some(qrow) = sqlx::query_as::<_, QuarantineRow>(
+            "SELECT quarantine_status, quarantine_until \
+             FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo.id)
+        .bind(&path)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        {
+            crate::services::quarantine_service::check_download_allowed(
+                qrow.quarantine_status.as_deref(),
+                qrow.quarantine_until,
+                chrono::Utc::now(),
+            )?;
+        }
+    }
 
     // Get client IP for analytics
     let ip_addr = request
@@ -2993,6 +3069,8 @@ mod tests {
             storage_key: path.to_string(),
             is_deleted: false,
             uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

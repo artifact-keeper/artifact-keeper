@@ -212,6 +212,7 @@ pub async fn promote_artifact(
             id, repository_id, path, name, version, size_bytes,
             checksum_sha256, checksum_md5, checksum_sha1,
             content_type, storage_key, is_deleted, uploaded_by,
+            quarantine_status, quarantine_until,
             created_at, updated_at
         FROM artifacts
         WHERE id = $1 AND repository_id = $2 AND is_deleted = false
@@ -439,6 +440,7 @@ pub async fn promote_artifacts_bulk(
                 id, repository_id, path, name, version, size_bytes,
                 checksum_sha256, checksum_md5, checksum_sha1,
                 content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
                 created_at, updated_at
             FROM artifacts
             WHERE id = $1 AND repository_id = $2 AND is_deleted = false

@@ -588,6 +588,11 @@ async fn serve_tarball(
         None => return Err(AppError::NotFound("Tarball not found".to_string()).into_response()),
     };
 
+    // Check quarantine status before serving
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
+
     // Read from storage
     let storage = state
         .storage_for_repo(&repo.storage_location())

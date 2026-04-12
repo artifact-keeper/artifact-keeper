@@ -46,6 +46,7 @@ use utoipa::{Modify, OpenApi};
         (name = "telemetry", description = "Crash reporting and telemetry"),
         (name = "sso", description = "Single sign-on configuration"),
         (name = "migration", description = "Data migration and import"),
+        (name = "quarantine", description = "Artifact quarantine period management"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
@@ -130,6 +131,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::service_accounts::ServiceAccountsApiDoc::openapi());
     doc.merge(super::handlers::artifact_labels::ArtifactLabelsApiDoc::openapi());
     doc.merge(super::handlers::curation::CurationApiDoc::openapi());
+    doc.merge(super::handlers::quarantine::QuarantineApiDoc::openapi());
     doc.merge(super::handlers::upload::UploadApiDoc::openapi());
     doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
     doc.merge(super::handlers::repo_tokens::RepoTokensApiDoc::openapi());
@@ -468,6 +470,10 @@ mod tests {
             (
                 "/api/v1/approval/",
                 vec![include_str!("handlers/approval.rs")],
+            ),
+            (
+                "/api/v1/quarantine/",
+                vec![include_str!("handlers/quarantine.rs")],
             ),
             (
                 "/api/v1/quality/",

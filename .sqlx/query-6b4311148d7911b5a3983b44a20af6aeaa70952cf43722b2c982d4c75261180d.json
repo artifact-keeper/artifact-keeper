@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, repository_id, path, name, version, size_bytes,\n                checksum_sha256, checksum_md5, checksum_sha1,\n                content_type, storage_key, is_deleted, uploaded_by,\n                created_at, updated_at\n            FROM artifacts\n            WHERE id = $1 AND is_deleted = false\n            ",
+  "query": "\n            SELECT\n                id, repository_id, path, name, version, size_bytes,\n                checksum_sha256, checksum_md5, checksum_sha1,\n                content_type, storage_key, is_deleted, uploaded_by,\n                quarantine_status, quarantine_until,\n                created_at, updated_at\n            FROM artifacts\n            WHERE repository_id = $1\n              AND is_deleted = false\n              AND ($2::text IS NULL OR path LIKE $2)\n              AND ($5::text IS NULL OR LOWER(name) LIKE $5 OR LOWER(path) LIKE $5)\n            ORDER BY path\n            OFFSET $3\n            LIMIT $4\n            ",
   "describe": {
     "columns": [
       {
@@ -70,18 +70,32 @@
       },
       {
         "ordinal": 13,
+        "name": "quarantine_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "quarantine_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 14,
+        "ordinal": 16,
         "name": "updated_at",
         "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8",
+        "Text"
       ]
     },
     "nullable": [
@@ -98,9 +112,11 @@
       false,
       false,
       true,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "f45a1da37cded4bb1457b627339c7362899a070197a5233477a7634c1e51bc80"
+  "hash": "6b4311148d7911b5a3983b44a20af6aeaa70952cf43722b2c982d4c75261180d"
 }
