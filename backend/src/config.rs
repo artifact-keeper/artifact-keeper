@@ -172,6 +172,29 @@ pub struct Config {
     /// Duration in minutes that a locked account remains locked before the
     /// user can try again. Default: 30.
     pub account_lockout_duration_minutes: i64,
+    // -- Password policy (local users) --
+    /// Minimum password length (default: 8).
+    pub password_min_length: usize,
+
+    /// Maximum password length (default: 128).
+    pub password_max_length: usize,
+
+    /// Require at least one uppercase letter (default: false).
+    pub password_require_uppercase: bool,
+
+    /// Require at least one lowercase letter (default: false).
+    pub password_require_lowercase: bool,
+
+    /// Require at least one digit (default: false).
+    pub password_require_digit: bool,
+
+    /// Require at least one special character (default: false).
+    pub password_require_special: bool,
+
+    /// Minimum zxcvbn strength score (0 = disabled, 1-4 = increasingly strict).
+    /// When set to a value > 0, passwords are evaluated by the zxcvbn estimator
+    /// and must meet or exceed the given score.
+    pub password_min_strength: u8,
 }
 
 redacted_debug!(Config {
@@ -223,6 +246,13 @@ redacted_debug!(Config {
     show rate_limit_exempt_service_accounts,
     show account_lockout_threshold,
     show account_lockout_duration_minutes,
+    show password_min_length,
+    show password_max_length,
+    show password_require_uppercase,
+    show password_require_lowercase,
+    show password_require_digit,
+    show password_require_special,
+    show password_min_strength,
 });
 
 impl Config {
@@ -329,6 +359,28 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
+            password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
+            password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
+            password_require_uppercase: matches!(
+                env::var("PASSWORD_REQUIRE_UPPERCASE").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_lowercase: matches!(
+                env::var("PASSWORD_REQUIRE_LOWERCASE").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_digit: matches!(
+                env::var("PASSWORD_REQUIRE_DIGIT").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_require_special: matches!(
+                env::var("PASSWORD_REQUIRE_SPECIAL").as_deref(),
+                Ok("true" | "1")
+            ),
+            password_min_strength: {
+                let raw = env_parse::<u8>("PASSWORD_MIN_STRENGTH", 0);
+                raw.min(4)
+            },
         };
 
         config.validate_jwt_secret()?;

@@ -26,6 +26,7 @@ pub mod nexus_client;
 pub mod oidc_service;
 pub mod openscap_scanner;
 pub mod package_service;
+pub mod password_policy;
 pub mod peer_instance_label_service;
 pub mod peer_instance_service;
 pub mod peer_service;
