@@ -365,7 +365,7 @@ impl Config {
             ),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
-            password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0),
+            password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
             password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
             password_require_uppercase: matches!(

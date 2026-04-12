@@ -14,6 +14,7 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -331,6 +332,21 @@ impl AuthService {
             )
         {
             user.must_change_password = true;
+
+            // Persist the flag so it survives across requests
+            sqlx::query!(
+                r#"
+            UPDATE users
+            SET must_change_password = true
+            WHERE id = $1
+            "#,
+                user.id
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            info!(user_id = %user.id, "password expired, forcing change on next login");
         }
 
         // Generate tokens
