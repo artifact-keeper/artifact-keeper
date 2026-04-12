@@ -782,6 +782,12 @@ mod tests {
             password_require_digit: false,
             password_require_special: false,
             password_min_strength: 0,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+            smtp_tls_mode: "starttls".to_string(),
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -852,6 +858,12 @@ mod tests {
             password_require_digit: false,
             password_require_special: false,
             password_min_strength: 0,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+            smtp_tls_mode: "starttls".to_string(),
         }
     }
 

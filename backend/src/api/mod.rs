@@ -18,6 +18,7 @@ use crate::services::proxy_service::ProxyService;
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
+use crate::services::smtp_service::SmtpService;
 use crate::services::wasm_plugin_service::WasmPluginService;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -79,6 +80,7 @@ pub struct AppState {
     pub dependency_track: Option<Arc<DependencyTrackService>>,
     pub quality_check_service: Option<Arc<QualityCheckService>>,
     pub proxy_service: Option<Arc<ProxyService>>,
+    pub smtp_service: Option<Arc<SmtpService>>,
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
     /// When true, most API endpoints return 403 until the admin changes the default password.
     pub setup_required: Arc<AtomicBool>,
@@ -111,6 +113,7 @@ impl AppState {
             meili_service: None,
             dependency_track: None,
             proxy_service: None,
+            smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
@@ -140,6 +143,7 @@ impl AppState {
             meili_service: None,
             dependency_track: None,
             proxy_service: None,
+            smtp_service: None,
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
@@ -200,6 +204,11 @@ impl AppState {
     /// Set the proxy service for remote repository proxying.
     pub fn set_proxy_service(&mut self, proxy_service: Arc<ProxyService>) {
         self.proxy_service = Some(proxy_service);
+    }
+
+    /// Set the SMTP service for email delivery.
+    pub fn set_smtp_service(&mut self, smtp_service: Arc<SmtpService>) {
+        self.smtp_service = Some(smtp_service);
     }
 
     /// Set the Prometheus metrics handle for rendering /metrics output.

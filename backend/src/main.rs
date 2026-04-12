@@ -37,6 +37,7 @@ use artifact_keeper_backend::{
         scan_result_service::ScanResultService,
         scanner_service::{AdvisoryClient, ScannerService},
         scheduler_service,
+        smtp_service::SmtpService,
         storage_service::StorageService,
         wasm_plugin_service::WasmPluginService,
     },
@@ -369,6 +370,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         Err(e) => {
             tracing::warn!(
                 "Failed to initialize proxy service, remote repositories disabled: {}",
+                e
+            );
+        }
+    }
+
+    // Initialize SMTP service (optional, graceful no-op when SMTP_HOST is absent)
+    match SmtpService::new(&config) {
+        Ok(smtp) => {
+            if smtp.is_configured() {
+                tracing::info!("SMTP service initialized");
+            } else {
+                tracing::info!("SMTP not configured, email delivery disabled");
+            }
+            app_state.set_smtp_service(Arc::new(smtp));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to initialize SMTP service, email delivery disabled: {}",
                 e
             );
         }

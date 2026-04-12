@@ -84,6 +84,7 @@ pub mod search;
 pub mod security;
 pub mod service_accounts;
 pub mod signing;
+pub mod smtp;
 pub mod sso;
 pub mod sso_admin;
 pub mod storage_gc;

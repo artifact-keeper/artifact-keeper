@@ -215,6 +215,26 @@ pub struct Config {
     /// When set to a value > 0, passwords are evaluated by the zxcvbn estimator
     /// and must meet or exceed the given score.
     pub password_min_strength: u8,
+
+    // -- SMTP (optional, notifications are disabled when smtp_host is None) --
+    /// SMTP server hostname. When absent, email delivery is disabled and the
+    /// SMTP service operates as a no-op.
+    pub smtp_host: Option<String>,
+
+    /// SMTP server port (default: 587).
+    pub smtp_port: u16,
+
+    /// SMTP username for authentication (optional).
+    pub smtp_username: Option<String>,
+
+    /// SMTP password for authentication (optional).
+    pub smtp_password: Option<String>,
+
+    /// Sender address used in the From header (default: "noreply@artifact-keeper.local").
+    pub smtp_from_address: String,
+
+    /// TLS mode for the SMTP connection: "starttls" (default), "tls", or "none".
+    pub smtp_tls_mode: String,
 }
 
 redacted_debug!(Config {
@@ -277,6 +297,12 @@ redacted_debug!(Config {
     show password_require_digit,
     show password_require_special,
     show password_min_strength,
+    show smtp_host,
+    show smtp_port,
+    show smtp_username,
+    redact_option smtp_password,
+    show smtp_from_address,
+    show smtp_tls_mode,
 });
 
 impl Config {
@@ -411,6 +437,27 @@ impl Config {
             password_min_strength: {
                 let raw = env_parse::<u8>("PASSWORD_MIN_STRENGTH", 0);
                 raw.min(4)
+            },
+            smtp_host: env::var("SMTP_HOST").ok().filter(|s| !s.is_empty()),
+            smtp_port: env_parse("SMTP_PORT", 587),
+            smtp_username: env::var("SMTP_USERNAME").ok().filter(|s| !s.is_empty()),
+            smtp_password: env::var("SMTP_PASSWORD").ok().filter(|s| !s.is_empty()),
+            smtp_from_address: env::var("SMTP_FROM_ADDRESS")
+                .unwrap_or_else(|_| "noreply@artifact-keeper.local".into()),
+            smtp_tls_mode: {
+                let mode = env::var("SMTP_TLS_MODE")
+                    .unwrap_or_else(|_| "starttls".into())
+                    .to_lowercase();
+                match mode.as_str() {
+                    "starttls" | "tls" | "none" => mode,
+                    _ => {
+                        tracing::warn!(
+                            value = %mode,
+                            "SMTP_TLS_MODE has an unrecognized value, falling back to \"starttls\""
+                        );
+                        "starttls".into()
+                    }
+                }
             },
         };
 
