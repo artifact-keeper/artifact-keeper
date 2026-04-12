@@ -147,6 +147,37 @@ Branch naming conventions:
 - `chore/` — maintenance, dependencies, CI
 - `docs/` — documentation only
 
+### Parallel Agent Work (shallow clones)
+
+When dispatching multiple agents to work on separate features or fixes in parallel, use **shallow clones in `/tmp/`** instead of git worktrees. Worktrees share the `.git` directory and agents end up switching branches in the main worktree, corrupting each other's state.
+
+**Pattern for each agent:**
+```bash
+WORK_DIR="/tmp/$(uuidgen)-artifact-keeper"
+git clone --depth 50 --branch main git@github.com:artifact-keeper/artifact-keeper.git "$WORK_DIR"
+cd "$WORK_DIR"
+git checkout -b feat/issue-description
+# ... make changes, run checks, commit, push, create PR ...
+rm -rf "$WORK_DIR"
+```
+
+Each agent gets a fully isolated repo copy. No shared state, no branch conflicts, no rust-analyzer cross-contamination. The agent must do ALL work inside `$WORK_DIR` and never touch the primary working directory at `/Users/khan/ak/artifact-keeper`.
+
+### Pre-push Quality Checklist
+
+Every commit must pass these checks locally before pushing. Do NOT use "push and see if CI passes" as a strategy.
+
+```bash
+cargo fmt --check                                          # formatting
+cargo clippy --workspace --all-targets -- -D warnings      # linting
+cargo test --workspace --lib                               # unit tests
+```
+
+Additionally, before pushing:
+- Check for code duplication: if structurally similar blocks appear 3+ times in new code, refactor into a shared helper
+- Check test coverage: new pure functions should have at least one test, aim for 70%+ of new lines covered
+- Check migration numbering: verify the migration number is not already taken (`ls backend/migrations/ | tail -5`)
+
 ### Maintenance Branches
 
 Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older release series:

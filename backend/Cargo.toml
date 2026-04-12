@@ -152,6 +152,7 @@ tonic.workspace = true
 tonic-reflection.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+zxcvbn = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
