@@ -7,12 +7,14 @@ use chrono::Utc;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::api::download_response::try_presigned_redirect;
 use crate::api::AppState;
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
 use crate::services::proxy_service::ProxyService;
 use crate::storage::StorageLocation;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Base URL from request headers
@@ -199,6 +201,68 @@ pub async fn proxy_fetch(
         .fetch_artifact(&repo, path)
         .await
         .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
+/// Fetch from upstream via the proxy service, returning a presigned redirect
+/// if the storage backend supports it and presigned downloads are enabled.
+///
+/// When the proxy cache serves a hit and the storage backend supports presigned
+/// URLs, this returns a 302 redirect to the presigned URL instead of streaming
+/// the full content through the backend. Otherwise it falls back to returning
+/// the content bytes.
+///
+/// Format handlers can use this as a drop-in replacement for [`proxy_fetch`]
+/// when they want to take advantage of presigned redirects for cached proxy
+/// content.
+pub async fn proxy_fetch_or_redirect(
+    proxy_service: &ProxyService,
+    state: &AppState,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<Response, Response> {
+    let (content, content_type) =
+        proxy_fetch(proxy_service, repo_id, repo_key, upstream_url, path).await?;
+
+    // If presigned downloads are enabled, try to redirect to the cached copy.
+    // The proxy cache stores content under a well-known key derived from
+    // the repo key and path.
+    if state.config.presigned_downloads_enabled {
+        let cache_key = proxy_cache_storage_key(repo_key, path);
+        let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+
+        if let Ok(storage) = state.storage_for_repo(&StorageLocation {
+            backend: state.config.storage_backend.clone(),
+            path: state.config.storage_path.clone(),
+        }) {
+            if let Some(redirect) =
+                try_presigned_redirect(storage.as_ref(), &cache_key, true, expiry).await
+            {
+                return Ok(redirect);
+            }
+        }
+    }
+
+    let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", ct)
+        .header("content-length", content.len().to_string())
+        .body(axum::body::Body::from(content))
+        .unwrap())
+}
+
+/// Derive the proxy cache storage key for a given repo key and artifact path.
+///
+/// Matches the key pattern used by `ProxyService::cache_storage_key`, so
+/// presigned redirects point to the correct cached object.
+fn proxy_cache_storage_key(repo_key: &str, path: &str) -> String {
+    format!(
+        "proxy-cache/{}/{}/__content__",
+        repo_key,
+        path.trim_start_matches('/').trim_end_matches('/')
+    )
 }
 
 /// Check whether an artifact is present in the proxy cache under `path`
@@ -601,6 +665,59 @@ pub async fn local_fetch_by_path_suffix(
     Ok((content, Some(artifact.content_type)))
 }
 
+/// Look up a local artifact by path and return a presigned redirect if the
+/// storage backend supports it and the feature is enabled. Falls back to
+/// streaming the content bytes when redirect is not possible.
+///
+/// This is meant for format handlers that serve stored artifacts and want to
+/// opt in to presigned download redirects without restructuring their logic.
+pub async fn local_fetch_or_redirect(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    artifact_path: &str,
+) -> Result<Response, Response> {
+    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+         LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    check_quarantine(&artifact)?;
+
+    let storage = state.storage_for_repo_or_500(location)?;
+
+    // Try presigned redirect before reading content into memory
+    if state.config.presigned_downloads_enabled {
+        let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+        if let Some(redirect) =
+            try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
+        {
+            return Ok(redirect);
+        }
+    }
+
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", &artifact.content_type)
+        .header("content-length", content.len().to_string())
+        .body(axum::body::Body::from(content))
+        .unwrap())
+}
+
 /// Build a minimal `Repository` model for proxy operations.
 fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repository {
     Repository {
@@ -967,5 +1084,49 @@ mod tests {
     #[test]
     fn test_reject_write_virtual_rejected() {
         assert!(super::reject_write_if_not_hosted("virtual").is_err());
+    }
+
+    // ── proxy_cache_storage_key tests ──────────────────────────────────
+
+    #[test]
+    fn test_proxy_cache_storage_key_basic() {
+        let key = super::proxy_cache_storage_key("npm-remote", "lodash/-/lodash-4.17.21.tgz");
+        assert_eq!(
+            key,
+            "proxy-cache/npm-remote/lodash/-/lodash-4.17.21.tgz/__content__"
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_strips_leading_slash() {
+        let key = super::proxy_cache_storage_key("maven-central", "/com/example/lib-1.0.jar");
+        assert_eq!(
+            key,
+            "proxy-cache/maven-central/com/example/lib-1.0.jar/__content__"
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_strips_trailing_slash() {
+        let key = super::proxy_cache_storage_key("pypi-proxy", "packages/simple/requests/");
+        assert_eq!(
+            key,
+            "proxy-cache/pypi-proxy/packages/simple/requests/__content__"
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_no_slashes() {
+        let key = super::proxy_cache_storage_key("npm-remote", "express");
+        assert_eq!(key, "proxy-cache/npm-remote/express/__content__");
+    }
+
+    #[test]
+    fn test_proxy_cache_storage_key_matches_proxy_service_format() {
+        // Verifies the key format matches ProxyService::cache_storage_key
+        // so presigned redirects point to the correct cached objects.
+        let key = super::proxy_cache_storage_key("test-repo", "path/to/artifact");
+        assert!(key.starts_with("proxy-cache/"));
+        assert!(key.ends_with("/__content__"));
     }
 }

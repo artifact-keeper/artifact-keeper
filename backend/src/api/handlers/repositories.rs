@@ -1593,9 +1593,12 @@ pub async fn download_artifact(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Check if the storage backend supports redirect downloads (S3 with presigned URLs)
+    // Check if the storage backend supports redirect downloads (S3 with presigned URLs).
+    // This path is gated on PRESIGNED_DOWNLOADS_ENABLED (or the per-backend
+    // redirect setting, which controls supports_redirect()).
     let storage = state.storage_for_repo(&repo.storage_location())?;
-    if storage.supports_redirect() {
+    let presigned_enabled = state.config.presigned_downloads_enabled && storage.supports_redirect();
+    if presigned_enabled {
         // Get artifact metadata first using query_as for runtime checking
         #[derive(sqlx::FromRow)]
         struct ArtifactRow {
@@ -1615,9 +1618,10 @@ pub async fn download_artifact(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
+            let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
             // Try to get presigned URL from the shared storage backend
             if let Some(presigned) = storage
-                .get_presigned_url(&artifact.storage_key, Duration::from_secs(3600))
+                .get_presigned_url(&artifact.storage_key, expiry)
                 .await?
             {
                 // Record download analytics

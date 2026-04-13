@@ -791,6 +791,8 @@ mod tests {
             password_require_digit: false,
             password_require_special: false,
             password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
             smtp_host: None,
             smtp_port: 587,
             smtp_username: None,
@@ -851,5 +853,84 @@ mod tests {
             result.is_ok(),
             "StorageService::from_config should succeed with storage_backend=gcs"
         );
+    }
+
+    // ── presigned URL support tests (via crate::storage::StorageBackend) ──
+
+    use crate::storage::{PresignedUrl, PresignedUrlSource};
+
+    /// A mock backend implementing `crate::storage::StorageBackend` with
+    /// presigned URL support.
+    struct MockPresignedInner;
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for MockPresignedInner {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes> {
+            Ok(Bytes::from_static(b"mock"))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn supports_redirect(&self) -> bool {
+            true
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: std::time::Duration,
+        ) -> Result<Option<PresignedUrl>> {
+            Ok(Some(PresignedUrl {
+                url: format!("https://mock.example.com/{}", key),
+                expires_in,
+                source: PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    #[test]
+    fn test_filesystem_storage_does_not_support_redirect() {
+        let backend = crate::storage::filesystem::FilesystemStorage::new("/tmp/test-artifacts");
+        assert!(!crate::storage::StorageBackend::supports_redirect(&backend));
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_storage_presigned_url_returns_none() {
+        let backend = crate::storage::filesystem::FilesystemStorage::new("/tmp/test-artifacts");
+        let result = crate::storage::StorageBackend::get_presigned_url(
+            &backend,
+            "test-key",
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mock_presigned_inner_supports_redirect() {
+        let backend = MockPresignedInner;
+        assert!(crate::storage::StorageBackend::supports_redirect(&backend));
+    }
+
+    #[tokio::test]
+    async fn test_mock_presigned_inner_returns_url() {
+        let backend = MockPresignedInner;
+        let result = crate::storage::StorageBackend::get_presigned_url(
+            &backend,
+            "test-key",
+            std::time::Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_some());
+        let presigned = result.unwrap();
+        assert!(presigned.url.contains("test-key"));
+        assert_eq!(presigned.source, PresignedUrlSource::S3);
     }
 }
