@@ -353,6 +353,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 .nest("/telemetry", handlers::telemetry::router())
                 .nest("/monitoring", handlers::monitoring::router())
                 .nest("/sso", handlers::sso_admin::router())
+                .nest("/smtp", handlers::smtp::router())
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),

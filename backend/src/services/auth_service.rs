@@ -1410,6 +1410,12 @@ mod tests {
             password_min_strength: 0,
             presigned_downloads_enabled: false,
             presigned_download_expiry_secs: 300,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".to_string(),
+            smtp_tls_mode: "starttls".to_string(),
         })
     }
 

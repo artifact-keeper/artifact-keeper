@@ -114,3 +114,6 @@ url = "2.5"
 
 # XML Digital Signatures (SAML signature verification)
 bergshamra = "0.3"
+
+# SMTP email delivery
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
