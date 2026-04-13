@@ -462,29 +462,21 @@ fn build_tarball_response(
         .unwrap()
 }
 
+/// Build an OK response with a given content type and body.
+fn build_ok_response(content_type: &str, body: impl Into<Body>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .body(body.into())
+        .unwrap()
+}
+
 /// Build a JSON response from rewritten npm metadata.
 ///
 /// Both the remote and virtual metadata paths rewrite upstream tarball URLs and
 /// return the modified JSON with `application/json` content type.
 fn build_json_metadata_response(json_string: String) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(json_string))
-        .unwrap()
-}
-
-/// Build a raw passthrough response for upstream metadata that could not be
-/// parsed as JSON.
-fn build_raw_metadata_response(content: Bytes, content_type: Option<String>) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            CONTENT_TYPE,
-            content_type.unwrap_or_else(|| "application/json".to_string()),
-        )
-        .body(Body::from(content))
-        .unwrap()
+    build_ok_response("application/json", json_string)
 }
 
 /// Try to parse upstream content as JSON, rewrite tarball URLs, and return the
@@ -501,7 +493,9 @@ fn rewrite_and_respond(
         let rewritten = serde_json::to_string(&json).unwrap_or_default();
         return build_json_metadata_response(rewritten);
     }
-    build_raw_metadata_response(content, content_type)
+    // Not valid JSON: pass through with the original content type
+    let ct = content_type.unwrap_or_else(|| "application/json".to_string());
+    build_ok_response(&ct, content)
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,46 +1554,42 @@ mod tests {
     }
 
     #[test]
-    fn test_build_npm_version_entry_basic() {
-        let info = make_artifact_info("mylib", "1.0.0", SHA256_EMPTY, None);
-        let entry = build_npm_version_entry(&info);
-        assert_eq!(entry["name"], "mylib");
-        assert_eq!(entry["version"], "1.0.0");
-        assert!(entry["dist"]["tarball"]
+    fn test_build_npm_version_entry_variants() {
+        // Basic entry without metadata: name, version, tarball URL, integrity
+        let basic =
+            build_npm_version_entry(&make_artifact_info("mylib", "1.0.0", SHA256_EMPTY, None));
+        assert_eq!(basic["name"], "mylib");
+        assert_eq!(basic["version"], "1.0.0");
+        assert!(basic["dist"]["tarball"]
             .as_str()
             .unwrap()
             .contains("mylib-1.0.0.tgz"));
-        assert!(entry["dist"]["integrity"]
+        assert!(basic["dist"]["integrity"]
             .as_str()
             .unwrap()
             .starts_with("sha256-"));
-    }
 
-    #[test]
-    fn test_build_npm_version_entry_with_metadata() {
-        let meta = serde_json::json!({
-            "description": "A great library",
-            "license": "MIT"
-        });
-        let info = make_artifact_info("pkg", "2.0.0", SHA256_ZEROS, Some(meta));
-        let entry = build_npm_version_entry(&info);
-        assert_eq!(entry["name"], "pkg");
-        assert_eq!(entry["version"], "2.0.0");
-        assert_eq!(entry["description"], "A great library");
-        assert_eq!(entry["license"], "MIT");
-    }
+        // Entry with extra metadata fields: those fields are preserved in the output
+        let with_meta = build_npm_version_entry(&make_artifact_info(
+            "pkg",
+            "2.0.0",
+            SHA256_ZEROS,
+            Some(serde_json::json!({"description": "A great library", "license": "MIT"})),
+        ));
+        assert_eq!(with_meta["name"], "pkg");
+        assert_eq!(with_meta["version"], "2.0.0");
+        assert_eq!(with_meta["description"], "A great library");
+        assert_eq!(with_meta["license"], "MIT");
 
-    #[test]
-    fn test_build_npm_version_entry_metadata_preserves_name_if_set() {
-        let meta = serde_json::json!({
-            "name": "custom-name",
-            "version": "0.9.0"
-        });
-        let info = make_artifact_info("pkg", "1.0.0", SHA256_ABCD, Some(meta));
-        let entry = build_npm_version_entry(&info);
-        // name and version from metadata should be preserved (or_insert_with doesn't overwrite)
-        assert_eq!(entry["name"], "custom-name");
-        assert_eq!(entry["version"], "0.9.0");
+        // When metadata already contains name/version, or_insert_with does not overwrite
+        let preserved = build_npm_version_entry(&make_artifact_info(
+            "pkg",
+            "1.0.0",
+            SHA256_ABCD,
+            Some(serde_json::json!({"name": "custom-name", "version": "0.9.0"})),
+        ));
+        assert_eq!(preserved["name"], "custom-name");
+        assert_eq!(preserved["version"], "0.9.0");
     }
 
     // -----------------------------------------------------------------------
@@ -1666,37 +1656,40 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_npm_publish_payload_name_mismatch() {
-        let payload = serde_json::json!({
-            "name": "wrong-name",
-            "versions": { "1.0.0": {} },
-            "_attachments": { "wrong-name-1.0.0.tgz": { "data": "dGVzdA==" } }
-        });
-        let body = json_to_bytes(&payload);
-        let result = parse_npm_publish_payload(&body, "correct-name");
-        assert!(result.is_err());
-    }
+    fn test_parse_npm_publish_payload_rejects_invalid_payloads() {
+        let cases: Vec<(serde_json::Value, &str, &str)> = vec![
+            // Name mismatch between body and URL
+            (
+                serde_json::json!({
+                    "name": "wrong-name",
+                    "versions": { "1.0.0": {} },
+                    "_attachments": { "wrong-name-1.0.0.tgz": { "data": "dGVzdA==" } }
+                }),
+                "correct-name",
+                "name mismatch",
+            ),
+            // Missing versions field
+            (
+                serde_json::json!({ "name": "pkg", "_attachments": {} }),
+                "pkg",
+                "missing versions",
+            ),
+            // Missing attachments field
+            (
+                serde_json::json!({ "name": "pkg", "versions": { "1.0.0": {} } }),
+                "pkg",
+                "missing attachments",
+            ),
+        ];
 
-    #[test]
-    fn test_parse_npm_publish_payload_missing_versions() {
-        let payload = serde_json::json!({
-            "name": "pkg",
-            "_attachments": {}
-        });
-        let body = json_to_bytes(&payload);
-        let result = parse_npm_publish_payload(&body, "pkg");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_npm_publish_payload_missing_attachments() {
-        let payload = serde_json::json!({
-            "name": "pkg",
-            "versions": { "1.0.0": {} }
-        });
-        let body = json_to_bytes(&payload);
-        let result = parse_npm_publish_payload(&body, "pkg");
-        assert!(result.is_err());
+        for (payload, url_name, label) in cases {
+            let body = json_to_bytes(&payload);
+            assert!(
+                parse_npm_publish_payload(&body, url_name).is_err(),
+                "expected error for case: {}",
+                label
+            );
+        }
     }
 
     #[test]
@@ -1771,35 +1764,28 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_version_tarball_empty_attachments() {
-        let attachments = serde_json::Map::new();
-        assert!(
-            extract_version_tarball("mylib", "1.0.0", serde_json::json!({}), &attachments).is_err()
-        );
-    }
+    fn test_extract_version_tarball_rejects_bad_attachments() {
+        let version_data = serde_json::json!({});
 
-    #[test]
-    fn test_extract_version_tarball_missing_data_field() {
-        let mut attachments = serde_json::Map::new();
-        attachments.insert(
+        // Empty attachments map
+        let empty = serde_json::Map::new();
+        assert!(extract_version_tarball("mylib", "1.0.0", version_data.clone(), &empty).is_err());
+
+        // Attachment present but missing the "data" field
+        let mut no_data = serde_json::Map::new();
+        no_data.insert(
             "mylib-1.0.0.tgz".to_string(),
             serde_json::json!({ "content_type": "application/octet-stream" }),
         );
-        assert!(
-            extract_version_tarball("mylib", "1.0.0", serde_json::json!({}), &attachments).is_err()
-        );
-    }
+        assert!(extract_version_tarball("mylib", "1.0.0", version_data.clone(), &no_data).is_err());
 
-    #[test]
-    fn test_extract_version_tarball_invalid_base64() {
-        let mut attachments = serde_json::Map::new();
-        attachments.insert(
+        // Attachment has a "data" field with invalid base64
+        let mut bad_b64 = serde_json::Map::new();
+        bad_b64.insert(
             "mylib-1.0.0.tgz".to_string(),
             serde_json::json!({ "data": "!!!not-base64!!!" }),
         );
-        assert!(
-            extract_version_tarball("mylib", "1.0.0", serde_json::json!({}), &attachments).is_err()
-        );
+        assert!(extract_version_tarball("mylib", "1.0.0", version_data, &bad_b64).is_err());
     }
 
     #[test]
@@ -1961,13 +1947,13 @@ mod tests {
     const SHA256_ABCD: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     #[tokio::test]
-    async fn test_build_npm_metadata_response_single_version() {
+    async fn test_build_npm_metadata_response_single_and_scoped_versions() {
+        // Unscoped package: basic metadata fields and tarball URL structure
         let artifacts = vec![make_artifact(
             "mylib/1.0.0/mylib-1.0.0.tgz",
             "1.0.0",
             SHA256_EMPTY,
         )];
-
         let body =
             metadata_response_json(&artifacts, "mylib", "http://localhost:8080", "npm-virtual")
                 .await;
@@ -1985,6 +1971,44 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("sha256-"));
+
+        // Scoped package: tarball URL must encode the scope correctly
+        let scoped = vec![make_artifact(
+            "@babel/core/7.24.0/core-7.24.0.tgz",
+            "7.24.0",
+            SHA256_ABCD,
+        )];
+        let body2 = metadata_response_json(
+            &scoped,
+            "@babel/core",
+            "http://localhost:8080",
+            "npm-virtual",
+        )
+        .await;
+        assert_eq!(body2["name"], "@babel/core");
+        assert_eq!(
+            body2["versions"]["7.24.0"]["dist"]["tarball"],
+            "http://localhost:8080/npm/npm-virtual/@babel/core/-/core-7.24.0.tgz"
+        );
+
+        // Virtual repo key: tarball URLs must use the virtual repo key, not the
+        // underlying member repo key.
+        let virt = vec![make_artifact(
+            "express/4.18.2/express-4.18.2.tgz",
+            "4.18.2",
+            SHA256_EMPTY,
+        )];
+        let body3 =
+            metadata_response_json(&virt, "express", "http://localhost:8080", "my-virtual-repo")
+                .await;
+        let tarball = body3["versions"]["4.18.2"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        assert!(
+            tarball.contains("my-virtual-repo"),
+            "tarball URL should use virtual repo key, got: {}",
+            tarball
+        );
     }
 
     #[tokio::test]
@@ -2006,57 +2030,6 @@ mod tests {
         assert_eq!(body["dist-tags"]["latest"], "4.17.21");
         assert!(body["versions"]["4.17.20"].is_object());
         assert!(body["versions"]["4.17.21"].is_object());
-    }
-
-    #[tokio::test]
-    async fn test_build_npm_metadata_response_scoped_package() {
-        let artifacts = vec![make_artifact(
-            "@babel/core/7.24.0/core-7.24.0.tgz",
-            "7.24.0",
-            SHA256_ABCD,
-        )];
-
-        let body = metadata_response_json(
-            &artifacts,
-            "@babel/core",
-            "http://localhost:8080",
-            "npm-virtual",
-        )
-        .await;
-
-        assert_eq!(body["name"], "@babel/core");
-        assert_eq!(
-            body["versions"]["7.24.0"]["dist"]["tarball"],
-            "http://localhost:8080/npm/npm-virtual/@babel/core/-/core-7.24.0.tgz"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_npm_metadata_response_uses_virtual_repo_key() {
-        // The key point of the virtual repo fix: tarball URLs use the virtual
-        // repo key, not the underlying member repo key.
-        let artifacts = vec![make_artifact(
-            "express/4.18.2/express-4.18.2.tgz",
-            "4.18.2",
-            SHA256_EMPTY,
-        )];
-
-        let body = metadata_response_json(
-            &artifacts,
-            "express",
-            "http://localhost:8080",
-            "my-virtual-repo",
-        )
-        .await;
-
-        let tarball = body["versions"]["4.18.2"]["dist"]["tarball"]
-            .as_str()
-            .unwrap();
-        assert!(
-            tarball.contains("my-virtual-repo"),
-            "tarball URL should use virtual repo key, got: {}",
-            tarball
-        );
     }
 
     #[tokio::test]
