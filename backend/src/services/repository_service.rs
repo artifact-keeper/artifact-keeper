@@ -97,6 +97,16 @@ pub(crate) fn exceeds_quota_warning_threshold(used_bytes: i64, quota_bytes: i64)
     quota_usage_percentage(used_bytes, quota_bytes) > 0.8
 }
 
+/// Check whether a database error message indicates a duplicate key violation.
+///
+/// PostgreSQL unique-constraint violations contain the phrase "duplicate key"
+/// in their error text. This helper centralises that check so both `create`
+/// (idempotent upsert under concurrency) and `update` (friendly 409 Conflict)
+/// paths share the same detection logic.
+pub(crate) fn is_duplicate_key_error(error_message: &str) -> bool {
+    error_message.contains("duplicate key")
+}
+
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
@@ -191,7 +201,7 @@ impl RepositoryService {
         .await
         {
             Ok(repo) => repo,
-            Err(e) if e.to_string().contains("duplicate key") => {
+            Err(e) if is_duplicate_key_error(&e.to_string()) => {
                 // Another request created this repo concurrently. Return the
                 // existing row so callers see a successful, idempotent result
                 // instead of a 409 Conflict under high concurrency.
@@ -401,7 +411,7 @@ impl RepositoryService {
         .fetch_optional(&self.db)
         .await
         .map_err(|e| {
-            if e.to_string().contains("duplicate key") {
+            if is_duplicate_key_error(&e.to_string()) {
                 AppError::Conflict("Repository with that key already exists".to_string())
             } else {
                 AppError::Database(e.to_string())
@@ -1089,5 +1099,41 @@ mod tests {
     #[test]
     fn test_exceeds_quota_threshold_empty() {
         assert!(!exceeds_quota_warning_threshold(0, 1000));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_duplicate_key_error (extracted pure function, issue #692)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_duplicate_key_error_postgres_message() {
+        let msg = r#"error returned from database: duplicate key value violates unique constraint "repositories_key_key""#;
+        assert!(is_duplicate_key_error(msg));
+    }
+
+    #[test]
+    fn test_is_duplicate_key_error_other_error() {
+        let msg = "connection refused";
+        assert!(!is_duplicate_key_error(msg));
+    }
+
+    #[test]
+    fn test_is_duplicate_key_error_empty() {
+        assert!(!is_duplicate_key_error(""));
+    }
+
+    #[test]
+    fn test_is_duplicate_key_error_partial_match() {
+        // Only "duplicate key" substring matters, not partial fragments
+        assert!(!is_duplicate_key_error("duplicate"));
+        assert!(!is_duplicate_key_error("key"));
+        assert!(is_duplicate_key_error("duplicate key"));
+    }
+
+    #[test]
+    fn test_is_duplicate_key_error_case_sensitive() {
+        // PostgreSQL always emits lowercase; we only match lowercase
+        assert!(!is_duplicate_key_error("Duplicate Key"));
+        assert!(!is_duplicate_key_error("DUPLICATE KEY"));
     }
 }
