@@ -352,9 +352,9 @@ fn is_digest_reference(reference: &str) -> bool {
     // OCI spec: algorithm = `[a-z0-9]+([+._-][a-z0-9]+)*` (lowercase only)
     !algorithm.is_empty()
         && !encoded.is_empty()
-        && algorithm
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '+' | '.' | '-'))
+        && algorithm.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '+' | '.' | '-')
+        })
         && encoded
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '=' | '_' | '-'))
