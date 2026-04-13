@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE artifacts\n        SET content_type = $1, updated_at = NOW()\n        WHERE repository_id = $2\n          AND path = $3\n          AND content_type != $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "335a77479e30e412d30b7d9353d655db7174220613bfd498deed36c257b836be"
+}

@@ -468,6 +468,14 @@ async fn get_package_metadata(
     build_npm_metadata_response(&meta_artifacts, package_name, &base_url, repo_key)
 }
 
+/// Content type for npm tarballs (.tgz). npm packages are always gzip-compressed
+/// tar archives. Upstream registries (including npmjs.org) sometimes serve these
+/// as `application/octet-stream`, but the correct MIME type is `application/gzip`.
+/// Using the right content type is important because downstream services (SBOM
+/// generation, Trivy, Grype) rely on it to decide how to extract and scan the
+/// artifact contents.
+const NPM_TARBALL_CONTENT_TYPE: &str = "application/gzip";
+
 // ---------------------------------------------------------------------------
 // GET tarball download handlers
 // ---------------------------------------------------------------------------
@@ -578,9 +586,15 @@ async fn serve_tarball(
                 proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path)
                     .await?;
 
+            // The upstream registry may return application/octet-stream for
+            // npm tarballs, which also gets persisted by the proxy cache.
+            // Correct the cached artifact record so that SBOM generation and
+            // security scanners can identify the file as a gzip archive.
+            correct_cached_tarball_content_type(&state.db, repo.id, &upstream_path).await;
+
             return Ok(Response::builder()
                 .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
                 .header(
                     "Content-Disposition",
                     format!("attachment; filename=\"{}\"", filename),
@@ -620,7 +634,7 @@ async fn serve_tarball(
             .status(StatusCode::OK)
             .header(
                 CONTENT_TYPE,
-                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+                content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
             )
             .header(
                 "Content-Disposition",
@@ -681,7 +695,7 @@ async fn serve_tarball(
 
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
         .header(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
@@ -689,6 +703,38 @@ async fn serve_tarball(
         .header(CONTENT_LENGTH, content.len().to_string())
         .body(Body::from(content))
         .unwrap())
+}
+
+/// Update the content_type of a cached proxy artifact from the incorrect
+/// `application/octet-stream` to `application/gzip`. The upstream npm registry
+/// often serves tarballs with a generic content type, and the proxy cache
+/// stores whatever the upstream returns. This correction ensures that SBOM
+/// generation and security scanners can properly identify and extract the
+/// archive.
+async fn correct_cached_tarball_content_type(db: &PgPool, repository_id: uuid::Uuid, path: &str) {
+    let normalized = path.trim_start_matches('/');
+    let result = sqlx::query!(
+        r#"
+        UPDATE artifacts
+        SET content_type = $1, updated_at = NOW()
+        WHERE repository_id = $2
+          AND path = $3
+          AND content_type != $1
+        "#,
+        NPM_TARBALL_CONTENT_TYPE,
+        repository_id,
+        normalized,
+    )
+    .execute(db)
+    .await;
+
+    if let Err(e) = result {
+        tracing::warn!(
+            "Failed to correct content_type for cached npm tarball {}: {}",
+            path,
+            e
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2262,7 +2308,6 @@ mod tests {
         assert!(versions.contains_key("1.0.0"));
     }
 
-    // -----------------------------------------------------------------------
     // Integrity preservation tests (issue #745)
     //
     // When proxying npm metadata from upstream, the rewrite function must
@@ -2538,5 +2583,35 @@ mod tests {
             integrity_u, integrity_s,
             "integrity for different packages must differ"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // NPM_TARBALL_CONTENT_TYPE
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_npm_tarball_content_type_is_application_gzip() {
+        // npm tarballs are gzip-compressed tar archives. The content type must
+        // be application/gzip so that SBOM generators and security scanners
+        // (Trivy, Grype) can identify and extract the archive contents.
+        assert_eq!(NPM_TARBALL_CONTENT_TYPE, "application/gzip");
+    }
+
+    #[test]
+    fn test_npm_tarball_content_type_is_not_octet_stream() {
+        // Upstream registries like npmjs.org often serve tarballs as
+        // application/octet-stream, but that prevents downstream tools from
+        // recognizing the file as a gzip archive. Verify the constant does
+        // not use this incorrect value.
+        assert_ne!(NPM_TARBALL_CONTENT_TYPE, "application/octet-stream");
+    }
+
+    #[test]
+    fn test_npm_tarball_content_type_consistent_with_publish() {
+        // The publish handler stores "application/gzip" in the content_type
+        // column (see publish_version_to_repo). The constant used by the
+        // download handlers must match so that published and proxied tarballs
+        // have the same content type in the database.
+        assert_eq!(NPM_TARBALL_CONTENT_TYPE, "application/gzip");
     }
 }
