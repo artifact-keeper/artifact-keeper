@@ -57,64 +57,48 @@ impl TrivyFsScanner {
             .any(|ext| name_lower.ends_with(ext))
     }
 
-    /// Attempt to scan using the Trivy CLI with server mode.
-    async fn scan_with_cli(&self, workspace: &Path) -> Result<TrivyReport> {
+    /// Run Trivy filesystem scan, optionally connecting to a server.
+    /// When `server_url` is Some, `--server <url>` is added to the command.
+    async fn run_trivy(&self, workspace: &Path, server_url: Option<&str>) -> Result<TrivyReport> {
+        let ws = workspace.to_string_lossy();
+        let mut args = vec!["filesystem"];
+        if let Some(url) = server_url {
+            args.push("--server");
+            args.push(url);
+        }
+        args.extend_from_slice(&[
+            "--format",
+            "json",
+            "--severity",
+            "CRITICAL,HIGH,MEDIUM,LOW",
+            "--quiet",
+            "--timeout",
+            "5m",
+            &ws,
+        ]);
+
+        let mode_label = if server_url.is_some() {
+            "server"
+        } else {
+            "standalone"
+        };
+
         let output = tokio::process::Command::new("trivy")
-            .args([
-                "filesystem",
-                "--server",
-                &self.trivy_url,
-                "--format",
-                "json",
-                "--severity",
-                "CRITICAL,HIGH,MEDIUM,LOW",
-                "--quiet",
-                "--timeout",
-                "5m",
-                &workspace.to_string_lossy(),
-            ])
+            .args(&args)
             .output()
             .await
             .map_err(|e| AppError::Internal(format!("Failed to execute Trivy CLI: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("not found") || stderr.contains("No such file") {
+            if server_url.is_some()
+                && (stderr.contains("not found") || stderr.contains("No such file"))
+            {
                 return Err(AppError::Internal("Trivy CLI not available".to_string()));
             }
             return Err(AppError::Internal(format!(
-                "Trivy filesystem scan failed (exit {}): {}",
-                output.status, stderr
-            )));
-        }
-
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| AppError::Internal(format!("Failed to parse Trivy output: {}", e)))
-    }
-
-    /// Fallback: scan using Trivy standalone CLI (no server).
-    async fn scan_with_standalone_cli(&self, workspace: &Path) -> Result<TrivyReport> {
-        let output = tokio::process::Command::new("trivy")
-            .args([
-                "filesystem",
-                "--format",
-                "json",
-                "--severity",
-                "CRITICAL,HIGH,MEDIUM,LOW",
-                "--quiet",
-                "--timeout",
-                "5m",
-                &workspace.to_string_lossy(),
-            ])
-            .output()
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to execute Trivy CLI: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::Internal(format!(
-                "Trivy standalone scan failed (exit {}): {}",
-                output.status, stderr
+                "Trivy {} scan failed (exit {}): {}",
+                mode_label, output.status, stderr
             )));
         }
 
@@ -152,14 +136,14 @@ impl Scanner for TrivyFsScanner {
             ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
 
         // Try CLI with server mode first, then standalone
-        let report = match self.scan_with_cli(&workspace).await {
+        let report = match self.run_trivy(&workspace, Some(&self.trivy_url)).await {
             Ok(report) => report,
             Err(e) => {
                 warn!(
                     "Trivy server-mode CLI failed for {}: {}. Trying standalone mode.",
                     artifact.name, e
                 );
-                match self.scan_with_standalone_cli(&workspace).await {
+                match self.run_trivy(&workspace, None).await {
                     Ok(report) => report,
                     Err(e) => {
                         return Err(fail_scan(
@@ -193,27 +177,10 @@ impl Scanner for TrivyFsScanner {
 mod tests {
     use super::*;
     use crate::models::security::Severity;
+    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
     fn make_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
-        Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: path.to_string(),
-            name: name.to_string(),
-            version: Some("1.0.0".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: content_type.to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
+        make_test_artifact(name, content_type, path)
     }
 
     #[test]
@@ -274,20 +241,6 @@ mod tests {
             "v2/myapp/manifests/v1.0.0",
         );
         assert!(!TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_is_archive() {
-        assert!(ScanWorkspace::is_archive("foo.tar.gz"));
-        assert!(ScanWorkspace::is_archive("foo.tgz"));
-        assert!(ScanWorkspace::is_archive("foo.whl"));
-        assert!(ScanWorkspace::is_archive("foo.jar"));
-        assert!(ScanWorkspace::is_archive("foo.zip"));
-        assert!(ScanWorkspace::is_archive("foo.gem"));
-        assert!(ScanWorkspace::is_archive("foo.crate"));
-        assert!(ScanWorkspace::is_archive("foo.nupkg"));
-        assert!(!ScanWorkspace::is_archive("Cargo.lock"));
-        assert!(!ScanWorkspace::is_archive("package.json"));
     }
 
     #[test]
@@ -377,15 +330,6 @@ mod tests {
         let content = bytes::Bytes::from_static(b"not a real archive");
 
         let result = scanner.scan(&artifact, None, &content).await;
-        assert!(
-            result.is_err(),
-            "scan() must return Err when trivy execution fails, not Ok(vec![])"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Trivy filesystem scan failed"),
-            "error message should indicate trivy failure, got: {}",
-            err_msg
-        );
+        assert_scan_failed(&result, "Trivy filesystem scan");
     }
 }

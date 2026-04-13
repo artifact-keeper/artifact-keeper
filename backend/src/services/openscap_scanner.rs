@@ -235,29 +235,10 @@ impl Scanner for OpenScapScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use uuid::Uuid;
+    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
     fn make_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
-        Artifact {
-            id: Uuid::new_v4(),
-            repository_id: Uuid::new_v4(),
-            path: path.to_string(),
-            name: name.to_string(),
-            version: None,
-            size_bytes: 0,
-            checksum_sha256: String::new(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: content_type.to_string(),
-            storage_key: String::new(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
+        make_test_artifact(name, content_type, path)
     }
 
     #[test]
@@ -371,15 +352,6 @@ mod tests {
         let content = bytes::Bytes::from_static(b"fake rootfs tarball");
 
         let result = scanner.scan(&artifact, None, &content).await;
-        assert!(
-            result.is_err(),
-            "scan() must return Err when sidecar is unreachable, not Ok(vec![])"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("OpenSCAP scan failed"),
-            "error message should indicate OpenSCAP failure, got: {}",
-            err_msg
-        );
+        assert_scan_failed(&result, "OpenSCAP scan");
     }
 }

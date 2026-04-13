@@ -184,42 +184,10 @@ impl Scanner for GrypeScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
-    #[allow(dead_code)]
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
-        Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: format!("test/{}", name),
-            name: name.to_string(),
-            version: Some("1.0.0".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: content_type.to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn test_is_archive() {
-        assert!(ScanWorkspace::is_archive("foo.tar.gz"));
-        assert!(ScanWorkspace::is_archive("foo.tgz"));
-        assert!(ScanWorkspace::is_archive("foo.whl"));
-        assert!(ScanWorkspace::is_archive("foo.jar"));
-        assert!(ScanWorkspace::is_archive("foo.zip"));
-        assert!(ScanWorkspace::is_archive("foo.gem"));
-        assert!(ScanWorkspace::is_archive("foo.crate"));
-        assert!(ScanWorkspace::is_archive("foo.nupkg"));
-        assert!(!ScanWorkspace::is_archive("Cargo.lock"));
-        assert!(!ScanWorkspace::is_archive("package.json"));
+        make_test_artifact(name, content_type, &format!("test/{}", name))
     }
 
     #[test]
@@ -345,16 +313,7 @@ mod tests {
         let content = Bytes::from_static(b"not a real archive");
 
         let result = scanner.scan(&artifact, None, &content).await;
-        assert!(
-            result.is_err(),
-            "scan() must return Err when grype execution fails, not Ok(vec![])"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Grype scan failed"),
-            "error message should indicate grype failure, got: {}",
-            err_msg
-        );
+        assert_scan_failed(&result, "Grype scan");
     }
 
     #[test]

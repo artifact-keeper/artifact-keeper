@@ -1627,6 +1627,54 @@ impl ScannerService {
     }
 }
 
+/// Test helpers shared across scanner test modules to avoid duplicating
+/// Artifact construction in every scanner file.
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use crate::models::artifact::Artifact;
+
+    /// Create a minimal Artifact for unit tests. Fields not relevant to a
+    /// specific test use sensible defaults.
+    pub fn make_test_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
+        Artifact {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            path: path.to_string(),
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1000,
+            checksum_sha256: "abc123".to_string(),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: content_type.to_string(),
+            storage_key: "test-key".to_string(),
+            is_deleted: false,
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Assert that a scan result is an error containing the expected label.
+    pub fn assert_scan_failed(
+        result: &crate::error::Result<Vec<crate::models::security::RawFinding>>,
+        expected_label: &str,
+    ) {
+        assert!(
+            result.is_err(),
+            "scan() must return Err, not Ok(vec![]), when {} fails",
+            expected_label
+        );
+        let err_msg = result.as_ref().unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&format!("{} failed", expected_label)),
+            "error message should contain '{} failed', got: {}",
+            expected_label,
+            err_msg
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,6 +1853,28 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ScanWorkspace::is_archive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_workspace_is_archive() {
+        assert!(ScanWorkspace::is_archive("foo.tar.gz"));
+        assert!(ScanWorkspace::is_archive("foo.tgz"));
+        assert!(ScanWorkspace::is_archive("foo.whl"));
+        assert!(ScanWorkspace::is_archive("foo.jar"));
+        assert!(ScanWorkspace::is_archive("foo.zip"));
+        assert!(ScanWorkspace::is_archive("foo.gem"));
+        assert!(ScanWorkspace::is_archive("foo.crate"));
+        assert!(ScanWorkspace::is_archive("foo.nupkg"));
+        assert!(ScanWorkspace::is_archive("foo.war"));
+        assert!(ScanWorkspace::is_archive("foo.ear"));
+        assert!(ScanWorkspace::is_archive("foo.egg"));
+        assert!(!ScanWorkspace::is_archive("Cargo.lock"));
+        assert!(!ScanWorkspace::is_archive("package.json"));
+        assert!(!ScanWorkspace::is_archive("foo.rs"));
     }
 
     // -----------------------------------------------------------------------

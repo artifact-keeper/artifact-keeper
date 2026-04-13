@@ -318,27 +318,10 @@ impl Scanner for IncusScanner {
 mod tests {
     use super::*;
     use crate::models::security::Severity;
+    use crate::services::scanner_service::test_helpers::make_test_artifact;
 
     fn make_incus_artifact(name: &str, path: &str) -> Artifact {
-        Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: path.to_string(),
-            name: name.to_string(),
-            version: Some("20240215".to_string()),
-            size_bytes: 100_000_000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/octet-stream".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
+        make_test_artifact(name, "application/octet-stream", path)
     }
 
     #[test]
