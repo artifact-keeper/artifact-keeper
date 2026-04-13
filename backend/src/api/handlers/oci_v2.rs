@@ -190,9 +190,10 @@ fn parse_pagination_params(
                 "invalid pagination parameter n",
             )
         })?,
-        // OCI spec says "return all tags" without `n`, but we cap at 100 to
-        // prevent unbounded responses. A `Link` header is emitted when more
-        // results exist, so well-behaved clients will paginate correctly.
+        // OCI spec says "return all tags" without `n`, but we cap at a default
+        // of 100 to prevent unbounded responses.  This matches Docker Hub's
+        // observed behaviour.  A `Link` header is emitted when more results
+        // exist, so well-behaved clients will paginate correctly.
         None => 100,
     }
     .min(10000);
@@ -239,6 +240,9 @@ fn apply_cursor_pagination(tags: Vec<String>, last: Option<&str>, n: usize) -> (
 /// per OCI Distribution Spec.
 /// Spec reference:
 /// https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#listing-tags
+///
+/// `dedup()` (consecutive-only) is sufficient here because `oci_lexical_cmp`
+/// provides a total order: equal strings are always adjacent after `sort_by`.
 fn merge_and_dedup_tags(tag_sets: Vec<Vec<String>>) -> Vec<String> {
     let mut all: Vec<String> = tag_sets.into_iter().flatten().collect();
     all.sort_by(|lhs, rhs| oci_lexical_cmp(lhs, rhs));
@@ -345,11 +349,12 @@ fn is_digest_reference(reference: &str) -> bool {
         return false;
     };
 
+    // OCI spec: algorithm = `[a-z0-9]+([+._-][a-z0-9]+)*` (lowercase only)
     !algorithm.is_empty()
         && !encoded.is_empty()
         && algorithm
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '.' | '-'))
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '+' | '.' | '-'))
         && encoded
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '=' | '_' | '-'))
@@ -1679,6 +1684,14 @@ async fn resolve_remote_tags_page(
     }
 }
 
+/// Resolve a single page of tags for a virtual repository.
+///
+/// The cursor (`last`) is forwarded to each member query **and** applied again
+/// on the merged result.  This double application is intentional: member repos
+/// (especially remote upstreams) may sort tags differently than our canonical
+/// `oci_lexical_cmp` order, so tags that the upstream considers "after" the
+/// cursor may land "before" it in our ordering.  The second pass in
+/// `apply_cursor_pagination` catches these strays and keeps pagination correct.
 async fn resolve_virtual_tags_page(
     state: &SharedState,
     repo: &OciRepoInfo,
