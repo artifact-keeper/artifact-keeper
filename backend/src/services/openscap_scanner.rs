@@ -15,7 +15,9 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{sanitize_artifact_filename, Scanner};
+use crate::services::scanner_service::{
+    fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
+};
 
 // ---------------------------------------------------------------------------
 // OpenSCAP wrapper JSON response structures
@@ -90,17 +92,15 @@ impl OpenScapScanner {
         is_container || is_rpm || is_deb
     }
 
-    fn workspace_dir(&self, artifact: &Artifact) -> PathBuf {
-        Path::new(&self.scan_workspace).join(format!("openscap-{}", artifact.id))
-    }
-
+    /// Prepare the scan workspace: create directory and write artifact content.
+    /// OpenSCAP does not extract archives (it scans the raw package).
     async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
-        let workspace = self.workspace_dir(artifact);
+        let workspace =
+            ScanWorkspace::workspace_dir(&self.scan_workspace, Some("openscap"), artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
-        // Sanitize the filename to its basename to prevent path traversal
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
         let artifact_path = workspace.join(&safe_filename);
@@ -112,17 +112,6 @@ impl OpenScapScanner {
             })?;
 
         Ok(workspace)
-    }
-
-    async fn cleanup_workspace(&self, artifact: &Artifact) {
-        let workspace = self.workspace_dir(artifact);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-            warn!(
-                "Failed to clean up scan workspace {}: {}",
-                workspace.display(),
-                e
-            );
-        }
     }
 
     async fn call_openscap(&self, workspace: &Path) -> Result<OpenScapResponse> {
@@ -214,12 +203,14 @@ impl Scanner for OpenScapScanner {
         let response = match self.call_openscap(&workspace).await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!("OpenSCAP scan failed for {}: {}", artifact.name, e);
-                self.cleanup_workspace(artifact).await;
-                return Err(AppError::Internal(format!(
-                    "OpenSCAP scan failed for {}: {}",
-                    artifact.name, e
-                )));
+                return Err(fail_scan(
+                    "OpenSCAP scan",
+                    artifact,
+                    &e,
+                    &self.scan_workspace,
+                    Some("openscap"),
+                )
+                .await);
             }
         };
 
@@ -235,7 +226,7 @@ impl Scanner for OpenScapScanner {
             findings.len()
         );
 
-        self.cleanup_workspace(artifact).await;
+        ScanWorkspace::cleanup(&self.scan_workspace, Some("openscap"), artifact).await;
 
         Ok(findings)
     }

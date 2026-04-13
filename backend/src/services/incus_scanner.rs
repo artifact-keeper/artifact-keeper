@@ -18,9 +18,9 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::formats::incus::{IncusFileType, IncusHandler};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
+use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
-use crate::services::scanner_service::Scanner;
+use crate::services::scanner_service::{convert_trivy_findings, fail_scan, ScanWorkspace, Scanner};
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
 async fn write_temp_file(path: &Path, content: &Bytes, label: &str) -> Result<()> {
@@ -121,7 +121,7 @@ impl IncusScanner {
 
     /// Build the workspace directory path for a given artifact.
     fn workspace_dir(&self, artifact: &Artifact) -> PathBuf {
-        Path::new(&self.scan_workspace).join(format!("incus-{}", artifact.id))
+        ScanWorkspace::workspace_dir(&self.scan_workspace, Some("incus"), artifact)
     }
 
     /// Prepare the scan workspace by extracting rootfs from the image.
@@ -213,14 +213,7 @@ impl IncusScanner {
 
     /// Clean up the scan workspace directory.
     async fn cleanup_workspace(&self, artifact: &Artifact) {
-        let workspace = self.workspace_dir(artifact);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-            warn!(
-                "Failed to clean up Incus scan workspace {}: {}",
-                workspace.display(),
-                e
-            );
-        }
+        ScanWorkspace::cleanup(&self.scan_workspace, Some("incus"), artifact).await;
     }
 
     /// Run Trivy filesystem scan on the extracted rootfs.
@@ -234,32 +227,8 @@ impl IncusScanner {
     }
 
     /// Convert Trivy report into RawFinding values.
-    fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
-        report
-            .results
-            .iter()
-            .flat_map(|result| {
-                result
-                    .vulnerabilities
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(move |vuln| RawFinding {
-                        severity: Severity::from_str_loose(&vuln.severity)
-                            .unwrap_or(Severity::Info),
-                        title: vuln.title.clone().unwrap_or_else(|| {
-                            format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
-                        }),
-                        description: vuln.description.clone(),
-                        cve_id: Some(vuln.vulnerability_id.clone()),
-                        affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
-                        affected_version: Some(vuln.installed_version.clone()),
-                        fixed_version: vuln.fixed_version.clone(),
-                        source: Some("trivy-incus".to_string()),
-                        source_url: vuln.primary_url.clone(),
-                    })
-            })
-            .collect()
+    fn convert_findings(report: &crate::services::image_scanner::TrivyReport) -> Vec<RawFinding> {
+        convert_trivy_findings(report, "trivy-incus")
     }
 }
 
@@ -296,12 +265,14 @@ impl Scanner for IncusScanner {
         let rootfs = match self.prepare_workspace(artifact, content).await {
             Ok(r) => r,
             Err(e) => {
-                warn!("Failed to extract Incus image {}: {}", artifact.name, e);
-                self.cleanup_workspace(artifact).await;
-                return Err(AppError::Internal(format!(
-                    "Failed to extract Incus image {}: {}",
-                    artifact.name, e
-                )));
+                return Err(fail_scan(
+                    "Incus image extraction",
+                    artifact,
+                    &e,
+                    &self.scan_workspace,
+                    Some("incus"),
+                )
+                .await);
             }
         };
 
@@ -316,12 +287,14 @@ impl Scanner for IncusScanner {
                 match self.scan_standalone(&rootfs).await {
                     Ok(report) => report,
                     Err(e) => {
-                        warn!("Trivy Incus scan failed for {}: {}", artifact.name, e);
-                        self.cleanup_workspace(artifact).await;
-                        return Err(AppError::Internal(format!(
-                            "Trivy Incus scan failed for {}: {}",
-                            artifact.name, e
-                        )));
+                        return Err(fail_scan(
+                            "Trivy Incus scan",
+                            artifact,
+                            &e,
+                            &self.scan_workspace,
+                            Some("incus"),
+                        )
+                        .await);
                     }
                 }
             }
@@ -344,6 +317,7 @@ impl Scanner for IncusScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::security::Severity;
 
     fn make_incus_artifact(name: &str, path: &str) -> Artifact {
         Artifact {
