@@ -63,6 +63,7 @@ pub mod upstream_auth;
 pub mod wasm_bindings;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
+pub mod webhook_payloads;
 
 // Observability & lifecycle
 pub mod analytics_service;

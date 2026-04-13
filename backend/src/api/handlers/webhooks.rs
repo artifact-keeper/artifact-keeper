@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::webhook_payloads::{self, PayloadTemplate};
 
 /// Create webhook routes
 pub fn router() -> Router<SharedState> {
@@ -73,6 +74,9 @@ pub struct CreateWebhookRequest {
     pub repository_id: Option<Uuid>,
     #[schema(value_type = Option<Object>)]
     pub headers: Option<serde_json::Value>,
+    /// Payload layout for the target platform (default: generic).
+    #[serde(default)]
+    pub payload_template: PayloadTemplate,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -85,6 +89,7 @@ pub struct WebhookResponse {
     pub repository_id: Option<Uuid>,
     #[schema(value_type = Option<Object>)]
     pub headers: Option<serde_json::Value>,
+    pub payload_template: PayloadTemplate,
     pub last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -116,9 +121,12 @@ pub async fn list_webhooks(
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = ((page - 1) * per_page) as i64;
 
-    let webhooks = sqlx::query!(
+    use sqlx::Row;
+
+    let webhooks = sqlx::query(
         r#"
-        SELECT id, name, url, events, is_enabled, repository_id, headers, last_triggered_at, created_at
+        SELECT id, name, url, events, is_enabled, repository_id, headers,
+               payload_template, last_triggered_at, created_at
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
@@ -126,41 +134,46 @@ pub async fn list_webhooks(
         OFFSET $3
         LIMIT $4
         "#,
-        query.repository_id,
-        query.enabled,
-        offset,
-        per_page as i64
     )
+    .bind(query.repository_id)
+    .bind(query.enabled)
+    .bind(offset)
+    .bind(per_page as i64)
     .fetch_all(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let total = sqlx::query_scalar!(
+    let total_row = sqlx::query(
         r#"
-        SELECT COUNT(*) as "count!"
+        SELECT COUNT(*) as count
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
         "#,
-        query.repository_id,
-        query.enabled
     )
+    .bind(query.repository_id)
+    .bind(query.enabled)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+    let total: i64 = total_row.get("count");
 
     let items = webhooks
         .into_iter()
-        .map(|w| WebhookResponse {
-            id: w.id,
-            name: w.name,
-            url: w.url,
-            events: w.events,
-            is_enabled: w.is_enabled,
-            repository_id: w.repository_id,
-            headers: w.headers,
-            last_triggered_at: w.last_triggered_at,
-            created_at: w.created_at,
+        .map(|w| {
+            let tpl: String = w.get("payload_template");
+            WebhookResponse {
+                id: w.get("id"),
+                name: w.get("name"),
+                url: w.get("url"),
+                events: w.get("events"),
+                is_enabled: w.get("is_enabled"),
+                repository_id: w.get("repository_id"),
+                headers: w.get("headers"),
+                payload_template: PayloadTemplate::from_str_lossy(&tpl),
+                last_triggered_at: w.get("last_triggered_at"),
+                created_at: w.get("created_at"),
+            }
         })
         .collect();
 
@@ -203,33 +216,40 @@ pub async fn create_webhook(
         None
     };
 
-    let webhook = sqlx::query!(
+    use sqlx::Row;
+
+    let template_str = payload.payload_template.to_string();
+    let webhook = sqlx::query(
         r#"
-        INSERT INTO webhooks (name, url, events, secret_hash, repository_id, headers)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id, name, url, events, is_enabled, repository_id, headers, last_triggered_at, created_at
+        INSERT INTO webhooks (name, url, events, secret_hash, repository_id, headers, payload_template)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, name, url, events, is_enabled, repository_id, headers,
+                  payload_template, last_triggered_at, created_at
         "#,
-        payload.name,
-        payload.url,
-        &payload.events,
-        secret_hash,
-        payload.repository_id,
-        payload.headers
     )
+    .bind(&payload.name)
+    .bind(&payload.url)
+    .bind(&payload.events)
+    .bind(&secret_hash)
+    .bind(payload.repository_id)
+    .bind(&payload.headers)
+    .bind(&template_str)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let tpl: String = webhook.get("payload_template");
     Ok(Json(WebhookResponse {
-        id: webhook.id,
-        name: webhook.name,
-        url: webhook.url,
-        events: webhook.events,
-        is_enabled: webhook.is_enabled,
-        repository_id: webhook.repository_id,
-        headers: webhook.headers,
-        last_triggered_at: webhook.last_triggered_at,
-        created_at: webhook.created_at,
+        id: webhook.get("id"),
+        name: webhook.get("name"),
+        url: webhook.get("url"),
+        events: webhook.get("events"),
+        is_enabled: webhook.get("is_enabled"),
+        repository_id: webhook.get("repository_id"),
+        headers: webhook.get("headers"),
+        payload_template: PayloadTemplate::from_str_lossy(&tpl),
+        last_triggered_at: webhook.get("last_triggered_at"),
+        created_at: webhook.get("created_at"),
     }))
 }
 
@@ -252,29 +272,34 @@ pub async fn get_webhook(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<WebhookResponse>> {
-    let webhook = sqlx::query!(
+    use sqlx::Row;
+
+    let webhook = sqlx::query(
         r#"
-        SELECT id, name, url, events, is_enabled, repository_id, headers, last_triggered_at, created_at
+        SELECT id, name, url, events, is_enabled, repository_id, headers,
+               payload_template, last_triggered_at, created_at
         FROM webhooks
         WHERE id = $1
         "#,
-        id
     )
+    .bind(id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
 
+    let tpl: String = webhook.get("payload_template");
     Ok(Json(WebhookResponse {
-        id: webhook.id,
-        name: webhook.name,
-        url: webhook.url,
-        events: webhook.events,
-        is_enabled: webhook.is_enabled,
-        repository_id: webhook.repository_id,
-        headers: webhook.headers,
-        last_triggered_at: webhook.last_triggered_at,
-        created_at: webhook.created_at,
+        id: webhook.get("id"),
+        name: webhook.get("name"),
+        url: webhook.get("url"),
+        events: webhook.get("events"),
+        is_enabled: webhook.get("is_enabled"),
+        repository_id: webhook.get("repository_id"),
+        headers: webhook.get("headers"),
+        payload_template: PayloadTemplate::from_str_lossy(&tpl),
+        last_triggered_at: webhook.get("last_triggered_at"),
+        created_at: webhook.get("created_at"),
     }))
 }
 
@@ -400,37 +425,43 @@ pub async fn test_webhook(
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TestWebhookResponse>> {
-    let webhook = sqlx::query!(
-        "SELECT url, headers, secret_hash FROM webhooks WHERE id = $1",
-        id
+    use sqlx::Row;
+
+    let webhook = sqlx::query(
+        "SELECT url, headers, secret_hash, payload_template FROM webhooks WHERE id = $1",
     )
+    .bind(id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
 
-    // Create test payload
-    let payload = serde_json::json!({
-        "event": "test",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "data": {
-            "message": "This is a test webhook delivery"
-        }
+    let url: String = webhook.get("url");
+    let headers: Option<serde_json::Value> = webhook.get("headers");
+    let secret_hash: Option<String> = webhook.get("secret_hash");
+    let tpl_str: String = webhook.get("payload_template");
+    let template = PayloadTemplate::from_str_lossy(&tpl_str);
+
+    // Create test payload using the configured template
+    let test_details = serde_json::json!({
+        "message": "This is a test webhook delivery"
     });
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let payload = webhook_payloads::render_payload(template, "test", &test_details, &timestamp);
 
     // Re-validate URL at delivery time to prevent DNS rebinding attacks
-    validate_webhook_url(&webhook.url)?;
+    validate_webhook_url(&url)?;
 
     // Send webhook
     let client = crate::services::http_client::default_client();
     let mut request = client
-        .post(&webhook.url)
+        .post(&url)
         .header("Content-Type", "application/json")
         .header("X-Webhook-Event", "test");
 
     // Add custom headers
-    if let Some(headers) = webhook.headers {
-        if let Some(obj) = headers.as_object() {
+    if let Some(ref h) = headers {
+        if let Some(obj) = h.as_object() {
             for (key, value) in obj {
                 if let Some(v) = value.as_str() {
                     request = request.header(key.as_str(), v);
@@ -440,7 +471,7 @@ pub async fn test_webhook(
     }
 
     // Add signature if secret exists
-    if let Some(ref _secret_hash) = webhook.secret_hash {
+    if secret_hash.is_some() {
         // In production, would sign payload with HMAC-SHA256
         request = request.header("X-Webhook-Signature", "test-signature");
     }
@@ -972,6 +1003,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
     ),
     components(schemas(
         WebhookEvent,
+        PayloadTemplate,
         CreateWebhookRequest,
         WebhookResponse,
         WebhookListResponse,
@@ -1168,6 +1200,7 @@ mod tests {
         assert_eq!(req.events.len(), 1);
         assert!(req.secret.is_none());
         assert!(req.repository_id.is_none());
+        assert_eq!(req.payload_template, PayloadTemplate::Generic);
     }
 
     #[test]
@@ -1178,13 +1211,15 @@ mod tests {
             "events": ["artifact_uploaded", "artifact_deleted"],
             "secret": "my-secret-key",
             "repository_id": Uuid::new_v4(),
-            "headers": {"X-Custom": "value"}
+            "headers": {"X-Custom": "value"},
+            "payload_template": "slack"
         });
         let req: CreateWebhookRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.events.len(), 2);
         assert!(req.secret.is_some());
         assert!(req.repository_id.is_some());
         assert!(req.headers.is_some());
+        assert_eq!(req.payload_template, PayloadTemplate::Slack);
     }
 
     #[test]
@@ -1197,6 +1232,7 @@ mod tests {
             is_enabled: true,
             repository_id: None,
             headers: None,
+            payload_template: PayloadTemplate::Generic,
             last_triggered_at: None,
             created_at: chrono::Utc::now(),
         };
@@ -1204,6 +1240,7 @@ mod tests {
         assert_eq!(json["name"], "test");
         assert_eq!(json["is_enabled"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 1);
+        assert_eq!(json["payload_template"], "generic");
     }
 
     #[test]
