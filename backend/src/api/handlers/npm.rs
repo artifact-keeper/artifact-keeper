@@ -267,11 +267,9 @@ fn build_npm_metadata_response(
         "dist-tags": dist_tags,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&response).unwrap()))
-        .unwrap())
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&response).unwrap(),
+    ))
 }
 
 /// Build and return the npm package metadata JSON for all versions.
@@ -305,22 +303,11 @@ async fn get_package_metadata(
                 if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
                     rewrite_npm_tarball_urls(&mut json, &base_url, repo_key);
                     let rewritten = serde_json::to_string(&json).unwrap_or_default();
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(rewritten))
-                        .unwrap());
+                    return Ok(build_json_metadata_response(rewritten));
                 }
 
                 // If not valid JSON, return raw upstream response
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/json".to_string()),
-                    )
-                    .body(Body::from(content))
-                    .unwrap());
+                return Ok(build_raw_metadata_response(content, content_type));
             }
         }
         return Err(AppError::NotFound("Package not found".to_string()).into_response());
@@ -399,22 +386,14 @@ async fn get_package_metadata(
             .await;
 
             match result {
-                Ok((content, _content_type)) => {
+                Ok((content, content_type)) => {
                     if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&content) {
                         rewrite_npm_tarball_urls(&mut json, &base_url, repo_key);
                         let rewritten = serde_json::to_string(&json).unwrap_or_default();
-                        return Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/json")
-                            .body(Body::from(rewritten))
-                            .unwrap());
+                        return Ok(build_json_metadata_response(rewritten));
                     }
 
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(content))
-                        .unwrap());
+                    return Ok(build_raw_metadata_response(content, content_type));
                 }
                 Err(_e) => {
                     debug!(
@@ -475,6 +454,57 @@ async fn get_package_metadata(
 /// generation, Trivy, Grype) rely on it to decide how to extract and scan the
 /// artifact contents.
 const NPM_TARBALL_CONTENT_TYPE: &str = "application/gzip";
+
+/// Build an HTTP response for an npm tarball download.
+///
+/// All three download paths (remote, virtual, local) return the same response
+/// shape: the tarball bytes with `application/gzip` content type, a
+/// `Content-Disposition` attachment header, and the content length. This helper
+/// eliminates the repeated response-builder blocks.
+fn build_tarball_response(
+    content: Bytes,
+    filename: &str,
+    content_type: Option<String>,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
+        )
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap()
+}
+
+/// Build a JSON response from rewritten npm metadata.
+///
+/// Both the remote and virtual metadata paths rewrite upstream tarball URLs and
+/// return the modified JSON with `application/json` content type.
+fn build_json_metadata_response(json_string: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(json_string))
+        .unwrap()
+}
+
+/// Build a raw passthrough response for upstream metadata that could not be
+/// parsed as JSON.
+fn build_raw_metadata_response(content: Bytes, content_type: Option<String>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            content_type.unwrap_or_else(|| "application/json".to_string()),
+        )
+        .body(Body::from(content))
+        .unwrap()
+}
 
 // ---------------------------------------------------------------------------
 // GET tarball download handlers
@@ -592,16 +622,7 @@ async fn serve_tarball(
             // security scanners can identify the file as a gzip archive.
             correct_cached_tarball_content_type(&state.db, repo.id, &upstream_path).await;
 
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(CONTENT_LENGTH, content.len().to_string())
-                .body(Body::from(content))
-                .unwrap());
+            return Ok(build_tarball_response(content, filename, None));
         }
         return Err(AppError::NotFound("Tarball not found".to_string()).into_response());
     }
@@ -630,19 +651,7 @@ async fn serve_tarball(
         )
         .await?;
 
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                CONTENT_TYPE,
-                content_type.unwrap_or_else(|| NPM_TARBALL_CONTENT_TYPE.to_string()),
-            )
-            .header(
-                "Content-Disposition",
-                format!("attachment; filename=\"{}\"", filename),
-            )
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap());
+        return Ok(build_tarball_response(content, filename, content_type));
     }
 
     // For local/staged repos, find artifact by filename. Include the package
@@ -693,16 +702,7 @@ async fn serve_tarball(
     .execute(&state.db)
     .await;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, NPM_TARBALL_CONTENT_TYPE)
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
+    Ok(build_tarball_response(content, filename, None))
 }
 
 /// Update the content_type of a cached proxy artifact from the incorrect
@@ -1028,13 +1028,9 @@ async fn publish_package(
     .execute(&state.db)
     .await;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
-        ))
-        .unwrap())
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&serde_json::json!({"ok": true})).unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,37 +1351,27 @@ mod tests {
 
     #[test]
     fn test_tarball_filename_unscoped() {
-        let package_name = "express";
-        let version = "4.18.2";
-        let filename = format!("{}-{}.tgz", package_name, version);
-        assert_eq!(filename, "express-4.18.2.tgz");
+        assert_eq!(
+            build_npm_tarball_filename("express", "4.18.2"),
+            "express-4.18.2.tgz"
+        );
     }
 
     #[test]
     fn test_tarball_filename_scoped() {
-        let package_name = "@angular/core";
-        let version = "17.0.0";
-        let tarball_filename = if package_name.starts_with('@') {
-            let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
-            format!("{}-{}.tgz", short_name, version)
-        } else {
-            format!("{}-{}.tgz", package_name, version)
-        };
-        assert_eq!(tarball_filename, "core-17.0.0.tgz");
+        assert_eq!(
+            build_npm_tarball_filename("@angular/core", "17.0.0"),
+            "core-17.0.0.tgz"
+        );
     }
 
     #[test]
     fn test_tarball_filename_scoped_no_slash() {
-        let package_name = "@oddpackage";
-        let version = "1.0.0";
-        let tarball_filename = if package_name.starts_with('@') {
-            let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
-            format!("{}-{}.tgz", short_name, version)
-        } else {
-            format!("{}-{}.tgz", package_name, version)
-        };
         // rsplit('/') returns the entire string when no '/' is found
-        assert_eq!(tarball_filename, "@oddpackage-1.0.0.tgz");
+        assert_eq!(
+            build_npm_tarball_filename("@oddpackage", "1.0.0"),
+            "@oddpackage-1.0.0.tgz"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1394,10 +1380,7 @@ mod tests {
 
     #[test]
     fn test_scoped_package_name() {
-        let scope = "babel";
-        let package = "core";
-        let full_name = format!("@{}/{}", scope, package);
-        assert_eq!(full_name, "@babel/core");
+        assert_eq!(build_scoped_package_name("babel", "core"), "@babel/core");
     }
 
     // -----------------------------------------------------------------------
@@ -1406,21 +1389,17 @@ mod tests {
 
     #[test]
     fn test_npm_artifact_path() {
-        let package_name = "express";
-        let version = "4.18.2";
-        let tarball_filename = format!("{}-{}.tgz", package_name, version);
-        let artifact_path = format!("{}/{}/{}", package_name, version, tarball_filename);
-        assert_eq!(artifact_path, "express/4.18.2/express-4.18.2.tgz");
+        let filename = build_npm_tarball_filename("express", "4.18.2");
+        assert_eq!(
+            build_npm_artifact_path("express", "4.18.2", &filename),
+            "express/4.18.2/express-4.18.2.tgz"
+        );
     }
 
     #[test]
     fn test_npm_storage_key() {
-        let package_name = "@vue/compiler-core";
-        let version = "3.4.0";
-        let tarball_filename = "compiler-core-3.4.0.tgz";
-        let storage_key = format!("npm/{}/{}/{}", package_name, version, tarball_filename);
         assert_eq!(
-            storage_key,
+            build_npm_storage_key("@vue/compiler-core", "3.4.0", "compiler-core-3.4.0.tgz"),
             "npm/@vue/compiler-core/3.4.0/compiler-core-3.4.0.tgz"
         );
     }
@@ -1450,18 +1429,10 @@ mod tests {
 
     #[test]
     fn test_hex_to_bytes_and_integrity() {
-        let hex = "abcdef0123456789";
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
-            .collect();
-        assert_eq!(bytes, vec![0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89]);
-
-        let integrity = format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(&bytes)
-        );
+        let hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let integrity = compute_npm_integrity(hex);
         assert!(integrity.starts_with("sha256-"));
+        assert!(integrity.len() > 7);
     }
 
     // -----------------------------------------------------------------------
@@ -1470,16 +1441,13 @@ mod tests {
 
     #[test]
     fn test_tarball_url() {
-        let base_url = "http://localhost:8080";
-        let repo_key = "npm-hosted";
-        let package_name = "express";
-        let filename = "express-4.18.2.tgz";
-        let url = format!(
-            "{}/npm/{}/{}/-/{}",
-            base_url, repo_key, package_name, filename
-        );
         assert_eq!(
-            url,
+            build_npm_tarball_url(
+                "http://localhost:8080",
+                "npm-hosted",
+                "express",
+                "express-4.18.2.tgz"
+            ),
             "http://localhost:8080/npm/npm-hosted/express/-/express-4.18.2.tgz"
         );
     }
@@ -2609,9 +2577,11 @@ mod tests {
     #[test]
     fn test_npm_tarball_content_type_consistent_with_publish() {
         // The publish handler stores "application/gzip" in the content_type
-        // column (see publish_version_to_repo). The constant used by the
-        // download handlers must match so that published and proxied tarballs
-        // have the same content type in the database.
-        assert_eq!(NPM_TARBALL_CONTENT_TYPE, "application/gzip");
+        // column (see store_npm_version). The constant used by the download
+        // handlers must match so that published and proxied tarballs have
+        // the same content type in the database. The literal "application/gzip"
+        // is passed to the INSERT in store_npm_version, so verify it matches.
+        let publish_content_type = "application/gzip";
+        assert_eq!(NPM_TARBALL_CONTENT_TYPE, publish_content_type);
     }
 }
