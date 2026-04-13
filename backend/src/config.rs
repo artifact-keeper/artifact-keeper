@@ -404,7 +404,7 @@ impl Config {
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
-            rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 5000),
+            rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
             rate_limit_window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60),
             rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
                 .ok()
@@ -655,6 +655,9 @@ mod tests {
         env::remove_var("LOG_LEVEL");
         env::remove_var("STORAGE_BACKEND");
         env::remove_var("DEMO_MODE");
+        env::remove_var("RATE_LIMIT_AUTH_PER_MIN");
+        env::remove_var("RATE_LIMIT_API_PER_MIN");
+        env::remove_var("RATE_LIMIT_WINDOW_SECS");
 
         let config = Config::from_env().expect("Config should load with required vars");
 
@@ -688,6 +691,11 @@ mod tests {
 
         // Password expiration default (disabled)
         assert_eq!(config.password_expiry_days, 0);
+
+        // Rate limit defaults (#692)
+        assert_eq!(config.rate_limit_auth_per_window, 120);
+        assert_eq!(config.rate_limit_api_per_window, 10000);
+        assert_eq!(config.rate_limit_window_secs, 60);
 
         // Restore
         if let Some(v) = saved_db {
@@ -1411,5 +1419,74 @@ mod tests {
         let expiry: u64 = env_parse("PRESIGNED_DOWNLOAD_EXPIRY_SECS", 300);
         assert_eq!(expiry, 600);
         env::remove_var("PRESIGNED_DOWNLOAD_EXPIRY_SECS");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limit defaults (#692)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_rate_limit_api_default_is_10000() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("RATE_LIMIT_API_PER_MIN");
+
+        let config = Config::from_env().expect("Config should load");
+        assert_eq!(
+            config.rate_limit_api_per_window, 10000,
+            "Default API rate limit should be 10000 after #692 fix"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_rate {
+            Some(v) => env::set_var("RATE_LIMIT_API_PER_MIN", v),
+            None => env::remove_var("RATE_LIMIT_API_PER_MIN"),
+        }
+    }
+
+    #[test]
+    fn test_config_rate_limit_api_env_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_rate = env::var("RATE_LIMIT_API_PER_MIN").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("RATE_LIMIT_API_PER_MIN", "25000");
+
+        let config = Config::from_env().expect("Config should load");
+        assert_eq!(config.rate_limit_api_per_window, 25000);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_rate {
+            Some(v) => env::set_var("RATE_LIMIT_API_PER_MIN", v),
+            None => env::remove_var("RATE_LIMIT_API_PER_MIN"),
+        }
     }
 }
