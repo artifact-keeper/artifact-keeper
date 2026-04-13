@@ -23,6 +23,7 @@ pub mod metadata_checker;
 pub mod migration_service;
 pub mod migration_worker;
 pub mod nexus_client;
+pub mod notification_dispatcher;
 pub mod oidc_service;
 pub mod openscap_scanner;
 pub mod package_service;

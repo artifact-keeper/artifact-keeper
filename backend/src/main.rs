@@ -393,6 +393,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
+    // Start notification dispatcher (subscribes to EventBus for email/webhook delivery)
+    artifact_keeper_backend::services::notification_dispatcher::start_dispatcher(
+        app_state.event_bus.clone(),
+        app_state.db.clone(),
+        app_state.smtp_service.clone(),
+    );
+    tracing::info!("Notification dispatcher started");
+
     app_state
         .setup_required
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
