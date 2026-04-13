@@ -155,7 +155,7 @@ impl RepositoryService {
             )));
         }
 
-        let repo = sqlx::query_as!(
+        let repo = match sqlx::query_as!(
             Repository,
             r#"
             INSERT INTO repositories (
@@ -189,13 +189,20 @@ impl RepositoryService {
         )
         .fetch_one(&self.db)
         .await
-        .map_err(|e| {
-            if e.to_string().contains("duplicate key") {
-                AppError::Conflict(format!("Repository with key '{}' already exists", req.key))
-            } else {
-                AppError::Database(e.to_string())
+        {
+            Ok(repo) => repo,
+            Err(e) if e.to_string().contains("duplicate key") => {
+                // Another request created this repo concurrently. Return the
+                // existing row so callers see a successful, idempotent result
+                // instead of a 409 Conflict under high concurrency.
+                tracing::debug!(
+                    key = %req.key,
+                    "Concurrent insert detected, returning existing repository"
+                );
+                self.get_by_key(&req.key).await?
             }
-        })?;
+            Err(e) => return Err(AppError::Database(e.to_string())),
+        };
 
         // Set custom format_key for WASM plugin handlers
         if let Some(ref fk) = req.format_key {
