@@ -192,6 +192,15 @@ pub struct Config {
     /// be changed. Set to 0 to disable password expiration. Default: 0.
     pub password_expiry_days: u32,
 
+    /// Comma-separated list of day thresholds at which expiry warning emails
+    /// are sent to local users. Only effective when `password_expiry_days` > 0
+    /// and SMTP is configured. Default: "14,7,1".
+    pub password_expiry_warning_days: Vec<u32>,
+
+    /// How often (in seconds) the password expiry notification job runs.
+    /// Default: 3600 (1 hour).
+    pub password_expiry_check_interval_secs: u64,
+
     // -- Password policy (local users) --
     /// Minimum password length (default: 8).
     pub password_min_length: usize,
@@ -300,6 +309,8 @@ redacted_debug!(Config {
     show quarantine_duration_minutes,
     show password_history_count,
     show password_expiry_days,
+    show password_expiry_warning_days,
+    show password_expiry_check_interval_secs,
     show password_min_length,
     show password_max_length,
     show password_require_uppercase,
@@ -510,6 +521,22 @@ impl Config {
             quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60).max(1),
             password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
             password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
+            password_expiry_warning_days: {
+                let raw =
+                    env::var("PASSWORD_EXPIRY_WARNING_DAYS").unwrap_or_else(|_| "14,7,1".into());
+                let mut days: Vec<u32> = raw
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&d| d > 0)
+                    .collect();
+                days.sort_unstable();
+                days.dedup();
+                days
+            },
+            password_expiry_check_interval_secs: env_parse(
+                "PASSWORD_EXPIRY_CHECK_INTERVAL_SECS",
+                3600,
+            ),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
             password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
             password_require_uppercase: matches!(
