@@ -144,6 +144,57 @@ async fn dispatch_event(
     Ok(())
 }
 
+/// Extract email recipient strings from subscription config.
+///
+/// Returns `None` if the config is missing a `recipients` array or if the
+/// array is empty. Non-string entries are silently skipped.
+pub fn parse_email_recipients(config: &serde_json::Value) -> Option<Vec<String>> {
+    let arr = config.get("recipients")?.as_array()?;
+    let recipients: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if recipients.is_empty() {
+        None
+    } else {
+        Some(recipients)
+    }
+}
+
+/// Build the email subject line for a notification event.
+pub fn build_email_subject(event: &DomainEvent) -> String {
+    format!(
+        "Artifact Keeper: {} ({})",
+        event.event_type, event.entity_id
+    )
+}
+
+/// Build the plain-text email body for a notification event.
+pub fn build_email_body_text(event: &DomainEvent) -> String {
+    format!(
+        "Event: {}\nEntity: {}\nActor: {}\nTime: {}",
+        event.event_type,
+        event.entity_id,
+        event.actor.as_deref().unwrap_or("system"),
+        event.timestamp,
+    )
+}
+
+/// Build the HTML email body for a notification event.
+pub fn build_email_body_html(event: &DomainEvent) -> String {
+    format!(
+        "<h2>Artifact Keeper Notification</h2>\
+         <p><strong>Event:</strong> {}</p>\
+         <p><strong>Entity:</strong> {}</p>\
+         <p><strong>Actor:</strong> {}</p>\
+         <p><strong>Time:</strong> {}</p>",
+        event.event_type,
+        event.entity_id,
+        event.actor.as_deref().unwrap_or("system"),
+        event.timestamp,
+    )
+}
+
 /// Deliver a notification via email.
 async fn deliver_email(
     smtp_service: &Option<Arc<SmtpService>>,
@@ -162,7 +213,7 @@ async fn deliver_email(
         }
     };
 
-    let recipients = match config.get("recipients").and_then(|v| v.as_array()) {
+    let recipients = match parse_email_recipients(config) {
         Some(r) => r,
         None => {
             tracing::warn!(
@@ -173,41 +224,59 @@ async fn deliver_email(
         }
     };
 
-    let subject = format!(
-        "Artifact Keeper: {} ({})",
-        event.event_type, event.entity_id
-    );
-    let body_text = format!(
-        "Event: {}\nEntity: {}\nActor: {}\nTime: {}",
-        event.event_type,
-        event.entity_id,
-        event.actor.as_deref().unwrap_or("system"),
-        event.timestamp,
-    );
-    let body_html = format!(
-        "<h2>Artifact Keeper Notification</h2>\
-         <p><strong>Event:</strong> {}</p>\
-         <p><strong>Entity:</strong> {}</p>\
-         <p><strong>Actor:</strong> {}</p>\
-         <p><strong>Time:</strong> {}</p>",
-        event.event_type,
-        event.entity_id,
-        event.actor.as_deref().unwrap_or("system"),
-        event.timestamp,
-    );
+    let subject = build_email_subject(event);
+    let body_text = build_email_body_text(event);
+    let body_html = build_email_body_html(event);
 
-    for recipient_value in recipients {
-        if let Some(to) = recipient_value.as_str() {
-            if let Err(e) = smtp.send_email(to, &subject, &body_html, &body_text).await {
-                tracing::warn!(
-                    subscription_id = %subscription_id,
-                    recipient = to,
-                    error = %e,
-                    "Failed to send email notification"
-                );
-            }
+    for to in &recipients {
+        if let Err(e) = smtp.send_email(to, &subject, &body_html, &body_text).await {
+            tracing::warn!(
+                subscription_id = %subscription_id,
+                recipient = %to,
+                error = %e,
+                "Failed to send email notification"
+            );
         }
     }
+}
+
+/// Extract the webhook URL from subscription config.
+///
+/// Returns `None` if the config has no `url` string field.
+pub fn parse_webhook_url(config: &serde_json::Value) -> Option<String> {
+    config.get("url").and_then(|v| v.as_str()).map(String::from)
+}
+
+/// Build the JSON payload sent to a webhook endpoint.
+pub fn build_webhook_payload(event: &DomainEvent) -> serde_json::Value {
+    serde_json::json!({
+        "event": event.event_type,
+        "entity_id": event.entity_id,
+        "actor": event.actor,
+        "timestamp": event.timestamp,
+    })
+}
+
+/// Compute an HMAC-SHA256 signature for a webhook payload.
+///
+/// Returns the hex-encoded signature prefixed with `sha256=`, matching the
+/// format expected by the `X-Signature-256` header. Returns `None` if the
+/// payload cannot be serialized.
+pub fn compute_webhook_signature(payload: &serde_json::Value, secret: &str) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let payload_bytes = serde_json::to_vec(payload).ok()?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(&payload_bytes);
+    let signature = hex::encode(mac.finalize().into_bytes());
+    Some(format!("sha256={}", signature))
+}
+
+/// Determine whether a subscription channel name is one we know how to
+/// deliver to.
+pub fn is_known_channel(channel: &str) -> bool {
+    matches!(channel, "email" | "webhook")
 }
 
 /// Deliver a notification via webhook HTTP POST.
@@ -216,7 +285,7 @@ async fn deliver_webhook(
     config: &serde_json::Value,
     subscription_id: uuid::Uuid,
 ) {
-    let url = match config.get("url").and_then(|v| v.as_str()) {
+    let url = match parse_webhook_url(config) {
         Some(u) => u,
         None => {
             tracing::warn!(
@@ -227,12 +296,7 @@ async fn deliver_webhook(
         }
     };
 
-    let payload = serde_json::json!({
-        "event": event.event_type,
-        "entity_id": event.entity_id,
-        "actor": event.actor,
-        "timestamp": event.timestamp,
-    });
+    let payload = build_webhook_payload(event);
 
     let client = match crate::services::http_client::base_client_builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -249,19 +313,12 @@ async fn deliver_webhook(
         }
     };
 
-    let mut request = client.post(url).json(&payload);
+    let mut request = client.post(&url).json(&payload);
 
     // Add HMAC signature header if a secret is configured
     if let Some(secret) = config.get("secret").and_then(|v| v.as_str()) {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        if let Ok(payload_bytes) = serde_json::to_vec(&payload) {
-            if let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
-                mac.update(&payload_bytes);
-                let signature = hex::encode(mac.finalize().into_bytes());
-                request = request.header("X-Signature-256", format!("sha256={}", signature));
-            }
+        if let Some(sig) = compute_webhook_signature(&payload, secret) {
+            request = request.header("X-Signature-256", sig);
         }
     }
 
@@ -271,7 +328,7 @@ async fn deliver_webhook(
             if !(200..300).contains(&status) {
                 tracing::warn!(
                     subscription_id = %subscription_id,
-                    url = url,
+                    url = %url,
                     status = status,
                     "Webhook notification delivery returned non-2xx status"
                 );
@@ -280,7 +337,7 @@ async fn deliver_webhook(
         Err(e) => {
             tracing::warn!(
                 subscription_id = %subscription_id,
-                url = url,
+                url = %url,
                 error = %e,
                 "Webhook notification delivery failed"
             );
@@ -291,6 +348,30 @@ async fn deliver_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper to build a test DomainEvent with all fields populated.
+    fn sample_event() -> DomainEvent {
+        DomainEvent {
+            event_type: "artifact.created".into(),
+            entity_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            actor: Some("alice".into()),
+            timestamp: "2026-04-08T12:00:00Z".into(),
+        }
+    }
+
+    /// Helper to build a DomainEvent with no actor.
+    fn sample_event_no_actor() -> DomainEvent {
+        DomainEvent {
+            event_type: "scan.completed".into(),
+            entity_id: "repo-key-abc".into(),
+            actor: None,
+            timestamp: "2026-04-08T13:00:00Z".into(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // map_event_type
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_map_event_type_artifact_created() {
@@ -348,5 +429,428 @@ mod tests {
     #[test]
     fn test_map_event_type_empty_string() {
         assert_eq!(map_event_type(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_email_recipients
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_email_recipients_valid() {
+        let config = serde_json::json!({"recipients": ["a@b.com", "c@d.com"]});
+        let result = parse_email_recipients(&config).unwrap();
+        assert_eq!(result, vec!["a@b.com", "c@d.com"]);
+    }
+
+    #[test]
+    fn test_parse_email_recipients_single() {
+        let config = serde_json::json!({"recipients": ["admin@example.com"]});
+        let result = parse_email_recipients(&config).unwrap();
+        assert_eq!(result, vec!["admin@example.com"]);
+    }
+
+    #[test]
+    fn test_parse_email_recipients_missing_key() {
+        let config = serde_json::json!({});
+        assert!(parse_email_recipients(&config).is_none());
+    }
+
+    #[test]
+    fn test_parse_email_recipients_not_array() {
+        let config = serde_json::json!({"recipients": "admin@example.com"});
+        assert!(parse_email_recipients(&config).is_none());
+    }
+
+    #[test]
+    fn test_parse_email_recipients_empty_array() {
+        let config = serde_json::json!({"recipients": []});
+        assert!(parse_email_recipients(&config).is_none());
+    }
+
+    #[test]
+    fn test_parse_email_recipients_skips_non_strings() {
+        let config = serde_json::json!({"recipients": [42, "valid@email.com", null]});
+        let result = parse_email_recipients(&config).unwrap();
+        assert_eq!(result, vec!["valid@email.com"]);
+    }
+
+    #[test]
+    fn test_parse_email_recipients_all_non_strings() {
+        let config = serde_json::json!({"recipients": [42, true, null]});
+        assert!(parse_email_recipients(&config).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_email_subject
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_email_subject_with_actor() {
+        let event = sample_event();
+        let subject = build_email_subject(&event);
+        assert_eq!(
+            subject,
+            "Artifact Keeper: artifact.created (550e8400-e29b-41d4-a716-446655440000)"
+        );
+    }
+
+    #[test]
+    fn test_build_email_subject_no_actor() {
+        let event = sample_event_no_actor();
+        let subject = build_email_subject(&event);
+        assert!(subject.contains("scan.completed"));
+        assert!(subject.contains("repo-key-abc"));
+    }
+
+    #[test]
+    fn test_build_email_subject_format() {
+        let event = DomainEvent {
+            event_type: "build.failed".into(),
+            entity_id: "build-42".into(),
+            actor: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        };
+        let subject = build_email_subject(&event);
+        assert_eq!(subject, "Artifact Keeper: build.failed (build-42)");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_email_body_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_email_body_text_with_actor() {
+        let event = sample_event();
+        let body = build_email_body_text(&event);
+        assert!(body.contains("Event: artifact.created"));
+        assert!(body.contains("Entity: 550e8400-e29b-41d4-a716-446655440000"));
+        assert!(body.contains("Actor: alice"));
+        assert!(body.contains("Time: 2026-04-08T12:00:00Z"));
+    }
+
+    #[test]
+    fn test_build_email_body_text_no_actor_shows_system() {
+        let event = sample_event_no_actor();
+        let body = build_email_body_text(&event);
+        assert!(body.contains("Actor: system"));
+    }
+
+    #[test]
+    fn test_build_email_body_text_contains_newlines() {
+        let event = sample_event();
+        let body = build_email_body_text(&event);
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("Event:"));
+        assert!(lines[1].starts_with("Entity:"));
+        assert!(lines[2].starts_with("Actor:"));
+        assert!(lines[3].starts_with("Time:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_email_body_html
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_email_body_html_with_actor() {
+        let event = sample_event();
+        let html = build_email_body_html(&event);
+        assert!(html.contains("<h2>Artifact Keeper Notification</h2>"));
+        assert!(html.contains("<strong>Event:</strong> artifact.created"));
+        assert!(html.contains("<strong>Actor:</strong> alice"));
+    }
+
+    #[test]
+    fn test_build_email_body_html_no_actor_shows_system() {
+        let event = sample_event_no_actor();
+        let html = build_email_body_html(&event);
+        assert!(html.contains("<strong>Actor:</strong> system"));
+    }
+
+    #[test]
+    fn test_build_email_body_html_contains_entity() {
+        let event = sample_event();
+        let html = build_email_body_html(&event);
+        assert!(html.contains("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    #[test]
+    fn test_build_email_body_html_contains_timestamp() {
+        let event = sample_event();
+        let html = build_email_body_html(&event);
+        assert!(html.contains("2026-04-08T12:00:00Z"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_webhook_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_webhook_url_valid_https() {
+        let config = serde_json::json!({"url": "https://hooks.example.com/notify"});
+        assert_eq!(
+            parse_webhook_url(&config).unwrap(),
+            "https://hooks.example.com/notify"
+        );
+    }
+
+    #[test]
+    fn test_parse_webhook_url_valid_http() {
+        let config = serde_json::json!({"url": "http://internal.example.com/hook"});
+        assert_eq!(
+            parse_webhook_url(&config).unwrap(),
+            "http://internal.example.com/hook"
+        );
+    }
+
+    #[test]
+    fn test_parse_webhook_url_missing() {
+        let config = serde_json::json!({});
+        assert!(parse_webhook_url(&config).is_none());
+    }
+
+    #[test]
+    fn test_parse_webhook_url_not_string() {
+        let config = serde_json::json!({"url": 42});
+        assert!(parse_webhook_url(&config).is_none());
+    }
+
+    #[test]
+    fn test_parse_webhook_url_null() {
+        let config = serde_json::json!({"url": null});
+        assert!(parse_webhook_url(&config).is_none());
+    }
+
+    #[test]
+    fn test_parse_webhook_url_with_extra_fields() {
+        let config = serde_json::json!({
+            "url": "https://hooks.example.com/x",
+            "secret": "my-secret"
+        });
+        assert_eq!(
+            parse_webhook_url(&config).unwrap(),
+            "https://hooks.example.com/x"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_webhook_payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_webhook_payload_structure() {
+        let event = sample_event();
+        let payload = build_webhook_payload(&event);
+        assert_eq!(payload["event"], "artifact.created");
+        assert_eq!(payload["entity_id"], "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(payload["actor"], "alice");
+        assert_eq!(payload["timestamp"], "2026-04-08T12:00:00Z");
+    }
+
+    #[test]
+    fn test_build_webhook_payload_no_actor() {
+        let event = sample_event_no_actor();
+        let payload = build_webhook_payload(&event);
+        assert_eq!(payload["event"], "scan.completed");
+        assert!(payload["actor"].is_null());
+    }
+
+    #[test]
+    fn test_build_webhook_payload_is_valid_json() {
+        let event = sample_event();
+        let payload = build_webhook_payload(&event);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, payload);
+    }
+
+    #[test]
+    fn test_build_webhook_payload_has_four_fields() {
+        let event = sample_event();
+        let payload = build_webhook_payload(&event);
+        let obj = payload.as_object().unwrap();
+        assert_eq!(obj.len(), 4);
+        assert!(obj.contains_key("event"));
+        assert!(obj.contains_key("entity_id"));
+        assert!(obj.contains_key("actor"));
+        assert!(obj.contains_key("timestamp"));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_webhook_signature
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_webhook_signature_deterministic() {
+        let payload = serde_json::json!({"event": "test"});
+        let sig1 = compute_webhook_signature(&payload, "secret123").unwrap();
+        let sig2 = compute_webhook_signature(&payload, "secret123").unwrap();
+        assert_eq!(sig1, sig2);
+    }
+
+    #[test]
+    fn test_compute_webhook_signature_prefix() {
+        let payload = serde_json::json!({"event": "test"});
+        let sig = compute_webhook_signature(&payload, "key").unwrap();
+        assert!(sig.starts_with("sha256="));
+    }
+
+    #[test]
+    fn test_compute_webhook_signature_hex_length() {
+        let payload = serde_json::json!({"event": "test"});
+        let sig = compute_webhook_signature(&payload, "key").unwrap();
+        // "sha256=" (7 chars) + 64 hex chars (SHA-256 = 32 bytes = 64 hex)
+        assert_eq!(sig.len(), 7 + 64);
+    }
+
+    #[test]
+    fn test_compute_webhook_signature_different_secrets() {
+        let payload = serde_json::json!({"event": "test"});
+        let sig1 = compute_webhook_signature(&payload, "secret-a").unwrap();
+        let sig2 = compute_webhook_signature(&payload, "secret-b").unwrap();
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn test_compute_webhook_signature_different_payloads() {
+        let p1 = serde_json::json!({"event": "a"});
+        let p2 = serde_json::json!({"event": "b"});
+        let sig1 = compute_webhook_signature(&p1, "same-key").unwrap();
+        let sig2 = compute_webhook_signature(&p2, "same-key").unwrap();
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn test_compute_webhook_signature_empty_secret() {
+        let payload = serde_json::json!({"event": "test"});
+        // Empty secret should still work (HMAC accepts zero-length keys)
+        let sig = compute_webhook_signature(&payload, "");
+        assert!(sig.is_some());
+        assert!(sig.unwrap().starts_with("sha256="));
+    }
+
+    #[test]
+    fn test_compute_webhook_signature_complex_payload() {
+        let event = sample_event();
+        let payload = build_webhook_payload(&event);
+        let sig = compute_webhook_signature(&payload, "webhook-secret");
+        assert!(sig.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_known_channel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_known_channel_email() {
+        assert!(is_known_channel("email"));
+    }
+
+    #[test]
+    fn test_is_known_channel_webhook() {
+        assert!(is_known_channel("webhook"));
+    }
+
+    #[test]
+    fn test_is_known_channel_unknown() {
+        assert!(!is_known_channel("sms"));
+    }
+
+    #[test]
+    fn test_is_known_channel_empty() {
+        assert!(!is_known_channel(""));
+    }
+
+    #[test]
+    fn test_is_known_channel_case_sensitive() {
+        assert!(!is_known_channel("Email"));
+        assert!(!is_known_channel("WEBHOOK"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: email body consistency
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_email_text_and_html_contain_same_data() {
+        let event = sample_event();
+        let text = build_email_body_text(&event);
+        let html = build_email_body_html(&event);
+
+        // Both should contain the same key fields
+        assert!(text.contains("artifact.created"));
+        assert!(html.contains("artifact.created"));
+
+        assert!(text.contains("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(html.contains("550e8400-e29b-41d4-a716-446655440000"));
+
+        assert!(text.contains("alice"));
+        assert!(html.contains("alice"));
+
+        assert!(text.contains("2026-04-08T12:00:00Z"));
+        assert!(html.contains("2026-04-08T12:00:00Z"));
+    }
+
+    #[test]
+    fn test_email_subject_and_body_reference_same_event() {
+        let event = sample_event();
+        let subject = build_email_subject(&event);
+        let body = build_email_body_text(&event);
+
+        // Subject and body should both reference the event type
+        assert!(subject.contains("artifact.created"));
+        assert!(body.contains("artifact.created"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: webhook payload + signature round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_webhook_payload_and_signature_round_trip() {
+        let event = sample_event();
+        let payload = build_webhook_payload(&event);
+        let sig = compute_webhook_signature(&payload, "test-secret").unwrap();
+
+        // Verify the signature by recomputing it
+        let sig_again = compute_webhook_signature(&payload, "test-secret").unwrap();
+        assert_eq!(sig, sig_again);
+    }
+
+    #[test]
+    fn test_webhook_url_and_payload_for_sample_event() {
+        let config = serde_json::json!({
+            "url": "https://hooks.example.com/notify",
+            "secret": "my-secret"
+        });
+        let url = parse_webhook_url(&config).unwrap();
+        assert_eq!(url, "https://hooks.example.com/notify");
+
+        let event = sample_event();
+        let payload = build_webhook_payload(&event);
+        assert_eq!(payload["event"], "artifact.created");
+
+        let sig = compute_webhook_signature(&payload, "my-secret").unwrap();
+        assert!(sig.starts_with("sha256="));
+    }
+
+    // -----------------------------------------------------------------------
+    // map_event_type + payload integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mapped_event_type_in_payload() {
+        let event = DomainEvent {
+            event_type: "artifact.created".into(),
+            entity_id: "abc".into(),
+            actor: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        };
+        let mapped = map_event_type(&event.event_type);
+        assert_eq!(mapped, "artifact.uploaded");
+
+        // The payload uses the raw event type, not the mapped one
+        let payload = build_webhook_payload(&event);
+        assert_eq!(payload["event"], "artifact.created");
     }
 }
