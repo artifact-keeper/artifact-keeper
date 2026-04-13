@@ -3,7 +3,7 @@
 //! Provides per-IP and per-user rate limiting with configurable limits.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -12,7 +12,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use tokio::sync::RwLock;
 
 use super::auth::AuthExtension;
 
@@ -60,12 +59,18 @@ pub struct RateLimitState {
 /// with the number of instances. For multi-instance deployments behind a load
 /// balancer, use an ingress-level rate limiter (e.g. NGINX `limit_req`,
 /// Envoy, or a cloud WAF) to enforce global limits.
+///
+/// Uses `std::sync::Mutex` rather than `tokio::sync::RwLock` because the
+/// critical section is pure in-memory computation with no async work. A
+/// synchronous mutex avoids the overhead of yielding to the Tokio scheduler
+/// on every request and prevents task-queue contention that was observed
+/// under high-concurrency stress tests (issue #692).
 #[derive(Debug)]
 pub struct RateLimiter {
     /// Map of key -> (request count, window start time)
-    requests: Arc<RwLock<HashMap<String, (u32, Instant)>>>,
+    requests: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     /// Maximum number of requests allowed per window
-    max_requests: u32,
+    pub(crate) max_requests: u32,
     /// Duration of the rate limiting window
     window: Duration,
 }
@@ -78,7 +83,7 @@ impl RateLimiter {
     /// * `window_secs` - Duration of the rate limiting window in seconds
     pub fn new(max_requests: u32, window_secs: u64) -> Self {
         Self {
-            requests: Arc::new(RwLock::new(HashMap::new())),
+            requests: Arc::new(Mutex::new(HashMap::new())),
             max_requests,
             window: Duration::from_secs(window_secs),
         }
@@ -90,7 +95,7 @@ impl RateLimiter {
     /// or `Err(retry_after_secs)` if the rate limit has been exceeded.
     pub async fn check_rate_limit(&self, key: &str) -> Result<u32, u64> {
         let now = Instant::now();
-        let mut requests = self.requests.write().await;
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
 
         let entry = requests.entry(key.to_string()).or_insert((0, now));
 
@@ -117,7 +122,7 @@ impl RateLimiter {
     /// Call this periodically to prevent memory bloat.
     pub async fn cleanup_expired(&self) {
         let now = Instant::now();
-        let mut requests = self.requests.write().await;
+        let mut requests = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         requests.retain(|_, (_, window_start)| now.duration_since(*window_start) < self.window);
     }
 }
@@ -364,7 +369,7 @@ mod tests {
         // Cleanup should remove expired entries (key1, key2) but keep key3
         limiter.cleanup_expired().await;
 
-        let requests = limiter.requests.read().await;
+        let requests = limiter.requests.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             !requests.contains_key("key1"),
             "Expired key1 should be removed"
