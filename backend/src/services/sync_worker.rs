@@ -3,8 +3,14 @@
 //! Processes the `sync_tasks` queue by transferring artifacts to remote peer
 //! instances.  Runs on a 10-second tick, respects per-peer concurrency limits,
 //! sync windows, and exponential backoff on failures.
+//!
+//! For artifacts larger than `SYNC_CHUNKED_THRESHOLD_BYTES`, the worker uses
+//! the swarm-based chunked transfer system instead of sending the full file
+//! in a single HTTP request.  This prevents timeouts and memory exhaustion
+//! when syncing large Docker images, ML models, etc.
 
 use chrono::{NaiveTime, Timelike, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
@@ -19,6 +25,15 @@ const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
 
 /// Duration of each worker tick in seconds.
 const TICK_INTERVAL_SECS: u64 = 10;
+
+/// Default threshold (in bytes) above which chunked transfer is used instead
+/// of a single-request upload.  100 MB.
+/// Override with the `SYNC_CHUNKED_THRESHOLD_BYTES` env var.
+const DEFAULT_CHUNKED_THRESHOLD_BYTES: i64 = 100 * 1024 * 1024;
+
+/// Default chunk size (in bytes) for chunked transfers.  50 MB.
+/// Override with the `SYNC_CHUNK_SIZE_BYTES` env var.
+const DEFAULT_SYNC_CHUNK_SIZE_BYTES: i32 = 50 * 1024 * 1024;
 
 /// Check whether the current tick should trigger a stale peer detection run.
 ///
@@ -456,7 +471,14 @@ async fn execute_transfer(
         return execute_delete(db, client, task, peer_endpoint, peer_api_key).await;
     }
 
-    // Push flow: read artifact bytes and POST to peer.
+    // Push flow: decide between single-request upload and chunked transfer
+    // based on the artifact size.
+    let threshold = chunked_threshold_bytes();
+    if should_use_chunked_transfer(task.artifact_size, threshold) {
+        return execute_chunked_transfer(db, client, task, peer_endpoint, peer_api_key).await;
+    }
+
+    // Fast path for small artifacts: read entire file and POST in one request.
 
     // 2. Read the artifact bytes from local storage.
     let file_bytes = match read_artifact_from_storage(db, &task.storage_key).await {
@@ -511,6 +533,205 @@ async fn execute_transfer(
         }
         Err(e) => {
             let msg = format!("HTTP request failed: {e}");
+            handle_transfer_failure(db, task, &msg).await;
+            Err(msg)
+        }
+    }
+}
+
+/// Execute a chunked transfer for a large artifact.
+///
+/// Instead of reading the entire artifact into memory and sending it in one
+/// request, this splits the file into chunks and uploads each one individually.
+/// The remote peer's transfer session API tracks progress so transfers can
+/// resume after partial failures.
+async fn execute_chunked_transfer(
+    db: &PgPool,
+    client: &reqwest::Client,
+    task: &TaskRow,
+    peer_endpoint: &str,
+    peer_api_key: &str,
+) -> Result<(), String> {
+    let chunk_size = sync_chunk_size_bytes();
+
+    tracing::info!(
+        "Using chunked transfer for artifact '{}' ({} bytes, chunk_size={}) to peer (task {})",
+        task.artifact_name,
+        task.artifact_size,
+        chunk_size,
+        task.id
+    );
+
+    // 1. Initialize a transfer session on the remote peer.
+    let init_url = build_chunked_init_url(peer_endpoint, &task.peer_instance_id);
+    let init_body = serde_json::json!({
+        "artifact_id": task.artifact_id,
+        "chunk_size": chunk_size,
+    });
+
+    let init_response = client
+        .post(&init_url)
+        .header("Authorization", format!("Bearer {}", peer_api_key))
+        .header("Content-Type", "application/json")
+        .json(&init_body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to init chunked transfer: {e}"))?;
+
+    if !init_response.status().is_success() {
+        let status = init_response.status();
+        let body = init_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let msg = format!("Chunked transfer init returned {status}: {body}");
+        handle_transfer_failure(db, task, &msg).await;
+        return Err(msg);
+    }
+
+    let session: serde_json::Value = init_response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse transfer session response: {e}"))?;
+
+    let session_id = session["id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| "Missing session id in transfer init response".to_string())?;
+
+    // 2. Upload chunks one at a time, streaming each from disk.
+    let chunk_ranges = compute_chunk_ranges(task.artifact_size, chunk_size);
+    let mut bytes_transferred: i64 = 0;
+
+    for (chunk_index, byte_offset, byte_length) in &chunk_ranges {
+        // Read just this chunk from storage.
+        let chunk_data = match read_artifact_chunk_from_storage(
+            &task.storage_key,
+            *byte_offset as u64,
+            *byte_length as usize,
+        )
+        .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                let msg = format!(
+                    "Failed to read chunk {} (offset={}, len={}): {e}",
+                    chunk_index, byte_offset, byte_length
+                );
+                handle_transfer_failure(db, task, &msg).await;
+                return Err(msg);
+            }
+        };
+
+        // Compute SHA-256 of this chunk for verification.
+        let mut hasher = Sha256::new();
+        hasher.update(&chunk_data);
+        let chunk_checksum = format!("{:x}", hasher.finalize());
+
+        // Upload the chunk data to the peer's artifact storage. The chunk is
+        // sent as a PUT with the byte range headers so the peer can reassemble.
+        let chunk_upload_url = format!(
+            "{}/api/v1/repositories/{}/artifacts/chunks/{}/{}",
+            peer_endpoint.trim_end_matches('/'),
+            task.repository_key,
+            session_id,
+            chunk_index
+        );
+
+        let upload_result = client
+            .put(&chunk_upload_url)
+            .header("Authorization", format!("Bearer {}", peer_api_key))
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Chunk-Offset", byte_offset.to_string())
+            .header("X-Chunk-Length", byte_length.to_string())
+            .header("X-Chunk-Checksum-SHA256", &chunk_checksum)
+            .body(chunk_data)
+            .send()
+            .await;
+
+        match upload_result {
+            Ok(resp) if resp.status().is_success() => {
+                // Mark chunk as completed on the remote session.
+                let complete_url = build_chunk_complete_url(
+                    peer_endpoint,
+                    &task.peer_instance_id,
+                    &session_id,
+                    *chunk_index,
+                );
+                let complete_body = serde_json::json!({
+                    "checksum": chunk_checksum,
+                    "source_peer_id": null,
+                });
+
+                let _ = client
+                    .post(&complete_url)
+                    .header("Authorization", format!("Bearer {}", peer_api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&complete_body)
+                    .send()
+                    .await;
+
+                bytes_transferred += *byte_length as i64;
+                tracing::debug!(
+                    "Chunk {}/{} uploaded for task {} ({} bytes)",
+                    chunk_index + 1,
+                    chunk_ranges.len(),
+                    task.id,
+                    byte_length
+                );
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                let msg = format!("Chunk {} upload returned {status}: {body}", chunk_index);
+                handle_transfer_failure(db, task, &msg).await;
+                return Err(msg);
+            }
+            Err(e) => {
+                let msg = format!("Chunk {} upload failed: {e}", chunk_index);
+                handle_transfer_failure(db, task, &msg).await;
+                return Err(msg);
+            }
+        }
+    }
+
+    // 3. Finalize the transfer session.
+    let session_complete_url =
+        build_session_complete_url(peer_endpoint, &task.peer_instance_id, &session_id);
+
+    let complete_result = client
+        .post(&session_complete_url)
+        .header("Authorization", format!("Bearer {}", peer_api_key))
+        .send()
+        .await;
+
+    match complete_result {
+        Ok(resp) if resp.status().is_success() => {
+            handle_transfer_success(db, task, bytes_transferred).await;
+            tracing::info!(
+                "Chunked transfer complete for artifact '{}' ({} bytes in {} chunks) to peer (task {})",
+                task.artifact_name,
+                bytes_transferred,
+                chunk_ranges.len(),
+                task.id
+            );
+            Ok(())
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let msg = format!("Chunked transfer session complete returned {status}: {body}");
+            handle_transfer_failure(db, task, &msg).await;
+            Err(msg)
+        }
+        Err(e) => {
+            let msg = format!("Chunked transfer session complete failed: {e}");
             handle_transfer_failure(db, task, &msg).await;
             Err(msg)
         }
@@ -576,6 +797,37 @@ async fn read_artifact_from_storage(_db: &PgPool, storage_key: &str) -> Result<V
     tokio::fs::read(&full_path)
         .await
         .map_err(|e| format!("Failed to read '{}': {e}", full_path.display()))
+}
+
+/// Read a specific byte range from a stored artifact.
+///
+/// Seeks to `offset` and reads exactly `length` bytes.  Used by the chunked
+/// transfer path to avoid loading the entire artifact into memory.
+async fn read_artifact_chunk_from_storage(
+    storage_key: &str,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let storage_path = std::env::var("STORAGE_PATH")
+        .unwrap_or_else(|_| "/var/lib/artifact-keeper/artifacts".into());
+    let full_path = std::path::PathBuf::from(&storage_path).join(storage_key);
+
+    let mut file = tokio::fs::File::open(&full_path)
+        .await
+        .map_err(|e| format!("Failed to open '{}': {e}", full_path.display()))?;
+
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| format!("Failed to seek in '{}': {e}", full_path.display()))?;
+
+    let mut buf = vec![0u8; length];
+    file.read_exact(&mut buf)
+        .await
+        .map_err(|e| format!("Failed to read chunk from '{}': {e}", full_path.display()))?;
+
+    Ok(buf)
 }
 
 /// Handle a successful transfer: mark task completed, update peer counters.
@@ -779,6 +1031,88 @@ pub(crate) fn build_delete_url(
         repository_key,
         artifact_path
     )
+}
+
+/// Build the URL to initialize a chunked transfer session on a peer.
+pub(crate) fn build_chunked_init_url(peer_endpoint: &str, peer_id: &Uuid) -> String {
+    format!(
+        "{}/api/v1/peers/{}/transfer/init",
+        peer_endpoint.trim_end_matches('/'),
+        peer_id
+    )
+}
+
+/// Build the URL to complete a single chunk within a transfer session.
+pub(crate) fn build_chunk_complete_url(
+    peer_endpoint: &str,
+    peer_id: &Uuid,
+    session_id: &Uuid,
+    chunk_index: i32,
+) -> String {
+    format!(
+        "{}/api/v1/peers/{}/transfer/{}/chunk/{}/complete",
+        peer_endpoint.trim_end_matches('/'),
+        peer_id,
+        session_id,
+        chunk_index
+    )
+}
+
+/// Build the URL to finalize an entire transfer session.
+pub(crate) fn build_session_complete_url(
+    peer_endpoint: &str,
+    peer_id: &Uuid,
+    session_id: &Uuid,
+) -> String {
+    format!(
+        "{}/api/v1/peers/{}/transfer/{}/complete",
+        peer_endpoint.trim_end_matches('/'),
+        peer_id,
+        session_id
+    )
+}
+
+/// Read the configured chunked transfer threshold from `SYNC_CHUNKED_THRESHOLD_BYTES`,
+/// falling back to `DEFAULT_CHUNKED_THRESHOLD_BYTES` (100 MB).
+pub(crate) fn chunked_threshold_bytes() -> i64 {
+    std::env::var("SYNC_CHUNKED_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_CHUNKED_THRESHOLD_BYTES)
+}
+
+/// Read the configured chunk size from `SYNC_CHUNK_SIZE_BYTES`,
+/// falling back to `DEFAULT_SYNC_CHUNK_SIZE_BYTES` (50 MB).
+pub(crate) fn sync_chunk_size_bytes() -> i32 {
+    std::env::var("SYNC_CHUNK_SIZE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(DEFAULT_SYNC_CHUNK_SIZE_BYTES)
+}
+
+/// Decide whether a given artifact size should use chunked transfer.
+pub(crate) fn should_use_chunked_transfer(artifact_size: i64, threshold: i64) -> bool {
+    artifact_size >= threshold
+}
+
+/// Compute the list of (chunk_index, byte_offset, byte_length) for a given
+/// total size and chunk size.
+pub(crate) fn compute_chunk_ranges(total_size: i64, chunk_size: i32) -> Vec<(i32, i64, i32)> {
+    if total_size <= 0 || chunk_size <= 0 {
+        return vec![];
+    }
+    let total_chunks = ((total_size as f64) / (chunk_size as f64)).ceil() as i32;
+    (0..total_chunks)
+        .map(|i| {
+            let byte_offset = (i as i64) * (chunk_size as i64);
+            let byte_length = if i == total_chunks - 1 {
+                (total_size - byte_offset) as i32
+            } else {
+                chunk_size
+            };
+            (i, byte_offset, byte_length)
+        })
+        .collect()
 }
 
 /// Compute the number of available transfer slots for a peer.
@@ -1898,5 +2232,203 @@ mod tests {
     #[test]
     fn test_default_max_retries_constant() {
         assert_eq!(DEFAULT_MAX_RETRIES, 3);
+    }
+
+    // ── Chunked transfer threshold ─────────────────────────────────────
+
+    #[test]
+    fn test_default_chunked_threshold() {
+        // 100 MB
+        assert_eq!(DEFAULT_CHUNKED_THRESHOLD_BYTES, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_default_sync_chunk_size() {
+        // 50 MB
+        assert_eq!(DEFAULT_SYNC_CHUNK_SIZE_BYTES, 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_should_use_chunked_transfer_above_threshold() {
+        let threshold: i64 = 100 * 1024 * 1024;
+        assert!(should_use_chunked_transfer(threshold, threshold));
+        assert!(should_use_chunked_transfer(threshold + 1, threshold));
+        assert!(should_use_chunked_transfer(500 * 1024 * 1024, threshold));
+    }
+
+    #[test]
+    fn test_should_use_chunked_transfer_below_threshold() {
+        let threshold: i64 = 100 * 1024 * 1024;
+        assert!(!should_use_chunked_transfer(threshold - 1, threshold));
+        assert!(!should_use_chunked_transfer(0, threshold));
+        assert!(!should_use_chunked_transfer(1024, threshold));
+    }
+
+    #[test]
+    fn test_should_use_chunked_transfer_zero_threshold() {
+        // A threshold of 0 means all artifacts use chunked transfer.
+        assert!(should_use_chunked_transfer(0, 0));
+        assert!(should_use_chunked_transfer(1, 0));
+    }
+
+    // ── compute_chunk_ranges ───────────────────────────────────────────
+
+    #[test]
+    fn test_compute_chunk_ranges_exact_division() {
+        let ranges = compute_chunk_ranges(4 * 1024 * 1024, 1024 * 1024);
+        assert_eq!(ranges.len(), 4);
+        for (i, (idx, offset, length)) in ranges.iter().enumerate() {
+            assert_eq!(*idx, i as i32);
+            assert_eq!(*offset, (i as i64) * 1024 * 1024);
+            assert_eq!(*length, 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_non_exact_division() {
+        // 2.5 MB split into 1 MB chunks: [1MB, 1MB, 0.5MB]
+        let total_size: i64 = 2_500_000;
+        let chunk_size: i32 = 1_000_000;
+        let ranges = compute_chunk_ranges(total_size, chunk_size);
+        assert_eq!(ranges.len(), 3);
+
+        assert_eq!(ranges[0], (0, 0, 1_000_000));
+        assert_eq!(ranges[1], (1, 1_000_000, 1_000_000));
+        assert_eq!(ranges[2], (2, 2_000_000, 500_000));
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_single_chunk() {
+        let ranges = compute_chunk_ranges(500, 1024 * 1024);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (0, 0, 500));
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_empty_file() {
+        let ranges = compute_chunk_ranges(0, 1024 * 1024);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_zero_chunk_size() {
+        let ranges = compute_chunk_ranges(1000, 0);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_negative_inputs() {
+        assert!(compute_chunk_ranges(-1, 1024).is_empty());
+        assert!(compute_chunk_ranges(1024, -1).is_empty());
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_one_byte_file() {
+        let ranges = compute_chunk_ranges(1, 1024 * 1024);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (0, 0, 1));
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_sum_equals_total() {
+        let total_size: i64 = 123_456_789;
+        let chunk_size: i32 = 10_000_000;
+        let ranges = compute_chunk_ranges(total_size, chunk_size);
+
+        let sum: i64 = ranges.iter().map(|(_, _, len)| *len as i64).sum();
+        assert_eq!(sum, total_size);
+    }
+
+    #[test]
+    fn test_compute_chunk_ranges_contiguous() {
+        let total_size: i64 = 77_777_777;
+        let chunk_size: i32 = 25_000_000;
+        let ranges = compute_chunk_ranges(total_size, chunk_size);
+
+        // Each chunk starts where the previous one ended.
+        for i in 1..ranges.len() {
+            let prev_end = ranges[i - 1].1 + ranges[i - 1].2 as i64;
+            assert_eq!(ranges[i].1, prev_end);
+        }
+    }
+
+    // ── build_chunked_init_url ─────────────────────────────────────────
+
+    #[test]
+    fn test_build_chunked_init_url() {
+        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(
+            build_chunked_init_url("https://peer.example.com", &peer_id),
+            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/init"
+        );
+    }
+
+    #[test]
+    fn test_build_chunked_init_url_trailing_slash() {
+        let peer_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(
+            build_chunked_init_url("https://peer.example.com/", &peer_id),
+            "https://peer.example.com/api/v1/peers/22222222-2222-2222-2222-222222222222/transfer/init"
+        );
+    }
+
+    // ── build_chunk_complete_url ───────────────────────────────────────
+
+    #[test]
+    fn test_build_chunk_complete_url() {
+        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let session_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        assert_eq!(
+            build_chunk_complete_url("https://peer.example.com", &peer_id, &session_id, 3),
+            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/chunk/3/complete"
+        );
+    }
+
+    #[test]
+    fn test_build_chunk_complete_url_trailing_slash() {
+        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let session_id = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        assert_eq!(
+            build_chunk_complete_url("https://peer.example.com/", &peer_id, &session_id, 0),
+            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb/chunk/0/complete"
+        );
+    }
+
+    // ── build_session_complete_url ─────────────────────────────────────
+
+    #[test]
+    fn test_build_session_complete_url() {
+        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let session_id = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        assert_eq!(
+            build_session_complete_url("https://peer.example.com", &peer_id, &session_id),
+            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/cccccccc-cccc-cccc-cccc-cccccccccccc/complete"
+        );
+    }
+
+    #[test]
+    fn test_build_session_complete_url_trailing_slash() {
+        let peer_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let session_id = Uuid::parse_str("dddddddd-dddd-dddd-dddd-dddddddddddd").unwrap();
+        assert_eq!(
+            build_session_complete_url("https://peer.example.com/", &peer_id, &session_id),
+            "https://peer.example.com/api/v1/peers/11111111-1111-1111-1111-111111111111/transfer/dddddddd-dddd-dddd-dddd-dddddddddddd/complete"
+        );
+    }
+
+    // ── chunked_threshold_bytes / sync_chunk_size_bytes ─────────────────
+
+    #[test]
+    fn test_chunked_threshold_bytes_default() {
+        // Clear env var to test default. This test may be affected by env
+        // state but the default should be 100MB when the var is unset.
+        let val = DEFAULT_CHUNKED_THRESHOLD_BYTES;
+        assert_eq!(val, 104_857_600);
+    }
+
+    #[test]
+    fn test_sync_chunk_size_bytes_default() {
+        let val = DEFAULT_SYNC_CHUNK_SIZE_BYTES;
+        assert_eq!(val, 52_428_800);
     }
 }

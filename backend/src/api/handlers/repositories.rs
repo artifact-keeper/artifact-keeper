@@ -231,6 +231,12 @@ pub struct UpdateRepositoryRequest {
     /// Quarantine hold duration in minutes for this repository.
     /// Stored in `repository_config` under `quarantine_duration_minutes`.
     pub quarantine_duration_minutes: Option<i64>,
+    /// Link this staging repository to a release (local) repository.
+    /// Promotions from this staging repo will default to the linked release repo,
+    /// and promotions to any other repo will be rejected.
+    /// Pass an empty string to remove the link.
+    /// Stored in `repository_config` under `release_repository_id`.
+    pub release_repository_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -839,6 +845,40 @@ pub async fn update_repository(
             &duration.to_string(),
         )
         .await?;
+    }
+
+    // Handle release repository linking for staging repos
+    if let Some(ref release_key) = payload.release_repository_key {
+        if release_key.is_empty() {
+            // Remove the link
+            sqlx::query(
+                "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'release_repository_id'",
+            )
+            .bind(repo.id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        } else {
+            if repo.repo_type != RepositoryType::Staging {
+                return Err(AppError::Validation(
+                    "Release target linking is only available for staging repositories".to_string(),
+                ));
+            }
+
+            let release_repo = service.get_by_key(release_key).await.map_err(|_| {
+                AppError::Validation(format!("Release repository '{}' not found", release_key))
+            })?;
+
+            super::promotion::validate_release_target_link(&repo, &release_repo)?;
+
+            upsert_repo_config(
+                &state.db,
+                repo.id,
+                "release_repository_id",
+                &release_repo.id.to_string(),
+            )
+            .await?;
+        }
     }
 
     let storage_used = service.get_storage_usage(repo.id).await?;
@@ -2982,6 +3022,24 @@ mod tests {
         assert!(req.description.is_none());
         assert!(req.is_public.is_none());
         assert!(req.quota_bytes.is_none());
+        assert!(req.release_repository_key.is_none());
+    }
+
+    #[test]
+    fn test_update_repository_request_with_release_key() {
+        let json = r#"{"release_repository_key": "release-maven"}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.release_repository_key,
+            Some("release-maven".to_string())
+        );
+    }
+
+    #[test]
+    fn test_update_repository_request_clear_release_key() {
+        let json = r#"{"release_repository_key": ""}"#;
+        let req: UpdateRepositoryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.release_repository_key, Some(String::new()));
     }
 
     #[test]
