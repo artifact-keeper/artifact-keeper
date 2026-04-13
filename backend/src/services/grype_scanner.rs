@@ -291,12 +291,12 @@ impl Scanner for GrypeScanner {
         let report = match self.run_grype(&workspace).await {
             Ok(report) => report,
             Err(e) => {
-                warn!(
-                    "Grype scan failed for {}: {}. Returning empty findings.",
-                    artifact.name, e
-                );
+                warn!("Grype scan failed for {}: {}", artifact.name, e);
                 self.cleanup_workspace(artifact).await;
-                return Ok(vec![]);
+                return Err(AppError::Internal(format!(
+                    "Grype scan failed for {}: {}",
+                    artifact.name, e
+                )));
             }
         };
 
@@ -438,6 +438,57 @@ mod tests {
         let report = GrypeReport { matches: vec![] };
         let findings = GrypeScanner::convert_findings(&report);
         assert!(findings.is_empty());
+    }
+
+    /// When the scan workspace cannot be created, prepare_workspace fails
+    /// and the error propagates to the caller.
+    #[tokio::test]
+    async fn test_scan_returns_error_when_workspace_creation_fails() {
+        // Use a path under /dev/null which cannot contain subdirectories
+        let scanner = GrypeScanner::new("/dev/null/impossible-workspace".to_string());
+        let artifact = make_artifact("pkg-1.0.0.tar.gz", "application/gzip");
+        let content = Bytes::from_static(b"not a real archive");
+
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert!(
+            result.is_err(),
+            "scan() must return Err when workspace creation fails"
+        );
+    }
+
+    /// When grype is not installed, the scanner must propagate the error
+    /// so the orchestrator records a failed scan instead of marking the
+    /// artifact as clean with 0 findings.
+    ///
+    /// Skipped when grype is installed, since it can legitimately scan
+    /// the raw file and return 0 findings.
+    #[tokio::test]
+    async fn test_scan_returns_error_when_grype_unavailable() {
+        if std::process::Command::new("grype")
+            .arg("version")
+            .output()
+            .is_ok()
+        {
+            eprintln!("grype is installed, skipping unavailable-grype test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = GrypeScanner::new(dir.path().to_string_lossy().to_string());
+        let artifact = make_artifact("pkg-1.0.0.tar.gz", "application/gzip");
+        let content = Bytes::from_static(b"not a real archive");
+
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert!(
+            result.is_err(),
+            "scan() must return Err when grype execution fails, not Ok(vec![])"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Grype scan failed"),
+            "error message should indicate grype failure, got: {}",
+            err_msg
+        );
     }
 
     #[test]

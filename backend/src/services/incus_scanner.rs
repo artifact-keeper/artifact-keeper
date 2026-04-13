@@ -296,12 +296,12 @@ impl Scanner for IncusScanner {
         let rootfs = match self.prepare_workspace(artifact, content).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(
-                    "Failed to extract Incus image {}: {}. Skipping scan.",
-                    artifact.name, e
-                );
+                warn!("Failed to extract Incus image {}: {}", artifact.name, e);
                 self.cleanup_workspace(artifact).await;
-                return Ok(vec![]);
+                return Err(AppError::Internal(format!(
+                    "Failed to extract Incus image {}: {}",
+                    artifact.name, e
+                )));
             }
         };
 
@@ -316,12 +316,12 @@ impl Scanner for IncusScanner {
                 match self.scan_standalone(&rootfs).await {
                     Ok(report) => report,
                     Err(e) => {
-                        warn!(
-                            "Trivy Incus scan failed for {}: {}. Returning empty findings.",
-                            artifact.name, e
-                        );
+                        warn!("Trivy Incus scan failed for {}: {}", artifact.name, e);
                         self.cleanup_workspace(artifact).await;
-                        return Ok(vec![]);
+                        return Err(AppError::Internal(format!(
+                            "Trivy Incus scan failed for {}: {}",
+                            artifact.name, e
+                        )));
                     }
                 }
             }
@@ -921,13 +921,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // scan gracefully handles prepare_workspace failure
+    // scan returns error when prepare_workspace fails
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_scan_qcow2_returns_empty_findings() {
-        // QCOW2 artifacts are applicable but prepare_workspace fails,
-        // so scan should return empty findings gracefully.
+    async fn test_scan_qcow2_returns_error() {
+        // QCOW2 artifacts are applicable but prepare_workspace fails because
+        // they require mounting. The scanner must return Err so the
+        // orchestrator records a failed scan instead of marking it clean.
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
             "http://trivy:8090".to_string(),
@@ -936,8 +937,11 @@ mod tests {
         let artifact = make_incus_artifact("rootfs.img", "ubuntu-noble/20240215/rootfs.img");
         let content = Bytes::from_static(b"fake qcow2 data");
 
-        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
-        assert!(findings.is_empty());
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert!(
+            result.is_err(),
+            "scan() must return Err for unscannable QCOW2 images, not Ok(vec![])"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1122,5 +1126,27 @@ mod tests {
         let report: TrivyReport = serde_json::from_str(json).unwrap();
         assert_eq!(report.results.len(), 1);
         assert!(report.results[0].vulnerabilities.is_none());
+    }
+
+    /// When rootfs extraction fails, the scanner must return Err so the
+    /// orchestrator records the scan as failed. Previously it returned
+    /// Ok(vec![]), making the artifact appear clean.
+    #[tokio::test]
+    async fn test_scan_returns_error_on_extraction_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        // Unified tarball path that is_applicable will match
+        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+        // Invalid content that will fail extraction
+        let content = Bytes::from_static(b"not a valid tarball");
+
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert!(
+            result.is_err(),
+            "scan() must return Err when extraction fails, not Ok(vec![])"
+        );
     }
 }

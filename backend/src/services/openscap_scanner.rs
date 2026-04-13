@@ -214,12 +214,12 @@ impl Scanner for OpenScapScanner {
         let response = match self.call_openscap(&workspace).await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!(
-                    "OpenSCAP scan failed for {}: {}. Returning empty findings.",
-                    artifact.name, e
-                );
+                warn!("OpenSCAP scan failed for {}: {}", artifact.name, e);
                 self.cleanup_workspace(artifact).await;
-                return Ok(vec![]);
+                return Err(AppError::Internal(format!(
+                    "OpenSCAP scan failed for {}: {}",
+                    artifact.name, e
+                )));
             }
         };
 
@@ -358,5 +358,37 @@ mod tests {
         );
         assert_eq!(findings[0].source_url, Some("CCE-27286-2".to_string()));
         assert_eq!(findings[1].severity, Severity::Medium);
+    }
+
+    /// When the OpenSCAP sidecar is unreachable, the scanner must return Err
+    /// so the orchestrator records the scan as failed. Previously it returned
+    /// Ok(vec![]), making the artifact appear clean.
+    #[tokio::test]
+    async fn test_scan_returns_error_when_sidecar_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            // Port 0 ensures the connection will be refused
+            "http://localhost:0".to_string(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_artifact(
+            "nginx-1.24.0-1.el9.x86_64.rpm",
+            "application/x-rpm",
+            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
+        );
+        let content = bytes::Bytes::from_static(b"fake rootfs tarball");
+
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert!(
+            result.is_err(),
+            "scan() must return Err when sidecar is unreachable, not Ok(vec![])"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("OpenSCAP scan failed"),
+            "error message should indicate OpenSCAP failure, got: {}",
+            err_msg
+        );
     }
 }

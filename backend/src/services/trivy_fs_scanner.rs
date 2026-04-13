@@ -322,12 +322,12 @@ impl Scanner for TrivyFsScanner {
                 match self.scan_with_standalone_cli(&workspace).await {
                     Ok(report) => report,
                     Err(e) => {
-                        warn!(
-                            "Trivy filesystem scan failed for {}: {}. Returning empty findings.",
-                            artifact.name, e
-                        );
+                        warn!("Trivy filesystem scan failed for {}: {}", artifact.name, e);
                         self.cleanup_workspace(artifact).await;
-                        return Ok(vec![]);
+                        return Err(AppError::Internal(format!(
+                            "Trivy filesystem scan failed for {}: {}",
+                            artifact.name, e
+                        )));
                     }
                 }
             }
@@ -478,5 +478,72 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("requests"));
+    }
+
+    /// When the scan workspace cannot be created, prepare_workspace fails
+    /// and the error propagates to the caller. This exercises the error path
+    /// that would previously have been swallowed.
+    #[tokio::test]
+    async fn test_scan_returns_error_when_workspace_creation_fails() {
+        // Use a path under /dev/null which cannot contain subdirectories
+        let scanner = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            "/dev/null/impossible-workspace".to_string(),
+        );
+        let artifact = make_artifact(
+            "my-lib-1.0.0.tar.gz",
+            "application/gzip",
+            "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
+        );
+        let content = bytes::Bytes::from_static(b"not a real archive");
+
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert!(
+            result.is_err(),
+            "scan() must return Err when workspace creation fails"
+        );
+    }
+
+    /// When both Trivy CLI modes fail, the scanner must return Err so the
+    /// orchestrator can record a failed scan with an error message, instead
+    /// of recording 0 findings and making the artifact appear clean.
+    ///
+    /// This test is skipped when Trivy is installed, since Trivy can
+    /// legitimately scan the raw file and return 0 findings.
+    #[tokio::test]
+    async fn test_scan_returns_error_when_trivy_unavailable() {
+        // If trivy is installed, the scanner will succeed (legitimately), so skip.
+        if std::process::Command::new("trivy")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            eprintln!("trivy is installed, skipping unavailable-trivy test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_artifact(
+            "my-lib-1.0.0.tar.gz",
+            "application/gzip",
+            "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
+        );
+        let content = bytes::Bytes::from_static(b"not a real archive");
+
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert!(
+            result.is_err(),
+            "scan() must return Err when trivy execution fails, not Ok(vec![])"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Trivy filesystem scan failed"),
+            "error message should indicate trivy failure, got: {}",
+            err_msg
+        );
     }
 }
