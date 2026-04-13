@@ -793,44 +793,38 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_scan_returns_empty_for_non_applicable_artifact() {
+    async fn test_scan_returns_empty_for_skipped_artifacts() {
         let scanner = IncusScanner::new(
             "http://trivy:8090".to_string(),
             "/tmp/test-workspace".to_string(),
         );
-        // streams/v1/index.json is not applicable
-        let artifact = make_incus_artifact("index.json", "streams/v1/index.json");
-        let content = Bytes::from_static(b"{}");
 
-        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
-        assert!(findings.is_empty());
-    }
+        // Non-applicable artifact (streams index)
+        let cases: Vec<(Artifact, Bytes)> = vec![
+            (
+                make_incus_artifact("index.json", "streams/v1/index.json"),
+                Bytes::from_static(b"{}"),
+            ),
+            // Empty content for an applicable artifact
+            (
+                make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz"),
+                Bytes::new(),
+            ),
+            // Metadata-only tarball (not applicable)
+            (
+                make_incus_artifact("metadata.tar.xz", "ubuntu-noble/20240215/metadata.tar.xz"),
+                Bytes::from_static(b"some content"),
+            ),
+        ];
 
-    #[tokio::test]
-    async fn test_scan_returns_empty_for_empty_content() {
-        let scanner = IncusScanner::new(
-            "http://trivy:8090".to_string(),
-            "/tmp/test-workspace".to_string(),
-        );
-        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
-        let content = Bytes::new();
-
-        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
-        assert!(findings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_scan_returns_empty_for_metadata_only() {
-        let scanner = IncusScanner::new(
-            "http://trivy:8090".to_string(),
-            "/tmp/test-workspace".to_string(),
-        );
-        let artifact =
-            make_incus_artifact("metadata.tar.xz", "ubuntu-noble/20240215/metadata.tar.xz");
-        let content = Bytes::from_static(b"some content");
-
-        let findings = scanner.scan(&artifact, None, &content).await.unwrap();
-        assert!(findings.is_empty());
+        for (artifact, content) in &cases {
+            let findings = scanner.scan(artifact, None, content).await.unwrap();
+            assert!(
+                findings.is_empty(),
+                "expected empty findings for {}",
+                artifact.name
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -881,23 +875,34 @@ mod tests {
     // scan returns error when prepare_workspace fails
     // -----------------------------------------------------------------------
 
+    /// Scan failures (QCOW2 unsupported, extraction failure) must propagate
+    /// as Err, never as Ok(vec![]).
     #[tokio::test]
-    async fn test_scan_qcow2_returns_error() {
-        // QCOW2 artifacts are applicable but prepare_workspace fails because
-        // they require mounting. The scanner must return Err so the
-        // orchestrator records a failed scan instead of marking it clean.
+    async fn test_scan_propagates_errors() {
         let dir = tempfile::tempdir().unwrap();
         let scanner = IncusScanner::new(
-            "http://trivy:8090".to_string(),
+            "http://localhost:0".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
-        let artifact = make_incus_artifact("rootfs.img", "ubuntu-noble/20240215/rootfs.img");
-        let content = Bytes::from_static(b"fake qcow2 data");
 
-        let result = scanner.scan(&artifact, None, &content).await;
+        // QCOW2 images are applicable but require mounting, so scan must fail
+        let qcow2 = make_incus_artifact("rootfs.img", "ubuntu-noble/20240215/rootfs.img");
         assert!(
-            result.is_err(),
-            "scan() must return Err for unscannable QCOW2 images, not Ok(vec![])"
+            scanner
+                .scan(&qcow2, None, &Bytes::from_static(b"fake qcow2 data"))
+                .await
+                .is_err(),
+            "scan() must return Err for unscannable QCOW2 images"
+        );
+
+        // Invalid tarball content causes extraction failure
+        let tarball = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+        assert!(
+            scanner
+                .scan(&tarball, None, &Bytes::from_static(b"not a valid tarball"))
+                .await
+                .is_err(),
+            "scan() must return Err when extraction fails"
         );
     }
 
@@ -1083,27 +1088,5 @@ mod tests {
         let report: TrivyReport = serde_json::from_str(json).unwrap();
         assert_eq!(report.results.len(), 1);
         assert!(report.results[0].vulnerabilities.is_none());
-    }
-
-    /// When rootfs extraction fails, the scanner must return Err so the
-    /// orchestrator records the scan as failed. Previously it returned
-    /// Ok(vec![]), making the artifact appear clean.
-    #[tokio::test]
-    async fn test_scan_returns_error_on_extraction_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let scanner = IncusScanner::new(
-            "http://localhost:0".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
-        // Unified tarball path that is_applicable will match
-        let artifact = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
-        // Invalid content that will fail extraction
-        let content = Bytes::from_static(b"not a valid tarball");
-
-        let result = scanner.scan(&artifact, None, &content).await;
-        assert!(
-            result.is_err(),
-            "scan() must return Err when extraction fails, not Ok(vec![])"
-        );
     }
 }

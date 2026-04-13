@@ -179,68 +179,61 @@ mod tests {
     use crate::models::security::Severity;
     use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
-    fn make_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
-        make_test_artifact(name, content_type, path)
-    }
-
     #[test]
-    fn test_is_applicable_tar_gz() {
-        let artifact = make_artifact(
-            "my-lib-1.0.0.tar.gz",
-            "application/gzip",
-            "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
+    fn test_is_applicable() {
+        // Scannable archive formats
+        let applicable = [
+            (
+                "my-lib-1.0.0.tar.gz",
+                "application/gzip",
+                "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
+            ),
+            (
+                "my_lib-1.0.0-py3-none-any.whl",
+                "application/zip",
+                "pypi/my-lib/1.0.0/my_lib-1.0.0-py3-none-any.whl",
+            ),
+            (
+                "myapp-1.0.0.jar",
+                "application/java-archive",
+                "maven/com/example/myapp/1.0.0/myapp-1.0.0.jar",
+            ),
+            (
+                "my-crate-1.0.0.crate",
+                "application/gzip",
+                "crates/my-crate/1.0.0/my-crate-1.0.0.crate",
+            ),
+        ];
+        for (name, ct, path) in applicable {
+            let a = make_test_artifact(name, ct, path);
+            assert!(
+                TrivyFsScanner::is_applicable(&a),
+                "expected applicable: {}",
+                name
+            );
+        }
 
-    #[test]
-    fn test_is_applicable_wheel() {
-        let artifact = make_artifact(
-            "my_lib-1.0.0-py3-none-any.whl",
-            "application/zip",
-            "pypi/my-lib/1.0.0/my_lib-1.0.0-py3-none-any.whl",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_is_applicable_jar() {
-        let artifact = make_artifact(
-            "myapp-1.0.0.jar",
-            "application/java-archive",
-            "maven/com/example/myapp/1.0.0/myapp-1.0.0.jar",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_is_applicable_crate() {
-        let artifact = make_artifact(
-            "my-crate-1.0.0.crate",
-            "application/gzip",
-            "crates/my-crate/1.0.0/my-crate-1.0.0.crate",
-        );
-        assert!(TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_not_applicable_oci_manifest() {
-        let artifact = make_artifact(
-            "myapp",
-            "application/vnd.oci.image.manifest.v1+json",
-            "v2/myapp/manifests/latest",
-        );
-        assert!(!TrivyFsScanner::is_applicable(&artifact));
-    }
-
-    #[test]
-    fn test_not_applicable_docker_manifest() {
-        let artifact = make_artifact(
-            "myapp",
-            "application/vnd.docker.distribution.manifest.v2+json",
-            "v2/myapp/manifests/v1.0.0",
-        );
-        assert!(!TrivyFsScanner::is_applicable(&artifact));
+        // Container manifests are scanned by the image scanner, not trivy-fs
+        let not_applicable = [
+            (
+                "myapp",
+                "application/vnd.oci.image.manifest.v1+json",
+                "v2/myapp/manifests/latest",
+            ),
+            (
+                "myapp",
+                "application/vnd.docker.distribution.manifest.v2+json",
+                "v2/myapp/manifests/v1.0.0",
+            ),
+        ];
+        for (name, ct, path) in not_applicable {
+            let a = make_test_artifact(name, ct, path);
+            assert!(
+                !TrivyFsScanner::is_applicable(&a),
+                "expected not applicable: {}",
+                name
+            );
+        }
     }
 
     #[test]
@@ -275,39 +268,28 @@ mod tests {
             .contains("requests"));
     }
 
-    /// When the scan workspace cannot be created, prepare_workspace fails
-    /// and the error propagates to the caller. This exercises the error path
-    /// that would previously have been swallowed.
+    /// Scan failures (workspace creation, missing Trivy binary) must
+    /// propagate as Err, never as Ok(vec![]).
     #[tokio::test]
-    async fn test_scan_returns_error_when_workspace_creation_fails() {
-        // Use a path under /dev/null which cannot contain subdirectories
-        let scanner = TrivyFsScanner::new(
-            "http://localhost:0".to_string(),
-            "/dev/null/impossible-workspace".to_string(),
-        );
-        let artifact = make_artifact(
+    async fn test_scan_propagates_errors() {
+        let artifact = make_test_artifact(
             "my-lib-1.0.0.tar.gz",
             "application/gzip",
             "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
         );
         let content = bytes::Bytes::from_static(b"not a real archive");
 
-        let result = scanner.scan(&artifact, None, &content).await;
+        // Impossible workspace path: /dev/null cannot contain subdirectories
+        let bad_ws = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            "/dev/null/impossible-workspace".to_string(),
+        );
         assert!(
-            result.is_err(),
+            bad_ws.scan(&artifact, None, &content).await.is_err(),
             "scan() must return Err when workspace creation fails"
         );
-    }
 
-    /// When both Trivy CLI modes fail, the scanner must return Err so the
-    /// orchestrator can record a failed scan with an error message, instead
-    /// of recording 0 findings and making the artifact appear clean.
-    ///
-    /// This test is skipped when Trivy is installed, since Trivy can
-    /// legitimately scan the raw file and return 0 findings.
-    #[tokio::test]
-    async fn test_scan_returns_error_when_trivy_unavailable() {
-        // If trivy is installed, the scanner will succeed (legitimately), so skip.
+        // Missing trivy binary (skip if trivy is installed)
         if std::process::Command::new("trivy")
             .arg("--version")
             .output()
@@ -316,20 +298,14 @@ mod tests {
             eprintln!("trivy is installed, skipping unavailable-trivy test");
             return;
         }
-
         let dir = tempfile::tempdir().unwrap();
-        let scanner = TrivyFsScanner::new(
+        let no_trivy = TrivyFsScanner::new(
             "http://localhost:0".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
-        let artifact = make_artifact(
-            "my-lib-1.0.0.tar.gz",
-            "application/gzip",
-            "pypi/my-lib/1.0.0/my-lib-1.0.0.tar.gz",
+        assert_scan_failed(
+            &no_trivy.scan(&artifact, None, &content).await,
+            "Trivy filesystem scan",
         );
-        let content = bytes::Bytes::from_static(b"not a real archive");
-
-        let result = scanner.scan(&artifact, None, &content).await;
-        assert_scan_failed(&result, "Trivy filesystem scan");
     }
 }

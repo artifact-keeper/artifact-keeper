@@ -237,13 +237,9 @@ mod tests {
     use super::*;
     use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
-    fn make_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
-        make_test_artifact(name, content_type, path)
-    }
-
     #[test]
     fn test_is_applicable_rpm() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "nginx-1.24.0-1.el9.x86_64.rpm",
             "application/x-rpm",
             "rpm/nginx/nginx-1.24.0-1.el9.x86_64.rpm",
@@ -253,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_is_applicable_deb() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "nginx_1.24.0-1_amd64.deb",
             "application/vnd.debian.binary-package",
             "deb/nginx/nginx_1.24.0-1_amd64.deb",
@@ -263,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_is_applicable_container() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "myapp",
             "application/vnd.oci.image.manifest.v1+json",
             "v2/myapp/manifests/latest",
@@ -273,13 +269,13 @@ mod tests {
 
     #[test]
     fn test_not_applicable_jar() {
-        let artifact = make_artifact("app.jar", "application/java-archive", "maven/app.jar");
+        let artifact = make_test_artifact("app.jar", "application/java-archive", "maven/app.jar");
         assert!(!OpenScapScanner::is_applicable(&artifact));
     }
 
     #[test]
     fn test_not_applicable_npm() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "prelaunch-test-0.1.0.tgz",
             "application/gzip",
             "npm/prelaunch-npm/prelaunch-test/-/prelaunch-test-0.1.0.tgz",
@@ -344,7 +340,7 @@ mod tests {
             "standard".to_string(),
             dir.path().to_string_lossy().to_string(),
         );
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "nginx-1.24.0-1.el9.x86_64.rpm",
             "application/x-rpm",
             "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",

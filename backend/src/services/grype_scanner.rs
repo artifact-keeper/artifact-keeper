@@ -274,30 +274,21 @@ mod tests {
         assert!(findings.is_empty());
     }
 
-    /// When the scan workspace cannot be created, prepare_workspace fails
-    /// and the error propagates to the caller.
+    /// Scan failures (workspace creation, missing grype binary) must
+    /// propagate as Err, never as Ok(vec![]).
     #[tokio::test]
-    async fn test_scan_returns_error_when_workspace_creation_fails() {
-        // Use a path under /dev/null which cannot contain subdirectories
-        let scanner = GrypeScanner::new("/dev/null/impossible-workspace".to_string());
+    async fn test_scan_propagates_errors() {
         let artifact = make_artifact("pkg-1.0.0.tar.gz", "application/gzip");
         let content = Bytes::from_static(b"not a real archive");
 
-        let result = scanner.scan(&artifact, None, &content).await;
+        // Impossible workspace path
+        let bad_ws = GrypeScanner::new("/dev/null/impossible-workspace".to_string());
         assert!(
-            result.is_err(),
+            bad_ws.scan(&artifact, None, &content).await.is_err(),
             "scan() must return Err when workspace creation fails"
         );
-    }
 
-    /// When grype is not installed, the scanner must propagate the error
-    /// so the orchestrator records a failed scan instead of marking the
-    /// artifact as clean with 0 findings.
-    ///
-    /// Skipped when grype is installed, since it can legitimately scan
-    /// the raw file and return 0 findings.
-    #[tokio::test]
-    async fn test_scan_returns_error_when_grype_unavailable() {
+        // Missing grype binary (skip if grype is installed)
         if std::process::Command::new("grype")
             .arg("version")
             .output()
@@ -306,14 +297,12 @@ mod tests {
             eprintln!("grype is installed, skipping unavailable-grype test");
             return;
         }
-
         let dir = tempfile::tempdir().unwrap();
-        let scanner = GrypeScanner::new(dir.path().to_string_lossy().to_string());
-        let artifact = make_artifact("pkg-1.0.0.tar.gz", "application/gzip");
-        let content = Bytes::from_static(b"not a real archive");
-
-        let result = scanner.scan(&artifact, None, &content).await;
-        assert_scan_failed(&result, "Grype scan");
+        let no_grype = GrypeScanner::new(dir.path().to_string_lossy().to_string());
+        assert_scan_failed(
+            &no_grype.scan(&artifact, None, &content).await,
+            "Grype scan",
+        );
     }
 
     #[test]

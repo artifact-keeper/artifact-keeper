@@ -129,15 +129,13 @@ impl ScanWorkspace {
             .to_string_lossy()
             .to_lowercase();
 
+        let src = archive_path.to_string_lossy();
+        let dst = dest.to_string_lossy();
+
         let output =
             if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
                 tokio::process::Command::new("tar")
-                    .args([
-                        "xzf",
-                        &archive_path.to_string_lossy(),
-                        "-C",
-                        &dest.to_string_lossy(),
-                    ])
+                    .args(["xzf", &src, "-C", &dst])
                     .output()
                     .await
             } else if name.ends_with(".zip")
@@ -149,23 +147,12 @@ impl ScanWorkspace {
                 || name.ends_with(".egg")
             {
                 tokio::process::Command::new("unzip")
-                    .args([
-                        "-o",
-                        "-q",
-                        &archive_path.to_string_lossy(),
-                        "-d",
-                        &dest.to_string_lossy(),
-                    ])
+                    .args(["-o", "-q", &src, "-d", &dst])
                     .output()
                     .await
             } else if name.ends_with(".gem") {
                 tokio::process::Command::new("tar")
-                    .args([
-                        "xf",
-                        &archive_path.to_string_lossy(),
-                        "-C",
-                        &dest.to_string_lossy(),
-                    ])
+                    .args(["xf", &src, "-C", &dst])
                     .output()
                     .await
             } else {
