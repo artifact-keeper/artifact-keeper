@@ -3,8 +3,37 @@
 //! When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an OTLP span exporter is added
 //! alongside the existing stdout fmt layer. When unset, behavior is identical
 //! to the previous stdout-only setup.
+//!
+//! The transport protocol is selected via the standard `OTEL_EXPORTER_OTLP_PROTOCOL`
+//! environment variable:
+//!   - `grpc` (default) — gRPC over HTTP/2 using tonic
+//!   - `http/protobuf`  — HTTP/1.1 with binary protobuf bodies using reqwest
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// OTLP transport protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OtlpProtocol {
+    /// gRPC over HTTP/2 (default).
+    Grpc,
+    /// HTTP/1.1 with binary protobuf bodies.
+    HttpProtobuf,
+}
+
+impl OtlpProtocol {
+    /// Read from `OTEL_EXPORTER_OTLP_PROTOCOL`. Defaults to gRPC when unset
+    /// or unrecognised, matching the OTel spec default.
+    fn from_env() -> Self {
+        match std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "http/protobuf" | "http-protobuf" | "http_protobuf" => Self::HttpProtobuf,
+            _ => Self::Grpc,
+        }
+    }
+}
 
 /// Initialize the tracing subscriber.
 ///
@@ -17,10 +46,15 @@ pub fn init_tracing(otel_endpoint: Option<&str>, service_name: &str) -> Option<O
 
     match otel_endpoint {
         Some(endpoint) => {
-            let guard = init_with_otel(endpoint, service_name, env_filter);
+            let protocol = OtlpProtocol::from_env();
+            let guard = init_with_otel(endpoint, service_name, env_filter, protocol);
             tracing::info!(
                 otel_endpoint = endpoint,
                 service_name,
+                protocol = match protocol {
+                    OtlpProtocol::Grpc => "grpc",
+                    OtlpProtocol::HttpProtobuf => "http/protobuf",
+                },
                 "OpenTelemetry tracing enabled"
             );
             Some(guard)
@@ -49,18 +83,30 @@ impl Drop for OtelGuard {
     }
 }
 
-fn init_with_otel(endpoint: &str, service_name: &str, env_filter: EnvFilter) -> OtelGuard {
+fn init_with_otel(
+    endpoint: &str,
+    service_name: &str,
+    env_filter: EnvFilter,
+    protocol: OtlpProtocol,
+) -> OtelGuard {
     use opentelemetry::trace::TracerProvider;
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::{SpanExporter, WithExportConfig};
     use opentelemetry_sdk::trace::{BatchSpanProcessor, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
 
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()
-        .expect("Failed to create OTLP span exporter");
+    let exporter = match protocol {
+        OtlpProtocol::Grpc => SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint)
+            .build()
+            .expect("Failed to create OTLP gRPC span exporter"),
+        OtlpProtocol::HttpProtobuf => SpanExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .build()
+            .expect("Failed to create OTLP HTTP/protobuf span exporter"),
+    };
 
     let resource = Resource::builder()
         .with_attributes([
