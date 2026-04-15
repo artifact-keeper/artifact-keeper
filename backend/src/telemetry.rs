@@ -49,7 +49,12 @@ mod tests {
 
     #[test]
     fn test_protocol_accepts_http_protobuf_variants() {
-        for val in ["http/protobuf", "http-protobuf", "http_protobuf", "HTTP/PROTOBUF"] {
+        for val in [
+            "http/protobuf",
+            "http-protobuf",
+            "http_protobuf",
+            "HTTP/PROTOBUF",
+        ] {
             assert_eq!(
                 OtlpProtocol::from_value(val),
                 OtlpProtocol::HttpProtobuf,
