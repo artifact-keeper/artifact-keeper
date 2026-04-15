@@ -29,13 +29,15 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-use super::{PresignedUrl, PresignedUrlSource, StoragePathFormat};
+use super::{PresignedUrl, PresignedUrlSource, PutStreamResult, StoragePathFormat};
 use crate::error::{AppError, Result};
 
 /// S3 storage backend configuration
@@ -642,6 +644,74 @@ impl super::StorageBackend for S3Backend {
                 }
             }
         }
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
+        let key_owned = key.to_string();
+
+        let result = self.store.get(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { .. } => {
+                AppError::NotFound(format!("Storage key not found: {}", key_owned))
+            }
+            _ => AppError::Storage(format!("Failed to get object '{}': {}", key_owned, e)),
+        })?;
+
+        let stream = result
+            .into_stream()
+            .map(|r| r.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        let full_key = self.full_key(key);
+        let path: ObjectPath = full_key.into();
+
+        let upload = self.store.put_multipart(&path).await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to start multipart upload for '{}': {}",
+                key, e
+            ))
+        })?;
+
+        let mut write = WriteMultipart::new(upload);
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(data) => {
+                    hasher.update(&data);
+                    total += data.len() as u64;
+                    write.put(data);
+                }
+                Err(e) => {
+                    // Abort the multipart upload on stream error to avoid
+                    // leaving partial objects in S3.
+                    let _ = write.abort().await;
+                    return Err(e);
+                }
+            }
+        }
+
+        write.finish().await.map_err(|e| {
+            AppError::Storage(format!(
+                "Failed to complete multipart upload for '{}': {}",
+                key, e
+            ))
+        })?;
+
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
     }
 }
 

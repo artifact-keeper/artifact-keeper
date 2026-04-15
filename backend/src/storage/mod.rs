@@ -12,9 +12,19 @@ pub use registry::{StorageLocation, StorageRegistry};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use std::time::Duration;
 
 use crate::error::Result;
+
+/// Result of a streaming put operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutStreamResult {
+    /// SHA-256 checksum computed incrementally during the write.
+    pub checksum_sha256: String,
+    /// Total bytes written.
+    pub bytes_written: u64,
+}
 
 /// Result of a presigned URL request
 #[derive(Debug, Clone)]
@@ -78,6 +88,44 @@ pub trait StorageBackend: Send + Sync {
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let content = tokio::fs::read(path).await?;
         self.put(key, content.into()).await
+    }
+
+    /// Retrieve content as a byte stream instead of loading the full object
+    /// into memory. The default implementation wraps `get()` in a single-item
+    /// stream.
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let content = self.get(key).await?;
+        Ok(Box::pin(futures::stream::once(async { Ok(content) })))
+    }
+
+    /// Store content from a byte stream, computing a SHA-256 checksum
+    /// incrementally as data arrives. The default implementation collects
+    /// the stream into memory and delegates to `put()`.
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        use futures::StreamExt;
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        let mut buf = Vec::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+            buf.extend_from_slice(&chunk);
+        }
+
+        self.put(key, Bytes::from(buf)).await?;
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
     }
 
     /// Perform a lightweight connectivity probe against the storage backend.
@@ -212,5 +260,98 @@ mod tests {
         assert_eq!(debug_str, "S3");
         let debug_str = format!("{:?}", PresignedUrlSource::CloudFront);
         assert_eq!(debug_str, "CloudFront");
+    }
+
+    #[test]
+    fn test_put_stream_result_construction() {
+        let result = PutStreamResult {
+            checksum_sha256: "abc123".to_string(),
+            bytes_written: 1024,
+        };
+        assert_eq!(result.checksum_sha256, "abc123");
+        assert_eq!(result.bytes_written, 1024);
+    }
+
+    #[test]
+    fn test_put_stream_result_clone() {
+        let result = PutStreamResult {
+            checksum_sha256: "def456".to_string(),
+            bytes_written: 512,
+        };
+        let cloned = result.clone();
+        assert_eq!(result, cloned);
+    }
+
+    #[test]
+    fn test_put_stream_result_debug() {
+        let result = PutStreamResult {
+            checksum_sha256: "abc".to_string(),
+            bytes_written: 0,
+        };
+        let debug_str = format!("{:?}", result);
+        assert!(debug_str.contains("PutStreamResult"));
+        assert!(debug_str.contains("abc"));
+    }
+
+    #[tokio::test]
+    async fn test_default_get_stream() {
+        use futures::StreamExt;
+
+        let backend = TestBackend;
+        let mut stream = backend.get_stream("any-key").await.unwrap();
+
+        let mut collected = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(collected, b"test");
+    }
+
+    #[tokio::test]
+    async fn test_default_put_stream() {
+        let backend = TestBackend;
+        let data = Bytes::from_static(b"hello world");
+        let stream = Box::pin(futures::stream::once(async { Ok(data) }))
+            as BoxStream<'static, Result<Bytes>>;
+
+        let result = backend.put_stream("test-key", stream).await.unwrap();
+        assert_eq!(result.bytes_written, 11);
+        // SHA-256 of "hello world"
+        assert_eq!(
+            result.checksum_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_put_stream_multi_chunk() {
+        let backend = TestBackend;
+        let chunks: Vec<Result<Bytes>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"world")),
+        ];
+        let stream = Box::pin(futures::stream::iter(chunks)) as BoxStream<'static, Result<Bytes>>;
+
+        let result = backend.put_stream("test-key", stream).await.unwrap();
+        assert_eq!(result.bytes_written, 11);
+        // Same content as above, so same hash
+        assert_eq!(
+            result.checksum_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_put_stream_empty() {
+        let backend = TestBackend;
+        let stream = Box::pin(futures::stream::empty()) as BoxStream<'static, Result<Bytes>>;
+
+        let result = backend.put_stream("test-key", stream).await.unwrap();
+        assert_eq!(result.bytes_written, 0);
+        // SHA-256 of empty input
+        assert_eq!(
+            result.checksum_sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }
