@@ -362,7 +362,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Initialize proxy service for remote repository caching
     match StorageService::from_config(&config).await {
         Ok(storage_svc) => {
-            let proxy_service = Arc::new(ProxyService::new(db_pool.clone(), Arc::new(storage_svc)));
+            let proxy_service = Arc::new(ProxyService::new(
+                db_pool.clone(),
+                Arc::new(storage_svc),
+                &config,
+            ));
             app_state.set_proxy_service(proxy_service);
             tracing::info!("Proxy service initialized for remote repositories");
         }

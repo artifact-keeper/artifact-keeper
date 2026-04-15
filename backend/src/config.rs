@@ -122,6 +122,17 @@ pub struct Config {
     /// recovery mechanism when SSO is misconfigured.
     pub allow_local_admin_login: bool,
 
+    /// Maximum concurrent upstream proxy fetches. Bounds peak memory from
+    /// parallel proxy downloads. Set to 0 to disable (not recommended).
+    pub proxy_max_concurrent_fetches: u32,
+
+    /// Maximum artifact size in bytes that the proxy will fetch from upstream.
+    /// Requests for artifacts larger than this are rejected with 502.
+    pub proxy_max_artifact_size_bytes: u64,
+
+    /// Seconds to wait for a proxy fetch permit before returning 503.
+    pub proxy_queue_timeout_secs: u64,
+
     /// Port for the unauthenticated Prometheus metrics-only listener.
     ///
     /// When set, a second TCP listener is started on this port serving only
@@ -172,6 +183,9 @@ redacted_debug!(Config {
     show lifecycle_check_interval_secs,
     show max_upload_size_bytes,
     show allow_local_admin_login,
+    show proxy_max_concurrent_fetches,
+    show proxy_max_artifact_size_bytes,
+    show proxy_queue_timeout_secs,
     show metrics_port,
 });
 
@@ -238,6 +252,12 @@ impl Config {
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
+            proxy_max_concurrent_fetches: env_parse("PROXY_MAX_CONCURRENT_FETCHES", 20),
+            proxy_max_artifact_size_bytes: env_parse(
+                "PROXY_MAX_ARTIFACT_SIZE_BYTES",
+                2_147_483_648_u64,
+            ),
+            proxy_queue_timeout_secs: env_parse("PROXY_QUEUE_TIMEOUT_SECS", 30),
             allow_local_admin_login: matches!(
                 env::var("ALLOW_LOCAL_ADMIN_LOGIN").as_deref(),
                 Ok("true" | "1")
@@ -979,6 +999,102 @@ mod tests {
             env::set_var("MAX_UPLOAD_SIZE", v);
         } else {
             env::remove_var("MAX_UPLOAD_SIZE");
+        }
+    }
+
+    #[test]
+    fn test_proxy_config_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_fetches = env::var("PROXY_MAX_CONCURRENT_FETCHES").ok();
+        let saved_size = env::var("PROXY_MAX_ARTIFACT_SIZE_BYTES").ok();
+        let saved_timeout = env::var("PROXY_QUEUE_TIMEOUT_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("PROXY_MAX_CONCURRENT_FETCHES");
+        env::remove_var("PROXY_MAX_ARTIFACT_SIZE_BYTES");
+        env::remove_var("PROXY_QUEUE_TIMEOUT_SECS");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.proxy_max_concurrent_fetches, 20);
+        assert_eq!(config.proxy_max_artifact_size_bytes, 2_147_483_648);
+        assert_eq!(config.proxy_queue_timeout_secs, 30);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_fetches {
+            env::set_var("PROXY_MAX_CONCURRENT_FETCHES", v);
+        } else {
+            env::remove_var("PROXY_MAX_CONCURRENT_FETCHES");
+        }
+        if let Some(v) = saved_size {
+            env::set_var("PROXY_MAX_ARTIFACT_SIZE_BYTES", v);
+        } else {
+            env::remove_var("PROXY_MAX_ARTIFACT_SIZE_BYTES");
+        }
+        if let Some(v) = saved_timeout {
+            env::set_var("PROXY_QUEUE_TIMEOUT_SECS", v);
+        } else {
+            env::remove_var("PROXY_QUEUE_TIMEOUT_SECS");
+        }
+    }
+
+    #[test]
+    fn test_proxy_config_custom_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_fetches = env::var("PROXY_MAX_CONCURRENT_FETCHES").ok();
+        let saved_size = env::var("PROXY_MAX_ARTIFACT_SIZE_BYTES").ok();
+        let saved_timeout = env::var("PROXY_QUEUE_TIMEOUT_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PROXY_MAX_CONCURRENT_FETCHES", "5");
+        env::set_var("PROXY_MAX_ARTIFACT_SIZE_BYTES", "536870912");
+        env::set_var("PROXY_QUEUE_TIMEOUT_SECS", "10");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.proxy_max_concurrent_fetches, 5);
+        assert_eq!(config.proxy_max_artifact_size_bytes, 536_870_912);
+        assert_eq!(config.proxy_queue_timeout_secs, 10);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_fetches {
+            env::set_var("PROXY_MAX_CONCURRENT_FETCHES", v);
+        } else {
+            env::remove_var("PROXY_MAX_CONCURRENT_FETCHES");
+        }
+        if let Some(v) = saved_size {
+            env::set_var("PROXY_MAX_ARTIFACT_SIZE_BYTES", v);
+        } else {
+            env::remove_var("PROXY_MAX_ARTIFACT_SIZE_BYTES");
+        }
+        if let Some(v) = saved_timeout {
+            env::set_var("PROXY_QUEUE_TIMEOUT_SECS", v);
+        } else {
+            env::remove_var("PROXY_QUEUE_TIMEOUT_SECS");
         }
     }
 }

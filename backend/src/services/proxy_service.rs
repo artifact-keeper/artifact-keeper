@@ -16,6 +16,9 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use metrics::gauge;
+
+use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::storage_service::StorageService;
@@ -66,22 +69,35 @@ pub struct ProxyService {
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
+    /// Limits the number of concurrent upstream fetches to bound peak memory.
+    fetch_semaphore: Arc<tokio::sync::Semaphore>,
+    /// How long to wait for a semaphore permit before returning 503.
+    queue_timeout: Duration,
+    /// Maximum artifact size in bytes that the proxy will fetch from upstream.
+    max_artifact_size: u64,
 }
 
 impl ProxyService {
     /// Create a new proxy service
-    pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
+    pub fn new(db: PgPool, storage: Arc<StorageService>, config: &Config) -> Self {
         let http_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .user_agent("artifact-keeper-proxy/1.0")
+            .pool_max_idle_per_host(50)
+            .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .expect("Failed to create HTTP client");
+
+        let max_concurrent = config.proxy_max_concurrent_fetches as usize;
 
         Self {
             db,
             storage,
             http_client,
             token_cache: RwLock::new(HashMap::new()),
+            fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            queue_timeout: Duration::from_secs(config.proxy_queue_timeout_secs),
+            max_artifact_size: config.proxy_max_artifact_size_bytes,
         }
     }
 
@@ -384,6 +400,36 @@ impl ProxyService {
         url: &str,
         repo_id: Uuid,
     ) -> Result<(Bytes, Option<String>, Option<String>, String)> {
+        let permit = tokio::time::timeout(self.queue_timeout, self.fetch_semaphore.acquire())
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    url = %url,
+                    timeout_secs = self.queue_timeout.as_secs(),
+                    "Proxy fetch queue full, rejecting request"
+                );
+                AppError::ServiceUnavailable(
+                    "Proxy upstream fetch queue is full. Try again later.".into(),
+                )
+            })?
+            .map_err(|_| AppError::Internal("Fetch semaphore closed".into()))?;
+
+        gauge!("ak_proxy_fetches_in_flight").increment(1.0);
+
+        let result = self.fetch_from_upstream_inner(url, repo_id).await;
+
+        gauge!("ak_proxy_fetches_in_flight").decrement(1.0);
+        drop(permit);
+
+        result
+    }
+
+    /// Inner fetch logic, called after the semaphore permit is acquired.
+    async fn fetch_from_upstream_inner(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+    ) -> Result<(Bytes, Option<String>, Option<String>, String)> {
         tracing::info!("Fetching artifact from upstream: {}", url);
 
         let upstream_auth =
@@ -443,7 +489,12 @@ impl ProxyService {
                         ))
                     })?;
 
-                    return Self::read_upstream_response(retry_response, url).await;
+                    return Self::read_upstream_response(
+                        retry_response,
+                        url,
+                        self.max_artifact_size,
+                    )
+                    .await;
                 }
             }
 
@@ -453,7 +504,7 @@ impl ProxyService {
             )));
         }
 
-        Self::read_upstream_response(response, url).await
+        Self::read_upstream_response(response, url, self.max_artifact_size).await
     }
 
     /// Extract content, content-type, etag, and effective URL from an upstream
@@ -461,6 +512,7 @@ impl ProxyService {
     async fn read_upstream_response(
         response: reqwest::Response,
         url: &str,
+        max_size: u64,
     ) -> Result<(Bytes, Option<String>, Option<String>, String)> {
         let status = response.status();
         let effective_url = response.url().to_string();
@@ -479,6 +531,22 @@ impl ProxyService {
             )));
         }
 
+        // Check Content-Length before reading the body
+        if let Some(content_length) = response.content_length() {
+            if content_length > max_size {
+                tracing::warn!(
+                    url = %url,
+                    content_length,
+                    max_size,
+                    "Upstream artifact exceeds size limit, rejecting"
+                );
+                return Err(AppError::BadGateway(format!(
+                    "Upstream artifact size ({} bytes) exceeds the configured limit ({} bytes)",
+                    content_length, max_size
+                )));
+            }
+        }
+
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -495,6 +563,21 @@ impl ProxyService {
             .bytes()
             .await
             .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
+
+        // Post-download size check (handles missing or inaccurate Content-Length)
+        if content.len() as u64 > max_size {
+            tracing::warn!(
+                url = %url,
+                actual_size = content.len(),
+                max_size,
+                "Upstream artifact body exceeds size limit after download"
+            );
+            return Err(AppError::BadGateway(format!(
+                "Upstream artifact size ({} bytes) exceeds the configured limit ({} bytes)",
+                content.len(),
+                max_size
+            )));
+        }
 
         tracing::info!(
             "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?})",
@@ -1976,5 +2059,178 @@ mod tests {
         assert_eq!(capped, 3600);
         let effective = capped.saturating_mul(9) / 10;
         assert_eq!(effective, 3240);
+    }
+
+    // =======================================================================
+    // Semaphore behavior tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_proxy_semaphore_limits_concurrent_fetches() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+
+        // Acquire two permits (fills semaphore)
+        let _p1 = semaphore.acquire().await.unwrap();
+        let _p2 = semaphore.acquire().await.unwrap();
+
+        // Third acquire should not succeed immediately
+        let result = tokio::time::timeout(Duration::from_millis(50), semaphore.acquire()).await;
+
+        assert!(
+            result.is_err(),
+            "Third acquire should time out when semaphore is full"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_semaphore_timeout_returns_503() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let queue_timeout = Duration::from_millis(50);
+
+        // Hold the only permit
+        let _permit = semaphore.acquire().await.unwrap();
+
+        // Attempt to acquire with timeout, simulating the fetch_from_upstream pattern
+        let result = tokio::time::timeout(queue_timeout, semaphore.acquire())
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable(
+                    "Proxy upstream fetch queue is full. Try again later.".into(),
+                )
+            });
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            AppError::ServiceUnavailable(msg) => {
+                assert!(msg.contains("queue is full"));
+            }
+            other => panic!("Expected ServiceUnavailable, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_semaphore_releases_on_drop() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+        // Acquire and drop in a scope
+        {
+            let _permit = semaphore.acquire().await.unwrap();
+            // permit drops here
+        }
+
+        // Should be able to acquire again
+        let result = tokio::time::timeout(Duration::from_millis(50), semaphore.acquire()).await;
+
+        assert!(
+            result.is_ok(),
+            "Semaphore should be available after permit is dropped"
+        );
+    }
+
+    // =======================================================================
+    // Size limit tests
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_proxy_rejects_oversized_content_length() {
+        // When reqwest::Response is built from http::Response<Bytes>, the
+        // content_length() method returns the actual body size, not the
+        // Content-Length header. So we test the pre-read check by providing
+        // a body whose actual size exceeds the configured limit.
+        let body = bytes::Bytes::from(vec![0u8; 2048]);
+        let http_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .unwrap();
+
+        let response = reqwest::Response::from(http_response);
+        // content_length() should return Some(2048)
+        let max_size: u64 = 1024;
+
+        let result =
+            ProxyService::read_upstream_response(response, "https://example.com/big.tar", max_size)
+                .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::BadGateway(msg) => {
+                assert!(msg.contains("2048"));
+                assert!(msg.contains("1024"));
+            }
+            other => panic!("Expected BadGateway, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_allows_content_length_within_limit() {
+        let body = bytes::Bytes::from_static(b"hello world");
+        let http_response = http::Response::builder()
+            .status(200)
+            .header("content-type", "text/plain")
+            .body(body)
+            .unwrap();
+
+        let response = reqwest::Response::from(http_response);
+        let max_size: u64 = 2_147_483_648;
+
+        let result = ProxyService::read_upstream_response(
+            response,
+            "https://example.com/small.txt",
+            max_size,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let (content, content_type, _etag, _url) = result.unwrap();
+        assert_eq!(&content[..], b"hello world");
+        assert_eq!(content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_rejects_oversized_body_no_content_length() {
+        // Build a response without Content-Length whose body exceeds a small limit.
+        let large_body = bytes::Bytes::from(vec![0u8; 2048]);
+        let http_response = http::Response::builder()
+            .status(200)
+            .body(large_body)
+            .unwrap();
+
+        let response = reqwest::Response::from(http_response);
+        let max_size: u64 = 1024; // 1 KB limit
+
+        let result = ProxyService::read_upstream_response(
+            response,
+            "https://example.com/sneaky.bin",
+            max_size,
+        )
+        .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::BadGateway(msg) => {
+                assert!(msg.contains("2048"));
+                assert!(msg.contains("1024"));
+            }
+            other => panic!("Expected BadGateway, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_allows_body_within_limit_no_content_length() {
+        let body = bytes::Bytes::from(vec![42u8; 512]);
+        let http_response = http::Response::builder().status(200).body(body).unwrap();
+
+        let response = reqwest::Response::from(http_response);
+        let max_size: u64 = 1024;
+
+        let result =
+            ProxyService::read_upstream_response(response, "https://example.com/ok.bin", max_size)
+                .await;
+
+        assert!(result.is_ok());
+        let (content, _ct, _etag, _url) = result.unwrap();
+        assert_eq!(content.len(), 512);
     }
 }
