@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT storage_key, content_type\n        FROM artifacts\n        WHERE repository_id = $1 AND path LIKE $2 || $3 AND is_deleted = false\n        LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "storage_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "content_type",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "81c95ae7856779504cf8b4a63f56b60f8d7d2fff35e997895045cac317db7711"
+}
