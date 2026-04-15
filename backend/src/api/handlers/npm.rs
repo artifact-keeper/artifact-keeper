@@ -492,6 +492,70 @@ async fn download_scoped_tarball(
     serve_tarball(&state, &repo_key, &full_name, &filename).await
 }
 
+/// Fetch an npm tarball from a virtual member's local storage, matching
+/// by the full upstream path or by the package name + filename pattern.
+///
+/// npm tarball filenames strip the scope prefix, so two different packages
+/// can produce the same filename (e.g. `mdurl` and `@types/mdurl` both
+/// produce `mdurl-2.0.0.tgz`). A bare filename suffix match with
+/// `local_fetch_by_path_suffix` can return the wrong package's tarball.
+/// This function narrows the match by checking the upstream proxy path
+/// first (exact match for proxy-cached artifacts), then falling back to
+/// a pattern that includes the decoded package name (for locally published
+/// artifacts).
+async fn npm_local_fetch(
+    db: &PgPool,
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    location: &crate::storage::StorageLocation,
+    upstream_path: &str,
+    package_name: &str,
+    filename: &str,
+) -> Result<(Bytes, Option<String>), Response> {
+    // Try exact path match first (proxy-cached artifacts use the upstream
+    // path verbatim, e.g. "@types%2Fmdurl/-/mdurl-2.0.0.tgz").
+    if let Ok(result) =
+        proxy_helpers::local_fetch_by_path(db, state, repo_id, location, upstream_path).await
+    {
+        return Ok(result);
+    }
+
+    // Fall back to a pattern that anchors the match on the decoded package
+    // name, covering locally published artifacts whose path follows the
+    // layout "{package_name}/{version}/{filename}".
+    let pkg_path_prefix = format!("{}/%/", package_name);
+    let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
+        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+         FROM artifacts \
+         WHERE repository_id = $1 AND path LIKE $2 || $3 AND is_deleted = false \
+         LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(&pkg_path_prefix)
+    .bind(filename)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        map_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Database error: {}", e),
+        )
+    })?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    proxy_helpers::check_quarantine_row(&artifact)?;
+
+    let storage = state
+        .storage_for_repo(location)
+        .map_err(|e| e.into_response())?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(map_storage_err)?;
+
+    Ok((content, Some(artifact.content_type.clone())))
+}
+
 async fn serve_tarball(
     state: &SharedState,
     repo_key: &str,
@@ -531,6 +595,8 @@ async fn serve_tarball(
     // Virtual repo: try each member in priority order
     if repo.repo_type == RepositoryType::Virtual {
         let db = state.db.clone();
+        let upath = upstream_path.clone();
+        let pkg = package_name.to_string();
         let fname = filename.to_string();
         let (content, content_type) = proxy_helpers::resolve_virtual_download(
             &state.db,
@@ -540,12 +606,11 @@ async fn serve_tarball(
             |member_id, location| {
                 let db = db.clone();
                 let state = state.clone();
+                let upath = upath.clone();
+                let pkg = pkg.clone();
                 let fname = fname.clone();
                 async move {
-                    proxy_helpers::local_fetch_by_path_suffix(
-                        &db, &state, member_id, &location, &fname,
-                    )
-                    .await
+                    npm_local_fetch(&db, &state, member_id, &location, &upath, &pkg, &fname).await
                 }
             },
         )
@@ -566,18 +631,22 @@ async fn serve_tarball(
             .unwrap());
     }
 
-    // For local/staged repos, find artifact by filename
+    // For local/staged repos, find artifact by filename. Include the package
+    // name in the path match to avoid returning a different package's tarball
+    // when two packages share the same filename (e.g. @types/mdurl and mdurl
+    // both produce mdurl-2.0.0.tgz).
+    let path_pattern = format!("{}/%/{}", package_name, filename);
     let artifact = sqlx::query!(
         r#"
         SELECT id, path, name, size_bytes, checksum_sha256, storage_key
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE $2
         LIMIT 1
         "#,
         repo.id,
-        filename
+        path_pattern
     )
     .fetch_optional(&state.db)
     .await
@@ -2191,5 +2260,283 @@ mod tests {
         let versions = body["versions"].as_object().unwrap();
         assert_eq!(versions.len(), 1);
         assert!(versions.contains_key("1.0.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Integrity preservation tests (issue #745)
+    //
+    // When proxying npm metadata from upstream, the rewrite function must
+    // preserve the original integrity and shasum fields. Only the tarball
+    // URL should change.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rewrite_preserves_upstream_integrity_and_shasum() {
+        let mut json = serde_json::json!({
+            "name": "@types/mdurl",
+            "versions": {
+                "2.0.0": {
+                    "name": "@types/mdurl",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/@types/mdurl/-/mdurl-2.0.0.tgz",
+                        "integrity": "sha512-RGdgjQUZba5p6QEFAVx2OGb8rQDL/cPRG7GiedRzMcJ1tYnUANBncjbSB1NRGwbvjcPeikRABz2nshyPk1bhWg==",
+                        "shasum": "d43878b5b20222682163ae6f897b20447233bdfd",
+                        "fileCount": 13,
+                        "unpackedSize": 5407
+                    }
+                }
+            }
+        });
+
+        rewrite_npm_tarball_urls(&mut json, "https://registry.example.dev", "npm");
+
+        let dist = &json["versions"]["2.0.0"]["dist"];
+
+        // tarball URL must be rewritten to our local instance
+        assert_eq!(
+            dist["tarball"].as_str().unwrap(),
+            "https://registry.example.dev/npm/npm/@types/mdurl/-/mdurl-2.0.0.tgz"
+        );
+
+        // integrity hash must be preserved verbatim from upstream
+        assert_eq!(
+            dist["integrity"].as_str().unwrap(),
+            "sha512-RGdgjQUZba5p6QEFAVx2OGb8rQDL/cPRG7GiedRzMcJ1tYnUANBncjbSB1NRGwbvjcPeikRABz2nshyPk1bhWg=="
+        );
+
+        // shasum must also be preserved
+        assert_eq!(
+            dist["shasum"].as_str().unwrap(),
+            "d43878b5b20222682163ae6f897b20447233bdfd"
+        );
+
+        // Other dist fields should also survive the rewrite
+        assert_eq!(dist["fileCount"], 13);
+        assert_eq!(dist["unpackedSize"], 5407);
+    }
+
+    #[test]
+    fn test_rewrite_preserves_integrity_with_multiple_versions() {
+        let mut json = serde_json::json!({
+            "name": "mdurl",
+            "versions": {
+                "1.0.1": {
+                    "name": "mdurl",
+                    "version": "1.0.1",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/mdurl/-/mdurl-1.0.1.tgz",
+                        "integrity": "sha512-aaa111==",
+                        "shasum": "aaaa1111"
+                    }
+                },
+                "2.0.0": {
+                    "name": "mdurl",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/mdurl/-/mdurl-2.0.0.tgz",
+                        "integrity": "sha512-bbb222==",
+                        "shasum": "bbbb2222"
+                    }
+                }
+            }
+        });
+
+        rewrite_npm_tarball_urls(&mut json, "http://localhost:8080", "npm-cache");
+
+        // Both versions should have rewritten tarball URLs
+        assert!(json["versions"]["1.0.1"]["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://localhost:8080/npm/npm-cache/mdurl/-/"));
+        assert!(json["versions"]["2.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://localhost:8080/npm/npm-cache/mdurl/-/"));
+
+        // Both versions must keep their own integrity values
+        assert_eq!(
+            json["versions"]["1.0.1"]["dist"]["integrity"]
+                .as_str()
+                .unwrap(),
+            "sha512-aaa111=="
+        );
+        assert_eq!(
+            json["versions"]["2.0.0"]["dist"]["integrity"]
+                .as_str()
+                .unwrap(),
+            "sha512-bbb222=="
+        );
+
+        // shasum preserved too
+        assert_eq!(
+            json["versions"]["1.0.1"]["dist"]["shasum"]
+                .as_str()
+                .unwrap(),
+            "aaaa1111"
+        );
+        assert_eq!(
+            json["versions"]["2.0.0"]["dist"]["shasum"]
+                .as_str()
+                .unwrap(),
+            "bbbb2222"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Path pattern disambiguation tests (issue #745)
+    //
+    // npm tarball filenames strip the scope prefix, so packages like
+    // `mdurl` and `@types/mdurl` both produce `mdurl-2.0.0.tgz`. The
+    // path pattern used for artifact lookup must include the package name
+    // to prevent returning the wrong package's tarball.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_path_pattern_distinguishes_scoped_from_unscoped() {
+        // Two packages with the same tarball filename
+        let unscoped_path = "mdurl/2.0.0/mdurl-2.0.0.tgz";
+        let scoped_path = "@types/mdurl/2.0.0/mdurl-2.0.0.tgz";
+
+        // The path pattern includes the package name as a prefix
+        let unscoped_pattern = format!("{}/%/{}", "mdurl", "mdurl-2.0.0.tgz");
+        let scoped_pattern = format!("{}/%/{}", "@types/mdurl", "mdurl-2.0.0.tgz");
+
+        // SQL LIKE with `%` as wildcard:
+        // unscoped_pattern = "mdurl/%/mdurl-2.0.0.tgz"
+        // scoped_pattern = "@types/mdurl/%/mdurl-2.0.0.tgz"
+
+        // Simulate SQL LIKE matching: replace `%` with regex `.*`
+        let unscoped_re = regex::Regex::new(&format!(
+            "^{}$",
+            regex::escape(&unscoped_pattern).replace("%", ".*")
+        ))
+        .unwrap();
+        let scoped_re = regex::Regex::new(&format!(
+            "^{}$",
+            regex::escape(&scoped_pattern).replace("%", ".*")
+        ))
+        .unwrap();
+
+        // Unscoped pattern matches only the unscoped path
+        assert!(unscoped_re.is_match(unscoped_path));
+        assert!(!unscoped_re.is_match(scoped_path));
+
+        // Scoped pattern matches only the scoped path
+        assert!(scoped_re.is_match(scoped_path));
+        assert!(!scoped_re.is_match(unscoped_path));
+    }
+
+    #[test]
+    fn test_path_pattern_matches_locally_published_layout() {
+        // Locally published artifacts use: {package}/{version}/{filename}
+        let path = "express/4.18.2/express-4.18.2.tgz";
+        let pattern = format!("{}/%/{}", "express", "express-4.18.2.tgz");
+        let re = regex::Regex::new(&format!("^{}$", regex::escape(&pattern).replace("%", ".*")))
+            .unwrap();
+        assert!(re.is_match(path));
+    }
+
+    #[test]
+    fn test_path_pattern_scoped_locally_published() {
+        let path = "@babel/core/7.24.0/core-7.24.0.tgz";
+        let pattern = format!("{}/%/{}", "@babel/core", "core-7.24.0.tgz");
+        let re = regex::Regex::new(&format!("^{}$", regex::escape(&pattern).replace("%", ".*")))
+            .unwrap();
+        assert!(re.is_match(path));
+    }
+
+    #[test]
+    fn test_encode_package_name_for_upstream_unscoped() {
+        assert_eq!(encode_package_name_for_upstream("express"), "express");
+        assert_eq!(encode_package_name_for_upstream("lodash"), "lodash");
+    }
+
+    #[test]
+    fn test_encode_package_name_for_upstream_scoped() {
+        assert_eq!(
+            encode_package_name_for_upstream("@types/mdurl"),
+            "@types%2Fmdurl"
+        );
+        assert_eq!(
+            encode_package_name_for_upstream("@angular/core"),
+            "@angular%2Fcore"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_npm_metadata_response_same_filename_different_packages() {
+        // Regression test for issue #745: two packages with the same tarball
+        // filename must produce metadata with the correct package name in each
+        // version entry, preventing the wrong tarball from being served.
+        let unscoped = vec![NpmMetadataArtifact {
+            path: "mdurl/2.0.0/mdurl-2.0.0.tgz".to_string(),
+            version: Some("2.0.0".to_string()),
+            checksum_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            metadata: None,
+        }];
+        let scoped = vec![NpmMetadataArtifact {
+            path: "@types/mdurl/2.0.0/mdurl-2.0.0.tgz".to_string(),
+            version: Some("2.0.0".to_string()),
+            checksum_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            metadata: None,
+        }];
+
+        let resp_unscoped =
+            build_npm_metadata_response(&unscoped, "mdurl", "http://localhost:8080", "npm-hosted")
+                .unwrap();
+        let resp_scoped = build_npm_metadata_response(
+            &scoped,
+            "@types/mdurl",
+            "http://localhost:8080",
+            "npm-hosted",
+        )
+        .unwrap();
+
+        let body_u = axum::body::to_bytes(resp_unscoped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_u: serde_json::Value = serde_json::from_slice(&body_u).unwrap();
+        let body_s = axum::body::to_bytes(resp_scoped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_s: serde_json::Value = serde_json::from_slice(&body_s).unwrap();
+
+        // The tarball URLs must reference different packages
+        let tarball_u = json_u["versions"]["2.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+        let tarball_s = json_s["versions"]["2.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap();
+
+        assert!(
+            tarball_u.contains("/mdurl/-/"),
+            "unscoped tarball URL should reference mdurl, got: {}",
+            tarball_u
+        );
+        assert!(
+            tarball_s.contains("/@types/mdurl/-/"),
+            "scoped tarball URL should reference @types/mdurl, got: {}",
+            tarball_s
+        );
+        assert_ne!(
+            tarball_u, tarball_s,
+            "tarball URLs for different packages must differ"
+        );
+
+        // Integrity hashes must differ because the checksums are different
+        let integrity_u = json_u["versions"]["2.0.0"]["dist"]["integrity"]
+            .as_str()
+            .unwrap();
+        let integrity_s = json_s["versions"]["2.0.0"]["dist"]["integrity"]
+            .as_str()
+            .unwrap();
+        assert_ne!(
+            integrity_u, integrity_s,
+            "integrity for different packages must differ"
+        );
     }
 }

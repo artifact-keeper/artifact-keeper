@@ -546,16 +546,16 @@ pub async fn fetch_virtual_members(
 
 /// Row type for local artifact fetch queries, including quarantine fields.
 #[derive(sqlx::FromRow)]
-struct LocalArtifactRow {
-    storage_key: String,
-    content_type: String,
-    quarantine_status: Option<String>,
-    quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct LocalArtifactRow {
+    pub storage_key: String,
+    pub content_type: String,
+    pub quarantine_status: Option<String>,
+    pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Check quarantine status on a fetched artifact row, mapping errors to Response.
 #[allow(clippy::result_large_err)]
-fn check_quarantine(row: &LocalArtifactRow) -> Result<(), Response> {
+pub(crate) fn check_quarantine_row(row: &LocalArtifactRow) -> Result<(), Response> {
     crate::services::quarantine_service::check_download_allowed(
         row.quarantine_status.as_deref(),
         row.quarantine_until,
@@ -586,7 +586,7 @@ pub async fn local_fetch_by_path(
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    check_quarantine(&artifact)?;
+    check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -621,7 +621,7 @@ pub async fn local_fetch_by_name_version(
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    check_quarantine(&artifact)?;
+    check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -654,7 +654,7 @@ pub async fn local_fetch_by_path_suffix(
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    check_quarantine(&artifact)?;
+    check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
     let content = storage
@@ -691,7 +691,7 @@ pub async fn local_fetch_or_redirect(
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    check_quarantine(&artifact)?;
+    check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
 
