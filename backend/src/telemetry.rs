@@ -21,17 +21,53 @@ enum OtlpProtocol {
 }
 
 impl OtlpProtocol {
-    /// Read from `OTEL_EXPORTER_OTLP_PROTOCOL`. Defaults to gRPC when unset
-    /// or unrecognised, matching the OTel spec default.
-    fn from_env() -> Self {
-        match std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
+    /// Parse a protocol value string. Defaults to gRPC for unrecognised values,
+    /// matching the OTel spec default.
+    fn from_value(val: &str) -> Self {
+        match val.to_lowercase().as_str() {
             "http/protobuf" | "http-protobuf" | "http_protobuf" => Self::HttpProtobuf,
             _ => Self::Grpc,
         }
+    }
+
+    /// Read from `OTEL_EXPORTER_OTLP_PROTOCOL`. Defaults to gRPC when unset
+    /// or unrecognised, matching the OTel spec default.
+    fn from_env() -> Self {
+        let val = std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_default();
+        Self::from_value(&val)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_protocol_defaults_to_grpc_for_empty_string() {
+        assert_eq!(OtlpProtocol::from_value(""), OtlpProtocol::Grpc);
+    }
+
+    #[test]
+    fn test_protocol_accepts_http_protobuf_variants() {
+        for val in ["http/protobuf", "http-protobuf", "http_protobuf", "HTTP/PROTOBUF"] {
+            assert_eq!(
+                OtlpProtocol::from_value(val),
+                OtlpProtocol::HttpProtobuf,
+                "failed for {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_grpc_explicit() {
+        assert_eq!(OtlpProtocol::from_value("grpc"), OtlpProtocol::Grpc);
+        assert_eq!(OtlpProtocol::from_value("GRPC"), OtlpProtocol::Grpc);
+    }
+
+    #[test]
+    fn test_protocol_unrecognized_falls_back_to_grpc() {
+        assert_eq!(OtlpProtocol::from_value("http/json"), OtlpProtocol::Grpc);
+        assert_eq!(OtlpProtocol::from_value("bogus"), OtlpProtocol::Grpc);
     }
 }
 
