@@ -1637,6 +1637,8 @@ pub(crate) mod test_helpers {
             storage_key: "test-key".to_string(),
             is_deleted: false,
             uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
