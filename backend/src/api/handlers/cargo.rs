@@ -35,10 +35,23 @@ use crate::error::AppError;
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
-// In-process index entry cache
+// In-process caches
 // ---------------------------------------------------------------------------
 
 const INDEX_CACHE_TTL_SECS: u64 = 300;
+
+/// TTL for cached upstream `config.json` data (the `dl` download URL).
+/// Upstream registries change their config.json very rarely, so 1 hour
+/// is a reasonable balance between freshness and upstream request volume.
+const CONFIG_CACHE_TTL_SECS: u64 = 3600;
+
+/// Thread-safe cache for upstream registry `config.json` download URL (`dl` field).
+/// Key: upstream base URL. Value: resolved `dl` URL + insertion time.
+type ConfigCache = std::sync::Arc<std::sync::RwLock<HashMap<String, (String, Instant)>>>;
+
+/// Module-level cache for upstream `config.json` download URLs.
+static UPSTREAM_CONFIG_CACHE: once_cell::sync::Lazy<ConfigCache> =
+    once_cell::sync::Lazy::new(|| std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())));
 
 fn index_cache_get(cache: &IndexCache, key: &str) -> Option<Bytes> {
     let c = cache.read().ok()?;
@@ -61,6 +74,105 @@ fn index_cache_invalidate(cache: &IndexCache, key: &str) {
     if let Ok(mut c) = cache.write() {
         c.remove(key);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Upstream config.json resolution
+// ---------------------------------------------------------------------------
+
+/// Look up the cached `dl` URL for an upstream registry base URL.
+fn config_cache_get(base_url: &str) -> Option<String> {
+    let c = UPSTREAM_CONFIG_CACHE.read().ok()?;
+    let (dl_url, at) = c.get(base_url)?;
+    if at.elapsed().as_secs() < CONFIG_CACHE_TTL_SECS {
+        Some(dl_url.clone())
+    } else {
+        None
+    }
+}
+
+/// Store a resolved `dl` URL for an upstream base URL.
+fn config_cache_set(base_url: String, dl_url: String) {
+    if let Ok(mut c) = UPSTREAM_CONFIG_CACHE.write() {
+        c.retain(|_, (_, at)| at.elapsed().as_secs() < CONFIG_CACHE_TTL_SECS);
+        c.insert(base_url, (dl_url, Instant::now()));
+    }
+}
+
+/// Fetch the upstream registry's `config.json` and extract the `dl` field.
+///
+/// Cargo registries serve a `config.json` at their root that contains a `dl`
+/// field indicating the download URL template. For registries like crates.io,
+/// the index (`https://index.crates.io`) and the download host
+/// (`https://crates.io`) are on different domains, so the `dl` field is the
+/// authoritative source for where to fetch .crate files.
+///
+/// Returns `Some(dl_url)` on success, `None` if the config could not be fetched
+/// or parsed. Results are cached for `CONFIG_CACHE_TTL_SECS`.
+async fn resolve_upstream_dl_url(
+    state: &SharedState,
+    repo: &RepoInfo,
+    repo_key: &str,
+) -> Option<String> {
+    // Determine which base URL to fetch config.json from. Prefer the index URL
+    // because that is where Cargo registries serve their config.json.
+    let base_url = repo
+        .index_upstream_url
+        .as_deref()
+        .or(repo.upstream_url.as_deref())?;
+
+    // Check the cache first.
+    if let Some(cached) = config_cache_get(base_url) {
+        return Some(cached);
+    }
+
+    // Fetch config.json from upstream.
+    let proxy = state.proxy_service.as_ref()?;
+    let config_bytes =
+        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, "config.json")
+            .await
+            .ok()?;
+
+    let config: serde_json::Value = serde_json::from_slice(&config_bytes.0).ok()?;
+    let dl_url = config.get("dl")?.as_str()?.to_string();
+
+    // Cache the resolved dl URL.
+    config_cache_set(base_url.to_string(), dl_url.clone());
+
+    Some(dl_url)
+}
+
+/// Build the full download URL for a crate, using the upstream `dl` template
+/// when available. Falls back to `{upstream_url}/api/v1/crates/{name}/{version}/download`.
+///
+/// The `dl` field from `config.json` can be either a plain base URL
+/// (e.g. `https://crates.io/api/v1/crates`) to which `/{name}/{version}/download`
+/// is appended, or a template with `{crate}` / `{version}` markers. This
+/// function handles both forms.
+fn build_download_url(dl_url: &str, name: &str, version: &str) -> String {
+    if dl_url.contains("{crate}") || dl_url.contains("{version}") {
+        dl_url
+            .replace("{crate}", name)
+            .replace("{version}", version)
+    } else {
+        let base = dl_url.trim_end_matches('/');
+        format!("{}/{}/{}/download", base, name, version)
+    }
+}
+
+/// Split a fully-qualified URL into `(origin, path)`.
+///
+/// Given `https://crates.io/api/v1/crates/serde/1.0.0/download`, returns
+/// `("https://crates.io", "api/v1/crates/serde/1.0.0/download")`.
+///
+/// Returns `None` when the URL has no scheme or no path component after the host.
+fn split_url(url: &str) -> Option<(String, String)> {
+    let scheme_end = url.find("://")?;
+    let after_scheme = &url[scheme_end + 3..];
+    let slash = after_scheme.find('/')?;
+    let origin = &url[..scheme_end + 3 + slash];
+    let path = &url[scheme_end + 3 + slash + 1..];
+    Some((origin.to_string(), path.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -671,14 +783,34 @@ async fn download(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let upstream_path =
+                    // Resolve the download base URL from the upstream config.json.
+                    // This handles split-host registries like crates.io where
+                    // the index lives at index.crates.io but downloads come
+                    // from crates.io/api/v1/crates.
+                    let fallback_path =
                         format!("api/v1/crates/{}/{}/download", name_lower, version);
-                    let (content, _content_type) = proxy_helpers::proxy_fetch(
+                    let (dl_base, dl_path) = match resolve_upstream_dl_url(&state, &repo, &repo_key)
+                        .await
+                    {
+                        Some(dl_url) => {
+                            let full = build_download_url(&dl_url, &name_lower, &version);
+                            split_url(&full)
+                                .unwrap_or_else(|| (upstream_url.clone(), fallback_path.clone()))
+                        }
+                        None => (upstream_url.clone(), fallback_path.clone()),
+                    };
+
+                    // Use the canonical local cache path regardless of which
+                    // upstream URL was resolved so that subsequent requests hit
+                    // the proxy cache even after a config.json TTL change.
+                    let cache_path = format!("api/v1/crates/{}/{}/download", name_lower, version);
+                    let (content, _content_type) = proxy_helpers::proxy_fetch_with_cache_key(
                         proxy,
                         repo.id,
                         &repo_key,
-                        upstream_url,
-                        &upstream_path,
+                        &dl_base,
+                        &dl_path,
+                        &cache_path,
                     )
                     .await?;
 
@@ -2426,5 +2558,189 @@ mod tests {
         index_cache_set(&cache, "repo:binary-crate".to_string(), binary_data.clone());
         let result = index_cache_get(&cache, "repo:binary-crate").unwrap();
         assert_eq!(result, binary_data);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_download_url (upstream config.json dl field)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_download_url_plain_base() {
+        // Standard crates.io style: dl is a plain URL, we append /{name}/{version}/download.
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "serde", "1.0.200");
+        assert_eq!(
+            url,
+            "https://crates.io/api/v1/crates/serde/1.0.200/download"
+        );
+    }
+
+    #[test]
+    fn test_build_download_url_plain_base_trailing_slash() {
+        let dl = "https://crates.io/api/v1/crates/";
+        let url = build_download_url(dl, "tokio", "1.38.0");
+        assert_eq!(url, "https://crates.io/api/v1/crates/tokio/1.38.0/download");
+    }
+
+    #[test]
+    fn test_build_download_url_template_with_markers() {
+        // Some registries use template markers in the dl field.
+        let dl = "https://dl.example.com/crates/{crate}/{version}/download";
+        let url = build_download_url(dl, "rand", "0.8.5");
+        assert_eq!(url, "https://dl.example.com/crates/rand/0.8.5/download");
+    }
+
+    #[test]
+    fn test_build_download_url_template_only_crate_marker() {
+        let dl = "https://cdn.example.com/{crate}/files/{version}.tgz";
+        let url = build_download_url(dl, "regex", "1.10.0");
+        assert_eq!(url, "https://cdn.example.com/regex/files/1.10.0.tgz");
+    }
+
+    #[test]
+    fn test_build_download_url_prerelease_version() {
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "my-crate", "0.1.0-alpha.1");
+        assert_eq!(
+            url,
+            "https://crates.io/api/v1/crates/my-crate/0.1.0-alpha.1/download"
+        );
+    }
+
+    #[test]
+    fn test_build_download_url_single_char_crate() {
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "a", "0.0.1");
+        assert_eq!(url, "https://crates.io/api/v1/crates/a/0.0.1/download");
+    }
+
+    // -----------------------------------------------------------------------
+    // split_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_url_standard() {
+        let (origin, path) =
+            split_url("https://crates.io/api/v1/crates/serde/1.0.0/download").unwrap();
+        assert_eq!(origin, "https://crates.io");
+        assert_eq!(path, "api/v1/crates/serde/1.0.0/download");
+    }
+
+    #[test]
+    fn test_split_url_with_port() {
+        let (origin, path) =
+            split_url("http://localhost:8080/api/v1/crates/tokio/1.0.0/download").unwrap();
+        assert_eq!(origin, "http://localhost:8080");
+        assert_eq!(path, "api/v1/crates/tokio/1.0.0/download");
+    }
+
+    #[test]
+    fn test_split_url_no_path() {
+        // A URL with no path after the host returns None.
+        assert!(split_url("https://crates.io").is_none());
+    }
+
+    #[test]
+    fn test_split_url_no_scheme() {
+        assert!(split_url("crates.io/api/v1/crates").is_none());
+    }
+
+    #[test]
+    fn test_split_url_root_path() {
+        let (origin, path) = split_url("https://example.com/download").unwrap();
+        assert_eq!(origin, "https://example.com");
+        assert_eq!(path, "download");
+    }
+
+    #[test]
+    fn test_split_url_deep_path() {
+        let (origin, path) = split_url("https://cdn.example.com/a/b/c/d/e").unwrap();
+        assert_eq!(origin, "https://cdn.example.com");
+        assert_eq!(path, "a/b/c/d/e");
+    }
+
+    // -----------------------------------------------------------------------
+    // config_cache_get / config_cache_set
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_cache_miss_returns_none() {
+        assert!(config_cache_get("https://nonexistent.example.com").is_none());
+    }
+
+    #[test]
+    fn test_config_cache_set_and_get_roundtrip() {
+        let base = format!(
+            "https://test-roundtrip-{}.example.com",
+            uuid::Uuid::new_v4()
+        );
+        let dl = "https://dl.example.com/api/v1/crates".to_string();
+        config_cache_set(base.clone(), dl.clone());
+        let result = config_cache_get(&base).expect("should be in cache");
+        assert_eq!(result, dl);
+    }
+
+    #[test]
+    fn test_config_cache_overwrites_previous_value() {
+        let base = format!(
+            "https://test-overwrite-{}.example.com",
+            uuid::Uuid::new_v4()
+        );
+        config_cache_set(base.clone(), "https://old.example.com/dl".to_string());
+        config_cache_set(base.clone(), "https://new.example.com/dl".to_string());
+        let result = config_cache_get(&base).unwrap();
+        assert_eq!(result, "https://new.example.com/dl");
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end download URL resolution scenario tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_crates_io_dl_url_produces_correct_download() {
+        // Simulates the crates.io scenario:
+        // config.json at index.crates.io has dl = "https://crates.io/api/v1/crates"
+        let dl = "https://crates.io/api/v1/crates";
+        let full_url = build_download_url(dl, "serde_json", "1.0.120");
+        assert_eq!(
+            full_url,
+            "https://crates.io/api/v1/crates/serde_json/1.0.120/download"
+        );
+
+        // The split must yield the correct origin for proxy_fetch.
+        let (origin, path) = split_url(&full_url).unwrap();
+        assert_eq!(origin, "https://crates.io");
+        assert_eq!(path, "api/v1/crates/serde_json/1.0.120/download");
+    }
+
+    #[test]
+    fn test_self_hosted_registry_same_host_dl() {
+        // A self-hosted registry where index and downloads share the same host.
+        // config.json has dl = "https://registry.company.com/api/v1/crates"
+        let dl = "https://registry.company.com/api/v1/crates";
+        let full_url = build_download_url(dl, "internal-lib", "2.0.0");
+        let (origin, path) = split_url(&full_url).unwrap();
+        assert_eq!(origin, "https://registry.company.com");
+        assert_eq!(path, "api/v1/crates/internal-lib/2.0.0/download");
+    }
+
+    #[test]
+    fn test_fallback_when_no_dl_url() {
+        // When resolve_upstream_dl_url returns None, the download handler
+        // falls back to upstream_url + the standard path.
+        let upstream_url = "https://index.crates.io";
+        let name = "serde";
+        let version = "1.0.0";
+        let fallback_path = format!("api/v1/crates/{}/{}/download", name, version);
+        assert_eq!(fallback_path, "api/v1/crates/serde/1.0.0/download");
+
+        // This would produce the wrong URL for crates.io (index.crates.io
+        // does not serve downloads), but it is the correct fallback for
+        // registries where index and downloads share the same host.
+        let full_fallback = format!("{}/{}", upstream_url, fallback_path);
+        assert_eq!(
+            full_fallback,
+            "https://index.crates.io/api/v1/crates/serde/1.0.0/download"
+        );
     }
 }
