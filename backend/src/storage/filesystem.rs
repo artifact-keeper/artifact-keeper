@@ -123,7 +123,9 @@ impl StorageBackend for FilesystemStorage {
 
         // Write to a temp file in the same directory so rename is atomic
         // (same filesystem guarantees atomic rename on POSIX).
-        let temp_path = dest.with_extension(format!("tmp.{}", Uuid::new_v4()));
+        let mut temp_name = dest.as_os_str().to_os_string();
+        temp_name.push(format!(".tmp.{}", Uuid::new_v4()));
+        let temp_path = PathBuf::from(temp_name);
         let mut file = fs::File::create(&temp_path)
             .await
             .map_err(|e| AppError::Storage(format!("Failed to create temp file: {}", e)))?;
@@ -157,11 +159,11 @@ impl StorageBackend for FilesystemStorage {
         drop(file);
 
         // Atomic rename
-        fs::rename(&temp_path, &dest).await.map_err(|e| {
+        if let Err(e) = fs::rename(&temp_path, &dest).await {
             // Best-effort cleanup; the temp file may already be gone
-            let _ = std::fs::remove_file(&temp_path);
-            AppError::Storage(format!("Rename error: {}", e))
-        })?;
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::Storage(format!("Rename error: {}", e)));
+        }
 
         Ok(PutStreamResult {
             checksum_sha256: format!("{:x}", hasher.finalize()),
@@ -497,8 +499,8 @@ mod tests {
                 Box::pin(collect_tmp_files(entry.path(), out)).await;
             }
         } else if path
-            .extension()
-            .map(|e| e.to_string_lossy().starts_with("tmp."))
+            .file_name()
+            .map(|n| n.to_string_lossy().contains(".tmp."))
             .unwrap_or(false)
         {
             out.push(path);
