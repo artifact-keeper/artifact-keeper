@@ -43,6 +43,188 @@ pub(crate) fn sanitize_artifact_filename(name: &str) -> String {
         .to_string()
 }
 
+/// Shared scan workspace utilities for scanners that need to write artifact
+/// content to disk, optionally extract archives, and clean up after scanning.
+pub(crate) struct ScanWorkspace;
+
+impl ScanWorkspace {
+    /// Build the workspace directory path for a given artifact, using an
+    /// optional prefix to distinguish different scanner types.
+    pub fn workspace_dir(base: &str, prefix: Option<&str>, artifact: &Artifact) -> PathBuf {
+        let dir_name = match prefix {
+            Some(p) => format!("{}-{}", p, artifact.id),
+            None => artifact.id.to_string(),
+        };
+        Path::new(base).join(dir_name)
+    }
+
+    /// Prepare the scan workspace: create directories, write artifact content,
+    /// and optionally extract archives. Returns the workspace path.
+    pub async fn prepare(
+        base: &str,
+        prefix: Option<&str>,
+        artifact: &Artifact,
+        content: &Bytes,
+    ) -> Result<PathBuf> {
+        let workspace = Self::workspace_dir(base, prefix, artifact);
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
+
+        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
+        let safe_filename = sanitize_artifact_filename(original_filename);
+        let artifact_path = workspace.join(&safe_filename);
+
+        tokio::fs::write(&artifact_path, content)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to write artifact to workspace: {}", e))
+            })?;
+
+        if Self::is_archive(original_filename) {
+            if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
+                warn!(
+                    "Failed to extract archive {}: {}. Scanning raw file instead.",
+                    artifact.name, e
+                );
+            }
+        }
+
+        Ok(workspace)
+    }
+
+    /// Clean up the scan workspace directory, logging warnings on failure.
+    pub async fn cleanup(base: &str, prefix: Option<&str>, artifact: &Artifact) {
+        let workspace = Self::workspace_dir(base, prefix, artifact);
+        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
+            warn!(
+                "Failed to clean up scan workspace {}: {}",
+                workspace.display(),
+                e
+            );
+        }
+    }
+
+    /// Check if the file is an extractable archive.
+    pub fn is_archive(name: &str) -> bool {
+        let lower = name.to_lowercase();
+        lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".whl")
+            || lower.ends_with(".jar")
+            || lower.ends_with(".war")
+            || lower.ends_with(".ear")
+            || lower.ends_with(".gem")
+            || lower.ends_with(".crate")
+            || lower.ends_with(".nupkg")
+            || lower.ends_with(".zip")
+            || lower.ends_with(".egg")
+    }
+
+    /// Extract an archive file into the given directory using system tools.
+    pub async fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
+        let name = archive_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+
+        let src = archive_path.to_string_lossy();
+        let dst = dest.to_string_lossy();
+
+        let output =
+            if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
+                tokio::process::Command::new("tar")
+                    .args(["xzf", &src, "-C", &dst])
+                    .output()
+                    .await
+            } else if name.ends_with(".zip")
+                || name.ends_with(".whl")
+                || name.ends_with(".jar")
+                || name.ends_with(".war")
+                || name.ends_with(".ear")
+                || name.ends_with(".nupkg")
+                || name.ends_with(".egg")
+            {
+                tokio::process::Command::new("unzip")
+                    .args(["-o", "-q", &src, "-d", &dst])
+                    .output()
+                    .await
+            } else if name.ends_with(".gem") {
+                tokio::process::Command::new("tar")
+                    .args(["xf", &src, "-C", &dst])
+                    .output()
+                    .await
+            } else {
+                return Ok(());
+            };
+
+        match output {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(AppError::Internal(format!(
+                "Archive extraction failed (exit {}): {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            ))),
+            Err(e) => Err(AppError::Internal(format!(
+                "Failed to execute extraction command: {}",
+                e
+            ))),
+        }
+    }
+}
+
+/// Handle a scan step failure: log a warning, clean up the workspace, and
+/// return an `AppError::Internal` with a formatted message.
+///
+/// Use this in `Scanner::scan()` implementations to avoid repeating the
+/// warn-cleanup-return-Err pattern in every error branch.
+pub(crate) async fn fail_scan(
+    scanner_label: &str,
+    artifact: &Artifact,
+    error: &AppError,
+    workspace_base: &str,
+    workspace_prefix: Option<&str>,
+) -> AppError {
+    let msg = format!("{} failed for {}: {}", scanner_label, artifact.name, error);
+    warn!("{}", msg);
+    ScanWorkspace::cleanup(workspace_base, workspace_prefix, artifact).await;
+    AppError::Internal(msg)
+}
+
+/// Convert a Trivy report into `RawFinding` values. Shared by all scanners
+/// that consume Trivy JSON output (trivy_fs_scanner, incus_scanner,
+/// image_scanner).
+pub(crate) fn convert_trivy_findings(
+    report: &crate::services::image_scanner::TrivyReport,
+    source_label: &str,
+) -> Vec<RawFinding> {
+    report
+        .results
+        .iter()
+        .flat_map(|result| {
+            result
+                .vulnerabilities
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(move |vuln| RawFinding {
+                    severity: Severity::from_str_loose(&vuln.severity).unwrap_or(Severity::Info),
+                    title: vuln.title.clone().unwrap_or_else(|| {
+                        format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
+                    }),
+                    description: vuln.description.clone(),
+                    cve_id: Some(vuln.vulnerability_id.clone()),
+                    affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
+                    affected_version: Some(vuln.installed_version.clone()),
+                    fixed_version: vuln.fixed_version.clone(),
+                    source: Some(source_label.to_string()),
+                    source_url: vuln.primary_url.clone(),
+                })
+        })
+        .collect()
+}
+
 /// Extract a tar.gz archive into `target_dir` while guarding against tar-slip
 /// attacks: symlinks, hardlinks, and paths that escape the target directory
 /// via `..` components are silently skipped.
@@ -1371,6 +1553,54 @@ impl ScannerService {
     }
 }
 
+/// Test helpers shared across scanner test modules to avoid duplicating
+/// Artifact construction in every scanner file.
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use crate::models::artifact::Artifact;
+
+    /// Create a minimal Artifact for unit tests. Fields not relevant to a
+    /// specific test use sensible defaults.
+    pub fn make_test_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
+        Artifact {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            path: path.to_string(),
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1000,
+            checksum_sha256: "abc123".to_string(),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: content_type.to_string(),
+            storage_key: "test-key".to_string(),
+            is_deleted: false,
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Assert that a scan result is an error containing the expected label.
+    pub fn assert_scan_failed(
+        result: &crate::error::Result<Vec<crate::models::security::RawFinding>>,
+        expected_label: &str,
+    ) {
+        assert!(
+            result.is_err(),
+            "scan() must return Err, not Ok(vec![]), when {} fails",
+            expected_label
+        );
+        let err_msg = result.as_ref().unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&format!("{} failed", expected_label)),
+            "error message should contain '{} failed', got: {}",
+            expected_label,
+            err_msg
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1547,6 +1777,28 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ScanWorkspace::is_archive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_workspace_is_archive() {
+        assert!(ScanWorkspace::is_archive("foo.tar.gz"));
+        assert!(ScanWorkspace::is_archive("foo.tgz"));
+        assert!(ScanWorkspace::is_archive("foo.whl"));
+        assert!(ScanWorkspace::is_archive("foo.jar"));
+        assert!(ScanWorkspace::is_archive("foo.zip"));
+        assert!(ScanWorkspace::is_archive("foo.gem"));
+        assert!(ScanWorkspace::is_archive("foo.crate"));
+        assert!(ScanWorkspace::is_archive("foo.nupkg"));
+        assert!(ScanWorkspace::is_archive("foo.war"));
+        assert!(ScanWorkspace::is_archive("foo.ear"));
+        assert!(ScanWorkspace::is_archive("foo.egg"));
+        assert!(!ScanWorkspace::is_archive("Cargo.lock"));
+        assert!(!ScanWorkspace::is_archive("package.json"));
+        assert!(!ScanWorkspace::is_archive("foo.rs"));
     }
 
     // -----------------------------------------------------------------------

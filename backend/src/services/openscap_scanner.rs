@@ -15,7 +15,9 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{sanitize_artifact_filename, Scanner};
+use crate::services::scanner_service::{
+    fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
+};
 
 // ---------------------------------------------------------------------------
 // OpenSCAP wrapper JSON response structures
@@ -90,17 +92,15 @@ impl OpenScapScanner {
         is_container || is_rpm || is_deb
     }
 
-    fn workspace_dir(&self, artifact: &Artifact) -> PathBuf {
-        Path::new(&self.scan_workspace).join(format!("openscap-{}", artifact.id))
-    }
-
+    /// Prepare the scan workspace: create directory and write artifact content.
+    /// OpenSCAP does not extract archives (it scans the raw package).
     async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
-        let workspace = self.workspace_dir(artifact);
+        let workspace =
+            ScanWorkspace::workspace_dir(&self.scan_workspace, Some("openscap"), artifact);
         tokio::fs::create_dir_all(&workspace)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
 
-        // Sanitize the filename to its basename to prevent path traversal
         let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
         let artifact_path = workspace.join(&safe_filename);
@@ -112,17 +112,6 @@ impl OpenScapScanner {
             })?;
 
         Ok(workspace)
-    }
-
-    async fn cleanup_workspace(&self, artifact: &Artifact) {
-        let workspace = self.workspace_dir(artifact);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-            warn!(
-                "Failed to clean up scan workspace {}: {}",
-                workspace.display(),
-                e
-            );
-        }
     }
 
     async fn call_openscap(&self, workspace: &Path) -> Result<OpenScapResponse> {
@@ -214,12 +203,14 @@ impl Scanner for OpenScapScanner {
         let response = match self.call_openscap(&workspace).await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!(
-                    "OpenSCAP scan failed for {}: {}. Returning empty findings.",
-                    artifact.name, e
-                );
-                self.cleanup_workspace(artifact).await;
-                return Ok(vec![]);
+                return Err(fail_scan(
+                    "OpenSCAP scan",
+                    artifact,
+                    &e,
+                    &self.scan_workspace,
+                    Some("openscap"),
+                )
+                .await);
             }
         };
 
@@ -235,7 +226,7 @@ impl Scanner for OpenScapScanner {
             findings.len()
         );
 
-        self.cleanup_workspace(artifact).await;
+        ScanWorkspace::cleanup(&self.scan_workspace, Some("openscap"), artifact).await;
 
         Ok(findings)
     }
@@ -244,32 +235,11 @@ impl Scanner for OpenScapScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use uuid::Uuid;
-
-    fn make_artifact(name: &str, content_type: &str, path: &str) -> Artifact {
-        Artifact {
-            id: Uuid::new_v4(),
-            repository_id: Uuid::new_v4(),
-            path: path.to_string(),
-            name: name.to_string(),
-            version: None,
-            size_bytes: 0,
-            checksum_sha256: String::new(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: content_type.to_string(),
-            storage_key: String::new(),
-            is_deleted: false,
-            uploaded_by: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
+    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
     #[test]
     fn test_is_applicable_rpm() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "nginx-1.24.0-1.el9.x86_64.rpm",
             "application/x-rpm",
             "rpm/nginx/nginx-1.24.0-1.el9.x86_64.rpm",
@@ -279,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_is_applicable_deb() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "nginx_1.24.0-1_amd64.deb",
             "application/vnd.debian.binary-package",
             "deb/nginx/nginx_1.24.0-1_amd64.deb",
@@ -289,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_is_applicable_container() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "myapp",
             "application/vnd.oci.image.manifest.v1+json",
             "v2/myapp/manifests/latest",
@@ -299,13 +269,13 @@ mod tests {
 
     #[test]
     fn test_not_applicable_jar() {
-        let artifact = make_artifact("app.jar", "application/java-archive", "maven/app.jar");
+        let artifact = make_test_artifact("app.jar", "application/java-archive", "maven/app.jar");
         assert!(!OpenScapScanner::is_applicable(&artifact));
     }
 
     #[test]
     fn test_not_applicable_npm() {
-        let artifact = make_artifact(
+        let artifact = make_test_artifact(
             "prelaunch-test-0.1.0.tgz",
             "application/gzip",
             "npm/prelaunch-npm/prelaunch-test/-/prelaunch-test-0.1.0.tgz",
@@ -356,5 +326,28 @@ mod tests {
         );
         assert_eq!(findings[0].source_url, Some("CCE-27286-2".to_string()));
         assert_eq!(findings[1].severity, Severity::Medium);
+    }
+
+    /// When the OpenSCAP sidecar is unreachable, the scanner must return Err
+    /// so the orchestrator records the scan as failed. Previously it returned
+    /// Ok(vec![]), making the artifact appear clean.
+    #[tokio::test]
+    async fn test_scan_returns_error_when_sidecar_unreachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            // Port 0 ensures the connection will be refused
+            "http://localhost:0".to_string(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let artifact = make_test_artifact(
+            "nginx-1.24.0-1.el9.x86_64.rpm",
+            "application/x-rpm",
+            "rpm/nginx/1.24.0/nginx-1.24.0-1.el9.x86_64.rpm",
+        );
+        let content = bytes::Bytes::from_static(b"fake rootfs tarball");
+
+        let result = scanner.scan(&artifact, None, &content).await;
+        assert_scan_failed(&result, "OpenSCAP scan");
     }
 }

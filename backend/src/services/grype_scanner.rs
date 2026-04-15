@@ -6,13 +6,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use std::path::Path;
+use tracing::info;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{sanitize_artifact_filename, Scanner};
+use crate::services::scanner_service::{fail_scan, ScanWorkspace, Scanner};
 
 // ---------------------------------------------------------------------------
 // Grype JSON output structures
@@ -71,136 +71,6 @@ pub struct GrypeScanner {
 impl GrypeScanner {
     pub fn new(scan_workspace: String) -> Self {
         Self { scan_workspace }
-    }
-
-    /// Build the workspace directory path for a given artifact.
-    fn workspace_dir(&self, artifact: &Artifact) -> PathBuf {
-        Path::new(&self.scan_workspace).join(artifact.id.to_string())
-    }
-
-    /// Prepare the scan workspace: write artifact content and extract archives.
-    async fn prepare_workspace(&self, artifact: &Artifact, content: &Bytes) -> Result<PathBuf> {
-        let workspace = self.workspace_dir(artifact);
-        tokio::fs::create_dir_all(&workspace)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to create scan workspace: {}", e)))?;
-
-        // Use the original filename from the path (last segment) for correct extension detection,
-        // then sanitize to basename to prevent path traversal
-        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
-        let safe_filename = sanitize_artifact_filename(original_filename);
-        let artifact_path = workspace.join(&safe_filename);
-
-        tokio::fs::write(&artifact_path, content)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to write artifact to workspace: {}", e))
-            })?;
-
-        // Extract archives into the workspace directory
-        if Self::is_archive(original_filename) {
-            if let Err(e) = Self::extract_archive(&artifact_path, &workspace).await {
-                warn!(
-                    "Failed to extract archive {}: {}. Scanning raw file instead.",
-                    artifact.name, e
-                );
-            }
-        }
-
-        Ok(workspace)
-    }
-
-    /// Check if the file is an extractable archive.
-    fn is_archive(name: &str) -> bool {
-        let lower = name.to_lowercase();
-        lower.ends_with(".tar.gz")
-            || lower.ends_with(".tgz")
-            || lower.ends_with(".whl")
-            || lower.ends_with(".jar")
-            || lower.ends_with(".war")
-            || lower.ends_with(".ear")
-            || lower.ends_with(".gem")
-            || lower.ends_with(".crate")
-            || lower.ends_with(".nupkg")
-            || lower.ends_with(".zip")
-            || lower.ends_with(".egg")
-    }
-
-    /// Extract an archive file into the given directory using system tools.
-    async fn extract_archive(archive_path: &Path, dest: &Path) -> Result<()> {
-        let name = archive_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-
-        let output =
-            if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
-                tokio::process::Command::new("tar")
-                    .args([
-                        "xzf",
-                        &archive_path.to_string_lossy(),
-                        "-C",
-                        &dest.to_string_lossy(),
-                    ])
-                    .output()
-                    .await
-            } else if name.ends_with(".zip")
-                || name.ends_with(".whl")
-                || name.ends_with(".jar")
-                || name.ends_with(".war")
-                || name.ends_with(".ear")
-                || name.ends_with(".nupkg")
-                || name.ends_with(".egg")
-            {
-                tokio::process::Command::new("unzip")
-                    .args([
-                        "-o",
-                        "-q",
-                        &archive_path.to_string_lossy(),
-                        "-d",
-                        &dest.to_string_lossy(),
-                    ])
-                    .output()
-                    .await
-            } else if name.ends_with(".gem") {
-                tokio::process::Command::new("tar")
-                    .args([
-                        "xf",
-                        &archive_path.to_string_lossy(),
-                        "-C",
-                        &dest.to_string_lossy(),
-                    ])
-                    .output()
-                    .await
-            } else {
-                return Ok(());
-            };
-
-        match output {
-            Ok(o) if o.status.success() => Ok(()),
-            Ok(o) => Err(AppError::Internal(format!(
-                "Archive extraction failed (exit {}): {}",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            ))),
-            Err(e) => Err(AppError::Internal(format!(
-                "Failed to execute extraction command: {}",
-                e
-            ))),
-        }
-    }
-
-    /// Clean up the scan workspace directory.
-    async fn cleanup_workspace(&self, artifact: &Artifact) {
-        let workspace = self.workspace_dir(artifact);
-        if let Err(e) = tokio::fs::remove_dir_all(&workspace).await {
-            warn!(
-                "Failed to clean up scan workspace {}: {}",
-                workspace.display(),
-                e
-            );
-        }
     }
 
     /// Run grype against the workspace directory.
@@ -285,18 +155,15 @@ impl Scanner for GrypeScanner {
             artifact.name, artifact.id
         );
 
-        // Prepare workspace with artifact content
-        let workspace = self.prepare_workspace(artifact, content).await?;
+        let workspace =
+            ScanWorkspace::prepare(&self.scan_workspace, None, artifact, content).await?;
 
         let report = match self.run_grype(&workspace).await {
             Ok(report) => report,
             Err(e) => {
-                warn!(
-                    "Grype scan failed for {}: {}. Returning empty findings.",
-                    artifact.name, e
+                return Err(
+                    fail_scan("Grype scan", artifact, &e, &self.scan_workspace, None).await,
                 );
-                self.cleanup_workspace(artifact).await;
-                return Ok(vec![]);
             }
         };
 
@@ -308,8 +175,7 @@ impl Scanner for GrypeScanner {
             findings.len()
         );
 
-        // Clean up workspace
-        self.cleanup_workspace(artifact).await;
+        ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
 
         Ok(findings)
     }
@@ -318,40 +184,10 @@ impl Scanner for GrypeScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
-    #[allow(dead_code)]
     fn make_artifact(name: &str, content_type: &str) -> Artifact {
-        Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: format!("test/{}", name),
-            name: name.to_string(),
-            version: Some("1.0.0".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: content_type.to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn test_is_archive() {
-        assert!(GrypeScanner::is_archive("foo.tar.gz"));
-        assert!(GrypeScanner::is_archive("foo.tgz"));
-        assert!(GrypeScanner::is_archive("foo.whl"));
-        assert!(GrypeScanner::is_archive("foo.jar"));
-        assert!(GrypeScanner::is_archive("foo.zip"));
-        assert!(GrypeScanner::is_archive("foo.gem"));
-        assert!(GrypeScanner::is_archive("foo.crate"));
-        assert!(GrypeScanner::is_archive("foo.nupkg"));
-        assert!(!GrypeScanner::is_archive("Cargo.lock"));
-        assert!(!GrypeScanner::is_archive("package.json"));
+        make_test_artifact(name, content_type, &format!("test/{}", name))
     }
 
     #[test]
@@ -436,6 +272,37 @@ mod tests {
         let report = GrypeReport { matches: vec![] };
         let findings = GrypeScanner::convert_findings(&report);
         assert!(findings.is_empty());
+    }
+
+    /// Scan failures (workspace creation, missing grype binary) must
+    /// propagate as Err, never as Ok(vec![]).
+    #[tokio::test]
+    async fn test_scan_propagates_errors() {
+        let artifact = make_artifact("pkg-1.0.0.tar.gz", "application/gzip");
+        let content = Bytes::from_static(b"not a real archive");
+
+        // Impossible workspace path
+        let bad_ws = GrypeScanner::new("/dev/null/impossible-workspace".to_string());
+        assert!(
+            bad_ws.scan(&artifact, None, &content).await.is_err(),
+            "scan() must return Err when workspace creation fails"
+        );
+
+        // Missing grype binary (skip if grype is installed)
+        if std::process::Command::new("grype")
+            .arg("version")
+            .output()
+            .is_ok()
+        {
+            eprintln!("grype is installed, skipping unavailable-grype test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let no_grype = GrypeScanner::new(dir.path().to_string_lossy().to_string());
+        assert_scan_failed(
+            &no_grype.scan(&artifact, None, &content).await,
+            "Grype scan",
+        );
     }
 
     #[test]
