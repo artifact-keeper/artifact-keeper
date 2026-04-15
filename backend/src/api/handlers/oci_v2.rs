@@ -90,6 +90,17 @@ fn unauthorized_challenge(host: &str) -> Response {
 // Auth helpers
 // ---------------------------------------------------------------------------
 
+/// Sentinel value returned by the token endpoint when no credentials are
+/// supplied.  Read handlers accept this token and grant access only when
+/// the target repository is marked as public.
+const ANONYMOUS_TOKEN: &str = "anonymous";
+
+/// Returns `true` when the bearer token is the anonymous pull token issued
+/// to unauthenticated Docker clients.
+fn is_anonymous_token(headers: &HeaderMap) -> bool {
+    extract_bearer_token(headers).as_deref() == Some(ANONYMOUS_TOKEN)
+}
+
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(AUTHORIZATION)
@@ -160,6 +171,7 @@ struct OciRepoInfo {
     location: crate::storage::StorageLocation,
     repo_type: String,
     upstream_url: Option<String>,
+    is_public: bool,
     image: String,
 }
 
@@ -176,7 +188,7 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
 
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, repo_type::text as repo_type, \
-         upstream_url FROM repositories WHERE key = $1",
+         upstream_url, is_public FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
     .fetch_optional(db)
@@ -207,6 +219,7 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
         location,
         repo_type: repo.try_get("repo_type").unwrap_or_default(),
         upstream_url: repo.try_get("upstream_url").ok(),
+        is_public: repo.try_get("is_public").unwrap_or(false),
         image: image.to_string(),
     })
 }
@@ -359,11 +372,22 @@ async fn token(
                     .body(Body::from(serde_json::to_string(&resp).unwrap()))
                     .unwrap();
             }
-            return oci_error(
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHORIZED",
-                "credentials required",
-            );
+
+            // No credentials and no existing token. Issue an anonymous pull
+            // token so that unauthenticated Docker clients can pull from public
+            // repositories. The token carries no identity; read handlers check
+            // repository visibility before granting access.
+            let resp = TokenResponse {
+                token: ANONYMOUS_TOKEN.to_string(),
+                access_token: ANONYMOUS_TOKEN.to_string(),
+                expires_in: 900,
+                issued_at: chrono::Utc::now().to_rfc3339(),
+            };
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&resp).unwrap()))
+                .unwrap();
         }
     };
 
@@ -527,16 +551,20 @@ async fn handle_head_blob(
     digest: &str,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
-    };
-    let _ = claims;
+    let is_anon = is_anonymous_token(headers);
+    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
+        return unauthorized_challenge(&host);
+    }
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
+
+    // Anonymous tokens may only access public repositories.
+    if is_anon && !repo.is_public {
+        return unauthorized_challenge(&host);
+    }
 
     // Check oci_blobs table
     let blob = sqlx::query!(
@@ -592,16 +620,20 @@ async fn handle_get_blob(
     digest: &str,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
-    };
-    let _ = claims;
+    let is_anon = is_anonymous_token(headers);
+    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
+        return unauthorized_challenge(&host);
+    }
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
+
+    // Anonymous tokens may only access public repositories.
+    if is_anon && !repo.is_public {
+        return unauthorized_challenge(&host);
+    }
 
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
@@ -1025,16 +1057,20 @@ async fn handle_head_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
-    };
-    let _ = claims;
+    let is_anon = is_anonymous_token(headers);
+    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
+        return unauthorized_challenge(&host);
+    }
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
+
+    // Anonymous tokens may only access public repositories.
+    if is_anon && !repo.is_public {
+        return unauthorized_challenge(&host);
+    }
 
     // Reference can be a tag or a digest. Look up locally first.
     let local_result: Option<(String, String)> = if reference.starts_with("sha256:") {
@@ -1111,16 +1147,20 @@ async fn handle_get_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
-        Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
-    };
-    let _ = claims;
+    let is_anon = is_anonymous_token(headers);
+    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
+        return unauthorized_challenge(&host);
+    }
 
     let repo = match resolve_repo(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
+
+    // Anonymous tokens may only access public repositories.
+    if is_anon && !repo.is_public {
+        return unauthorized_challenge(&host);
+    }
 
     let local_result: Option<(String, String)> = if reference.starts_with("sha256:") {
         sqlx::query!(
@@ -2127,6 +2167,7 @@ mod tests {
             },
             repo_type: repo_type.to_string(),
             upstream_url: upstream_url.map(String::from),
+            is_public: false,
             image: image.to_string(),
         }
     }
@@ -2232,5 +2273,75 @@ mod tests {
             super::normalize_docker_image("nginx", "https://docker.io"),
             "library/nginx"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ANONYMOUS_TOKEN constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anonymous_token_is_non_empty() {
+        assert!(!ANONYMOUS_TOKEN.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_anonymous_token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_anonymous_token_with_anonymous_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer anonymous"));
+        assert!(is_anonymous_token(&headers));
+    }
+
+    #[test]
+    fn test_is_anonymous_token_with_real_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.test"),
+        );
+        assert!(!is_anonymous_token(&headers));
+    }
+
+    #[test]
+    fn test_is_anonymous_token_no_header() {
+        let headers = HeaderMap::new();
+        assert!(!is_anonymous_token(&headers));
+    }
+
+    #[test]
+    fn test_is_anonymous_token_basic_auth() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert!(!is_anonymous_token(&headers));
+    }
+
+    #[test]
+    fn test_is_anonymous_token_lowercase_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("bearer anonymous"));
+        assert!(is_anonymous_token(&headers));
+    }
+
+    // -----------------------------------------------------------------------
+    // OciRepoInfo.is_public field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_oci_repo_info_default_not_public() {
+        let info = make_repo_info("docker-local", "local", None, "myapp");
+        assert!(!info.is_public);
+    }
+
+    #[test]
+    fn test_oci_repo_info_public_flag() {
+        let mut info = make_repo_info("docker-pub", "local", None, "myapp");
+        info.is_public = true;
+        assert!(info.is_public);
     }
 }
