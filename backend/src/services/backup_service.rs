@@ -102,11 +102,11 @@ const ALLOWED_EXPORT_TABLES: &[&str] = &[
     "users",
     "repositories",
     "artifacts",
-    "download_stats",
+    "download_statistics",
     "api_tokens",
     "roles",
     "user_roles",
-    "repository_permissions",
+    "permission_grants",
 ];
 
 /// Validate that a table name is in the export allowlist.
@@ -290,11 +290,11 @@ impl BackupService {
                 "users",
                 "repositories",
                 "artifacts",
-                "download_stats",
+                "download_statistics",
                 "api_tokens",
                 "roles",
                 "user_roles",
-                "repository_permissions",
+                "permission_grants",
             ];
 
             for table in &tables {
@@ -525,9 +525,9 @@ impl BackupService {
                 "roles",
                 "user_roles",
                 "repositories",
-                "repository_permissions",
+                "permission_grants",
                 "artifacts",
-                "download_stats",
+                "download_statistics",
                 "api_tokens",
             ];
 
@@ -1075,5 +1075,65 @@ mod tests {
     fn test_validate_export_table_case_sensitive() {
         // "Users" (capital) should not match "users"
         assert!(validate_export_table("Users").is_err());
+    }
+
+    /// Regression test for #736: the table is "download_statistics", not "download_stats".
+    #[test]
+    fn test_allowed_tables_uses_download_statistics() {
+        assert!(
+            ALLOWED_EXPORT_TABLES.contains(&"download_statistics"),
+            "ALLOWED_EXPORT_TABLES must reference 'download_statistics' (the actual table name)"
+        );
+        assert!(
+            !ALLOWED_EXPORT_TABLES.contains(&"download_stats"),
+            "ALLOWED_EXPORT_TABLES must not reference 'download_stats' (incorrect table name)"
+        );
+    }
+
+    /// Regression test for #742: the table is "permission_grants" (migration 002),
+    /// not "repository_permissions" which does not exist in any migration.
+    #[test]
+    fn test_allowed_tables_uses_permission_grants() {
+        assert!(
+            ALLOWED_EXPORT_TABLES.contains(&"permission_grants"),
+            "ALLOWED_EXPORT_TABLES must reference 'permission_grants' (the actual table name from migration 002)"
+        );
+        assert!(
+            !ALLOWED_EXPORT_TABLES.contains(&"repository_permissions"),
+            "ALLOWED_EXPORT_TABLES must not reference 'repository_permissions' (non-existent table)"
+        );
+    }
+
+    /// Verify every table in ALLOWED_EXPORT_TABLES is a known migration table.
+    /// This prevents future mismatches by listing all valid tables.
+    #[test]
+    fn test_allowed_tables_are_all_known_migration_tables() {
+        // Tables created by migrations (only those relevant to backup)
+        let known_migration_tables: &[&str] = &[
+            "users",
+            "roles",
+            "user_roles",
+            "permission_grants",
+            "role_assignments",
+            "repositories",
+            "artifacts",
+            "artifact_metadata",
+            "download_statistics",
+            "audit_log",
+            "api_tokens",
+            "backups",
+            "plugins",
+            "webhooks",
+            "permissions",
+            "groups",
+        ];
+
+        for table in ALLOWED_EXPORT_TABLES {
+            assert!(
+                known_migration_tables.contains(table),
+                "ALLOWED_EXPORT_TABLES entry '{}' is not a known migration table",
+                table
+            );
+        }
     }
 }
