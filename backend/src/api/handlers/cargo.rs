@@ -29,6 +29,7 @@ use tracing::info;
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers;
 use crate::api::middleware::auth::{require_auth_with_bearer_fallback, AuthExtension};
+use crate::api::validation::validate_outbound_url;
 use crate::api::SharedState;
 use crate::api::{CachedRepo, IndexCache, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::error::AppError;
@@ -794,6 +795,11 @@ async fn download(
                     {
                         Some(dl_url) => {
                             let full = build_download_url(&dl_url, &name_lower, &version);
+                            // Validate the resolved download URL against SSRF.
+                            // A malicious upstream config.json could set `dl` to
+                            // a cloud metadata endpoint or internal service URL.
+                            validate_outbound_url(&full, "Cargo upstream download URL")
+                                .map_err(|e| e.into_response())?;
                             split_url(&full)
                                 .unwrap_or_else(|| (upstream_url.clone(), fallback_path.clone()))
                         }
@@ -2741,6 +2747,51 @@ mod tests {
         assert_eq!(
             full_fallback,
             "https://index.crates.io/api/v1/crates/serde/1.0.0/download"
+        );
+    }
+
+    #[test]
+    fn test_build_download_url_rejects_internal_addresses() {
+        use crate::api::validation::validate_outbound_url;
+
+        // Cloud metadata endpoint (AWS IMDSv1)
+        let dl = "http://169.254.169.254/latest/meta-data/";
+        let url = build_download_url(dl, "evil", "1.0.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "cloud metadata URL should be rejected"
+        );
+
+        // Localhost
+        let dl = "http://localhost:8080/evil";
+        let url = build_download_url(dl, "crate", "0.1.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "localhost URL should be rejected"
+        );
+
+        // Private network (10.x)
+        let dl = "http://10.0.0.1/packages";
+        let url = build_download_url(dl, "crate", "0.1.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "private network URL should be rejected"
+        );
+
+        // Docker-internal service name
+        let dl = "http://backend:8080/internal";
+        let url = build_download_url(dl, "crate", "0.1.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
+            "Docker-internal service URL should be rejected"
+        );
+
+        // Legitimate external URL should pass
+        let dl = "https://crates.io/api/v1/crates";
+        let url = build_download_url(dl, "serde", "1.0.0");
+        assert!(
+            validate_outbound_url(&url, "Cargo upstream download URL").is_ok(),
+            "legitimate external URL should be accepted"
         );
     }
 }
