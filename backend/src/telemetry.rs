@@ -38,44 +38,6 @@ impl OtlpProtocol {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_protocol_defaults_to_grpc_for_empty_string() {
-        assert_eq!(OtlpProtocol::from_value(""), OtlpProtocol::Grpc);
-    }
-
-    #[test]
-    fn test_protocol_accepts_http_protobuf_variants() {
-        for val in [
-            "http/protobuf",
-            "http-protobuf",
-            "http_protobuf",
-            "HTTP/PROTOBUF",
-        ] {
-            assert_eq!(
-                OtlpProtocol::from_value(val),
-                OtlpProtocol::HttpProtobuf,
-                "failed for {val}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_protocol_grpc_explicit() {
-        assert_eq!(OtlpProtocol::from_value("grpc"), OtlpProtocol::Grpc);
-        assert_eq!(OtlpProtocol::from_value("GRPC"), OtlpProtocol::Grpc);
-    }
-
-    #[test]
-    fn test_protocol_unrecognized_falls_back_to_grpc() {
-        assert_eq!(OtlpProtocol::from_value("http/json"), OtlpProtocol::Grpc);
-        assert_eq!(OtlpProtocol::from_value("bogus"), OtlpProtocol::Grpc);
-    }
-}
-
 /// Initialize the tracing subscriber.
 ///
 /// Returns an optional guard that must be held for the lifetime of the
@@ -171,4 +133,42 @@ fn init_with_otel(
         .init();
 
     OtelGuard { provider }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_protocol_defaults_to_grpc_for_empty_string() {
+        assert_eq!(OtlpProtocol::from_value(""), OtlpProtocol::Grpc);
+    }
+
+    #[test]
+    fn test_protocol_accepts_http_protobuf_variants() {
+        for val in [
+            "http/protobuf",
+            "http-protobuf",
+            "http_protobuf",
+            "HTTP/PROTOBUF",
+        ] {
+            assert_eq!(
+                OtlpProtocol::from_value(val),
+                OtlpProtocol::HttpProtobuf,
+                "failed for {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_grpc_explicit() {
+        assert_eq!(OtlpProtocol::from_value("grpc"), OtlpProtocol::Grpc);
+        assert_eq!(OtlpProtocol::from_value("GRPC"), OtlpProtocol::Grpc);
+    }
+
+    #[test]
+    fn test_protocol_unrecognized_falls_back_to_grpc() {
+        assert_eq!(OtlpProtocol::from_value("http/json"), OtlpProtocol::Grpc);
+        assert_eq!(OtlpProtocol::from_value("bogus"), OtlpProtocol::Grpc);
+    }
 }
