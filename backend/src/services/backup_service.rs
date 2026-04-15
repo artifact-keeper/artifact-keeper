@@ -102,7 +102,7 @@ const ALLOWED_EXPORT_TABLES: &[&str] = &[
     "users",
     "repositories",
     "artifacts",
-    "download_stats",
+    "download_statistics",
     "api_tokens",
     "roles",
     "user_roles",
@@ -290,7 +290,7 @@ impl BackupService {
                 "users",
                 "repositories",
                 "artifacts",
-                "download_stats",
+                "download_statistics",
                 "api_tokens",
                 "roles",
                 "user_roles",
@@ -527,7 +527,7 @@ impl BackupService {
                 "repositories",
                 "repository_permissions",
                 "artifacts",
-                "download_stats",
+                "download_statistics",
                 "api_tokens",
             ];
 
@@ -1075,5 +1075,18 @@ mod tests {
     fn test_validate_export_table_case_sensitive() {
         // "Users" (capital) should not match "users"
         assert!(validate_export_table("Users").is_err());
+    }
+
+    /// Regression test for #736: the table is "download_statistics", not "download_stats".
+    #[test]
+    fn test_allowed_tables_uses_download_statistics() {
+        assert!(
+            ALLOWED_EXPORT_TABLES.contains(&"download_statistics"),
+            "ALLOWED_EXPORT_TABLES must reference 'download_statistics' (the actual table name)"
+        );
+        assert!(
+            !ALLOWED_EXPORT_TABLES.contains(&"download_stats"),
+            "ALLOWED_EXPORT_TABLES must not reference 'download_stats' (incorrect table name)"
+        );
     }
 }
