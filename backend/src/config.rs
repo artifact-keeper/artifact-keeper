@@ -317,7 +317,89 @@ redacted_debug!(Config {
     show smtp_tls_mode,
 });
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            database_url: String::new(),
+            bind_address: "0.0.0.0:8080".into(),
+            log_level: "info".into(),
+            storage_backend: "filesystem".into(),
+            storage_path: "/tmp/artifact-keeper-test".into(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/tmp/scan-workspace".into(),
+            demo_mode: false,
+            peer_instance_name: "test-instance".into(),
+            peer_public_endpoint: "http://localhost:8080".into(),
+            peer_api_key: "test-peer-api-key".into(),
+            dependency_track_url: None,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "artifact-keeper".into(),
+            gc_schedule: "0 0 * * * *".into(),
+            lifecycle_check_interval_secs: 60,
+            max_upload_size_bytes: 10_737_418_240,
+            allow_local_admin_login: false,
+            metrics_port: None,
+            database_max_connections: 20,
+            database_min_connections: 5,
+            database_acquire_timeout_secs: 30,
+            database_idle_timeout_secs: 600,
+            database_max_lifetime_secs: 1800,
+            rate_limit_auth_per_window: 120,
+            rate_limit_api_per_window: 10000,
+            rate_limit_window_secs: 60,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
+            account_lockout_threshold: 5,
+            account_lockout_duration_minutes: 30,
+            quarantine_enabled: false,
+            quarantine_duration_minutes: 60,
+            password_history_count: 0,
+            password_expiry_days: 0,
+            password_min_length: 8,
+            password_max_length: 128,
+            password_require_uppercase: false,
+            password_require_lowercase: false,
+            password_require_digit: false,
+            password_require_special: false,
+            password_min_strength: 0,
+            presigned_downloads_enabled: false,
+            presigned_download_expiry_secs: 300,
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_from_address: "noreply@artifact-keeper.local".into(),
+            smtp_tls_mode: "starttls".into(),
+        }
+    }
+}
+
 impl Config {
+    /// Return a `Config` with sensible defaults for unit tests. Equivalent to
+    /// `Config::default()` today, but kept as a named constructor so tests read
+    /// clearly and any future test-specific tweaks live in one place.
+    #[cfg(test)]
+    pub fn test_config() -> Self {
+        Self::default()
+    }
+
     /// Load configuration from environment variables
     pub fn from_env() -> Result<Self> {
         let config = Self {
@@ -522,6 +604,41 @@ mod tests {
     // Environment variable tests must be serialized because env is global state.
     // We use a mutex to prevent parallel test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    // -----------------------------------------------------------------------
+    // Default / test_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_produces_valid_config() {
+        let config = Config::default();
+        assert_eq!(config.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.storage_backend, "filesystem");
+        assert_eq!(config.jwt_expiration_secs, 86400);
+        assert_eq!(config.jwt_access_token_expiry_minutes, 30);
+        assert_eq!(config.jwt_refresh_token_expiry_days, 7);
+        assert!(!config.demo_mode);
+        assert_eq!(config.database_max_connections, 20);
+        assert_eq!(config.database_min_connections, 5);
+        assert_eq!(config.rate_limit_api_per_window, 10000);
+        assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
+        assert_eq!(config.smtp_port, 587);
+        assert_eq!(config.smtp_tls_mode, "starttls");
+    }
+
+    #[test]
+    fn test_test_config_returns_default() {
+        let from_default = Config::default();
+        let from_helper = Config::test_config();
+        // Spot-check a few fields to confirm they are the same.
+        assert_eq!(from_default.bind_address, from_helper.bind_address);
+        assert_eq!(from_default.jwt_secret, from_helper.jwt_secret);
+        assert_eq!(from_default.storage_backend, from_helper.storage_backend);
+        assert_eq!(
+            from_default.max_upload_size_bytes,
+            from_helper.max_upload_size_bytes
+        );
+    }
 
     // -----------------------------------------------------------------------
     // env_parse
