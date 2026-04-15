@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE};
 use reqwest::{Client, StatusCode};
@@ -559,25 +559,32 @@ impl ProxyService {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        let content = response
-            .bytes()
+        // Stream the response body in chunks, enforcing the size limit
+        // incrementally. This prevents unbounded memory allocation when the
+        // upstream uses chunked transfer encoding or HTTP/2 (no Content-Length).
+        let mut buf = BytesMut::new();
+        let mut response = response;
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?;
-
-        // Post-download size check (handles missing or inaccurate Content-Length)
-        if content.len() as u64 > max_size {
-            tracing::warn!(
-                url = %url,
-                actual_size = content.len(),
-                max_size,
-                "Upstream artifact body exceeds size limit after download"
-            );
-            return Err(AppError::BadGateway(format!(
-                "Upstream artifact size ({} bytes) exceeds the configured limit ({} bytes)",
-                content.len(),
-                max_size
-            )));
+            .map_err(|e| AppError::Storage(format!("Failed to read upstream response: {}", e)))?
+        {
+            buf.extend_from_slice(&chunk);
+            if buf.len() as u64 > max_size {
+                tracing::warn!(
+                    url = %url,
+                    accumulated = buf.len(),
+                    max_size,
+                    "Upstream artifact exceeds size limit during streaming download"
+                );
+                return Err(AppError::BadGateway(format!(
+                    "Upstream artifact size ({} bytes) exceeds the configured limit ({} bytes)",
+                    buf.len(),
+                    max_size
+                )));
+            }
         }
+        let content = buf.freeze();
 
         tracing::info!(
             "Fetched {} bytes from upstream (content_type: {:?}, etag: {:?})",

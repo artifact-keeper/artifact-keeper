@@ -148,6 +148,14 @@ impl IntoResponse for AppError {
             "message": message,
         }));
 
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            let mut response = (status, body).into_response();
+            response
+                .headers_mut()
+                .insert("Retry-After", axum::http::HeaderValue::from_static("5"));
+            return response;
+        }
+
         (status, body).into_response()
     }
 }
@@ -313,5 +321,20 @@ mod tests {
         let err = AppError::BadGateway("upstream failed".to_string());
         assert_eq!(err.user_message(), "upstream failed");
         assert_eq!(err.to_string(), "Bad gateway: upstream failed");
+    }
+
+    #[test]
+    fn test_service_unavailable_includes_retry_after_header() {
+        let err = AppError::ServiceUnavailable("queue full".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("Retry-After")
+                .map(|v| v.to_str().unwrap()),
+            Some("5"),
+            "503 responses must include a Retry-After header"
+        );
     }
 }
