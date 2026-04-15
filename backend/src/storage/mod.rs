@@ -109,6 +109,8 @@ pub trait StorageBackend: Send + Sync {
         use futures::StreamExt;
         use sha2::{Digest, Sha256};
 
+        tracing::debug!(key, "put_stream falling back to in-memory buffering");
+
         let mut hasher = Sha256::new();
         let mut buf = Vec::new();
         let mut total: u64 = 0;
