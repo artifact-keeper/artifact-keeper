@@ -767,6 +767,9 @@ mod tests {
             lifecycle_check_interval_secs: 60,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
+            proxy_max_concurrent_fetches: 20,
+            proxy_max_artifact_size_bytes: 2_147_483_648,
+            proxy_queue_timeout_secs: 30,
             metrics_port: None,
         }
     }

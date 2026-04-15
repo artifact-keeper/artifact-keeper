@@ -72,6 +72,9 @@ pub enum AppError {
 
     #[error("Bad gateway: {0}")]
     BadGateway(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl AppError {
@@ -98,6 +101,7 @@ impl AppError {
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
         }
     }
 
@@ -125,7 +129,8 @@ impl AppError {
             | Self::Conflict(msg)
             | Self::Validation(msg)
             | Self::QuotaExceeded(msg)
-            | Self::BadGateway(msg) => msg.clone(),
+            | Self::BadGateway(msg)
+            | Self::ServiceUnavailable(msg) => msg.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -282,6 +287,25 @@ mod tests {
             AppError::BadGateway("x".into()).status_and_code().1,
             "BAD_GATEWAY"
         );
+    }
+
+    #[test]
+    fn test_service_unavailable_status_code() {
+        assert_eq!(
+            AppError::ServiceUnavailable("x".into()).status_and_code().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            AppError::ServiceUnavailable("x".into()).status_and_code().1,
+            "SERVICE_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn test_service_unavailable_message() {
+        let err = AppError::ServiceUnavailable("queue full".to_string());
+        assert_eq!(err.user_message(), "queue full");
+        assert_eq!(err.to_string(), "Service unavailable: queue full");
     }
 
     #[test]
