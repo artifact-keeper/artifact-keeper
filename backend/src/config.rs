@@ -252,7 +252,7 @@ impl Config {
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
-            proxy_max_concurrent_fetches: env_parse("PROXY_MAX_CONCURRENT_FETCHES", 20),
+            proxy_max_concurrent_fetches: env_parse("PROXY_MAX_CONCURRENT_FETCHES", 20).max(1),
             proxy_max_artifact_size_bytes: env_parse(
                 "PROXY_MAX_ARTIFACT_SIZE_BYTES",
                 2_147_483_648_u64,
@@ -1095,6 +1095,41 @@ mod tests {
             env::set_var("PROXY_QUEUE_TIMEOUT_SECS", v);
         } else {
             env::remove_var("PROXY_QUEUE_TIMEOUT_SECS");
+        }
+    }
+
+    #[test]
+    fn test_proxy_max_concurrent_fetches_clamped_to_minimum_one() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_fetches = env::var("PROXY_MAX_CONCURRENT_FETCHES").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PROXY_MAX_CONCURRENT_FETCHES", "0");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.proxy_max_concurrent_fetches, 1,
+            "PROXY_MAX_CONCURRENT_FETCHES=0 must be clamped to 1 to avoid permanent outage"
+        );
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_fetches {
+            env::set_var("PROXY_MAX_CONCURRENT_FETCHES", v);
+        } else {
+            env::remove_var("PROXY_MAX_CONCURRENT_FETCHES");
         }
     }
 }
