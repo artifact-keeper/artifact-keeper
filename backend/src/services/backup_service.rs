@@ -302,13 +302,16 @@ impl BackupService {
                 let json_bytes = serde_json::to_vec_pretty(&json_data)?;
 
                 let mut header = tar::Header::new_gnu();
-                header.set_path(format!("database/{}.json", table))?;
                 header.set_size(json_bytes.len() as u64);
                 header.set_mode(0o644);
                 header.set_mtime(Utc::now().timestamp() as u64);
                 header.set_cksum();
 
-                tar.append(&header, json_bytes.as_slice())?;
+                tar.append_data(
+                    &mut header,
+                    format!("database/{}.json", table),
+                    json_bytes.as_slice(),
+                )?;
             }
 
             // Add artifact storage keys
@@ -320,13 +323,12 @@ impl BackupService {
             for key in storage_keys {
                 if let Ok(content) = self.storage.get(&key).await {
                     let mut header = tar::Header::new_gnu();
-                    header.set_path(format!("artifacts/{}", key))?;
                     header.set_size(content.len() as u64);
                     header.set_mode(0o644);
                     header.set_mtime(Utc::now().timestamp() as u64);
                     header.set_cksum();
 
-                    tar.append(&header, content.as_ref())?;
+                    tar.append_data(&mut header, format!("artifacts/{}", key), content.as_ref())?;
                     artifact_count += 1;
                 }
             }
@@ -345,13 +347,12 @@ impl BackupService {
 
             let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
             let mut header = tar::Header::new_gnu();
-            header.set_path("manifest.json")?;
             header.set_size(manifest_bytes.len() as u64);
             header.set_mode(0o644);
             header.set_mtime(Utc::now().timestamp() as u64);
             header.set_cksum();
 
-            tar.append(&header, manifest_bytes.as_slice())?;
+            tar.append_data(&mut header, "manifest.json", manifest_bytes.as_slice())?;
 
             tar.into_inner()?.finish()?;
         }
@@ -938,12 +939,11 @@ mod tests {
 
             for (path, data) in entries {
                 let mut header = tar::Header::new_gnu();
-                header.set_path(path).unwrap();
                 header.set_size(data.len() as u64);
                 header.set_mode(0o644);
                 header.set_mtime(0);
                 header.set_cksum();
-                tar.append(&header, *data).unwrap();
+                tar.append_data(&mut header, path, *data).unwrap();
             }
 
             tar.into_inner().unwrap().finish().unwrap();
@@ -989,6 +989,29 @@ mod tests {
     fn test_extract_entries_invalid_data() {
         let result = BackupService::extract_entries(b"not a tar gz");
         assert!(result.is_err());
+    }
+
+    /// Regression test for #758: paths longer than 100 characters caused
+    /// `set_path` to fail with "provided value is too long". Using
+    /// `append_data` writes GNU LongLink extensions for long paths.
+    #[test]
+    fn test_tar_long_path_roundtrip() {
+        let long_key = "proxy-cache/maven-test/org/springframework/boot/\
+            spring-boot-starter-parent/4.0.5/\
+            spring-boot-starter-parent-4.0.5.pom";
+        let long_path = format!("artifacts/{}", long_key);
+        assert!(
+            long_path.len() > 100,
+            "test path must exceed the 100-char POSIX tar limit"
+        );
+
+        let content = b"<project>pom content</project>";
+        let tar_data = create_test_tar_gz(&[(&long_path, content.as_slice())]);
+
+        let entries = BackupService::extract_entries(&tar_data).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0.to_string_lossy(), long_path);
+        assert_eq!(entries[0].1, content);
     }
 
     // -----------------------------------------------------------------------
