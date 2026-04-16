@@ -39,7 +39,7 @@ jobs:
 
   lint-rust:
     name: 🦀 Lint Rust
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -64,7 +64,7 @@ jobs:
 
   test-backend-unit:
     name: 🧪 Backend Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -86,7 +86,7 @@ jobs:
 
   coverage:
     name: 📊 Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     services:
       postgres:
         image: postgres:16-alpine
@@ -160,7 +160,7 @@ jobs:
 
   test-backend-integration:
     name: 🔗 Backend Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.event_name == 'push'
     services:
       postgres:
@@ -313,7 +313,7 @@ jobs:
 
   detect-changes:
     name: 🔍 Detect Changes
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     permissions:
       contents: read
       pull-requests: read
@@ -339,7 +339,7 @@ jobs:
 
   build-backend-image:
     name: 🐳 Build Backend Image
-    runs-on: ubuntu-24.04
+    runs-on: ak-ci-runners
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     steps:
@@ -390,7 +390,7 @@ jobs:
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
-    runs-on: ubuntu-24.04
+    runs-on: ak-ci-runners
     needs: detect-changes
     if: needs.detect-changes.outputs.openscap == 'true'
     steps:
@@ -452,7 +452,7 @@ jobs:
 
   ci-complete:
     name: ✅ CI Complete
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     needs: [lint-rust, test-backend-unit, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
