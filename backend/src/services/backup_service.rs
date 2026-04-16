@@ -120,6 +120,81 @@ fn validate_export_table(table: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build a tar.gz archive from pre-fetched table data and artifact data.
+///
+/// Uses `tar::Builder::append_data` instead of `header.set_path` + `tar.append`
+/// so that paths longer than 100 characters are written as GNU LongLink
+/// extensions (fixes #758).
+///
+/// `tables` is a list of (table_name, json_bytes) pairs.
+/// `artifacts` is a list of (storage_key, content) pairs.
+/// `manifest` is the serialized backup manifest.
+fn build_backup_tar(
+    tables: &[(&str, &[u8])],
+    artifacts: &[(&str, &[u8])],
+    manifest: &[u8],
+) -> Result<Vec<u8>> {
+    let mut tar_buffer = Vec::new();
+    {
+        let encoder = GzEncoder::new(&mut tar_buffer, Compression::default());
+        let mut tar = Builder::new(encoder);
+
+        for (table, json_bytes) in tables {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(json_bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(Utc::now().timestamp() as u64);
+            header.set_cksum();
+
+            tar.append_data(&mut header, format!("database/{}.json", table), *json_bytes)?;
+        }
+
+        for (key, content) in artifacts {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(Utc::now().timestamp() as u64);
+            header.set_cksum();
+
+            tar.append_data(&mut header, format!("artifacts/{}", key), *content)?;
+        }
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(Utc::now().timestamp() as u64);
+        header.set_cksum();
+
+        tar.append_data(&mut header, "manifest.json", manifest)?;
+
+        tar.into_inner()?.finish()?;
+    }
+
+    Ok(tar_buffer)
+}
+
+/// Count entries under the `artifacts/` prefix in a tar.gz archive.
+fn count_artifacts_in_tar(tar_data: &[u8]) -> Result<i64> {
+    let decoder = GzDecoder::new(tar_data);
+    let mut archive = Archive::new(decoder);
+    let mut count = 0i64;
+
+    for entry in archive
+        .entries()
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        let entry = entry.map_err(|e| AppError::Internal(e.to_string()))?;
+        let path = entry
+            .path()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        if path.starts_with("artifacts/") {
+            count += 1;
+        }
+    }
+
+    Ok(count)
+}
+
 impl BackupService {
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
         Self {
@@ -279,83 +354,59 @@ impl BackupService {
     async fn do_backup(&self, backup_id: Uuid) -> Result<Backup> {
         let backup = self.get_by_id(backup_id).await?;
 
-        // Create tar.gz in memory
-        let mut tar_buffer = Vec::new();
-        {
-            let encoder = GzEncoder::new(&mut tar_buffer, Compression::default());
-            let mut tar = Builder::new(encoder);
+        // Export database tables as JSON
+        let table_names = vec![
+            "users",
+            "repositories",
+            "artifacts",
+            "download_statistics",
+            "api_tokens",
+            "roles",
+            "user_roles",
+            "permission_grants",
+        ];
 
-            // Export database tables as JSON
-            let tables = vec![
-                "users",
-                "repositories",
-                "artifacts",
-                "download_statistics",
-                "api_tokens",
-                "roles",
-                "user_roles",
-                "permission_grants",
-            ];
-
-            for table in &tables {
-                let json_data = self.export_table(table).await?;
-                let json_bytes = serde_json::to_vec_pretty(&json_data)?;
-
-                let mut header = tar::Header::new_gnu();
-                header.set_size(json_bytes.len() as u64);
-                header.set_mode(0o644);
-                header.set_mtime(Utc::now().timestamp() as u64);
-                header.set_cksum();
-
-                tar.append_data(
-                    &mut header,
-                    format!("database/{}.json", table),
-                    json_bytes.as_slice(),
-                )?;
-            }
-
-            // Add artifact storage keys
-            let storage_keys = self
-                .get_artifact_storage_keys(backup.metadata.as_ref())
-                .await?;
-            let mut artifact_count = 0i64;
-
-            for key in storage_keys {
-                if let Ok(content) = self.storage.get(&key).await {
-                    let mut header = tar::Header::new_gnu();
-                    header.set_size(content.len() as u64);
-                    header.set_mode(0o644);
-                    header.set_mtime(Utc::now().timestamp() as u64);
-                    header.set_cksum();
-
-                    tar.append_data(&mut header, format!("artifacts/{}", key), content.as_ref())?;
-                    artifact_count += 1;
-                }
-            }
-
-            // Create manifest placeholder (actual size/checksum set after finalization)
-            let manifest = BackupManifest {
-                version: "1.0".to_string(),
-                backup_id,
-                backup_type: backup.backup_type,
-                created_at: Utc::now(),
-                database_tables: tables.iter().map(|s| s.to_string()).collect(),
-                artifact_count,
-                total_size_bytes: 0,     // Will be actual size in final backup
-                checksum: String::new(), // Will be computed after archive is complete
-            };
-
-            let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-            let mut header = tar::Header::new_gnu();
-            header.set_size(manifest_bytes.len() as u64);
-            header.set_mode(0o644);
-            header.set_mtime(Utc::now().timestamp() as u64);
-            header.set_cksum();
-
-            tar.append_data(&mut header, "manifest.json", manifest_bytes.as_slice())?;
-
-            tar.into_inner()?.finish()?;
+        let mut table_data: Vec<(String, Vec<u8>)> = Vec::new();
+        for table in &table_names {
+            let json_data = self.export_table(table).await?;
+            let json_bytes = serde_json::to_vec_pretty(&json_data)?;
+            table_data.push((table.to_string(), json_bytes));
         }
+
+        // Fetch artifact storage keys and content
+        let storage_keys = self
+            .get_artifact_storage_keys(backup.metadata.as_ref())
+            .await?;
+        let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
+        for key in storage_keys {
+            if let Ok(content) = self.storage.get(&key).await {
+                artifact_data.push((key, content.to_vec()));
+            }
+        }
+
+        // Build manifest
+        let manifest = BackupManifest {
+            version: "1.0".to_string(),
+            backup_id,
+            backup_type: backup.backup_type,
+            created_at: Utc::now(),
+            database_tables: table_names.iter().map(|s| s.to_string()).collect(),
+            artifact_count: artifact_data.len() as i64,
+            total_size_bytes: 0,     // Will be actual size in final backup
+            checksum: String::new(), // Will be computed after archive is complete
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+
+        // Build tar.gz archive using append_data (supports paths > 100 chars)
+        let tables_ref: Vec<(&str, &[u8])> = table_data
+            .iter()
+            .map(|(name, data)| (name.as_str(), data.as_slice()))
+            .collect();
+        let artifacts_ref: Vec<(&str, &[u8])> = artifact_data
+            .iter()
+            .map(|(key, data)| (key.as_str(), data.as_slice()))
+            .collect();
+        let tar_buffer = build_backup_tar(&tables_ref, &artifacts_ref, &manifest_bytes)?;
 
         // Store backup
         let storage_path = backup
@@ -367,7 +418,7 @@ impl BackupService {
             .await?;
 
         // Update backup record
-        let artifact_count = self.count_artifacts_in_backup(&tar_buffer)?;
+        let artifact_count = count_artifacts_in_tar(&tar_buffer)?;
         sqlx::query(
             r#"
             UPDATE backups
@@ -422,27 +473,6 @@ impl BackupService {
         };
 
         Ok(keys)
-    }
-
-    fn count_artifacts_in_backup(&self, tar_data: &[u8]) -> Result<i64> {
-        let decoder = GzDecoder::new(tar_data);
-        let mut archive = Archive::new(decoder);
-        let mut count = 0i64;
-
-        for entry in archive
-            .entries()
-            .map_err(|e| AppError::Internal(e.to_string()))?
-        {
-            let entry = entry.map_err(|e| AppError::Internal(e.to_string()))?;
-            let path = entry
-                .path()
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            if path.starts_with("artifacts/") {
-                count += 1;
-            }
-        }
-
-        Ok(count)
     }
 
     async fn update_status(
@@ -1012,6 +1042,223 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0.to_string_lossy(), long_path);
         assert_eq!(entries[0].1, content);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_backup_tar tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_backup_tar_empty() {
+        let manifest = b"{}";
+        let tar_data = build_backup_tar(&[], &[], manifest).unwrap();
+
+        let entries = BackupService::extract_entries(&tar_data).unwrap();
+        // Only the manifest entry
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0.to_string_lossy(), "manifest.json");
+        assert_eq!(entries[0].1, b"{}");
+    }
+
+    #[test]
+    fn test_build_backup_tar_with_tables_and_artifacts() {
+        let table_data = b"[{\"id\":1}]";
+        let artifact_data = b"binary content here";
+        let manifest = b"{\"version\":\"1.0\"}";
+
+        let tar_data = build_backup_tar(
+            &[("users", table_data.as_slice())],
+            &[("repo/pkg-1.0.tar.gz", artifact_data.as_slice())],
+            manifest,
+        )
+        .unwrap();
+
+        let entries = BackupService::extract_entries(&tar_data).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let paths: Vec<String> = entries
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert!(paths.contains(&"database/users.json".to_string()));
+        assert!(paths.contains(&"artifacts/repo/pkg-1.0.tar.gz".to_string()));
+        assert!(paths.contains(&"manifest.json".to_string()));
+
+        // Verify content matches
+        let users_entry = entries
+            .iter()
+            .find(|(p, _)| p.to_string_lossy() == "database/users.json")
+            .unwrap();
+        assert_eq!(users_entry.1, table_data);
+    }
+
+    #[test]
+    fn test_build_backup_tar_with_long_artifact_paths() {
+        let long_key = "proxy-cache/maven-central/org/springframework/boot/\
+            spring-boot-starter-parent/4.0.5/\
+            spring-boot-starter-parent-4.0.5.pom";
+        let expected_path = format!("artifacts/{}", long_key);
+        assert!(
+            expected_path.len() > 100,
+            "path must exceed 100-char POSIX limit"
+        );
+
+        let content = b"<project>long-path pom</project>";
+        let manifest = b"{\"version\":\"1.0\"}";
+
+        let tar_data = build_backup_tar(&[], &[(long_key, content.as_slice())], manifest).unwrap();
+
+        let entries = BackupService::extract_entries(&tar_data).unwrap();
+        assert_eq!(entries.len(), 2); // artifact + manifest
+
+        let artifact = entries
+            .iter()
+            .find(|(p, _)| p.starts_with("artifacts/"))
+            .unwrap();
+        assert_eq!(artifact.0.to_string_lossy(), expected_path);
+        assert_eq!(artifact.1, content);
+    }
+
+    #[test]
+    fn test_build_backup_tar_multiple_tables() {
+        let manifest = b"{}";
+        let tar_data = build_backup_tar(
+            &[
+                ("users", b"[]".as_slice()),
+                ("roles", b"[]".as_slice()),
+                ("artifacts", b"[{\"id\":1}]".as_slice()),
+                ("repositories", b"[{\"name\":\"test\"}]".as_slice()),
+            ],
+            &[],
+            manifest,
+        )
+        .unwrap();
+
+        let entries = BackupService::extract_entries(&tar_data).unwrap();
+        // 4 tables + 1 manifest
+        assert_eq!(entries.len(), 5);
+
+        let db_entries: Vec<_> = entries
+            .iter()
+            .filter(|(p, _)| p.starts_with("database/"))
+            .collect();
+        assert_eq!(db_entries.len(), 4);
+    }
+
+    #[test]
+    fn test_build_backup_tar_multiple_long_path_artifacts() {
+        let keys: Vec<String> = (0..5)
+            .map(|i| {
+                format!(
+                    "proxy-cache/maven/org/example/deeply/nested/package/name/\
+                     artifact-with-very-long-classifier-{}/1.0.0/\
+                     artifact-with-very-long-classifier-{}-1.0.0.jar",
+                    i, i
+                )
+            })
+            .collect();
+
+        // Verify all paths exceed the 100-char limit
+        for key in &keys {
+            let full_path = format!("artifacts/{}", key);
+            assert!(
+                full_path.len() > 100,
+                "expected path > 100 chars: {}",
+                full_path
+            );
+        }
+
+        let artifacts: Vec<(&str, &[u8])> = keys
+            .iter()
+            .map(|k| (k.as_str(), b"jar-content".as_slice()))
+            .collect();
+        let manifest = b"{}";
+
+        let tar_data = build_backup_tar(&[], &artifacts, manifest).unwrap();
+
+        let entries = BackupService::extract_entries(&tar_data).unwrap();
+        // 5 artifacts + 1 manifest
+        assert_eq!(entries.len(), 6);
+
+        let artifact_entries: Vec<_> = entries
+            .iter()
+            .filter(|(p, _)| p.starts_with("artifacts/"))
+            .collect();
+        assert_eq!(artifact_entries.len(), 5);
+
+        // Verify all content is preserved
+        for (_, content) in &artifact_entries {
+            assert_eq!(content.as_slice(), b"jar-content");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // count_artifacts_in_tar tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_artifacts_in_tar_empty_archive() {
+        let tar_data = create_test_tar_gz(&[]);
+        assert_eq!(count_artifacts_in_tar(&tar_data).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_count_artifacts_in_tar_no_artifacts() {
+        let tar_data =
+            create_test_tar_gz(&[("manifest.json", b"{}"), ("database/users.json", b"[]")]);
+        assert_eq!(count_artifacts_in_tar(&tar_data).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_count_artifacts_in_tar_with_artifacts() {
+        let tar_data = create_test_tar_gz(&[
+            ("manifest.json", b"{}"),
+            ("database/users.json", b"[]"),
+            ("artifacts/repo/pkg-1.0.tar.gz", b"data1"),
+            ("artifacts/repo/pkg-2.0.tar.gz", b"data2"),
+            ("artifacts/other/file.bin", b"data3"),
+        ]);
+        assert_eq!(count_artifacts_in_tar(&tar_data).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_count_artifacts_in_tar_with_long_paths() {
+        let long_key = "proxy-cache/maven-central/org/springframework/boot/\
+            spring-boot-starter-parent/4.0.5/\
+            spring-boot-starter-parent-4.0.5.pom";
+        let long_path = format!("artifacts/{}", long_key);
+        assert!(long_path.len() > 100);
+
+        let tar_data = create_test_tar_gz(&[
+            ("manifest.json", b"{}"),
+            (&long_path, b"pom-content"),
+            ("artifacts/short-key", b"other"),
+        ]);
+        assert_eq!(count_artifacts_in_tar(&tar_data).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_count_artifacts_in_tar_invalid_data() {
+        let result = count_artifacts_in_tar(b"not valid tar gz data");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_count_artifacts_in_tar_from_build_backup_tar() {
+        let manifest = b"{\"version\":\"1.0\"}";
+        let tar_data = build_backup_tar(
+            &[("users", b"[]".as_slice()), ("roles", b"[]".as_slice())],
+            &[
+                ("repo/artifact-1.jar", b"jar1".as_slice()),
+                ("repo/artifact-2.jar", b"jar2".as_slice()),
+                ("other/file.txt", b"txt".as_slice()),
+            ],
+            manifest,
+        )
+        .unwrap();
+
+        // 3 artifacts should be counted (database entries and manifest excluded)
+        assert_eq!(count_artifacts_in_tar(&tar_data).unwrap(), 3);
     }
 
     // -----------------------------------------------------------------------
