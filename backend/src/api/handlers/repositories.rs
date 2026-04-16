@@ -181,6 +181,12 @@ pub struct CreateRepositoryRequest {
     pub format: String,
     pub repo_type: String,
     pub is_public: Option<bool>,
+    /// Alias for `is_public`. When set to true, anonymous users can download
+    /// artifacts from this repository without authentication. Useful for remote
+    /// (pull-through cache) repositories that proxy public upstream registries.
+    /// If both `is_public` and `allow_anonymous_access` are provided,
+    /// `allow_anonymous_access` takes precedence.
+    pub allow_anonymous_access: Option<bool>,
     pub upstream_url: Option<String>,
     pub quota_bytes: Option<i64>,
     /// Override the default storage backend for this repository.
@@ -205,6 +211,16 @@ pub struct CreateRepositoryRequest {
     pub upstream_password: Option<String>,
 }
 
+impl CreateRepositoryRequest {
+    /// Resolve the effective `is_public` value. `allow_anonymous_access` takes
+    /// precedence over `is_public` when both are provided.
+    pub fn effective_is_public(&self) -> bool {
+        self.allow_anonymous_access
+            .or(self.is_public)
+            .unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateVirtualMemberInput {
     pub repo_key: String,
@@ -222,6 +238,13 @@ pub struct UpdateRepositoryRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub is_public: Option<bool>,
+    /// Alias for `is_public`. When set to true, anonymous users can download
+    /// artifacts without authentication. Useful for remote (pull-through cache)
+    /// repositories that proxy public upstream registries. Write operations
+    /// (upload, delete) still require authentication regardless of this setting.
+    /// If both `is_public` and `allow_anonymous_access` are provided,
+    /// `allow_anonymous_access` takes precedence.
+    pub allow_anonymous_access: Option<bool>,
     pub quota_bytes: Option<i64>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
@@ -241,6 +264,14 @@ pub struct UpdateRepositoryRequest {
     pub release_repository_key: Option<String>,
 }
 
+impl UpdateRepositoryRequest {
+    /// Resolve the effective `is_public` value. `allow_anonymous_access` takes
+    /// precedence over `is_public` when both are provided.
+    pub fn effective_is_public(&self) -> Option<bool> {
+        self.allow_anonymous_access.or(self.is_public)
+    }
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryResponse {
     pub id: Uuid,
@@ -250,6 +281,10 @@ pub struct RepositoryResponse {
     pub format: String,
     pub repo_type: String,
     pub is_public: bool,
+    /// Whether anonymous (unauthenticated) downloads are allowed. This is
+    /// always equal to `is_public` and provided as a convenience alias so
+    /// the semantics are clear for remote (pull-through cache) repositories.
+    pub allow_anonymous_access: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
     pub upstream_url: Option<String>,
@@ -277,6 +312,7 @@ fn repo_to_response(
         description: repo.description,
         format: format!("{:?}", repo.format).to_lowercase(),
         repo_type: format!("{:?}", repo.repo_type).to_lowercase(),
+        allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
@@ -644,6 +680,8 @@ pub async fn create_repository(
         payload.key.clone()
     };
 
+    let is_public = payload.effective_is_public();
+
     let service = state.create_repository_service();
     let repo = service
         .create(ServiceCreateRepoReq {
@@ -655,7 +693,7 @@ pub async fn create_repository(
             storage_backend,
             storage_path,
             upstream_url: payload.upstream_url,
-            is_public: payload.is_public.unwrap_or(false),
+            is_public,
             quota_bytes: payload.quota_bytes,
             format_key: payload.format_key,
         })
@@ -810,6 +848,8 @@ pub async fn update_repository(
     let existing = service.get_by_key(&key).await?;
     require_repo_access(&auth, existing.id)?;
 
+    let effective_is_public = payload.effective_is_public();
+
     let repo = service
         .update(
             existing.id,
@@ -817,12 +857,20 @@ pub async fn update_repository(
                 key: payload.key,
                 name: payload.name,
                 description: payload.description,
-                is_public: payload.is_public,
+                is_public: effective_is_public,
                 quota_bytes: payload.quota_bytes.map(Some),
                 upstream_url: None,
             },
         )
         .await?;
+
+    // Invalidate the in-memory repo cache so that visibility changes take
+    // effect immediately instead of waiting for the TTL to expire. Remove
+    // both the old key and the new key (in case the key was renamed).
+    if let Ok(mut cache) = state.repo_cache.write() {
+        cache.remove(&key);
+        cache.remove(&repo.key);
+    }
 
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
@@ -923,6 +971,12 @@ pub async fn delete_repository(
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
     service.delete(repo.id).await?;
+
+    // Remove the deleted repo from the in-memory cache.
+    if let Ok(mut cache) = state.repo_cache.write() {
+        cache.remove(&key);
+    }
+
     state
         .event_bus
         .emit("repository.deleted", repo.id, Some(auth.username.clone()));
@@ -3058,6 +3112,7 @@ mod tests {
             format: "maven".to_string(),
             repo_type: "local".to_string(),
             is_public: true,
+            allow_anonymous_access: true,
             storage_used_bytes: 1024,
             quota_bytes: Some(1048576),
             upstream_url: None,
@@ -3070,6 +3125,7 @@ mod tests {
         assert!(json.contains("\"key\":\"my-repo\""));
         assert!(json.contains("\"storage_used_bytes\":1024"));
         assert!(json.contains("\"quota_bytes\":1048576"));
+        assert!(json.contains("\"allow_anonymous_access\":true"));
     }
 
     #[test]
@@ -4450,5 +4506,138 @@ mod tests {
             Some(a) => RepoVisibility::User(a.user_id),
         };
         assert_eq!(visibility, RepoVisibility::User(expected_user_id));
+    }
+
+    // -----------------------------------------------------------------------
+    // allow_anonymous_access alias (CreateRepositoryRequest)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_request_effective_is_public_defaults_false() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test",
+            "name": "Test",
+            "format": "pypi",
+            "repo_type": "remote"
+        }))
+        .unwrap();
+        assert!(!req.effective_is_public());
+    }
+
+    #[test]
+    fn test_create_request_effective_is_public_from_is_public() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test",
+            "name": "Test",
+            "format": "pypi",
+            "repo_type": "remote",
+            "is_public": true
+        }))
+        .unwrap();
+        assert!(req.effective_is_public());
+    }
+
+    #[test]
+    fn test_create_request_effective_is_public_from_allow_anonymous_access() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test",
+            "name": "Test",
+            "format": "pypi",
+            "repo_type": "remote",
+            "allow_anonymous_access": true
+        }))
+        .unwrap();
+        assert!(req.effective_is_public());
+    }
+
+    #[test]
+    fn test_create_request_allow_anonymous_access_overrides_is_public() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test",
+            "name": "Test",
+            "format": "pypi",
+            "repo_type": "remote",
+            "is_public": false,
+            "allow_anonymous_access": true
+        }))
+        .unwrap();
+        assert!(req.effective_is_public());
+    }
+
+    #[test]
+    fn test_create_request_allow_anonymous_false_overrides_is_public_true() {
+        let req: CreateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "key": "test",
+            "name": "Test",
+            "format": "pypi",
+            "repo_type": "remote",
+            "is_public": true,
+            "allow_anonymous_access": false
+        }))
+        .unwrap();
+        assert!(!req.effective_is_public());
+    }
+
+    // -----------------------------------------------------------------------
+    // allow_anonymous_access alias (UpdateRepositoryRequest)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_request_effective_is_public_none_when_absent() {
+        let req: UpdateRepositoryRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(req.effective_is_public().is_none());
+    }
+
+    #[test]
+    fn test_update_request_effective_is_public_from_is_public() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({"is_public": true})).unwrap();
+        assert_eq!(req.effective_is_public(), Some(true));
+    }
+
+    #[test]
+    fn test_update_request_effective_is_public_from_allow_anonymous_access() {
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({"allow_anonymous_access": true})).unwrap();
+        assert_eq!(req.effective_is_public(), Some(true));
+    }
+
+    #[test]
+    fn test_update_request_allow_anonymous_access_overrides_is_public() {
+        let req: UpdateRepositoryRequest = serde_json::from_value(serde_json::json!({
+            "is_public": false,
+            "allow_anonymous_access": true
+        }))
+        .unwrap();
+        assert_eq!(req.effective_is_public(), Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // RepositoryResponse includes allow_anonymous_access
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_response_includes_allow_anonymous_access_true() {
+        let repo = make_repo(true);
+        let resp = repo_to_response(repo, 0);
+        assert!(resp.allow_anonymous_access);
+        assert_eq!(resp.is_public, resp.allow_anonymous_access);
+    }
+
+    #[test]
+    fn test_repo_response_includes_allow_anonymous_access_false() {
+        let repo = make_repo(false);
+        let resp = repo_to_response(repo, 0);
+        assert!(!resp.allow_anonymous_access);
+        assert_eq!(resp.is_public, resp.allow_anonymous_access);
+    }
+
+    #[test]
+    fn test_repo_response_allow_anonymous_access_serialized() {
+        let repo = make_repo(true);
+        let resp = repo_to_response(repo, 0);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["allow_anonymous_access"], true);
+        assert_eq!(json["is_public"], true);
     }
 }
