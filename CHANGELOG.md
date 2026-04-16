@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-04-15
+
+### Sponsors
+
+Thank you to our backers for supporting ongoing development:
+
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper)
+
+### Thank You
+
+- @Firjens for reporting npm Content-Type causing empty SBOMs (#722), scan status masking (#723), Docker unauth repo failure (#744), and npm pull-through integrity loss (#745)
+- @roblabla for reporting proxy OOM under parallel requests (#737)
+- @agangadharan-navaera for reporting migration pagination beyond 100 artifacts (#671)
+- @Dreamacro for reporting APT remote proxy missing InRelease/Release files (#674)
+
+### Fixed
+
+- **npm tarballs stored with wrong Content-Type** (#722) -- npm .tgz files are now stored with `application/gzip` instead of `application/octet-stream`, fixing empty SBOM results and failed security scans on npm artifacts.
+- **Scan status masked extraction errors as "clean"** (#723) -- all four vulnerability scanners (Grype, Trivy, OpenSCAP, Incus) now propagate errors instead of returning empty findings, so the UI shows the real failure instead of a misleading clean status.
+- **Docker pull from public repos required authentication** (#744) -- the OCI/Docker handler now issues an anonymous pull token when no credentials are provided, allowing unauthenticated `docker pull` from repositories marked as public.
+- **npm pull-through cache served wrong package tarball** (#745) -- tarball lookups now include the package name in the path pattern, preventing cross-package collisions when two packages produce the same filename (e.g., `mdurl` vs `@types/mdurl`).
+- **Proxy OOM under concurrent requests** (#737) -- added a concurrent fetch semaphore (`PROXY_MAX_CONCURRENT_FETCHES`, default 10) and artifact size limit (`PROXY_MAX_ARTIFACT_SIZE_BYTES`, default 2 GB) to prevent unbounded memory growth when proxying many large artifacts in parallel.
+- **Migration pagination beyond 100 artifacts** (#671) -- the migration artifact enumeration now paginates correctly, fixing imports from Artifactory instances with more than 100 artifacts per repository.
+- **APT remote proxy missing metadata** (#674) -- APT remote repositories now proxy `InRelease`, `Release`, `Release.gpg`, and `Packages` files from upstream, fixing `apt update` failures.
+- **Backup service wrong table name** (#742) -- corrected `download_stats` to `download_statistics` and `repository_permissions` to `permission_grants` in the backup export queries.
+- **Cargo pull-through registry dl URL resolution** (#743) -- the Cargo download handler now resolves the `dl` URL from the upstream registry's `config.json` instead of assuming a fixed path pattern, fixing pull-through for registries with non-standard download URLs.
+
+### Security
+
+- Updated rustls-webpki 0.103.10 to 0.103.12 (RUSTSEC-2026-0098, RUSTSEC-2026-0099)
+
 ## [1.1.2] - 2026-04-09
 
 ### Sponsors
