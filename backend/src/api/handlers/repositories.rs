@@ -24,7 +24,7 @@ use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::repository_service::{
-    CreateRepositoryRequest as ServiceCreateRepoReq, RepositoryService,
+    CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
@@ -529,7 +529,11 @@ pub async fn list_repositories(
         .map(|t| parse_repo_type(t))
         .transpose()?;
 
-    let public_only = auth.is_none();
+    let visibility = match &auth {
+        None => RepoVisibility::PublicOnly,
+        Some(a) if a.is_admin => RepoVisibility::All,
+        Some(a) => RepoVisibility::User(a.user_id),
+    };
     let service = RepositoryService::new(state.db.clone());
     let (repos, total) = service
         .list(
@@ -537,7 +541,7 @@ pub async fn list_repositories(
             per_page as i64,
             format_filter,
             type_filter,
-            public_only,
+            visibility,
             query.q.as_deref(),
         )
         .await?;
@@ -4394,5 +4398,57 @@ mod tests {
         let (name, version) = extract_name_version_from_path("file.txt");
         assert_eq!(name, "file.txt");
         assert!(version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Visibility derivation from AuthExtension
+    // -----------------------------------------------------------------------
+
+    fn make_auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_visibility_no_auth_is_public_only() {
+        let auth: Option<AuthExtension> = None;
+        let visibility = match &auth {
+            None => RepoVisibility::PublicOnly,
+            Some(a) if a.is_admin => RepoVisibility::All,
+            Some(a) => RepoVisibility::User(a.user_id),
+        };
+        assert_eq!(visibility, RepoVisibility::PublicOnly);
+    }
+
+    #[test]
+    fn test_visibility_admin_is_all() {
+        let auth = Some(make_auth(true));
+        let visibility = match &auth {
+            None => RepoVisibility::PublicOnly,
+            Some(a) if a.is_admin => RepoVisibility::All,
+            Some(a) => RepoVisibility::User(a.user_id),
+        };
+        assert_eq!(visibility, RepoVisibility::All);
+    }
+
+    #[test]
+    fn test_visibility_non_admin_user_filters_by_user_id() {
+        let user_auth = make_auth(false);
+        let expected_user_id = user_auth.user_id;
+        let auth = Some(user_auth);
+        let visibility = match &auth {
+            None => RepoVisibility::PublicOnly,
+            Some(a) if a.is_admin => RepoVisibility::All,
+            Some(a) => RepoVisibility::User(a.user_id),
+        };
+        assert_eq!(visibility, RepoVisibility::User(expected_user_id));
     }
 }
