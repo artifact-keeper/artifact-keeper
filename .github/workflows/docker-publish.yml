@@ -37,7 +37,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-ci-runners
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     outputs:
@@ -105,7 +105,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-ci-runners
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     outputs:
@@ -171,7 +171,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ak-ci-runners
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     outputs:
