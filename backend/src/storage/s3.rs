@@ -1141,6 +1141,7 @@ mod tests {
         assert!(config.prefix.is_none());
         assert!(config.ca_cert_path.is_none());
         assert!(!config.insecure_tls);
+        assert!(!config.disable_multi_delete);
     }
 
     #[test]
@@ -1247,27 +1248,19 @@ mod tests {
     // --- disable_multi_delete config tests ---
 
     #[test]
-    fn test_s3_config_disable_multi_delete_default_false() {
-        let config = S3Config::new("b".to_string(), "r".to_string(), None, None);
-        assert!(!config.disable_multi_delete);
+    fn test_s3_config_disable_multi_delete_defaults_off_and_can_enable() {
+        let default_config = S3Config::new("b".to_string(), "r".to_string(), None, None);
+        assert!(
+            !default_config.disable_multi_delete,
+            "should default to false"
+        );
+
+        let enabled = default_config.with_disable_multi_delete(true);
+        assert!(enabled.disable_multi_delete);
     }
 
     #[test]
-    fn test_s3_config_with_disable_multi_delete() {
-        let config = S3Config::new("b".to_string(), "r".to_string(), None, None)
-            .with_disable_multi_delete(true);
-        assert!(config.disable_multi_delete);
-    }
-
-    #[test]
-    fn test_s3_config_with_disable_multi_delete_false() {
-        let config = S3Config::new("b".to_string(), "r".to_string(), None, None)
-            .with_disable_multi_delete(false);
-        assert!(!config.disable_multi_delete);
-    }
-
-    #[test]
-    fn test_s3_config_chained_builders_with_disable_multi_delete() {
+    fn test_s3_config_huawei_obs_chained_builders() {
         let config = S3Config::new(
             "obs-bucket".to_string(),
             "cn-north-4".to_string(),
