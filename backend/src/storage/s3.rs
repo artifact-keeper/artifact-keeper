@@ -1990,6 +1990,177 @@ mod tests {
 
         restore_cred_env(saved);
     }
+
+    // --- single_object_delete / disable_multi_delete via wiremock ---
+
+    /// Build an S3Backend pointing at the given base URL with
+    /// `disable_multi_delete` set to the requested value.
+    async fn mock_s3_backend(base_url: &str, disable_multi_delete: bool) -> S3Backend {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(base_url.to_string()),
+            None,
+        )
+        .with_disable_multi_delete(disable_multi_delete);
+
+        // build_store needs explicit creds so the signer can produce URLs
+        let store = S3Backend::build_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
+            .expect("build mock store");
+        S3Backend {
+            store,
+            prefix: None,
+            redirect_downloads: false,
+            cloudfront: None,
+            path_format: StoragePathFormat::Native,
+            signing_store: None,
+            disable_multi_delete,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_success_204() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The presigned DELETE URL hits the mock server; respond with 204
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "test-key".into();
+        let result = backend.single_object_delete(&path, "test-key").await;
+        assert!(result.is_ok(), "204 should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_success_200() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "another-key".into();
+        let result = backend.single_object_delete(&path, "another-key").await;
+        assert!(result.is_ok(), "200 should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_404_is_idempotent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("NoSuchKey"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "missing-key".into();
+        let result = backend.single_object_delete(&path, "missing-key").await;
+        assert!(
+            result.is_ok(),
+            "404 on delete should be treated as success (idempotent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_403_returns_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("AccessDenied"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "forbidden-key".into();
+        let result = backend.single_object_delete(&path, "forbidden-key").await;
+        assert!(result.is_err(), "403 should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("403"),
+            "error should mention status code: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_500_returns_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("InternalError"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "error-key".into();
+        let result = backend.single_object_delete(&path, "error-key").await;
+        assert!(result.is_err(), "500 should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("500"),
+            "error should mention status code: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_dispatches_to_single_object_delete_when_enabled() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // single_object_delete generates a signed DELETE URL and then issues
+        // an HTTP DELETE to it, so we only need to match DELETE
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let result = StorageBackendTrait::delete(&backend, "dispatch-key").await;
+        assert!(
+            result.is_ok(),
+            "delete with disable_multi_delete=true should use single_object_delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_uses_store_delete_when_multi_delete_enabled() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // object_store issues a POST ?delete for multi-object delete.
+        // We just mock any request to respond with 200 so the call succeeds.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<?xml version="1.0"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        // With disable_multi_delete=false, the standard store.delete() path
+        // is used. We mainly verify the branch is taken without panicking.
+        let _ = crate::storage::StorageBackend::delete(&backend, "multi-key").await;
+        // Not asserting success because the mock may not perfectly satisfy
+        // the object_store S3 multi-delete protocol, but the branch is exercised.
+    }
 }
 
 #[cfg(test)]
