@@ -332,6 +332,22 @@ pub async fn proxy_fetch_uncached(
         .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
+/// Fetch from upstream directly, preserving the upstream `Link` header.
+pub async fn proxy_fetch_uncached_with_link(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<(Bytes, Option<String>, Option<String>), Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+
+    proxy_service
+        .fetch_upstream_direct_with_link(&repo, path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
 /// Resolve virtual repository members and attempt to find an artifact.
 /// Iterates through members by priority, trying local storage first,
 /// then proxy for remote members.

@@ -122,6 +122,56 @@ impl TestServer {
         }
     }
 
+    async fn create_user(
+        &self,
+        username: &str,
+        email: &str,
+        password: &str,
+        is_admin: bool,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let client = Client::new();
+        let resp = client
+            .post(format!("{}/api/v1/users", self.base_url))
+            .header("Authorization", self.auth_header())
+            .json(&json!({
+                "username": username,
+                "email": email,
+                "password": password,
+                "display_name": username,
+                "is_admin": is_admin
+            }))
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            Ok(resp.json().await?)
+        } else {
+            let status = resp.status();
+            let text = resp.text().await?;
+            Err(format!("Failed to create user: {} - {}", status, text).into())
+        }
+    }
+
+    async fn get_oci_token(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let client = Client::new();
+        let token_resp: Value = client
+            .get(format!("{}/v2/token", self.base_url))
+            .basic_auth(username, Some(password))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        token_resp["token"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "No OCI token in response".into())
+    }
+
     async fn upload_artifact(
         &self,
         repo_key: &str,
@@ -572,6 +622,256 @@ mod tests {
             .await
             .expect("Download failed");
         assert_eq!(downloaded, samples::docker_manifest());
+    }
+
+    // ============= Docker Tags/List and Catalog Tests =============
+
+    #[tokio::test]
+    #[ignore = "requires running HTTP server"]
+    async fn test_oci_tags_list_after_manifest_push() {
+        let server = get_server().await;
+        let repo_key = "docker-tags-test";
+
+        // Create repository
+        let _ = server
+            .create_repository(repo_key, "Docker Tags Test", "docker")
+            .await;
+
+        // Push a manifest with a tag (via the generic artifact API)
+        let manifest_path = "v2/myimage/manifests/v1.0";
+        let _ = server
+            .upload_artifact(
+                repo_key,
+                manifest_path,
+                samples::docker_manifest(),
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .await;
+
+        // Query tags/list via OCI V2 API
+        let client = Client::new();
+        let token = server.get_oci_token("admin", "admin123").await.unwrap();
+
+        let resp = client
+            .get(format!(
+                "{}/v2/{}/myimage/tags/list",
+                server.base_url, repo_key
+            ))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "Tags list should return 200");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["name"], "myimage");
+        let tags = body["tags"].as_array().expect("tags should be an array");
+        assert!(
+            tags.iter().any(|t| t.as_str() == Some("v1.0")),
+            "Tags should contain v1.0, got: {:?}",
+            tags
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running HTTP server"]
+    async fn test_oci_tags_list_pagination() {
+        let server = get_server().await;
+        let repo_key = "docker-tags-page-test";
+
+        let _ = server
+            .create_repository(repo_key, "Docker Tags Page Test", "docker")
+            .await;
+
+        // Push two manifests with different tags
+        for tag in &["alpha", "beta"] {
+            let path = format!("v2/paged/manifests/{}", tag);
+            let _ = server
+                .upload_artifact(
+                    repo_key,
+                    &path,
+                    samples::docker_manifest(),
+                    "application/vnd.docker.distribution.manifest.v2+json",
+                )
+                .await;
+        }
+
+        let client = Client::new();
+        let token = server.get_oci_token("admin", "admin123").await.unwrap();
+
+        // Request n=1 — should get one tag and a Link header
+        let resp = client
+            .get(format!(
+                "{}/v2/{}/paged/tags/list?n=1",
+                server.base_url, repo_key
+            ))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let link = resp
+            .headers()
+            .get("link")
+            .map(|v| v.to_str().unwrap_or("").to_string());
+        let body: Value = resp.json().await.unwrap();
+        let tags = body["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), 1, "Should return exactly 1 tag");
+        assert!(link.is_some(), "Should have Link header for next page");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running HTTP server"]
+    async fn test_oci_tags_list_n_zero() {
+        let server = get_server().await;
+        let repo_key = "docker-tags-zero-test";
+
+        let _ = server
+            .create_repository(repo_key, "Docker Tags Zero Test", "docker")
+            .await;
+        let _ = server
+            .upload_artifact(
+                repo_key,
+                "v2/img/manifests/latest",
+                samples::docker_manifest(),
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .await;
+
+        let client = Client::new();
+        let token = server.get_oci_token("admin", "admin123").await.unwrap();
+
+        let resp = client
+            .get(format!(
+                "{}/v2/{}/img/tags/list?n=0",
+                server.base_url, repo_key
+            ))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let link = resp.headers().get("link");
+        assert!(link.is_none(), "n=0 should not have Link header");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["tags"],
+            serde_json::json!([]),
+            "n=0 should return empty tags"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running HTTP server"]
+    async fn test_oci_catalog() {
+        let server = get_server().await;
+        let repo_key = "docker-catalog-test";
+
+        let _ = server
+            .create_repository(repo_key, "Docker Catalog Test", "docker")
+            .await;
+        let _ = server
+            .upload_artifact(
+                repo_key,
+                "v2/catalogimg/manifests/v1",
+                samples::docker_manifest(),
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .await;
+
+        let client = Client::new();
+        let token = server.get_oci_token("admin", "admin123").await.unwrap();
+
+        let resp = client
+            .get(format!("{}/v2/_catalog", server.base_url))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "Catalog should return 200");
+        let body: Value = resp.json().await.unwrap();
+        let repos = body["repositories"]
+            .as_array()
+            .expect("repositories should be an array");
+        assert!(
+            repos
+                .iter()
+                .any(|r| r.as_str().is_some_and(|s| s.contains("catalogimg"))),
+            "Catalog should contain catalogimg, got: {:?}",
+            repos
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running HTTP server"]
+    async fn test_oci_catalog_includes_private_repos_for_authenticated_non_admin_user() {
+        let server = get_server().await;
+        let repo_key = "docker-private-catalog-test";
+        let username = "catalog-reader";
+        let password = "CatalogPass123!";
+
+        let _ = server
+            .create_private_repository(repo_key, "Docker Private Catalog Test", "docker")
+            .await;
+        let _ = server
+            .upload_artifact(
+                repo_key,
+                "v2/privateimg/manifests/v1",
+                samples::docker_manifest(),
+                "application/vnd.docker.distribution.manifest.v2+json",
+            )
+            .await;
+        let _ = server
+            .create_user(username, "catalog-reader@example.test", password, false)
+            .await;
+
+        let token = server
+            .get_oci_token(username, password)
+            .await
+            .expect("Failed to issue OCI token for non-admin user");
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("{}/v2/_catalog", server.base_url))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "Catalog should return 200");
+        let body: Value = resp.json().await.unwrap();
+        let repos = body["repositories"]
+            .as_array()
+            .expect("repositories should be an array");
+        assert!(
+            repos
+                .iter()
+                .any(|r| r.as_str().is_some_and(|s| s.contains("privateimg"))),
+            "Catalog should contain privateimg for authenticated non-admin users, got: {:?}",
+            repos
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running HTTP server"]
+    async fn test_oci_tags_list_nonexistent_returns_404() {
+        let server = get_server().await;
+
+        let client = Client::new();
+        let token = server.get_oci_token("admin", "admin123").await.unwrap();
+
+        let resp = client
+            .get(format!(
+                "{}/v2/nonexistent-repo/someimage/tags/list",
+                server.base_url
+            ))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "Tags list for unknown repo should return 404"
+        );
     }
 
     // ============= Helm Repository Tests =============
