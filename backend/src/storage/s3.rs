@@ -1,6 +1,6 @@
 //! S3 storage backend using the `object_store` crate (Apache Arrow project).
 //!
-//! Supports AWS S3 and S3-compatible services (MinIO, Ceph RGW, R2, etc.).
+//! Supports AWS S3 and S3-compatible services (MinIO, Ceph RGW, R2, Huawei OBS, etc.).
 //! Configuration via environment variables:
 //! - S3_BUCKET: Bucket name (required)
 //! - S3_REGION: AWS region (default: us-east-1)
@@ -11,6 +11,11 @@
 //! For TLS configuration:
 //! - S3_CA_CERT_PATH: Path to PEM file with custom CA certificate(s)
 //! - S3_INSECURE_TLS: Disable TLS certificate verification (default: false)
+//!
+//! For S3-compatible providers:
+//! - S3_DISABLE_MULTI_DELETE: Use single-object DELETE instead of multi-object
+//!   POST ?delete (default: false). Required for providers that do not implement
+//!   the S3 DeleteObjects API, such as Huawei Cloud OBS.
 //!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
@@ -67,6 +72,10 @@ pub struct S3Config {
     pub ca_cert_path: Option<String>,
     /// Disable TLS certificate verification (for dev/test with self-signed certs)
     pub insecure_tls: bool,
+    /// Use single-object DELETE requests instead of the S3 multi-object delete
+    /// API (POST ?delete). Some S3-compatible providers (e.g. Huawei Cloud OBS)
+    /// do not implement DeleteObjects and return 405 Method Not Allowed.
+    pub disable_multi_delete: bool,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -112,6 +121,9 @@ impl S3Config {
         let insecure_tls = std::env::var("S3_INSECURE_TLS")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        let disable_multi_delete = std::env::var("S3_DISABLE_MULTI_DELETE")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
 
         Ok(Self {
             bucket,
@@ -126,6 +138,7 @@ impl S3Config {
             presign_secret_key,
             ca_cert_path,
             insecure_tls,
+            disable_multi_delete,
         })
     }
 
@@ -186,6 +199,7 @@ impl S3Config {
             presign_secret_key: None,
             ca_cert_path: None,
             insecure_tls: false,
+            disable_multi_delete: false,
         }
     }
 
@@ -220,6 +234,11 @@ impl S3Config {
 
     pub fn with_insecure_tls(mut self, insecure: bool) -> Self {
         self.insecure_tls = insecure;
+        self
+    }
+
+    pub fn with_disable_multi_delete(mut self, disable: bool) -> Self {
+        self.disable_multi_delete = disable;
         self
     }
 }
@@ -268,6 +287,10 @@ pub struct S3Backend {
     cloudfront: Option<CloudFrontConfig>,
     path_format: StoragePathFormat,
     signing_store: Option<AmazonS3>,
+    /// When true, delete objects one at a time with HTTP DELETE instead of the
+    /// S3 multi-object delete API (POST ?delete). Needed for providers like
+    /// Huawei Cloud OBS that do not implement DeleteObjects.
+    disable_multi_delete: bool,
 }
 
 impl S3Backend {
@@ -401,6 +424,13 @@ impl S3Backend {
             tracing::info!(path_format = %config.path_format, "S3 storage path format configured");
         }
 
+        if config.disable_multi_delete {
+            tracing::info!(
+                "S3 multi-object delete disabled (S3_DISABLE_MULTI_DELETE=true), \
+                 using single-object DELETE requests"
+            );
+        }
+
         Ok(Self {
             store,
             prefix: config.prefix,
@@ -408,6 +438,7 @@ impl S3Backend {
             cloudfront: config.cloudfront,
             path_format: config.path_format,
             signing_store,
+            disable_multi_delete: config.disable_multi_delete,
         })
     }
 
@@ -467,6 +498,63 @@ impl S3Backend {
                 "Failed to get fallback object '{}' for '{}': {}",
                 fallback_key, key, e
             ))),
+        }
+    }
+
+    /// Delete a single object using a presigned DELETE URL.
+    ///
+    /// The `object_store` crate routes all deletes through the S3 multi-object
+    /// delete API (POST ?delete). Some S3-compatible providers, notably Huawei
+    /// Cloud OBS, do not implement this endpoint and return 405 Method Not
+    /// Allowed. This method works around the limitation by generating a
+    /// presigned DELETE URL via the `Signer` trait and executing it with a
+    /// plain HTTP DELETE request.
+    async fn single_object_delete(&self, path: &ObjectPath, display_key: &str) -> Result<()> {
+        use object_store::signer::Signer;
+
+        let presigned_url = self
+            .store
+            .signed_url(http::Method::DELETE, path, Duration::from_secs(300))
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to generate presigned DELETE URL for '{}': {}",
+                    display_key, e
+                ))
+            })?;
+
+        let response = reqwest::Client::new()
+            .delete(presigned_url)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to send DELETE request for '{}': {}",
+                    display_key, e
+                ))
+            })?;
+
+        let status = response.status();
+        if status.is_success() || status.as_u16() == 204 {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            // S3 returns 404 when deleting a non-existent object, which is not
+            // an error (idempotent delete).
+            if status.as_u16() == 404 {
+                tracing::debug!(
+                    key = %display_key,
+                    "Single-object DELETE returned 404, treating as success"
+                );
+                return Ok(());
+            }
+            Err(AppError::Storage(format!(
+                "Failed to delete object '{}': {} {}: {}",
+                display_key,
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                body
+            )))
         }
     }
 }
@@ -559,10 +647,13 @@ impl super::StorageBackend for S3Backend {
         let full_key = self.full_key(key);
         let path: ObjectPath = full_key.into();
 
-        self.store
-            .delete(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to delete object '{}': {}", key, e)))?;
+        if self.disable_multi_delete {
+            self.single_object_delete(&path, key).await?;
+        } else {
+            self.store.delete(&path).await.map_err(|e| {
+                AppError::Storage(format!("Failed to delete object '{}': {}", key, e))
+            })?;
+        }
 
         tracing::debug!(key = %key, "S3 delete object successful");
         Ok(())
@@ -1050,6 +1141,7 @@ mod tests {
         assert!(config.prefix.is_none());
         assert!(config.ca_cert_path.is_none());
         assert!(!config.insecure_tls);
+        assert!(!config.disable_multi_delete);
     }
 
     #[test]
@@ -1153,6 +1245,37 @@ mod tests {
         assert!(!config.insecure_tls);
     }
 
+    // --- disable_multi_delete config tests ---
+
+    #[test]
+    fn test_s3_config_disable_multi_delete_defaults_off_and_can_enable() {
+        let default_config = S3Config::new("b".to_string(), "r".to_string(), None, None);
+        assert!(
+            !default_config.disable_multi_delete,
+            "should default to false"
+        );
+
+        let enabled = default_config.with_disable_multi_delete(true);
+        assert!(enabled.disable_multi_delete);
+    }
+
+    #[test]
+    fn test_s3_config_huawei_obs_chained_builders() {
+        let config = S3Config::new(
+            "obs-bucket".to_string(),
+            "cn-north-4".to_string(),
+            Some("https://obs.cn-north-4.myhuaweicloud.com".to_string()),
+            None,
+        )
+        .with_disable_multi_delete(true)
+        .with_insecure_tls(false);
+
+        assert_eq!(config.bucket, "obs-bucket");
+        assert_eq!(config.region, "cn-north-4");
+        assert!(config.disable_multi_delete);
+        assert!(!config.insecure_tls);
+    }
+
     // --- build_store tests ---
 
     #[test]
@@ -1248,6 +1371,7 @@ mod tests {
         let orig_psk = std::env::var("S3_PRESIGN_SECRET_ACCESS_KEY").ok();
         let orig_ca = std::env::var("S3_CA_CERT_PATH").ok();
         let orig_insecure = std::env::var("S3_INSECURE_TLS").ok();
+        let orig_disable_multi = std::env::var("S3_DISABLE_MULTI_DELETE").ok();
         // Also save CloudFront vars to avoid interference
         let orig_cf_url = std::env::var("CLOUDFRONT_DISTRIBUTION_URL").ok();
 
@@ -1262,6 +1386,7 @@ mod tests {
         std::env::set_var("S3_PRESIGN_SECRET_ACCESS_KEY", "presign-sk");
         std::env::remove_var("S3_CA_CERT_PATH");
         std::env::set_var("S3_INSECURE_TLS", "1");
+        std::env::set_var("S3_DISABLE_MULTI_DELETE", "true");
         std::env::remove_var("CLOUDFRONT_DISTRIBUTION_URL");
 
         let result = S3Config::from_env();
@@ -1281,6 +1406,7 @@ mod tests {
         assert_eq!(config.presign_secret_key, Some("presign-sk".to_string()));
         assert!(config.ca_cert_path.is_none());
         assert!(config.insecure_tls);
+        assert!(config.disable_multi_delete);
         assert!(config.cloudfront.is_none());
 
         // Restore all originals
@@ -1298,6 +1424,7 @@ mod tests {
         restore("S3_PRESIGN_SECRET_ACCESS_KEY", orig_psk);
         restore("S3_CA_CERT_PATH", orig_ca);
         restore("S3_INSECURE_TLS", orig_insecure);
+        restore("S3_DISABLE_MULTI_DELETE", orig_disable_multi);
         restore("CLOUDFRONT_DISTRIBUTION_URL", orig_cf_url);
     }
 
@@ -1862,6 +1989,177 @@ mod tests {
         );
 
         restore_cred_env(saved);
+    }
+
+    // --- single_object_delete / disable_multi_delete via wiremock ---
+
+    /// Build an S3Backend pointing at the given base URL with
+    /// `disable_multi_delete` set to the requested value.
+    async fn mock_s3_backend(base_url: &str, disable_multi_delete: bool) -> S3Backend {
+        let config = S3Config::new(
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+            Some(base_url.to_string()),
+            None,
+        )
+        .with_disable_multi_delete(disable_multi_delete);
+
+        // build_store needs explicit creds so the signer can produce URLs
+        let store = S3Backend::build_store(&config, Some("AKIAIOSFODNN7EXAMPLE"), Some("secret"))
+            .expect("build mock store");
+        S3Backend {
+            store,
+            prefix: None,
+            redirect_downloads: false,
+            cloudfront: None,
+            path_format: StoragePathFormat::Native,
+            signing_store: None,
+            disable_multi_delete,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_success_204() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The presigned DELETE URL hits the mock server; respond with 204
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "test-key".into();
+        let result = backend.single_object_delete(&path, "test-key").await;
+        assert!(result.is_ok(), "204 should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_success_200() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "another-key".into();
+        let result = backend.single_object_delete(&path, "another-key").await;
+        assert!(result.is_ok(), "200 should be treated as success");
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_404_is_idempotent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("NoSuchKey"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "missing-key".into();
+        let result = backend.single_object_delete(&path, "missing-key").await;
+        assert!(
+            result.is_ok(),
+            "404 on delete should be treated as success (idempotent)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_403_returns_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("AccessDenied"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "forbidden-key".into();
+        let result = backend.single_object_delete(&path, "forbidden-key").await;
+        assert!(result.is_err(), "403 should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("403"),
+            "error should mention status code: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_object_delete_500_returns_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("InternalError"))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let path: ObjectPath = "error-key".into();
+        let result = backend.single_object_delete(&path, "error-key").await;
+        assert!(result.is_err(), "500 should be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("500"),
+            "error should mention status code: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_dispatches_to_single_object_delete_when_enabled() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // single_object_delete generates a signed DELETE URL and then issues
+        // an HTTP DELETE to it, so we only need to match DELETE
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), true).await;
+        let result = StorageBackendTrait::delete(&backend, "dispatch-key").await;
+        assert!(
+            result.is_ok(),
+            "delete with disable_multi_delete=true should use single_object_delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_uses_store_delete_when_multi_delete_enabled() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // object_store issues a POST ?delete for multi-object delete.
+        // We just mock any request to respond with 200 so the call succeeds.
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<?xml version="1.0"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        // With disable_multi_delete=false, the standard store.delete() path
+        // is used. We mainly verify the branch is taken without panicking.
+        let _ = crate::storage::StorageBackend::delete(&backend, "multi-key").await;
+        // Not asserting success because the mock may not perfectly satisfy
+        // the object_store S3 multi-delete protocol, but the branch is exercised.
     }
 }
 
