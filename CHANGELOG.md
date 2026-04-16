@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.4] - 2026-04-16
+
+### Sponsors
+
+Thank you to our backers for supporting ongoing development:
+
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper)
+
+### Thank You
+
+- @jamie-kemp for reporting the backup path length failure (#758)
+
+### Fixed
+
+- **Backups fail on long artifact paths** (#758) -- backup exports crashed with "provided value is too long when setting path" for proxy-cached Maven artifacts with deep coordinates. The tar builder now uses `append_data()` which handles paths over 100 characters via GNU LongLink entries.
+
 ## [1.1.3] - 2026-04-15
 
 ### Sponsors
