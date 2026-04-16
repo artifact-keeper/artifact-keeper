@@ -65,6 +65,40 @@ impl From<GroupRow> for GroupResponse {
     }
 }
 
+#[derive(Debug, Serialize, FromRow)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupMemberResponse {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<MemberRow> for GroupMemberResponse {
+    fn from(row: MemberRow) -> Self {
+        Self {
+            user_id: row.user_id,
+            username: row.username,
+            display_name: row.display_name,
+            joined_at: row.joined_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupDetailResponse {
+    #[serde(flatten)]
+    pub group: GroupResponse,
+    pub members: Vec<GroupMemberResponse>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GroupListResponse {
     pub items: Vec<GroupResponse>,
@@ -234,7 +268,7 @@ pub async fn create_group(
         ("id" = Uuid, Path, description = "Group ID")
     ),
     responses(
-        (status = 200, description = "Group details", body = GroupResponse),
+        (status = 200, description = "Group details with members", body = GroupDetailResponse),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -243,7 +277,7 @@ pub async fn create_group(
 pub async fn get_group(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<GroupResponse>> {
+) -> Result<Json<GroupDetailResponse>> {
     // Check if groups table exists first
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'groups')",
@@ -272,7 +306,24 @@ pub async fn get_group(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
-    Ok(Json(GroupResponse::from(group)))
+    let members: Vec<MemberRow> = sqlx::query_as(
+        r#"
+        SELECT ugm.user_id, u.username, u.display_name, ugm.joined_at
+        FROM user_group_members ugm
+        JOIN users u ON u.id = ugm.user_id
+        WHERE ugm.group_id = $1
+        ORDER BY ugm.joined_at
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(Json(GroupDetailResponse {
+        group: GroupResponse::from(group),
+        members: members.into_iter().map(GroupMemberResponse::from).collect(),
+    }))
 }
 
 /// Update a group
@@ -769,5 +820,144 @@ mod tests {
         assert!(json["items"].as_array().unwrap().is_empty());
         assert_eq!(json["pagination"]["total"], 0);
         assert_eq!(json["pagination"]["total_pages"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // MemberRow -> GroupMemberResponse conversion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_member_row_to_response() {
+        let now = Utc::now();
+        let row = MemberRow {
+            user_id: Uuid::nil(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            joined_at: now,
+        };
+        let resp: GroupMemberResponse = row.into();
+        assert_eq!(resp.username, "alice");
+        assert_eq!(resp.display_name, Some("Alice".to_string()));
+        assert_eq!(resp.joined_at, now);
+    }
+
+    #[test]
+    fn test_member_row_to_response_no_display_name() {
+        let row = MemberRow {
+            user_id: Uuid::nil(),
+            username: "bob".to_string(),
+            display_name: None,
+            joined_at: Utc::now(),
+        };
+        let resp: GroupMemberResponse = row.into();
+        assert_eq!(resp.username, "bob");
+        assert!(resp.display_name.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupDetailResponse / GroupMemberResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_member_response_serialization() {
+        let member = GroupMemberResponse {
+            user_id: Uuid::nil(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            joined_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&member).unwrap();
+        assert_eq!(json["user_id"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(json["username"], "alice");
+        assert_eq!(json["display_name"], "Alice");
+        assert!(json["joined_at"].is_string());
+    }
+
+    #[test]
+    fn test_group_member_response_null_display_name() {
+        let member = GroupMemberResponse {
+            user_id: Uuid::nil(),
+            username: "bob".to_string(),
+            display_name: None,
+            joined_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&member).unwrap();
+        assert_eq!(json["username"], "bob");
+        assert!(json["display_name"].is_null());
+    }
+
+    #[test]
+    fn test_group_detail_response_flattens_group_fields() {
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "dev".to_string(),
+                description: Some("Developers".to_string()),
+                member_count: 2,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            members: vec![],
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        // `group` is flattened: its fields appear at the top level alongside `members`.
+        assert_eq!(json["name"], "dev");
+        assert_eq!(json["description"], "Developers");
+        assert_eq!(json["member_count"], 2);
+        assert!(json["members"].is_array());
+        assert!(json["group"].is_null());
+    }
+
+    #[test]
+    fn test_group_detail_response_with_members() {
+        let now = Utc::now();
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "admins".to_string(),
+                description: None,
+                member_count: 2,
+                created_at: now,
+                updated_at: now,
+            },
+            members: vec![
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "alice".to_string(),
+                    display_name: Some("Alice".to_string()),
+                    joined_at: now,
+                },
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "bob".to_string(),
+                    display_name: None,
+                    joined_at: now,
+                },
+            ],
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["username"], "alice");
+        assert_eq!(members[1]["username"], "bob");
+        assert!(members[1]["display_name"].is_null());
+    }
+
+    #[test]
+    fn test_group_detail_response_empty_members() {
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "empty".to_string(),
+                description: None,
+                member_count: 0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            members: vec![],
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["member_count"], 0);
+        assert!(json["members"].as_array().unwrap().is_empty());
     }
 }
