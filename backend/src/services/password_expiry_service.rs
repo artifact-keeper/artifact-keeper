@@ -396,4 +396,122 @@ mod tests {
         let remaining = days_until_expiry(changed, 3650, now);
         assert_eq!(remaining, Some(3650));
     }
+
+    #[test]
+    fn test_days_until_expiry_one_day_policy() {
+        let now = Utc::now();
+        let changed = now;
+        let remaining = days_until_expiry(changed, 1, now);
+        assert_eq!(remaining, Some(1));
+    }
+
+    // -------------------------------------------------------------------
+    // build_notification_text (additional edge cases)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_text_negative_days() {
+        let text = build_notification_text("dave", -3);
+        assert!(text.contains("dave"));
+        assert!(text.contains("expired"));
+        assert!(!text.contains("-3"));
+    }
+
+    #[test]
+    fn test_notification_text_many_days() {
+        let text = build_notification_text("eve", 30);
+        assert!(text.contains("eve"));
+        assert!(text.contains("30 days"));
+        assert!(!text.contains("tomorrow"));
+        assert!(!text.contains("expired"));
+    }
+
+    #[test]
+    fn test_notification_text_two_days() {
+        let text = build_notification_text("frank", 2);
+        assert!(text.contains("frank"));
+        assert!(text.contains("2 days"));
+        assert!(!text.contains("tomorrow"));
+    }
+
+    // -------------------------------------------------------------------
+    // build_notification_html (additional edge cases)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_html_negative_days() {
+        let html = build_notification_html("dave", -3);
+        assert!(html.contains("dave"));
+        assert!(html.contains("expired"));
+        assert!(html.contains("<strong>"));
+    }
+
+    #[test]
+    fn test_notification_html_many_days() {
+        let html = build_notification_html("eve", 30);
+        assert!(html.contains("eve"));
+        assert!(html.contains("30 days"));
+        assert!(html.contains("<strong>"));
+    }
+
+    #[test]
+    fn test_notification_html_contains_structure() {
+        let html = build_notification_html("test_user", 5);
+        assert!(html.contains("<h2>"));
+        assert!(html.contains("<p>"));
+        assert!(html.contains("Password Expiry Notice"));
+        assert!(html.contains("Artifact Keeper"));
+    }
+
+    #[test]
+    fn test_notification_text_contains_signature() {
+        let text = build_notification_text("test_user", 5);
+        assert!(text.contains("Artifact Keeper"));
+        assert!(text.contains("Hello test_user"));
+    }
+
+    // -------------------------------------------------------------------
+    // should_notify (additional edge cases)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_should_notify_warning_equals_expiry() {
+        let now = Utc::now();
+        // 7-day expiry with 7-day warning: notify for the entire lifecycle
+        let changed = now - Duration::days(3);
+        assert!(should_notify(changed, 7, 7, now));
+    }
+
+    #[test]
+    fn test_should_not_notify_warning_zero() {
+        let now = Utc::now();
+        // 0-day warning tier should only notify on expiry day
+        let changed = now - Duration::days(89);
+        assert!(!should_notify(changed, 90, 0, now));
+    }
+
+    #[test]
+    fn test_should_notify_warning_zero_on_expiry_day() {
+        let now = Utc::now();
+        // 0-day warning tier, password expires today (remaining = 0)
+        let changed = now - Duration::days(90);
+        assert!(should_notify(changed, 90, 0, now));
+    }
+
+    // -------------------------------------------------------------------
+    // ExpiringUser struct
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_expiring_user_debug() {
+        let user = ExpiringUser {
+            id: uuid::Uuid::nil(),
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            password_changed_at: Utc::now(),
+        };
+        let debug_output = format!("{:?}", user);
+        assert!(debug_output.contains("testuser"));
+        assert!(debug_output.contains("test@example.com"));
+    }
 }
