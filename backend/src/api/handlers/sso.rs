@@ -288,6 +288,13 @@ async fn oidc_callback_inner(
 
     let groups = extract_oidc_groups(&claims, groups_claim);
 
+    // Read admin group setting from DB attribute_mapping, falling back to env
+    let required_admin_group = attr
+        .get("admin_group")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("OIDC_ADMIN_GROUP").ok());
+
     // 7. Authenticate via federated flow (find/create user + generate tokens)
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
@@ -300,6 +307,7 @@ async fn oidc_callback_inner(
                 email,
                 display_name,
                 groups,
+                required_admin_group,
             },
         )
         .await?;
@@ -382,6 +390,7 @@ pub async fn ldap_login(
                 email: ldap_user.email,
                 display_name: ldap_user.display_name,
                 groups: ldap_user.groups,
+                required_admin_group: row.admin_group_dn.clone(),
             },
         )
         .await?;
@@ -520,6 +529,7 @@ pub async fn saml_acs(
                 email: saml_user.email,
                 display_name: saml_user.display_name,
                 groups: saml_user.groups,
+                required_admin_group: row.admin_group.clone(),
             },
         )
         .await?;
