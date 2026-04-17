@@ -1526,3 +1526,4 @@ mod tests {
     // unit-tested on macOS/Linux. It is compile-checked on Windows CI and
     // tested manually via `--install` / `--uninstall` / `--service` flags.
 }
+// warm cache benchmark
