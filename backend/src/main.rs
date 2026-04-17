@@ -1527,3 +1527,4 @@ mod tests {
     // tested manually via `--install` / `--uninstall` / `--service` flags.
 }
 // warm cache benchmark
+// sqlx-cli benchmark
