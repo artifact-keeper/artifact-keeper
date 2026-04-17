@@ -9,10 +9,9 @@ pull_request_rules:
       - author=dependabot[bot]
       - "title~=^Bump .* from .* to .*"
       - "-title~=major"
-      - check-success=lint-rust
+      - check-success=check-rust
       - check-success=test-backend-unit
       - check-success=ci-complete
-      - "check-success=SonarCloud Code Analysis"
       - "#approved-reviews-by>=1"
     actions:
       queue:
