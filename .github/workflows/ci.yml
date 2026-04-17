@@ -89,24 +89,18 @@ jobs:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
-        run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
+        run: |
+          cargo llvm-cov --workspace --lib --lcov --output-path lcov.info --fail-under-lines 70
+          echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo llvm-cov --workspace --lib --no-run --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: lcov-coverage
           path: lcov.info
-
-      - name: SonarCloud Scan
-        if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@299e4b793aaa83bf2aba7c9c14bedbb485688ec4 # v7
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.projectKey=artifact-keeper_artifact-keeper
-            -Dsonar.organization=artifact-keeper
-            -Dsonar.rust.lcov.reportPaths=lcov.info
 
   # ════════════════════════════════════════════════════════════════════════════
   # TIER 2: INTEGRATION (Main Branch Push Only)
