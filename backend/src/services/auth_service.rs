@@ -902,7 +902,11 @@ impl AuthService {
     ///
     /// # Returns
     /// * `RoleMapping` - The mapped roles and admin status
-    pub fn map_groups_to_roles(&self, groups: &[String], required_admin_group: Option<&str>) -> RoleMapping {
+    pub fn map_groups_to_roles(
+        &self,
+        groups: &[String],
+        required_admin_group: Option<&str>,
+    ) -> RoleMapping {
         let mut mapping = RoleMapping::default();
 
         // Normalize groups to lowercase for case-insensitive matching
@@ -1022,7 +1026,10 @@ impl AuthService {
         credentials: &FederatedCredentials,
     ) -> Result<User> {
         // Map groups to roles
-        let role_mapping = self.map_groups_to_roles(&credentials.groups, credentials.required_admin_group.as_deref());
+        let role_mapping = self.map_groups_to_roles(
+            &credentials.groups,
+            credentials.required_admin_group.as_deref(),
+        );
 
         // Check if user exists by external_id
         let existing_user = sqlx::query_as!(
@@ -1679,7 +1686,10 @@ mod tests {
         test_map_groups_to_roles_with_admin(groups, None)
     }
 
-    fn test_map_groups_to_roles_with_admin(groups: &[String], required_admin_group: Option<&str>) -> RoleMapping {
+    fn test_map_groups_to_roles_with_admin(
+        groups: &[String],
+        required_admin_group: Option<&str>,
+    ) -> RoleMapping {
         let mut mapping = RoleMapping::default();
         let normalized_groups: Vec<String> = groups.iter().map(|g| g.to_lowercase()).collect();
 
@@ -1860,10 +1870,8 @@ mod tests {
     #[test]
     fn test_required_admin_group_prevents_substring_match() {
         // "company-admin-team" contains "admin" but should NOT match required "admin"
-        let mapping = test_map_groups_to_roles_with_admin(
-            &["company-admin-team".to_string()],
-            Some("admin"),
-        );
+        let mapping =
+            test_map_groups_to_roles_with_admin(&["company-admin-team".to_string()], Some("admin"));
         assert_eq!(mapping.is_admin, Some(false));
     }
 
