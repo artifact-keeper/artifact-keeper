@@ -916,7 +916,7 @@ impl AuthService {
         // exact match only; otherwise fall back to built-in pattern matching.
         if let Some(ag) = required_admin_group {
             let ag_lower = ag.to_lowercase();
-            if normalized_groups.iter().any(|g| *g == ag_lower) {
+            if normalized_groups.contains(&ag_lower) {
                 mapping.is_admin = Some(true);
                 mapping.roles.push("admin".to_string());
             } else {
@@ -1695,7 +1695,7 @@ mod tests {
 
         if let Some(ag) = required_admin_group {
             let ag_lower = ag.to_lowercase();
-            if normalized_groups.iter().any(|g| *g == ag_lower) {
+            if normalized_groups.contains(&ag_lower) {
                 mapping.is_admin = Some(true);
                 mapping.roles.push("admin".to_string());
             } else {
