@@ -115,7 +115,7 @@ jobs:
   test-backend-integration:
     name: 🔗 Backend Integration Tests
     runs-on: ak-ci-runners
-    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.event_name == 'push'
+    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     services:
       postgres:
         image: postgres:16-alpine
