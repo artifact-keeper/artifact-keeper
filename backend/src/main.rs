@@ -1528,3 +1528,4 @@ mod tests {
 }
 // warm cache benchmark
 // sqlx-cli benchmark
+// coverage benchmark
