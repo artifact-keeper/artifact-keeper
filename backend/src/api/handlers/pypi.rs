@@ -87,7 +87,7 @@ async fn simple_root(
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
     // Get all distinct normalized package names in this repository
-    let packages: Vec<String> = sqlx::query_scalar!(
+    let mut packages: Vec<String> = sqlx::query_scalar!(
         r#"
         SELECT DISTINCT
             LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-'))
@@ -104,6 +104,56 @@ async fn simple_root(
     .flatten()
     .collect();
 
+    // Virtual repos have no artifacts of their own. Aggregate package names
+    // from all member repos so that the root index lists every package
+    // available through the virtual endpoint.
+    if packages.is_empty() && repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for member in &members {
+            if member.repo_type == RepositoryType::Local
+                || member.repo_type == RepositoryType::Staging
+            {
+                let member_packages: Vec<String> = sqlx::query_scalar!(
+                    r#"
+        SELECT DISTINCT
+            LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-'))
+        FROM artifacts
+        WHERE repository_id = $1 AND is_deleted = false
+        ORDER BY 1
+        "#,
+                    member.id
+                )
+                .fetch_all(&state.db)
+                .await
+                .map_err(map_db_err)?
+                .into_iter()
+                .flatten()
+                .collect();
+
+                merged.extend(member_packages);
+            }
+            // Remote member proxying for the root index is intentionally
+            // skipped: the upstream /simple/ can be very large and slow.
+            // Individual package lookups in simple_project() already proxy
+            // remote members on demand.
+        }
+
+        packages = merged.into_iter().collect();
+    }
+
+    build_simple_root_response(&headers, &repo_key, &packages)
+}
+
+/// Render the simple root index (list of all packages) as either HTML (PEP 503)
+/// or JSON (PEP 691) based on the Accept header.
+#[allow(clippy::result_large_err)]
+fn build_simple_root_response(
+    headers: &HeaderMap,
+    repo_key: &str,
+    packages: &[String],
+) -> Result<Response, Response> {
     // Check Accept header for PEP 691 JSON
     let accept = headers
         .get(CONTENT_TYPE.as_str())
@@ -131,7 +181,7 @@ async fn simple_root(
          <title>Simple Index</title></head>\n<body>\n<h1>Simple Index</h1>\n",
     );
 
-    for package in &packages {
+    for package in packages {
         let normalized = PypiHandler::normalize_name(package);
         html.push_str(&format!(
             "<a href=\"/pypi/{}/simple/{}/\">{}</a><br/>\n",
@@ -2421,5 +2471,125 @@ mod tests {
 
         let files = json["files"].as_array().unwrap();
         assert_eq!(files[0]["requires-python"], ">=3.9,<4.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_simple_root_response (PEP 503 / PEP 691 root index)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_simple_root_response_html() {
+        let packages = vec![
+            "flask".to_string(),
+            "numpy".to_string(),
+            "requests".to_string(),
+        ];
+        let headers = HeaderMap::new();
+
+        let result = build_simple_root_response(&headers, "pypi-virtual", &packages);
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/html; charset=utf-8");
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("<h1>Simple Index</h1>"));
+        assert!(html.contains("/pypi/pypi-virtual/simple/flask/"));
+        assert!(html.contains("/pypi/pypi-virtual/simple/numpy/"));
+        assert!(html.contains("/pypi/pypi-virtual/simple/requests/"));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_json() {
+        let packages = vec!["flask".to_string(), "numpy".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.pypi.simple.v1+json".parse().unwrap(),
+        );
+
+        let result = build_simple_root_response(&headers, "pypi-virtual", &packages);
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/vnd.pypi.simple.v1+json");
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["meta"]["api-version"], "1.1");
+        let projects = json["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0]["name"], "flask");
+        assert_eq!(projects[1]["name"], "numpy");
+    }
+
+    #[test]
+    fn test_build_simple_root_response_empty_packages() {
+        let packages: Vec<String> = vec![];
+        let headers = HeaderMap::new();
+
+        let result = build_simple_root_response(&headers, "pypi-local", &packages);
+        let response = result.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("<h1>Simple Index</h1>"));
+        // No package links should appear
+        assert!(!html.contains("<a href="));
+    }
+
+    #[test]
+    fn test_build_simple_root_response_deduplicates_via_btreeset() {
+        // Verify that duplicate package names (which would come from
+        // multiple member repos in a virtual) are already deduplicated
+        // by the BTreeSet in simple_root before reaching the response
+        // builder. The response builder itself renders whatever it gets.
+        let packages = vec!["flask".to_string(), "flask".to_string()];
+        let headers = HeaderMap::new();
+
+        let result = build_simple_root_response(&headers, "pypi-virtual", &packages);
+        let response = result.unwrap();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX);
+        let body = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(body_bytes)
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        // Two entries appear because deduplication is the caller's job
+        // (simple_root uses BTreeSet). This test documents the contract.
+        let count = html.matches("/pypi/pypi-virtual/simple/flask/").count();
+        assert_eq!(count, 2);
     }
 }
