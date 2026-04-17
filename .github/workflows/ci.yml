@@ -29,8 +29,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
+  SQLX_OFFLINE: "true"
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
@@ -494,6 +493,9 @@ jobs:
     # Only build Windows on main push (not PRs) to save 27+ min on PR checks.
     # The release workflow builds Windows binaries for actual releases.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
