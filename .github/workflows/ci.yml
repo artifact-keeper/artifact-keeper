@@ -37,24 +37,11 @@ jobs:
   # TIER 1: FAST CI (Every Push/PR) - Target: < 5 minutes
   # ════════════════════════════════════════════════════════════════════════════
 
-  lint-rust:
-    name: 🦀 Lint Rust
+  check-rust:
+    name: 🦀 Check Rust
     runs-on: ak-ci-runners
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -67,17 +54,6 @@ jobs:
     runs-on: ak-ci-runners
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run unit tests
         env:
@@ -103,22 +79,6 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov
 
       - name: Install sqlx-cli
         uses: taiki-e/install-action@v2
@@ -179,17 +139,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run integration tests
         env:
@@ -453,7 +402,7 @@ jobs:
   ci-complete:
     name: ✅ CI Complete
     runs-on: ak-ci-runners
-    needs: [lint-rust, test-backend-unit, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [check-rust, test-backend-unit, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -464,8 +413,8 @@ jobs:
           tier1_pass=true
 
           # Tier 1 jobs (required)
-          for job in lint-rust test-backend-unit; do
-            result="${{ needs.lint-rust.result }}"
+          for job in check-rust test-backend-unit; do
+            result="${{ needs.check-rust.result }}"
             [ "$job" = "test-backend-unit" ] && result="${{ needs.test-backend-unit.result }}"
             if [[ "$result" == "success" ]]; then
               echo "✅ $job" >> $GITHUB_STEP_SUMMARY
