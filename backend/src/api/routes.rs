@@ -344,21 +344,28 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         // Admin routes with admin middleware (requires is_admin)
         .nest(
             "/admin",
-            handlers::admin::router()
-                .route("/metrics", get(handlers::health::metrics))
-                .nest("/analytics", handlers::analytics::router())
-                .nest("/lifecycle", handlers::lifecycle::router())
-                .nest("/storage-gc", handlers::storage_gc::router())
-                .nest("/search", handlers::search::admin_router())
-                .nest("/telemetry", handlers::telemetry::router())
-                .nest("/monitoring", handlers::monitoring::router())
-                .nest("/sso", handlers::sso_admin::router())
-                .nest("/smtp", handlers::smtp::router())
-                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
-                .layer(middleware::from_fn_with_state(
-                    auth_service.clone(),
-                    admin_middleware,
-                )),
+            {
+                let admin =
+                    handlers::admin::router().route("/metrics", get(handlers::health::metrics));
+                #[cfg(feature = "profiling")]
+                let admin = admin
+                    .route("/memory-stats", get(handlers::health::memory_stats))
+                    .route("/heap-profile", get(handlers::health::heap_profile));
+                admin
+            }
+            .nest("/analytics", handlers::analytics::router())
+            .nest("/lifecycle", handlers::lifecycle::router())
+            .nest("/storage-gc", handlers::storage_gc::router())
+            .nest("/search", handlers::search::admin_router())
+            .nest("/telemetry", handlers::telemetry::router())
+            .nest("/monitoring", handlers::monitoring::router())
+            .nest("/sso", handlers::sso_admin::router())
+            .nest("/smtp", handlers::smtp::router())
+            .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+            .layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
+            )),
         )
         // Plugin routes with auth middleware
         .nest(
