@@ -32,7 +32,12 @@ FROM rust-base AS deps
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 ENV SQLX_OFFLINE=true
-RUN cargo chef cook --release --recipe-path recipe.json
+ARG CARGO_FEATURES=""
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo chef cook --release --features "$CARGO_FEATURES" --recipe-path recipe.json; \
+    else \
+      cargo chef cook --release --recipe-path recipe.json; \
+    fi
 
 # ---------- Stage 3: Build binary ----------
 FROM rust-base AS builder
@@ -43,9 +48,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
 ARG GIT_SHA=unknown
+ARG CARGO_FEATURES=""
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
-RUN cargo build --release --bin artifact-keeper
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo build --release --features "$CARGO_FEATURES" --bin artifact-keeper; \
+    else \
+      cargo build --release --bin artifact-keeper; \
+    fi
 
 # ---------- Stage 4: Build minimal rootfs ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.7 AS rootfs-builder
