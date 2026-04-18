@@ -79,6 +79,8 @@ fn test_config(storage_path: &str) -> Config {
         quarantine_duration_minutes: 60,
         password_history_count: 0,
         password_expiry_days: 0,
+        password_expiry_warning_days: vec![14, 7, 1],
+        password_expiry_check_interval_secs: 3600,
         password_min_length: 8,
         password_max_length: 128,
         password_require_uppercase: false,

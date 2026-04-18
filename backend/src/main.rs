@@ -412,6 +412,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         config.clone(),
         scheduler_storage,
         storage_registry.clone(),
+        state.smtp_service.clone(),
     );
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
@@ -1525,3 +1526,6 @@ mod tests {
     // unit-tested on macOS/Linux. It is compile-checked on Windows CI and
     // tested manually via `--install` / `--uninstall` / `--service` flags.
 }
+// warm cache benchmark
+// sqlx-cli benchmark
+// coverage benchmark

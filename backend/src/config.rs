@@ -192,6 +192,15 @@ pub struct Config {
     /// be changed. Set to 0 to disable password expiration. Default: 0.
     pub password_expiry_days: u32,
 
+    /// Comma-separated list of day thresholds at which expiry warning emails
+    /// are sent to local users. Only effective when `password_expiry_days` > 0
+    /// and SMTP is configured. Default: "14,7,1".
+    pub password_expiry_warning_days: Vec<u32>,
+
+    /// How often (in seconds) the password expiry notification job runs.
+    /// Default: 3600 (1 hour).
+    pub password_expiry_check_interval_secs: u64,
+
     // -- Password policy (local users) --
     /// Minimum password length (default: 8).
     pub password_min_length: usize,
@@ -300,6 +309,8 @@ redacted_debug!(Config {
     show quarantine_duration_minutes,
     show password_history_count,
     show password_expiry_days,
+    show password_expiry_warning_days,
+    show password_expiry_check_interval_secs,
     show password_min_length,
     show password_max_length,
     show password_require_uppercase,
@@ -372,6 +383,8 @@ impl Default for Config {
             quarantine_duration_minutes: 60,
             password_history_count: 0,
             password_expiry_days: 0,
+            password_expiry_warning_days: vec![1, 7, 14],
+            password_expiry_check_interval_secs: 3600,
             password_min_length: 8,
             password_max_length: 128,
             password_require_uppercase: false,
@@ -510,6 +523,22 @@ impl Config {
             quarantine_duration_minutes: env_parse("QUARANTINE_DURATION_MINUTES", 60).max(1),
             password_history_count: env_parse::<u32>("PASSWORD_HISTORY_COUNT", 0).min(24),
             password_expiry_days: env_parse("PASSWORD_EXPIRY_DAYS", 0).min(3650),
+            password_expiry_warning_days: {
+                let raw =
+                    env::var("PASSWORD_EXPIRY_WARNING_DAYS").unwrap_or_else(|_| "14,7,1".into());
+                let mut days: Vec<u32> = raw
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u32>().ok())
+                    .filter(|&d| d > 0)
+                    .collect();
+                days.sort_unstable();
+                days.dedup();
+                days
+            },
+            password_expiry_check_interval_secs: env_parse(
+                "PASSWORD_EXPIRY_CHECK_INTERVAL_SECS",
+                3600,
+            ),
             password_min_length: env_parse("PASSWORD_MIN_LENGTH", 8),
             password_max_length: env_parse("PASSWORD_MAX_LENGTH", 128),
             password_require_uppercase: matches!(
@@ -775,6 +804,8 @@ mod tests {
         env::remove_var("RATE_LIMIT_AUTH_PER_MIN");
         env::remove_var("RATE_LIMIT_API_PER_MIN");
         env::remove_var("RATE_LIMIT_WINDOW_SECS");
+        env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS");
+        env::remove_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS");
 
         let config = Config::from_env().expect("Config should load with required vars");
 
@@ -806,8 +837,10 @@ mod tests {
         assert_eq!(config.database_idle_timeout_secs, 600);
         assert_eq!(config.database_max_lifetime_secs, 1800);
 
-        // Password expiration default (disabled)
+        // Password expiration defaults (#679)
         assert_eq!(config.password_expiry_days, 0);
+        assert_eq!(config.password_expiry_warning_days, vec![1, 7, 14]);
+        assert_eq!(config.password_expiry_check_interval_secs, 3600);
 
         // Rate limit defaults (#692)
         assert_eq!(config.rate_limit_auth_per_window, 120);
@@ -1604,6 +1637,169 @@ mod tests {
         match saved_rate {
             Some(v) => env::set_var("RATE_LIMIT_API_PER_MIN", v),
             None => env::remove_var("RATE_LIMIT_API_PER_MIN"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Password expiry notification config (#679)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_config_password_expiry_warning_days_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "30,14,7,3,1");
+
+        let config = Config::from_env().unwrap();
+        // Should be sorted and deduped
+        assert_eq!(config.password_expiry_warning_days, vec![1, 3, 7, 14, 30]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_warning_days_dedup_and_sort() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "7,7,3,14,3");
+
+        let config = Config::from_env().unwrap();
+        // Duplicates removed and sorted
+        assert_eq!(config.password_expiry_warning_days, vec![3, 7, 14]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_warning_days_filters_zero() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "0,7,0,1");
+
+        let config = Config::from_env().unwrap();
+        // Zeros filtered out
+        assert_eq!(config.password_expiry_warning_days, vec![1, 7]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_warning_days_ignores_invalid() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_warn = env::var("PASSWORD_EXPIRY_WARNING_DAYS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", "abc,7,,1,xyz");
+
+        let config = Config::from_env().unwrap();
+        // Non-numeric values filtered by parse, empty strings ignored
+        assert_eq!(config.password_expiry_warning_days, vec![1, 7]);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_warn {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_WARNING_DAYS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_WARNING_DAYS"),
+        }
+    }
+
+    #[test]
+    fn test_config_password_expiry_check_interval_custom() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_interval = env::var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::set_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS", "1800");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.password_expiry_check_interval_secs, 1800);
+
+        // Restore
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        match saved_interval {
+            Some(v) => env::set_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS", v),
+            None => env::remove_var("PASSWORD_EXPIRY_CHECK_INTERVAL_SECS"),
         }
     }
 }

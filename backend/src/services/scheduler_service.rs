@@ -16,6 +16,7 @@ use crate::services::backup_service::{BackupService, BackupType, CreateBackupReq
 use crate::services::health_monitor_service::{HealthMonitorService, MonitorConfig};
 use crate::services::lifecycle_service::LifecycleService;
 use crate::services::metrics_service;
+use crate::services::smtp_service::SmtpService;
 use crate::services::storage_service::StorageService;
 use crate::services::sync_policy_service::SyncPolicyService;
 
@@ -35,6 +36,7 @@ pub fn spawn_all(
     config: Config,
     _primary_storage: Arc<dyn crate::storage::StorageBackend>,
     storage_registry: Arc<crate::storage::StorageRegistry>,
+    smtp_service: Option<Arc<SmtpService>>,
 ) {
     // Daily metrics snapshot (runs every hour, captures once per day via UPSERT)
     {
@@ -298,9 +300,52 @@ pub fn spawn_all(
         });
     }
 
-    tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
-    );
+    // Password expiry notifications (configurable interval, default: hourly)
+    if config.password_expiry_days > 0 {
+        if let Some(smtp) = smtp_service {
+            let db = db.clone();
+            let expiry_days = config.password_expiry_days;
+            let warning_tiers = config.password_expiry_warning_days.clone();
+            let check_secs = config.password_expiry_check_interval_secs;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let mut ticker = interval(Duration::from_secs(check_secs));
+
+                loop {
+                    ticker.tick().await;
+                    tracing::debug!("Checking for password expiry notifications");
+
+                    match crate::services::password_expiry_service::send_expiry_notifications(
+                        &db,
+                        &smtp,
+                        expiry_days,
+                        &warning_tiers,
+                    )
+                    .await
+                    {
+                        Ok(count) if count > 0 => {
+                            tracing::info!("Sent {} password expiry notification(s)", count,);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Password expiry notification check failed: {}", e);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            tracing::info!(
+                "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, password expiry notifications"
+            );
+        } else {
+            tracing::info!(
+                "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup (password expiry notifications skipped: SMTP not configured)"
+            );
+        }
+    } else {
+        tracing::info!(
+            "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
+        );
+    }
 }
 
 /// A row from the backup_schedules table.
