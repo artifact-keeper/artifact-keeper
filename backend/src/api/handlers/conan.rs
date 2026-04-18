@@ -40,7 +40,11 @@ use crate::models::repository::RepositoryType;
 
 pub fn router() -> Router<SharedState> {
     Router::new()
-        // Ping
+        // Ping. Conan 2 clients probe `/v1/ping` for server capabilities
+        // (the `x-conan-server-capabilities` header) even when using the v2
+        // protocol — see `conan/internal/rest/rest_client.py::_get_api`. Both
+        // routes return the same response.
+        .route("/:repo_key/v1/ping", get(ping))
         .route("/:repo_key/v2/ping", get(ping))
         // Authentication
         .route(
@@ -1277,6 +1281,22 @@ async fn package_file_upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ping_returns_revisions_capability() {
+        let response = ping().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let capabilities = response
+            .headers()
+            .get("x-conan-server-capabilities")
+            .expect("x-conan-server-capabilities header must be present")
+            .to_str()
+            .expect("header value must be ASCII");
+        assert!(
+            capabilities.contains("revisions"),
+            "capability header must advertise 'revisions', got: {capabilities}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (moved into test module)
