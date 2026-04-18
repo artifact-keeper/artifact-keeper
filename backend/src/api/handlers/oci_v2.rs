@@ -2322,6 +2322,98 @@ async fn catalog_local_entries(
     Ok((entries, has_more))
 }
 
+async fn handle_delete_manifest(
+    state: &SharedState,
+    headers: &HeaderMap,
+    image_name: &str,
+    reference: &str,
+) -> Response {
+    let host = request_host(headers);
+    let claims = match validate_token(&state.db, &state.config, headers) {
+        Ok(c) => c,
+        Err(_) => return unauthorized_challenge(&host),
+    };
+    let _ = claims;
+
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    // Resolve the manifest digest. The reference may be a tag name or a digest.
+    let manifest_digest: Option<String> = if reference.starts_with("sha256:") {
+        // Verify the digest actually exists in our tag table
+        sqlx::query_scalar!(
+            "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
+            repo.id,
+            reference
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        sqlx::query_scalar!(
+            "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+            repo.id,
+            repo.image,
+            reference
+        )
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+    };
+
+    let digest = match manifest_digest {
+        Some(d) => d,
+        None => {
+            return oci_error(
+                StatusCode::NOT_FOUND,
+                "MANIFEST_UNKNOWN",
+                "manifest not found",
+            )
+        }
+    };
+
+    // Delete all tag rows pointing to this digest within the repository
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2",
+        repo.id,
+        digest
+    )
+    .execute(&state.db)
+    .await
+    {
+        return oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            &e.to_string(),
+        );
+    }
+
+    // Soft-delete the corresponding artifact record
+    let artifact_path = format!("v2/{}/manifests/{}", repo.image, reference);
+    let _ = sqlx::query!(
+        "UPDATE artifacts SET is_deleted = true, updated_at = NOW() WHERE repository_id = $1 AND path = $2",
+        repo.id,
+        artifact_path
+    )
+    .execute(&state.db)
+    .await;
+
+    info!(
+        "Manifest deleted: {}:{} (digest {})",
+        image_name, reference, digest
+    );
+
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Catch-all handlers
 // ---------------------------------------------------------------------------
@@ -2390,6 +2482,10 @@ async fn catch_all(
         ("PUT", "manifests") => {
             let r = require_ref!(reference, "NAME_INVALID", "reference required");
             handle_put_manifest(&state, &headers, &image_name, &r, body).await
+        }
+        ("DELETE", "manifests") => {
+            let r = require_ref!(reference, "NAME_INVALID", "reference required");
+            handle_delete_manifest(&state, &headers, &image_name, &r).await
         }
         ("GET", "tags") => handle_tags_list(&state, &headers, &image_name, &query).await,
         _ => oci_error(
@@ -3667,5 +3763,31 @@ mod tests {
         params.insert("n".to_string(), "-1".to_string());
         let err = parse_pagination_params(&params).unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_delete_manifest: path parsing for DELETE dispatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_oci_path_delete_manifest_by_tag() {
+        let result = parse_oci_path("/myrepo/myimage/manifests/v1.0");
+        let (name, op, reference) = result.unwrap();
+        assert_eq!(name, "myrepo/myimage");
+        assert_eq!(op, "manifests");
+        assert_eq!(reference, Some("v1.0".to_string()));
+    }
+
+    #[test]
+    fn test_parse_oci_path_delete_manifest_by_digest() {
+        let result =
+            parse_oci_path("/myrepo/myimage/manifests/sha256:abcdef1234567890abcdef1234567890");
+        let (name, op, reference) = result.unwrap();
+        assert_eq!(name, "myrepo/myimage");
+        assert_eq!(op, "manifests");
+        assert_eq!(
+            reference,
+            Some("sha256:abcdef1234567890abcdef1234567890".to_string())
+        );
     }
 }

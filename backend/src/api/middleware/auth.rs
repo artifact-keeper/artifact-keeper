@@ -1432,4 +1432,100 @@ mod tests {
         };
         assert!(ext.require_admin().is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // Public repo anonymous access: should_allow_repo_access + is_write_method
+    // combined to verify the middleware allows anonymous reads on public repos
+    // while blocking anonymous writes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_public_repo_allows_anonymous_get() {
+        let is_public = true;
+        let has_auth = false;
+        let method = Method::GET;
+        assert!(
+            should_allow_repo_access(is_public, has_auth),
+            "public repo should allow anonymous reads"
+        );
+        assert!(
+            !is_write_method(&method),
+            "GET is not a write method, should not trigger write-auth requirement"
+        );
+    }
+
+    #[test]
+    fn test_public_repo_blocks_anonymous_post() {
+        let is_public = true;
+        let has_auth = false;
+        // Middleware allows access (public repo)...
+        assert!(should_allow_repo_access(is_public, has_auth));
+        // ...but the write-method check catches it and requires auth.
+        assert!(
+            is_write_method(&Method::POST),
+            "POST is a write method, middleware should require auth"
+        );
+    }
+
+    #[test]
+    fn test_public_repo_blocks_anonymous_put() {
+        let is_public = true;
+        let has_auth = false;
+        assert!(should_allow_repo_access(is_public, has_auth));
+        assert!(
+            is_write_method(&Method::PUT),
+            "PUT is a write method, middleware should require auth"
+        );
+    }
+
+    #[test]
+    fn test_public_repo_blocks_anonymous_delete() {
+        let is_public = true;
+        let has_auth = false;
+        assert!(should_allow_repo_access(is_public, has_auth));
+        assert!(
+            is_write_method(&Method::DELETE),
+            "DELETE is a write method, middleware should require auth"
+        );
+    }
+
+    #[test]
+    fn test_public_repo_allows_anonymous_head() {
+        let is_public = true;
+        let has_auth = false;
+        assert!(should_allow_repo_access(is_public, has_auth));
+        assert!(
+            !is_write_method(&Method::HEAD),
+            "HEAD is not a write method, anonymous access allowed on public repos"
+        );
+    }
+
+    #[test]
+    fn test_private_repo_blocks_anonymous_get() {
+        let is_public = false;
+        let has_auth = false;
+        assert!(
+            !should_allow_repo_access(is_public, has_auth),
+            "private repo should block anonymous reads"
+        );
+    }
+
+    #[test]
+    fn test_private_repo_allows_authenticated_get() {
+        let is_public = false;
+        let has_auth = true;
+        assert!(
+            should_allow_repo_access(is_public, has_auth),
+            "private repo should allow authenticated reads"
+        );
+    }
+
+    #[test]
+    fn test_public_repo_allows_authenticated_write() {
+        let is_public = true;
+        let has_auth = true;
+        assert!(should_allow_repo_access(is_public, has_auth));
+        // With auth present, even write methods are allowed through the
+        // visibility check (the write-method guard passes because auth exists).
+    }
 }

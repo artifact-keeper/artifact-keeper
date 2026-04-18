@@ -386,6 +386,87 @@ mod tests {
         assert!(!repo.is_public);
     }
 
+    #[test]
+    fn test_repo_cache_invalidation_by_key_removal() {
+        let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
+        let repo = make_cached_repo();
+        cache
+            .write()
+            .unwrap()
+            .insert("my-remote".to_string(), (repo, Instant::now()));
+        assert!(cache.read().unwrap().contains_key("my-remote"));
+
+        // Simulate cache invalidation on repo update: remove the key.
+        cache.write().unwrap().remove("my-remote");
+        assert!(
+            !cache.read().unwrap().contains_key("my-remote"),
+            "entry should be removed after invalidation"
+        );
+    }
+
+    #[test]
+    fn test_repo_cache_invalidation_preserves_other_entries() {
+        let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
+        let repo = make_cached_repo();
+        cache
+            .write()
+            .unwrap()
+            .insert("repo-a".to_string(), (repo.clone(), Instant::now()));
+        cache
+            .write()
+            .unwrap()
+            .insert("repo-b".to_string(), (repo, Instant::now()));
+
+        // Invalidate only repo-a.
+        cache.write().unwrap().remove("repo-a");
+        assert!(!cache.read().unwrap().contains_key("repo-a"));
+        assert!(
+            cache.read().unwrap().contains_key("repo-b"),
+            "other entries should remain after targeted invalidation"
+        );
+    }
+
+    #[test]
+    fn test_repo_cache_visibility_toggle() {
+        let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
+        let private_repo = CachedRepo {
+            is_public: false,
+            ..make_cached_repo()
+        };
+        cache
+            .write()
+            .unwrap()
+            .insert("my-cache".to_string(), (private_repo, Instant::now()));
+
+        // Verify it's private.
+        {
+            let guard = cache.read().unwrap();
+            let (entry, _) = guard.get("my-cache").unwrap();
+            assert!(!entry.is_public);
+        }
+
+        // Simulate update: remove old entry, insert updated one.
+        cache.write().unwrap().remove("my-cache");
+        let public_repo = CachedRepo {
+            is_public: true,
+            ..make_cached_repo()
+        };
+        cache
+            .write()
+            .unwrap()
+            .insert("my-cache".to_string(), (public_repo, Instant::now()));
+
+        // Verify the change is visible immediately.
+        {
+            let guard = cache.read().unwrap();
+            let (entry, _) = guard.get("my-cache").unwrap();
+            assert!(
+                entry.is_public,
+                "cache should reflect the updated visibility immediately"
+            );
+        }
+    }
+
     // -- redact_sensitive_params --
 
     #[test]

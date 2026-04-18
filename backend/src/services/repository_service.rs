@@ -43,6 +43,18 @@ pub struct UpdateRepositoryRequest {
     pub upstream_url: Option<String>,
 }
 
+/// Controls which repositories a caller can see in listing results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoVisibility {
+    /// Unauthenticated caller: only public repositories.
+    PublicOnly,
+    /// Admin caller: all repositories, regardless of visibility or grants.
+    All,
+    /// Authenticated non-admin caller: public repositories plus any private
+    /// repositories where the user holds a role assignment (direct or global).
+    User(Uuid),
+}
+
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
 // ---------------------------------------------------------------------------
@@ -76,6 +88,33 @@ pub(crate) fn derive_format_key(format: &RepositoryFormat) -> String {
 /// Build a SQL LIKE search pattern from a user query string.
 pub(crate) fn build_search_pattern(query: Option<&str>) -> Option<String> {
     query.map(|q| format!("%{}%", q.to_lowercase()))
+}
+
+/// Build the SQL visibility clause and optional user_id bind value for
+/// repository listing queries.
+///
+/// The returned clause references `$3` as the user_id parameter.
+///
+/// - `PublicOnly` -> only public repos, user_id bound as NULL.
+/// - `All`        -> no visibility restriction (always true), user_id bound as NULL.
+/// - `User(id)`   -> public repos OR repos the user has a role_assignment for.
+pub(crate) fn build_visibility_clause(visibility: &RepoVisibility) -> (String, Option<Uuid>) {
+    match visibility {
+        RepoVisibility::PublicOnly => ("is_public = true".to_string(), None),
+        RepoVisibility::All => ("true".to_string(), None),
+        RepoVisibility::User(user_id) => {
+            let clause = r#"(
+                is_public = true
+                OR EXISTS (
+                    SELECT 1 FROM role_assignments ra
+                    WHERE ra.user_id = $3
+                      AND (ra.repository_id = repositories.id OR ra.repository_id IS NULL)
+                )
+            )"#
+            .to_string();
+            (clause, Some(*user_id))
+        }
+    }
 }
 
 /// Check whether a format_enabled value should cause repo creation to be rejected.
@@ -300,28 +339,33 @@ impl RepositoryService {
         Ok(repo)
     }
 
-    /// List repositories with pagination
+    /// List repositories with pagination, filtered by caller visibility.
+    ///
+    /// - `PublicOnly`: only public repositories (unauthenticated callers).
+    /// - `All`: every repository (admin callers).
+    /// - `User(id)`: public repositories plus private repositories where the
+    ///   user holds at least one role assignment (direct or global).
     pub async fn list(
         &self,
         offset: i64,
         limit: i64,
         format_filter: Option<RepositoryFormat>,
         type_filter: Option<RepositoryType>,
-        public_only: bool,
+        visibility: RepoVisibility,
         search_query: Option<&str>,
     ) -> Result<(Vec<Repository>, i64)> {
         let search_pattern = build_search_pattern(search_query);
+        let (visibility_clause, user_id) = build_visibility_clause(&visibility);
 
-        let repos = sqlx::query_as!(
-            Repository,
+        // -- fetch page --
+        let select_sql = format!(
             r#"
             SELECT
                 id, key, name, description,
-                format as "format: RepositoryFormat",
-                repo_type as "repo_type: RepositoryType",
+                format, repo_type,
                 storage_backend, storage_path, upstream_url,
                 is_public, quota_bytes,
-                replication_priority as "replication_priority: ReplicationPriority",
+                replication_priority,
                 promotion_target_id, promotion_policy_id,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
@@ -329,41 +373,45 @@ impl RepositoryService {
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
-              AND ($3 = false OR is_public = true)
-              AND ($6::text IS NULL OR LOWER(key) LIKE $6 OR LOWER(name) LIKE $6 OR LOWER(COALESCE(description, '')) LIKE $6)
+              AND ({visibility_clause})
+              AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
             ORDER BY name
-            OFFSET $4
-            LIMIT $5
-            "#,
-            format_filter.clone() as Option<RepositoryFormat>,
-            type_filter.clone() as Option<RepositoryType>,
-            public_only,
-            offset,
-            limit,
-            search_pattern.clone() as Option<String>,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            OFFSET $5
+            LIMIT $6
+            "#
+        );
 
-        let total = sqlx::query_scalar!(
+        let repos = sqlx::query_as::<_, Repository>(&select_sql)
+            .bind(format_filter.clone())
+            .bind(type_filter.clone())
+            .bind(user_id)
+            .bind(search_pattern.clone())
+            .bind(offset)
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // -- fetch total count --
+        let count_sql = format!(
             r#"
             SELECT COUNT(*)
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
               AND ($2::repository_type IS NULL OR repo_type = $2)
-              AND ($3 = false OR is_public = true)
+              AND ({visibility_clause})
               AND ($4::text IS NULL OR LOWER(key) LIKE $4 OR LOWER(name) LIKE $4 OR LOWER(COALESCE(description, '')) LIKE $4)
-            "#,
-            format_filter.clone() as Option<RepositoryFormat>,
-            type_filter.clone() as Option<RepositoryType>,
-            public_only,
-            search_pattern as Option<String>,
-        )
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .unwrap_or(0);
+            "#
+        );
+
+        let total: i64 = sqlx::query_scalar::<_, i64>(&count_sql)
+            .bind(format_filter)
+            .bind(type_filter)
+            .bind(user_id)
+            .bind(search_pattern)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok((repos, total))
     }
@@ -1135,5 +1183,56 @@ mod tests {
         // PostgreSQL always emits lowercase; we only match lowercase
         assert!(!is_duplicate_key_error("Duplicate Key"));
         assert!(!is_duplicate_key_error("DUPLICATE KEY"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_visibility_clause tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_visibility_public_only_returns_is_public_clause() {
+        let (clause, user_id) = build_visibility_clause(&RepoVisibility::PublicOnly);
+        assert_eq!(clause, "is_public = true");
+        assert!(user_id.is_none());
+    }
+
+    #[test]
+    fn test_visibility_all_returns_true_clause() {
+        let (clause, user_id) = build_visibility_clause(&RepoVisibility::All);
+        assert_eq!(clause, "true");
+        assert!(user_id.is_none());
+    }
+
+    #[test]
+    fn test_visibility_user_returns_subquery_and_user_id() {
+        let uid = Uuid::new_v4();
+        let (clause, user_id) = build_visibility_clause(&RepoVisibility::User(uid));
+        assert!(clause.contains("is_public = true"));
+        assert!(clause.contains("role_assignments"));
+        assert!(clause.contains("$3"));
+        assert_eq!(user_id, Some(uid));
+    }
+
+    #[test]
+    fn test_visibility_user_clause_checks_both_direct_and_global_assignments() {
+        let uid = Uuid::new_v4();
+        let (clause, _) = build_visibility_clause(&RepoVisibility::User(uid));
+        // Direct repo assignment
+        assert!(clause.contains("ra.repository_id = repositories.id"));
+        // Global assignment (repository_id IS NULL)
+        assert!(clause.contains("ra.repository_id IS NULL"));
+    }
+
+    #[test]
+    fn test_repo_visibility_enum_equality() {
+        let uid = Uuid::new_v4();
+        assert_eq!(RepoVisibility::PublicOnly, RepoVisibility::PublicOnly);
+        assert_eq!(RepoVisibility::All, RepoVisibility::All);
+        assert_eq!(RepoVisibility::User(uid), RepoVisibility::User(uid));
+        assert_ne!(RepoVisibility::PublicOnly, RepoVisibility::All);
+        assert_ne!(
+            RepoVisibility::User(uid),
+            RepoVisibility::User(Uuid::new_v4())
+        );
     }
 }
