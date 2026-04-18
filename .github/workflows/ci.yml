@@ -163,10 +163,9 @@ jobs:
           echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} lines)"
 
           if [ "$PCT" -lt 70 ]; then
-            echo "::warning::New code coverage is ${PCT}%, below 70% threshold"
+            echo "::error::New code coverage is ${PCT}%, below 70% threshold"
             echo "Coverage on changed files is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
-            # Warn but don't fail for now - uncomment to enforce:
-            # exit 1
+            exit 1
           fi
 
       - name: Upload coverage artifact
