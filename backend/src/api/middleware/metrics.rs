@@ -16,6 +16,27 @@ use axum::{
 };
 use metrics::{counter, gauge, histogram};
 
+/// RAII guard that decrements the in-flight gauge on drop.
+///
+/// When a client disconnects mid-request, hyper cancels (drops) the response
+/// future. Any code after the `.await` point is skipped, so a plain
+/// `gauge!(...).decrement(1.0)` call would never execute. By putting the
+/// decrement in a `Drop` impl we guarantee it runs regardless of how the
+/// future completes — normal return *or* cancellation.
+struct InFlightGuard {
+    method: String,
+    path: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        gauge!("ak_http_requests_in_flight",
+               "method" => self.method.clone(),
+               "path" => self.path.clone())
+        .decrement(1.0);
+    }
+}
+
 /// Axum middleware that records HTTP request metrics.
 ///
 /// Emits the following metrics (all prefixed with `ak_`):
@@ -45,6 +66,12 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     gauge!("ak_http_requests_in_flight", "method" => method.clone(), "path" => path.clone())
         .increment(1.0);
 
+    // Guard ensures decrement happens even if the future is cancelled.
+    let _guard = InFlightGuard {
+        method: method.clone(),
+        path: path.clone(),
+    };
+
     let response = next.run(request).await;
 
     let duration = start.elapsed().as_secs_f64();
@@ -59,13 +86,14 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     .record(duration);
     counter!(
         "ak_http_responses_total",
-        "method" => method.clone(),
-        "path" => path.clone(),
+        "method" => method,
+        "path" => path,
         "status" => status,
     )
     .increment(1);
-    gauge!("ak_http_requests_in_flight", "method" => method, "path" => path).decrement(1.0);
 
+    // _guard drops here, firing exactly one decrement in all cases:
+    // normal completion and future cancellation.
     response
 }
 
