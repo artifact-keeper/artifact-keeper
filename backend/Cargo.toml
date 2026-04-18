@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [features]
 vendored-openssl = ["openssl/vendored"]
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+profiling = ["jemalloc", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "tikv-jemallocator/profiling"]
 
 [dependencies]
 openssl = { workspace = true, optional = true }
@@ -156,6 +159,13 @@ zxcvbn = "3"
 
 # SMTP email delivery
 lettre.workspace = true
+
+# Allocators
+mimalloc = { version = "0.1", optional = true }
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

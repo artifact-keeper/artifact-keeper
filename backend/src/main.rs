@@ -1,5 +1,24 @@
 //! Artifact Keeper - Main Entry Point
 
+// ---------------------------------------------------------------------------
+// Global allocator selection (non-Windows only)
+// ---------------------------------------------------------------------------
+// - `--features jemalloc`   -> use jemalloc
+// - `--features mimalloc`   -> use mimalloc
+// - `--features profiling`  -> use jemalloc with heap profiling enabled
+//   (profiling implies jemalloc)
+//
+// If both jemalloc and mimalloc features are enabled, jemalloc wins.
+// On Windows these features are unavailable; the system allocator is used.
+
+#[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "mimalloc", not(feature = "jemalloc")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -109,6 +128,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Load configuration
     let config = Config::from_env()?;
+
+    // Log active allocator
+    #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+    tracing::info!("Global allocator: jemalloc");
+    #[cfg(all(feature = "mimalloc", not(feature = "jemalloc")))]
+    tracing::info!("Global allocator: mimalloc");
+    #[cfg(not(any(
+        all(feature = "jemalloc", not(target_os = "windows")),
+        all(feature = "mimalloc", not(feature = "jemalloc")),
+    )))]
+    tracing::info!("Global allocator: system");
+    #[cfg(feature = "profiling")]
+    tracing::info!("Jemalloc profiling enabled — set _RJEM_MALLOC_CONF=prof:true to activate");
+
     tracing::info!("Starting Artifact Keeper");
 
     // Connect to database

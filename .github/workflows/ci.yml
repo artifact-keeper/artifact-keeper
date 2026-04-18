@@ -93,11 +93,78 @@ jobs:
 
       - name: Coverage summary and gate
         run: |
+          # Total project coverage summary
           echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           cargo llvm-cov --workspace --lib --no-run --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # Total coverage floor (never let overall coverage drop below 50%)
           cargo llvm-cov --workspace --lib --no-run --fail-under-lines 50
+
+      - name: New code coverage gate
+        if: github.event_name == 'pull_request'
+        run: |
+          # Check coverage on changed .rs files only (matches SonarCloud's "new code" gate)
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} -- '*.rs' 2>/dev/null || true)
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No .rs files changed, skipping new code coverage check"
+            echo "### New Code Coverage: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Extract coverage for changed files from lcov
+          PATTERNS=""
+          for f in $CHANGED_FILES; do
+            PATTERNS="$PATTERNS -e $f"
+          done
+
+          # Parse lcov.info for changed files and compute line coverage
+          RESULT=$(python3 -c "
+          import sys
+          changed = set('''$CHANGED_FILES'''.split())
+          hit = miss = 0
+          current_file = None
+          in_changed = False
+          for line in open('lcov.info'):
+              line = line.strip()
+              if line.startswith('SF:'):
+                  path = line[3:]
+                  in_changed = any(path.endswith(f) for f in changed)
+              elif line.startswith('DA:') and in_changed:
+                  parts = line[3:].split(',')
+                  count = int(parts[1])
+                  if count > 0:
+                      hit += 1
+                  else:
+                      miss += 1
+          total = hit + miss
+          if total == 0:
+              print('none')
+          else:
+              pct = (hit * 100) // total
+              print(f'{pct} {hit} {total}')
+          ")
+
+          if [ "$RESULT" = "none" ]; then
+            echo "No instrumented lines in changed files"
+            echo "### New Code Coverage: N/A (no instrumented lines)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          PCT=$(echo "$RESULT" | awk '{print $1}')
+          HIT=$(echo "$RESULT" | awk '{print $2}')
+          TOTAL=$(echo "$RESULT" | awk '{print $3}')
+
+          echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} lines)" >> $GITHUB_STEP_SUMMARY
+          echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} lines)"
+
+          if [ "$PCT" -lt 70 ]; then
+            echo "::warning::New code coverage is ${PCT}%, below 70% threshold"
+            echo "Coverage on changed files is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
+            # Warn but don't fail for now - uncomment to enforce:
+            # exit 1
+          fi
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
