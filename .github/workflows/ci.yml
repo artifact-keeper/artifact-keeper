@@ -480,43 +480,25 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   build-windows-dev:
-    name: 🪟 Windows Dev Build
-    runs-on: windows-latest
-    # Only build Windows on main push (not PRs) to save 27+ min on PR checks.
+    name: 🪟 Windows Cross-Build
+    runs-on: ak-ci-runners
+    # Only build Windows on main push (not PRs).
     # The release workflow builds Windows binaries for actual releases.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: x86_64-pc-windows-msvc
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build Windows binary
+      - name: Build Windows binary (cross-compile)
         env:
           SQLX_OFFLINE: true
           CARGO_TERM_COLOR: always
-        run: cargo build --release --target x86_64-pc-windows-msvc --features vendored-openssl
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --target x86_64-pc-windows-gnu --features vendored-openssl
 
       - name: Package binary
-        shell: bash
         run: |
           mkdir -p dist
-          cp target/x86_64-pc-windows-msvc/release/artifact-keeper.exe dist/artifact-keeper-windows-amd64.exe
+          cp target/x86_64-pc-windows-gnu/release/artifact-keeper.exe dist/artifact-keeper-windows-amd64.exe
           cd dist
           sha256sum artifact-keeper-windows-amd64.exe > artifact-keeper-windows-amd64.exe.sha256
           echo "Built: $(ls -lh artifact-keeper-windows-amd64.exe | awk '{print $5}')"
