@@ -105,8 +105,11 @@ jobs:
       - name: New code coverage gate
         if: github.event_name == 'pull_request'
         run: |
+          # Fetch base branch so we can diff against it (checkout is shallow by default)
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }}
+
           # Check coverage on changed .rs files only (matches SonarCloud's "new code" gate)
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} -- '*.rs' 2>/dev/null || true)
+          CHANGED_FILES=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null || true)
           if [ -z "$CHANGED_FILES" ]; then
             echo "No .rs files changed, skipping new code coverage check"
             echo "### New Code Coverage: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
