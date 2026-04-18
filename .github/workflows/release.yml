@@ -73,8 +73,8 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: artifact-keeper-darwin-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
             name: artifact-keeper-windows-amd64
 
     steps:
@@ -96,15 +96,13 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install Windows cross-compilation tools
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get install -y mingw-w64
+
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-
-      - name: Install build dependencies (Windows)
-        if: runner.os == 'Windows'
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -115,10 +113,11 @@ jobs:
         env:
           SQLX_OFFLINE: true
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
         run: cargo build --release --target ${{ matrix.target }} --features vendored-openssl
 
       - name: Package binary (Unix)
-        if: runner.os != 'Windows'
+        if: "!contains(matrix.target, 'windows')"
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/artifact-keeper dist/${{ matrix.name }}
@@ -132,8 +131,7 @@ jobs:
           fi
 
       - name: Package binary (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
+        if: contains(matrix.target, 'windows')
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/artifact-keeper.exe dist/${{ matrix.name }}.exe
