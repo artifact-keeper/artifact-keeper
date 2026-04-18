@@ -443,6 +443,130 @@ pub async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Jemalloc heap profiling (only available with `--features profiling`)
+// ---------------------------------------------------------------------------
+
+/// Dump a jemalloc heap profile.
+///
+/// Requires the binary to be started with `_RJEM_MALLOC_CONF=prof:true` (or
+/// the equivalent `MALLOC_CONF`). Returns a pprof-compatible heap profile
+/// that can be analyzed with `jeprof` / `pprof`.
+///
+/// Query parameters:
+/// - `activate` — if `"true"`, activate profiling at runtime (prof.active).
+/// - `deactivate` — if `"true"`, deactivate profiling (prof.active = false).
+/// - `dump` (default) — dump current profile to a temp file and return it.
+#[cfg(feature = "profiling")]
+pub async fn heap_profile(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    use tikv_jemalloc_ctl::raw;
+
+    // Activate profiling at runtime.
+    if params.get("activate").map(|v| v == "true").unwrap_or(false) {
+        let name = b"prof.active\0";
+        let activated: bool = true;
+        if let Err(e) = unsafe { raw::write(name, activated) } {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                format!("Failed to activate profiling: {e}"),
+            )
+                .into_response();
+        }
+        return (StatusCode::OK, "profiling activated\n").into_response();
+    }
+
+    // Deactivate profiling.
+    if params
+        .get("deactivate")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        let name = b"prof.active\0";
+        let deactivated: bool = false;
+        if let Err(e) = unsafe { raw::write(name, deactivated) } {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                format!("Failed to deactivate profiling: {e}"),
+            )
+                .into_response();
+        }
+        return (StatusCode::OK, "profiling deactivated\n").into_response();
+    }
+
+    // Dump heap profile.
+    let path = format!("/tmp/ak_heap_{}.prof", std::process::id());
+    let c_path = match std::ffi::CString::new(path.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("bad path: {e}")).into_response()
+        }
+    };
+
+    let name = b"prof.dump\0";
+    if let Err(e) = unsafe { raw::write(name, c_path.as_ptr() as *const std::ffi::c_char) } {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            format!("Failed to dump profile: {e}\n\nHint: start with _RJEM_MALLOC_CONF=prof:true"),
+        )
+            .into_response();
+    }
+
+    match tokio::fs::read(&path).await {
+        Ok(data) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"heap.prof\"",
+                    ),
+                ],
+                data,
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read profile: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Memory statistics from jemalloc (available with `--features profiling`).
+///
+/// Returns a JSON object with allocated, active, resident, mapped, and
+/// retained bytes.
+#[cfg(feature = "profiling")]
+pub async fn memory_stats() -> impl IntoResponse {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    // Advance the jemalloc epoch to get fresh stats.
+    let _ = epoch::advance();
+
+    let allocated = stats::allocated::read().unwrap_or(0);
+    let active = stats::active::read().unwrap_or(0);
+    let resident = stats::resident::read().unwrap_or(0);
+    let mapped = stats::mapped::read().unwrap_or(0);
+    let retained = stats::retained::read().unwrap_or(0);
+
+    axum::Json(serde_json::json!({
+        "allocator": "jemalloc",
+        "allocated_bytes": allocated,
+        "active_bytes": active,
+        "resident_bytes": resident,
+        "mapped_bytes": mapped,
+        "retained_bytes": retained,
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(health_check, readiness_check, liveness_check, metrics),
