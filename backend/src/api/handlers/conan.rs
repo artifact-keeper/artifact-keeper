@@ -9,10 +9,12 @@
 //!   GET  /conan/{repo_key}/v2/conans/search                                                                - Search packages
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/latest                               - Latest recipe revision
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions                            - List recipe revisions
+//!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/files                - List recipe files
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/files/{path}         - Download recipe file
 //!   PUT  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/files/{path}         - Upload recipe file
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/latest           - Latest package revision
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions        - List package revisions
+//!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev}/files                - List package files
 //!   GET  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev}/files/{path} - Download package file
 //!   PUT  /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev}/files/{path} - Upload package file
 
@@ -67,6 +69,13 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions",
             get(recipe_revisions),
         )
+        // Recipe files list (must precede the wildcard route below so axum
+        // matches exact `/files` requests here rather than treating them as
+        // a wildcard with an empty path segment).
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/files",
+            get(recipe_files_list),
+        )
         // Recipe file download / upload
         .route(
             "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/files/*file_path",
@@ -81,6 +90,12 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/packages/:package_id/revisions",
             get(package_revisions),
+        )
+        // Package files list (precedes the wildcard route, same reason as
+        // the recipe files-list route above).
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/packages/:package_id/revisions/:pkg_revision/files",
+            get(package_files_list),
         )
         // Package file download / upload
         .route(
@@ -475,6 +490,59 @@ async fn recipe_revisions(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET  .../revisions/{rev}/files — List recipe files
+// ---------------------------------------------------------------------------
+
+async fn recipe_files_list(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel, revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT am.metadata->>'file' as "file?"
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND am.metadata->>'type' = 'recipe'
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+        "#,
+        repo.id,
+        name,
+        version,
+        normalize_user(&user),
+        normalize_channel(&channel),
+        revision,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
+    Ok(files_listing_response(filenames))
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1002,88 @@ async fn package_revisions(
 }
 
 // ---------------------------------------------------------------------------
+// GET  .../packages/{pkg_id}/revisions/{pkg_rev}/files — List package files
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::type_complexity)]
+async fn package_files_list(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT am.metadata->>'file' as "file?"
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND am.metadata->>'type' = 'package'
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+          AND am.metadata->>'packageId' = $7
+          AND am.metadata->>'packageRevision' = $8
+        "#,
+        repo.id,
+        name,
+        version,
+        normalize_user(&user),
+        normalize_channel(&channel),
+        revision,
+        package_id,
+        pkg_revision,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
+    Ok(files_listing_response(filenames))
+}
+
+/// Build the Conan v2 files-listing JSON body. The protocol shape is
+/// `{"files": {"filename.ext": {}, ...}}` — see
+/// `conan/internal/rest/rest_client_v2.py::_get_file_list_json`. Returns an
+/// empty `files` object when no artifacts match, matching what Conan expects
+/// for a recipe/package revision that has zero files.
+fn build_files_listing_json(filenames: Vec<String>) -> serde_json::Value {
+    let mut files = serde_json::Map::new();
+    for name in filenames {
+        files.insert(name, serde_json::json!({}));
+    }
+    serde_json::json!({ "files": files })
+}
+
+fn files_listing_response(filenames: Vec<String>) -> Response {
+    let body = build_files_listing_json(filenames);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
 // GET  .../packages/{pkg_id}/revisions/{pkg_rev}/files/{path} — Download package file
 // ---------------------------------------------------------------------------
 
@@ -1296,6 +1446,33 @@ mod tests {
             capabilities.contains("revisions"),
             "capability header must advertise 'revisions', got: {capabilities}"
         );
+    }
+
+    #[test]
+    fn build_files_listing_json_empty() {
+        let json = build_files_listing_json(Vec::new());
+        assert_eq!(json, serde_json::json!({ "files": {} }));
+    }
+
+    #[test]
+    fn build_files_listing_json_with_filenames() {
+        let json = build_files_listing_json(vec![
+            "conanfile.py".to_string(),
+            "conanmanifest.txt".to_string(),
+            "conan_export.tgz".to_string(),
+        ]);
+        let files = json
+            .get("files")
+            .and_then(|v| v.as_object())
+            .expect("response must have a 'files' object");
+        assert_eq!(files.len(), 3);
+        for name in ["conanfile.py", "conanmanifest.txt", "conan_export.tgz"] {
+            assert_eq!(
+                files.get(name),
+                Some(&serde_json::json!({})),
+                "missing or wrong value for {name}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
