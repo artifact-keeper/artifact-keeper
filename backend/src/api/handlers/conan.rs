@@ -1335,6 +1335,10 @@ async fn package_file_upload(
         .await;
     }
 
+    // Clean up soft-deleted rows (including the one just soft-deleted above)
+    // so the UNIQUE(repository_id, path) constraint won't block the INSERT.
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the file
     let storage = state
         .storage_for_repo(&repo.storage_location())
