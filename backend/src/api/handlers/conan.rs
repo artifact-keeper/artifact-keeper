@@ -2578,6 +2578,71 @@ mod tests {
                 .execute(pool)
                 .await;
         }
+
+        // ------------------------------------------------------------------
+        // TestFixture: eliminates the 5-line setup + 2-line teardown
+        // boilerplate that was duplicated across every DB-backed test.
+        // ------------------------------------------------------------------
+
+        /// Bundles a database pool, user, repository, state, and auth extension
+        /// so each test body can focus on the actual assertions. Call
+        /// `TestFixture::setup("local")` at the start and
+        /// `fixture.teardown().await` at the end.
+        pub struct TestFixture {
+            pub pool: PgPool,
+            pub user_id: Uuid,
+            pub username: String,
+            pub repo_id: Uuid,
+            pub repo_key: String,
+            pub storage_dir: PathBuf,
+            pub state: SharedState,
+            pub auth: AuthExtension,
+        }
+
+        impl TestFixture {
+            /// Create a full test environment: pool, user, repo, state, auth.
+            /// Returns `None` when `DATABASE_URL` is absent (the test skips).
+            pub async fn setup(repo_type: &str) -> Option<Self> {
+                let pool = try_pool().await?;
+                let (user_id, username, _pw) = create_user(&pool).await;
+                let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, repo_type).await;
+                let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+                let auth = make_auth(user_id, &username);
+                Some(Self {
+                    pool,
+                    user_id,
+                    username,
+                    repo_id,
+                    repo_key,
+                    storage_dir,
+                    state,
+                    auth,
+                })
+            }
+
+            /// Clean up all test data and remove the storage directory.
+            pub async fn teardown(&self) {
+                cleanup(&self.pool, self.repo_id, self.user_id).await;
+                let _ = std::fs::remove_dir_all(&self.storage_dir);
+            }
+
+            /// Shorthand: build a router with auth pre-injected.
+            pub fn router(&self) -> Router {
+                router_with_auth(self.state.clone(), self.auth.clone())
+            }
+
+            /// Shorthand: GET request with basic auth, returns (status, body).
+            pub async fn get(&self, uri: String) -> (StatusCode, Bytes) {
+                let app = self.router();
+                let req = Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("Authorization", basic_auth(&self.username, "irrelevant"))
+                    .body(Body::empty())
+                    .expect("build request");
+                send(app, req).await
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2593,21 +2658,15 @@ mod tests {
 
     #[tokio::test]
     async fn smoke_scaffolding_works() {
-        let Some(pool) = test_helpers::try_pool().await else {
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
             return;
         };
 
-        let (user_id, username, _pw) = test_helpers::create_user(&pool).await;
-        let (repo_id, repo_key, storage_dir) =
-            test_helpers::create_conan_repo(&pool, "local").await;
-        let state = test_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
-        let auth = test_helpers::make_auth(user_id, &username);
-
-        // Seed rev_old first, then rev_new — DESC ordering must return
+        // Seed rev_old first, then rev_new. DESC ordering must return
         // rev_new before rev_old.
         let _a1 = test_helpers::seed_recipe_row(
-            &pool,
-            repo_id,
+            &f.pool,
+            f.repo_id,
             "smokelib",
             "1.0",
             "_",
@@ -2616,11 +2675,10 @@ mod tests {
             "conanfile.py",
         )
         .await;
-        // Ensure the second row lands with a strictly greater created_at.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let _a2 = test_helpers::seed_recipe_row(
-            &pool,
-            repo_id,
+            &f.pool,
+            f.repo_id,
             "smokelib",
             "1.0",
             "_",
@@ -2630,58 +2688,31 @@ mod tests {
         )
         .await;
 
-        let app = test_helpers::router_with_auth(state.clone(), auth.clone());
-        let req = axum::http::Request::builder()
-            .method("GET")
-            .uri(format!(
+        let (status, body) = f
+            .get(format!(
                 "/{}/v2/conans/smokelib/1.0/_/_/revisions",
-                repo_key
+                f.repo_key
             ))
-            .header(
-                "Authorization",
-                test_helpers::basic_auth(&username, "irrelevant"),
-            )
-            .body(axum::body::Body::empty())
-            .expect("build request");
-
-        let (status, body) = test_helpers::send(app, req).await;
+            .await;
         let body_str = String::from_utf8_lossy(&body).to_string();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "smoke test expected 200, got {}: {}",
-            status,
-            body_str,
-        );
+        assert_eq!(status, StatusCode::OK, "smoke: {}", body_str);
 
         let json: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
         let revisions = json
             .get("revisions")
             .and_then(|v| v.as_array())
             .expect("response must contain a 'revisions' array");
-        assert_eq!(
-            revisions.len(),
-            2,
-            "expected 2 revisions, got {}: {}",
-            revisions.len(),
-            body_str
-        );
+        assert_eq!(revisions.len(), 2, "got: {}", body_str);
         assert_eq!(
             revisions[0].get("revision").and_then(|v| v.as_str()),
             Some("rev_new"),
-            "expected DESC ordering (rev_new first), got: {}",
-            body_str
         );
         assert_eq!(
             revisions[1].get("revision").and_then(|v| v.as_str()),
             Some("rev_old"),
-            "expected DESC ordering (rev_old last), got: {}",
-            body_str
         );
 
-        // Cleanup
-        test_helpers::cleanup(&pool, repo_id, user_id).await;
-        let _ = std::fs::remove_dir_all(&storage_dir);
+        f.teardown().await;
     }
 
     // -----------------------------------------------------------------------
@@ -2701,20 +2732,16 @@ mod tests {
 
         #[tokio::test]
         async fn users_authenticate_echoes_basic_token_on_200() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
-            let app = router_with_auth(state, auth);
-            let basic = basic_auth(&username, "irrelevant");
+            let app = f.router();
+            let basic = basic_auth(&f.username, "irrelevant");
             let expected_token = basic.strip_prefix("Basic ").unwrap().to_string();
             let req = Request::builder()
                 .method("POST")
-                .uri(format!("/{}/v2/users/authenticate", repo_key))
+                .uri(format!("/{}/v2/users/authenticate", f.repo_key))
                 .header("Authorization", &basic)
                 .body(Body::empty())
                 .expect("build request");
@@ -2727,35 +2754,28 @@ mod tests {
                 "handler should echo the base64 Basic value back to the client",
             );
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn users_authenticate_404_when_repo_missing() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            // Create a repo just so the cleanup helper has something to chew on.
-            let (repo_id, _existing_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             let bogus_key = format!("nonexistent-{}", Uuid::new_v4());
-            let app = router_with_auth(state, auth);
+            let app = f.router();
             let req = Request::builder()
                 .method("POST")
                 .uri(format!("/{}/v2/users/authenticate", bogus_key))
-                .header("Authorization", basic_auth(&username, "irrelevant"))
+                .header("Authorization", basic_auth(&f.username, "irrelevant"))
                 .body(Body::empty())
                 .expect("build request");
 
             let (status, _body) = send(app, req).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
@@ -2841,23 +2861,13 @@ mod tests {
 
         #[tokio::test]
         async fn check_credentials_200_empty_body() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/users/check_credentials", repo_key))
-                .header("Authorization", basic_auth(&username, "irrelevant"))
-                .body(Body::empty())
-                .expect("build request");
-
-            let (status, body) = send(app, req).await;
+            let (status, body) = f
+                .get(format!("/{}/v2/users/check_credentials", f.repo_key))
+                .await;
             assert_eq!(status, StatusCode::OK);
             assert!(
                 body.is_empty(),
@@ -2865,34 +2875,22 @@ mod tests {
                 body.len(),
             );
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn check_credentials_404_when_repo_missing() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, _existing_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             let bogus_key = format!("nonexistent-{}", Uuid::new_v4());
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/users/check_credentials", bogus_key))
-                .header("Authorization", basic_auth(&username, "irrelevant"))
-                .body(Body::empty())
-                .expect("build request");
-
-            let (status, _body) = send(app, req).await;
+            let (status, _body) = f
+                .get(format!("/{}/v2/users/check_credentials", bogus_key))
+                .await;
             assert_eq!(status, StatusCode::NOT_FOUND);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
@@ -2932,42 +2930,27 @@ mod tests {
 
         #[tokio::test]
         async fn search_empty_repo_returns_empty_results() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/conans/search", repo_key))
-                .body(Body::empty())
-                .expect("build request");
-            let (status, body) = send(app, req).await;
+            let (status, body) = f.get(format!("/{}/v2/conans/search", f.repo_key)).await;
             assert_eq!(status, StatusCode::OK);
             let results = parse_search_results(&body).await;
             assert!(results.is_empty(), "expected no results, got {:?}", results);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn search_single_recipe_returns_one_reference() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             let _ = seed_recipe_row(
-                &pool,
-                repo_id,
+                &f.pool,
+                f.repo_id,
                 "zlib",
                 "1.3",
                 "_",
@@ -2977,74 +2960,30 @@ mod tests {
             )
             .await;
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/conans/search", repo_key))
-                .body(Body::empty())
-                .expect("build request");
-            let (status, body) = send(app, req).await;
+            let (status, body) = f.get(format!("/{}/v2/conans/search", f.repo_key)).await;
             assert_eq!(status, StatusCode::OK);
             let results = parse_search_results(&body).await;
             assert_eq!(results, vec!["zlib/1.3@_/_".to_string()]);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn search_deduplicates_across_revisions_and_files() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
-            // Three rows in `artifacts` but only two distinct (name, version)
-            // pairs: fmt/9.1 appears twice (different revisions + files).
-            let _ = seed_recipe_row(
-                &pool,
-                repo_id,
-                "fmt",
-                "9.1",
-                "_",
-                "_",
-                "rev1",
-                "conanfile.py",
-            )
-            .await;
-            let _ = seed_recipe_row(
-                &pool,
-                repo_id,
-                "fmt",
-                "9.1",
-                "_",
-                "_",
-                "rev2",
-                "conanmanifest.txt",
-            )
-            .await;
-            let _ = seed_recipe_row(
-                &pool,
-                repo_id,
-                "boost",
-                "1.82",
-                "_",
-                "_",
-                "rev1",
-                "conanfile.py",
-            )
-            .await;
+            // Three rows but only two distinct (name, version) pairs.
+            for (n, v, rev, file) in [
+                ("fmt", "9.1", "rev1", "conanfile.py"),
+                ("fmt", "9.1", "rev2", "conanmanifest.txt"),
+                ("boost", "1.82", "rev1", "conanfile.py"),
+            ] {
+                let _ = seed_recipe_row(&f.pool, f.repo_id, n, v, "_", "_", rev, file).await;
+            }
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/conans/search", repo_key))
-                .body(Body::empty())
-                .expect("build request");
-            let (_status, body) = send(app, req).await;
+            let (_status, body) = f.get(format!("/{}/v2/conans/search", f.repo_key)).await;
             let results = parse_search_results(&body).await;
             assert_eq!(
                 results,
@@ -3052,61 +2991,23 @@ mod tests {
                 "expected de-duplicated, name-ASC-ordered results",
             );
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn search_glob_wildcard_filters_by_prefix() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
-            let _ = seed_recipe_row(
-                &pool,
-                repo_id,
-                "zlib",
-                "1.3",
-                "_",
-                "_",
-                "rev1",
-                "conanfile.py",
-            )
-            .await;
-            let _ = seed_recipe_row(
-                &pool,
-                repo_id,
-                "zstd",
-                "1.5.5",
-                "_",
-                "_",
-                "rev1",
-                "conanfile.py",
-            )
-            .await;
-            let _ = seed_recipe_row(
-                &pool,
-                repo_id,
-                "boost",
-                "1.82",
-                "_",
-                "_",
-                "rev1",
-                "conanfile.py",
-            )
-            .await;
+            for (n, v) in [("zlib", "1.3"), ("zstd", "1.5.5"), ("boost", "1.82")] {
+                let _ = seed_recipe_row(&f.pool, f.repo_id, n, v, "_", "_", "rev1", "conanfile.py")
+                    .await;
+            }
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/conans/search?q=z*", repo_key))
-                .body(Body::empty())
-                .expect("build request");
-            let (status, body) = send(app, req).await;
+            let (status, body) = f
+                .get(format!("/{}/v2/conans/search?q=z*", f.repo_key))
+                .await;
             assert_eq!(status, StatusCode::OK);
             let results = parse_search_results(&body).await;
             assert_eq!(
@@ -3115,25 +3016,18 @@ mod tests {
                 "glob z* must match zlib + zstd but exclude boost",
             );
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn search_missing_q_defaults_to_match_all() {
-            // The handler's `q: Option<String>` falls back to "*" when absent
-            // so all conan artifacts in the repo appear in the response.
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             let _ = seed_recipe_row(
-                &pool,
-                repo_id,
+                &f.pool,
+                f.repo_id,
                 "libcurl",
                 "8.5",
                 "_",
@@ -3143,35 +3037,23 @@ mod tests {
             )
             .await;
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                // Note: no `q` query-string param at all.
-                .uri(format!("/{}/v2/conans/search", repo_key))
-                .body(Body::empty())
-                .expect("build request");
-            let (status, body) = send(app, req).await;
+            let (status, body) = f.get(format!("/{}/v2/conans/search", f.repo_key)).await;
             assert_eq!(status, StatusCode::OK);
             let results = parse_search_results(&body).await;
             assert_eq!(results, vec!["libcurl/8.5@_/_".to_string()]);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn search_excludes_soft_deleted_artifacts() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             let visible = seed_recipe_row(
-                &pool,
-                repo_id,
+                &f.pool,
+                f.repo_id,
                 "openssl",
                 "3.2",
                 "_",
@@ -3181,8 +3063,8 @@ mod tests {
             )
             .await;
             let hidden = seed_recipe_row(
-                &pool,
-                repo_id,
+                &f.pool,
+                f.repo_id,
                 "sqlite3",
                 "3.45",
                 "_",
@@ -3191,50 +3073,33 @@ mod tests {
                 "conanfile.py",
             )
             .await;
-            // Soft-delete sqlite3. It should disappear from search results.
             sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
                 .bind(hidden)
-                .execute(&pool)
+                .execute(&f.pool)
                 .await
                 .expect("soft-delete artifact");
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/conans/search", repo_key))
-                .body(Body::empty())
-                .expect("build request");
-            let (_status, body) = send(app, req).await;
+            let (_status, body) = f.get(format!("/{}/v2/conans/search", f.repo_key)).await;
             let results = parse_search_results(&body).await;
             assert_eq!(
                 results,
                 vec!["openssl/3.2@_/_".to_string()],
                 "soft-deleted sqlite3 must not appear in search output",
             );
-            // Also sanity-check the visible row's id wasn't the one we hid.
             assert_ne!(visible, hidden);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn search_returns_real_user_channel_and_version_from_metadata() {
-            // Regression guard: handler previously hardcoded "0.0.0@_/_" in
-            // every response tuple, which broke Conan clients that parse the
-            // reference back into (name, version, user, channel). This test
-            // asserts the fix — the response reflects the metadata JSON.
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             let _ = seed_recipe_row(
-                &pool,
-                repo_id,
+                &f.pool,
+                f.repo_id,
                 "mylib",
                 "2.5.1",
                 "myorg",
@@ -3244,13 +3109,7 @@ mod tests {
             )
             .await;
 
-            let app = router_with_auth(state, auth);
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/{}/v2/conans/search", repo_key))
-                .body(Body::empty())
-                .expect("build request");
-            let (status, body) = send(app, req).await;
+            let (status, body) = f.get(format!("/{}/v2/conans/search", f.repo_key)).await;
             assert_eq!(status, StatusCode::OK);
             let results = parse_search_results(&body).await;
             assert_eq!(
@@ -3259,8 +3118,7 @@ mod tests {
                 "search response must use real user/channel/version from metadata",
             );
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
     }
 
@@ -3273,7 +3131,8 @@ mod tests {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
 
-        // Short helper to make GET requests.
+        // Short helper to make GET requests (used by tests that haven't been
+        // migrated to TestFixture yet).
         async fn get_json(
             app: axum::Router,
             uri: String,
@@ -3294,19 +3153,15 @@ mod tests {
 
         #[tokio::test]
         async fn recipe_file_upload_fresh_created_201_and_persists() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             let body_bytes = sample_conanfile_py();
             let status = upload_recipe_file(
-                &state,
-                &auth,
-                &repo_key,
+                &f.state,
+                &f.auth,
+                &f.repo_key,
                 "uplib",
                 "1.0",
                 "_",
@@ -3324,9 +3179,9 @@ mod tests {
                 "SELECT checksum_sha256 FROM artifacts \
                  WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
             )
-            .bind(repo_id)
+            .bind(f.repo_id)
             .bind(&art_path)
-            .fetch_one(&pool)
+            .fetch_one(&f.pool)
             .await
             .expect("artifact row must exist");
 
@@ -3335,9 +3190,9 @@ mod tests {
                  JOIN artifacts a ON a.id = am.artifact_id \
                  WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
             )
-            .bind(repo_id)
+            .bind(f.repo_id)
             .bind(&art_path)
-            .fetch_one(&pool)
+            .fetch_one(&f.pool)
             .await
             .expect("metadata row must exist");
             assert_eq!(meta_type, "recipe");
@@ -3347,37 +3202,31 @@ mod tests {
                  JOIN artifacts a ON a.id = am.artifact_id \
                  WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
             )
-            .bind(repo_id)
+            .bind(f.repo_id)
             .bind(&art_path)
-            .fetch_one(&pool)
+            .fetch_one(&f.pool)
             .await
             .expect("format");
             assert_eq!(meta_format, "conan");
 
-            // Verify SHA256 matches real bytes.
             use sha2::{Digest, Sha256};
             let expected = format!("{:x}", Sha256::digest(body_bytes));
             assert_eq!(checksum, expected);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
         async fn recipe_file_upload_reupload_soft_deletes_prior() {
-            let Some(pool) = try_pool().await else {
+            let Some(f) = TestFixture::setup("local").await else {
                 return;
             };
-            let (user_id, username, _pw) = create_user(&pool).await;
-            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
-            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
-            let auth = make_auth(user_id, &username);
 
             // First upload.
             let s1 = upload_recipe_file(
-                &state,
-                &auth,
-                &repo_key,
+                &f.state,
+                &f.auth,
+                &f.repo_key,
                 "relib",
                 "1.0",
                 "_",
@@ -3392,9 +3241,9 @@ mod tests {
             // Second upload with different bytes at the same path.
             let new_body: &[u8] = b"second-bytes-v2-different";
             let s2 = upload_recipe_file(
-                &state,
-                &auth,
-                &repo_key,
+                &f.state,
+                &f.auth,
+                &f.repo_key,
                 "relib",
                 "1.0",
                 "_",
@@ -3411,28 +3260,26 @@ mod tests {
             let count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
             )
-            .bind(repo_id)
+            .bind(f.repo_id)
             .bind(&art_path)
-            .fetch_one(&pool)
+            .fetch_one(&f.pool)
             .await
             .expect("count query");
             assert_eq!(count, 1, "re-upload must leave exactly one live row");
 
-            // Checksum matches the newer bytes.
             use sha2::{Digest, Sha256};
             let want = format!("{:x}", Sha256::digest(new_body));
             let got: String = sqlx::query_scalar(
                 "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
             )
-            .bind(repo_id)
+            .bind(f.repo_id)
             .bind(&art_path)
-            .fetch_one(&pool)
+            .fetch_one(&f.pool)
             .await
             .expect("checksum");
             assert_eq!(got, want);
 
-            cleanup(&pool, repo_id, user_id).await;
-            let _ = std::fs::remove_dir_all(&storage_dir);
+            f.teardown().await;
         }
 
         #[tokio::test]
