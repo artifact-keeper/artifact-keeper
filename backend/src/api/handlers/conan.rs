@@ -2713,4 +2713,584 @@ mod tests {
         test_helpers::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
+
+    // -----------------------------------------------------------------------
+    // Agent 1 — users_authenticate, check_credentials, search handlers.
+    //
+    // All tests are DB-backed and no-op when `DATABASE_URL` is unreachable.
+    // -----------------------------------------------------------------------
+    #[cfg(test)]
+    mod agent1_auth_search {
+        use super::test_helpers::*;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+        use uuid::Uuid;
+
+        // ---------------- users_authenticate ----------------
+
+        #[tokio::test]
+        async fn users_authenticate_echoes_basic_token_on_200() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state, auth);
+            let basic = basic_auth(&username, "irrelevant");
+            let expected_token = basic.strip_prefix("Basic ").unwrap().to_string();
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/{}/v2/users/authenticate", repo_key))
+                .header("Authorization", &basic)
+                .body(Body::empty())
+                .expect("build request");
+
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK, "body={:?}", body);
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                expected_token,
+                "handler should echo the base64 Basic value back to the client",
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn users_authenticate_404_when_repo_missing() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            // Create a repo just so the cleanup helper has something to chew on.
+            let (repo_id, _existing_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let bogus_key = format!("nonexistent-{}", Uuid::new_v4());
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/{}/v2/users/authenticate", bogus_key))
+                .header("Authorization", basic_auth(&username, "irrelevant"))
+                .body(Body::empty())
+                .expect("build request");
+
+            let (status, _body) = send(app, req).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn users_authenticate_400_when_repo_wrong_format() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            // Seed a non-conan (maven) repository directly so
+            // resolve_conan_repo rejects it with a 400 "not a Conan repo" body.
+            let repo_id = Uuid::new_v4();
+            let repo_key = format!("mvn-test-{}", repo_id);
+            let storage_dir = std::env::temp_dir().join(format!("mvn-test-{}", repo_id));
+            std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+                 VALUES ($1, $2, $3, $4, 'local'::repository_type, 'maven'::repository_format)",
+            )
+            .bind(repo_id)
+            .bind(&repo_key)
+            .bind(format!("mvn-test-{}", repo_id))
+            .bind(storage_dir.to_string_lossy().as_ref())
+            .execute(&pool)
+            .await
+            .expect("seed maven repo");
+
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/{}/v2/users/authenticate", repo_key))
+                .header("Authorization", basic_auth(&username, "irrelevant"))
+                .body(Body::empty())
+                .expect("build request");
+
+            let (status, _body) = send(app, req).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "wrong-format repo should fail resolve_conan_repo with 400",
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn users_authenticate_401_when_anon() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, _username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+            let app = router_anon(state);
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/{}/v2/users/authenticate", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+
+            let resp = app.oneshot(req).await.expect("oneshot");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let www = resp
+                .headers()
+                .get("WWW-Authenticate")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                www.contains("Basic") && www.contains("conan"),
+                "WWW-Authenticate header must advertise Basic realm=\"conan\", got: {}",
+                www,
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        // ---------------- check_credentials ----------------
+
+        #[tokio::test]
+        async fn check_credentials_200_empty_body() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/users/check_credentials", repo_key))
+                .header("Authorization", basic_auth(&username, "irrelevant"))
+                .body(Body::empty())
+                .expect("build request");
+
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body.is_empty(),
+                "check_credentials should return an empty body on success, got {} bytes",
+                body.len(),
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn check_credentials_404_when_repo_missing() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, _existing_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let bogus_key = format!("nonexistent-{}", Uuid::new_v4());
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/users/check_credentials", bogus_key))
+                .header("Authorization", basic_auth(&username, "irrelevant"))
+                .body(Body::empty())
+                .expect("build request");
+
+            let (status, _body) = send(app, req).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn check_credentials_401_when_anon() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, _username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+            let app = router_anon(state);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/users/check_credentials", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+
+            let (status, _body) = send(app, req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        // ---------------- search ----------------
+
+        async fn parse_search_results(body: &bytes::Bytes) -> Vec<String> {
+            let json: serde_json::Value = serde_json::from_slice(body).expect("body is JSON");
+            json.get("results")
+                .and_then(|v| v.as_array())
+                .expect("results array")
+                .iter()
+                .map(|v| v.as_str().expect("result is string").to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn search_empty_repo_returns_empty_results() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/conans/search", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            let results = parse_search_results(&body).await;
+            assert!(results.is_empty(), "expected no results, got {:?}", results);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn search_single_recipe_returns_one_reference() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "zlib",
+                "1.3",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/conans/search", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            let results = parse_search_results(&body).await;
+            assert_eq!(results, vec!["zlib/1.3@_/_".to_string()]);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn search_deduplicates_across_revisions_and_files() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            // Three rows in `artifacts` but only two distinct (name, version)
+            // pairs: fmt/9.1 appears twice (different revisions + files).
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "fmt",
+                "9.1",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "fmt",
+                "9.1",
+                "_",
+                "_",
+                "rev2",
+                "conanmanifest.txt",
+            )
+            .await;
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "boost",
+                "1.82",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/conans/search", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+            let (_status, body) = send(app, req).await;
+            let results = parse_search_results(&body).await;
+            assert_eq!(
+                results,
+                vec!["boost/1.82@_/_".to_string(), "fmt/9.1@_/_".to_string()],
+                "expected de-duplicated, name-ASC-ordered results",
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn search_glob_wildcard_filters_by_prefix() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "zlib",
+                "1.3",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "zstd",
+                "1.5.5",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "boost",
+                "1.82",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/conans/search?q=z*", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            let results = parse_search_results(&body).await;
+            assert_eq!(
+                results,
+                vec!["zlib/1.3@_/_".to_string(), "zstd/1.5.5@_/_".to_string()],
+                "glob z* must match zlib + zstd but exclude boost",
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn search_missing_q_defaults_to_match_all() {
+            // The handler's `q: Option<String>` falls back to "*" when absent
+            // so all conan artifacts in the repo appear in the response.
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "libcurl",
+                "8.5",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                // Note: no `q` query-string param at all.
+                .uri(format!("/{}/v2/conans/search", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            let results = parse_search_results(&body).await;
+            assert_eq!(results, vec!["libcurl/8.5@_/_".to_string()]);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn search_excludes_soft_deleted_artifacts() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let visible = seed_recipe_row(
+                &pool,
+                repo_id,
+                "openssl",
+                "3.2",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+            let hidden = seed_recipe_row(
+                &pool,
+                repo_id,
+                "sqlite3",
+                "3.45",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+            // Soft-delete sqlite3. It should disappear from search results.
+            sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+                .bind(hidden)
+                .execute(&pool)
+                .await
+                .expect("soft-delete artifact");
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/conans/search", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+            let (_status, body) = send(app, req).await;
+            let results = parse_search_results(&body).await;
+            assert_eq!(
+                results,
+                vec!["openssl/3.2@_/_".to_string()],
+                "soft-deleted sqlite3 must not appear in search output",
+            );
+            // Also sanity-check the visible row's id wasn't the one we hid.
+            assert_ne!(visible, hidden);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn search_returns_real_user_channel_and_version_from_metadata() {
+            // Regression guard: handler previously hardcoded "0.0.0@_/_" in
+            // every response tuple, which broke Conan clients that parse the
+            // reference back into (name, version, user, channel). This test
+            // asserts the fix — the response reflects the metadata JSON.
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let _ = seed_recipe_row(
+                &pool,
+                repo_id,
+                "mylib",
+                "2.5.1",
+                "myorg",
+                "stable",
+                "rev1",
+                "conanfile.py",
+            )
+            .await;
+
+            let app = router_with_auth(state, auth);
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/{}/v2/conans/search", repo_key))
+                .body(Body::empty())
+                .expect("build request");
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            let results = parse_search_results(&body).await;
+            assert_eq!(
+                results,
+                vec!["mylib/2.5.1@myorg/stable".to_string()],
+                "search response must use real user/channel/version from metadata",
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+    }
 }
