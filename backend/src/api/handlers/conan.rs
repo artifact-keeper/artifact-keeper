@@ -407,7 +407,7 @@ async fn recipe_latest(
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'revision' IS NOT NULL
-        ORDER BY a.created_at DESC
+        ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
         "#,
         repo.id,
