@@ -907,7 +907,7 @@ async fn package_latest(
           AND am.metadata->>'packageId' = $5
           AND am.metadata->>'type' = 'package'
           AND am.metadata->>'packageRevision' IS NOT NULL
-        ORDER BY a.created_at DESC
+        ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
         "#,
         repo.id,
