@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
@@ -63,6 +64,13 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions",
             get(recipe_revisions),
         )
+        // Recipe files list (must precede the wildcard route below so axum
+        // matches exact `/files` requests here rather than treating them as
+        // a wildcard with an empty path segment).
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/files",
+            get(recipe_files_list),
+        )
         // Recipe file download / upload
         .route(
             "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/files/*file_path",
@@ -77,6 +85,12 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/packages/:package_id/revisions",
             get(package_revisions),
+        )
+        // Package files list (precedes the wildcard route, same reason as
+        // the recipe files-list route above).
+        .route(
+            "/:repo_key/v2/conans/:name/:version/:user/:channel/revisions/:revision/packages/:package_id/revisions/:pkg_revision/files",
+            get(package_files_list),
         )
         // Package file download / upload
         .route(
@@ -300,7 +314,12 @@ async fn search(
 
     let rows = sqlx::query!(
         r#"
-        SELECT DISTINCT a.name, a.version as "version?"
+        SELECT DISTINCT
+            a.name,
+            a.version as "version?",
+            am.metadata->>'version' as "meta_version?",
+            am.metadata->>'user' as "meta_user?",
+            am.metadata->>'channel' as "meta_channel?"
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -314,21 +333,25 @@ async fn search(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
-    // Build search results in Conan v2 format
+    // Build search results in Conan v2 format.
+    //
+    // Prefer the per-recipe values stored in `artifact_metadata.metadata`
+    // (`version`, `user`, `channel`) so the response matches what the Conan
+    // client uploaded. Fall back to the artifact column / spec defaults when
+    // the JSON field is absent (preserves Conan v2 protocol: `_` is the
+    // sentinel for "no user / no channel", `0.0.0` is the fallback version).
     let results: Vec<String> = rows
         .iter()
         .map(|r| {
-            let version = r.version.as_deref().unwrap_or("0.0.0");
-            let user = "_";
-            let channel = "_";
+            let version = r
+                .meta_version
+                .as_deref()
+                .or(r.version.as_deref())
+                .unwrap_or("0.0.0");
+            let user = r.meta_user.as_deref().unwrap_or("_");
+            let channel = r.meta_channel.as_deref().unwrap_or("_");
             format!("{}/{}@{}/{}", r.name, version, user, channel)
         })
         .collect();
@@ -373,7 +396,7 @@ async fn recipe_latest(
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'revision' IS NOT NULL
-        ORDER BY a.created_at DESC
+        ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
         "#,
         repo.id,
@@ -382,13 +405,7 @@ async fn recipe_latest(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(map_db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?;
 
     let revision = row
@@ -442,13 +459,7 @@ async fn recipe_revisions(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     let revisions: Vec<serde_json::Value> = rows
         .into_iter()
@@ -471,6 +482,53 @@ async fn recipe_revisions(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET  .../revisions/{rev}/files - List recipe files
+// ---------------------------------------------------------------------------
+
+async fn recipe_files_list(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel, revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT am.metadata->>'file' as "file?"
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND am.metadata->>'type' = 'recipe'
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+        "#,
+        repo.id,
+        name,
+        version,
+        normalize_user(&user),
+        normalize_channel(&channel),
+        revision,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
+    Ok(files_listing_response(filenames))
 }
 
 // ---------------------------------------------------------------------------
@@ -510,13 +568,7 @@ async fn recipe_file_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(map_db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response());
 
     let artifact = match artifact {
@@ -603,13 +655,10 @@ async fn recipe_file_download(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -672,13 +721,7 @@ async fn recipe_file_upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     if let Some(existing_id) = existing {
         // Soft-delete the old version to allow re-upload within same revision
@@ -698,13 +741,10 @@ async fn recipe_file_upload(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(map_storage_err)?;
 
     // Build metadata JSON
     let metadata = serde_json::json!({
@@ -739,13 +779,7 @@ async fn recipe_file_upload(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -815,7 +849,7 @@ async fn package_latest(
           AND am.metadata->>'packageId' = $5
           AND am.metadata->>'type' = 'package'
           AND am.metadata->>'packageRevision' IS NOT NULL
-        ORDER BY a.created_at DESC
+        ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
         "#,
         repo.id,
@@ -826,13 +860,7 @@ async fn package_latest(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(map_db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "No package revisions found").into_response())?;
 
     let pkg_revision = row
@@ -893,13 +921,7 @@ async fn package_revisions(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     let revisions: Vec<serde_json::Value> = rows
         .into_iter()
@@ -922,6 +944,82 @@ async fn package_revisions(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&json).unwrap()))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET  .../packages/{pkg_id}/revisions/{pkg_rev}/files - List package files
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::type_complexity)]
+async fn package_files_list(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT am.metadata->>'file' as "file?"
+        FROM artifacts a
+        JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND am.format = 'conan'
+          AND am.metadata->>'type' = 'package'
+          AND a.name = $2
+          AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
+          AND am.metadata->>'revision' = $6
+          AND am.metadata->>'packageId' = $7
+          AND am.metadata->>'packageRevision' = $8
+        "#,
+        repo.id,
+        name,
+        version,
+        normalize_user(&user),
+        normalize_channel(&channel),
+        revision,
+        package_id,
+        pkg_revision,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(map_db_err)?;
+
+    let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
+    Ok(files_listing_response(filenames))
+}
+
+/// Build the Conan v2 files-listing JSON body. The protocol shape is
+/// `{"files": {"filename.ext": {}, ...}}` -- see
+/// `conan/internal/rest/rest_client_v2.py::_get_file_list_json`. Returns an
+/// empty `files` object when no artifacts match, matching what Conan expects
+/// for a recipe/package revision that has zero files.
+fn build_files_listing_json(filenames: Vec<String>) -> serde_json::Value {
+    let mut files = serde_json::Map::new();
+    for name in filenames {
+        files.insert(name, serde_json::json!({}));
+    }
+    serde_json::json!({ "files": files })
+}
+
+fn files_listing_response(filenames: Vec<String>) -> Response {
+    let body = build_files_listing_json(filenames);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -971,13 +1069,7 @@ async fn package_file_download(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(map_db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response());
 
     let artifact =
@@ -1065,13 +1157,10 @@ async fn package_file_download(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -1146,7 +1235,7 @@ async fn package_file_upload(
     let size_bytes = body.len() as i64;
     let ct = content_type_for_conan_file(&file_path);
 
-    // Check for duplicate — allow overwrite within same revision
+    // Check for duplicate -- allow overwrite within same revision
     let existing = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
         repo.id,
@@ -1154,13 +1243,7 @@ async fn package_file_upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     if let Some(existing_id) = existing {
         let _ = sqlx::query!(
@@ -1171,17 +1254,18 @@ async fn package_file_upload(
         .await;
     }
 
+    // Clean up soft-deleted rows (including the one just soft-deleted above)
+    // so the UNIQUE(repository_id, path) constraint won't block the INSERT.
+    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+
     // Store the file
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(map_storage_err)?;
 
     // Build metadata JSON
     let metadata = serde_json::json!({
@@ -1218,13 +1302,7 @@ async fn package_file_upload(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -1594,6 +1672,45 @@ mod tests {
         assert_eq!(
             content_type_for_conan_file("somefile"),
             "application/octet-stream"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // files_listing_response / build_files_listing_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn files_listing_response_returns_200_json() {
+        let resp = files_listing_response(vec!["conanfile.py".to_string()]);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn files_listing_response_empty_returns_200() {
+        let resp = files_listing_response(Vec::new());
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn build_files_listing_json_preserves_order_independent_keys() {
+        // Verify that duplicate filenames collapse to one entry (last wins
+        // with serde_json::Map insert semantics).
+        let json =
+            build_files_listing_json(vec!["conanfile.py".to_string(), "conanfile.py".to_string()]);
+        let files = json
+            .get("files")
+            .and_then(|v| v.as_object())
+            .expect("files object");
+        assert_eq!(
+            files.len(),
+            1,
+            "duplicate filenames should collapse to one key"
         );
     }
 
