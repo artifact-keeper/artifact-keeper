@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
@@ -338,13 +339,7 @@ async fn search(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     // Build search results in Conan v2 format.
     //
@@ -476,13 +471,7 @@ async fn recipe_revisions(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     let revisions: Vec<serde_json::Value> = rows
         .into_iter()
@@ -548,13 +537,7 @@ async fn recipe_files_list(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
     Ok(files_listing_response(filenames))
@@ -695,13 +678,10 @@ async fn recipe_file_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -764,13 +744,7 @@ async fn recipe_file_upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     if let Some(existing_id) = existing {
         // Soft-delete the old version to allow re-upload within same revision
@@ -790,13 +764,10 @@ async fn recipe_file_upload(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(map_storage_err)?;
 
     // Build metadata JSON
     let metadata = serde_json::json!({
@@ -831,13 +802,7 @@ async fn recipe_file_upload(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -985,13 +950,7 @@ async fn package_revisions(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     let revisions: Vec<serde_json::Value> = rows
         .into_iter()
@@ -1064,13 +1023,7 @@ async fn package_files_list(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     let filenames: Vec<String> = rows.into_iter().filter_map(|r| r.file).collect();
     Ok(files_listing_response(filenames))
@@ -1244,13 +1197,10 @@ async fn package_file_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    let content = storage
+        .get(&artifact.storage_key)
+        .await
+        .map_err(map_storage_err)?;
 
     // Record download
     let _ = sqlx::query!(
@@ -1333,13 +1283,7 @@ async fn package_file_upload(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     if let Some(existing_id) = existing {
         let _ = sqlx::query!(
@@ -1358,13 +1302,10 @@ async fn package_file_upload(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(map_storage_err)?;
 
     // Build metadata JSON
     let metadata = serde_json::json!({
@@ -1401,13 +1342,7 @@ async fn package_file_upload(
     )
     .fetch_one(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(map_db_err)?;
 
     // Store metadata
     let _ = sqlx::query!(
@@ -1492,6 +1427,41 @@ mod tests {
                 "missing or wrong value for {name}"
             );
         }
+    }
+
+    #[test]
+    fn files_listing_response_returns_200_json() {
+        let resp = files_listing_response(vec!["conanfile.py".to_string()]);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn files_listing_response_empty_returns_200() {
+        let resp = files_listing_response(Vec::new());
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn build_files_listing_json_preserves_order_independent_keys() {
+        // Verify that duplicate filenames collapse to one entry (last wins
+        // with serde_json::Map insert semantics).
+        let json =
+            build_files_listing_json(vec!["conanfile.py".to_string(), "conanfile.py".to_string()]);
+        let files = json
+            .get("files")
+            .and_then(|v| v.as_object())
+            .expect("files object");
+        assert_eq!(
+            files.len(),
+            1,
+            "duplicate filenames should collapse to one key"
+        );
     }
 
     // -----------------------------------------------------------------------
