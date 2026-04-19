@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-04-19
+
+### Sponsors
+
+Thank you to our backers for supporting ongoing development:
+
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper)
+
+### Thank You
+
+- @slai-eddie for the Conan files-listing endpoints and handler coverage improvements (#782, #790)
+
+### Added
+
+- **Conan recipe files-listing endpoint** -- `GET /conan/{repo}/v2/conans/{name}/{ver}/{user}/{channel}/revisions/{rev}/files` returns a JSON listing of all files in a recipe revision, matching the Conan v2 protocol spec.
+- **Conan package files-listing endpoint** -- `GET .../packages/{pkg_id}/revisions/{prev}/files` returns the same for package binary revisions.
+
+### Fixed
+
+- **Conan search returns wrong metadata** -- search results now use the actual `version`, `user`, and `channel` values from artifact metadata instead of falling back to column defaults, which could show incorrect references.
+- **Conan recipe latest revision unstable ordering** -- when multiple revisions share the same timestamp, the latest endpoint now uses `id DESC` as a tiebreaker for deterministic results.
+- **Conan package latest revision unstable ordering** -- same tiebreaker fix applied to the package latest endpoint.
+- **Conan package re-upload fails with 500** -- uploading a file to the same package revision now properly cleans up the soft-deleted previous version before inserting, preventing unique constraint violations. Recipe uploads already had this cleanup; package uploads were missing it.
+
+### Changed
+
+- **Conan handler deduplication** -- replaced 13 inline database/storage error-mapping closures with shared `map_db_err` and `map_storage_err` helpers, reducing code by ~200 lines while preserving identical behavior.
+
 ## [1.1.4] - 2026-04-16
 
 ### Sponsors
