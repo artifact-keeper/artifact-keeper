@@ -319,7 +319,12 @@ async fn search(
 
     let rows = sqlx::query!(
         r#"
-        SELECT DISTINCT a.name, a.version as "version?"
+        SELECT DISTINCT
+            a.name,
+            a.version as "version?",
+            am.metadata->>'version' as "meta_version?",
+            am.metadata->>'user' as "meta_user?",
+            am.metadata->>'channel' as "meta_channel?"
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -341,13 +346,23 @@ async fn search(
             .into_response()
     })?;
 
-    // Build search results in Conan v2 format
+    // Build search results in Conan v2 format.
+    //
+    // Prefer the per-recipe values stored in `artifact_metadata.metadata`
+    // (`version`, `user`, `channel`) so the response matches what the Conan
+    // client uploaded. Fall back to the artifact column / spec defaults when
+    // the JSON field is absent (preserves Conan v2 protocol: `_` is the
+    // sentinel for "no user / no channel", `0.0.0` is the fallback version).
     let results: Vec<String> = rows
         .iter()
         .map(|r| {
-            let version = r.version.as_deref().unwrap_or("0.0.0");
-            let user = "_";
-            let channel = "_";
+            let version = r
+                .meta_version
+                .as_deref()
+                .or(r.version.as_deref())
+                .unwrap_or("0.0.0");
+            let user = r.meta_user.as_deref().unwrap_or("_");
+            let channel = r.meta_channel.as_deref().unwrap_or("_");
             format!("{}/{}@{}/{}", r.name, version, user, channel)
         })
         .collect();
