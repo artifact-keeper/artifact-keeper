@@ -168,11 +168,17 @@ jobs:
             exit 1
           fi
 
+      - name: Setup Node.js for jscpd
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Code duplication gate
         if: always() && github.event_name == 'pull_request'
         run: |
           # Install jscpd (copy-paste detector, same approach as SonarCloud's CPD engine)
-          npm install -g jscpd@4 --silent 2>/dev/null
+          npm install -g jscpd@4 --silent
 
           # Get changed .rs files
           git fetch --no-tags --depth=1 origin ${{ github.base_ref }} 2>/dev/null || true
