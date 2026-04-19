@@ -3294,3 +3294,817 @@ mod tests {
         }
     }
 }
+
+// ===========================================================================
+// Agent 2 — recipe-side read handlers:
+//   recipe_latest, recipe_revisions, recipe_files_list, recipe_file_download
+// ===========================================================================
+
+#[cfg(test)]
+mod agent2_recipe_reads {
+    use super::tests::test_helpers::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use uuid::Uuid;
+
+    /// Build an anonymous request for a recipe read endpoint (these handlers
+    /// do not call `require_auth_basic`).
+    fn get(uri: String) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    // -----------------------------------------------------------------------
+    // recipe_latest
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recipe_latest_returns_newest_revision() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "boost",
+            "1.83.0",
+            "_",
+            "_",
+            "rev_old_hash",
+            "conanfile.py",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "boost",
+            "1.83.0",
+            "_",
+            "_",
+            "rev_new_hash",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!("/{}/v2/conans/boost/1.83.0/_/_/latest", repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={:?}", body);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            json.get("revision").and_then(|v| v.as_str()),
+            Some("rev_new_hash"),
+            "expected newest revision; body={}",
+            String::from_utf8_lossy(&body)
+        );
+        // RFC 3339 time string present and parseable.
+        let time = json
+            .get("time")
+            .and_then(|v| v.as_str())
+            .expect("time present");
+        chrono::DateTime::parse_from_rfc3339(time).expect("valid rfc3339");
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_latest_404_when_no_rows() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let app = router_with_auth(state, auth);
+        let (status, _body) = send(
+            app,
+            get(format!("/{}/v2/conans/nope/0.0.1/_/_/latest", repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_latest_404_when_other_ref_exists_but_query_ref_missing() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        // Seed a row for foo/1.0 — we then query bar/1.0 and expect 404.
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "foo",
+            "1.0",
+            "_",
+            "_",
+            "revX",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, _body) = send(
+            app,
+            get(format!("/{}/v2/conans/bar/1.0/_/_/latest", repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Tiebreaker bug: when two recipe rows share the same `created_at`, the
+    /// handler must return a deterministic result. The fix adds `a.id DESC`
+    /// to `ORDER BY`, so the row with the larger UUID wins.
+    #[tokio::test]
+    async fn recipe_latest_tiebreaker_is_deterministic_on_identical_created_at() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        // Two artifacts with EXACTLY the same explicit created_at. The
+        // tiebreaker on `a.id DESC` should pick the larger UUID. We use
+        // fresh UUIDs here (not hardcoded) so parallel/repeated test runs
+        // on the same database don't collide on the primary key.
+        let ts = chrono::Utc::now();
+        let u_a = Uuid::new_v4();
+        let u_b = Uuid::new_v4();
+        let (id_lo, id_hi) = if u_a < u_b { (u_a, u_b) } else { (u_b, u_a) };
+
+        for (aid, rev) in [(id_lo, "rev_low_id"), (id_hi, "rev_high_id")] {
+            let path = format!("tbreak/1.0/_/_/revisions/{}/files/conanfile.py", rev);
+            let storage_key = format!("conan/tbreak/1.0/_/_/recipe/{}/conanfile.py", rev);
+            let checksum = format!("{:0>64}", aid.simple().to_string());
+            sqlx::query(
+                r#"
+                INSERT INTO artifacts (
+                    id, repository_id, path, name, version, size_bytes,
+                    checksum_sha256, content_type, storage_key, created_at
+                )
+                VALUES ($1, $2, $3, 'tbreak', '1.0', 0, $4, 'text/plain', $5, $6)
+                "#,
+            )
+            .bind(aid)
+            .bind(repo_id)
+            .bind(&path)
+            .bind(&checksum)
+            .bind(&storage_key)
+            .bind(ts)
+            .execute(&pool)
+            .await
+            .expect("seed artifact");
+            let md = serde_json::json!({
+                "name": "tbreak",
+                "version": "1.0",
+                "user": "_",
+                "channel": "_",
+                "revision": rev,
+                "type": "recipe",
+                "file": "conanfile.py",
+            });
+            sqlx::query(
+                r#"
+                INSERT INTO artifact_metadata (artifact_id, format, metadata)
+                VALUES ($1, 'conan', $2)
+                "#,
+            )
+            .bind(aid)
+            .bind(md)
+            .execute(&pool)
+            .await
+            .expect("seed metadata");
+        }
+
+        // The fix (`ORDER BY created_at DESC, id DESC`) picks the row with
+        // the larger UUID, i.e. rev_high_id. Repeat the request several
+        // times to make sure we always get the same answer (the pre-fix
+        // code could return either, depending on storage order).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let app = router_with_auth(state.clone(), auth.clone());
+            let (status, body) = send(
+                app,
+                get(format!("/{}/v2/conans/tbreak/1.0/_/_/latest", repo_key)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            seen.insert(
+                json.get("revision")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            1,
+            "recipe_latest must be deterministic across calls; saw: {:?}",
+            seen
+        );
+        let chosen = seen.into_iter().next().unwrap();
+        assert_eq!(
+            chosen, "rev_high_id",
+            "tiebreaker must pick the larger UUID (id DESC); got {}",
+            chosen
+        );
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // recipe_revisions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recipe_revisions_empty_returns_empty_array() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!("/{}/v2/conans/ghost/0.0.0/_/_/revisions", repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let revs = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        assert!(revs.is_empty(), "expected [], got {:?}", revs);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_revisions_single_entry() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "openssl",
+            "3.0.0",
+            "_",
+            "_",
+            "rev_only",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/openssl/3.0.0/_/_/revisions",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let revs = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        assert_eq!(revs.len(), 1);
+        assert_eq!(
+            revs[0].get("revision").and_then(|v| v.as_str()),
+            Some("rev_only")
+        );
+        let time = revs[0]
+            .get("time")
+            .and_then(|v| v.as_str())
+            .expect("time str");
+        chrono::DateTime::parse_from_rfc3339(time).expect("rfc3339");
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_revisions_multiple_ordered_desc_by_created_at() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "zlib",
+            "1.2.13",
+            "_",
+            "_",
+            "rev_a",
+            "conanfile.py",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "zlib",
+            "1.2.13",
+            "_",
+            "_",
+            "rev_b",
+            "conanfile.py",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "zlib",
+            "1.2.13",
+            "_",
+            "_",
+            "rev_c",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!("/{}/v2/conans/zlib/1.2.13/_/_/revisions", repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let revs = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        let labels: Vec<&str> = revs
+            .iter()
+            .filter_map(|v| v.get("revision").and_then(|r| r.as_str()))
+            .collect();
+        assert_eq!(labels, vec!["rev_c", "rev_b", "rev_a"]);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_revisions_filters_soft_deleted_rows() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let a_del = seed_recipe_row(
+            &pool,
+            repo_id,
+            "fmt",
+            "10.0",
+            "_",
+            "_",
+            "rev_gone",
+            "conanfile.py",
+        )
+        .await;
+        let _a_live = seed_recipe_row(
+            &pool,
+            repo_id,
+            "fmt",
+            "10.0",
+            "_",
+            "_",
+            "rev_live",
+            "conanfile.py",
+        )
+        .await;
+        // Soft-delete a_del.
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(a_del)
+            .execute(&pool)
+            .await
+            .expect("soft delete");
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!("/{}/v2/conans/fmt/10.0/_/_/revisions", repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let revs = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("array");
+        let labels: Vec<&str> = revs
+            .iter()
+            .filter_map(|v| v.get("revision").and_then(|r| r.as_str()))
+            .collect();
+        assert_eq!(labels, vec!["rev_live"]);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // recipe_files_list
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recipe_files_list_empty_returns_empty_map() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/nothing/1.0/_/_/revisions/revNone/files",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json, serde_json::json!({"files": {}}));
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_files_list_single_file() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "cat",
+            "2.0",
+            "_",
+            "_",
+            "rev_one",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/cat/2.0/_/_/revisions/rev_one/files",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let files = json.get("files").and_then(|v| v.as_object()).expect("map");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files.get("conanfile.py"), Some(&serde_json::json!({})));
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_files_list_multiple_files_for_revision() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        for fname in ["conanfile.py", "conanmanifest.txt", "conan_export.tgz"] {
+            let _ = seed_recipe_row(&pool, repo_id, "multi", "1.0", "_", "_", "rev_m", fname).await;
+        }
+        // And seed one row for an unrelated revision — must NOT appear.
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "multi",
+            "1.0",
+            "_",
+            "_",
+            "rev_other",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/multi/1.0/_/_/revisions/rev_m/files",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let files = json.get("files").and_then(|v| v.as_object()).expect("map");
+        assert_eq!(files.len(), 3, "files={:?}", files);
+        for name in ["conanfile.py", "conanmanifest.txt", "conan_export.tgz"] {
+            assert!(files.contains_key(name), "missing {}", name);
+        }
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_files_list_user_channel_placeholder_underscore() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        // Seed with "_"/"_" as user/channel and a non-placeholder neighbor
+        // — only the placeholder rows should come back.
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "plib",
+            "1.0",
+            "_",
+            "_",
+            "rev_u",
+            "conanfile.py",
+        )
+        .await;
+        let _ = seed_recipe_row(
+            &pool,
+            repo_id,
+            "plib",
+            "1.0",
+            "acme",
+            "stable",
+            "rev_u",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/plib/1.0/_/_/revisions/rev_u/files",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let files = json.get("files").and_then(|v| v.as_object()).expect("map");
+        assert_eq!(files.len(), 1);
+        assert!(files.contains_key("conanfile.py"));
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // recipe_file_download
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recipe_file_download_hosted_roundtrip() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, &username);
+
+        let body = b"from conan import ConanFile\nclass T(ConanFile): pass\n";
+        let put_status = upload_recipe_file(
+            &state,
+            &auth,
+            &repo_key,
+            "rt",
+            "1.0",
+            "_",
+            "_",
+            "rev_rt",
+            "conanfile.py",
+            body,
+        )
+        .await;
+        assert!(put_status.is_success(), "upload failed: {}", put_status);
+
+        let app = router_with_auth(state, auth);
+        let (status, got) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/rt/1.0/_/_/revisions/rev_rt/files/conanfile.py",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got.as_ref(), body);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_file_download_404_when_missing_in_hosted_repo() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let app = router_with_auth(state, auth);
+        let (status, _body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/zz/1.0/_/_/revisions/rev_zz/files/conanfile.py",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_file_download_remote_without_proxy_returns_404() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "remote").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        // state.proxy_service is None in build_state — this branch returns
+        // the original NOT_FOUND from the artifact lookup.
+        let auth = make_auth(user_id, "dummy");
+
+        let app = router_with_auth(state, auth);
+        let (status, _body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/xx/9.9/_/_/revisions/revX/files/conanfile.py",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_file_download_virtual_with_no_member_returns_error() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "virtual").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        let app = router_with_auth(state, auth);
+        let (status, _body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/missing/1.0/_/_/revisions/revV/files/conanfile.py",
+                repo_key
+            )),
+        )
+        .await;
+        // No members resolved; `resolve_virtual_download` returns a 404 or
+        // similar non-success status. The exact status depends on
+        // proxy_helpers; assert it's a client/server error and not 200.
+        assert!(
+            !status.is_success(),
+            "virtual repo with no members should not return 200, got {}",
+            status
+        );
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn recipe_file_download_soft_deleted_artifact_returns_404() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username, _pw) = create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+        let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, &username);
+
+        let body = b"payload";
+        let put_status = upload_recipe_file(
+            &state,
+            &auth,
+            &repo_key,
+            "soft",
+            "1.0",
+            "_",
+            "_",
+            "rev_sd",
+            "conanfile.py",
+            body,
+        )
+        .await;
+        assert!(put_status.is_success(), "upload failed: {}", put_status);
+
+        // Soft-delete the artifact row.
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true \
+             WHERE repository_id = $1 AND name = 'soft'",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("soft delete");
+
+        let app = router_with_auth(state, auth);
+        let (status, _body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/soft/1.0/_/_/revisions/rev_sd/files/conanfile.py",
+                repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+}
