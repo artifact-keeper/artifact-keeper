@@ -3293,6 +3293,938 @@ mod tests {
             let _ = std::fs::remove_dir_all(&storage_dir);
         }
     }
+
+    // ========================================================================
+    // Agent 3 — recipe_file_upload + package-side read handlers.
+    // ========================================================================
+    #[cfg(test)]
+    mod agent3_mixed {
+        use super::test_helpers::*;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        // Short helper to make GET requests.
+        async fn get_json(
+            app: axum::Router,
+            uri: String,
+            username: &str,
+        ) -> (StatusCode, bytes::Bytes) {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", basic_auth(username, "irrelevant"))
+                .body(Body::empty())
+                .expect("build request");
+            send(app, req).await
+        }
+
+        // ================================================================
+        // recipe_file_upload
+        // ================================================================
+
+        #[tokio::test]
+        async fn recipe_file_upload_fresh_created_201_and_persists() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let body_bytes = sample_conanfile_py();
+            let status = upload_recipe_file(
+                &state,
+                &auth,
+                &repo_key,
+                "uplib",
+                "1.0",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+                body_bytes,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+
+            // Verify the artifact row + metadata landed.
+            let art_path = "uplib/1.0/_/_/revisions/rev1/files/conanfile.py".to_string();
+            let checksum: String = sqlx::query_scalar(
+                "SELECT checksum_sha256 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .bind(&art_path)
+            .fetch_one(&pool)
+            .await
+            .expect("artifact row must exist");
+
+            let meta_type: String = sqlx::query_scalar(
+                "SELECT am.metadata->>'type' FROM artifact_metadata am \
+                 JOIN artifacts a ON a.id = am.artifact_id \
+                 WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
+            )
+            .bind(repo_id)
+            .bind(&art_path)
+            .fetch_one(&pool)
+            .await
+            .expect("metadata row must exist");
+            assert_eq!(meta_type, "recipe");
+
+            let meta_format: String = sqlx::query_scalar(
+                "SELECT am.format::text FROM artifact_metadata am \
+                 JOIN artifacts a ON a.id = am.artifact_id \
+                 WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
+            )
+            .bind(repo_id)
+            .bind(&art_path)
+            .fetch_one(&pool)
+            .await
+            .expect("format");
+            assert_eq!(meta_format, "conan");
+
+            // Verify SHA256 matches real bytes.
+            use sha2::{Digest, Sha256};
+            let expected = format!("{:x}", Sha256::digest(body_bytes));
+            assert_eq!(checksum, expected);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn recipe_file_upload_reupload_soft_deletes_prior() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            // First upload.
+            let s1 = upload_recipe_file(
+                &state,
+                &auth,
+                &repo_key,
+                "relib",
+                "1.0",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+                b"first-bytes-v1",
+            )
+            .await;
+            assert_eq!(s1, StatusCode::CREATED);
+
+            // Second upload with different bytes at the same path.
+            let new_body: &[u8] = b"second-bytes-v2-different";
+            let s2 = upload_recipe_file(
+                &state,
+                &auth,
+                &repo_key,
+                "relib",
+                "1.0",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+                new_body,
+            )
+            .await;
+            assert_eq!(s2, StatusCode::CREATED);
+
+            // Exactly one non-deleted row at that path.
+            let art_path = "relib/1.0/_/_/revisions/rev1/files/conanfile.py".to_string();
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .bind(&art_path)
+            .fetch_one(&pool)
+            .await
+            .expect("count query");
+            assert_eq!(count, 1, "re-upload must leave exactly one live row");
+
+            // Checksum matches the newer bytes.
+            use sha2::{Digest, Sha256};
+            let want = format!("{:x}", Sha256::digest(new_body));
+            let got: String = sqlx::query_scalar(
+                "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .bind(&art_path)
+            .fetch_one(&pool)
+            .await
+            .expect("checksum");
+            assert_eq!(got, want);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn recipe_file_upload_401_when_anonymous() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, _username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+            let app = router_anon(state.clone());
+            let uri = format!(
+                "/{}/v2/conans/anonlib/1.0/_/_/revisions/rev1/files/conanfile.py",
+                repo_key
+            );
+            let req = Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .body(Body::from(sample_conanfile_py().to_vec()))
+                .expect("build req");
+            let (status, _body) = send(app, req).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn recipe_file_upload_405_on_remote_repo() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "remote").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let status = upload_recipe_file(
+                &state,
+                &auth,
+                &repo_key,
+                "rl",
+                "1.0",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+                sample_conanfile_py(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn recipe_file_upload_400_on_virtual_repo() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "virtual").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let status = upload_recipe_file(
+                &state,
+                &auth,
+                &repo_key,
+                "vl",
+                "1.0",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+                sample_conanfile_py(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn recipe_file_upload_bumps_repository_updated_at() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let before: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT updated_at FROM repositories WHERE id = $1")
+                    .bind(repo_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("before updated_at");
+
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let status = upload_recipe_file(
+                &state,
+                &auth,
+                &repo_key,
+                "stamp",
+                "1.0",
+                "_",
+                "_",
+                "rev1",
+                "conanfile.py",
+                sample_conanfile_py(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+
+            let after: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT updated_at FROM repositories WHERE id = $1")
+                    .bind(repo_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("after updated_at");
+            assert!(
+                after > before,
+                "updated_at must advance after upload (before={before}, after={after})"
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        // ================================================================
+        // package_latest
+        // ================================================================
+
+        #[tokio::test]
+        async fn package_latest_returns_newer_revision() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "plib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_old",
+                "conan_package.tgz",
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "plib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_new",
+                "conaninfo.txt",
+            )
+            .await;
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/plib/1.0/_/_/revisions/rrev/packages/pid/latest",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(json["revision"], "pkg_new");
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_latest_404_when_no_rows_match() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/nothing/1.0/_/_/revisions/r/packages/pid/latest",
+                repo_key
+            );
+            let (status, _body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_latest_404_when_package_id_mismatches_existing_recipe_rev() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            // Recipe revision exists, but packageId 'pid-other' will not.
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "lib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid-here",
+                "pkgrev",
+                "conan_package.tgz",
+            )
+            .await;
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/lib/1.0/_/_/revisions/rrev/packages/pid-other/latest",
+                repo_key
+            );
+            let (status, _body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        /// Tiebreaker test: two package rows with identical created_at values
+        /// must still yield a deterministic winner. Paired with the fix
+        /// `fix(conan): stable tiebreaker for package_latest ordering` —
+        /// before that fix, ORDER BY created_at DESC alone picks an
+        /// indeterminate row when timestamps collide.
+        #[tokio::test]
+        async fn package_latest_tiebreaker_is_deterministic() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let a1 = seed_package_row(
+                &pool,
+                repo_id,
+                "tblib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_A",
+                "conan_package.tgz",
+            )
+            .await;
+            let a2 = seed_package_row(
+                &pool,
+                repo_id,
+                "tblib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_B",
+                "conaninfo.txt",
+            )
+            .await;
+
+            // Force identical created_at on both rows.
+            sqlx::query("UPDATE artifacts SET created_at = NOW() WHERE id = ANY($1::uuid[])")
+                .bind(vec![a1, a2])
+                .execute(&pool)
+                .await
+                .expect("normalize created_at");
+
+            // Expected winner under `ORDER BY created_at DESC, id DESC`: max(id).
+            let (winner_id, winner_label) = if a1 > a2 {
+                (a1, "pkg_A")
+            } else {
+                (a2, "pkg_B")
+            };
+            let _ = winner_id;
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/tblib/1.0/_/_/revisions/rrev/packages/pid/latest",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(
+                json["revision"], winner_label,
+                "tiebreaker must pick the row with the lexicographically greater UUID"
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        // ================================================================
+        // package_revisions
+        // ================================================================
+
+        #[tokio::test]
+        async fn package_revisions_empty_returns_empty_array() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/nolib/1.0/_/_/revisions/r/packages/pid/revisions",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let arr = json
+                .get("revisions")
+                .and_then(|v| v.as_array())
+                .expect("revisions array");
+            assert!(arr.is_empty(), "expected empty revisions");
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_revisions_multiple_in_desc_order() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "rlib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_old",
+                "conan_package.tgz",
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "rlib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_new",
+                "conaninfo.txt",
+            )
+            .await;
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/rlib/1.0/_/_/revisions/rrev/packages/pid/revisions",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let arr = json["revisions"].as_array().expect("revisions array");
+            assert_eq!(arr.len(), 2);
+            assert_eq!(arr[0]["revision"], "pkg_new");
+            assert_eq!(arr[1]["revision"], "pkg_old");
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_revisions_filters_soft_deleted() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let deleted_id = seed_package_row(
+                &pool,
+                repo_id,
+                "slib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_deleted",
+                "conan_package.tgz",
+            )
+            .await;
+            let _live = seed_package_row(
+                &pool,
+                repo_id,
+                "slib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkg_alive",
+                "conaninfo.txt",
+            )
+            .await;
+
+            sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+                .bind(deleted_id)
+                .execute(&pool)
+                .await
+                .expect("soft-delete");
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/slib/1.0/_/_/revisions/rrev/packages/pid/revisions",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let arr = json["revisions"].as_array().expect("array");
+            assert_eq!(arr.len(), 1, "soft-deleted rows must be filtered");
+            assert_eq!(arr[0]["revision"], "pkg_alive");
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        // ================================================================
+        // package_files_list
+        // ================================================================
+
+        #[tokio::test]
+        async fn package_files_list_empty_revision_returns_empty_files() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/elib/1.0/_/_/revisions/r/packages/pid/revisions/pr/files",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let files = json["files"].as_object().expect("files object");
+            assert!(files.is_empty(), "expected empty files object");
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_files_list_includes_all_filenames() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            for fname in ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"] {
+                let _ = seed_package_row(
+                    &pool, repo_id, "mlib", "1.0", "_", "_", "rrev", "pid", "pkgrev", fname,
+                )
+                .await;
+            }
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/mlib/1.0/_/_/revisions/rrev/packages/pid/revisions/pkgrev/files",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let files = json["files"].as_object().expect("files object");
+            for fname in ["conan_package.tgz", "conaninfo.txt", "conanmanifest.txt"] {
+                assert!(files.contains_key(fname), "missing file: {}", fname);
+            }
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_files_list_scoped_by_package_revision() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            // Two pkg revisions with overlapping file names. Scope query to
+            // pr_A and assert pr_B's files are absent.
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "slib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pr_A",
+                "only_in_A.tgz",
+            )
+            .await;
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "slib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pr_A",
+                "conaninfo.txt",
+            )
+            .await;
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "slib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pr_B",
+                "only_in_B.tgz",
+            )
+            .await;
+            let _ = seed_package_row(
+                &pool,
+                repo_id,
+                "slib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pr_B",
+                "conaninfo.txt",
+            )
+            .await;
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/slib/1.0/_/_/revisions/rrev/packages/pid/revisions/pr_A/files",
+                repo_key
+            );
+            let (status, body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::OK);
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            let files = json["files"].as_object().expect("files object");
+            assert!(files.contains_key("only_in_A.tgz"));
+            assert!(files.contains_key("conaninfo.txt"));
+            assert!(
+                !files.contains_key("only_in_B.tgz"),
+                "pr_A query must NOT see pr_B's unique file"
+            );
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        // ================================================================
+        // package_file_download
+        // ================================================================
+
+        #[tokio::test]
+        async fn package_file_download_hosted_happy_path() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            // Upload via handler so bytes actually land on disk with matching
+            // storage_key + checksum. Seeded rows use a synthetic checksum.
+            let pkg_bytes = sample_conan_package_tgz();
+            let s = upload_package_file(
+                &state,
+                &auth,
+                &repo_key,
+                "dlib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkgrev",
+                "conan_package.tgz",
+                &pkg_bytes,
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/dlib/1.0/_/_/revisions/rrev/packages/pid/revisions/pkgrev/files/conan_package.tgz",
+                repo_key
+            );
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", basic_auth(&username, "irrelevant"))
+                .body(Body::empty())
+                .expect("build req");
+            let (status, body) = send(app, req).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.as_ref(), pkg_bytes.as_slice());
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_file_download_hosted_missing_file_404() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/miss/1.0/_/_/revisions/r/packages/pid/revisions/pr/files/nope.tgz",
+                repo_key
+            );
+            let (status, _body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_file_download_remote_without_proxy_404() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "remote").await;
+            // `build_state` wires no proxy_service, so remote-type repos
+            // hit the not-found branch guard (state.proxy_service = None).
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/remotelib/1.0/_/_/revisions/r/packages/pid/revisions/pr/files/x.tgz",
+                repo_key
+            );
+            let (status, _body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+
+        #[tokio::test]
+        async fn package_file_download_soft_deleted_returns_404() {
+            let Some(pool) = try_pool().await else {
+                return;
+            };
+            let (user_id, username, _pw) = create_user(&pool).await;
+            let (repo_id, repo_key, storage_dir) = create_conan_repo(&pool, "local").await;
+            let state = build_state(pool.clone(), storage_dir.to_str().unwrap());
+            let auth = make_auth(user_id, &username);
+
+            let s = upload_package_file(
+                &state,
+                &auth,
+                &repo_key,
+                "sdlib",
+                "1.0",
+                "_",
+                "_",
+                "rrev",
+                "pid",
+                "pkgrev",
+                "conan_package.tgz",
+                &sample_conan_package_tgz(),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+
+            sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("soft-delete");
+
+            let app = router_with_auth(state.clone(), auth.clone());
+            let uri = format!(
+                "/{}/v2/conans/sdlib/1.0/_/_/revisions/rrev/packages/pid/revisions/pkgrev/files/conan_package.tgz",
+                repo_key
+            );
+            let (status, _body) = get_json(app, uri, &username).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            cleanup(&pool, repo_id, user_id).await;
+            let _ = std::fs::remove_dir_all(&storage_dir);
+        }
+    }
 }
 
 // ===========================================================================
