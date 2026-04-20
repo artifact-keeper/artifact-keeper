@@ -454,7 +454,8 @@ async fn recipe_revisions(
 
     let rows = sqlx::query!(
         r#"
-        SELECT DISTINCT am.metadata->>'revision' as "revision?", a.created_at
+        SELECT am.metadata->>'revision' as "revision?",
+               MAX(a.created_at) as "created_at!"
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -463,7 +464,8 @@ async fn recipe_revisions(
           AND a.name = $2
           AND a.version = $3
           AND am.metadata->>'revision' IS NOT NULL
-        ORDER BY a.created_at DESC
+        GROUP BY am.metadata->>'revision'
+        ORDER BY "created_at!" DESC
         "#,
         repo.id,
         name,
@@ -928,7 +930,8 @@ async fn package_revisions(
 
     let rows = sqlx::query!(
         r#"
-        SELECT DISTINCT am.metadata->>'packageRevision' as "pkg_revision?", a.created_at
+        SELECT am.metadata->>'packageRevision' as "pkg_revision?",
+               MAX(a.created_at) as "created_at!"
         FROM artifacts a
         JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
@@ -940,7 +943,8 @@ async fn package_revisions(
           AND am.metadata->>'packageId' = $5
           AND am.metadata->>'type' = 'package'
           AND am.metadata->>'packageRevision' IS NOT NULL
-        ORDER BY a.created_at DESC
+        GROUP BY am.metadata->>'packageRevision'
+        ORDER BY "created_at!" DESC
         "#,
         repo.id,
         name,
