@@ -28,6 +28,25 @@ use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/// Maximum model ID length. The `name` column in the artifacts table is
+/// VARCHAR(512). HuggingFace model IDs follow the pattern `org/model-name`,
+/// so 255 characters provides ample room while preventing DB constraint
+/// violations with a clear error message.
+const MAX_MODEL_ID_LEN: usize = 255;
+
+/// Maximum revision length. The `version` column is VARCHAR(255).
+const MAX_REVISION_LEN: usize = 255;
+
+/// Maximum artifact path length. The `path` and `storage_key` columns are
+/// VARCHAR(2048). The storage key adds a `huggingface/` prefix (12 chars),
+/// so the artifact path must stay within 2036 to keep the storage key under
+/// the column limit.
+const MAX_PATH_LEN: usize = 2036;
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -369,6 +388,32 @@ async fn upload_file(
         return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
     }
 
+    // Validate model_id length: the `name` database column is VARCHAR(512)
+    if model_id.len() > MAX_MODEL_ID_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Model ID exceeds maximum length of {} characters (got {})",
+                MAX_MODEL_ID_LEN,
+                model_id.len()
+            ),
+        )
+            .into_response());
+    }
+
+    // Validate revision length: the `version` database column is VARCHAR(255)
+    if revision.len() > MAX_REVISION_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Revision exceeds maximum length of {} characters (got {})",
+                MAX_REVISION_LEN,
+                revision.len()
+            ),
+        )
+            .into_response());
+    }
+
     // Extract filename from Content-Disposition header or default
     let filename = headers
         .get("x-filename")
@@ -387,6 +432,20 @@ async fn upload_file(
         .unwrap_or_else(|| "uploaded_file".to_string());
 
     let artifact_path = format!("{}/{}/{}", model_id, revision, filename);
+
+    // Validate total path length: the `path` database column is VARCHAR(2048)
+    if artifact_path.len() > MAX_PATH_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Artifact path exceeds maximum length of {} characters (got {}). \
+                 Use a shorter model ID, revision, or filename.",
+                MAX_PATH_LEN,
+                artifact_path.len()
+            ),
+        )
+            .into_response());
+    }
 
     // Compute SHA256
     let mut hasher = Sha256::new();
@@ -746,5 +805,71 @@ mod tests {
             upstream_url: Some("https://huggingface.co".to_string()),
         };
         assert_eq!(repo.upstream_url.as_deref(), Some("https://huggingface.co"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Length validation constants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_model_id_within_limit() {
+        let model_id = "a".repeat(MAX_MODEL_ID_LEN);
+        assert!(model_id.len() <= MAX_MODEL_ID_LEN);
+    }
+
+    #[test]
+    fn test_model_id_exceeds_limit() {
+        let model_id = "a".repeat(MAX_MODEL_ID_LEN + 1);
+        assert!(model_id.len() > MAX_MODEL_ID_LEN);
+    }
+
+    #[test]
+    fn test_long_model_id_path_fits_in_db() {
+        // A 255-char model_id with "main" revision and a typical filename
+        // should produce a path under MAX_PATH_LEN.
+        let model_id = "a".repeat(MAX_MODEL_ID_LEN);
+        let revision = "main";
+        let filename = "model.safetensors";
+        let path = format!("{}/{}/{}", model_id, revision, filename);
+        assert!(
+            path.len() <= MAX_PATH_LEN,
+            "path length {} exceeds MAX_PATH_LEN {}",
+            path.len(),
+            MAX_PATH_LEN
+        );
+    }
+
+    #[test]
+    fn test_long_model_id_storage_key_fits_in_db() {
+        // Storage key adds "huggingface/" prefix (12 chars).
+        let model_id = "a".repeat(MAX_MODEL_ID_LEN);
+        let revision = "main";
+        let filename = "model.safetensors";
+        let key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
+        assert!(
+            key.len() <= 2048,
+            "storage_key length {} exceeds VARCHAR(2048)",
+            key.len()
+        );
+    }
+
+    #[test]
+    fn test_revision_within_limit() {
+        let revision = "v".repeat(MAX_REVISION_LEN);
+        assert!(revision.len() <= MAX_REVISION_LEN);
+    }
+
+    #[test]
+    fn test_long_model_name_artifact_path() {
+        // A model name over 100 characters should still produce valid paths.
+        let model_id = "x".repeat(120);
+        assert_eq!(model_id.len(), 120);
+        let path = format!("{}/{}/{}", model_id, "main", "weights.safetensors");
+        assert!(path.len() <= MAX_PATH_LEN);
+        let key = format!(
+            "huggingface/{}/{}/{}",
+            model_id, "main", "weights.safetensors"
+        );
+        assert!(key.len() <= 2048);
     }
 }
