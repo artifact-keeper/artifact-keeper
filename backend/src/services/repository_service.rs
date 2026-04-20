@@ -81,8 +81,68 @@ pub(crate) fn validate_remote_upstream(
 }
 
 /// Derive a format key string from a RepositoryFormat enum.
+///
+/// Returns the canonical snake_case format key matching the database enum
+/// value and the `FormatHandler::format_key()` contract. Using `Debug`
+/// formatting followed by `to_lowercase()` is insufficient because it
+/// drops underscores from multi-word variants (e.g., `CondaNative` becomes
+/// `"condanative"` instead of `"conda_native"`).
 pub(crate) fn derive_format_key(format: &RepositoryFormat) -> String {
-    format!("{:?}", format).to_lowercase()
+    match format {
+        RepositoryFormat::Maven => "maven",
+        RepositoryFormat::Gradle => "gradle",
+        RepositoryFormat::Npm => "npm",
+        RepositoryFormat::Pypi => "pypi",
+        RepositoryFormat::Nuget => "nuget",
+        RepositoryFormat::Go => "go",
+        RepositoryFormat::Rubygems => "rubygems",
+        RepositoryFormat::Docker => "docker",
+        RepositoryFormat::Helm => "helm",
+        RepositoryFormat::Rpm => "rpm",
+        RepositoryFormat::Debian => "debian",
+        RepositoryFormat::Conan => "conan",
+        RepositoryFormat::Cargo => "cargo",
+        RepositoryFormat::Generic => "generic",
+        RepositoryFormat::Podman => "podman",
+        RepositoryFormat::Buildx => "buildx",
+        RepositoryFormat::Oras => "oras",
+        RepositoryFormat::WasmOci => "wasm_oci",
+        RepositoryFormat::HelmOci => "helm_oci",
+        RepositoryFormat::Poetry => "poetry",
+        RepositoryFormat::Conda => "conda",
+        RepositoryFormat::Yarn => "yarn",
+        RepositoryFormat::Bower => "bower",
+        RepositoryFormat::Pnpm => "pnpm",
+        RepositoryFormat::Chocolatey => "chocolatey",
+        RepositoryFormat::Powershell => "powershell",
+        RepositoryFormat::Terraform => "terraform",
+        RepositoryFormat::Opentofu => "opentofu",
+        RepositoryFormat::Alpine => "alpine",
+        RepositoryFormat::CondaNative => "conda_native",
+        RepositoryFormat::Composer => "composer",
+        RepositoryFormat::Hex => "hex",
+        RepositoryFormat::Cocoapods => "cocoapods",
+        RepositoryFormat::Swift => "swift",
+        RepositoryFormat::Pub => "pub",
+        RepositoryFormat::Sbt => "sbt",
+        RepositoryFormat::Chef => "chef",
+        RepositoryFormat::Puppet => "puppet",
+        RepositoryFormat::Ansible => "ansible",
+        RepositoryFormat::Gitlfs => "gitlfs",
+        RepositoryFormat::Vscode => "vscode",
+        RepositoryFormat::Jetbrains => "jetbrains",
+        RepositoryFormat::Huggingface => "huggingface",
+        RepositoryFormat::Mlmodel => "mlmodel",
+        RepositoryFormat::Cran => "cran",
+        RepositoryFormat::Vagrant => "vagrant",
+        RepositoryFormat::Opkg => "opkg",
+        RepositoryFormat::P2 => "p2",
+        RepositoryFormat::Bazel => "bazel",
+        RepositoryFormat::Protobuf => "protobuf",
+        RepositoryFormat::Incus => "incus",
+        RepositoryFormat::Lxc => "lxc",
+    }
+    .to_string()
 }
 
 /// Build a SQL LIKE search pattern from a user query string.
@@ -1045,19 +1105,19 @@ mod tests {
 
     #[test]
     fn test_derive_format_key_wasm_oci() {
-        assert_eq!(derive_format_key(&RepositoryFormat::WasmOci), "wasmoci");
+        assert_eq!(derive_format_key(&RepositoryFormat::WasmOci), "wasm_oci");
     }
 
     #[test]
     fn test_derive_format_key_helm_oci() {
-        assert_eq!(derive_format_key(&RepositoryFormat::HelmOci), "helmoci");
+        assert_eq!(derive_format_key(&RepositoryFormat::HelmOci), "helm_oci");
     }
 
     #[test]
     fn test_derive_format_key_conda_native() {
         assert_eq!(
             derive_format_key(&RepositoryFormat::CondaNative),
-            "condanative"
+            "conda_native"
         );
     }
 
