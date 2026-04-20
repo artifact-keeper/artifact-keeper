@@ -240,7 +240,7 @@ pub fn sort_maven_versions(versions: &[String]) -> Vec<String> {
         .iter()
         .map(|v| (MavenVersion::parse(v), v.clone()))
         .collect();
-    versioned.sort_by(|a, b| a.0.cmp(&b.0));
+    versioned.sort_by_key(|v| v.0.clone());
     versioned.into_iter().map(|(_, v)| v).collect()
 }
 
