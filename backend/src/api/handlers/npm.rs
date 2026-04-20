@@ -3,8 +3,10 @@
 //! Implements the endpoints required for `npm publish` and `npm install`.
 //!
 //! Routes are mounted at `/npm/{repo_key}/...`:
-//!   GET  /npm/{repo_key}/{package}                    - Get package metadata
+//!   GET  /npm/{repo_key}/{package}                    - Get package metadata (packument)
 //!   GET  /npm/{repo_key}/{@scope}/{package}           - Get scoped package metadata
+//!   GET  /npm/{repo_key}/{package}/{version}          - Get version-specific metadata
+//!   GET  /npm/{repo_key}/{@scope}/{package}/{version} - Get scoped version-specific metadata
 //!   GET  /npm/{repo_key}/{package}/-/{filename}       - Download tarball
 //!   GET  /npm/{repo_key}/{@scope}/{package}/-/{filename} - Download scoped tarball
 //!   PUT  /npm/{repo_key}/{package}                    - Publish package
@@ -42,6 +44,11 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/@:scope/:package/-/:filename",
             get(download_scoped_tarball),
         )
+        // Scoped version metadata: GET /npm/{repo_key}/@{scope}/{package}/{version}
+        .route(
+            "/:repo_key/@:scope/:package/:version",
+            get(get_scoped_version_metadata),
+        )
         // Scoped package metadata / publish: GET/PUT /npm/{repo_key}/@{scope}/{package}
         .route(
             "/:repo_key/@:scope/:package",
@@ -49,6 +56,8 @@ pub fn router() -> Router<SharedState> {
         )
         // Unscoped package tarball: GET /npm/{repo_key}/{package}/-/{filename}
         .route("/:repo_key/:package/-/:filename", get(download_tarball))
+        // Unscoped version metadata: GET /npm/{repo_key}/{package}/{version}
+        .route("/:repo_key/:package/:version", get(get_version_metadata))
         // Unscoped package metadata / publish: GET/PUT /npm/{repo_key}/{package}
         .route("/:repo_key/:package", get(get_metadata).put(publish))
 }
@@ -181,6 +190,28 @@ async fn get_scoped_metadata(
     let full_name = format!("@{}/{}", scope, package);
     validate_package_name(&full_name)?;
     get_package_metadata(&state, &repo_key, &full_name, &headers).await
+}
+
+async fn get_version_metadata(
+    State(state): State<SharedState>,
+    Path((repo_key, package, version)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let package = normalize_package_name(&package);
+    validate_package_name(&package)?;
+    get_package_version_metadata(&state, &repo_key, &package, &version, &headers).await
+}
+
+async fn get_scoped_version_metadata(
+    State(state): State<SharedState>,
+    Path((repo_key, scope, package, version)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Response> {
+    let scope = normalize_package_name(&scope);
+    let package = normalize_package_name(&package);
+    let full_name = format!("@{}/{}", scope, package);
+    validate_package_name(&full_name)?;
+    get_package_version_metadata(&state, &repo_key, &full_name, &version, &headers).await
 }
 
 /// Minimal artifact info needed to construct npm package metadata.
@@ -426,6 +457,163 @@ async fn get_package_metadata(
     }
 
     build_npm_metadata_response(&meta_artifacts, package_name, &base_url, repo_key)
+}
+
+/// Fetch the full packument and extract a single version's metadata.
+///
+/// For remote and virtual repos the full packument is fetched from upstream
+/// (or the first matching member) and parsed as JSON. For local/staging repos
+/// the packument is built from stored artifacts. In either case the
+/// `versions[version]` object is extracted and returned. Returns 404 when
+/// the package exists but does not contain the requested version.
+async fn get_package_version_metadata(
+    state: &SharedState,
+    repo_key: &str,
+    package_name: &str,
+    version: &str,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let base_url = proxy_helpers::request_base_url(headers);
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+
+    // Build or fetch the full packument as a JSON value.
+    let packument: serde_json::Value = if repo.repo_type == RepositoryType::Remote {
+        fetch_remote_packument(state, &repo, repo_key, package_name, &base_url).await?
+    } else if repo.repo_type == RepositoryType::Virtual {
+        fetch_virtual_packument(state, &repo, repo_key, package_name, &base_url).await?
+    } else {
+        let artifacts = fetch_npm_artifacts(&state.db, repo.id, package_name).await?;
+        if artifacts.is_empty() {
+            return Err(AppError::NotFound("Package not found".to_string()).into_response());
+        }
+        let resp = build_npm_metadata_response(&artifacts, package_name, &base_url, repo_key)?;
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to read packument body: {}", e)).into_response()
+            })?;
+        serde_json::from_slice(&body_bytes).map_err(|e| {
+            AppError::Internal(format!("Failed to parse packument JSON: {}", e)).into_response()
+        })?
+    };
+
+    // Extract the requested version from the packument.
+    let version_obj = packument
+        .get("versions")
+        .and_then(|v| v.get(version))
+        .cloned()
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "Version '{}' not found for package '{}'",
+                version, package_name
+            ))
+            .into_response()
+        })?;
+
+    Ok(build_json_metadata_response(
+        serde_json::to_string(&version_obj).unwrap(),
+    ))
+}
+
+/// Fetch the full packument JSON from a remote repository's upstream.
+async fn fetch_remote_packument(
+    state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+) -> Result<serde_json::Value, Response> {
+    let upstream_url = repo
+        .upstream_url
+        .as_deref()
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
+    let proxy = state
+        .proxy_service
+        .as_ref()
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    let (content, _ct) =
+        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &encoded_name).await?;
+    let mut json: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
+        AppError::Internal(format!("Invalid JSON from upstream: {}", e)).into_response()
+    })?;
+    rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+    Ok(json)
+}
+
+/// Fetch the full packument JSON by iterating virtual repo members.
+async fn fetch_virtual_packument(
+    state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+) -> Result<serde_json::Value, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+    if members.is_empty() {
+        return Err(
+            AppError::NotFound("Virtual repository has no members".to_string()).into_response(),
+        );
+    }
+
+    for member in &members {
+        if member.repo_type == RepositoryType::Local || member.repo_type == RepositoryType::Staging
+        {
+            let meta = fetch_npm_artifacts(&state.db, member.id, package_name).await?;
+            if !meta.is_empty() {
+                let resp = build_npm_metadata_response(&meta, package_name, base_url, repo_key)?;
+                let body_bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!("Failed to read packument body: {}", e))
+                            .into_response()
+                    })?;
+                return serde_json::from_slice(&body_bytes).map_err(|e| {
+                    AppError::Internal(format!("Failed to parse packument JSON: {}", e))
+                        .into_response()
+                });
+            }
+            continue;
+        }
+
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let Some(ref upstream_url) = member.upstream_url else {
+            continue;
+        };
+        let Some(ref proxy) = state.proxy_service else {
+            continue;
+        };
+
+        let encoded_name = encode_package_name_for_upstream(package_name);
+        let result =
+            proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, &encoded_name)
+                .await;
+
+        match result {
+            Ok((content, _ct)) => {
+                let mut json: serde_json::Value =
+                    serde_json::from_slice(&content).map_err(|e| {
+                        AppError::Internal(format!("Invalid JSON from upstream: {}", e))
+                            .into_response()
+                    })?;
+                rewrite_npm_tarball_urls(&mut json, base_url, repo_key);
+                return Ok(json);
+            }
+            Err(_e) => {
+                debug!(
+                    member_key = %member.key,
+                    "npm metadata proxy fetch missed for virtual member"
+                );
+            }
+        }
+    }
+
+    Err(
+        AppError::NotFound("Package not found in any member repository".to_string())
+            .into_response(),
+    )
 }
 
 /// Content type for npm tarballs (.tgz). npm packages are always gzip-compressed
