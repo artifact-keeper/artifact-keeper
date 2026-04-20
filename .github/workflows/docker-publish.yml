@@ -79,6 +79,7 @@ jobs:
           provenance: mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       - name: Export digest
         run: |
@@ -213,6 +214,7 @@ jobs:
           provenance: mode=max
           build-args: |
             GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
       - name: Export digest
         run: |

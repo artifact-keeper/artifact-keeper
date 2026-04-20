@@ -43,9 +43,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
 ARG GIT_SHA=unknown
+ARG APP_VERSION=""
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
-RUN cargo build --release --bin artifact-keeper
+RUN if [ -n "${APP_VERSION}" ]; then \
+      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
+      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
+    fi && \
+    cargo build --release --bin artifact-keeper
 
 # ---------- Stage 4: Build minimal rootfs ----------
 FROM registry.access.redhat.com/ubi9/ubi:9.7 AS rootfs-builder

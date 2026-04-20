@@ -111,6 +111,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Set version from tag
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Setting workspace version to ${VERSION}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          head -5 Cargo.toml
+
       - name: Build
         env:
           SQLX_OFFLINE: true
