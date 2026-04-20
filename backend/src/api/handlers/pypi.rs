@@ -56,6 +56,39 @@ pub fn router() -> Router<SharedState> {
 }
 
 // ---------------------------------------------------------------------------
+// PEP 503 name normalization
+// ---------------------------------------------------------------------------
+
+/// Normalize a package name per PEP 503: lowercase, and replace any run of
+/// `[-_.]` characters with a single hyphen.
+fn normalize_pep503(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut last_was_sep = true;
+
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            result.push(c.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if c == '-' || c == '_' || c == '.' {
+            if !last_was_sep {
+                result.push('-');
+                last_was_sep = true;
+            }
+        } else {
+            // Keep other characters as-is (digits, etc.)
+            result.push(c);
+            last_was_sep = false;
+        }
+    }
+
+    if result.ends_with('-') {
+        result.pop();
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Internal struct used to decouple DB query results from response rendering.
 // ---------------------------------------------------------------------------
 
@@ -86,23 +119,26 @@ async fn simple_root(
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
 
-    // Get all distinct normalized package names in this repository
-    let mut packages: Vec<String> = sqlx::query_scalar!(
+    // Get all distinct package names in this repository, then normalize
+    // them in Rust per PEP 503 (the SQL REPLACE chain is only approximate).
+    let raw_names: Vec<String> = sqlx::query_scalar!(
         r#"
-        SELECT DISTINCT
-            LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-'))
+        SELECT DISTINCT name
         FROM artifacts
         WHERE repository_id = $1 AND is_deleted = false
-        ORDER BY 1
         "#,
         repo.id
     )
     .fetch_all(&state.db)
     .await
-    .map_err(map_db_err)?
-    .into_iter()
-    .flatten()
-    .collect();
+    .map_err(map_db_err)?;
+
+    let mut packages: Vec<String> = raw_names
+        .iter()
+        .map(|n| normalize_pep503(n))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     // Virtual repos have no artifacts of their own. Aggregate package names
     // from all member repos so that the root index lists every package
@@ -115,24 +151,19 @@ async fn simple_root(
             if member.repo_type == RepositoryType::Local
                 || member.repo_type == RepositoryType::Staging
             {
-                let member_packages: Vec<String> = sqlx::query_scalar!(
+                let member_raw: Vec<String> = sqlx::query_scalar!(
                     r#"
-        SELECT DISTINCT
-            LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-'))
+        SELECT DISTINCT name
         FROM artifacts
         WHERE repository_id = $1 AND is_deleted = false
-        ORDER BY 1
         "#,
                     member.id
                 )
                 .fetch_all(&state.db)
                 .await
-                .map_err(map_db_err)?
-                .into_iter()
-                .flatten()
-                .collect();
+                .map_err(map_db_err)?;
 
-                merged.extend(member_packages);
+                merged.extend(member_raw.iter().map(|n| normalize_pep503(n)));
             }
             // Remote member proxying for the root index is intentionally
             // skipped: the upstream /simple/ can be very large and slow.
@@ -182,10 +213,9 @@ fn build_simple_root_response(
     );
 
     for package in packages {
-        let normalized = PypiHandler::normalize_name(package);
         html.push_str(&format!(
             "<a href=\"/pypi/{}/simple/{}/\">{}</a><br/>\n",
-            repo_key, normalized, package
+            repo_key, package, package
         ));
     }
     html.push_str("</body>\n</html>\n");
@@ -207,7 +237,7 @@ async fn simple_project(
     headers: HeaderMap,
 ) -> Result<Response, Response> {
     let repo = resolve_pypi_repo(&state.db, &repo_key).await?;
-    let normalized = PypiHandler::normalize_name(&project);
+    let normalized = normalize_pep503(&project);
 
     // Find all artifacts that belong to this package.
     // We normalize the name for matching: replace [_.-]+ with - then lowercase.
@@ -1326,6 +1356,64 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // normalize_pep503
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_pep503_lowercase() {
+        assert_eq!(normalize_pep503("MyPackage"), "mypackage");
+    }
+
+    #[test]
+    fn test_normalize_pep503_underscores_to_hyphen() {
+        assert_eq!(normalize_pep503("my_package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_dots_to_hyphen() {
+        assert_eq!(normalize_pep503("my.package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_mixed_separators() {
+        assert_eq!(normalize_pep503("My_Package.Name"), "my-package-name");
+    }
+
+    #[test]
+    fn test_normalize_pep503_consecutive_separators() {
+        assert_eq!(normalize_pep503("my__package"), "my-package");
+        assert_eq!(normalize_pep503("my_._package"), "my-package");
+        assert_eq!(normalize_pep503("my--package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_already_normalized() {
+        assert_eq!(normalize_pep503("my-package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_trailing_separator() {
+        assert_eq!(normalize_pep503("my-package_"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_pep503_leading_separator() {
+        // Leading separators are collapsed and skipped
+        assert_eq!(normalize_pep503("_mypackage"), "mypackage");
+    }
+
+    #[test]
+    fn test_normalize_pep503_real_world_names() {
+        assert_eq!(normalize_pep503("Jinja2"), "jinja2");
+        assert_eq!(normalize_pep503("zope.interface"), "zope-interface");
+        assert_eq!(normalize_pep503("ruamel.yaml"), "ruamel-yaml");
+        assert_eq!(
+            normalize_pep503("backports.ssl_match_hostname"),
+            "backports-ssl-match-hostname"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // html_escape

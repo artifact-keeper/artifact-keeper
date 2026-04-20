@@ -120,6 +120,13 @@ async fn list_releases(
         )
     })?;
 
+    if artifacts.is_empty() {
+        return Err(swift_error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Package {}.{} not found", scope, name),
+        ));
+    }
+
     // Build releases object: version -> { url }
     let mut releases = serde_json::Map::new();
     for artifact in &artifacts {
