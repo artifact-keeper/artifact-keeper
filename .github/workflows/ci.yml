@@ -163,13 +163,86 @@ jobs:
           echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} lines)"
 
           if [ "$PCT" -lt 70 ]; then
-            echo "::warning::New code coverage is ${PCT}%, below 70% threshold"
+            echo "::error::New code coverage is ${PCT}%, below 70% threshold"
             echo "Coverage on changed files is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
-            # Warn but don't fail for now - uncomment to enforce:
-            # exit 1
+            exit 1
+          fi
+
+      - name: Setup Node.js for jscpd
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Code duplication gate
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          # Install jscpd (copy-paste detector, same approach as SonarCloud's CPD engine)
+          npm install -g jscpd@4 --silent
+
+          # Get changed .rs files
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }} 2>/dev/null || true
+          CHANGED_RS=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
+
+          if [ -z "$CHANGED_RS" ]; then
+            echo "No .rs source files changed, skipping duplication check"
+            echo "### Code Duplication: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Write changed files to a list for jscpd
+          echo "$CHANGED_RS" > /tmp/changed-files.txt
+
+          # Run jscpd on changed files only (min 10 lines, threshold 3%)
+          RESULT=$(jscpd --min-lines 10 --threshold 3 --reporters json \
+            --format rust --output /tmp/jscpd-report \
+            $(echo "$CHANGED_RS" | tr '\n' ' ') 2>&1) || true
+
+          # Parse results
+          if [ -f /tmp/jscpd-report/jscpd-report.json ]; then
+            DUP_PCT=$(python3 -c "
+          import json
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          stats = data.get('statistics', {})
+          total = stats.get('total', {})
+          pct = total.get('percentage', 0)
+          dups = total.get('duplicatedLines', 0)
+          lines = total.get('lines', 0)
+          clones = len(data.get('duplicates', []))
+          print(f'{pct:.1f} {dups} {lines} {clones}')
+          " 2>/dev/null) || DUP_PCT="0.0 0 0 0"
+
+            PCT=$(echo "$DUP_PCT" | awk '{print $1}')
+            DUP_LINES=$(echo "$DUP_PCT" | awk '{print $2}')
+            TOTAL_LINES=$(echo "$DUP_PCT" | awk '{print $3}')
+            CLONES=$(echo "$DUP_PCT" | awk '{print $4}')
+
+            echo "### Code Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)" >> $GITHUB_STEP_SUMMARY
+            echo "Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)"
+
+            # Fail if duplication exceeds 3%
+            OVER=$(python3 -c "print('yes' if float('${PCT}') > 3.0 else 'no')")
+            if [ "$OVER" = "yes" ]; then
+              echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
+
+              # Show the duplicate blocks
+              python3 -c "
+          import json
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          for d in data.get('duplicates', []):
+              fa = d['firstFile']
+              sa = d['secondFile']
+              print(f\"  {fa['name']}:{fa['startLoc']['line']}-{fa['endLoc']['line']} <-> {sa['name']}:{sa['startLoc']['line']}-{sa['endLoc']['line']}\")
+          " 2>/dev/null || true
+
+              exit 1
+            fi
+          else
+            echo "### Code Duplication: 0% (no duplicates found)" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Upload coverage artifact
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: lcov-coverage
