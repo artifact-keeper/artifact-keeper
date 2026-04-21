@@ -136,7 +136,7 @@ RUN if [ -f /mnt/rootfs/etc/dnf/dnf.conf ]; then \
 RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 
 # ---------- Stage 5: Copy scanner CLIs from official images ----------
-FROM ghcr.io/aquasecurity/trivy:0.69.3 AS trivy-bin
+FROM ghcr.io/aquasecurity/trivy:0.70.0 AS trivy-bin
 FROM ghcr.io/anchore/grype:v0.111.0 AS grype-bin
 
 # ---------- Stage 6: UBI 9 Micro runtime ----------
