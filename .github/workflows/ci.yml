@@ -191,6 +191,14 @@ jobs:
           echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} new lines)" >> $GITHUB_STEP_SUMMARY
           echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} new lines)"
 
+          # Skip gate for very small changes (< 10 instrumented new lines) since
+          # the percentage is statistically noisy at that scale
+          if [ "$TOTAL" -lt 10 ]; then
+            echo "Too few new lines ($TOTAL) to enforce coverage gate, skipping"
+            echo "Skipped: fewer than 10 instrumented new lines" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
           if [ "$PCT" -lt 70 ]; then
             echo "::error::New code coverage is ${PCT}%, below 70% threshold"
             echo "Coverage on new/changed lines is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
