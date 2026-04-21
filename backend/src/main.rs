@@ -363,7 +363,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
     let scan_config_service = Arc::new(ScanConfigService::new(db_pool.clone()));
-    let scanner_service = Arc::new(ScannerService::new(
+    let mut scanner_service = ScannerService::new(
         db_pool.clone(),
         advisory_client,
         scan_result_service,
@@ -375,7 +375,28 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         config.scan_workspace_path.clone(),
         config.openscap_url.clone(),
         config.openscap_profile.clone(),
-    ));
+    );
+
+    // Initialize Dependency-Track integration (before wrapping scanner in Arc,
+    // so we can wire the DT service into the scan pipeline for SBOM submission).
+    let dt_service_arc: Option<Arc<DependencyTrackService>> =
+        match DependencyTrackService::from_env() {
+            Some(Ok(dt_service)) => {
+                tracing::info!("Dependency-Track integration enabled");
+                Some(Arc::new(dt_service))
+            }
+            Some(Err(e)) => {
+                tracing::warn!("Failed to initialize Dependency-Track: {}", e);
+                None
+            }
+            None => None,
+        };
+
+    if let Some(ref dt) = dt_service_arc {
+        scanner_service.set_dependency_track(dt.clone());
+    }
+
+    let scanner_service = Arc::new(scanner_service);
 
     // Create application state with WASM plugin support
     let scheduler_storage = primary_storage.clone();
@@ -399,17 +420,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let Some(meili) = meili_service {
         app_state.set_meili_service(meili);
     }
-    // Initialize Dependency-Track integration
-    if let Some(dt_result) = DependencyTrackService::from_env() {
-        match dt_result {
-            Ok(dt_service) => {
-                tracing::info!("Dependency-Track integration enabled");
-                app_state.set_dependency_track(Arc::new(dt_service));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize Dependency-Track: {}", e);
-            }
-        }
+    if let Some(dt) = dt_service_arc {
+        app_state.set_dependency_track(dt);
     }
 
     app_state.set_metrics_handle(metrics_handle);

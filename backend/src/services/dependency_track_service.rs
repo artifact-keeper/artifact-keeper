@@ -20,6 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+use url::Url;
 use utoipa::ToSchema;
 
 use crate::error::{AppError, Result};
@@ -349,17 +350,92 @@ pub struct DtAnalysisResponse {
     pub is_suppressed: bool,
 }
 
+/// Check whether a URL points to a private or local network address where
+/// HTTP (non-TLS) is acceptable. This covers:
+///
+/// - `localhost` / `127.0.0.0/8` / `::1`
+/// - RFC 1918 private ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+/// - Link-local: `169.254.0.0/16`, `fe80::/10`
+/// - Kubernetes service DNS: `*.svc`, `*.svc.cluster.local`
+/// - mDNS / local domains: `*.local`
+///
+/// Returns `false` for URLs that cannot be parsed or have no host component.
+pub fn is_private_network_url(raw_url: &str) -> bool {
+    let parsed = match Url::parse(raw_url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+
+    let host = match parsed.host() {
+        Some(h) => h,
+        None => return false,
+    };
+
+    // Check IP-based hosts using the parsed Host enum, which handles
+    // IPv6 bracket notation (e.g. [::1]) correctly.
+    match host {
+        url::Host::Ipv4(v4) => {
+            return v4.is_loopback()        // 127.0.0.0/8
+                || v4.is_private()         // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()      // 169.254/16
+                || v4.is_unspecified(); // 0.0.0.0
+        }
+        url::Host::Ipv6(v6) => {
+            return v6.is_loopback()        // ::1
+                || v6.is_unspecified()     // ::
+                // fe80::/10 (link-local) -- no stable std method yet
+                || (v6.segments()[0] & 0xffc0) == 0xfe80;
+        }
+        url::Host::Domain(_) => {}
+    }
+
+    // Check hostname-based patterns
+    let host_lower = parsed.host_str().unwrap_or("").to_lowercase();
+
+    if host_lower == "localhost" {
+        return true;
+    }
+
+    // Kubernetes in-cluster service names (e.g. dependency-track.ns.svc.cluster.local)
+    if host_lower.ends_with(".svc") || host_lower.ends_with(".svc.cluster.local") {
+        return true;
+    }
+
+    // mDNS / local domains
+    if host_lower.ends_with(".local") {
+        return true;
+    }
+
+    false
+}
+
 impl DependencyTrackService {
     /// Create a new Dependency-Track service
     pub fn new(config: DependencyTrackConfig) -> Result<Self> {
-        // Enforce HTTPS unless explicitly opted out for local dev
-        let allow_http = std::env::var("ALLOW_HTTP_INTEGRATIONS")
+        // Determine whether HTTP (non-TLS) is acceptable for this URL.
+        //
+        // Priority:
+        //   1. Explicit opt-in via ALLOW_HTTP_INTEGRATIONS=1
+        //   2. Auto-allow for private/local network addresses (localhost,
+        //      RFC 1918, *.svc.cluster.local, *.local)
+        //   3. Default: require HTTPS
+        let explicit_allow_http = std::env::var("ALLOW_HTTP_INTEGRATIONS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
+
+        let is_private = is_private_network_url(&config.base_url);
+        let allow_http = explicit_allow_http || is_private;
+
         if !allow_http && !config.base_url.starts_with("https://") {
             warn!(
                 url = %config.base_url,
-                "Dependency-Track base_url is not HTTPS. Set ALLOW_HTTP_INTEGRATIONS=1 for local dev."
+                "Dependency-Track base_url is not HTTPS and not a private network address. \
+                 Set ALLOW_HTTP_INTEGRATIONS=1 to allow plain HTTP connections."
+            );
+        } else if is_private && !config.base_url.starts_with("https://") && !explicit_allow_http {
+            info!(
+                url = %config.base_url,
+                "Dependency-Track base_url is HTTP on a private network address, allowing automatically"
             );
         }
 
@@ -1617,6 +1693,98 @@ mod tests {
         assert_eq!(json["analysisState"], "NOT_AFFECTED");
         assert!(json.get("analysisDetails").is_none());
         assert_eq!(json["isSuppressed"], true);
+    }
+
+    // ===================================================================
+    // is_private_network_url
+    // ===================================================================
+
+    #[test]
+    fn test_private_url_localhost() {
+        assert!(is_private_network_url("http://localhost:8080"));
+        assert!(is_private_network_url("http://localhost"));
+        assert!(is_private_network_url("https://localhost:443/api"));
+    }
+
+    #[test]
+    fn test_private_url_loopback_ipv4() {
+        assert!(is_private_network_url("http://127.0.0.1:8092"));
+        assert!(is_private_network_url("http://127.0.0.1"));
+        assert!(is_private_network_url("http://127.255.255.255:80"));
+    }
+
+    #[test]
+    fn test_private_url_loopback_ipv6() {
+        assert!(is_private_network_url("http://[::1]:8080"));
+        assert!(is_private_network_url("http://[::1]"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_a() {
+        assert!(is_private_network_url("http://10.0.0.1:8080"));
+        assert!(is_private_network_url("http://10.255.255.255"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_b() {
+        assert!(is_private_network_url("http://172.16.0.1:8080"));
+        assert!(is_private_network_url("http://172.31.255.255"));
+        // 172.32.x.x is NOT private
+        assert!(!is_private_network_url("http://172.32.0.1:8080"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_c() {
+        assert!(is_private_network_url("http://192.168.0.1:8080"));
+        assert!(is_private_network_url("http://192.168.255.255"));
+    }
+
+    #[test]
+    fn test_private_url_link_local() {
+        assert!(is_private_network_url("http://169.254.1.1:8080"));
+    }
+
+    #[test]
+    fn test_private_url_kubernetes_svc() {
+        assert!(is_private_network_url(
+            "http://dependency-track.default.svc.cluster.local:8080"
+        ));
+        assert!(is_private_network_url("http://dt-api.ns.svc:8080"));
+        assert!(is_private_network_url(
+            "http://my-service.monitoring.svc.cluster.local"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_local_domain() {
+        assert!(is_private_network_url("http://dt.local:8080"));
+        assert!(is_private_network_url("http://myhost.local"));
+    }
+
+    #[test]
+    fn test_private_url_unspecified() {
+        assert!(is_private_network_url("http://0.0.0.0:8080"));
+    }
+
+    #[test]
+    fn test_public_url_rejected() {
+        assert!(!is_private_network_url("http://dt.example.com:8080"));
+        assert!(!is_private_network_url("http://8.8.8.8:8080"));
+        assert!(!is_private_network_url(
+            "https://dependency-track.prod.company.com"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_invalid_input() {
+        assert!(!is_private_network_url("not-a-url"));
+        assert!(!is_private_network_url(""));
+        assert!(!is_private_network_url("://missing-scheme"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_link_local() {
+        assert!(is_private_network_url("http://[fe80::1]:8080"));
     }
 
     // ===================================================================

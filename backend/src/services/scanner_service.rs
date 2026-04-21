@@ -1084,6 +1084,8 @@ pub struct ScannerService {
     #[allow(dead_code)]
     storage_base_path: String,
     scan_workspace_path: String,
+    dependency_track:
+        Option<Arc<crate::services::dependency_track_service::DependencyTrackService>>,
 }
 
 impl ScannerService {
@@ -1146,7 +1148,16 @@ impl ScannerService {
             storage_registry,
             storage_base_path,
             scan_workspace_path,
+            dependency_track: None,
         }
+    }
+
+    /// Set the Dependency-Track service for SBOM submission after scans.
+    pub fn set_dependency_track(
+        &mut self,
+        dt: Arc<crate::services::dependency_track_service::DependencyTrackService>,
+    ) {
+        self.dependency_track = Some(dt);
     }
 
     /// Scan a single artifact: run all applicable scanners, persist results,
@@ -1331,7 +1342,155 @@ impl ScannerService {
             .recalculate_score(artifact.repository_id)
             .await?;
 
+        // Submit SBOM to Dependency-Track if integration is configured.
+        // This generates a CycloneDX SBOM from scan findings and uploads it
+        // to the corresponding DT project, closing the gap where scans
+        // completed but SBOMs were never forwarded to DT.
+        if let Some(ref dt) = self.dependency_track {
+            self.submit_sbom_to_dependency_track(dt, &artifact).await;
+        }
+
         Ok(())
+    }
+
+    /// Generate a CycloneDX SBOM from scan findings for the given artifact and
+    /// submit it to Dependency-Track. Errors are logged but do not fail the
+    /// scan pipeline, since DT submission is best-effort.
+    async fn submit_sbom_to_dependency_track(
+        &self,
+        dt: &crate::services::dependency_track_service::DependencyTrackService,
+        artifact: &Artifact,
+    ) {
+        use crate::models::sbom::SbomFormat;
+        use crate::services::sbom_service::{DependencyInfo, SbomService};
+
+        // Fetch repository name for the DT project
+        let repo_name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM repositories WHERE id = $1")
+                .bind(artifact.repository_id)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten();
+
+        let project_name = repo_name.unwrap_or_else(|| artifact.repository_id.to_string());
+
+        // Fetch scan findings to build dependency info for the SBOM.
+        // The scan_findings table stores affected components in the
+        // `affected_component` and `affected_version` columns.
+        let findings_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT f.affected_component, f.affected_version, f.source
+            FROM scan_findings f
+            JOIN scan_results sr ON f.scan_result_id = sr.id
+            WHERE sr.artifact_id = $1
+              AND f.affected_component IS NOT NULL
+              AND f.affected_component != ''
+            "#,
+        )
+        .bind(artifact.id)
+        .fetch_all(&self.db)
+        .await
+        .unwrap_or_default();
+
+        let deps: Vec<DependencyInfo> = findings_rows
+            .into_iter()
+            .map(|(name, version, _source)| {
+                let purl = version
+                    .as_deref()
+                    .map(|v| format!("pkg:generic/{}@{}", name, v));
+                DependencyInfo {
+                    name,
+                    version,
+                    purl,
+                    license: None,
+                    sha256: None,
+                }
+            })
+            .collect();
+
+        if deps.is_empty() {
+            info!(
+                artifact_id = %artifact.id,
+                "No scan findings with package info, skipping Dependency-Track SBOM submission"
+            );
+            return;
+        }
+
+        // Generate the CycloneDX SBOM
+        let sbom_service = SbomService::new(self.db.clone());
+        let sbom_doc = match sbom_service
+            .generate_sbom(
+                artifact.id,
+                artifact.repository_id,
+                SbomFormat::CycloneDX,
+                deps,
+            )
+            .await
+        {
+            Ok(doc) => doc,
+            Err(e) => {
+                warn!(
+                    artifact_id = %artifact.id,
+                    error = %e,
+                    "Failed to generate CycloneDX SBOM for Dependency-Track submission"
+                );
+                return;
+            }
+        };
+
+        // Extract the SBOM content as a string for DT upload
+        let sbom_content = match serde_json::to_string(&sbom_doc.content) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    artifact_id = %artifact.id,
+                    error = %e,
+                    "Failed to serialize SBOM content for Dependency-Track"
+                );
+                return;
+            }
+        };
+
+        // Get or create the DT project
+        let dt_project = match dt
+            .get_or_create_project(
+                &project_name,
+                artifact.version.as_deref(),
+                Some(&format!("Artifact: {}", artifact.name)),
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    artifact_id = %artifact.id,
+                    error = %e,
+                    "Failed to get or create Dependency-Track project"
+                );
+                return;
+            }
+        };
+
+        // Upload the SBOM
+        match dt.upload_sbom(&dt_project.uuid, &sbom_content).await {
+            Ok(upload_resp) => {
+                info!(
+                    artifact_id = %artifact.id,
+                    dt_project = %dt_project.name,
+                    dt_token = %upload_resp.token,
+                    components = sbom_doc.component_count,
+                    "Submitted SBOM to Dependency-Track"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    artifact_id = %artifact.id,
+                    error = %e,
+                    "Failed to upload SBOM to Dependency-Track"
+                );
+            }
+        }
     }
 
     /// Scan a single artifact (respects repo scan-enabled config).
