@@ -17,6 +17,10 @@
 //!   POST ?delete (default: false). Required for providers that do not implement
 //!   the S3 DeleteObjects API, such as Huawei Cloud OBS.
 //!
+//! For HTTP connection pool tuning:
+//! - S3_POOL_MAX_IDLE_PER_HOST: Maximum idle connections per host (default: 256)
+//! - S3_POOL_IDLE_TIMEOUT_SECS: Idle connection timeout in seconds (default: 90)
+//!
 //! For redirect downloads (302 to presigned URLs):
 //! - S3_REDIRECT_DOWNLOADS: Enable 302 redirects (default: false)
 //! - S3_PRESIGN_EXPIRY_SECS: URL expiry in seconds (default: 3600)
@@ -76,6 +80,14 @@ pub struct S3Config {
     /// API (POST ?delete). Some S3-compatible providers (e.g. Huawei Cloud OBS)
     /// do not implement DeleteObjects and return 405 Method Not Allowed.
     pub disable_multi_delete: bool,
+    /// Maximum number of idle connections kept per host in the HTTP connection
+    /// pool used by the S3 client. Higher values reduce TLS handshake overhead
+    /// under high concurrency. Default: 256.
+    pub pool_max_idle_per_host: usize,
+    /// Idle timeout in seconds for pooled HTTP connections. Connections idle
+    /// longer than this are closed. Default: 90 seconds (matches hyper/reqwest
+    /// defaults).
+    pub pool_idle_timeout_secs: u64,
 }
 
 /// CloudFront CDN configuration for signed URLs
@@ -124,6 +136,14 @@ impl S3Config {
         let disable_multi_delete = std::env::var("S3_DISABLE_MULTI_DELETE")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
+        let pool_max_idle_per_host: usize = std::env::var("S3_POOL_MAX_IDLE_PER_HOST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+        let pool_idle_timeout_secs: u64 = std::env::var("S3_POOL_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
 
         Ok(Self {
             bucket,
@@ -139,6 +159,8 @@ impl S3Config {
             ca_cert_path,
             insecure_tls,
             disable_multi_delete,
+            pool_max_idle_per_host,
+            pool_idle_timeout_secs,
         })
     }
 
@@ -200,6 +222,8 @@ impl S3Config {
             ca_cert_path: None,
             insecure_tls: false,
             disable_multi_delete: false,
+            pool_max_idle_per_host: 256,
+            pool_idle_timeout_secs: 90,
         }
     }
 
@@ -239,6 +263,16 @@ impl S3Config {
 
     pub fn with_disable_multi_delete(mut self, disable: bool) -> Self {
         self.disable_multi_delete = disable;
+        self
+    }
+
+    pub fn with_pool_max_idle_per_host(mut self, max_idle: usize) -> Self {
+        self.pool_max_idle_per_host = max_idle;
+        self
+    }
+
+    pub fn with_pool_idle_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.pool_idle_timeout_secs = timeout_secs;
         self
     }
 }
@@ -299,7 +333,9 @@ impl S3Backend {
         access_key: Option<&str>,
         secret_key: Option<&str>,
     ) -> Result<AmazonS3> {
-        let mut client_opts = object_store::ClientOptions::new();
+        let mut client_opts = object_store::ClientOptions::new()
+            .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
 
         if config
             .endpoint
