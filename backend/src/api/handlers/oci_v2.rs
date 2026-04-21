@@ -62,14 +62,24 @@ fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
         .unwrap()
 }
 
-fn www_authenticate_header(host: &str) -> String {
-    format!(
-        "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\"",
-        host
-    )
+fn www_authenticate_header(host: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(s) => format!(
+            "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\",scope=\"{}\"",
+            host, s
+        ),
+        None => format!(
+            "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\"",
+            host
+        ),
+    }
 }
 
 fn unauthorized_challenge(host: &str) -> Response {
+    unauthorized_challenge_with_scope(host, None)
+}
+
+fn unauthorized_challenge_with_scope(host: &str, scope: Option<&str>) -> Response {
     let body = OciErrorResponse {
         errors: vec![OciErrorEntry {
             code: "UNAUTHORIZED".to_string(),
@@ -80,7 +90,7 @@ fn unauthorized_challenge(host: &str) -> Response {
     let json = serde_json::to_string(&body).unwrap_or_default();
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", www_authenticate_header(host))
+        .header("WWW-Authenticate", www_authenticate_header(host, scope))
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(json))
         .unwrap()
@@ -132,6 +142,91 @@ fn validate_token(
     let token = extract_bearer_token(headers).ok_or(())?;
     let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
     auth_service.validate_access_token(&token).map_err(|_| ())
+}
+
+/// Credential extracted from an OCI request's Authorization header.
+///
+/// `Bearer` carries a JWT token (the standard OCI token-exchange flow).
+/// `Basic` carries username + password/api-token (curl, CI runners, HTTP
+/// clients that skip the token exchange).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OciCredential {
+    Bearer(String),
+    Basic { username: String, password: String },
+}
+
+/// Parse the Authorization header into an [`OciCredential`].
+///
+/// Returns `None` when the header is missing, empty, or uses an unsupported
+/// scheme.  Bearer is tried first so that a valid JWT is never accidentally
+/// interpreted as a base64-encoded Basic credential.
+fn extract_oci_credential(headers: &HeaderMap) -> Option<OciCredential> {
+    if let Some(token) = extract_bearer_token(headers) {
+        return Some(OciCredential::Bearer(token));
+    }
+    if let Some((username, password)) = extract_basic_credentials(headers) {
+        return Some(OciCredential::Basic { username, password });
+    }
+    None
+}
+
+/// Authenticate an OCI request by trying Bearer token first, then falling back
+/// to Basic credentials (username/password or username/api-token).  This mirrors
+/// the `version_check` logic so that Docker, Podman, and plain HTTP clients can
+/// all authenticate regardless of whether they went through the token exchange.
+async fn authenticate_oci(
+    db: &PgPool,
+    config: &crate::config::Config,
+    headers: &HeaderMap,
+) -> Result<crate::services::auth_service::Claims, ()> {
+    let credential = extract_oci_credential(headers).ok_or(())?;
+
+    match credential {
+        OciCredential::Bearer(token) => {
+            let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
+            auth_service.validate_access_token(&token).map_err(|_| ())
+        }
+        OciCredential::Basic { username, password } => {
+            let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
+
+            // Try username/password authentication first.
+            if let Ok((user, _tokens)) = auth_service.authenticate(&username, &password).await {
+                // Re-generate short-lived claims so downstream code has a consistent
+                // Claims value regardless of the authentication method.
+                return auth_service
+                    .generate_tokens(&user)
+                    .map_err(|_| ())
+                    .and_then(|tokens| {
+                        auth_service
+                            .validate_access_token(&tokens.access_token)
+                            .map_err(|_| ())
+                    });
+            }
+
+            // Also try API token in the password field (service accounts, CI pipelines).
+            if let Ok(validation) = auth_service.validate_api_token(&password).await {
+                return auth_service
+                    .generate_tokens(&validation.user)
+                    .map_err(|_| ())
+                    .and_then(|tokens| {
+                        auth_service
+                            .validate_access_token(&tokens.access_token)
+                            .map_err(|_| ())
+                    });
+            }
+
+            Err(())
+        }
+    }
+}
+
+/// Build a Docker/OCI scope string for a repository resource.
+fn pull_scope(image_name: &str) -> String {
+    format!("repository:{}:pull", image_name)
+}
+
+fn push_scope(image_name: &str) -> String {
+    format!("repository:{}:pull,push", image_name)
 }
 
 fn request_host(headers: &HeaderMap) -> String {
@@ -751,9 +846,14 @@ async fn handle_head_blob(
     digest: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -763,7 +863,7 @@ async fn handle_head_blob(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     // Check oci_blobs table
@@ -820,9 +920,14 @@ async fn handle_get_blob(
     digest: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -832,7 +937,7 @@ async fn handle_get_blob(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let blob = sqlx::query!(
@@ -894,9 +999,10 @@ async fn handle_start_upload(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -1021,9 +1127,10 @@ async fn handle_patch_upload(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
     let _ = claims;
 
@@ -1117,9 +1224,10 @@ async fn handle_complete_upload(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
     let _ = claims;
 
@@ -1257,9 +1365,14 @@ async fn handle_head_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -1269,7 +1382,7 @@ async fn handle_head_manifest(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     // Reference can be a tag or a digest. Look up locally first.
@@ -1355,9 +1468,14 @@ async fn handle_get_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -1367,7 +1485,7 @@ async fn handle_get_manifest(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let local_result: Option<(String, String)> = if is_digest_reference(reference) {
@@ -1453,9 +1571,10 @@ async fn handle_put_manifest(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -1596,8 +1715,12 @@ async fn handle_tags_list(
     query: &std::collections::HashMap<String, String>,
 ) -> Response {
     let host = request_host(headers);
-    if validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    let scope = pull_scope(image_name);
+    if authenticate_oci(&state.db, &state.config, headers)
+        .await
+        .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -2204,7 +2327,10 @@ async fn handle_catalog(
     query: Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let host = request_host(&headers);
-    if validate_token(&state.db, &state.config, &headers).is_err() {
+    if authenticate_oci(&state.db, &state.config, &headers)
+        .await
+        .is_err()
+    {
         return unauthorized_challenge(&host);
     }
 
@@ -2329,9 +2455,10 @@ async fn handle_delete_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
     let _ = claims;
 
@@ -2646,15 +2773,41 @@ mod tests {
 
     #[test]
     fn test_www_authenticate_header_with_scheme() {
-        let header = www_authenticate_header("http://localhost:8080");
+        let header = www_authenticate_header("http://localhost:8080", None);
         assert!(header.contains("realm=\"http://localhost:8080/v2/token\""));
         assert!(header.contains("service=\"artifact-keeper\""));
     }
 
     #[test]
     fn test_www_authenticate_header_https() {
-        let header = www_authenticate_header("https://registry.example.com");
+        let header = www_authenticate_header("https://registry.example.com", None);
         assert!(header.contains("https://registry.example.com/v2/token"));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_with_scope() {
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:myrepo/myimage:pull"),
+        );
+        assert!(header.contains("realm=\"https://registry.example.com/v2/token\""));
+        assert!(header.contains("service=\"artifact-keeper\""));
+        assert!(header.contains("scope=\"repository:myrepo/myimage:pull\""));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_with_push_scope() {
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:myrepo/myimage:pull,push"),
+        );
+        assert!(header.contains("scope=\"repository:myrepo/myimage:pull,push\""));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_no_scope_omits_scope_field() {
+        let header = www_authenticate_header("https://registry.example.com", None);
+        assert!(!header.contains("scope="));
     }
 
     // -----------------------------------------------------------------------
@@ -2671,6 +2824,63 @@ mod tests {
     fn test_unauthorized_challenge_has_www_authenticate_header() {
         let resp = unauthorized_challenge("http://localhost");
         assert!(resp.headers().get("WWW-Authenticate").is_some());
+    }
+
+    #[test]
+    fn test_unauthorized_challenge_with_scope_includes_scope() {
+        let resp = unauthorized_challenge_with_scope(
+            "https://registry.example.com",
+            Some("repository:docker/openjdk:pull"),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(header.contains("scope=\"repository:docker/openjdk:pull\""));
+    }
+
+    #[test]
+    fn test_unauthorized_challenge_with_scope_none_omits_scope() {
+        let resp = unauthorized_challenge_with_scope("https://registry.example.com", None);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!header.contains("scope="));
+    }
+
+    // -----------------------------------------------------------------------
+    // pull_scope / push_scope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pull_scope() {
+        assert_eq!(
+            pull_scope("docker/openjdk"),
+            "repository:docker/openjdk:pull"
+        );
+    }
+
+    #[test]
+    fn test_push_scope() {
+        assert_eq!(
+            push_scope("docker/openjdk"),
+            "repository:docker/openjdk:pull,push"
+        );
+    }
+
+    #[test]
+    fn test_pull_scope_nested_name() {
+        assert_eq!(
+            pull_scope("myrepo/org/image"),
+            "repository:myrepo/org/image:pull"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3253,6 +3463,240 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // OciCredential + extract_oci_credential
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_oci_credential_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Bearer(
+                "eyJhbGciOiJIUzI1NiJ9.payload.sig".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_bearer_lowercase() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("bearer my-token-value"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Bearer("my-token-value".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic() {
+        let mut headers = HeaderMap::new();
+        // "user:pass" in base64 = "dXNlcjpwYXNz"
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_lowercase() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("basic dXNlcjpwYXNz"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_none_when_no_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_none_for_unsupported_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Digest realm=\"example\""),
+        );
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_bearer_takes_priority_over_basic() {
+        // If somehow both Bearer and Basic are present (not valid HTTP, but
+        // defensive), the function should return the one that matches the
+        // single Authorization header value.  With a Bearer header, it must
+        // return Bearer.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer jwt-token-here"),
+        );
+        match extract_oci_credential(&headers) {
+            Some(OciCredential::Bearer(t)) => assert_eq!(t, "jwt-token-here"),
+            other => panic!("expected Bearer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_with_api_token_password() {
+        // API tokens are passed in the password field of Basic auth.
+        // "deploy-bot:akt_abc123def456" in base64
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("deploy-bot:akt_abc123def456");
+        let value = format!("Basic {}", encoded);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&value).unwrap());
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "deploy-bot".to_string(),
+                password: "akt_abc123def456".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_invalid_base64_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic !!!not-b64"));
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_no_colon_returns_none() {
+        let mut headers = HeaderMap::new();
+        // "justusername" in base64 = "anVzdHVzZXJuYW1l"
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic anVzdHVzZXJuYW1l"),
+        );
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_empty_password() {
+        let mut headers = HeaderMap::new();
+        // "user:" in base64 = "dXNlcjo="
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjo="));
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_password_with_colons() {
+        let mut headers = HeaderMap::new();
+        // "user:p:a:ss" in base64 = "dXNlcjpwOmE6c3M="
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwOmE6c3M="),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "p:a:ss".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_bearer_anonymous_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer anonymous"));
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(cred, Some(OciCredential::Bearer("anonymous".to_string())));
+    }
+
+    #[test]
+    fn test_oci_credential_debug_format() {
+        let bearer = OciCredential::Bearer("tok".to_string());
+        let debug = format!("{:?}", bearer);
+        assert!(debug.contains("Bearer"));
+
+        let basic = OciCredential::Basic {
+            username: "u".to_string(),
+            password: "p".to_string(),
+        };
+        let debug = format!("{:?}", basic);
+        assert!(debug.contains("Basic"));
+    }
+
+    #[test]
+    fn test_oci_credential_clone() {
+        let original = OciCredential::Basic {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+        };
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_oci_credential_eq_different_variants() {
+        let bearer = OciCredential::Bearer("token".to_string());
+        let basic = OciCredential::Basic {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        };
+        assert_ne!(bearer, basic);
+    }
+
+    #[test]
+    fn test_oci_credential_eq_same_bearer_different_token() {
+        let a = OciCredential::Bearer("token-a".to_string());
+        let b = OciCredential::Bearer("token-b".to_string());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_oci_credential_eq_same_basic_different_password() {
+        let a = OciCredential::Basic {
+            username: "user".to_string(),
+            password: "pass-a".to_string(),
+        };
+        let b = OciCredential::Basic {
+            username: "user".to_string(),
+            password: "pass-b".to_string(),
+        };
+        assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
     // extract_basic_credentials edge cases
     // -----------------------------------------------------------------------
 
@@ -3318,6 +3762,156 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
         assert_eq!(json["errors"][0]["message"], "authentication required");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_challenge_with_scope_body_contains_error() {
+        let resp = unauthorized_challenge_with_scope(
+            "https://registry.example.com",
+            Some("repository:myrepo/alpine:pull"),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(www_auth.contains("realm=\"https://registry.example.com/v2/token\""));
+        assert!(www_auth.contains("service=\"artifact-keeper\""));
+        assert!(www_auth.contains("scope=\"repository:myrepo/alpine:pull\""));
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
+        assert_eq!(json["errors"][0]["message"], "authentication required");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_challenge_with_push_scope_body() {
+        let resp = unauthorized_challenge_with_scope(
+            "https://registry.example.com",
+            Some("repository:myrepo/alpine:pull,push"),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(www_auth.contains("scope=\"repository:myrepo/alpine:pull,push\""));
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_challenge_with_no_scope_body() {
+        let resp = unauthorized_challenge_with_scope("http://localhost:8080", None);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!www_auth.contains("scope="));
+        assert!(www_auth.contains("realm=\"http://localhost:8080/v2/token\""));
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
+        assert_eq!(json["errors"][0]["message"], "authentication required");
+    }
+
+    #[test]
+    fn test_www_authenticate_header_scope_with_special_chars() {
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:my-org/my.image_v2:pull"),
+        );
+        assert!(header.contains("scope=\"repository:my-org/my.image_v2:pull\""));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_empty_scope_string() {
+        let header = www_authenticate_header("https://registry.example.com", Some(""));
+        assert!(header.contains("scope=\"\""));
+    }
+
+    #[test]
+    fn test_pull_scope_single_segment() {
+        assert_eq!(pull_scope("alpine"), "repository:alpine:pull");
+    }
+
+    #[test]
+    fn test_push_scope_single_segment() {
+        assert_eq!(push_scope("alpine"), "repository:alpine:pull,push");
+    }
+
+    #[test]
+    fn test_pull_scope_deeply_nested() {
+        assert_eq!(
+            pull_scope("org/team/subteam/image"),
+            "repository:org/team/subteam/image:pull"
+        );
+    }
+
+    #[test]
+    fn test_push_scope_deeply_nested() {
+        assert_eq!(
+            push_scope("org/team/subteam/image"),
+            "repository:org/team/subteam/image:pull,push"
+        );
+    }
+
+    #[test]
+    fn test_pull_scope_with_special_chars() {
+        assert_eq!(
+            pull_scope("my-org/my.image_v2"),
+            "repository:my-org/my.image_v2:pull"
+        );
+    }
+
+    #[test]
+    fn test_push_scope_with_special_chars() {
+        assert_eq!(
+            push_scope("my-org/my.image_v2"),
+            "repository:my-org/my.image_v2:pull,push"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // unauthorized_challenge delegates to unauthorized_challenge_with_scope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unauthorized_challenge_delegates_no_scope() {
+        // unauthorized_challenge should produce the same result as
+        // unauthorized_challenge_with_scope(host, None)
+        let r1 = unauthorized_challenge("http://localhost");
+        let r2 = unauthorized_challenge_with_scope("http://localhost", None);
+        assert_eq!(r1.status(), r2.status());
+        let h1 = r1
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let h2 = r2
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(h1, h2);
     }
 
     // -----------------------------------------------------------------------
