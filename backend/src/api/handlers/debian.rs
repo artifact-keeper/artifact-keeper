@@ -569,6 +569,33 @@ async fn gpg_key_asc(
 }
 
 // ---------------------------------------------------------------------------
+// Shared helpers for Packages index handlers
+// ---------------------------------------------------------------------------
+
+/// Strip the `binary-` prefix from an Axum path segment like `binary-amd64`,
+/// returning just `amd64`. If the prefix is absent, returns the input unchanged.
+fn strip_binary_arch_prefix(binary_arch: &str) -> &str {
+    binary_arch.strip_prefix("binary-").unwrap_or(binary_arch)
+}
+
+/// Build the dists-relative suffix for a Packages index file.
+/// e.g. `("main", "binary-amd64", "gz")` -> `"main/binary-amd64/Packages.gz"`
+/// Pass an empty string for `ext` to get the uncompressed path.
+fn packages_index_suffix(component: &str, binary_arch: &str, ext: &str) -> String {
+    if ext.is_empty() {
+        format!("{}/{}/Packages", component, binary_arch)
+    } else {
+        format!("{}/{}/Packages.{}", component, binary_arch, ext)
+    }
+}
+
+/// Build a Packages index and compress it with XZ.
+fn build_packages_xz(entries: &[PackageEntry]) -> Result<Vec<u8>, io::Error> {
+    let text = build_packages_text(entries);
+    xz_compress(text.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
 // GET /debian/{repo_key}/dists/{dist}/{component}/binary-{arch}/Packages
 // ---------------------------------------------------------------------------
 
@@ -577,13 +604,12 @@ async fn packages_index(
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
-    let packages_suffix = format!("{}/{}/Packages", component, binary_arch);
+    let packages_suffix = packages_index_suffix(&component, &binary_arch, "");
     proxy
         .dists(&packages_suffix, "text/plain; charset=utf-8", &repo)
         .await?;
 
-    // binary_arch is like "binary-amd64", strip the "binary-" prefix
-    let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
+    let arch = strip_binary_arch_prefix(&binary_arch);
 
     let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
     let text = build_packages_text(&entries);
@@ -605,12 +631,12 @@ async fn packages_index_gz(
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
-    let packages_gz_suffix = format!("{}/{}/Packages.gz", component, binary_arch);
+    let packages_gz_suffix = packages_index_suffix(&component, &binary_arch, "gz");
     proxy
         .dists(&packages_gz_suffix, "application/gzip", &repo)
         .await?;
 
-    let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
+    let arch = strip_binary_arch_prefix(&binary_arch);
 
     let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
     let text = build_packages_text(&entries);
@@ -648,17 +674,16 @@ async fn packages_index_xz(
     Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
-    let packages_xz_suffix = format!("{}/{}/Packages.xz", component, binary_arch);
+    let packages_xz_suffix = packages_index_suffix(&component, &binary_arch, "xz");
     proxy
         .dists(&packages_xz_suffix, "application/x-xz", &repo)
         .await?;
 
-    let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
+    let arch = strip_binary_arch_prefix(&binary_arch);
 
     let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
-    let text = build_packages_text(&entries);
 
-    let compressed = xz_compress(text.as_bytes()).map_err(|e| {
+    let compressed = build_packages_xz(&entries).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("XZ compression error: {}", e),
@@ -1555,5 +1580,202 @@ mod tests {
             content_type_for_dists_path("main/binary-amd64/Packages.lz4"),
             "application/x-lz4"
         );
+    }
+
+    #[test]
+    fn test_content_type_for_dists_path_zstd_long_extension() {
+        assert_eq!(
+            content_type_for_dists_path("main/binary-arm64/Packages.zstd"),
+            "application/zstd"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_binary_arch_prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_binary_arch_prefix_amd64() {
+        assert_eq!(strip_binary_arch_prefix("binary-amd64"), "amd64");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_arm64() {
+        assert_eq!(strip_binary_arch_prefix("binary-arm64"), "arm64");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_i386() {
+        assert_eq!(strip_binary_arch_prefix("binary-i386"), "i386");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_all() {
+        assert_eq!(strip_binary_arch_prefix("binary-all"), "all");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_no_prefix() {
+        assert_eq!(strip_binary_arch_prefix("amd64"), "amd64");
+    }
+
+    #[test]
+    fn test_strip_binary_arch_prefix_empty() {
+        assert_eq!(strip_binary_arch_prefix(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // packages_index_suffix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_packages_index_suffix_uncompressed() {
+        assert_eq!(
+            packages_index_suffix("main", "binary-amd64", ""),
+            "main/binary-amd64/Packages"
+        );
+    }
+
+    #[test]
+    fn test_packages_index_suffix_gz() {
+        assert_eq!(
+            packages_index_suffix("main", "binary-amd64", "gz"),
+            "main/binary-amd64/Packages.gz"
+        );
+    }
+
+    #[test]
+    fn test_packages_index_suffix_xz() {
+        assert_eq!(
+            packages_index_suffix("main", "binary-amd64", "xz"),
+            "main/binary-amd64/Packages.xz"
+        );
+    }
+
+    #[test]
+    fn test_packages_index_suffix_non_free_arm64() {
+        assert_eq!(
+            packages_index_suffix("non-free", "binary-arm64", "xz"),
+            "non-free/binary-arm64/Packages.xz"
+        );
+    }
+
+    #[test]
+    fn test_packages_index_suffix_contrib() {
+        assert_eq!(
+            packages_index_suffix("contrib", "binary-i386", "gz"),
+            "contrib/binary-i386/Packages.gz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_packages_xz (integration of build_packages_text + xz_compress)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_packages_xz_single_entry() {
+        let entries = vec![PackageEntry {
+            name: "curl".to_string(),
+            version: "7.88.1-10".to_string(),
+            arch: "amd64".to_string(),
+            filename: "pool/main/c/curl/curl_7.88.1-10_amd64.deb".to_string(),
+            size: 311296,
+            sha256: "abcdef1234567890".to_string(),
+            description: "command line tool for transferring data with URL syntax".to_string(),
+        }];
+        let compressed = build_packages_xz(&entries).expect("xz compression should succeed");
+        // Verify XZ magic bytes
+        assert_eq!(&compressed[..6], &[0xFD, b'7', b'z', b'X', b'Z', 0x00]);
+        // Decompress and verify it contains the expected package text
+        use std::io::Read;
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        assert!(decompressed.contains("Package: curl\n"));
+        assert!(decompressed.contains("Version: 7.88.1-10\n"));
+        assert!(decompressed.contains("Architecture: amd64\n"));
+    }
+
+    #[test]
+    fn test_build_packages_xz_multiple_entries() {
+        let entries = vec![
+            PackageEntry {
+                name: "nginx".to_string(),
+                version: "1.24.0".to_string(),
+                arch: "amd64".to_string(),
+                filename: "pool/main/n/nginx/nginx_1.24.0_amd64.deb".to_string(),
+                size: 1024,
+                sha256: "aaa".to_string(),
+                description: "HTTP server".to_string(),
+            },
+            PackageEntry {
+                name: "curl".to_string(),
+                version: "8.0.0".to_string(),
+                arch: "amd64".to_string(),
+                filename: "pool/main/c/curl/curl_8.0.0_amd64.deb".to_string(),
+                size: 2048,
+                sha256: "bbb".to_string(),
+                description: "URL transfer tool".to_string(),
+            },
+        ];
+        let compressed = build_packages_xz(&entries).expect("xz compression should succeed");
+        use std::io::Read;
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        assert!(decompressed.contains("Package: nginx\n"));
+        assert!(decompressed.contains("Package: curl\n"));
+        // Entries separated by blank line
+        assert!(decompressed.contains("\n\n"));
+    }
+
+    #[test]
+    fn test_build_packages_xz_empty_entries() {
+        let entries: Vec<PackageEntry> = vec![];
+        let compressed = build_packages_xz(&entries).expect("xz of empty input should succeed");
+        use std::io::Read;
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        assert!(decompressed.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // xz_compress with realistic Packages-sized data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xz_compress_large_packages_text() {
+        // Generate a realistic multi-package index (the kind of data the
+        // handler compresses in production).
+        let mut text = String::new();
+        for i in 0..50 {
+            if i > 0 {
+                text.push('\n');
+            }
+            text.push_str(&format!("Package: libfoo{}\n", i));
+            text.push_str(&format!("Version: 1.0.{}\n", i));
+            text.push_str("Architecture: amd64\n");
+            text.push_str(&format!(
+                "Filename: pool/main/libf/libfoo{}/libfoo{}_1.0.{}_amd64.deb\n",
+                i, i, i
+            ));
+            text.push_str("Size: 10240\n");
+            text.push_str("SHA256: deadbeef\n");
+            text.push_str("Description: Test library\n");
+        }
+        let compressed = xz_compress(text.as_bytes()).expect("xz compression should succeed");
+        // XZ compresses well on repetitive data
+        assert!(
+            compressed.len() < text.len(),
+            "compressed ({}) should be smaller than original ({})",
+            compressed.len(),
+            text.len()
+        );
+        use std::io::Read;
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, text.as_bytes());
     }
 }
