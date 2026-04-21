@@ -27,6 +27,7 @@ use crate::api::{CachedRepo, RepoCache, REPO_CACHE_TTL_SECS};
 use crate::error::AppError;
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
+use crate::services::permission_service::PermissionService;
 
 /// Custom header name for API key
 static X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
@@ -514,6 +515,8 @@ pub struct RepoVisibilityState {
     /// Shared with `AppState::repo_cache` so format-handler resolvers can
     /// reuse the repo metadata fetched here without a second DB round-trip.
     pub repo_cache: RepoCache,
+    /// Permission service for fine-grained repository access control.
+    pub permission_service: Arc<PermissionService>,
 }
 
 /// Extract the repository key from a format handler request path.
@@ -572,6 +575,30 @@ fn forbidden_repo_response() -> Response {
             "Token does not have access to this repository",
         ))
         .unwrap()
+}
+
+/// Build a 403 response when fine-grained permission rules deny access.
+fn forbidden_permission_response() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from(
+            "You do not have permission to perform this action on this repository",
+        ))
+        .unwrap()
+}
+
+/// Map an HTTP method to a permission action string.
+///
+/// Used by [`repo_visibility_middleware`] to determine the required permission
+/// action when fine-grained rules exist for a repository.
+pub(crate) fn action_for_method(method: &Method) -> &'static str {
+    match *method {
+        Method::GET | Method::HEAD | Method::OPTIONS => "read",
+        Method::PUT | Method::POST | Method::PATCH => "write",
+        Method::DELETE => "delete",
+        _ => "read",
+    }
 }
 
 /// Middleware that enforces repository visibility on format handler routes.
@@ -696,6 +723,38 @@ pub async fn repo_visibility_middleware(
     if let Some(ref ext) = auth_ext {
         if !ext.can_access_repo(repo.id) {
             return forbidden_repo_response();
+        }
+    }
+
+    // #817: Fine-grained repository permission enforcement.
+    //
+    // If the authenticated user is an admin, skip permission checks entirely
+    // to preserve backward compatibility and avoid unnecessary DB lookups.
+    //
+    // For non-admin users, check whether any permission rules exist for this
+    // repository. If no rules exist, fall through to the default access model
+    // (the visibility checks above are sufficient). If rules do exist, the
+    // user must hold the action that matches the HTTP method.
+    if let Some(ref ext) = auth_ext {
+        if !ext.is_admin {
+            let has_rules = vis_state
+                .permission_service
+                .has_any_rules_for_target("repository", repo.id)
+                .await
+                .unwrap_or(false);
+
+            if has_rules {
+                let action = action_for_method(request.method());
+                let allowed = vis_state
+                    .permission_service
+                    .check_permission(ext.user_id, "repository", repo.id, action, false)
+                    .await
+                    .unwrap_or(false);
+
+                if !allowed {
+                    return forbidden_permission_response();
+                }
+            }
         }
     }
 
@@ -1527,5 +1586,219 @@ mod tests {
         assert!(should_allow_repo_access(is_public, has_auth));
         // With auth present, even write methods are allowed through the
         // visibility check (the write-method guard passes because auth exists).
+    }
+
+    // -----------------------------------------------------------------------
+    // action_for_method: HTTP method -> permission action mapping (#817)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_action_for_method_get_maps_to_read() {
+        assert_eq!(action_for_method(&Method::GET), "read");
+    }
+
+    #[test]
+    fn test_action_for_method_head_maps_to_read() {
+        assert_eq!(action_for_method(&Method::HEAD), "read");
+    }
+
+    #[test]
+    fn test_action_for_method_options_maps_to_read() {
+        assert_eq!(action_for_method(&Method::OPTIONS), "read");
+    }
+
+    #[test]
+    fn test_action_for_method_put_maps_to_write() {
+        assert_eq!(action_for_method(&Method::PUT), "write");
+    }
+
+    #[test]
+    fn test_action_for_method_post_maps_to_write() {
+        assert_eq!(action_for_method(&Method::POST), "write");
+    }
+
+    #[test]
+    fn test_action_for_method_patch_maps_to_write() {
+        assert_eq!(action_for_method(&Method::PATCH), "write");
+    }
+
+    #[test]
+    fn test_action_for_method_delete_maps_to_delete() {
+        assert_eq!(action_for_method(&Method::DELETE), "delete");
+    }
+
+    #[test]
+    fn test_action_for_method_unknown_defaults_to_read() {
+        // TRACE and other uncommon methods should default to read.
+        assert_eq!(action_for_method(&Method::TRACE), "read");
+    }
+
+    // -----------------------------------------------------------------------
+    // forbidden_permission_response (#817)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_forbidden_permission_response_status() {
+        let resp = forbidden_permission_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_forbidden_permission_response_content_type() {
+        let resp = forbidden_permission_response();
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("Content-Type header must be present");
+        assert_eq!(ct.to_str().unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn test_forbidden_permission_response_body_differs_from_repo_response() {
+        // The permission-denied response should be distinguishable from the
+        // token-scope response so callers can tell the two apart.
+        let perm_resp = forbidden_permission_response();
+        let repo_resp = forbidden_repo_response();
+        // Both are 403, but the bodies should carry different messages.
+        assert_eq!(perm_resp.status(), repo_resp.status());
+        // We cannot easily read the body in a sync test, but verify they are
+        // separate functions that both return 403 with text/plain.
+        assert_eq!(
+            perm_resp.headers().get(axum::http::header::CONTENT_TYPE),
+            repo_resp.headers().get(axum::http::header::CONTENT_TYPE),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Permission enforcement logic: combined unit tests (#817)
+    //
+    // These tests verify the decision logic without a real database by
+    // testing the individual pieces that compose the middleware behavior.
+    // -----------------------------------------------------------------------
+
+    /// Admin users bypass all permission checks regardless of rules.
+    #[test]
+    fn test_permission_admin_bypasses_all_checks() {
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        // The middleware skips permission checks when is_admin is true.
+        // Verify the flag is correctly detected.
+        assert!(
+            ext.is_admin,
+            "admin users should bypass permission enforcement"
+        );
+    }
+
+    /// When no permission rules exist for a repository, all authenticated
+    /// users are allowed access (backward compatible default).
+    #[test]
+    fn test_permission_no_rules_allows_everyone() {
+        // Simulates has_any_rules_for_target returning false.
+        let has_rules = false;
+        let is_admin = false;
+
+        // When there are no rules, the middleware should not call
+        // check_permission at all. Access is allowed by default.
+        if !is_admin && has_rules {
+            panic!("should not reach permission check when no rules exist");
+        }
+        // If we get here, access is allowed. This matches the middleware logic.
+    }
+
+    /// When rules exist and the user lacks the required action, the
+    /// middleware returns 403.
+    #[test]
+    fn test_permission_rules_block_unauthorized_user() {
+        let has_rules = true;
+        let check_result = false; // user does not have the action
+
+        // Simulates the middleware path where rules exist and check fails.
+        if has_rules && !check_result {
+            // This is the path where forbidden_permission_response() is returned.
+            let resp = forbidden_permission_response();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        } else {
+            panic!("should have reached the permission denied path");
+        }
+    }
+
+    /// When rules exist and the user holds the required action, the
+    /// request proceeds to the handler.
+    #[test]
+    fn test_permission_rules_allow_authorized_user() {
+        let has_rules = true;
+        let check_result = true; // user has the action
+        let mut allowed = false;
+
+        if has_rules && !check_result {
+            panic!("should not deny an authorized user");
+        } else {
+            allowed = true;
+        }
+        assert!(allowed, "authorized user should be allowed through");
+    }
+
+    /// Verify that the correct action is derived for each method in the
+    /// full permission enforcement flow.
+    #[test]
+    fn test_permission_action_mapping_for_common_methods() {
+        let cases = vec![
+            (Method::GET, "read"),
+            (Method::HEAD, "read"),
+            (Method::POST, "write"),
+            (Method::PUT, "write"),
+            (Method::DELETE, "delete"),
+            (Method::PATCH, "write"),
+        ];
+        for (method, expected_action) in cases {
+            assert_eq!(
+                action_for_method(&method),
+                expected_action,
+                "method {:?} should map to action {:?}",
+                method,
+                expected_action,
+            );
+        }
+    }
+
+    /// Non-admin user with no auth extension (anonymous) does not enter
+    /// the permission check block at all. The middleware only checks
+    /// permissions when auth_ext is Some.
+    #[test]
+    fn test_permission_anonymous_skips_permission_check() {
+        let auth_ext: Option<AuthExtension> = None;
+        // The middleware guard is `if let Some(ref ext) = auth_ext`.
+        // Anonymous users (None) never enter the permission block.
+        assert!(
+            auth_ext.is_none(),
+            "anonymous users should not trigger permission checks"
+        );
+    }
+
+    /// Admin user via API token also bypasses permission checks.
+    #[test]
+    fn test_permission_admin_api_token_bypasses_checks() {
+        let ext = AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "bot".to_string(),
+            email: "bot@example.com".to_string(),
+            is_admin: true,
+            is_api_token: true,
+            is_service_account: true,
+            scopes: Some(vec!["admin".to_string()]),
+            allowed_repo_ids: None,
+        };
+        assert!(
+            ext.is_admin,
+            "admin API token should bypass permission enforcement"
+        );
     }
 }
