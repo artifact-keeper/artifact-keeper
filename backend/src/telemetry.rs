@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn test_protocol_clone_and_copy() {
         let original = OtlpProtocol::HttpProtobuf;
-        let cloned = original.clone();
+        let cloned = original;
         let copied = original;
         assert_eq!(original, cloned);
         assert_eq!(original, copied);
