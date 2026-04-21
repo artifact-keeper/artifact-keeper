@@ -57,7 +57,8 @@ pub async fn setup_guard(
                 "1. Read the generated password: docker exec artifact-keeper-backend cat /data/storage/admin.password && echo",
                 "2. Login: POST /api/v1/auth/login with {\"username\":\"admin\",\"password\":\"<from-file>\"}",
                 "3. Change password: POST /api/v1/users/<id>/password with {\"new_password\":\"<your-password>\"}",
-                "4. The API will unlock automatically after the password is changed."
+                "4. The API will unlock automatically after the password is changed.",
+                "If the password file is missing, restart the container. A new password will be generated automatically."
             ]
         })),
     )

@@ -998,7 +998,21 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         return Ok(false);
     }
 
-    let password_file = Path::new(storage_path).join("admin.password");
+    let storage_dir = Path::new(storage_path);
+    let password_file = storage_dir.join("admin.password");
+
+    // Ensure the storage directory exists before we try to write anything.
+    // Docker named volumes normally create the mount point, but bind mounts,
+    // alternative runtimes (Podman rootless, Kubernetes emptyDir), and custom
+    // STORAGE_PATH values may not.  Creating it here avoids a silent failure
+    // when writing the admin password file later. (fixes #787)
+    if let Err(e) = std::fs::create_dir_all(storage_dir) {
+        tracing::warn!(
+            "Could not create storage directory {}: {}",
+            storage_dir.display(),
+            e
+        );
+    }
 
     // Check if an admin user already exists
     let admin_row: Option<(bool,)> =
@@ -1041,9 +1055,28 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             tracing::warn!(
                 "Admin user has not changed default password. API is locked until password is changed."
             );
-            // Ensure the password file still exists for the user to read
             if password_file.exists() {
                 tracing::info!("Admin password file: {}", password_file.display());
+            } else {
+                // The password file is missing (deleted, volume recreated, or
+                // the initial write failed).  Generate a new password, update
+                // the hash in the database, and write the file so the user can
+                // complete setup. (fixes #787)
+                tracing::warn!(
+                    "Admin password file missing at {}. Regenerating password.",
+                    password_file.display()
+                );
+                let password = generate_random_password();
+                let password_hash = AuthService::hash_password(&password).await?;
+                sqlx::query("UPDATE users SET password_hash = $1 WHERE username = 'admin'")
+                    .bind(&password_hash)
+                    .execute(db)
+                    .await
+                    .map_err(|e| {
+                        artifact_keeper_backend::error::AppError::Database(e.to_string())
+                    })?;
+                write_admin_password_file(&password_file, &password);
+                log_admin_setup_banner(&password_file);
             }
             return Ok(true);
         }
@@ -1060,15 +1093,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             }
         }
         _ => {
-            const CHARSET: &[u8] =
-                b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
-            let mut rng = rand::rng();
-            let p: String = (0..20)
-                .map(|_| {
-                    let idx = rng.random_range(0..CHARSET.len());
-                    CHARSET[idx] as char
-                })
-                .collect();
+            let p = generate_random_password();
             (p, true)
         }
     };
@@ -1092,64 +1117,91 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
     if must_change {
-        // Write password + setup instructions to the file
-        let file_contents = format!(
-            "{}\n\n\
-            # ONE-TIME SETUP — this password must be changed before the API unlocks.\n\
-            #\n\
-            # Step 1: Login to get a JWT token:\n\
-            #   curl -s -X POST http://localhost:8080/api/v1/auth/login \\\n\
-            #     -H 'Content-Type: application/json' \\\n\
-            #     -d '{{\"username\":\"admin\",\"password\":\"<password-above>\"}}'\n\
-            #\n\
-            # Step 2: Change the password (use the access_token from step 1):\n\
-            #   curl -s -X POST http://localhost:8080/api/v1/users/me/password \\\n\
-            #     -H 'Authorization: Bearer <access_token>' \\\n\
-            #     -H 'Content-Type: application/json' \\\n\
-            #     -d '{{\"current_password\":\"<password-above>\",\"new_password\":\"<your-new-password>\"}}'\n\
-            #\n\
-            # The API is LOCKED until you complete these steps.\n\
-            # Do NOT use this password directly in API calls — you must login first.\n",
-            password
-        );
-        if let Err(e) = std::fs::write(&password_file, &file_contents) {
-            tracing::error!("Failed to write admin password file: {}", e);
-            tracing::error!("Admin password could not be persisted. Re-run the server or check file permissions for: {}", password_file.display());
-        } else {
-            // Restrict file permissions to owner-only (0600) since this file contains credentials
-            #[cfg(unix)]
-            if let Err(e) =
-                std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600))
-            {
-                tracing::warn!("Failed to set permissions on admin password file: {}", e);
-            }
-            tracing::info!("Admin password written to: {}", password_file.display());
-        }
-        tracing::info!(
-            "\n\
-            ===========================================================\n\
-            \n\
-              Initial admin user created.\n\
-            \n\
-              Username:  admin\n\
-              Password:  see file {}\n\
-            \n\
-              Read it:   docker exec artifact-keeper-backend cat {}\n\
-            \n\
-              The API is LOCKED until you change this password.\n\
-              You MUST login first (POST /api/v1/auth/login) to get\n\
-              a token, then change the password. See the file for\n\
-              full curl examples.\n\
-            \n\
-            ===========================================================",
-            password_file.display(),
-            password_file.display(),
-        );
+        write_admin_password_file(&password_file, &password);
+        log_admin_setup_banner(&password_file);
         Ok(true)
     } else {
         tracing::info!("Admin user created with password from ADMIN_PASSWORD env var");
         Ok(false)
     }
+}
+
+/// Generate a random 20-character password for the admin user.
+fn generate_random_password() -> String {
+    const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
+    let mut rng = rand::rng();
+    (0..20)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
+}
+
+/// Write the admin password and setup instructions to a file.
+///
+/// Failures are logged but not propagated, because the server should still
+/// start (the password is printed in the banner as a fallback).
+fn write_admin_password_file(password_file: &std::path::Path, password: &str) {
+    let file_contents = format!(
+        "{}\n\n\
+        # ONE-TIME SETUP -- this password must be changed before the API unlocks.\n\
+        #\n\
+        # Step 1: Login to get a JWT token:\n\
+        #   curl -s -X POST http://localhost:8080/api/v1/auth/login \\\n\
+        #     -H 'Content-Type: application/json' \\\n\
+        #     -d '{{\"username\":\"admin\",\"password\":\"<password-above>\"}}'\n\
+        #\n\
+        # Step 2: Change the password (use the access_token from step 1):\n\
+        #   curl -s -X POST http://localhost:8080/api/v1/users/me/password \\\n\
+        #     -H 'Authorization: Bearer <access_token>' \\\n\
+        #     -H 'Content-Type: application/json' \\\n\
+        #     -d '{{\"current_password\":\"<password-above>\",\"new_password\":\"<your-new-password>\"}}'\n\
+        #\n\
+        # The API is LOCKED until you complete these steps.\n\
+        # Do NOT use this password directly in API calls -- you must login first.\n",
+        password
+    );
+    if let Err(e) = std::fs::write(password_file, &file_contents) {
+        tracing::error!("Failed to write admin password file: {}", e);
+        tracing::error!(
+            "Admin password could not be persisted. \
+             Re-run the server or check file permissions for: {}",
+            password_file.display()
+        );
+    } else {
+        #[cfg(unix)]
+        if let Err(e) =
+            std::fs::set_permissions(password_file, std::fs::Permissions::from_mode(0o600))
+        {
+            tracing::warn!("Failed to set permissions on admin password file: {}", e);
+        }
+        tracing::info!("Admin password written to: {}", password_file.display());
+    }
+}
+
+/// Log the setup banner with instructions for the admin user.
+fn log_admin_setup_banner(password_file: &std::path::Path) {
+    tracing::info!(
+        "\n\
+        ===========================================================\n\
+        \n\
+          Initial admin user created.\n\
+        \n\
+          Username:  admin\n\
+          Password:  see file {}\n\
+        \n\
+          Read it:   docker exec artifact-keeper-backend cat {}\n\
+        \n\
+          The API is LOCKED until you change this password.\n\
+          You MUST login first (POST /api/v1/auth/login) to get\n\
+          a token, then change the password. See the file for\n\
+          full curl examples.\n\
+        \n\
+        ===========================================================",
+        password_file.display(),
+        password_file.display(),
+    );
 }
 
 fn is_insecure_default_password(password: &str) -> bool {
