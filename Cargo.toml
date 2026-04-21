@@ -50,7 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "regis
 # OpenTelemetry (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT)
 opentelemetry = "0.28"
 opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic", "http-proto", "reqwest-client"] }
 tracing-opentelemetry = "0.29"
 
 # Metrics
