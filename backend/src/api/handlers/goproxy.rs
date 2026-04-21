@@ -411,6 +411,8 @@ async fn list_versions(
         {
             return Ok(resp);
         }
+
+        return Err((StatusCode::NOT_FOUND, "module not found").into_response());
     }
 
     Ok(Response::builder()

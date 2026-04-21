@@ -35,9 +35,14 @@ COPY .sqlx ./.sqlx
 COPY backend ./backend
 ARG GIT_SHA=unknown
 ARG CARGO_FEATURES=""
+ARG APP_VERSION=""
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
-RUN FEATURES="vendored-openssl"; \
+RUN if [ -n "${APP_VERSION}" ]; then \
+      CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
+      sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
+    fi && \
+    FEATURES="vendored-openssl"; \
     if [ -n "$CARGO_FEATURES" ]; then FEATURES="$FEATURES,$CARGO_FEATURES"; fi && \
     cargo build --release --features "$FEATURES" --bin artifact-keeper
 
