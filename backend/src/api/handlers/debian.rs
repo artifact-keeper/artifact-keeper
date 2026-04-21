@@ -10,11 +10,13 @@
 //!   GET  /debian/{repo_key}/dists/{distribution}/gpg-key.asc                        - Repository public key
 //!   GET  /debian/{repo_key}/dists/{distribution}/{component}/binary-{arch}/Packages - Packages index
 //!   GET  /debian/{repo_key}/dists/{distribution}/{component}/binary-{arch}/Packages.gz - Compressed Packages index
+//!   GET  /debian/{repo_key}/dists/{distribution}/{component}/binary-{arch}/Packages.xz - XZ-compressed Packages index
+//!   GET  /debian/{repo_key}/dists/{distribution}/*path                              - Catch-all dists proxy (i18n, Sources, etc.)
 //!   GET  /debian/{repo_key}/pool/{component}/*path                                  - Download .deb
 //!   PUT  /debian/{repo_key}/pool/{component}/*path                                  - Upload .deb
 //!   POST /debian/{repo_key}/upload                                                  - Upload .deb (raw body)
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -68,11 +70,15 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/dists/:distribution/:component/:binary_arch/Packages.gz",
             get(packages_index_gz),
         )
-        // TODO: Add Packages.xz support once xz2/lzma crate is available
-        // .route(
-        //     "/:repo_key/dists/:distribution/:component/:binary_arch/Packages.xz",
-        //     get(packages_index_xz),
-        // )
+        .route(
+            "/:repo_key/dists/:distribution/:component/:binary_arch/Packages.xz",
+            get(packages_index_xz),
+        )
+        // Catch-all for other dists metadata (i18n/Translation-*.xz, Sources, etc.)
+        .route(
+            "/:repo_key/dists/:distribution/*dists_path",
+            get(dists_proxy_catchall),
+        )
         // Pool: download and upload
         .route(
             "/:repo_key/pool/:component/*path",
@@ -634,7 +640,113 @@ async fn packages_index_gz(
 }
 
 // ---------------------------------------------------------------------------
-// GET /debian/{repo_key}/pool/{component}/*path — Download .deb
+// GET /debian/{repo_key}/dists/{dist}/{component}/binary-{arch}/Packages.xz
+// ---------------------------------------------------------------------------
+
+async fn packages_index_xz(
+    State(state): State<SharedState>,
+    Path((repo_key, distribution, component, binary_arch)): Path<(String, String, String, String)>,
+) -> Result<Response, Response> {
+    let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    let packages_xz_suffix = format!("{}/{}/Packages.xz", component, binary_arch);
+    proxy
+        .dists(&packages_xz_suffix, "application/x-xz", &repo)
+        .await?;
+
+    let arch = binary_arch.strip_prefix("binary-").unwrap_or(&binary_arch);
+
+    let entries = fetch_package_entries(&state.db, repo.id, &component, arch).await?;
+    let text = build_packages_text(&entries);
+
+    let compressed = xz_compress(text.as_bytes()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("XZ compression error: {}", e),
+        )
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/x-xz")
+        .header(CONTENT_LENGTH, compressed.len().to_string())
+        .body(Body::from(compressed))
+        .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// GET /debian/{repo_key}/dists/{distribution}/*dists_path -- Catch-all proxy
+// ---------------------------------------------------------------------------
+
+/// Catch-all handler for dists metadata that does not have a dedicated route.
+/// This covers files like `i18n/Translation-en.xz`, `i18n/Translation-en.gz`,
+/// `Sources`, `Sources.gz`, `Sources.xz`, and other index files that upstream
+/// Debian mirrors serve under `dists/`.
+///
+/// For remote repositories the file is fetched from upstream and returned
+/// directly. For hosted repositories the handler returns 404 because these
+/// metadata files are generated on-the-fly only through the dedicated routes.
+async fn dists_proxy_catchall(
+    State(state): State<SharedState>,
+    Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_debian_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type != RepositoryType::Remote {
+        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
+    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+        (Some(u), Some(p)) => (u, p),
+        _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
+    };
+
+    let upstream_path = format!("dists/{}/{}", distribution, dists_path);
+    let (content, upstream_ct) =
+        proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path).await?;
+
+    let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap())
+}
+
+/// Infer a reasonable content-type from the file extension when the upstream
+/// response does not include one. Covers the common Debian index
+/// compressions and the uncompressed fallback.
+fn content_type_for_dists_path(path: &str) -> String {
+    if path.ends_with(".xz") {
+        "application/x-xz".to_string()
+    } else if path.ends_with(".gz") {
+        "application/gzip".to_string()
+    } else if path.ends_with(".bz2") {
+        "application/x-bzip2".to_string()
+    } else if path.ends_with(".lz4") {
+        "application/x-lz4".to_string()
+    } else if path.ends_with(".zst") || path.ends_with(".zstd") {
+        "application/zstd".to_string()
+    } else {
+        "text/plain; charset=utf-8".to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XZ compression helper
+// ---------------------------------------------------------------------------
+
+/// Compress data using XZ/LZMA2.
+fn xz_compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
+    let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+// ---------------------------------------------------------------------------
+// GET /debian/{repo_key}/pool/{component}/*path -- Download .deb
 // ---------------------------------------------------------------------------
 
 async fn pool_download(
@@ -1310,6 +1422,26 @@ mod tests {
                 "main/binary-amd64/Packages.gz",
                 "dists/trixie/main/binary-amd64/Packages.gz",
             ),
+            (
+                "trixie",
+                "main/binary-amd64/Packages.xz",
+                "dists/trixie/main/binary-amd64/Packages.xz",
+            ),
+            (
+                "bookworm",
+                "main/i18n/Translation-en.xz",
+                "dists/bookworm/main/i18n/Translation-en.xz",
+            ),
+            (
+                "bookworm",
+                "main/i18n/Translation-en.gz",
+                "dists/bookworm/main/i18n/Translation-en.gz",
+            ),
+            (
+                "trixie",
+                "main/source/Sources.xz",
+                "dists/trixie/main/source/Sources.xz",
+            ),
         ];
         for (dist, suffix, expected) in &cases {
             let path = format!("dists/{}/{}", dist, suffix);
@@ -1331,6 +1463,97 @@ mod tests {
         assert_eq!(
             full_url,
             "http://deb.debian.org/debian/dists/trixie/InRelease"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // XZ compression round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xz_compress_round_trip() {
+        let original = b"Package: hello\nVersion: 1.0\nArchitecture: amd64\n";
+        let compressed = xz_compress(original).expect("xz compression should succeed");
+        // XZ magic bytes: 0xFD, '7', 'z', 'X', 'Z', 0x00
+        assert_eq!(&compressed[..6], &[0xFD, b'7', b'z', b'X', b'Z', 0x00]);
+        // Decompress and verify round-trip
+        use std::io::Read;
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .expect("xz decompression should succeed");
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn test_xz_compress_empty_input() {
+        let compressed = xz_compress(b"").expect("xz compression of empty input should succeed");
+        assert!(!compressed.is_empty(), "xz output is never zero-length");
+        use std::io::Read;
+        let mut decoder = xz2::read::XzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert!(decompressed.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // content_type_for_dists_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_content_type_for_dists_path_xz() {
+        assert_eq!(
+            content_type_for_dists_path("main/i18n/Translation-en.xz"),
+            "application/x-xz"
+        );
+        assert_eq!(
+            content_type_for_dists_path("main/binary-amd64/Packages.xz"),
+            "application/x-xz"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_dists_path_gz() {
+        assert_eq!(
+            content_type_for_dists_path("main/i18n/Translation-en.gz"),
+            "application/gzip"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_dists_path_bz2() {
+        assert_eq!(
+            content_type_for_dists_path("main/source/Sources.bz2"),
+            "application/x-bzip2"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_dists_path_plain() {
+        assert_eq!(
+            content_type_for_dists_path("main/i18n/Translation-en"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for_dists_path("main/source/Sources"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_dists_path_zstd() {
+        assert_eq!(
+            content_type_for_dists_path("main/binary-amd64/Packages.zst"),
+            "application/zstd"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_dists_path_lz4() {
+        assert_eq!(
+            content_type_for_dists_path("main/binary-amd64/Packages.lz4"),
+            "application/x-lz4"
         );
     }
 }
