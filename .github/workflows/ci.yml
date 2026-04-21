@@ -108,7 +108,9 @@ jobs:
           # Fetch base branch so we can diff against it (checkout is shallow by default)
           git fetch --no-tags --depth=1 origin ${{ github.base_ref }}
 
-          # Check coverage on changed .rs files only (matches SonarCloud's "new code" gate)
+          # Check coverage on new/changed lines only (not the entire file).
+          # Uses unified diff to extract exact line numbers that were added or modified,
+          # then cross-references with lcov to measure coverage of those specific lines.
           CHANGED_FILES=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null || true)
           if [ -z "$CHANGED_FILES" ]; then
             echo "No .rs files changed, skipping new code coverage check"
@@ -116,42 +118,69 @@ jobs:
             exit 0
           fi
 
-          # Extract coverage for changed files from lcov
-          PATTERNS=""
-          for f in $CHANGED_FILES; do
-            PATTERNS="$PATTERNS -e $f"
-          done
-
-          # Parse lcov.info for changed files and compute line coverage
+          # Parse the unified diff to find which lines were added/changed in each file,
+          # then cross-reference with lcov.info to compute coverage on those lines only.
           RESULT=$(python3 -c "
-          import sys
-          changed = set('''$CHANGED_FILES'''.split())
-          hit = miss = 0
+          import subprocess, re
+
+          # Step 1: Parse unified diff to find added line numbers per file
+          diff = subprocess.run(
+              ['git', 'diff', '-U0', 'FETCH_HEAD', '--', '*.rs'],
+              capture_output=True, text=True
+          ).stdout
+
+          new_lines = {}  # filename -> set of added line numbers
           current_file = None
-          in_changed = False
-          for line in open('lcov.info'):
-              line = line.strip()
-              if line.startswith('SF:'):
-                  path = line[3:]
-                  in_changed = any(path.endswith(f) for f in changed)
-              elif line.startswith('DA:') and in_changed:
-                  parts = line[3:].split(',')
-                  count = int(parts[1])
-                  if count > 0:
-                      hit += 1
-                  else:
-                      miss += 1
-          total = hit + miss
-          if total == 0:
+          for line in diff.split('\n'):
+              if line.startswith('+++ b/'):
+                  current_file = line[6:]
+              elif line.startswith('@@') and current_file:
+                  # Parse @@ -old,count +new,count @@ format
+                  m = re.search(r'\+(\d+)(?:,(\d+))?', line)
+                  if m:
+                      start = int(m.group(1))
+                      count = int(m.group(2)) if m.group(2) else 1
+                      if current_file not in new_lines:
+                          new_lines[current_file] = set()
+                      for i in range(start, start + count):
+                          new_lines[current_file].add(i)
+
+          if not new_lines:
               print('none')
           else:
-              pct = (hit * 100) // total
-              print(f'{pct} {hit} {total}')
+              # Step 2: Parse lcov.info and check coverage only for new lines
+              hit = miss = 0
+              lcov_file = None
+              lcov_match = None
+              for line in open('lcov.info'):
+                  line = line.strip()
+                  if line.startswith('SF:'):
+                      path = line[3:]
+                      lcov_match = None
+                      for f, lines in new_lines.items():
+                          if path.endswith(f):
+                              lcov_match = lines
+                              break
+                  elif line.startswith('DA:') and lcov_match is not None:
+                      parts = line[3:].split(',')
+                      lineno = int(parts[0])
+                      count = int(parts[1])
+                      if lineno in lcov_match:
+                          if count > 0:
+                              hit += 1
+                          else:
+                              miss += 1
+              total = hit + miss
+              if total == 0:
+                  print('none')
+              else:
+                  pct = (hit * 100) // total
+                  print(f'{pct} {hit} {total}')
           ")
 
           if [ "$RESULT" = "none" ]; then
-            echo "No instrumented lines in changed files"
-            echo "### New Code Coverage: N/A (no instrumented lines)" >> $GITHUB_STEP_SUMMARY
+            echo "No instrumented lines in new code"
+            echo "### New Code Coverage: N/A (no instrumented new lines)" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
 
@@ -159,12 +188,12 @@ jobs:
           HIT=$(echo "$RESULT" | awk '{print $2}')
           TOTAL=$(echo "$RESULT" | awk '{print $3}')
 
-          echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} lines)" >> $GITHUB_STEP_SUMMARY
-          echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} lines)"
+          echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} new lines)" >> $GITHUB_STEP_SUMMARY
+          echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} new lines)"
 
           if [ "$PCT" -lt 70 ]; then
             echo "::error::New code coverage is ${PCT}%, below 70% threshold"
-            echo "Coverage on changed files is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
+            echo "Coverage on new/changed lines is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
