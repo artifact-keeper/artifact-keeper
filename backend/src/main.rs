@@ -983,6 +983,10 @@ fn build_oidc_request_from_values(
 /// Returns `true` when the API should be locked until the admin changes
 /// the default password (i.e. `must_change_password` is still set and no
 /// explicit `ADMIN_PASSWORD` env var was provided).
+///
+/// Uses a PostgreSQL advisory lock to prevent race conditions when multiple
+/// replicas start simultaneously.  The lock is held for the duration of the
+/// check-and-create sequence so only one replica performs the initial insert.
 async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<bool> {
     use std::path::Path;
 
@@ -1014,10 +1018,25 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         );
     }
 
-    // Check if an admin user already exists
+    // Acquire a cluster-wide advisory lock so that concurrent replicas
+    // serialize their admin provisioning.  The lock key is a stable hash
+    // of a well-known string.  We use a transaction-scoped lock
+    // (pg_advisory_xact_lock) so it is automatically released when the
+    // transaction commits or rolls back.
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('admin_password_init'))")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
+    // Re-check admin existence while holding the lock (double-check pattern).
     let admin_row: Option<(bool,)> =
         sqlx::query_as("SELECT must_change_password FROM users WHERE is_admin = true LIMIT 1")
-            .fetch_optional(db)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
@@ -1028,9 +1047,10 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         // password-based login works.  This is a no-op when the column is
         // already correct but fixes installs that ended up with a wrong value.
         sqlx::query(
-            "UPDATE users SET auth_provider = 'local' WHERE username = 'admin' AND auth_provider != 'local'"
+            "UPDATE users SET auth_provider = 'local' \
+             WHERE username = 'admin' AND auth_provider != 'local'",
         )
-        .execute(db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
@@ -1041,9 +1061,12 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
                     sqlx::query(
                         "UPDATE users SET must_change_password = true WHERE username = 'admin'",
                     )
-                    .execute(db)
+                    .execute(&mut *tx)
                     .await
                     .map_err(|e| {
+                        artifact_keeper_backend::error::AppError::Database(e.to_string())
+                    })?;
+                    tx.commit().await.map_err(|e| {
                         artifact_keeper_backend::error::AppError::Database(e.to_string())
                     })?;
                     return Ok(true);
@@ -1053,35 +1076,54 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
 
         if must_change {
             tracing::warn!(
-                "Admin user has not changed default password. API is locked until password is changed."
+                "Admin user has not changed default password. \
+                 API is locked until password is changed."
             );
             if password_file.exists() {
                 tracing::info!("Admin password file: {}", password_file.display());
             } else {
                 // The password file is missing (deleted, volume recreated, or
-                // the initial write failed).  Generate a new password, update
-                // the hash in the database, and write the file so the user can
-                // complete setup. (fixes #787)
+                // the initial write failed).  Generate a new password, write
+                // the file FIRST, then update the DB hash.  If the file write
+                // fails we skip the DB update so the old hash remains usable
+                // on retry.
                 tracing::warn!(
                     "Admin password file missing at {}. Regenerating password.",
                     password_file.display()
                 );
                 let password = generate_random_password();
-                let password_hash = AuthService::hash_password(&password).await?;
-                sqlx::query("UPDATE users SET password_hash = $1 WHERE username = 'admin'")
-                    .bind(&password_hash)
-                    .execute(db)
-                    .await
-                    .map_err(|e| {
-                        artifact_keeper_backend::error::AppError::Database(e.to_string())
-                    })?;
-                write_admin_password_file(&password_file, &password);
-                log_admin_setup_banner(&password_file);
+                if let Err(e) = write_admin_password_file(&password_file, &password) {
+                    tracing::error!("Failed to write admin password file: {}", e);
+                    tracing::error!(
+                        "Admin password could not be persisted. \
+                         Re-run the server or check file permissions for: {}",
+                        password_file.display()
+                    );
+                } else {
+                    // File written successfully, now update the DB hash to match.
+                    let password_hash = AuthService::hash_password(&password).await?;
+                    sqlx::query("UPDATE users SET password_hash = $1 WHERE username = 'admin'")
+                        .bind(&password_hash)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            artifact_keeper_backend::error::AppError::Database(e.to_string())
+                        })?;
+                    log_admin_setup_banner(&password_file);
+                }
             }
+            tx.commit()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
             return Ok(true);
         }
+        tx.commit()
+            .await
+            .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
         return Ok(false);
     }
+
+    // --- No admin user exists yet: create one. ---
 
     let (password, must_change) = match std::env::var("ADMIN_PASSWORD") {
         Ok(p) if !p.is_empty() => {
@@ -1098,6 +1140,31 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         }
     };
 
+    // Write the password file BEFORE updating the database.  If the file
+    // write fails, we abort without inserting the DB row so the next startup
+    // can retry cleanly.  This avoids the scenario where the hash is in the
+    // DB but the plaintext is lost.
+    if must_change {
+        if let Err(e) = write_admin_password_file(&password_file, &password) {
+            tracing::error!("Failed to write admin password file: {}", e);
+            tracing::error!(
+                "Admin password could not be persisted. \
+                 Re-run the server or check file permissions for: {}",
+                password_file.display()
+            );
+            // Roll back the transaction (advisory lock released).  The next
+            // replica or restart will retry.
+            tx.rollback()
+                .await
+                .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+            return Err(artifact_keeper_backend::error::AppError::Config(format!(
+                "Cannot persist admin password file at {}. \
+                 Fix file permissions and restart.",
+                password_file.display()
+            )));
+        }
+    }
+
     let password_hash = AuthService::hash_password(&password).await?;
 
     sqlx::query(
@@ -1112,12 +1179,15 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
     )
     .bind(&password_hash)
     .bind(must_change)
-    .execute(db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
 
+    tx.commit()
+        .await
+        .map_err(|e| artifact_keeper_backend::error::AppError::Database(e.to_string()))?;
+
     if must_change {
-        write_admin_password_file(&password_file, &password);
         log_admin_setup_banner(&password_file);
         Ok(true)
     } else {
@@ -1140,9 +1210,13 @@ fn generate_random_password() -> String {
 
 /// Write the admin password and setup instructions to a file.
 ///
-/// Failures are logged but not propagated, because the server should still
-/// start (the password is printed in the banner as a fallback).
-fn write_admin_password_file(password_file: &std::path::Path, password: &str) {
+/// Returns `Ok(())` on success.  On failure the error is propagated so that
+/// callers can avoid updating the database hash (preventing the "hash in DB
+/// but plaintext lost" scenario).
+fn write_admin_password_file(
+    password_file: &std::path::Path,
+    password: &str,
+) -> std::io::Result<()> {
     let file_contents = format!(
         "{}\n\n\
         # ONE-TIME SETUP -- this password must be changed before the API unlocks.\n\
@@ -1162,22 +1236,14 @@ fn write_admin_password_file(password_file: &std::path::Path, password: &str) {
         # Do NOT use this password directly in API calls -- you must login first.\n",
         password
     );
-    if let Err(e) = std::fs::write(password_file, &file_contents) {
-        tracing::error!("Failed to write admin password file: {}", e);
-        tracing::error!(
-            "Admin password could not be persisted. \
-             Re-run the server or check file permissions for: {}",
-            password_file.display()
-        );
-    } else {
-        #[cfg(unix)]
-        if let Err(e) =
-            std::fs::set_permissions(password_file, std::fs::Permissions::from_mode(0o600))
-        {
-            tracing::warn!("Failed to set permissions on admin password file: {}", e);
-        }
-        tracing::info!("Admin password written to: {}", password_file.display());
+    std::fs::write(password_file, &file_contents)?;
+    #[cfg(unix)]
+    if let Err(e) = std::fs::set_permissions(password_file, std::fs::Permissions::from_mode(0o600))
+    {
+        tracing::warn!("Failed to set permissions on admin password file: {}", e);
     }
+    tracing::info!("Admin password written to: {}", password_file.display());
+    Ok(())
 }
 
 /// Log the setup banner with instructions for the admin user.
