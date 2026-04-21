@@ -611,17 +611,16 @@ async fn token(
             if let Ok(claims) = validate_token(&state.db, &state.config, &headers) {
                 let auth_service =
                     AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-                let user = match sqlx::query_as!(
-                    crate::models::user::User,
+                let user = match sqlx::query_as::<_, crate::models::user::User>(
                     r#"SELECT id, username, email, password_hash, display_name,
-                       auth_provider as "auth_provider: crate::models::user::AuthProvider",
-                       external_id, is_admin, is_active, is_service_account, must_change_password,
+                       auth_provider, external_id, is_admin, is_active,
+                       is_service_account, must_change_password,
                        totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                        failed_login_attempts, locked_until, last_failed_login_at,
                        password_changed_at, last_login_at, created_at, updated_at
                        FROM users WHERE id = $1"#,
-                    claims.sub
                 )
+                .bind(claims.sub)
                 .fetch_optional(&state.db)
                 .await
                 {
@@ -2075,7 +2074,7 @@ async fn fetch_upstream_tags_page(
     })?;
 
     let upstream_path = format!("v2/{}/{}", image, build_remote_tags_list_path(n, last));
-    let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached_with_link(
+    let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached(
         proxy,
         repo_id,
         repo_key,
@@ -2121,7 +2120,7 @@ async fn fetch_upstream_tags_page(
             .iter()
             .filter_map(|t| t.as_str().map(String::from))
             .collect(),
-        next_last: link.as_deref().and_then(parse_upstream_pagination_last),
+        next_last: if link.is_empty() { None } else { parse_upstream_pagination_last(&link) },
     })
 }
 
