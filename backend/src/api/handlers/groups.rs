@@ -32,6 +32,27 @@ pub struct ListGroupsQuery {
     pub per_page: Option<u32>,
 }
 
+/// Query parameters for the group detail endpoint, controlling member pagination.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct GetGroupQuery {
+    /// Maximum number of members to return (default: 50, max: 200)
+    pub member_limit: Option<u32>,
+    /// Number of members to skip for pagination (default: 0)
+    pub member_offset: Option<u32>,
+}
+
+impl GetGroupQuery {
+    /// Resolved limit, clamped to [1, 200] with a default of 50.
+    pub fn limit(&self) -> i64 {
+        self.member_limit.unwrap_or(50).clamp(1, 200) as i64
+    }
+
+    /// Resolved offset with a default of 0.
+    pub fn offset(&self) -> i64 {
+        self.member_offset.unwrap_or(0) as i64
+    }
+}
+
 #[derive(Debug, Serialize, FromRow, ToSchema)]
 pub struct GroupRow {
     pub id: Uuid,
@@ -63,6 +84,44 @@ impl From<GroupRow> for GroupResponse {
             updated_at: row.updated_at,
         }
     }
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct MemberRow {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupMemberResponse {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<MemberRow> for GroupMemberResponse {
+    fn from(row: MemberRow) -> Self {
+        Self {
+            user_id: row.user_id,
+            username: row.username,
+            display_name: row.display_name,
+            joined_at: row.joined_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GroupDetailResponse {
+    #[serde(flatten)]
+    pub group: GroupResponse,
+    /// Paginated list of group members.
+    pub members: Vec<GroupMemberResponse>,
+    /// Total number of members in the group. Clients can compare this against
+    /// the length of `members` to determine whether additional pages exist.
+    pub members_total: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -231,10 +290,11 @@ pub async fn create_group(
     context_path = "/api/v1/groups",
     tag = "groups",
     params(
-        ("id" = Uuid, Path, description = "Group ID")
+        ("id" = Uuid, Path, description = "Group ID"),
+        GetGroupQuery,
     ),
     responses(
-        (status = 200, description = "Group details", body = GroupResponse),
+        (status = 200, description = "Group details with paginated members", body = GroupDetailResponse),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -243,7 +303,8 @@ pub async fn create_group(
 pub async fn get_group(
     State(state): State<SharedState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<GroupResponse>> {
+    Query(query): Query<GetGroupQuery>,
+) -> Result<Json<GroupDetailResponse>> {
     // Check if groups table exists first
     let table_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'groups')",
@@ -272,7 +333,36 @@ pub async fn get_group(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Group not found".to_string()))?;
 
-    Ok(Json(GroupResponse::from(group)))
+    let member_limit = query.limit();
+    let member_offset = query.offset();
+
+    let members: Vec<MemberRow> = sqlx::query_as(
+        r#"
+        SELECT ugm.user_id, u.username, u.display_name, ugm.joined_at
+        FROM user_group_members ugm
+        JOIN users u ON u.id = ugm.user_id
+        WHERE ugm.group_id = $1
+        ORDER BY ugm.joined_at
+        LIMIT $2
+        OFFSET $3
+        "#,
+    )
+    .bind(id)
+    .bind(member_limit)
+    .bind(member_offset)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // member_count from the group query already holds the total; reuse it
+    // instead of issuing a separate COUNT query.
+    let members_total = group.member_count;
+
+    Ok(Json(GroupDetailResponse {
+        group: GroupResponse::from(group),
+        members: members.into_iter().map(GroupMemberResponse::from).collect(),
+        members_total,
+    }))
 }
 
 /// Update a group
@@ -461,6 +551,8 @@ pub async fn remove_members(
     components(schemas(
         GroupRow,
         GroupResponse,
+        GroupMemberResponse,
+        GroupDetailResponse,
         GroupListResponse,
         CreateGroupRequest,
         CreatedGroupRow,
@@ -502,6 +594,57 @@ mod tests {
         let query: ListGroupsQuery = serde_json::from_str(json).unwrap();
         assert_eq!(query.search, Some("admin".to_string()));
         assert!(query.page.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // GetGroupQuery deserialization and pagination logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_group_query_defaults() {
+        let json = r#"{}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert!(query.member_limit.is_none());
+        assert!(query.member_offset.is_none());
+        assert_eq!(query.limit(), 50);
+        assert_eq!(query.offset(), 0);
+    }
+
+    #[test]
+    fn test_get_group_query_custom_values() {
+        let json = r#"{"member_limit": 10, "member_offset": 20}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 10);
+        assert_eq!(query.offset(), 20);
+    }
+
+    #[test]
+    fn test_get_group_query_limit_clamped_to_max() {
+        let json = r#"{"member_limit": 500}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 200);
+    }
+
+    #[test]
+    fn test_get_group_query_limit_clamped_to_min() {
+        let json = r#"{"member_limit": 0}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 1);
+    }
+
+    #[test]
+    fn test_get_group_query_limit_at_boundary() {
+        let json = r#"{"member_limit": 200}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 200);
+    }
+
+    #[test]
+    fn test_get_group_query_offset_only() {
+        let json = r#"{"member_offset": 100}"#;
+        let query: GetGroupQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.limit(), 50);
+        assert_eq!(query.offset(), 100);
     }
 
     // -----------------------------------------------------------------------
@@ -594,7 +737,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // GroupRow → GroupResponse conversion
+    // GroupRow -> GroupResponse conversion
     // -----------------------------------------------------------------------
 
     #[test]
@@ -752,6 +895,215 @@ mod tests {
         assert_eq!(json["items"].as_array().unwrap().len(), 1);
         assert_eq!(json["pagination"]["page"], 1);
         assert_eq!(json["pagination"]["total"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // MemberRow -> GroupMemberResponse conversion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_member_row_to_response() {
+        let now = Utc::now();
+        let row = MemberRow {
+            user_id: Uuid::nil(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            joined_at: now,
+        };
+        let resp: GroupMemberResponse = row.into();
+        assert_eq!(resp.user_id, Uuid::nil());
+        assert_eq!(resp.username, "alice");
+        assert_eq!(resp.display_name, Some("Alice".to_string()));
+        assert_eq!(resp.joined_at, now);
+    }
+
+    #[test]
+    fn test_member_row_to_response_no_display_name() {
+        let row = MemberRow {
+            user_id: Uuid::nil(),
+            username: "bob".to_string(),
+            display_name: None,
+            joined_at: Utc::now(),
+        };
+        let resp: GroupMemberResponse = row.into();
+        assert_eq!(resp.username, "bob");
+        assert!(resp.display_name.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupMemberResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_member_response_serialization() {
+        let member = GroupMemberResponse {
+            user_id: Uuid::nil(),
+            username: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            joined_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&member).unwrap();
+        assert_eq!(json["user_id"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(json["username"], "alice");
+        assert_eq!(json["display_name"], "Alice");
+        assert!(json["joined_at"].is_string());
+    }
+
+    #[test]
+    fn test_group_member_response_null_display_name() {
+        let member = GroupMemberResponse {
+            user_id: Uuid::nil(),
+            username: "bob".to_string(),
+            display_name: None,
+            joined_at: Utc::now(),
+        };
+        let json = serde_json::to_value(&member).unwrap();
+        assert_eq!(json["username"], "bob");
+        assert!(json["display_name"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupDetailResponse serialization (flatten + members + members_total)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_detail_response_flattens_group_fields() {
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "dev".to_string(),
+                description: Some("Developers".to_string()),
+                member_count: 2,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            members: vec![],
+            members_total: 2,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        // group is flattened: its fields appear at the top level alongside members
+        assert_eq!(json["name"], "dev");
+        assert_eq!(json["description"], "Developers");
+        assert_eq!(json["member_count"], 2);
+        assert!(json["members"].is_array());
+        assert_eq!(json["members_total"], 2);
+        // the nested "group" key should not exist in flattened output
+        assert!(json["group"].is_null());
+    }
+
+    #[test]
+    fn test_group_detail_response_with_members() {
+        let now = Utc::now();
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "admins".to_string(),
+                description: None,
+                member_count: 2,
+                created_at: now,
+                updated_at: now,
+            },
+            members: vec![
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "alice".to_string(),
+                    display_name: Some("Alice".to_string()),
+                    joined_at: now,
+                },
+                GroupMemberResponse {
+                    user_id: Uuid::nil(),
+                    username: "bob".to_string(),
+                    display_name: None,
+                    joined_at: now,
+                },
+            ],
+            members_total: 2,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["username"], "alice");
+        assert_eq!(members[1]["username"], "bob");
+        assert!(members[1]["display_name"].is_null());
+        assert_eq!(json["members_total"], 2);
+    }
+
+    #[test]
+    fn test_group_detail_response_empty_members() {
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "empty".to_string(),
+                description: None,
+                member_count: 0,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            members: vec![],
+            members_total: 0,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["member_count"], 0);
+        assert!(json["members"].as_array().unwrap().is_empty());
+        assert_eq!(json["members_total"], 0);
+    }
+
+    #[test]
+    fn test_group_detail_response_contains_all_group_fields() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id,
+                name: "ops".to_string(),
+                description: Some("Operations".to_string()),
+                member_count: 1,
+                created_at: now,
+                updated_at: now,
+            },
+            members: vec![GroupMemberResponse {
+                user_id: Uuid::new_v4(),
+                username: "carol".to_string(),
+                display_name: Some("Carol".to_string()),
+                joined_at: now,
+            }],
+            members_total: 1,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["id"], id.to_string());
+        assert_eq!(json["name"], "ops");
+        assert_eq!(json["description"], "Operations");
+        assert_eq!(json["member_count"], 1);
+        assert!(json["created_at"].is_string());
+        assert!(json["updated_at"].is_string());
+        assert_eq!(json["members"].as_array().unwrap().len(), 1);
+        assert_eq!(json["members_total"], 1);
+    }
+
+    #[test]
+    fn test_group_detail_response_members_total_exceeds_page() {
+        let now = Utc::now();
+        let detail = GroupDetailResponse {
+            group: GroupResponse {
+                id: Uuid::nil(),
+                name: "large".to_string(),
+                description: None,
+                member_count: 500,
+                created_at: now,
+                updated_at: now,
+            },
+            members: vec![GroupMemberResponse {
+                user_id: Uuid::nil(),
+                username: "first".to_string(),
+                display_name: None,
+                joined_at: now,
+            }],
+            members_total: 500,
+        };
+        let json = serde_json::to_value(&detail).unwrap();
+        // Only 1 member in the page but total is 500
+        assert_eq!(json["members"].as_array().unwrap().len(), 1);
+        assert_eq!(json["members_total"], 500);
     }
 
     #[test]
