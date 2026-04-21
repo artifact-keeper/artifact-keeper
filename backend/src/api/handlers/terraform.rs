@@ -153,6 +153,14 @@ async fn list_module_versions(
         .map(|v| serde_json::json!({ "version": v }))
         .collect();
 
+    if version_list.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Module {} not found", module_name),
+        )
+            .into_response());
+    }
+
     let json = serde_json::json!({
         "modules": [{
             "versions": version_list,
@@ -699,6 +707,14 @@ async fn list_provider_versions(
             })
         })
         .collect();
+
+    if versions.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Provider {} not found", provider_name),
+        )
+            .into_response());
+    }
 
     let json = serde_json::json!({
         "versions": versions,
