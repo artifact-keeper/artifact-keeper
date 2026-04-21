@@ -32,6 +32,7 @@ pub mod password_policy;
 pub mod peer_instance_label_service;
 pub mod peer_instance_service;
 pub mod peer_service;
+pub mod permission_service;
 pub mod plugin_registry;
 pub mod plugin_service;
 pub mod policy_service;

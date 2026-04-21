@@ -13,6 +13,7 @@ use crate::services::artifact_service::ArtifactService;
 use crate::services::dependency_track_service::DependencyTrackService;
 use crate::services::event_bus::EventBus;
 use crate::services::meili_service::MeiliService;
+use crate::services::permission_service::PermissionService;
 use crate::services::plugin_registry::PluginRegistry;
 use crate::services::proxy_service::ProxyService;
 use crate::services::quality_check_service::QualityCheckService;
@@ -79,6 +80,7 @@ pub struct AppState {
     pub meili_service: Option<Arc<MeiliService>>,
     pub dependency_track: Option<Arc<DependencyTrackService>>,
     pub quality_check_service: Option<Arc<QualityCheckService>>,
+    pub permission_service: Arc<PermissionService>,
     pub proxy_service: Option<Arc<ProxyService>>,
     pub smtp_service: Option<Arc<SmtpService>>,
     pub metrics_handle: Option<Arc<PrometheusHandle>>,
@@ -101,6 +103,7 @@ impl AppState {
         storage: Arc<dyn StorageBackend>,
         storage_registry: Arc<StorageRegistry>,
     ) -> Self {
+        let permission_service = Arc::new(PermissionService::new(db.clone()));
         Self {
             config,
             db,
@@ -112,6 +115,7 @@ impl AppState {
             quality_check_service: None,
             meili_service: None,
             dependency_track: None,
+            permission_service,
             proxy_service: None,
             smtp_service: None,
             metrics_handle: None,
@@ -131,6 +135,7 @@ impl AppState {
         plugin_registry: Arc<PluginRegistry>,
         wasm_plugin_service: Arc<WasmPluginService>,
     ) -> Self {
+        let permission_service = Arc::new(PermissionService::new(db.clone()));
         Self {
             config,
             db,
@@ -142,6 +147,7 @@ impl AppState {
             quality_check_service: None,
             meili_service: None,
             dependency_track: None,
+            permission_service,
             proxy_service: None,
             smtp_service: None,
             metrics_handle: None,
