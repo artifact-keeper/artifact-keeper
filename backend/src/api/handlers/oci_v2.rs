@@ -62,14 +62,24 @@ fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
         .unwrap()
 }
 
-fn www_authenticate_header(host: &str) -> String {
-    format!(
-        "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\"",
-        host
-    )
+fn www_authenticate_header(host: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(s) => format!(
+            "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\",scope=\"{}\"",
+            host, s
+        ),
+        None => format!(
+            "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\"",
+            host
+        ),
+    }
 }
 
 fn unauthorized_challenge(host: &str) -> Response {
+    unauthorized_challenge_with_scope(host, None)
+}
+
+fn unauthorized_challenge_with_scope(host: &str, scope: Option<&str>) -> Response {
     let body = OciErrorResponse {
         errors: vec![OciErrorEntry {
             code: "UNAUTHORIZED".to_string(),
@@ -80,7 +90,7 @@ fn unauthorized_challenge(host: &str) -> Response {
     let json = serde_json::to_string(&body).unwrap_or_default();
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header("WWW-Authenticate", www_authenticate_header(host))
+        .header("WWW-Authenticate", www_authenticate_header(host, scope))
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(json))
         .unwrap()
@@ -134,6 +144,91 @@ fn validate_token(
     auth_service.validate_access_token(&token).map_err(|_| ())
 }
 
+/// Credential extracted from an OCI request's Authorization header.
+///
+/// `Bearer` carries a JWT token (the standard OCI token-exchange flow).
+/// `Basic` carries username + password/api-token (curl, CI runners, HTTP
+/// clients that skip the token exchange).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OciCredential {
+    Bearer(String),
+    Basic { username: String, password: String },
+}
+
+/// Parse the Authorization header into an [`OciCredential`].
+///
+/// Returns `None` when the header is missing, empty, or uses an unsupported
+/// scheme.  Bearer is tried first so that a valid JWT is never accidentally
+/// interpreted as a base64-encoded Basic credential.
+fn extract_oci_credential(headers: &HeaderMap) -> Option<OciCredential> {
+    if let Some(token) = extract_bearer_token(headers) {
+        return Some(OciCredential::Bearer(token));
+    }
+    if let Some((username, password)) = extract_basic_credentials(headers) {
+        return Some(OciCredential::Basic { username, password });
+    }
+    None
+}
+
+/// Authenticate an OCI request by trying Bearer token first, then falling back
+/// to Basic credentials (username/password or username/api-token).  This mirrors
+/// the `version_check` logic so that Docker, Podman, and plain HTTP clients can
+/// all authenticate regardless of whether they went through the token exchange.
+async fn authenticate_oci(
+    db: &PgPool,
+    config: &crate::config::Config,
+    headers: &HeaderMap,
+) -> Result<crate::services::auth_service::Claims, ()> {
+    let credential = extract_oci_credential(headers).ok_or(())?;
+
+    match credential {
+        OciCredential::Bearer(token) => {
+            let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
+            auth_service.validate_access_token(&token).map_err(|_| ())
+        }
+        OciCredential::Basic { username, password } => {
+            let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
+
+            // Try username/password authentication first.
+            if let Ok((user, _tokens)) = auth_service.authenticate(&username, &password).await {
+                // Re-generate short-lived claims so downstream code has a consistent
+                // Claims value regardless of the authentication method.
+                return auth_service
+                    .generate_tokens(&user)
+                    .map_err(|_| ())
+                    .and_then(|tokens| {
+                        auth_service
+                            .validate_access_token(&tokens.access_token)
+                            .map_err(|_| ())
+                    });
+            }
+
+            // Also try API token in the password field (service accounts, CI pipelines).
+            if let Ok(validation) = auth_service.validate_api_token(&password).await {
+                return auth_service
+                    .generate_tokens(&validation.user)
+                    .map_err(|_| ())
+                    .and_then(|tokens| {
+                        auth_service
+                            .validate_access_token(&tokens.access_token)
+                            .map_err(|_| ())
+                    });
+            }
+
+            Err(())
+        }
+    }
+}
+
+/// Build a Docker/OCI scope string for a repository resource.
+fn pull_scope(image_name: &str) -> String {
+    format!("repository:{}:pull", image_name)
+}
+
+fn push_scope(image_name: &str) -> String {
+    format!("repository:{}:pull,push", image_name)
+}
+
 fn request_host(headers: &HeaderMap) -> String {
     proxy_helpers::request_base_url(headers)
 }
@@ -158,6 +253,96 @@ fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("sha256:{:x}", hasher.finalize())
+}
+
+// ---------------------------------------------------------------------------
+// Tags/list and catalog response types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct TagsListResponse {
+    name: String,
+    tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CatalogResponse {
+    repositories: Vec<String>,
+}
+
+/// Parse `n` and `last` pagination query parameters.
+/// Returns `Err(Response)` with 400 PAGINATION_NUMBER_INVALID when `n` is
+/// present but not a valid non-negative integer.
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+fn parse_pagination_params(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<(usize, Option<String>), Response> {
+    let n = match params.get("n") {
+        Some(v) => v.parse::<usize>().map_err(|_| {
+            oci_error(
+                StatusCode::BAD_REQUEST,
+                "PAGINATION_NUMBER_INVALID",
+                "invalid pagination parameter n",
+            )
+        })?,
+        // OCI spec says "return all tags" without `n`, but we cap at a default
+        // of 100 to prevent unbounded responses.  This matches Docker Hub's
+        // observed behaviour.  A `Link` header is emitted when more results
+        // exist, so well-behaved clients will paginate correctly.
+        None => 100,
+    }
+    .min(10000);
+    let last = params.get("last").cloned();
+    Ok((n, last))
+}
+
+/// Build a `Link` header value for OCI pagination (RFC 5988).
+/// Uses a relative URL which is reliable behind reverse proxies.
+fn build_pagination_link_header(path: &str, last_item: &str, n: usize) -> String {
+    let encoded_last = urlencoding::encode(last_item);
+    format!("<{}?n={}&last={}>; rel=\"next\"", path, n, encoded_last)
+}
+
+fn oci_lexical_cmp(lhs: &str, rhs: &str) -> std::cmp::Ordering {
+    lhs.to_ascii_lowercase()
+        .cmp(&rhs.to_ascii_lowercase())
+        .then_with(|| lhs.cmp(rhs))
+}
+
+/// Apply cursor-based pagination to a lexically sorted list.
+/// Spec reference:
+/// https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#listing-tags
+/// Returns (page, has_more).
+fn apply_cursor_pagination(tags: Vec<String>, last: Option<&str>, n: usize) -> (Vec<String>, bool) {
+    if n == 0 {
+        return (vec![], false);
+    }
+    let start = match last {
+        Some(cursor) => tags.partition_point(|t| {
+            matches!(
+                oci_lexical_cmp(t, cursor),
+                std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+            )
+        }),
+        None => 0,
+    };
+    let end = (start + n).min(tags.len());
+    let has_more = end < tags.len();
+    (tags[start..end].to_vec(), has_more)
+}
+
+/// Merge multiple tag lists, deduplicate, and sort lexically
+/// per OCI Distribution Spec.
+/// Spec reference:
+/// https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#listing-tags
+///
+/// `dedup()` (consecutive-only) is sufficient here because `oci_lexical_cmp`
+/// provides a total order: equal strings are always adjacent after `sort_by`.
+fn merge_and_dedup_tags(tag_sets: Vec<Vec<String>>) -> Vec<String> {
+    let mut all: Vec<String> = tag_sets.into_iter().flatten().collect();
+    all.sort_by(|lhs, rhs| oci_lexical_cmp(lhs, rhs));
+    all.dedup();
+    all
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +427,107 @@ fn normalize_docker_image(image: &str, upstream_url: &str) -> String {
         format!("library/{}", image)
     } else {
         image.to_string()
+    }
+}
+
+/// Check whether `reference` looks like an OCI content-addressable digest
+/// rather than a human-readable tag. The grammar (from the OCI Distribution
+/// Spec) is:
+///
+/// ```text
+/// digest    ::= algorithm ":" encoded
+/// algorithm ::= [a-z0-9]([a-z0-9._+-]*[a-z0-9])?
+/// encoded   ::= [a-zA-Z0-9=_-]+
+/// ```
+fn is_digest_reference(reference: &str) -> bool {
+    let Some((algorithm, encoded)) = reference.split_once(':') else {
+        return false;
+    };
+
+    // OCI spec: algorithm = `[a-z0-9]+([+._-][a-z0-9]+)*` (lowercase only)
+    !algorithm.is_empty()
+        && !encoded.is_empty()
+        && algorithm.chars().all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '+' | '.' | '-')
+        })
+        && encoded
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '=' | '_' | '-'))
+}
+
+fn cached_manifest_reference_key(repo_type: &str, reference: &str, digest: &str) -> String {
+    if repo_type == RepositoryType::Remote && !is_digest_reference(reference) {
+        digest.to_string()
+    } else {
+        reference.to_string()
+    }
+}
+
+async fn cache_manifest_reference_locally(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    reference: &str,
+    content: &Bytes,
+    content_type: Option<&str>,
+) -> Result<String, String> {
+    let digest = compute_sha256(content);
+    let storage = state
+        .storage_for_repo(&repo.location)
+        .map_err(|e| e.to_string())?;
+    let manifest_key = manifest_storage_key(&digest);
+
+    storage
+        .put(&manifest_key, content.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let manifest_content_type = content_type
+        .unwrap_or("application/vnd.oci.image.manifest.v1+json")
+        .to_string();
+    let cached_reference = cached_manifest_reference_key(&repo.repo_type, reference, &digest);
+
+    sqlx::query(
+        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
+             manifest_digest = EXCLUDED.manifest_digest,
+             manifest_content_type = EXCLUDED.manifest_content_type,
+             updated_at = NOW()"#,
+    )
+    .bind(repo.id)
+    .bind(&repo.image)
+    .bind(cached_reference)
+    .bind(&digest)
+    .bind(&manifest_content_type)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(digest)
+}
+
+/// Cache a proxied manifest locally and return its digest. Falls back to
+/// computing the digest without caching if persistence fails.
+async fn cache_manifest_or_compute_digest(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    image_name: &str,
+    reference: &str,
+    content: &Bytes,
+    content_type: Option<&str>,
+) -> String {
+    match cache_manifest_reference_locally(state, repo, reference, content, content_type).await {
+        Ok(digest) => digest,
+        Err(e) => {
+            warn!(
+                image = image_name,
+                reference = reference,
+                error = %e,
+                "Failed to persist proxied manifest locally — \
+                 subsequent pulls will re-fetch from upstream until caching succeeds"
+            );
+            compute_sha256(content)
+        }
     }
 }
 
@@ -331,7 +617,8 @@ async fn token(
                        auth_provider as "auth_provider: crate::models::user::AuthProvider",
                        external_id, is_admin, is_active, is_service_account, must_change_password,
                        totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
-                       last_login_at, created_at, updated_at
+                       failed_login_attempts, locked_until, last_failed_login_at,
+                       password_changed_at, last_login_at, created_at, updated_at
                        FROM users WHERE id = $1"#,
                     claims.sub
                 )
@@ -521,12 +808,20 @@ async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> 
 ///   "test/python/blobs/uploads/uuid" → ("test/python", "uploads", "uuid")
 fn parse_oci_path(path: &str) -> Option<(String, String, Option<String>)> {
     let path = path.trim_start_matches('/');
+    if let Some(name) = path.strip_suffix("/tags/list") {
+        return Some((
+            name.to_string(),
+            "tags".to_string(),
+            Some("list".to_string()),
+        ));
+    }
+
     let parts: Vec<&str> = path.split('/').collect();
 
-    // Find "manifests" or "blobs" in the parts
+    // Find terminal content operations in the remaining path.
     let op_idx = parts
         .iter()
-        .position(|&p| p == "manifests" || p == "blobs" || p == "tags")?;
+        .position(|&p| p == "manifests" || p == "blobs")?;
     let name = parts[..op_idx].join("/");
     let operation = parts[op_idx];
 
@@ -551,9 +846,14 @@ async fn handle_head_blob(
     digest: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -563,7 +863,7 @@ async fn handle_head_blob(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     // Check oci_blobs table
@@ -620,9 +920,14 @@ async fn handle_get_blob(
     digest: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -632,7 +937,7 @@ async fn handle_get_blob(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let blob = sqlx::query!(
@@ -694,9 +999,10 @@ async fn handle_start_upload(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -821,9 +1127,10 @@ async fn handle_patch_upload(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
     let _ = claims;
 
@@ -917,9 +1224,10 @@ async fn handle_complete_upload(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
     let _ = claims;
 
@@ -1057,9 +1365,14 @@ async fn handle_head_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -1069,11 +1382,11 @@ async fn handle_head_manifest(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     // Reference can be a tag or a digest. Look up locally first.
-    let local_result: Option<(String, String)> = if reference.starts_with("sha256:") {
+    let local_result: Option<(String, String)> = if is_digest_reference(reference) {
         sqlx::query!(
             "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
             repo.id, reference
@@ -1123,7 +1436,15 @@ async fn handle_head_manifest(
     if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
     {
-        let digest = compute_sha256(&content);
+        let digest = cache_manifest_or_compute_digest(
+            state,
+            &repo,
+            image_name,
+            reference,
+            &content,
+            ct.as_deref(),
+        )
+        .await;
         return build_oci_proxy_response(
             &content,
             ct,
@@ -1147,9 +1468,14 @@ async fn handle_get_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
+    let scope = pull_scope(image_name);
     let is_anon = is_anonymous_token(headers);
-    if !is_anon && validate_token(&state.db, &state.config, headers).is_err() {
-        return unauthorized_challenge(&host);
+    if !is_anon
+        && authenticate_oci(&state.db, &state.config, headers)
+            .await
+            .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -1159,10 +1485,10 @@ async fn handle_get_manifest(
 
     // Anonymous tokens may only access public repositories.
     if is_anon && !repo.is_public {
-        return unauthorized_challenge(&host);
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
     }
 
-    let local_result: Option<(String, String)> = if reference.starts_with("sha256:") {
+    let local_result: Option<(String, String)> = if is_digest_reference(reference) {
         sqlx::query!(
             "SELECT manifest_digest, manifest_content_type FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2 LIMIT 1",
             repo.id, reference
@@ -1212,7 +1538,15 @@ async fn handle_get_manifest(
     if let Some((content, ct)) =
         try_upstream_fetch(&repo, state, &format!("manifests/{}", reference)).await
     {
-        let digest = compute_sha256(&content);
+        let digest = cache_manifest_or_compute_digest(
+            state,
+            &repo,
+            image_name,
+            reference,
+            &content,
+            ct.as_deref(),
+        )
+        .await;
         return build_oci_proxy_response(
             &content,
             ct,
@@ -1237,9 +1571,10 @@ async fn handle_put_manifest(
     body: Bytes,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
 
     let repo = match resolve_repo(&state.db, image_name).await {
@@ -1370,8 +1705,748 @@ async fn handle_put_manifest(
 }
 
 // ---------------------------------------------------------------------------
-// DELETE manifest handler
+// Tags list handler
 // ---------------------------------------------------------------------------
+
+async fn handle_tags_list(
+    state: &SharedState,
+    headers: &HeaderMap,
+    image_name: &str,
+    query: &std::collections::HashMap<String, String>,
+) -> Response {
+    let host = request_host(headers);
+    let scope = pull_scope(image_name);
+    if authenticate_oci(&state.db, &state.config, headers)
+        .await
+        .is_err()
+    {
+        return unauthorized_challenge_with_scope(&host, Some(&scope));
+    }
+
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    let (n, last) = match parse_pagination_params(query) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // n=0: return empty list per spec
+    if n == 0 {
+        return build_tags_response(&repo.image, vec![]);
+    }
+
+    let (page, has_more) = match resolve_tags_page(state, &repo, n, last.as_deref()).await {
+        Ok(page) => page,
+        Err(e) => return e,
+    };
+
+    // OCI spec: return 404 NAME_UNKNOWN when the repository name is not
+    // known to the registry. For local repos, if the first page is empty
+    // and no cursor was provided, the image has never been pushed.
+    if page.is_empty()
+        && !has_more
+        && last.is_none()
+        && repo.repo_type != RepositoryType::Remote
+        && !local_tags_exist(&state.db, repo.id, &repo.image)
+            .await
+            .unwrap_or(false)
+    {
+        return oci_error(
+            StatusCode::NOT_FOUND,
+            "NAME_UNKNOWN",
+            &format!("repository name not known to registry: {}", image_name),
+        );
+    }
+
+    build_tags_response_with_pagination(&repo.image, page, has_more, image_name, n)
+}
+
+async fn resolve_tags_page(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    n: usize,
+    last: Option<&str>,
+) -> Result<(Vec<String>, bool), Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        return resolve_remote_tags_page(state, repo, n, last).await;
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        return resolve_virtual_tags_page(state, repo, n, last).await;
+    }
+
+    resolve_local_tags_page(state, repo, n, last).await
+}
+
+async fn resolve_remote_tags_page(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    n: usize,
+    last: Option<&str>,
+) -> Result<(Vec<String>, bool), Response> {
+    match tags_list_remote(state, repo, n, last).await {
+        Ok(page) => Ok(page),
+        Err(err) => {
+            warn!(
+                repo = %repo.key,
+                image = %repo.image,
+                status = %err.status(),
+                "Upstream tags/list failed, falling back to cached tags"
+            );
+            let cached_page = tags_list_local(&state.db, repo.id, &repo.image, last, n).await?;
+            let cache_populated = if cached_page.tags.is_empty() {
+                local_tags_exist(&state.db, repo.id, &repo.image).await?
+            } else {
+                true
+            };
+            finalize_remote_tags_page(Err(err), cached_page, cache_populated)
+        }
+    }
+}
+
+/// Resolve a single page of tags for a virtual repository.
+///
+/// The cursor (`last`) is forwarded to each member query **and** applied again
+/// on the merged result.  This double application is intentional: member repos
+/// (especially remote upstreams) may sort tags differently than our canonical
+/// `oci_lexical_cmp` order, so tags that the upstream considers "after" the
+/// cursor may land "before" it in our ordering.  The second pass in
+/// `apply_cursor_pagination` catches these strays and keeps pagination correct.
+async fn resolve_virtual_tags_page(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    n: usize,
+    last: Option<&str>,
+) -> Result<(Vec<String>, bool), Response> {
+    let tags = tags_list_virtual(state, repo, n, last).await?;
+    Ok(apply_cursor_pagination(tags, last, n))
+}
+
+async fn resolve_local_tags_page(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    n: usize,
+    last: Option<&str>,
+) -> Result<(Vec<String>, bool), Response> {
+    let page = tags_list_local(&state.db, repo.id, &repo.image, last, n).await?;
+    Ok((page.tags, page.has_more))
+}
+
+/// Build a JSON response for tags/list with no pagination.
+fn build_tags_response(image: &str, tags: Vec<String>) -> Response {
+    let resp = TagsListResponse {
+        name: image.to_string(),
+        tags,
+    };
+    let json = serde_json::to_string(&resp).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, json.len().to_string())
+        .body(Body::from(json))
+        .unwrap()
+}
+
+/// Build a JSON response for tags/list with optional Link pagination header.
+fn build_tags_response_with_pagination(
+    image: &str,
+    page: Vec<String>,
+    has_more: bool,
+    image_name: &str,
+    n: usize,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json");
+
+    if has_more {
+        if let Some(last_tag) = page.last() {
+            let path = format!("/v2/{}/tags/list", image_name);
+            let link = build_pagination_link_header(&path, last_tag, n);
+            builder = builder.header("Link", link);
+        }
+    }
+
+    let resp = TagsListResponse {
+        name: image.to_string(),
+        tags: page,
+    };
+    let json = serde_json::to_string(&resp).unwrap_or_default();
+    builder
+        .header(CONTENT_LENGTH, json.len().to_string())
+        .body(Body::from(json))
+        .unwrap()
+}
+
+/// Build the upstream `tags/list` path for direct remote repositories.
+///
+/// Requests one extra tag so this server can determine whether it should emit
+/// its own `Link` header while still returning at most `n` tags to the client.
+fn build_remote_tags_list_path(n: usize, last: Option<&str>) -> String {
+    let mut path = format!("tags/list?n={}", n.saturating_add(1));
+    if let Some(last) = last {
+        path.push_str("&last=");
+        path.push_str(&urlencoding::encode(last));
+    }
+    path
+}
+
+/// Extract the upstream `last` cursor from an OCI pagination `Link` header.
+fn parse_upstream_pagination_last(link: &str) -> Option<String> {
+    let selected = link
+        .split(',')
+        .map(str::trim)
+        .find(|segment| segment.contains("rel=\"next\""))?;
+
+    let target = selected
+        .split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(uri, _)| uri)?;
+    let query = target.split_once('?')?.1;
+
+    serde_urlencoded::from_str::<Vec<(String, String)>>(query)
+        .ok()?
+        .into_iter()
+        .find_map(|(key, value)| (key == "last").then_some(value))
+}
+
+/// Trim the extra upstream tag used to detect whether another page exists.
+fn split_remote_tags_page(
+    mut tags: Vec<String>,
+    n: usize,
+    upstream_has_more: bool,
+) -> (Vec<String>, bool) {
+    let has_more = upstream_has_more || tags.len() > n;
+    if has_more {
+        tags.truncate(n);
+    }
+    (tags, has_more)
+}
+
+#[allow(clippy::result_large_err)] // Response-as-error is used throughout this module
+fn finalize_remote_tags_page(
+    upstream: Result<(Vec<String>, bool), Response>,
+    cached_page: LocalTagsPage,
+    cache_populated: bool,
+) -> Result<(Vec<String>, bool), Response> {
+    match upstream {
+        Ok(page) => Ok(page),
+        Err(err) => {
+            if !cache_populated {
+                Err(err)
+            } else {
+                Ok((cached_page.tags, cached_page.has_more))
+            }
+        }
+    }
+}
+
+fn missing_upload_uuid_response() -> Response {
+    oci_error(
+        StatusCode::NOT_FOUND,
+        "BLOB_UPLOAD_UNKNOWN",
+        "upload UUID required",
+    )
+}
+
+/// Build a SQL query for local tags, excluding digest references (which
+/// contain a ':' character, e.g. "sha256:abc…") so only human-readable tags
+/// are returned. This uses `POSITION(':' IN tag) = 0` as a fast SQL-side
+/// filter; the more precise `is_digest_reference()` is used on the Rust side
+/// when validating individual references.
+fn local_tags_query(has_cursor: bool) -> &'static str {
+    if has_cursor {
+        r#"SELECT tag
+           FROM (
+               SELECT DISTINCT tag
+               FROM oci_tags
+               WHERE repository_id = $1
+                 AND name = $2
+                 AND POSITION(':' IN tag) = 0
+                 AND (LOWER(tag), tag) > (LOWER($3), $3)
+           ) local_tags
+           ORDER BY LOWER(tag), tag
+           LIMIT $4"#
+    } else {
+        r#"SELECT tag
+           FROM (
+               SELECT DISTINCT tag
+               FROM oci_tags
+               WHERE repository_id = $1
+                 AND name = $2
+                 AND POSITION(':' IN tag) = 0
+           ) local_tags
+           ORDER BY LOWER(tag), tag
+           LIMIT $3"#
+    }
+}
+
+struct LocalTagsPage {
+    tags: Vec<String>,
+    has_more: bool,
+}
+
+async fn local_tags_exist(db: &PgPool, repo_id: Uuid, image_name: &str) -> Result<bool, Response> {
+    sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+               SELECT 1
+               FROM oci_tags
+               WHERE repository_id = $1
+                 AND name = $2
+                 AND POSITION(':' IN tag) = 0
+           )"#,
+    )
+    .bind(repo_id)
+    .bind(image_name)
+    .fetch_one(db)
+    .await
+    .map_err(|e| {
+        warn!("Failed to check cached tags for {}: {}", image_name, e);
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "failed to list tags",
+        )
+    })
+}
+
+async fn tags_list_local(
+    db: &PgPool,
+    repo_id: Uuid,
+    image_name: &str,
+    last: Option<&str>,
+    n: usize,
+) -> Result<LocalTagsPage, Response> {
+    let limit = (n.saturating_add(1)) as i64;
+    let rows = if let Some(last) = last {
+        sqlx::query_scalar::<_, String>(local_tags_query(true))
+            .bind(repo_id)
+            .bind(image_name)
+            .bind(last)
+            .bind(limit)
+            .fetch_all(db)
+            .await
+    } else {
+        sqlx::query_scalar::<_, String>(local_tags_query(false))
+            .bind(repo_id)
+            .bind(image_name)
+            .bind(limit)
+            .fetch_all(db)
+            .await
+    };
+
+    rows.map(|tags| {
+        let (tags, has_more) = split_remote_tags_page(tags, n, false);
+        LocalTagsPage { tags, has_more }
+    })
+    .map_err(|e| {
+        warn!("Failed to list tags for {}: {}", image_name, e);
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "failed to list tags",
+        )
+    })
+}
+
+struct UpstreamTagsPage {
+    tags: Vec<String>,
+    next_last: Option<String>,
+}
+
+async fn fetch_upstream_tags_page(
+    state: &SharedState,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    image: &str,
+    n: usize,
+    last: Option<&str>,
+) -> Result<UpstreamTagsPage, Response> {
+    let proxy = state.proxy_service.as_ref().ok_or_else(|| {
+        oci_error(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "proxy service unavailable",
+        )
+    })?;
+
+    let upstream_path = format!("v2/{}/{}", image, build_remote_tags_list_path(n, last));
+    let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached_with_link(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+    )
+    .await
+    .map_err(|resp| match resp.status() {
+        StatusCode::NOT_FOUND => oci_error(
+            StatusCode::NOT_FOUND,
+            "NAME_UNKNOWN",
+            "repository not found upstream",
+        ),
+        _ => oci_error(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "failed to fetch tags from upstream",
+        ),
+    })?;
+
+    let parsed = serde_json::from_slice::<serde_json::Value>(&content).map_err(|e| {
+        warn!("Invalid upstream tags/list response for {}: {}", image, e);
+        oci_error(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "invalid upstream tags response",
+        )
+    })?;
+    let tags = parsed["tags"].as_array().ok_or_else(|| {
+        warn!(
+            "Upstream tags/list response for {} is missing a tags array",
+            image
+        );
+        oci_error(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "invalid upstream tags response",
+        )
+    })?;
+
+    Ok(UpstreamTagsPage {
+        tags: tags
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect(),
+        next_last: link.as_deref().and_then(parse_upstream_pagination_last),
+    })
+}
+
+async fn collect_upstream_tags(
+    state: &SharedState,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    image: &str,
+    max_tags: usize,
+    last: Option<&str>,
+) -> Result<(Vec<String>, bool), Response> {
+    if max_tags == 0 {
+        return Ok((vec![], false));
+    }
+
+    let mut collected = Vec::new();
+    let mut cursor = last.map(String::from);
+    let mut pages_fetched = 0usize;
+
+    loop {
+        let remaining = max_tags.saturating_sub(collected.len());
+        if remaining == 0 {
+            return Ok((collected, false));
+        }
+
+        let page = fetch_upstream_tags_page(
+            state,
+            repo_id,
+            repo_key,
+            upstream_url,
+            image,
+            remaining,
+            cursor.as_deref(),
+        )
+        .await?;
+        pages_fetched += 1;
+
+        if pages_fetched > 1024 {
+            warn!(
+                "Stopping upstream tags pagination for {} after {} pages to avoid a loop",
+                image, pages_fetched
+            );
+            return Ok((collected, true));
+        }
+
+        let had_extra_item = page.tags.len() > remaining;
+        if had_extra_item {
+            collected.extend(page.tags.into_iter().take(remaining));
+            return Ok((collected, true));
+        }
+
+        let before_len = collected.len();
+        collected.extend(page.tags);
+
+        match page.next_last {
+            Some(next_last) if collected.len() < max_tags => {
+                if collected.len() == before_len || cursor.as_deref() == Some(next_last.as_str()) {
+                    warn!(
+                        "Upstream tags pagination for {} returned a non-advancing cursor, stopping early",
+                        image
+                    );
+                    return Ok((collected, true));
+                }
+                cursor = Some(next_last);
+            }
+            Some(_) => return Ok((collected, true)),
+            None => return Ok((collected, false)),
+        }
+    }
+}
+
+/// Fetch all tags from the upstream registry for a remote repo.
+/// Returns a single page and whether another page exists so the caller can
+/// emit artifact-keeper `Link` headers instead of upstream ones.
+async fn tags_list_remote(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    n: usize,
+    last: Option<&str>,
+) -> Result<(Vec<String>, bool), Response> {
+    let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
+        oci_error(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "remote repository has no upstream configured",
+        )
+    })?;
+    let image = normalize_docker_image(&repo.image, upstream_url);
+    let (tags, upstream_has_more) =
+        collect_upstream_tags(state, repo.id, &repo.key, upstream_url, &image, n + 1, last).await?;
+    Ok(split_remote_tags_page(tags, n, upstream_has_more))
+}
+
+/// Aggregate tags from all virtual repo members.
+///
+/// Forward the merged cursor to every member because any tag at or before the
+/// merged cursor cannot appear on the next merged page.
+async fn tags_list_virtual(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    n_limit: usize,
+    last: Option<&str>,
+) -> Result<Vec<String>, Response> {
+    let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+    let member_limit = n_limit.saturating_add(1);
+    let member_cursor = last;
+    let image = repo.image.clone();
+
+    let handles: Vec<_> = members
+        .iter()
+        .map(|member| {
+            let image = image.clone();
+            let member_id = member.id;
+            let member_key = member.key.clone();
+            let repo_type = member.repo_type.clone();
+            let upstream_url = member.upstream_url.clone();
+            async move {
+                if repo_type == RepositoryType::Remote {
+                    fetch_tags_from_remote_member(
+                        state,
+                        member_id,
+                        &member_key,
+                        upstream_url.as_deref(),
+                        &image,
+                        member_limit,
+                        member_cursor,
+                    )
+                    .await
+                } else {
+                    tags_list_local(&state.db, member_id, &image, member_cursor, member_limit)
+                        .await
+                        .ok()
+                        .map(|page| page.tags)
+                }
+            }
+        })
+        .collect();
+
+    let tag_sets: Vec<Vec<String>> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Ok(merge_and_dedup_tags(tag_sets))
+}
+
+/// Fetch tags from a single remote virtual member via upstream proxy.
+async fn fetch_tags_from_remote_member(
+    state: &SharedState,
+    member_id: Uuid,
+    member_key: &str,
+    upstream_url: Option<&str>,
+    image_name: &str,
+    n_limit: usize,
+    last: Option<&str>,
+) -> Option<Vec<String>> {
+    let upstream_url = upstream_url?;
+    let image = normalize_docker_image(image_name, upstream_url);
+    let (tags, upstream_has_more) = collect_upstream_tags(
+        state,
+        member_id,
+        member_key,
+        upstream_url,
+        &image,
+        n_limit,
+        last,
+    )
+    .await
+    .map_err(|_| {
+        tracing::debug!(
+            "Virtual member '{}': upstream tags/list failed, skipping",
+            member_key
+        );
+    })
+    .ok()?;
+
+    tracing::debug!(
+        "Virtual member '{}': fetched {} tags from upstream (has_more={})",
+        member_key,
+        tags.len(),
+        upstream_has_more
+    );
+    Some(tags)
+}
+
+// ---------------------------------------------------------------------------
+// Catalog handler
+// ---------------------------------------------------------------------------
+
+/// List all repositories visible to the authenticated user.
+///
+/// Note: `_catalog` is defined by the Docker Registry HTTP API V2
+/// (distribution/distribution), **not** the OCI Distribution Spec.
+/// Per the Docker spec, the catalog contents are implementation-specific:
+/// registries MAY limit results based on access level. This implementation
+/// returns all repositories to any authenticated user without per-repository
+/// ACL filtering, consistent with Docker Hub and most registry implementations.
+async fn handle_catalog(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    query: Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let host = request_host(&headers);
+    if authenticate_oci(&state.db, &state.config, &headers)
+        .await
+        .is_err()
+    {
+        return unauthorized_challenge(&host);
+    }
+
+    let (n, last) = match parse_pagination_params(&query) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if n == 0 {
+        let resp = CatalogResponse {
+            repositories: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap_or_default();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_LENGTH, json.len().to_string())
+            .body(Body::from(json))
+            .unwrap();
+    }
+
+    // `_catalog` is defined by the Docker Registry HTTP API V2 and is scoped
+    // to repositories available in the local registry cluster. It must not
+    // advertise what may exist only upstream.
+    // Spec reference:
+    // https://github.com/distribution/distribution/blob/v3.0.0/docs/content/spec/api.md#catalog
+    let (page, has_more) = match catalog_local_entries(&state.db, last.as_deref(), n).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json");
+
+    if has_more {
+        if let Some(last_repo) = page.last() {
+            let link = build_pagination_link_header("/v2/_catalog", last_repo, n);
+            builder = builder.header("Link", link);
+        }
+    }
+
+    let resp = CatalogResponse { repositories: page };
+    let json = serde_json::to_string(&resp).unwrap_or_default();
+    builder
+        .header(CONTENT_LENGTH, json.len().to_string())
+        .body(Body::from(json))
+        .unwrap()
+}
+
+/// Fetch a single page of catalog entries from oci_tags using SQL-side
+/// cursor pagination. Returns `(page, has_more)`.
+///
+/// Sorting uses `LOWER()` for case-insensitive primary order (matching
+/// `oci_lexical_cmp`) with a case-sensitive tiebreaker. The cursor
+/// comparison mirrors this ordering so pagination is consistent.
+async fn catalog_local_entries(
+    db: &PgPool,
+    last: Option<&str>,
+    n: usize,
+) -> Result<(Vec<String>, bool), Response> {
+    let limit = (n as i64).saturating_add(1);
+
+    let rows: Vec<(String,)> = if let Some(cursor) = last {
+        sqlx::query_as(
+            "SELECT name FROM ( \
+                 SELECT DISTINCT \
+                     CASE WHEN t.name = r.key OR t.name = '' \
+                          THEN r.key \
+                          ELSE r.key || '/' || t.name \
+                     END AS name \
+                 FROM oci_tags t \
+                 JOIN repositories r ON r.id = t.repository_id \
+             ) catalog \
+             WHERE (LOWER(name), name) > (LOWER($1), $1) \
+             ORDER BY LOWER(name), name \
+             LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(db)
+        .await
+    } else {
+        sqlx::query_as(
+            "SELECT name FROM ( \
+                 SELECT DISTINCT \
+                     CASE WHEN t.name = r.key OR t.name = '' \
+                          THEN r.key \
+                          ELSE r.key || '/' || t.name \
+                     END AS name \
+                 FROM oci_tags t \
+                 JOIN repositories r ON r.id = t.repository_id \
+             ) catalog \
+             ORDER BY LOWER(name), name \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(db)
+        .await
+    }
+    .map_err(|e| {
+        warn!("Failed to query local catalog entries: {}", e);
+        oci_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "failed to list catalog",
+        )
+    })?;
+
+    let mut entries: Vec<String> = rows.into_iter().map(|(name,)| name).collect();
+    let has_more = entries.len() > n;
+    if has_more {
+        entries.truncate(n);
+    }
+    Ok((entries, has_more))
+}
 
 async fn handle_delete_manifest(
     state: &SharedState,
@@ -1380,9 +2455,10 @@ async fn handle_delete_manifest(
     reference: &str,
 ) -> Response {
     let host = request_host(headers);
-    let claims = match validate_token(&state.db, &state.config, headers) {
+    let scope = push_scope(image_name);
+    let claims = match authenticate_oci(&state.db, &state.config, headers).await {
         Ok(c) => c,
-        Err(_) => return unauthorized_challenge(&host),
+        Err(_) => return unauthorized_challenge_with_scope(&host, Some(&scope)),
     };
     let _ = claims;
 
@@ -1486,114 +2562,59 @@ async fn catch_all(
 
     let (image_name, operation, reference) = parsed;
 
+    // Helper to require a reference, reducing repeated match arms
+    macro_rules! require_ref {
+        ($ref:expr, $code:expr, $msg:expr) => {
+            match $ref {
+                Some(r) => r,
+                None => return oci_error(StatusCode::BAD_REQUEST, $code, $msg),
+            }
+        };
+    }
+
     match (method.as_str(), operation.as_str()) {
-        // Blob operations
         ("HEAD", "blobs") => {
-            let digest = match reference {
-                Some(d) => d,
-                None => {
-                    return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "digest required")
-                }
-            };
-            handle_head_blob(&state, &headers, &image_name, &digest).await
+            let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
+            handle_head_blob(&state, &headers, &image_name, &d).await
         }
         ("GET", "blobs") => {
-            let digest = match reference {
-                Some(d) => d,
-                None => {
-                    return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "digest required")
-                }
-            };
-            handle_get_blob(&state, &headers, &image_name, &digest).await
+            let d = require_ref!(reference, "DIGEST_INVALID", "digest required");
+            handle_get_blob(&state, &headers, &image_name, &d).await
         }
-
-        // Upload operations
         ("POST", "uploads") => {
             let digest = query.get("digest").map(|s| s.as_str());
             handle_start_upload(&state, &headers, &image_name, digest, body).await
         }
         ("PATCH", "uploads") => {
-            let uuid = match reference {
-                Some(u) => u,
-                None => {
-                    return oci_error(
-                        StatusCode::NOT_FOUND,
-                        "BLOB_UPLOAD_UNKNOWN",
-                        "upload UUID required",
-                    )
-                }
+            let Some(u) = reference else {
+                return missing_upload_uuid_response();
             };
-            handle_patch_upload(&state, &headers, &image_name, &uuid, body).await
+            handle_patch_upload(&state, &headers, &image_name, &u, body).await
         }
         ("PUT", "uploads") => {
-            let uuid = match reference {
-                Some(u) => u,
-                None => {
-                    return oci_error(
-                        StatusCode::NOT_FOUND,
-                        "BLOB_UPLOAD_UNKNOWN",
-                        "upload UUID required",
-                    )
-                }
+            let Some(u) = reference else {
+                return missing_upload_uuid_response();
             };
             let digest = query.get("digest").map(|s| s.as_str());
-            handle_complete_upload(&state, &headers, &image_name, &uuid, digest, body).await
+            handle_complete_upload(&state, &headers, &image_name, &u, digest, body).await
         }
-
-        // Manifest operations
         ("HEAD", "manifests") => {
-            let reference = match reference {
-                Some(r) => r,
-                None => {
-                    return oci_error(
-                        StatusCode::BAD_REQUEST,
-                        "NAME_INVALID",
-                        "reference required",
-                    )
-                }
-            };
-            handle_head_manifest(&state, &headers, &image_name, &reference).await
+            let r = require_ref!(reference, "NAME_INVALID", "reference required");
+            handle_head_manifest(&state, &headers, &image_name, &r).await
         }
         ("GET", "manifests") => {
-            let reference = match reference {
-                Some(r) => r,
-                None => {
-                    return oci_error(
-                        StatusCode::BAD_REQUEST,
-                        "NAME_INVALID",
-                        "reference required",
-                    )
-                }
-            };
-            handle_get_manifest(&state, &headers, &image_name, &reference).await
+            let r = require_ref!(reference, "NAME_INVALID", "reference required");
+            handle_get_manifest(&state, &headers, &image_name, &r).await
         }
         ("PUT", "manifests") => {
-            let reference = match reference {
-                Some(r) => r,
-                None => {
-                    return oci_error(
-                        StatusCode::BAD_REQUEST,
-                        "NAME_INVALID",
-                        "reference required",
-                    )
-                }
-            };
-            handle_put_manifest(&state, &headers, &image_name, &reference, body).await
+            let r = require_ref!(reference, "NAME_INVALID", "reference required");
+            handle_put_manifest(&state, &headers, &image_name, &r, body).await
         }
         ("DELETE", "manifests") => {
-            let reference = match reference {
-                Some(r) => r,
-                None => {
-                    return oci_error(
-                        StatusCode::BAD_REQUEST,
-                        "NAME_INVALID",
-                        "reference required",
-                    )
-                }
-            };
-            handle_delete_manifest(&state, &headers, &image_name, &reference).await
+            let r = require_ref!(reference, "NAME_INVALID", "reference required");
+            handle_delete_manifest(&state, &headers, &image_name, &r).await
         }
-
+        ("GET", "tags") => handle_tags_list(&state, &headers, &image_name, &query).await,
         _ => oci_error(
             StatusCode::METHOD_NOT_ALLOWED,
             "UNSUPPORTED",
@@ -1610,6 +2631,7 @@ pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(version_check))
         .route("/token", get(token).post(token))
+        .route("/_catalog", get(handle_catalog))
         .fallback(catch_all)
         .layer(DefaultBodyLimit::disable())
 }
@@ -1751,15 +2773,41 @@ mod tests {
 
     #[test]
     fn test_www_authenticate_header_with_scheme() {
-        let header = www_authenticate_header("http://localhost:8080");
+        let header = www_authenticate_header("http://localhost:8080", None);
         assert!(header.contains("realm=\"http://localhost:8080/v2/token\""));
         assert!(header.contains("service=\"artifact-keeper\""));
     }
 
     #[test]
     fn test_www_authenticate_header_https() {
-        let header = www_authenticate_header("https://registry.example.com");
+        let header = www_authenticate_header("https://registry.example.com", None);
         assert!(header.contains("https://registry.example.com/v2/token"));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_with_scope() {
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:myrepo/myimage:pull"),
+        );
+        assert!(header.contains("realm=\"https://registry.example.com/v2/token\""));
+        assert!(header.contains("service=\"artifact-keeper\""));
+        assert!(header.contains("scope=\"repository:myrepo/myimage:pull\""));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_with_push_scope() {
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:myrepo/myimage:pull,push"),
+        );
+        assert!(header.contains("scope=\"repository:myrepo/myimage:pull,push\""));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_no_scope_omits_scope_field() {
+        let header = www_authenticate_header("https://registry.example.com", None);
+        assert!(!header.contains("scope="));
     }
 
     // -----------------------------------------------------------------------
@@ -1776,6 +2824,63 @@ mod tests {
     fn test_unauthorized_challenge_has_www_authenticate_header() {
         let resp = unauthorized_challenge("http://localhost");
         assert!(resp.headers().get("WWW-Authenticate").is_some());
+    }
+
+    #[test]
+    fn test_unauthorized_challenge_with_scope_includes_scope() {
+        let resp = unauthorized_challenge_with_scope(
+            "https://registry.example.com",
+            Some("repository:docker/openjdk:pull"),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(header.contains("scope=\"repository:docker/openjdk:pull\""));
+    }
+
+    #[test]
+    fn test_unauthorized_challenge_with_scope_none_omits_scope() {
+        let resp = unauthorized_challenge_with_scope("https://registry.example.com", None);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!header.contains("scope="));
+    }
+
+    // -----------------------------------------------------------------------
+    // pull_scope / push_scope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pull_scope() {
+        assert_eq!(
+            pull_scope("docker/openjdk"),
+            "repository:docker/openjdk:pull"
+        );
+    }
+
+    #[test]
+    fn test_push_scope() {
+        assert_eq!(
+            push_scope("docker/openjdk"),
+            "repository:docker/openjdk:pull,push"
+        );
+    }
+
+    #[test]
+    fn test_pull_scope_nested_name() {
+        assert_eq!(
+            pull_scope("myrepo/org/image"),
+            "repository:myrepo/org/image:pull"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2085,6 +3190,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_oci_path_allows_tags_in_repository_name() {
+        let result = parse_oci_path("acme/tags/api/manifests/latest");
+        let (name, op, reference) = result.unwrap();
+        assert_eq!(name, "acme/tags/api");
+        assert_eq!(op, "manifests");
+        assert_eq!(reference, Some("latest".to_string()));
+    }
+
+    #[test]
+    fn test_parse_oci_path_allows_repo_key_named_tags() {
+        let result = parse_oci_path("tags/myimage/manifests/latest");
+        let (name, op, reference) = result.unwrap();
+        assert_eq!(name, "tags/myimage");
+        assert_eq!(op, "manifests");
+        assert_eq!(reference, Some("latest".to_string()));
+    }
+
+    #[test]
     fn test_parse_oci_path_blobs_no_digest() {
         let result = parse_oci_path("test/image/blobs");
         let (name, op, reference) = result.unwrap();
@@ -2100,6 +3223,175 @@ mod tests {
         assert_eq!(name, "test/image");
         assert_eq!(op, "manifests");
         assert_eq!(reference, Some("sha256:abc123".to_string()));
+    }
+
+    #[test]
+    fn test_is_digest_reference_accepts_sha256_reference() {
+        assert!(is_digest_reference(
+            "sha256:4d3f1c5bcf9f2f7e4a3e2d1c0b9a887766554433221100ffeeddccbbaa998877"
+        ));
+    }
+
+    #[test]
+    fn test_is_digest_reference_accepts_non_hex_encoded() {
+        // OCI spec allows [a-zA-Z0-9=_-]+ in the encoded part
+        assert!(is_digest_reference(
+            "multihash+base58:QmRZxt2b1FVZPNqd8hsiykDL3TdBDeTSPX9Kv46HmX4Kgd"
+        ));
+    }
+
+    #[test]
+    fn test_is_digest_reference_rejects_tag_name() {
+        assert!(!is_digest_reference("latest"));
+    }
+
+    #[test]
+    fn test_is_digest_reference_rejects_tag_with_dot() {
+        assert!(!is_digest_reference("v1.0.0"));
+    }
+
+    #[test]
+    fn test_cached_manifest_reference_key_uses_digest_for_remote_tags() {
+        assert_eq!(
+            cached_manifest_reference_key("remote", "latest", "sha256:abc"),
+            "sha256:abc"
+        );
+    }
+
+    #[test]
+    fn test_cached_manifest_reference_key_preserves_remote_digest_reference() {
+        assert_eq!(
+            cached_manifest_reference_key("remote", "sha256:def", "sha256:def"),
+            "sha256:def"
+        );
+    }
+
+    #[test]
+    fn test_cached_manifest_reference_key_preserves_local_tags() {
+        assert_eq!(
+            cached_manifest_reference_key("local", "latest", "sha256:abc"),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn test_build_remote_tags_list_path_without_cursor() {
+        let path = build_remote_tags_list_path(100, None);
+        assert_eq!(path, "tags/list?n=101");
+    }
+
+    #[test]
+    fn test_build_remote_tags_list_path_forwards_cursor() {
+        let path = build_remote_tags_list_path(50, Some("release+candidate"));
+        assert_eq!(path, "tags/list?n=51&last=release%2Bcandidate");
+    }
+
+    #[test]
+    fn test_local_tags_query_without_cursor_filters_digests_and_limits_in_sql() {
+        let query = local_tags_query(false);
+        assert!(query.contains("POSITION(':' IN tag) = 0"));
+        assert!(query.contains("ORDER BY LOWER(tag), tag"));
+        assert!(query.contains("LIMIT $3"));
+    }
+
+    #[test]
+    fn test_local_tags_query_with_cursor_applies_cursor_in_sql() {
+        let query = local_tags_query(true);
+        assert!(query.contains("POSITION(':' IN tag) = 0"));
+        assert!(query.contains("(LOWER(tag), tag) > (LOWER($3), $3)"));
+        assert!(query.contains("ORDER BY LOWER(tag), tag"));
+        assert!(query.contains("LIMIT $4"));
+    }
+
+    #[test]
+    fn test_split_remote_tags_page_detects_next_page() {
+        let tags = vec!["a", "b", "c"].into_iter().map(String::from).collect();
+        let (page, has_more) = split_remote_tags_page(tags, 2, false);
+        assert_eq!(page, vec!["a", "b"]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn test_split_remote_tags_page_without_extra_item() {
+        let tags = vec!["a", "b"].into_iter().map(String::from).collect();
+        let (page, has_more) = split_remote_tags_page(tags, 2, false);
+        assert_eq!(page, vec!["a", "b"]);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn test_split_remote_tags_page_preserves_upstream_continuation() {
+        let tags = vec!["a", "b"].into_iter().map(String::from).collect();
+        let (page, has_more) = split_remote_tags_page(tags, 2, true);
+        assert_eq!(page, vec!["a", "b"]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn test_parse_upstream_pagination_last_from_relative_link() {
+        let next = parse_upstream_pagination_last(
+            "</v2/library/alpine/tags/list?n=2&last=v1.0%2Bbuild>; rel=\"next\"",
+        );
+        assert_eq!(next.as_deref(), Some("v1.0+build"));
+    }
+
+    #[test]
+    fn test_parse_upstream_pagination_last_from_absolute_link() {
+        let next = parse_upstream_pagination_last(
+            "<https://registry.example.test/v2/library/alpine/tags/list?n=2&last=rc-2>; rel=\"next\"",
+        );
+        assert_eq!(next.as_deref(), Some("rc-2"));
+    }
+
+    #[test]
+    fn test_parse_upstream_pagination_last_ignores_non_next_rel() {
+        let next = parse_upstream_pagination_last(
+            "</v2/library/alpine/tags/list?n=2&last=v1.0>; rel=\"prev\"",
+        );
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn test_finalize_remote_tags_page_preserves_upstream_error_without_cache() {
+        let upstream = Err(oci_error(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "upstream unavailable",
+        ));
+
+        let err = finalize_remote_tags_page(
+            upstream,
+            LocalTagsPage {
+                tags: vec![],
+                has_more: false,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_finalize_remote_tags_page_falls_back_to_cached_tags() {
+        let upstream = Err(oci_error(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "upstream unavailable",
+        ));
+        let cached_page = LocalTagsPage {
+            tags: vec!["beta".to_string()],
+            has_more: true,
+        };
+
+        let (page, has_more) = finalize_remote_tags_page(upstream, cached_page, true).unwrap();
+        assert_eq!(page, vec!["beta"]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn test_missing_upload_uuid_response_uses_not_found() {
+        let resp = missing_upload_uuid_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // -----------------------------------------------------------------------
@@ -2171,6 +3463,240 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // OciCredential + extract_oci_credential
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_oci_credential_bearer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Bearer(
+                "eyJhbGciOiJIUzI1NiJ9.payload.sig".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_bearer_lowercase() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("bearer my-token-value"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Bearer("my-token-value".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic() {
+        let mut headers = HeaderMap::new();
+        // "user:pass" in base64 = "dXNlcjpwYXNz"
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_lowercase() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("basic dXNlcjpwYXNz"),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_none_when_no_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_none_for_unsupported_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Digest realm=\"example\""),
+        );
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_bearer_takes_priority_over_basic() {
+        // If somehow both Bearer and Basic are present (not valid HTTP, but
+        // defensive), the function should return the one that matches the
+        // single Authorization header value.  With a Bearer header, it must
+        // return Bearer.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer jwt-token-here"),
+        );
+        match extract_oci_credential(&headers) {
+            Some(OciCredential::Bearer(t)) => assert_eq!(t, "jwt-token-here"),
+            other => panic!("expected Bearer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_with_api_token_password() {
+        // API tokens are passed in the password field of Basic auth.
+        // "deploy-bot:akt_abc123def456" in base64
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("deploy-bot:akt_abc123def456");
+        let value = format!("Basic {}", encoded);
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&value).unwrap());
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "deploy-bot".to_string(),
+                password: "akt_abc123def456".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_invalid_base64_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic !!!not-b64"));
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_no_colon_returns_none() {
+        let mut headers = HeaderMap::new();
+        // "justusername" in base64 = "anVzdHVzZXJuYW1l"
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic anVzdHVzZXJuYW1l"),
+        );
+        assert_eq!(extract_oci_credential(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_empty_password() {
+        let mut headers = HeaderMap::new();
+        // "user:" in base64 = "dXNlcjo="
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic dXNlcjo="));
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_basic_password_with_colons() {
+        let mut headers = HeaderMap::new();
+        // "user:p:a:ss" in base64 = "dXNlcjpwOmE6c3M="
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwOmE6c3M="),
+        );
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(
+            cred,
+            Some(OciCredential::Basic {
+                username: "user".to_string(),
+                password: "p:a:ss".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_oci_credential_bearer_anonymous_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer anonymous"));
+        let cred = extract_oci_credential(&headers);
+        assert_eq!(cred, Some(OciCredential::Bearer("anonymous".to_string())));
+    }
+
+    #[test]
+    fn test_oci_credential_debug_format() {
+        let bearer = OciCredential::Bearer("tok".to_string());
+        let debug = format!("{:?}", bearer);
+        assert!(debug.contains("Bearer"));
+
+        let basic = OciCredential::Basic {
+            username: "u".to_string(),
+            password: "p".to_string(),
+        };
+        let debug = format!("{:?}", basic);
+        assert!(debug.contains("Basic"));
+    }
+
+    #[test]
+    fn test_oci_credential_clone() {
+        let original = OciCredential::Basic {
+            username: "admin".to_string(),
+            password: "secret".to_string(),
+        };
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn test_oci_credential_eq_different_variants() {
+        let bearer = OciCredential::Bearer("token".to_string());
+        let basic = OciCredential::Basic {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+        };
+        assert_ne!(bearer, basic);
+    }
+
+    #[test]
+    fn test_oci_credential_eq_same_bearer_different_token() {
+        let a = OciCredential::Bearer("token-a".to_string());
+        let b = OciCredential::Bearer("token-b".to_string());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_oci_credential_eq_same_basic_different_password() {
+        let a = OciCredential::Basic {
+            username: "user".to_string(),
+            password: "pass-a".to_string(),
+        };
+        let b = OciCredential::Basic {
+            username: "user".to_string(),
+            password: "pass-b".to_string(),
+        };
+        assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
     // extract_basic_credentials edge cases
     // -----------------------------------------------------------------------
 
@@ -2236,6 +3762,156 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
         assert_eq!(json["errors"][0]["message"], "authentication required");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_challenge_with_scope_body_contains_error() {
+        let resp = unauthorized_challenge_with_scope(
+            "https://registry.example.com",
+            Some("repository:myrepo/alpine:pull"),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(www_auth.contains("realm=\"https://registry.example.com/v2/token\""));
+        assert!(www_auth.contains("service=\"artifact-keeper\""));
+        assert!(www_auth.contains("scope=\"repository:myrepo/alpine:pull\""));
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
+        assert_eq!(json["errors"][0]["message"], "authentication required");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_challenge_with_push_scope_body() {
+        let resp = unauthorized_challenge_with_scope(
+            "https://registry.example.com",
+            Some("repository:myrepo/alpine:pull,push"),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(www_auth.contains("scope=\"repository:myrepo/alpine:pull,push\""));
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
+    }
+
+    #[tokio::test]
+    async fn test_unauthorized_challenge_with_no_scope_body() {
+        let resp = unauthorized_challenge_with_scope("http://localhost:8080", None);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www_auth = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!www_auth.contains("scope="));
+        assert!(www_auth.contains("realm=\"http://localhost:8080/v2/token\""));
+
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], "UNAUTHORIZED");
+        assert_eq!(json["errors"][0]["message"], "authentication required");
+    }
+
+    #[test]
+    fn test_www_authenticate_header_scope_with_special_chars() {
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:my-org/my.image_v2:pull"),
+        );
+        assert!(header.contains("scope=\"repository:my-org/my.image_v2:pull\""));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_empty_scope_string() {
+        let header = www_authenticate_header("https://registry.example.com", Some(""));
+        assert!(header.contains("scope=\"\""));
+    }
+
+    #[test]
+    fn test_pull_scope_single_segment() {
+        assert_eq!(pull_scope("alpine"), "repository:alpine:pull");
+    }
+
+    #[test]
+    fn test_push_scope_single_segment() {
+        assert_eq!(push_scope("alpine"), "repository:alpine:pull,push");
+    }
+
+    #[test]
+    fn test_pull_scope_deeply_nested() {
+        assert_eq!(
+            pull_scope("org/team/subteam/image"),
+            "repository:org/team/subteam/image:pull"
+        );
+    }
+
+    #[test]
+    fn test_push_scope_deeply_nested() {
+        assert_eq!(
+            push_scope("org/team/subteam/image"),
+            "repository:org/team/subteam/image:pull,push"
+        );
+    }
+
+    #[test]
+    fn test_pull_scope_with_special_chars() {
+        assert_eq!(
+            pull_scope("my-org/my.image_v2"),
+            "repository:my-org/my.image_v2:pull"
+        );
+    }
+
+    #[test]
+    fn test_push_scope_with_special_chars() {
+        assert_eq!(
+            push_scope("my-org/my.image_v2"),
+            "repository:my-org/my.image_v2:pull,push"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // unauthorized_challenge delegates to unauthorized_challenge_with_scope
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unauthorized_challenge_delegates_no_scope() {
+        // unauthorized_challenge should produce the same result as
+        // unauthorized_challenge_with_scope(host, None)
+        let r1 = unauthorized_challenge("http://localhost");
+        let r2 = unauthorized_challenge_with_scope("http://localhost", None);
+        assert_eq!(r1.status(), r2.status());
+        let h1 = r1
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let h2 = r2
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(h1, h2);
     }
 
     // -----------------------------------------------------------------------
@@ -2452,6 +4128,235 @@ mod tests {
         let mut info = make_repo_info("docker-pub", "local", None, "myapp");
         info.is_public = true;
         assert!(info.is_public);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_cursor_pagination
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_cursor_no_last_returns_first_n() {
+        let tags = vec!["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (result, has_more) = apply_cursor_pagination(tags, None, 3);
+        assert_eq!(result, vec!["a", "b", "c"]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn test_apply_cursor_with_last_skips_before() {
+        let tags = vec!["a", "b", "c", "d", "e"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (result, has_more) = apply_cursor_pagination(tags, Some("b"), 2);
+        assert_eq!(result, vec!["c", "d"]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn test_apply_cursor_last_item_returns_rest() {
+        let tags = vec!["a", "b", "c"].into_iter().map(String::from).collect();
+        let (result, has_more) = apply_cursor_pagination(tags, Some("a"), 10);
+        assert_eq!(result, vec!["b", "c"]);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn test_apply_cursor_n_zero_returns_empty() {
+        let tags = vec!["a", "b"].into_iter().map(String::from).collect();
+        let (result, has_more) = apply_cursor_pagination(tags, None, 0);
+        assert!(result.is_empty());
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn test_apply_cursor_last_not_found_returns_from_lexicographic_position() {
+        let tags = vec!["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // "az" is between "alpha" and "beta" lexicographically
+        let (result, _) = apply_cursor_pagination(tags, Some("az"), 10);
+        assert_eq!(result, vec!["beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_merge_and_dedup_tags() {
+        let sets = vec![
+            vec!["b".to_string(), "a".to_string(), "c".to_string()],
+            vec!["c".to_string(), "d".to_string(), "a".to_string()],
+        ];
+        let merged = merge_and_dedup_tags(sets);
+        assert_eq!(merged, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_merge_and_dedup_tags_lexical_order() {
+        let sets = vec![vec![
+            "Beta".to_string(),
+            "alpha".to_string(),
+            "GAMMA".to_string(),
+        ]];
+        let merged = merge_and_dedup_tags(sets);
+        assert_eq!(merged, vec!["alpha", "Beta", "GAMMA"]);
+    }
+
+    #[test]
+    fn test_merge_and_dedup_tags_empty() {
+        let sets: Vec<Vec<String>> = vec![vec![], vec![]];
+        let merged = merge_and_dedup_tags(sets);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_merge_and_dedup_tags_exact_dedup() {
+        let sets = vec![
+            vec!["Latest".to_string(), "v1.0".to_string()],
+            vec!["latest".to_string(), "v1.0".to_string()],
+        ];
+        let merged = merge_and_dedup_tags(sets);
+        // Case-sensitive dedup: "Latest" and "latest" are distinct tags
+        assert_eq!(merged, vec!["Latest", "latest", "v1.0"]);
+    }
+
+    #[test]
+    fn test_apply_cursor_lexical_ordering() {
+        let tags = vec!["alpha", "Beta", "gamma"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (result, _) = apply_cursor_pagination(tags, Some("Beta"), 10);
+        assert_eq!(result, vec!["gamma"]);
+    }
+
+    #[test]
+    fn test_oci_lexical_cmp_is_case_insensitive_with_stable_tiebreak() {
+        assert_eq!(oci_lexical_cmp("alpha", "Beta"), std::cmp::Ordering::Less);
+        assert_eq!(oci_lexical_cmp("Beta", "beta"), std::cmp::Ordering::Less);
+    }
+
+    // -----------------------------------------------------------------------
+    // TagsListResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tags_list_response_serialization() {
+        let resp = TagsListResponse {
+            name: "library/nginx".to_string(),
+            tags: vec!["1.25".to_string(), "latest".to_string()],
+        };
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["name"], "library/nginx");
+        assert_eq!(json["tags"], serde_json::json!(["1.25", "latest"]));
+    }
+
+    #[test]
+    fn test_tags_list_response_empty_tags() {
+        let resp = TagsListResponse {
+            name: "myimage".to_string(),
+            tags: vec![],
+        };
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["tags"], serde_json::json!([]));
+    }
+
+    // -----------------------------------------------------------------------
+    // CatalogResponse serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_catalog_response_serialization() {
+        let resp = CatalogResponse {
+            repositories: vec!["myrepo/alpine".to_string(), "myrepo/nginx".to_string()],
+        };
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json["repositories"],
+            serde_json::json!(["myrepo/alpine", "myrepo/nginx"])
+        );
+    }
+
+    #[test]
+    fn test_catalog_response_empty() {
+        let resp = CatalogResponse {
+            repositories: vec![],
+        };
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["repositories"], serde_json::json!([]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pagination Link header
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_pagination_link_header_relative_url() {
+        let link = build_pagination_link_header("/v2/myrepo/nginx/tags/list", "v2.0", 100);
+        assert_eq!(
+            link,
+            "</v2/myrepo/nginx/tags/list?n=100&last=v2.0>; rel=\"next\""
+        );
+    }
+
+    #[test]
+    fn test_build_pagination_link_header_url_encodes_last() {
+        let link = build_pagination_link_header("/v2/myrepo/nginx/tags/list", "v1.0+build", 50);
+        assert!(link.contains("last=v1.0%2Bbuild"));
+        assert!(link.contains("n=50"));
+        assert!(link.starts_with("</v2/"));
+    }
+
+    #[test]
+    fn test_parse_pagination_params_defaults() {
+        let params = std::collections::HashMap::new();
+        let (n, last) = parse_pagination_params(&params).unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(last, None);
+    }
+
+    #[test]
+    fn test_parse_pagination_params_custom() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("n".to_string(), "50".to_string());
+        params.insert("last".to_string(), "v1.0".to_string());
+        let (n, last) = parse_pagination_params(&params).unwrap();
+        assert_eq!(n, 50);
+        assert_eq!(last, Some("v1.0".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pagination_params_n_zero() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("n".to_string(), "0".to_string());
+        let (n, _last) = parse_pagination_params(&params).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_parse_pagination_params_n_exceeds_max() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("n".to_string(), "99999".to_string());
+        let (n, _last) = parse_pagination_params(&params).unwrap();
+        assert_eq!(n, 10000);
+    }
+
+    #[test]
+    fn test_parse_pagination_params_invalid_n_returns_error() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("n".to_string(), "abc".to_string());
+        let err = parse_pagination_params(&params).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_parse_pagination_params_negative_n_returns_error() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("n".to_string(), "-1".to_string());
+        let err = parse_pagination_params(&params).unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     // -----------------------------------------------------------------------
