@@ -6,9 +6,24 @@
 
 use axum::{extract::State, Json};
 use serde::Serialize;
+use sqlx;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::api::SharedState;
+
+/// Fine-grained permissions enforcement status.
+#[derive(Serialize, ToSchema)]
+pub struct PermissionsConfig {
+    /// Whether the permissions table (from migration 018) has any rows.
+    /// When true, an administrator has configured permission rules.
+    pub rules_exist: bool,
+    /// Whether those rules are actively enforced on API requests.
+    /// Currently always `false`: permission rules can be created and
+    /// managed via /api/v1/permissions, but the backend does not yet
+    /// consult them when authorizing requests. This field will become
+    /// `true` once enforcement is implemented (tracked in #795-#798).
+    pub enforcement_enabled: bool,
+}
 
 /// Scanner availability flags.
 #[derive(Serialize, ToSchema)]
@@ -55,6 +70,9 @@ pub struct SystemConfigResponse {
     /// clients to initiate the OIDC flow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oidc_issuer: Option<String>,
+    /// Fine-grained permissions enforcement status. Permission rules can be
+    /// managed via /api/v1/permissions, but enforcement is not yet active.
+    pub permissions: PermissionsConfig,
 }
 
 /// Return public runtime configuration.
@@ -93,6 +111,22 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
         "database".to_string()
     };
 
+    // Check whether any permission rules exist in the database. The
+    // permissions table is created by migration 018 and may not exist on
+    // very old schema versions, so we fall back to false on any error.
+    let rules_exist: bool =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM permissions LIMIT 1)")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(false);
+
+    let permissions = PermissionsConfig {
+        rules_exist,
+        // Enforcement is not yet implemented. This will change to `true`
+        // once the permission-check middleware is wired in (#795-#798).
+        enforcement_enabled: false,
+    };
+
     Json(SystemConfigResponse {
         max_upload_size_bytes: config.max_upload_size_bytes,
         demo_mode: config.demo_mode,
@@ -101,13 +135,14 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
         storage_backend: config.storage_backend.clone(),
         auth,
         oidc_issuer: config.oidc_issuer.clone(),
+        permissions,
     })
 }
 
 #[derive(OpenApi)]
 #[openapi(
     paths(get_system_config),
-    components(schemas(SystemConfigResponse, ScannersConfig, AuthConfig))
+    components(schemas(SystemConfigResponse, ScannersConfig, AuthConfig, PermissionsConfig))
 )]
 pub struct SystemConfigApiDoc;
 
@@ -133,6 +168,10 @@ mod tests {
                 sso_enabled: false,
             },
             oidc_issuer: None,
+            permissions: PermissionsConfig {
+                rules_exist: false,
+                enforcement_enabled: false,
+            },
         }
     }
 
@@ -153,6 +192,9 @@ mod tests {
         assert!(json.contains("\"sso_enabled\":false"));
         // oidc_issuer should be omitted when None
         assert!(!json.contains("\"oidc_issuer\""));
+        // Permissions enforcement status
+        assert!(json.contains("\"rules_exist\":false"));
+        assert!(json.contains("\"enforcement_enabled\":false"));
     }
 
     #[test]
@@ -173,6 +215,10 @@ mod tests {
                 sso_enabled: true,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
+            permissions: PermissionsConfig {
+                rules_exist: true,
+                enforcement_enabled: false,
+            },
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -188,6 +234,8 @@ mod tests {
         assert!(json.contains("\"ldap_enabled\":true"));
         assert!(json.contains("\"sso_enabled\":true"));
         assert!(json.contains("\"oidc_issuer\":\"https://auth.example.com\""));
+        assert!(json.contains("\"rules_exist\":true"));
+        assert!(json.contains("\"enforcement_enabled\":false"));
     }
 
     #[test]
@@ -274,5 +322,31 @@ mod tests {
             parsed["oidc_issuer"].as_str().unwrap(),
             "https://accounts.google.com"
         );
+    }
+
+    #[test]
+    fn test_system_config_permissions_serialization() {
+        let perms = PermissionsConfig {
+            rules_exist: false,
+            enforcement_enabled: false,
+        };
+        let json = serde_json::to_string(&perms).unwrap();
+        assert!(json.contains("\"rules_exist\":false"));
+        assert!(json.contains("\"enforcement_enabled\":false"));
+    }
+
+    #[test]
+    fn test_system_config_permissions_rules_exist_not_enforced() {
+        let response = SystemConfigResponse {
+            permissions: PermissionsConfig {
+                rules_exist: true,
+                enforcement_enabled: false,
+            },
+            ..minimal_response()
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["permissions"]["rules_exist"], true);
+        assert_eq!(parsed["permissions"]["enforcement_enabled"], false);
     }
 }

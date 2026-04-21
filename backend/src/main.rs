@@ -173,6 +173,27 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let peer_id = init_peer_identity(&db_pool, &config).await?;
     tracing::info!("Peer identity: {} ({})", config.peer_instance_name, peer_id);
 
+    // Warn when permission rules exist but enforcement is not yet active (#794).
+    // This makes the gap visible in server logs so administrators do not
+    // assume their rules are protecting anything.
+    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permissions")
+        .fetch_one(&db_pool)
+        .await
+    {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                permission_rules = count,
+                "Found {} permission rule(s) in the database, but enforcement is NOT active. \
+                 Permission rules created via /api/v1/permissions are stored but not consulted \
+                 during request authorization. This will be addressed in a future release. \
+                 See https://github.com/artifact-keeper/artifact-keeper/issues/794",
+                count,
+            );
+        }
+        Ok(_) => {}  // no rules, nothing to warn about
+        Err(_) => {} // table may not exist on old schema, ignore
+    }
+
     // Initialize WASM plugin system (T068)
     let plugins_dir =
         PathBuf::from(std::env::var("PLUGINS_DIR").unwrap_or_else(|_| "./plugins".to_string()));
