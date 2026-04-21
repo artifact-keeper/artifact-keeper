@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -48,6 +49,35 @@ impl CacheEntry {
     }
 }
 
+/// Composite key for the target rules existence cache: (target_type, target_id).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RulesCacheKey {
+    target_type: String,
+    target_id: Uuid,
+}
+
+impl RulesCacheKey {
+    fn new(target_type: &str, target_id: Uuid) -> Self {
+        Self {
+            target_type: target_type.to_string(),
+            target_id,
+        }
+    }
+}
+
+/// A cached boolean result with an insertion timestamp.
+#[derive(Debug, Clone)]
+struct RulesCacheEntry {
+    exists: bool,
+    inserted_at: Instant,
+}
+
+impl RulesCacheEntry {
+    fn is_expired(&self) -> bool {
+        self.inserted_at.elapsed() > CACHE_TTL
+    }
+}
+
 /// Service that evaluates permission rules stored in the `permissions` table.
 ///
 /// The service resolves both direct user grants and group-based grants in a
@@ -56,6 +86,7 @@ impl CacheEntry {
 pub struct PermissionService {
     db: PgPool,
     cache: RwLock<HashMap<CacheKey, CacheEntry>>,
+    rules_cache: RwLock<HashMap<RulesCacheKey, RulesCacheEntry>>,
 }
 
 impl PermissionService {
@@ -63,6 +94,7 @@ impl PermissionService {
         Self {
             db,
             cache: RwLock::new(HashMap::new()),
+            rules_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -99,6 +131,36 @@ impl PermissionService {
         target_type: &str,
         target_id: Uuid,
     ) -> Result<bool> {
+        let key = RulesCacheKey::new(target_type, target_id);
+
+        // Fast path: return cached result if still fresh.
+        let cached = match self.rules_cache.read() {
+            Ok(cache) => cache.get(&key).and_then(|entry| {
+                if entry.is_expired() {
+                    None
+                } else {
+                    debug!(
+                        target_type,
+                        %target_id,
+                        exists = entry.exists,
+                        "rules cache hit"
+                    );
+                    Some(entry.exists)
+                }
+            }),
+            Err(poisoned) => {
+                error!("rules cache read lock poisoned, skipping cache");
+                drop(poisoned.into_inner());
+                None
+            }
+        };
+
+        if let Some(exists) = cached {
+            return Ok(exists);
+        }
+
+        debug!(target_type, %target_id, "rules cache miss, querying database");
+
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM permissions WHERE target_type = $1 AND target_id = $2)",
         )
@@ -108,14 +170,55 @@ impl PermissionService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Populate cache.
+        match self.rules_cache.write() {
+            Ok(mut cache) => {
+                cache.retain(|_, v| !v.is_expired());
+                cache.insert(
+                    key,
+                    RulesCacheEntry {
+                        exists,
+                        inserted_at: Instant::now(),
+                    },
+                );
+            }
+            Err(poisoned) => {
+                error!("rules cache write lock poisoned, recovering to update cache");
+                let mut cache = poisoned.into_inner();
+                cache.retain(|_, v| !v.is_expired());
+                cache.insert(
+                    key,
+                    RulesCacheEntry {
+                        exists,
+                        inserted_at: Instant::now(),
+                    },
+                );
+            }
+        }
+
+        if !exists {
+            warn!(target_type, %target_id, "no permission rules found for target");
+        }
+
         Ok(exists)
     }
 
-    /// Clear the entire permission cache. Call this after any CRUD operation
+    /// Clear both permission caches. Call this after any CRUD operation
     /// on the `permissions` table to ensure stale grants are not served.
     pub fn invalidate_cache(&self) {
-        if let Ok(mut cache) = self.cache.write() {
-            cache.clear();
+        match self.cache.write() {
+            Ok(mut cache) => cache.clear(),
+            Err(poisoned) => {
+                error!("permission cache lock poisoned during invalidation, clearing");
+                poisoned.into_inner().clear();
+            }
+        }
+        match self.rules_cache.write() {
+            Ok(mut cache) => cache.clear(),
+            Err(poisoned) => {
+                error!("rules cache lock poisoned during invalidation, clearing");
+                poisoned.into_inner().clear();
+            }
         }
     }
 
@@ -132,28 +235,71 @@ impl PermissionService {
         let key = CacheKey::new(user_id, target_type, target_id);
 
         // Fast path: return cached entry if still fresh.
-        if let Ok(cache) = self.cache.read() {
-            if let Some(entry) = cache.get(&key) {
-                if !entry.is_expired() {
-                    return Ok(entry.actions.clone());
+        let cached = match self.cache.read() {
+            Ok(cache) => cache.get(&key).and_then(|entry| {
+                if entry.is_expired() {
+                    None
+                } else {
+                    debug!(
+                        %user_id,
+                        target_type,
+                        %target_id,
+                        actions = ?entry.actions,
+                        "permission cache hit"
+                    );
+                    Some(entry.actions.clone())
                 }
+            }),
+            Err(poisoned) => {
+                error!("permission cache read lock poisoned, skipping cache");
+                drop(poisoned.into_inner());
+                None
             }
+        };
+
+        if let Some(actions) = cached {
+            return Ok(actions);
         }
+
+        debug!(%user_id, target_type, %target_id, "permission cache miss, querying database");
 
         // Cache miss or expired -- query the database.
         let actions = self.query_actions(user_id, target_type, target_id).await?;
 
+        if actions.is_empty() {
+            warn!(
+                %user_id,
+                target_type,
+                %target_id,
+                "permission denied: rules exist but no actions granted"
+            );
+        }
+
         // Populate cache. Evict stale entries while we hold the write lock
         // to keep memory bounded over time.
-        if let Ok(mut cache) = self.cache.write() {
-            cache.retain(|_, v| !v.is_expired());
-            cache.insert(
-                key,
-                CacheEntry {
-                    actions: actions.clone(),
-                    inserted_at: Instant::now(),
-                },
-            );
+        match self.cache.write() {
+            Ok(mut cache) => {
+                cache.retain(|_, v| !v.is_expired());
+                cache.insert(
+                    key,
+                    CacheEntry {
+                        actions: actions.clone(),
+                        inserted_at: Instant::now(),
+                    },
+                );
+            }
+            Err(poisoned) => {
+                error!("permission cache write lock poisoned, recovering to update cache");
+                let mut cache = poisoned.into_inner();
+                cache.retain(|_, v| !v.is_expired());
+                cache.insert(
+                    key,
+                    CacheEntry {
+                        actions: actions.clone(),
+                        inserted_at: Instant::now(),
+                    },
+                );
+            }
         }
 
         Ok(actions)
@@ -315,16 +461,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Invalidation clears the cache
+    // Invalidation clears both caches
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_invalidate_cache_clears_all_entries() {
-        // We cannot construct a real PgPool in unit tests, but we can test
-        // the cache layer by constructing PermissionService with a placeholder.
-        // Since invalidate_cache only touches the RwLock<HashMap>, we use an
-        // unsafe-free workaround: build the cache directly.
         let cache: RwLock<HashMap<CacheKey, CacheEntry>> = RwLock::new(HashMap::new());
+        let rules_cache: RwLock<HashMap<RulesCacheKey, RulesCacheEntry>> =
+            RwLock::new(HashMap::new());
         {
             let mut guard = cache.write().unwrap();
             guard.insert(
@@ -343,13 +487,32 @@ mod tests {
             );
             assert_eq!(guard.len(), 2);
         }
-        // Simulate invalidation
+        {
+            let mut guard = rules_cache.write().unwrap();
+            guard.insert(
+                RulesCacheKey::new("repository", Uuid::new_v4()),
+                RulesCacheEntry {
+                    exists: true,
+                    inserted_at: Instant::now(),
+                },
+            );
+            assert_eq!(guard.len(), 1);
+        }
+        // Simulate invalidation (same logic as invalidate_cache)
         {
             let mut guard = cache.write().unwrap();
             guard.clear();
         }
         {
+            let mut guard = rules_cache.write().unwrap();
+            guard.clear();
+        }
+        {
             let guard = cache.read().unwrap();
+            assert!(guard.is_empty());
+        }
+        {
+            let guard = rules_cache.read().unwrap();
             assert!(guard.is_empty());
         }
     }
@@ -370,13 +533,13 @@ mod tests {
         let is_admin = true;
         let result: std::result::Result<bool, AppError> =
             if is_admin { Ok(true) } else { Ok(false) };
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
     fn test_non_admin_does_not_bypass() {
         let is_admin = false;
-        let result = if is_admin { true } else { false };
+        let result = is_admin;
         assert!(!result);
     }
 
@@ -422,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_action_list_contains_target_action() {
-        let actions = vec![
+        let actions = [
             "read".to_string(),
             "write".to_string(),
             "delete".to_string(),
@@ -432,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_action_list_does_not_contain_missing_action() {
-        let actions = vec!["read".to_string()];
+        let actions = ["read".to_string()];
         assert!(!actions.iter().any(|a| a == "admin"));
     }
 
@@ -443,5 +606,212 @@ mod tests {
         assert!(!actions.iter().any(|a| a == "write"));
         assert!(!actions.iter().any(|a| a == "delete"));
         assert!(!actions.iter().any(|a| a == "admin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // RulesCacheKey construction and equality
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rules_cache_key_equality_same_inputs() {
+        let target_id = Uuid::new_v4();
+        let a = RulesCacheKey::new("repository", target_id);
+        let b = RulesCacheKey::new("repository", target_id);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_rules_cache_key_inequality_different_type() {
+        let target_id = Uuid::new_v4();
+        let a = RulesCacheKey::new("repository", target_id);
+        let b = RulesCacheKey::new("artifact", target_id);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_rules_cache_key_inequality_different_id() {
+        let a = RulesCacheKey::new("repository", Uuid::new_v4());
+        let b = RulesCacheKey::new("repository", Uuid::new_v4());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_rules_cache_key_used_as_hash_key() {
+        let target_id = Uuid::new_v4();
+        let key = RulesCacheKey::new("repository", target_id);
+
+        let mut map: HashMap<RulesCacheKey, bool> = HashMap::new();
+        map.insert(key.clone(), true);
+
+        let lookup = RulesCacheKey::new("repository", target_id);
+        assert_eq!(map.get(&lookup), Some(&true));
+    }
+
+    // -----------------------------------------------------------------------
+    // RulesCacheEntry TTL behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rules_cache_entry_not_expired_when_fresh() {
+        let entry = RulesCacheEntry {
+            exists: true,
+            inserted_at: Instant::now(),
+        };
+        assert!(!entry.is_expired());
+    }
+
+    #[test]
+    fn test_rules_cache_entry_expired_after_ttl() {
+        let entry = RulesCacheEntry {
+            exists: true,
+            inserted_at: Instant::now() - CACHE_TTL - Duration::from_millis(1),
+        };
+        assert!(entry.is_expired());
+    }
+
+    #[test]
+    fn test_rules_cache_entry_not_expired_just_before_ttl() {
+        let entry = RulesCacheEntry {
+            exists: false,
+            inserted_at: Instant::now() - CACHE_TTL + Duration::from_secs(1),
+        };
+        assert!(!entry.is_expired());
+    }
+
+    // -----------------------------------------------------------------------
+    // RwLock poisoning recovery
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_poisoned_cache_lock_recovers_on_invalidation() {
+        let cache: RwLock<HashMap<CacheKey, CacheEntry>> = RwLock::new(HashMap::new());
+
+        // Populate the cache
+        {
+            let mut guard = cache.write().unwrap();
+            guard.insert(
+                CacheKey::new(Uuid::new_v4(), "repository", Uuid::new_v4()),
+                CacheEntry {
+                    actions: vec!["read".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        // Poison the lock by panicking inside a write guard
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.write().unwrap();
+            panic!("intentional poison");
+        }));
+
+        // The lock is now poisoned. Verify we can still recover and clear.
+        match cache.write() {
+            Ok(_) => panic!("expected poisoned lock"),
+            Err(poisoned) => {
+                let mut inner = poisoned.into_inner();
+                inner.clear();
+                assert!(inner.is_empty());
+            }
+        };
+    }
+
+    #[test]
+    fn test_poisoned_rules_cache_lock_recovers_on_invalidation() {
+        let cache: RwLock<HashMap<RulesCacheKey, RulesCacheEntry>> = RwLock::new(HashMap::new());
+
+        {
+            let mut guard = cache.write().unwrap();
+            guard.insert(
+                RulesCacheKey::new("repository", Uuid::new_v4()),
+                RulesCacheEntry {
+                    exists: true,
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.write().unwrap();
+            panic!("intentional poison");
+        }));
+
+        match cache.write() {
+            Ok(_) => panic!("expected poisoned lock"),
+            Err(poisoned) => {
+                let mut inner = poisoned.into_inner();
+                inner.clear();
+                assert!(inner.is_empty());
+            }
+        };
+    }
+
+    #[test]
+    fn test_poisoned_read_lock_returns_none() {
+        let cache: RwLock<HashMap<CacheKey, CacheEntry>> = RwLock::new(HashMap::new());
+
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let key = CacheKey::new(user_id, "repository", target_id);
+
+        {
+            let mut guard = cache.write().unwrap();
+            guard.insert(
+                key.clone(),
+                CacheEntry {
+                    actions: vec!["read".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        // Poison the lock
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.write().unwrap();
+            panic!("intentional poison");
+        }));
+
+        // On poisoned read, we should gracefully handle it (return None / skip cache)
+        match cache.read() {
+            Ok(_) => panic!("expected poisoned lock"),
+            Err(poisoned) => {
+                // The recovery pattern: accept the inner data exists but skip
+                drop(poisoned.into_inner());
+            }
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale rules cache entry eviction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stale_rules_entries_evicted_on_insert() {
+        let mut cache: HashMap<RulesCacheKey, RulesCacheEntry> = HashMap::new();
+
+        // Insert a stale entry
+        cache.insert(
+            RulesCacheKey::new("repository", Uuid::new_v4()),
+            RulesCacheEntry {
+                exists: true,
+                inserted_at: Instant::now() - CACHE_TTL - Duration::from_secs(10),
+            },
+        );
+
+        // Insert a fresh entry
+        let fresh_key = RulesCacheKey::new("artifact", Uuid::new_v4());
+        cache.insert(
+            fresh_key.clone(),
+            RulesCacheEntry {
+                exists: false,
+                inserted_at: Instant::now(),
+            },
+        );
+
+        assert_eq!(cache.len(), 2);
+
+        cache.retain(|_, v| !v.is_expired());
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&fresh_key));
     }
 }
