@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::services::meili_service::{ArtifactDocument, MeiliService};
+use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::plugin_service::{ArtifactInfo, PluginEventType, PluginService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
@@ -27,7 +27,7 @@ pub struct ArtifactService {
     plugin_service: Option<Arc<PluginService>>,
     scanner_service: Option<Arc<ScannerService>>,
     quality_check_service: Option<Arc<QualityCheckService>>,
-    meili_service: Option<Arc<MeiliService>>,
+    search_service: Option<Arc<OpenSearchService>>,
 }
 
 impl ArtifactService {
@@ -41,15 +41,15 @@ impl ArtifactService {
             plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
-            meili_service: None,
+            search_service: None,
         }
     }
 
-    /// Create a new artifact service with Meilisearch indexing support.
-    pub fn new_with_meili(
+    /// Create a new artifact service with search indexing support.
+    pub fn new_with_search(
         db: PgPool,
         storage: Arc<dyn StorageBackend>,
-        meili_service: Option<Arc<MeiliService>>,
+        search_service: Option<Arc<OpenSearchService>>,
     ) -> Self {
         let repo_service = RepositoryService::new(db.clone());
         Self {
@@ -59,7 +59,7 @@ impl ArtifactService {
             plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
-            meili_service,
+            search_service,
         }
     }
 
@@ -77,7 +77,7 @@ impl ArtifactService {
             plugin_service: Some(plugin_service),
             scanner_service: None,
             quality_check_service: None,
-            meili_service: None,
+            search_service: None,
         }
     }
 
@@ -96,9 +96,9 @@ impl ArtifactService {
         self.quality_check_service = Some(qc_service);
     }
 
-    /// Set the Meilisearch service for search indexing.
-    pub fn set_meili_service(&mut self, meili_service: Arc<MeiliService>) {
-        self.meili_service = Some(meili_service);
+    /// Set the search service for search indexing.
+    pub fn set_search_service(&mut self, search_service: Arc<OpenSearchService>) {
+        self.search_service = Some(search_service);
     }
 
     /// Trigger a plugin hook, logging but not failing if plugin service is unavailable.
@@ -516,9 +516,9 @@ impl ArtifactService {
             });
         }
 
-        // Index artifact in Meilisearch (non-blocking)
-        if let Some(ref meili) = self.meili_service {
-            let meili = meili.clone();
+        // Index artifact in OpenSearch (non-blocking)
+        if let Some(ref search) = self.search_service {
+            let search = search.clone();
             let db = self.db.clone();
             let artifact_id = artifact.id;
             let artifact_name = artifact.name.clone();
@@ -530,15 +530,15 @@ impl ArtifactService {
             let repo_id = artifact.repository_id;
             tokio::spawn(async move {
                 // Fetch repository info for the document
-                let repo_info = sqlx::query_as::<_, (String, String, String)>(
-                    "SELECT key, name, format::text FROM repositories WHERE id = $1",
+                let repo_info = sqlx::query_as::<_, (String, String, String, bool)>(
+                    "SELECT key, name, format::text, is_public FROM repositories WHERE id = $1",
                 )
                 .bind(repo_id)
                 .fetch_optional(&db)
                 .await;
 
                 match repo_info {
-                    Ok(Some((repo_key, repo_name, format))) => {
+                    Ok(Some((repo_key, repo_name, format, is_public))) => {
                         let doc = ArtifactDocument {
                             id: artifact_id.to_string(),
                             name: artifact_name,
@@ -551,11 +551,12 @@ impl ArtifactService {
                             content_type: artifact_content_type,
                             size_bytes: artifact_size,
                             download_count: 0,
+                            is_public,
                             created_at: artifact_created.timestamp(),
                         };
-                        if let Err(e) = meili.index_artifact(&doc).await {
+                        if let Err(e) = search.index_artifact(&doc).await {
                             tracing::warn!(
-                                "Failed to index artifact {} in Meilisearch: {}",
+                                "Failed to index artifact {} in OpenSearch: {}",
                                 artifact_id,
                                 e
                             );
@@ -569,10 +570,7 @@ impl ArtifactService {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to fetch repository for Meilisearch indexing: {}",
-                            e
-                        );
+                        tracing::warn!("Failed to fetch repository for search indexing: {}", e);
                     }
                 }
             });
@@ -873,14 +871,14 @@ impl ArtifactService {
         self.trigger_hook_non_blocking(PluginEventType::AfterDelete, &artifact_info)
             .await;
 
-        // Remove artifact from Meilisearch index (non-blocking)
-        if let Some(ref meili) = self.meili_service {
-            let meili = meili.clone();
+        // Remove artifact from search index (non-blocking)
+        if let Some(ref search) = self.search_service {
+            let search = search.clone();
             let artifact_id_str = id.to_string();
             tokio::spawn(async move {
-                if let Err(e) = meili.remove_artifact(&artifact_id_str).await {
+                if let Err(e) = search.remove_artifact(&artifact_id_str).await {
                     tracing::warn!(
-                        "Failed to remove artifact {} from Meilisearch: {}",
+                        "Failed to remove artifact {} from search index: {}",
                         artifact_id_str,
                         e
                     );

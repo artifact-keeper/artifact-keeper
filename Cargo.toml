@@ -96,7 +96,7 @@ git2 = "0.20"
 
 # OpenSSL (vendored feature for cross-compilation in release builds)
 openssl = { version = "0.10" }
-meilisearch-sdk = "0.32"
+opensearch = "2"
 
 # OpenAPI
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }

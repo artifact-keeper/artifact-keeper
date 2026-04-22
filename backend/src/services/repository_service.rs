@@ -13,7 +13,7 @@ use crate::error::{AppError, Result};
 use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
-use crate::services::meili_service::{MeiliService, RepositoryDocument};
+use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
 
 /// Request to create a new repository
 #[derive(Debug)]
@@ -209,7 +209,7 @@ pub(crate) fn is_duplicate_key_error(error_message: &str) -> bool {
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
-    meili_service: Option<Arc<MeiliService>>,
+    search_service: Option<Arc<OpenSearchService>>,
 }
 
 impl RepositoryService {
@@ -217,18 +217,18 @@ impl RepositoryService {
     pub fn new(db: PgPool) -> Self {
         Self {
             db,
-            meili_service: None,
+            search_service: None,
         }
     }
 
-    /// Create a new repository service with Meilisearch indexing support.
-    pub fn new_with_meili(db: PgPool, meili_service: Option<Arc<MeiliService>>) -> Self {
-        Self { db, meili_service }
+    /// Create a new repository service with search indexing support.
+    pub fn new_with_search(db: PgPool, search_service: Option<Arc<OpenSearchService>>) -> Self {
+        Self { db, search_service }
     }
 
-    /// Set the Meilisearch service for search indexing.
-    pub fn set_meili_service(&mut self, meili_service: Arc<MeiliService>) {
-        self.meili_service = Some(meili_service);
+    /// Set the search service for search indexing.
+    pub fn set_search_service(&mut self, search_service: Arc<OpenSearchService>) {
+        self.search_service = Some(search_service);
     }
 
     /// Get the custom format_key for a repository (if set for WASM plugins).
@@ -323,14 +323,14 @@ impl RepositoryService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         }
 
-        // Index repository in Meilisearch (non-blocking)
-        if let Some(ref meili) = self.meili_service {
-            let meili = meili.clone();
-            let doc = Self::repo_to_meili_doc(&repo);
+        // Index repository in search engine (non-blocking)
+        if let Some(ref search) = self.search_service {
+            let search = search.clone();
+            let doc = Self::repo_to_search_doc(&repo);
             tokio::spawn(async move {
-                if let Err(e) = meili.index_repository(&doc).await {
+                if let Err(e) = search.index_repository(&doc).await {
                     tracing::warn!(
-                        "Failed to index repository {} in Meilisearch: {}",
+                        "Failed to index repository {} in search engine: {}",
                         doc.id,
                         e
                     );
@@ -527,14 +527,14 @@ impl RepositoryService {
         })?
         .ok_or_else(|| AppError::NotFound("Repository not found".to_string()))?;
 
-        // Index updated repository in Meilisearch (non-blocking)
-        if let Some(ref meili) = self.meili_service {
-            let meili = meili.clone();
-            let doc = Self::repo_to_meili_doc(&repo);
+        // Index updated repository in search engine (non-blocking)
+        if let Some(ref search) = self.search_service {
+            let search = search.clone();
+            let doc = Self::repo_to_search_doc(&repo);
             tokio::spawn(async move {
-                if let Err(e) = meili.index_repository(&doc).await {
+                if let Err(e) = search.index_repository(&doc).await {
                     tracing::warn!(
-                        "Failed to index updated repository {} in Meilisearch: {}",
+                        "Failed to index updated repository {} in search engine: {}",
                         doc.id,
                         e
                     );
@@ -556,14 +556,14 @@ impl RepositoryService {
             return Err(AppError::NotFound("Repository not found".to_string()));
         }
 
-        // Remove repository from Meilisearch index (non-blocking)
-        if let Some(ref meili) = self.meili_service {
-            let meili = meili.clone();
+        // Remove repository from search index (non-blocking)
+        if let Some(ref search) = self.search_service {
+            let search = search.clone();
             let repo_id_str = id.to_string();
             tokio::spawn(async move {
-                if let Err(e) = meili.remove_repository(&repo_id_str).await {
+                if let Err(e) = search.remove_repository(&repo_id_str).await {
                     tracing::warn!(
-                        "Failed to remove repository {} from Meilisearch: {}",
+                        "Failed to remove repository {} from search index: {}",
                         repo_id_str,
                         e
                     );
@@ -706,7 +706,7 @@ impl RepositoryService {
     }
 
     /// Convert a Repository model to a Meilisearch RepositoryDocument.
-    fn repo_to_meili_doc(repo: &Repository) -> RepositoryDocument {
+    fn repo_to_search_doc(repo: &Repository) -> RepositoryDocument {
         RepositoryDocument {
             id: repo.id.to_string(),
             name: repo.name.clone(),
@@ -728,7 +728,7 @@ mod tests {
     };
 
     // -----------------------------------------------------------------------
-    // repo_to_meili_doc tests
+    // repo_to_search_doc tests
     // -----------------------------------------------------------------------
 
     fn make_test_repo(format: RepositoryFormat, repo_type: RepositoryType) -> Repository {
@@ -760,9 +760,9 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_to_meili_doc_maven_local() {
+    fn test_repo_to_search_doc_maven_local() {
         let repo = make_test_repo(RepositoryFormat::Maven, RepositoryType::Local);
-        let doc = RepositoryService::repo_to_meili_doc(&repo);
+        let doc = RepositoryService::repo_to_search_doc(&repo);
 
         assert_eq!(doc.id, repo.id.to_string());
         assert_eq!(doc.name, "Test Repository");
@@ -775,31 +775,31 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_to_meili_doc_docker_remote() {
+    fn test_repo_to_search_doc_docker_remote() {
         let repo = make_test_repo(RepositoryFormat::Docker, RepositoryType::Remote);
-        let doc = RepositoryService::repo_to_meili_doc(&repo);
+        let doc = RepositoryService::repo_to_search_doc(&repo);
         assert_eq!(doc.format, "docker");
         assert_eq!(doc.repo_type, "remote");
     }
 
     #[test]
-    fn test_repo_to_meili_doc_npm_virtual() {
+    fn test_repo_to_search_doc_npm_virtual() {
         let repo = make_test_repo(RepositoryFormat::Npm, RepositoryType::Virtual);
-        let doc = RepositoryService::repo_to_meili_doc(&repo);
+        let doc = RepositoryService::repo_to_search_doc(&repo);
         assert_eq!(doc.format, "npm");
         assert_eq!(doc.repo_type, "virtual");
     }
 
     #[test]
-    fn test_repo_to_meili_doc_pypi_staging() {
+    fn test_repo_to_search_doc_pypi_staging() {
         let repo = make_test_repo(RepositoryFormat::Pypi, RepositoryType::Staging);
-        let doc = RepositoryService::repo_to_meili_doc(&repo);
+        let doc = RepositoryService::repo_to_search_doc(&repo);
         assert_eq!(doc.format, "pypi");
         assert_eq!(doc.repo_type, "staging");
     }
 
     #[test]
-    fn test_repo_to_meili_doc_no_description() {
+    fn test_repo_to_search_doc_no_description() {
         let now = chrono::Utc::now();
         let repo = Repository {
             id: Uuid::new_v4(),
@@ -825,14 +825,14 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let doc = RepositoryService::repo_to_meili_doc(&repo);
+        let doc = RepositoryService::repo_to_search_doc(&repo);
         assert!(doc.description.is_none());
         assert!(!doc.is_public);
         assert_eq!(doc.format, "generic");
     }
 
     #[test]
-    fn test_repo_to_meili_doc_various_formats() {
+    fn test_repo_to_search_doc_various_formats() {
         let formats_and_expected: Vec<(RepositoryFormat, &str)> = vec![
             (RepositoryFormat::Cargo, "cargo"),
             (RepositoryFormat::Nuget, "nuget"),
@@ -853,7 +853,7 @@ mod tests {
 
         for (format, expected) in formats_and_expected {
             let repo = make_test_repo(format, RepositoryType::Local);
-            let doc = RepositoryService::repo_to_meili_doc(&repo);
+            let doc = RepositoryService::repo_to_search_doc(&repo);
             assert_eq!(
                 doc.format, expected,
                 "Format mismatch for {:?}",
