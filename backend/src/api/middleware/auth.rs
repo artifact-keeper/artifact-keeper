@@ -737,19 +737,40 @@ pub async fn repo_visibility_middleware(
     // user must hold the action that matches the HTTP method.
     if let Some(ref ext) = auth_ext {
         if !ext.is_admin {
-            let has_rules = vis_state
+            let has_rules = match vis_state
                 .permission_service
                 .has_any_rules_for_target("repository", repo.id)
                 .await
-                .unwrap_or(false);
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    // DB error on permission check: fail closed.
+                    tracing::error!("permission check failed: database unreachable");
+                    return Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(axum::body::Body::from(
+                            "permission service temporarily unavailable",
+                        ))
+                        .unwrap();
+                }
+            };
 
             if has_rules {
                 let action = action_for_method(request.method());
+                // Check for the specific action first, then fall back to
+                // "admin" which implies all actions (#827 policy compat).
+                // Both calls resolve from the same cached action set, so the
+                // second call is essentially free.
                 let allowed = vis_state
                     .permission_service
                     .check_permission(ext.user_id, "repository", repo.id, action, false)
                     .await
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || vis_state
+                        .permission_service
+                        .check_permission(ext.user_id, "repository", repo.id, "admin", false)
+                        .await
+                        .unwrap_or(false);
 
                 if !allowed {
                     return forbidden_permission_response();
@@ -1736,21 +1757,20 @@ mod tests {
     fn test_permission_rules_allow_authorized_user() {
         let has_rules = true;
         let check_result = true; // user has the action
-        let mut allowed = false;
 
-        if has_rules && !check_result {
-            panic!("should not deny an authorized user");
-        } else {
-            allowed = true;
-        }
-        assert!(allowed, "authorized user should be allowed through");
+        // Simulates the middleware path: when rules exist AND the user
+        // passes the check, the request proceeds to the handler.
+        assert!(
+            !has_rules || check_result,
+            "authorized user should be allowed through"
+        );
     }
 
     /// Verify that the correct action is derived for each method in the
     /// full permission enforcement flow.
     #[test]
     fn test_permission_action_mapping_for_common_methods() {
-        let cases = vec![
+        let cases = [
             (Method::GET, "read"),
             (Method::HEAD, "read"),
             (Method::POST, "write"),
