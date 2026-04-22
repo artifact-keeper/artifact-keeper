@@ -58,7 +58,7 @@ pub struct SystemConfigResponse {
     pub demo_mode: bool,
     /// Scanner availability.
     pub scanners: ScannersConfig,
-    /// Search engine type: "meilisearch" when configured, "database" otherwise.
+    /// Search engine type: "opensearch" when configured, "database" otherwise.
     pub search_engine: String,
     /// Storage backend type (e.g. "filesystem", "s3", "gcs", "azure").
     pub storage_backend: String,
@@ -103,8 +103,8 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
         sso_enabled: config.oidc_issuer.is_some(),
     };
 
-    let search_engine = if config.meilisearch_url.is_some() {
-        "meilisearch".to_string()
+    let search_engine = if config.opensearch_url.is_some() {
+        "opensearch".to_string()
     } else {
         "database".to_string()
     };
@@ -203,7 +203,7 @@ mod tests {
                 openscap_enabled: true,
                 dependency_track_enabled: true,
             },
-            search_engine: "meilisearch".to_string(),
+            search_engine: "opensearch".to_string(),
             storage_backend: "s3".to_string(),
             auth: AuthConfig {
                 oidc_enabled: true,
@@ -221,7 +221,7 @@ mod tests {
 
         assert!(json.contains("\"max_upload_size_bytes\":21474836480"));
         assert!(json.contains("\"demo_mode\":true"));
-        assert!(json.contains("\"search_engine\":\"meilisearch\""));
+        assert!(json.contains("\"search_engine\":\"opensearch\""));
         assert!(json.contains("\"storage_backend\":\"s3\""));
         assert!(json.contains("\"trivy_enabled\":true"));
         assert!(json.contains("\"openscap_enabled\":true"));
@@ -246,8 +246,8 @@ mod tests {
         assert!(!json.contains("peer_api_key"));
         assert!(!json.contains("oidc_client_secret"));
         assert!(!json.contains("oidc_client_id"));
-        assert!(!json.contains("meilisearch_api_key"));
-        assert!(!json.contains("meilisearch_url"));
+        assert!(!json.contains("opensearch_password"));
+        assert!(!json.contains("opensearch_url"));
         assert!(!json.contains("s3_bucket"));
         assert!(!json.contains("s3_region"));
         assert!(!json.contains("s3_endpoint"));
