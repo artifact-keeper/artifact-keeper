@@ -3,6 +3,10 @@
 //! Provides quick search, advanced search, checksum lookup, suggestions,
 //! trending, and recent artifact endpoints. Uses Meilisearch when available,
 //! falling back to PostgreSQL full-text search.
+//!
+//! All search endpoints enforce repository visibility: unauthenticated callers
+//! only see public repos, non-admin authenticated users see public repos plus
+//! repos where they hold a role assignment, and admins see everything.
 
 use axum::{
     extract::{Extension, Query, State},
@@ -11,6 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -41,6 +46,66 @@ pub fn router() -> Router<SharedState> {
         .route("/suggest", get(suggest))
         .route("/trending", get(trending))
         .route("/recent", get(recent))
+}
+
+// ---------------------------------------------------------------------------
+// Repository visibility resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve which repository IDs the current caller is allowed to see.
+///
+/// - Unauthenticated: returns `Some(ids)` containing only public repo IDs.
+/// - Admin: returns `None`, meaning no filter (all repos visible).
+/// - Authenticated non-admin: returns `Some(ids)` containing public repos
+///   plus any private repos where the user holds a role assignment.
+///
+/// The returned value is passed directly to SearchService methods as the
+/// `accessible_repo_ids` parameter.
+async fn resolve_accessible_repos(
+    db: &PgPool,
+    auth: &Option<AuthExtension>,
+) -> Result<Option<Vec<Uuid>>> {
+    match auth {
+        Some(a) if a.is_admin => {
+            // Admins see everything -- no filter.
+            Ok(None)
+        }
+        Some(a) => {
+            // Authenticated non-admin: public repos + repos with role assignment.
+            let rows: Vec<(Uuid,)> = sqlx::query_as(
+                r#"
+                SELECT r.id
+                FROM repositories r
+                WHERE r.is_public = true
+                UNION
+                SELECT COALESCE(ra.repository_id, r2.id)
+                FROM role_assignments ra
+                LEFT JOIN repositories r2 ON ra.repository_id IS NULL
+                WHERE ra.user_id = $1
+                  AND (ra.repository_id IS NOT NULL OR r2.id IS NOT NULL)
+                "#,
+            )
+            .bind(a.user_id)
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            Ok(Some(rows.into_iter().map(|(id,)| id).collect()))
+        }
+        None => {
+            // Unauthenticated: only public repos.
+            let rows: Vec<(Uuid,)> = sqlx::query_as(
+                r#"
+                SELECT r.id FROM repositories r WHERE r.is_public = true
+                "#,
+            )
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            Ok(Some(rows.into_iter().map(|(id,)| id).collect()))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,13 +194,16 @@ pub async fn quick_search(
         }));
     }
 
+    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+
     let search_query = SearchQuery {
         q: Some(query_text),
         format: None,
         name: None,
         offset: Some(0),
         limit: Some(limit),
-        public_only: auth.is_none(),
+        public_only: false,
+        accessible_repo_ids,
     };
 
     let service = SearchService::new(state.db.clone());
@@ -209,13 +277,16 @@ pub async fn advanced_search(
     let per_page = params.per_page.unwrap_or(20).clamp(1, 100);
     let offset = ((page - 1) * per_page) as i64;
 
+    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+
     let search_query = SearchQuery {
         q: params.query.clone(),
         format: params.format.clone(),
         name: params.name.clone(),
         offset: Some(offset),
         limit: Some(per_page as i64),
-        public_only: auth.is_none(),
+        public_only: false,
+        accessible_repo_ids,
     };
 
     let service = SearchService::new(state.db.clone());
@@ -325,6 +396,7 @@ pub struct ChecksumSearchResponse {
 )]
 pub async fn checksum_search(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<ChecksumQuery>,
 ) -> Result<Json<ChecksumSearchResponse>> {
     let algorithm = params.algorithm.as_deref().unwrap_or("sha256");
@@ -336,91 +408,12 @@ pub async fn checksum_search(
         }));
     }
 
-    let artifacts = match algorithm {
-        "sha256" => sqlx::query_as!(
-            ChecksumRow,
-            r#"
-                SELECT
-                    a.id,
-                    r.key AS repository_key,
-                    a.path,
-                    a.name,
-                    a.version,
-                    a.size_bytes,
-                    a.checksum_sha256,
-                    a.content_type,
-                    a.created_at,
-                    COALESCE(
-                        (SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id),
-                        0
-                    ) AS "download_count!"
-                FROM artifacts a
-                JOIN repositories r ON r.id = a.repository_id
-                WHERE a.is_deleted = false
-                  AND a.checksum_sha256 = $1
-                ORDER BY a.created_at DESC
-                "#,
-            checksum
-        )
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?,
-        "sha1" => sqlx::query_as!(
-            ChecksumRow,
-            r#"
-                SELECT
-                    a.id,
-                    r.key AS repository_key,
-                    a.path,
-                    a.name,
-                    a.version,
-                    a.size_bytes,
-                    a.checksum_sha256,
-                    a.content_type,
-                    a.created_at,
-                    COALESCE(
-                        (SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id),
-                        0
-                    ) AS "download_count!"
-                FROM artifacts a
-                JOIN repositories r ON r.id = a.repository_id
-                WHERE a.is_deleted = false
-                  AND a.checksum_sha1 = $1
-                ORDER BY a.created_at DESC
-                "#,
-            checksum
-        )
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?,
-        "md5" => sqlx::query_as!(
-            ChecksumRow,
-            r#"
-                SELECT
-                    a.id,
-                    r.key AS repository_key,
-                    a.path,
-                    a.name,
-                    a.version,
-                    a.size_bytes,
-                    a.checksum_sha256,
-                    a.content_type,
-                    a.created_at,
-                    COALESCE(
-                        (SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id),
-                        0
-                    ) AS "download_count!"
-                FROM artifacts a
-                JOIN repositories r ON r.id = a.repository_id
-                WHERE a.is_deleted = false
-                  AND a.checksum_md5 = $1
-                ORDER BY a.created_at DESC
-                "#,
-            checksum
-        )
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?,
+    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+
+    let checksum_column = match algorithm {
+        "sha256" => "a.checksum_sha256",
+        "sha1" => "a.checksum_sha1",
+        "md5" => "a.checksum_md5",
         other => {
             return Err(AppError::Validation(format!(
                 "Unsupported checksum algorithm: {other}. Use sha256, sha1, or md5."
@@ -428,7 +421,43 @@ pub async fn checksum_search(
         }
     };
 
-    let artifacts = artifacts
+    // Build the query dynamically to select the correct checksum column.
+    // The repo visibility filter ($2) uses the same pattern as other search
+    // methods: NULL means no filter (admin), otherwise restrict to the list.
+    let sql = format!(
+        r#"
+        SELECT
+            a.id,
+            r.key AS repository_key,
+            a.path,
+            a.name,
+            a.version,
+            a.size_bytes,
+            a.checksum_sha256,
+            a.content_type,
+            a.created_at,
+            COALESCE(
+                (SELECT COUNT(*) FROM download_statistics ds WHERE ds.artifact_id = a.id),
+                0
+            )::BIGINT AS download_count
+        FROM artifacts a
+        JOIN repositories r ON r.id = a.repository_id
+        WHERE a.is_deleted = false
+          AND {col} = $1
+          AND ($2::uuid[] IS NULL OR r.id = ANY($2))
+        ORDER BY a.created_at DESC
+        "#,
+        col = checksum_column,
+    );
+
+    let rows: Vec<ChecksumRow> = sqlx::query_as(&sql)
+        .bind(&checksum)
+        .bind(&accessible_repo_ids)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let artifacts = rows
         .into_iter()
         .map(|row| ChecksumArtifact {
             id: row.id,
@@ -448,6 +477,7 @@ pub async fn checksum_search(
 }
 
 /// Internal row type for checksum query results.
+#[derive(sqlx::FromRow)]
 struct ChecksumRow {
     id: Uuid,
     repository_key: String,
@@ -488,12 +518,17 @@ pub struct SuggestResponse {
 )]
 pub async fn suggest(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<SuggestQuery>,
 ) -> Result<Json<SuggestResponse>> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
 
+    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+
     let service = SearchService::new(state.db.clone());
-    let suggestions = service.suggest(&params.prefix, limit).await?;
+    let suggestions = service
+        .suggest(&params.prefix, limit, accessible_repo_ids.as_deref(), false)
+        .await?;
 
     Ok(Json(SuggestResponse { suggestions }))
 }
@@ -526,8 +561,12 @@ pub async fn trending(
     let days = params.days.unwrap_or(7).clamp(1, 90);
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
+    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+
     let service = SearchService::new(state.db.clone());
-    let results = service.trending(days, limit, auth.is_none()).await?;
+    let results = service
+        .trending(days, limit, false, accessible_repo_ids.as_deref())
+        .await?;
 
     let items = results
         .into_iter()
@@ -574,8 +613,12 @@ pub async fn recent(
 ) -> Result<Json<Vec<SearchResultItem>>> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
+    let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
+
     let service = SearchService::new(state.db.clone());
-    let results = service.recent(limit, auth.is_none()).await?;
+    let results = service
+        .recent(limit, false, accessible_repo_ids.as_deref())
+        .await?;
 
     let items = results
         .into_iter()

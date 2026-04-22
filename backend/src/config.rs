@@ -161,6 +161,7 @@ pub struct Config {
 
     pub rate_limit_auth_per_window: u32,
     pub rate_limit_api_per_window: u32,
+    pub rate_limit_search_per_window: u32,
     pub rate_limit_window_secs: u64,
     pub rate_limit_exempt_usernames: Vec<String>,
     pub rate_limit_exempt_service_accounts: bool,
@@ -300,6 +301,7 @@ redacted_debug!(Config {
     show database_max_lifetime_secs,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
+    show rate_limit_search_per_window,
     show rate_limit_window_secs,
     show rate_limit_exempt_usernames,
     show rate_limit_exempt_service_accounts,
@@ -374,6 +376,7 @@ impl Default for Config {
             database_max_lifetime_secs: 1800,
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
+            rate_limit_search_per_window: 300,
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
@@ -500,6 +503,7 @@ impl Config {
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
+            rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
             rate_limit_window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60),
             rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
                 .ok()
