@@ -824,6 +824,43 @@ mod tests {
         PermissionService::new(pool)
     }
 
+    /// Insert a permission cache entry for the given user/target with the specified actions.
+    fn seed_permission_cache(
+        service: &PermissionService,
+        user_id: Uuid,
+        target_type: &str,
+        target_id: Uuid,
+        actions: Vec<String>,
+        inserted_at: Instant,
+    ) {
+        let mut cache = service.cache.write().unwrap();
+        cache.insert(
+            CacheKey::new(user_id, target_type, target_id),
+            CacheEntry {
+                actions,
+                inserted_at,
+            },
+        );
+    }
+
+    /// Insert a rules cache entry indicating whether rules exist for a target.
+    fn seed_rules_cache(
+        service: &PermissionService,
+        target_type: &str,
+        target_id: Uuid,
+        exists: bool,
+        inserted_at: Instant,
+    ) {
+        let mut rules = service.rules_cache.write().unwrap();
+        rules.insert(
+            RulesCacheKey::new(target_type, target_id),
+            RulesCacheEntry {
+                exists,
+                inserted_at,
+            },
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PermissionService::check_permission -- admin bypass via real service
     // -----------------------------------------------------------------------
@@ -864,17 +901,14 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        // Pre-populate the permission cache with granted actions.
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string(), "write".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec!["read".into(), "write".into()],
+            Instant::now(),
+        );
 
         let result = service
             .check_permission(user_id, "repository", target_id, "write", false)
@@ -889,16 +923,14 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec!["read".into()],
+            Instant::now(),
+        );
 
         let result = service
             .check_permission(user_id, "repository", target_id, "delete", false)
@@ -913,16 +945,14 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec![],
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec![],
+            Instant::now(),
+        );
 
         let result = service
             .check_permission(user_id, "repository", target_id, "read", false)
@@ -941,17 +971,14 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        // Insert an expired entry so the cache miss path runs.
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string()],
-                    inserted_at: Instant::now() - CACHE_TTL - Duration::from_secs(5),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec!["read".into()],
+            Instant::now() - CACHE_TTL - Duration::from_secs(5),
+        );
 
         // The lazy pool is not connected, so the DB query will fail.
         let result = service
@@ -992,36 +1019,23 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        // Populate permission cache.
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string(), "write".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-            cache.insert(
-                CacheKey::new(Uuid::new_v4(), "artifact", Uuid::new_v4()),
-                CacheEntry {
-                    actions: vec!["delete".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
-
-        // Populate rules cache.
-        {
-            let mut rules = service.rules_cache.write().unwrap();
-            rules.insert(
-                RulesCacheKey::new("repository", target_id),
-                RulesCacheEntry {
-                    exists: true,
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec!["read".into(), "write".into()],
+            Instant::now(),
+        );
+        seed_permission_cache(
+            &service,
+            Uuid::new_v4(),
+            "artifact",
+            Uuid::new_v4(),
+            vec!["delete".into()],
+            Instant::now(),
+        );
+        seed_rules_cache(&service, "repository", target_id, true, Instant::now());
 
         // Verify caches are populated.
         assert_eq!(service.cache.read().unwrap().len(), 2);
@@ -1041,17 +1055,7 @@ mod tests {
     async fn test_has_any_rules_cache_hit_returns_true() {
         let service = lazy_service();
         let target_id = Uuid::new_v4();
-
-        {
-            let mut rules = service.rules_cache.write().unwrap();
-            rules.insert(
-                RulesCacheKey::new("repository", target_id),
-                RulesCacheEntry {
-                    exists: true,
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_rules_cache(&service, "repository", target_id, true, Instant::now());
 
         let result = service
             .has_any_rules_for_target("repository", target_id)
@@ -1064,17 +1068,7 @@ mod tests {
     async fn test_has_any_rules_cache_hit_returns_false() {
         let service = lazy_service();
         let target_id = Uuid::new_v4();
-
-        {
-            let mut rules = service.rules_cache.write().unwrap();
-            rules.insert(
-                RulesCacheKey::new("artifact", target_id),
-                RulesCacheEntry {
-                    exists: false,
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_rules_cache(&service, "artifact", target_id, false, Instant::now());
 
         let result = service
             .has_any_rules_for_target("artifact", target_id)
@@ -1092,16 +1086,13 @@ mod tests {
         let service = lazy_service();
         let target_id = Uuid::new_v4();
 
-        {
-            let mut rules = service.rules_cache.write().unwrap();
-            rules.insert(
-                RulesCacheKey::new("repository", target_id),
-                RulesCacheEntry {
-                    exists: true,
-                    inserted_at: Instant::now() - CACHE_TTL - Duration::from_secs(5),
-                },
-            );
-        }
+        seed_rules_cache(
+            &service,
+            "repository",
+            target_id,
+            true,
+            Instant::now() - CACHE_TTL - Duration::from_secs(5),
+        );
 
         let result = service
             .has_any_rules_for_target("repository", target_id)
@@ -1128,16 +1119,14 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec!["read".into(), "write".into(), "admin".into()],
+            Instant::now(),
+        );
 
         let actions = service
             .resolve_actions(user_id, "repository", target_id)
@@ -1155,16 +1144,14 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "artifact", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string()],
-                    inserted_at: Instant::now() - CACHE_TTL - Duration::from_secs(10),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "artifact",
+            target_id,
+            vec!["read".into()],
+            Instant::now() - CACHE_TTL - Duration::from_secs(10),
+        );
 
         let result = service
             .resolve_actions(user_id, "artifact", target_id)
@@ -1183,26 +1170,15 @@ mod tests {
         let target_id = Uuid::new_v4();
 
         // Populate both caches through the service's internal locks.
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
-        {
-            let mut rules = service.rules_cache.write().unwrap();
-            rules.insert(
-                RulesCacheKey::new("repository", target_id),
-                RulesCacheEntry {
-                    exists: true,
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec!["read".into()],
+            Instant::now(),
+        );
+        seed_rules_cache(&service, "repository", target_id, true, Instant::now());
 
         // Verify cache hit works before invalidation.
         let granted = service
@@ -1253,23 +1229,22 @@ mod tests {
         let user_id = Uuid::new_v4();
         let target_id = Uuid::new_v4();
 
-        {
-            let mut cache = service.cache.write().unwrap();
-            cache.insert(
-                CacheKey::new(user_id, "repository", target_id),
-                CacheEntry {
-                    actions: vec!["read".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-            cache.insert(
-                CacheKey::new(user_id, "artifact", target_id),
-                CacheEntry {
-                    actions: vec!["delete".to_string()],
-                    inserted_at: Instant::now(),
-                },
-            );
-        }
+        seed_permission_cache(
+            &service,
+            user_id,
+            "repository",
+            target_id,
+            vec!["read".into()],
+            Instant::now(),
+        );
+        seed_permission_cache(
+            &service,
+            user_id,
+            "artifact",
+            target_id,
+            vec!["delete".into()],
+            Instant::now(),
+        );
 
         // "repository" grants "read" but not "delete".
         let repo_read = service
