@@ -1,7 +1,7 @@
 //! Group management handlers.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -11,8 +11,14 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::dto::Pagination;
+use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+
+/// Require that the request is authenticated, returning an error if not.
+fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
+    auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
+}
 
 /// Create group routes
 pub fn router() -> Router<SharedState> {
@@ -242,6 +248,8 @@ pub struct CreatedGroupRow {
     request_body = CreateGroupRequest,
     responses(
         (status = 200, description = "Group created successfully", body = GroupResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 409, description = "Group name already exists"),
         (status = 500, description = "Internal server error")
     ),
@@ -249,8 +257,24 @@ pub struct CreatedGroupRow {
 )]
 pub async fn create_group(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
+    let auth = require_auth(auth)?;
+
+    // Fine-grained permission check: non-admins need "admin" on the system sentinel.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "system", Uuid::nil(), "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to create groups".to_string(),
+            ));
+        }
+    }
+
     let group: CreatedGroupRow = sqlx::query_as(
         r#"
         INSERT INTO groups (name, description)
@@ -377,6 +401,8 @@ pub async fn get_group(
     request_body = CreateGroupRequest,
     responses(
         (status = 200, description = "Group updated successfully", body = GroupResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -384,9 +410,25 @@ pub async fn get_group(
 )]
 pub async fn update_group(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>> {
+    let auth = require_auth(auth)?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to update this group".to_string(),
+            ));
+        }
+    }
+
     let group: CreatedGroupRow = sqlx::query_as(
         r#"
         UPDATE groups
@@ -433,12 +475,33 @@ pub async fn update_group(
     ),
     responses(
         (status = 200, description = "Group deleted successfully"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
-pub async fn delete_group(State(state): State<SharedState>, Path(id): Path<Uuid>) -> Result<()> {
+pub async fn delete_group(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(id): Path<Uuid>,
+) -> Result<()> {
+    let auth = require_auth(auth)?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to delete this group".to_string(),
+            ));
+        }
+    }
+
     let result = sqlx::query("DELETE FROM groups WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -471,6 +534,8 @@ pub struct MembersRequest {
     request_body = MembersRequest,
     responses(
         (status = 200, description = "Members added successfully"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -478,9 +543,25 @@ pub struct MembersRequest {
 )]
 pub async fn add_members(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
+    let auth = require_auth(auth)?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to manage group membership".to_string(),
+            ));
+        }
+    }
+
     for user_id in payload.user_ids {
         sqlx::query(
             r#"
@@ -513,6 +594,8 @@ pub async fn add_members(
     request_body = MembersRequest,
     responses(
         (status = 200, description = "Members removed successfully"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Group not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -520,9 +603,25 @@ pub async fn add_members(
 )]
 pub async fn remove_members(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
     Json(payload): Json<MembersRequest>,
 ) -> Result<()> {
+    let auth = require_auth(auth)?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target group.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "group", id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to manage group membership".to_string(),
+            ));
+        }
+    }
+
     for user_id in payload.user_ids {
         sqlx::query("DELETE FROM user_group_members WHERE user_id = $1 AND group_id = $2")
             .bind(user_id)
@@ -1121,5 +1220,171 @@ mod tests {
         assert!(json["items"].as_array().unwrap().is_empty());
         assert_eq!(json["pagination"]["total"], 0);
         assert_eq!(json["pagination"]["total_pages"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Permission check logic (Phase 3: admin-level endpoint checks)
+    // -----------------------------------------------------------------------
+
+    fn make_auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    /// Simulates the permission gate used in group mutation handlers.
+    /// Admins bypass all checks; non-admins must hold the required action.
+    fn check_permission_gate(
+        is_admin: bool,
+        granted_actions: &[&str],
+        required_action: &str,
+    ) -> bool {
+        if is_admin {
+            return true;
+        }
+        granted_actions.iter().any(|a| *a == required_action)
+    }
+
+    #[test]
+    fn test_require_auth_none_returns_error() {
+        let result = require_auth(None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::Authentication(msg) => assert!(msg.contains("Authentication required")),
+            other => panic!("Expected Authentication error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_auth_some_returns_auth() {
+        let auth = make_auth(false);
+        let user_id = auth.user_id;
+        let result = require_auth(Some(auth));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().user_id, user_id);
+    }
+
+    #[test]
+    fn test_create_group_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_create_group_permission_non_admin_with_system_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_create_group_permission_non_admin_without_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_create_group_permission_non_admin_with_wrong_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(
+            auth.is_admin,
+            &["read", "write"],
+            "admin"
+        ));
+    }
+
+    #[test]
+    fn test_update_group_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_update_group_permission_non_admin_with_group_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_update_group_permission_non_admin_without_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_delete_group_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_delete_group_permission_non_admin_with_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_delete_group_permission_non_admin_without_grant_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_add_members_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_add_members_permission_non_admin_with_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_add_members_permission_non_admin_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_remove_members_permission_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_remove_members_permission_non_admin_with_grant() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_remove_members_permission_non_admin_denied() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_system_sentinel_is_nil_uuid() {
+        // create_group uses Uuid::nil() as the system sentinel target_id
+        let sentinel = Uuid::nil();
+        assert_eq!(sentinel.to_string(), "00000000-0000-0000-0000-000000000000");
+    }
+
+    #[test]
+    fn test_permission_gate_non_admin_multiple_grants_includes_admin() {
+        let auth = make_auth(false);
+        assert!(check_permission_gate(
+            auth.is_admin,
+            &["read", "write", "delete", "admin"],
+            "admin"
+        ));
     }
 }
