@@ -265,14 +265,15 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     auth_middleware,
                 )),
         )
-        // Group routes with auth middleware
+        // Group routes with optional auth middleware
+        // (list/get are public, mutating endpoints check auth in handlers)
         .nest(
             "/groups",
             handlers::groups::router()
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
-                    auth_middleware,
+                    optional_auth_middleware,
                 )),
         )
         // Permission routes with auth middleware

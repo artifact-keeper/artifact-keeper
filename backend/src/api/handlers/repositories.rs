@@ -23,6 +23,7 @@ use crate::error::{AppError, Result};
 use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
+use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -651,7 +652,13 @@ pub async fn create_repository(
     if !auth.is_admin {
         let has_perm = state
             .permission_service
-            .check_permission(auth.user_id, "system", Uuid::nil(), "admin", false)
+            .check_permission(
+                auth.user_id,
+                SYSTEM_TARGET_TYPE,
+                SYSTEM_SENTINEL_ID,
+                "admin",
+                false,
+            )
             .await?;
         if !has_perm {
             return Err(AppError::Authorization(
@@ -4700,7 +4707,7 @@ mod tests {
         if is_admin {
             return true;
         }
-        granted_actions.iter().any(|a| *a == required_action)
+        granted_actions.contains(&required_action)
     }
 
     #[test]
@@ -4740,9 +4747,12 @@ mod tests {
 
     #[test]
     fn test_system_sentinel_is_nil_uuid() {
-        // create_repository uses Uuid::nil() as the system sentinel target_id
-        let sentinel = Uuid::nil();
-        assert_eq!(sentinel.to_string(), "00000000-0000-0000-0000-000000000000");
+        // create_repository uses SYSTEM_SENTINEL_ID as the system sentinel target_id
+        assert_eq!(
+            SYSTEM_SENTINEL_ID.to_string(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(SYSTEM_TARGET_TYPE, "system");
     }
 
     #[test]
