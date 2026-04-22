@@ -47,7 +47,7 @@ pub(crate) fn sanitize_artifact_filename(name: &str) -> String {
 ///
 /// Common formats (pypi, npm, maven, etc.) get their standard purl type.
 /// Unknown formats fall back to `"generic"`.
-fn format_to_purl_type(format: &str) -> &str {
+fn format_to_purl_type(format: &str) -> &'static str {
     match format.to_lowercase().as_str() {
         "pypi" => "pypi",
         "npm" => "npm",
@@ -70,6 +70,54 @@ fn format_to_purl_type(format: &str) -> &str {
         "apk" | "alpine" => "apk",
         _ => "generic",
     }
+}
+
+/// Derive the Dependency-Track project name and purl type from an optional
+/// repo name and format. When the repo row is missing, falls back to the
+/// raw repository UUID string.
+///
+/// Returns `(project_name, purl_type)`.
+pub(crate) fn derive_dt_project_info(
+    repo_row: Option<(String, Option<String>)>,
+    fallback_id: &str,
+) -> (String, &'static str) {
+    let (project_name, repo_format) = match repo_row {
+        Some((name, format)) => (name, format),
+        None => (fallback_id.to_string(), None),
+    };
+    let purl_type = match repo_format {
+        Some(ref fmt) => format_to_purl_type(fmt),
+        None => "generic",
+    };
+    (project_name, purl_type)
+}
+
+/// Build a list of [`DependencyInfo`] from scan-finding rows.
+///
+/// Each row is `(component_name, optional_version, optional_source)`.
+/// When a version is present the function generates a purl string using
+/// the supplied `purl_type`.
+pub(crate) fn build_dependency_info_from_findings(
+    findings_rows: Vec<(String, Option<String>, Option<String>)>,
+    purl_type: &str,
+) -> Vec<crate::services::sbom_service::DependencyInfo> {
+    use crate::services::sbom_service::DependencyInfo;
+
+    findings_rows
+        .into_iter()
+        .map(|(name, version, _source)| {
+            let purl = version
+                .as_deref()
+                .map(|v| format!("pkg:{}/{}@{}", purl_type, name, v));
+            DependencyInfo {
+                name,
+                version,
+                purl,
+                license: None,
+                sha256: None,
+            }
+        })
+        .collect()
 }
 
 /// Shared scan workspace utilities for scanners that need to write artifact
@@ -1391,7 +1439,7 @@ impl ScannerService {
         artifact: &Artifact,
     ) {
         use crate::models::sbom::SbomFormat;
-        use crate::services::sbom_service::{DependencyInfo, SbomService};
+        use crate::services::sbom_service::SbomService;
 
         // Fetch repository name and format for the DT project
         let repo_row: Option<(String, Option<String>)> =
@@ -1402,15 +1450,8 @@ impl ScannerService {
                 .ok()
                 .flatten();
 
-        let (project_name, repo_format) = match repo_row {
-            Some((name, format)) => (name, format),
-            None => (artifact.repository_id.to_string(), None),
-        };
-
-        let purl_type = repo_format
-            .as_deref()
-            .map(format_to_purl_type)
-            .unwrap_or("generic");
+        let (project_name, purl_type) =
+            derive_dt_project_info(repo_row, &artifact.repository_id.to_string());
 
         // Fetch scan findings to build dependency info for the SBOM.
         // The scan_findings table stores affected components in the
@@ -1430,21 +1471,7 @@ impl ScannerService {
         .await
         .unwrap_or_default();
 
-        let deps: Vec<DependencyInfo> = findings_rows
-            .into_iter()
-            .map(|(name, version, _source)| {
-                let purl = version
-                    .as_deref()
-                    .map(|v| format!("pkg:{}/{}@{}", purl_type, name, v));
-                DependencyInfo {
-                    name,
-                    version,
-                    purl,
-                    license: None,
-                    sha256: None,
-                }
-            })
-            .collect();
+        let deps = build_dependency_info_from_findings(findings_rows, purl_type);
 
         if deps.is_empty() {
             info!(
@@ -5801,5 +5828,354 @@ mod tests {
         extract_tar_gz_safe(&archive, tmp.path()).unwrap();
         // Should succeed with no files created
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    // ===================================================================
+    // format_to_purl_type -- exhaustive mapping tests
+    // ===================================================================
+
+    #[test]
+    fn test_format_to_purl_type_pypi() {
+        assert_eq!(format_to_purl_type("pypi"), "pypi");
+        assert_eq!(format_to_purl_type("PyPI"), "pypi");
+        assert_eq!(format_to_purl_type("PYPI"), "pypi");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_npm() {
+        assert_eq!(format_to_purl_type("npm"), "npm");
+        assert_eq!(format_to_purl_type("NPM"), "npm");
+        assert_eq!(format_to_purl_type("Npm"), "npm");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_cargo() {
+        assert_eq!(format_to_purl_type("cargo"), "cargo");
+        assert_eq!(format_to_purl_type("crates"), "cargo");
+        assert_eq!(format_to_purl_type("Cargo"), "cargo");
+        assert_eq!(format_to_purl_type("CRATES"), "cargo");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_maven() {
+        assert_eq!(format_to_purl_type("maven"), "maven");
+        assert_eq!(format_to_purl_type("Maven"), "maven");
+        assert_eq!(format_to_purl_type("MAVEN"), "maven");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_go() {
+        assert_eq!(format_to_purl_type("go"), "golang");
+        assert_eq!(format_to_purl_type("golang"), "golang");
+        assert_eq!(format_to_purl_type("Go"), "golang");
+        assert_eq!(format_to_purl_type("GOLANG"), "golang");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_nuget() {
+        assert_eq!(format_to_purl_type("nuget"), "nuget");
+        assert_eq!(format_to_purl_type("NuGet"), "nuget");
+        assert_eq!(format_to_purl_type("NUGET"), "nuget");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_rubygems() {
+        assert_eq!(format_to_purl_type("rubygems"), "gem");
+        assert_eq!(format_to_purl_type("gem"), "gem");
+        assert_eq!(format_to_purl_type("RubyGems"), "gem");
+        assert_eq!(format_to_purl_type("GEM"), "gem");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_docker() {
+        assert_eq!(format_to_purl_type("docker"), "docker");
+        assert_eq!(format_to_purl_type("oci"), "docker");
+        assert_eq!(format_to_purl_type("container"), "docker");
+        assert_eq!(format_to_purl_type("Docker"), "docker");
+        assert_eq!(format_to_purl_type("OCI"), "docker");
+        assert_eq!(format_to_purl_type("Container"), "docker");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_composer() {
+        assert_eq!(format_to_purl_type("composer"), "composer");
+        assert_eq!(format_to_purl_type("php"), "composer");
+        assert_eq!(format_to_purl_type("PHP"), "composer");
+        assert_eq!(format_to_purl_type("Composer"), "composer");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_cocoapods() {
+        assert_eq!(format_to_purl_type("cocoapods"), "cocoapods");
+        assert_eq!(format_to_purl_type("pods"), "cocoapods");
+        assert_eq!(format_to_purl_type("CocoaPods"), "cocoapods");
+        assert_eq!(format_to_purl_type("PODS"), "cocoapods");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_swift() {
+        assert_eq!(format_to_purl_type("swift"), "swift");
+        assert_eq!(format_to_purl_type("Swift"), "swift");
+        assert_eq!(format_to_purl_type("SWIFT"), "swift");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_hex() {
+        assert_eq!(format_to_purl_type("hex"), "hex");
+        assert_eq!(format_to_purl_type("elixir"), "hex");
+        assert_eq!(format_to_purl_type("Hex"), "hex");
+        assert_eq!(format_to_purl_type("Elixir"), "hex");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_pub() {
+        assert_eq!(format_to_purl_type("pub"), "pub");
+        assert_eq!(format_to_purl_type("dart"), "pub");
+        assert_eq!(format_to_purl_type("Pub"), "pub");
+        assert_eq!(format_to_purl_type("Dart"), "pub");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_conan() {
+        assert_eq!(format_to_purl_type("conan"), "conan");
+        assert_eq!(format_to_purl_type("cpp"), "conan");
+        assert_eq!(format_to_purl_type("Conan"), "conan");
+        assert_eq!(format_to_purl_type("CPP"), "conan");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_conda() {
+        assert_eq!(format_to_purl_type("conda"), "conda");
+        assert_eq!(format_to_purl_type("Conda"), "conda");
+        assert_eq!(format_to_purl_type("CONDA"), "conda");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_hackage() {
+        assert_eq!(format_to_purl_type("hackage"), "hackage");
+        assert_eq!(format_to_purl_type("haskell"), "hackage");
+        assert_eq!(format_to_purl_type("Hackage"), "hackage");
+        assert_eq!(format_to_purl_type("Haskell"), "hackage");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_rpm() {
+        assert_eq!(format_to_purl_type("rpm"), "rpm");
+        assert_eq!(format_to_purl_type("RPM"), "rpm");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_deb() {
+        assert_eq!(format_to_purl_type("deb"), "deb");
+        assert_eq!(format_to_purl_type("debian"), "deb");
+        assert_eq!(format_to_purl_type("apt"), "deb");
+        assert_eq!(format_to_purl_type("DEB"), "deb");
+        assert_eq!(format_to_purl_type("Debian"), "deb");
+        assert_eq!(format_to_purl_type("APT"), "deb");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_apk() {
+        assert_eq!(format_to_purl_type("apk"), "apk");
+        assert_eq!(format_to_purl_type("alpine"), "apk");
+        assert_eq!(format_to_purl_type("APK"), "apk");
+        assert_eq!(format_to_purl_type("Alpine"), "apk");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_unknown_fallback() {
+        assert_eq!(format_to_purl_type("unknown"), "generic");
+        assert_eq!(format_to_purl_type("foo"), "generic");
+        assert_eq!(format_to_purl_type("terraform"), "generic");
+        assert_eq!(format_to_purl_type("helm"), "generic");
+        assert_eq!(format_to_purl_type("raw"), "generic");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_empty_string() {
+        assert_eq!(format_to_purl_type(""), "generic");
+    }
+
+    #[test]
+    fn test_format_to_purl_type_whitespace() {
+        // Leading/trailing whitespace is not trimmed by the function,
+        // so " npm " should fall through to generic.
+        assert_eq!(format_to_purl_type(" npm "), "generic");
+        assert_eq!(format_to_purl_type("npm "), "generic");
+        assert_eq!(format_to_purl_type(" npm"), "generic");
+    }
+
+    // ===================================================================
+    // derive_dt_project_info
+    // ===================================================================
+
+    #[test]
+    fn test_derive_dt_project_info_with_repo_name_and_format() {
+        let row = Some(("my-npm-repo".to_string(), Some("npm".to_string())));
+        let (name, purl) = derive_dt_project_info(row, "fallback-id");
+        assert_eq!(name, "my-npm-repo");
+        assert_eq!(purl, "npm");
+    }
+
+    #[test]
+    fn test_derive_dt_project_info_with_repo_name_no_format() {
+        let row = Some(("my-repo".to_string(), None));
+        let (name, purl) = derive_dt_project_info(row, "fallback-id");
+        assert_eq!(name, "my-repo");
+        assert_eq!(purl, "generic");
+    }
+
+    #[test]
+    fn test_derive_dt_project_info_no_repo_row() {
+        let (name, purl) = derive_dt_project_info(None, "abc-123-uuid");
+        assert_eq!(name, "abc-123-uuid");
+        assert_eq!(purl, "generic");
+    }
+
+    #[test]
+    fn test_derive_dt_project_info_format_case_insensitive() {
+        let row = Some(("repo".to_string(), Some("PyPI".to_string())));
+        let (_, purl) = derive_dt_project_info(row, "x");
+        assert_eq!(purl, "pypi");
+    }
+
+    #[test]
+    fn test_derive_dt_project_info_docker_format() {
+        let row = Some(("docker-repo".to_string(), Some("docker".to_string())));
+        let (name, purl) = derive_dt_project_info(row, "x");
+        assert_eq!(name, "docker-repo");
+        assert_eq!(purl, "docker");
+    }
+
+    #[test]
+    fn test_derive_dt_project_info_unknown_format_is_generic() {
+        let row = Some(("repo".to_string(), Some("custom-format".to_string())));
+        let (_, purl) = derive_dt_project_info(row, "x");
+        assert_eq!(purl, "generic");
+    }
+
+    // ===================================================================
+    // build_dependency_info_from_findings
+    // ===================================================================
+
+    #[test]
+    fn test_build_deps_empty_findings() {
+        let deps = build_dependency_info_from_findings(vec![], "npm");
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_build_deps_single_finding_with_version() {
+        let rows = vec![(
+            "lodash".to_string(),
+            Some("4.17.21".to_string()),
+            Some("trivy".to_string()),
+        )];
+        let deps = build_dependency_info_from_findings(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+        assert_eq!(deps[0].version.as_deref(), Some("4.17.21"));
+        assert_eq!(deps[0].purl.as_deref(), Some("pkg:npm/lodash@4.17.21"));
+        assert!(deps[0].license.is_none());
+        assert!(deps[0].sha256.is_none());
+    }
+
+    #[test]
+    fn test_build_deps_finding_without_version() {
+        let rows = vec![("express".to_string(), None, None)];
+        let deps = build_dependency_info_from_findings(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "express");
+        assert_eq!(deps[0].version, None);
+        // No version means no purl
+        assert_eq!(deps[0].purl, None);
+    }
+
+    #[test]
+    fn test_build_deps_multiple_findings() {
+        let rows = vec![
+            ("serde".to_string(), Some("1.0.200".to_string()), None),
+            ("tokio".to_string(), Some("1.35.0".to_string()), None),
+            ("uuid".to_string(), None, Some("grype".to_string())),
+        ];
+        let deps = build_dependency_info_from_findings(rows, "cargo");
+        assert_eq!(deps.len(), 3);
+        assert_eq!(deps[0].purl.as_deref(), Some("pkg:cargo/serde@1.0.200"));
+        assert_eq!(deps[1].purl.as_deref(), Some("pkg:cargo/tokio@1.35.0"));
+        assert_eq!(deps[2].purl, None);
+    }
+
+    #[test]
+    fn test_build_deps_purl_uses_given_type() {
+        let rows = vec![("flask".to_string(), Some("2.3.0".to_string()), None)];
+
+        let npm_deps = build_dependency_info_from_findings(rows.clone(), "npm");
+        assert_eq!(npm_deps[0].purl.as_deref(), Some("pkg:npm/flask@2.3.0"));
+
+        let pypi_deps = build_dependency_info_from_findings(
+            vec![("flask".to_string(), Some("2.3.0".to_string()), None)],
+            "pypi",
+        );
+        assert_eq!(pypi_deps[0].purl.as_deref(), Some("pkg:pypi/flask@2.3.0"));
+
+        let generic_deps = build_dependency_info_from_findings(
+            vec![("flask".to_string(), Some("2.3.0".to_string()), None)],
+            "generic",
+        );
+        assert_eq!(
+            generic_deps[0].purl.as_deref(),
+            Some("pkg:generic/flask@2.3.0")
+        );
+    }
+
+    #[test]
+    fn test_build_deps_source_field_ignored() {
+        // The source field should not affect the output
+        let rows = vec![
+            (
+                "pkg-a".to_string(),
+                Some("1.0".to_string()),
+                Some("trivy".to_string()),
+            ),
+            (
+                "pkg-b".to_string(),
+                Some("2.0".to_string()),
+                Some("grype".to_string()),
+            ),
+            ("pkg-c".to_string(), Some("3.0".to_string()), None),
+        ];
+        let deps = build_dependency_info_from_findings(rows, "maven");
+        assert_eq!(deps.len(), 3);
+        // All should produce valid purls regardless of source
+        for dep in &deps {
+            assert!(dep.purl.is_some());
+        }
+    }
+
+    #[test]
+    fn test_build_deps_special_characters_in_name() {
+        let rows = vec![(
+            "@scope/package".to_string(),
+            Some("1.0.0".to_string()),
+            None,
+        )];
+        let deps = build_dependency_info_from_findings(rows, "npm");
+        assert_eq!(
+            deps[0].purl.as_deref(),
+            Some("pkg:npm/@scope/package@1.0.0")
+        );
+    }
+
+    #[test]
+    fn test_build_deps_preserves_order() {
+        let rows = vec![
+            ("zzz".to_string(), Some("3.0".to_string()), None),
+            ("aaa".to_string(), Some("1.0".to_string()), None),
+            ("mmm".to_string(), Some("2.0".to_string()), None),
+        ];
+        let deps = build_dependency_info_from_findings(rows, "npm");
+        assert_eq!(deps[0].name, "zzz");
+        assert_eq!(deps[1].name, "aaa");
+        assert_eq!(deps[2].name, "mmm");
     }
 }

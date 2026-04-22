@@ -1796,6 +1796,155 @@ mod tests {
         assert!(is_private_network_url("http://[fd12::1]:8080"));
     }
 
+    // --- Additional edge cases for is_private_network_url ---
+
+    #[test]
+    fn test_private_url_ipv4_with_path_and_query() {
+        assert!(is_private_network_url(
+            "http://10.0.0.1:8080/api/v1?key=abc"
+        ));
+        assert!(is_private_network_url(
+            "http://192.168.1.1/health?format=json"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_ipv4_with_auth_info() {
+        assert!(is_private_network_url("http://admin:pass@192.168.1.1:8080"));
+        assert!(is_private_network_url("http://user:pwd@10.0.0.5/api"));
+        assert!(is_private_network_url("http://user@127.0.0.1:9090"));
+    }
+
+    #[test]
+    fn test_private_url_ipv4_ports_on_private_ips() {
+        assert!(is_private_network_url("http://10.0.0.1:443"));
+        assert!(is_private_network_url("http://10.0.0.1:8443"));
+        assert!(is_private_network_url("http://172.16.0.1:9090"));
+        assert!(is_private_network_url("http://192.168.0.1:1"));
+        assert!(is_private_network_url("http://192.168.0.1:65535"));
+    }
+
+    #[test]
+    fn test_private_url_rfc1918_class_b_boundary() {
+        // 172.15.x.x is NOT private (below the 172.16-172.31 range)
+        assert!(!is_private_network_url("http://172.15.255.255:8080"));
+        // 172.16.0.0 is the start of the private range
+        assert!(is_private_network_url("http://172.16.0.0:8080"));
+        // 172.31.255.255 is the end of the private range
+        assert!(is_private_network_url("http://172.31.255.255:8080"));
+        // 172.32.0.0 is outside the private range
+        assert!(!is_private_network_url("http://172.32.0.0:8080"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_unspecified() {
+        assert!(is_private_network_url("http://[::]:8080"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_full_link_local() {
+        assert!(is_private_network_url("http://[fe80::abcd:1234]:8080"));
+        assert!(is_private_network_url("http://[fe80::abcd:ef01:2345]:9090"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_unique_local_range() {
+        // fc00::/7 covers fc00:: through fdff::
+        assert!(is_private_network_url("http://[fc00::1]:8080"));
+        assert!(is_private_network_url("http://[fdff::1]:8080"));
+    }
+
+    #[test]
+    fn test_public_url_ipv6_global() {
+        // 2001:db8:: is documentation range, but treated as public by the function
+        assert!(!is_private_network_url("http://[2001:db8::1]:8080"));
+        // 2600:: is a public IPv6 range
+        assert!(!is_private_network_url("http://[2600::1]:8080"));
+    }
+
+    #[test]
+    fn test_private_url_localhost_variants() {
+        assert!(is_private_network_url("http://localhost:3000/path"));
+        assert!(is_private_network_url("https://localhost:443"));
+        assert!(is_private_network_url("http://localhost"));
+        // LOCALHOST uppercase should not match (case-sensitive hostname comparison
+        // lowercases before checking, so it should match)
+        assert!(is_private_network_url("http://LOCALHOST:8080"));
+    }
+
+    #[test]
+    fn test_private_url_kubernetes_svc_variants() {
+        assert!(is_private_network_url(
+            "http://my-app.production.svc.cluster.local:8080"
+        ));
+        assert!(is_private_network_url(
+            "http://api.kube-system.svc.cluster.local"
+        ));
+        assert!(is_private_network_url("http://service.ns.svc"));
+        // Just ".svc" suffix should match
+        assert!(is_private_network_url("http://redis.default.svc:6379"));
+    }
+
+    #[test]
+    fn test_private_url_local_domain_variants() {
+        assert!(is_private_network_url("http://my-mac.local:8080"));
+        assert!(is_private_network_url("http://printer.local"));
+        assert!(is_private_network_url("http://nas.local:5000/api"));
+    }
+
+    #[test]
+    fn test_public_url_svc_in_middle() {
+        // "svc" appearing in the middle of a domain should NOT be private
+        assert!(!is_private_network_url("http://svc.example.com:8080"));
+        assert!(!is_private_network_url(
+            "http://my-svc-api.cloud.company.com"
+        ));
+    }
+
+    #[test]
+    fn test_private_url_loopback_full_range() {
+        // 127.0.0.0/8 covers 127.0.0.0 through 127.255.255.255
+        assert!(is_private_network_url("http://127.0.0.0:8080"));
+        assert!(is_private_network_url("http://127.0.0.1:8080"));
+        assert!(is_private_network_url("http://127.100.200.50:8080"));
+        assert!(is_private_network_url("http://127.255.255.254:8080"));
+    }
+
+    #[test]
+    fn test_private_url_invalid_schemes() {
+        // Schemes other than http/https should still be parseable by url::Url
+        // ftp with a private IP
+        assert!(is_private_network_url("ftp://192.168.1.1/file"));
+    }
+
+    #[test]
+    fn test_private_url_fragment_and_query() {
+        assert!(is_private_network_url(
+            "http://10.0.0.1:8080/path?q=1#section"
+        ));
+    }
+
+    #[test]
+    fn test_public_url_dot_local_like_but_not_local() {
+        // "example.locals" is not ".local"
+        assert!(!is_private_network_url("http://example.locals:8080"));
+        // "mylocal.com" is not ".local"
+        assert!(!is_private_network_url("http://mylocal.com:8080"));
+    }
+
+    #[test]
+    fn test_private_url_https_scheme() {
+        assert!(is_private_network_url("https://10.0.0.1:443"));
+        assert!(is_private_network_url("https://192.168.1.1"));
+        assert!(is_private_network_url("https://localhost:8443"));
+    }
+
+    #[test]
+    fn test_private_url_link_local_range() {
+        assert!(is_private_network_url("http://169.254.0.1:8080"));
+        assert!(is_private_network_url("http://169.254.255.254:8080"));
+    }
+
     // ===================================================================
     // Pagination (wiremock integration tests)
     // ===================================================================
