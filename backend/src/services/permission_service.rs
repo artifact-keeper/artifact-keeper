@@ -15,6 +15,14 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 
+/// Target type for system-wide permission checks (e.g. creating repositories or groups).
+pub const SYSTEM_TARGET_TYPE: &str = "system";
+
+/// Sentinel UUID used as the `target_id` for system-wide permission checks.
+/// Operations that are not scoped to a specific entity (repository, group, etc.)
+/// use this nil UUID as a conventional placeholder.
+pub const SYSTEM_SENTINEL_ID: Uuid = Uuid::nil();
+
 /// How long cached permission entries remain valid before a fresh DB lookup.
 const CACHE_TTL: Duration = Duration::from_secs(30);
 

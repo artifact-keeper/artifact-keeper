@@ -23,6 +23,7 @@ use crate::error::{AppError, Result};
 use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
+use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -635,6 +636,7 @@ pub async fn list_repositories(
     responses(
         (status = 200, description = "Repository created", body = RepositoryResponse),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 409, description = "Repository key already exists"),
     )
 )]
@@ -645,6 +647,26 @@ pub async fn create_repository(
 ) -> Result<Json<RepositoryResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    // Fine-grained permission check: non-admins need "admin" on the system sentinel.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(
+                auth.user_id,
+                SYSTEM_TARGET_TYPE,
+                SYSTEM_SENTINEL_ID,
+                "admin",
+                false,
+            )
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to create repositories".to_string(),
+            ));
+        }
+    }
+
     validate_repository_key(&payload.key)?;
     let format = parse_format(&payload.format)?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
@@ -815,6 +837,7 @@ pub async fn get_repository(
     responses(
         (status = 200, description = "Repository updated", body = RepositoryResponse),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key already exists"),
     )
@@ -847,6 +870,19 @@ pub async fn update_repository(
     // Get existing repo by key and check repo access
     let existing = service.get_by_key(&key).await?;
     require_repo_access(&auth, existing.id)?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target repository.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", existing.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to update this repository".to_string(),
+            ));
+        }
+    }
 
     let effective_is_public = payload.effective_is_public();
 
@@ -957,6 +993,7 @@ pub async fn update_repository(
     responses(
         (status = 200, description = "Repository deleted"),
         (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Repository not found"),
     )
 )]
@@ -970,6 +1007,20 @@ pub async fn delete_repository(
     let service = state.create_repository_service();
     let repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
+
+    // Fine-grained permission check: non-admins need "admin" on the target repository.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to delete this repository".to_string(),
+            ));
+        }
+    }
+
     service.delete(repo.id).await?;
 
     // Remove the deleted repo from the in-memory cache.
@@ -4639,5 +4690,113 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["allow_anonymous_access"], true);
         assert_eq!(json["is_public"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Permission check logic (Phase 3: admin-level endpoint checks)
+    // -----------------------------------------------------------------------
+
+    /// Simulates the permission gate used in create_repository and other
+    /// system-level operations. Admins bypass the check entirely; non-admins
+    /// must hold the "admin" action on the target.
+    fn check_permission_gate(
+        is_admin: bool,
+        granted_actions: &[&str],
+        required_action: &str,
+    ) -> bool {
+        if is_admin {
+            return true;
+        }
+        granted_actions.contains(&required_action)
+    }
+
+    #[test]
+    fn test_permission_gate_admin_always_passes() {
+        assert!(check_permission_gate(true, &[], "admin"));
+    }
+
+    #[test]
+    fn test_permission_gate_admin_passes_without_explicit_grant() {
+        // Admin users bypass regardless of whether they have a rule
+        assert!(check_permission_gate(true, &["read"], "admin"));
+    }
+
+    #[test]
+    fn test_permission_gate_non_admin_with_admin_grant_passes() {
+        assert!(check_permission_gate(false, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_permission_gate_non_admin_with_multiple_grants_passes() {
+        assert!(check_permission_gate(
+            false,
+            &["read", "write", "admin"],
+            "admin"
+        ));
+    }
+
+    #[test]
+    fn test_permission_gate_non_admin_without_admin_grant_denied() {
+        assert!(!check_permission_gate(false, &["read", "write"], "admin"));
+    }
+
+    #[test]
+    fn test_permission_gate_non_admin_empty_grants_denied() {
+        assert!(!check_permission_gate(false, &[], "admin"));
+    }
+
+    #[test]
+    fn test_system_sentinel_is_nil_uuid() {
+        // create_repository uses SYSTEM_SENTINEL_ID as the system sentinel target_id
+        assert_eq!(
+            SYSTEM_SENTINEL_ID.to_string(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(SYSTEM_TARGET_TYPE, "system");
+    }
+
+    #[test]
+    fn test_create_repo_permission_check_admin_bypasses() {
+        let auth = make_auth(true);
+        // Admin user should always pass the gate
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_create_repo_permission_check_non_admin_with_grant() {
+        let auth = make_auth(false);
+        // Non-admin with system-level admin grant should pass
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+    }
+
+    #[test]
+    fn test_create_repo_permission_check_non_admin_without_grant() {
+        let auth = make_auth(false);
+        // Non-admin without grant should be denied
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_update_repo_permission_check_requires_repo_admin() {
+        let auth = make_auth(false);
+        // Non-admin needs "admin" on the specific repository
+        assert!(check_permission_gate(auth.is_admin, &["admin"], "admin"));
+        assert!(!check_permission_gate(
+            auth.is_admin,
+            &["read", "write"],
+            "admin"
+        ));
+    }
+
+    #[test]
+    fn test_delete_repo_permission_check_admin_bypasses() {
+        let auth = make_auth(true);
+        assert!(check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    #[test]
+    fn test_delete_repo_permission_check_non_admin_without_grant() {
+        let auth = make_auth(false);
+        assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
     }
 }
