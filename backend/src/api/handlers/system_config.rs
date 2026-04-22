@@ -18,10 +18,8 @@ pub struct PermissionsConfig {
     /// When true, an administrator has configured permission rules.
     pub rules_exist: bool,
     /// Whether those rules are actively enforced on API requests.
-    /// Currently always `false`: permission rules can be created and
-    /// managed via /api/v1/permissions, but the backend does not yet
-    /// consult them when authorizing requests. This field will become
-    /// `true` once enforcement is implemented (tracked in #795-#798).
+    /// The permission-check middleware and handler guards are wired in,
+    /// so this is `true` when the server is running.
     pub enforcement_enabled: bool,
 }
 
@@ -71,7 +69,7 @@ pub struct SystemConfigResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oidc_issuer: Option<String>,
     /// Fine-grained permissions enforcement status. Permission rules can be
-    /// managed via /api/v1/permissions, but enforcement is not yet active.
+    /// managed via /api/v1/permissions and are actively enforced.
     pub permissions: PermissionsConfig,
 }
 
@@ -122,9 +120,7 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
 
     let permissions = PermissionsConfig {
         rules_exist,
-        // Enforcement is not yet implemented. This will change to `true`
-        // once the permission-check middleware is wired in (#795-#798).
-        enforcement_enabled: false,
+        enforcement_enabled: true,
     };
 
     Json(SystemConfigResponse {
@@ -217,7 +213,7 @@ mod tests {
             oidc_issuer: Some("https://auth.example.com".to_string()),
             permissions: PermissionsConfig {
                 rules_exist: true,
-                enforcement_enabled: false,
+                enforcement_enabled: true,
             },
         };
 
@@ -235,7 +231,7 @@ mod tests {
         assert!(json.contains("\"sso_enabled\":true"));
         assert!(json.contains("\"oidc_issuer\":\"https://auth.example.com\""));
         assert!(json.contains("\"rules_exist\":true"));
-        assert!(json.contains("\"enforcement_enabled\":false"));
+        assert!(json.contains("\"enforcement_enabled\":true"));
     }
 
     #[test]
@@ -336,17 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn test_system_config_permissions_rules_exist_not_enforced() {
+    fn test_system_config_permissions_rules_exist_and_enforced() {
         let response = SystemConfigResponse {
             permissions: PermissionsConfig {
                 rules_exist: true,
-                enforcement_enabled: false,
+                enforcement_enabled: true,
             },
             ..minimal_response()
         };
         let json = serde_json::to_string(&response).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["permissions"]["rules_exist"], true);
-        assert_eq!(parsed["permissions"]["enforcement_enabled"], false);
+        assert_eq!(parsed["permissions"]["enforcement_enabled"], true);
     }
 }
