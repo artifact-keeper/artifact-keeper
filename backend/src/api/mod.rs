@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::services::artifact_service::ArtifactService;
 use crate::services::dependency_track_service::DependencyTrackService;
 use crate::services::event_bus::EventBus;
-use crate::services::meili_service::MeiliService;
+use crate::services::opensearch_service::OpenSearchService;
 use crate::services::permission_service::PermissionService;
 use crate::services::plugin_registry::PluginRegistry;
 use crate::services::proxy_service::ProxyService;
@@ -77,7 +77,7 @@ pub struct AppState {
     pub plugin_registry: Option<Arc<PluginRegistry>>,
     pub wasm_plugin_service: Option<Arc<WasmPluginService>>,
     pub scanner_service: Option<Arc<ScannerService>>,
-    pub meili_service: Option<Arc<MeiliService>>,
+    pub opensearch_service: Option<Arc<OpenSearchService>>,
     pub dependency_track: Option<Arc<DependencyTrackService>>,
     pub quality_check_service: Option<Arc<QualityCheckService>>,
     pub permission_service: Arc<PermissionService>,
@@ -113,7 +113,7 @@ impl AppState {
             wasm_plugin_service: None,
             scanner_service: None,
             quality_check_service: None,
-            meili_service: None,
+            opensearch_service: None,
             dependency_track: None,
             permission_service,
             proxy_service: None,
@@ -145,7 +145,7 @@ impl AppState {
             wasm_plugin_service: Some(wasm_plugin_service),
             scanner_service: None,
             quality_check_service: None,
-            meili_service: None,
+            opensearch_service: None,
             dependency_track: None,
             permission_service,
             proxy_service: None,
@@ -197,9 +197,9 @@ impl AppState {
         self.quality_check_service = Some(qc_service);
     }
 
-    /// Set the Meilisearch service for search indexing.
-    pub fn set_meili_service(&mut self, meili_service: Arc<MeiliService>) {
-        self.meili_service = Some(meili_service);
+    /// Set the OpenSearch service for search indexing.
+    pub fn set_opensearch_service(&mut self, opensearch_service: Arc<OpenSearchService>) {
+        self.opensearch_service = Some(opensearch_service);
     }
 
     /// Set the Dependency-Track service for security analysis.
@@ -222,10 +222,13 @@ impl AppState {
         self.metrics_handle = Some(Arc::new(handle));
     }
 
-    /// Create an ArtifactService with the shared Meilisearch and scanner services.
+    /// Create an ArtifactService with the shared OpenSearch and scanner services.
     pub fn create_artifact_service(&self, storage: Arc<dyn StorageBackend>) -> ArtifactService {
-        let mut svc =
-            ArtifactService::new_with_meili(self.db.clone(), storage, self.meili_service.clone());
+        let mut svc = ArtifactService::new_with_search(
+            self.db.clone(),
+            storage,
+            self.opensearch_service.clone(),
+        );
         if let Some(ref scanner) = self.scanner_service {
             svc.set_scanner_service(scanner.clone());
         }
@@ -235,9 +238,9 @@ impl AppState {
         svc
     }
 
-    /// Create a RepositoryService with the shared Meilisearch service.
+    /// Create a RepositoryService with the shared OpenSearch service.
     pub fn create_repository_service(&self) -> RepositoryService {
-        RepositoryService::new_with_meili(self.db.clone(), self.meili_service.clone())
+        RepositoryService::new_with_search(self.db.clone(), self.opensearch_service.clone())
     }
 }
 

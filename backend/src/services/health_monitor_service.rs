@@ -229,9 +229,12 @@ impl HealthMonitorService {
             results.push(self.check_service("trivy", url, "/healthz").await?);
         }
 
-        // Meilisearch
-        if let Some(url) = &app_config.meilisearch_url {
-            results.push(self.check_service("meilisearch", url, "/health").await?);
+        // OpenSearch
+        if let Some(url) = &app_config.opensearch_url {
+            results.push(
+                self.check_service("opensearch", url, "/_cluster/health")
+                    .await?,
+            );
         }
 
         // OpenSCAP
@@ -520,7 +523,7 @@ mod tests {
     fn test_alert_state_serialization() {
         let now = Utc::now();
         let state = AlertState {
-            service_name: "meilisearch".to_string(),
+            service_name: "opensearch".to_string(),
             current_status: "unhealthy".to_string(),
             consecutive_failures: 5,
             last_alert_sent_at: Some(now),
@@ -529,7 +532,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&state).unwrap();
-        assert!(json.contains("\"service_name\":\"meilisearch\""));
+        assert!(json.contains("\"service_name\":\"opensearch\""));
         assert!(json.contains("\"consecutive_failures\":5"));
     }
 
@@ -577,14 +580,14 @@ mod tests {
     fn test_health_event_service_recovered_serialization() {
         let now = Utc::now();
         let event = HealthEvent::ServiceRecovered {
-            service_name: "meilisearch".to_string(),
+            service_name: "opensearch".to_string(),
             downtime_started: Some(now),
             timestamp: now,
         };
 
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event_type\":\"ServiceRecovered\""));
-        assert!(json.contains("\"service_name\":\"meilisearch\""));
+        assert!(json.contains("\"service_name\":\"opensearch\""));
     }
 
     #[test]

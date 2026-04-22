@@ -1,4 +1,4 @@
-//! Integration tests for Meilisearch reindex cursor-based pagination.
+//! Integration tests for search reindex cursor-based pagination.
 //!
 //! These tests verify that the pagination queries correctly visit all rows
 //! across multiple batches without duplicates or gaps.
@@ -6,7 +6,7 @@
 //! Requires PostgreSQL:
 //! ```sh
 //! DATABASE_URL="postgresql://registry:registry@localhost:5432/artifact_registry" \
-//!   cargo test --test meili_reindex_tests -- --ignored
+//!   cargo test --test search_reindex_tests -- --ignored
 //! ```
 
 use sqlx::PgPool;

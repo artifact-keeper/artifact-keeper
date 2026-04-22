@@ -35,7 +35,7 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
         "backend",
         "postgres",
         "redis",
-        "meilisearch",
+        "opensearch",
         "trivy",
     ];
     let host_lower = host_str.to_lowercase();

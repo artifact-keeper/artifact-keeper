@@ -1,7 +1,7 @@
 //! Search handlers.
 //!
 //! Provides quick search, advanced search, checksum lookup, suggestions,
-//! trending, and recent artifact endpoints. Uses Meilisearch when available,
+//! trending, and recent artifact endpoints. Uses OpenSearch when available,
 //! falling back to PostgreSQL full-text search.
 
 use axum::{
@@ -607,7 +607,7 @@ pub struct ReindexResponse {
     pub message: String,
 }
 
-/// Trigger a full reindex of all artifacts and repositories in Meilisearch.
+/// Trigger a full reindex of all artifacts and repositories in OpenSearch.
 ///
 /// The reindex runs asynchronously in the background. The endpoint returns
 /// immediately with a confirmation that the task was started.
@@ -619,19 +619,19 @@ pub struct ReindexResponse {
     operation_id = "trigger_search_reindex",
     responses(
         (status = 200, description = "Reindex started in background", body = ReindexResponse),
-        (status = 500, description = "Meilisearch is not configured"),
+        (status = 500, description = "OpenSearch is not configured"),
     ),
 )]
 pub async fn trigger_reindex(State(state): State<SharedState>) -> Result<Json<ReindexResponse>> {
-    let meili = state
-        .meili_service
+    let search = state
+        .opensearch_service
         .as_ref()
-        .ok_or_else(|| AppError::Config("Meilisearch is not configured".to_string()))?;
+        .ok_or_else(|| AppError::Config("OpenSearch is not configured".to_string()))?;
 
     let db = state.db.clone();
-    let meili = meili.clone();
+    let search = search.clone();
     tokio::spawn(async move {
-        match meili.full_reindex(&db).await {
+        match search.full_reindex(&db).await {
             Ok((a, r)) => {
                 tracing::info!(
                     "Search reindex complete: {} artifacts, {} repositories",
