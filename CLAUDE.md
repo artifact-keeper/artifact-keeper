@@ -141,6 +141,17 @@ All changes must go through pull requests:
 
 4. **Merge via GitHub** after CI passes (squash merge preferred)
 
+### Merge Requirements (MANDATORY)
+
+**NEVER merge a PR unless ALL of the following are true:**
+
+1. **CI workflow fully green.** Every check must pass: Rust check (clippy), unit tests, code coverage gate, duplication gate, security audit, CodeQL. No exceptions.
+2. **Code coverage >= 70%** on new/changed lines. The CI coverage gate enforces this. If it fails, add tests until it passes.
+3. **Code duplication <= 3%** on changed files. The CI duplication gate (jscpd) enforces this. If it fails, refactor duplicated code into shared helpers.
+4. **No `--admin` bypass.** Do not use `gh pr merge --admin` to skip failing checks. If a gate is genuinely wrong (not a code issue), fix the gate first, get that fix merged, then rebase the PR.
+
+If a CI gate is blocking a PR due to a systemic issue (e.g., the gate itself has a bug), **ask the user before bypassing.** Document why the bypass was needed and create a follow-up issue to fix the gate. This rule exists because bypassing gates erodes trust in the CI pipeline.
+
 Branch naming conventions:
 - `feat/` — new features
 - `fix/` — bug fixes
@@ -174,9 +185,10 @@ cargo test --workspace --lib                               # unit tests
 ```
 
 Additionally, before pushing:
-- Check for code duplication: if structurally similar blocks appear 3+ times in new code, refactor into a shared helper
-- Check test coverage: new pure functions should have at least one test, aim for 70%+ of new lines covered
+- **Code coverage**: new/changed lines MUST have >= 70% test coverage. The CI gate measures only lines you added or modified (not the entire file). Extract testable logic into pure helper functions to make handler code coverable.
+- **Code duplication**: changed files MUST have <= 3% duplication (measured by jscpd). Extract repeated patterns into shared helpers. Common offenders: cache read/write patterns, test setup blocks, filter construction.
 - Check migration numbering: verify the migration number is not already taken (`ls backend/migrations/ | tail -5`)
+- If coverage or duplication gates will fail, fix them BEFORE pushing. Do not push and hope CI passes.
 
 ### Maintenance Branches
 
