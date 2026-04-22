@@ -258,6 +258,7 @@ pub async fn create_permission(
         }
     })?;
 
+    state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.created", permission.id, None);
@@ -377,6 +378,7 @@ pub async fn update_permission(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Permission not found".to_string()))?;
 
+    state.permission_service.invalidate_cache();
     state
         .event_bus
         .emit("permission.updated", permission.id, None);
@@ -425,6 +427,7 @@ pub async fn delete_permission(
         return Err(AppError::NotFound("Permission not found".to_string()));
     }
 
+    state.permission_service.invalidate_cache();
     state.event_bus.emit("permission.deleted", id, None);
 
     Ok(())
