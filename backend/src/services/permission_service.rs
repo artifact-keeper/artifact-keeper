@@ -814,4 +814,487 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key(&fresh_key));
     }
+
+    // -----------------------------------------------------------------------
+    // Helper: build a PermissionService with a lazy (non-connecting) PgPool
+    // -----------------------------------------------------------------------
+
+    fn lazy_service() -> PermissionService {
+        let pool = PgPool::connect_lazy("postgres://fake:fake@localhost/fake").expect("lazy pool");
+        PermissionService::new(pool)
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::check_permission -- admin bypass via real service
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_permission_admin_returns_true() {
+        let service = lazy_service();
+        let result = service
+            .check_permission(Uuid::new_v4(), "repository", Uuid::new_v4(), "delete", true)
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_check_permission_admin_ignores_action_value() {
+        let service = lazy_service();
+        // Even a nonsensical action is granted for admins.
+        let result = service
+            .check_permission(
+                Uuid::new_v4(),
+                "artifact",
+                Uuid::new_v4(),
+                "nonexistent_action",
+                true,
+            )
+            .await;
+        assert!(result.unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::check_permission -- cache hit for non-admin
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_permission_cache_hit_grants_action() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        // Pre-populate the permission cache with granted actions.
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string(), "write".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        let result = service
+            .check_permission(user_id, "repository", target_id, "write", false)
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_check_permission_cache_hit_denies_missing_action() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        let result = service
+            .check_permission(user_id, "repository", target_id, "delete", false)
+            .await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_check_permission_cache_hit_empty_actions_denies() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec![],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        let result = service
+            .check_permission(user_id, "repository", target_id, "read", false)
+            .await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::check_permission -- expired cache triggers DB miss
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_check_permission_expired_cache_falls_through_to_db_error() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        // Insert an expired entry so the cache miss path runs.
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string()],
+                    inserted_at: Instant::now() - CACHE_TTL - Duration::from_secs(5),
+                },
+            );
+        }
+
+        // The lazy pool is not connected, so the DB query will fail.
+        let result = service
+            .check_permission(user_id, "repository", target_id, "read", false)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_check_permission_no_cache_entry_falls_through_to_db_error() {
+        let service = lazy_service();
+        // No cache entry at all -- falls straight to DB which errors.
+        let result = service
+            .check_permission(Uuid::new_v4(), "repository", Uuid::new_v4(), "read", false)
+            .await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::invalidate_cache via real service
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_invalidate_cache_on_fresh_service() {
+        let service = lazy_service();
+        // Calling invalidate on an empty service should not panic.
+        service.invalidate_cache();
+
+        let cache = service.cache.read().unwrap();
+        assert!(cache.is_empty());
+        let rules = service.rules_cache.read().unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_clears_populated_caches() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        // Populate permission cache.
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string(), "write".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+            cache.insert(
+                CacheKey::new(Uuid::new_v4(), "artifact", Uuid::new_v4()),
+                CacheEntry {
+                    actions: vec!["delete".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        // Populate rules cache.
+        {
+            let mut rules = service.rules_cache.write().unwrap();
+            rules.insert(
+                RulesCacheKey::new("repository", target_id),
+                RulesCacheEntry {
+                    exists: true,
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        // Verify caches are populated.
+        assert_eq!(service.cache.read().unwrap().len(), 2);
+        assert_eq!(service.rules_cache.read().unwrap().len(), 1);
+
+        service.invalidate_cache();
+
+        assert!(service.cache.read().unwrap().is_empty());
+        assert!(service.rules_cache.read().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::has_any_rules_for_target -- cache hit
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_has_any_rules_cache_hit_returns_true() {
+        let service = lazy_service();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut rules = service.rules_cache.write().unwrap();
+            rules.insert(
+                RulesCacheKey::new("repository", target_id),
+                RulesCacheEntry {
+                    exists: true,
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        let result = service
+            .has_any_rules_for_target("repository", target_id)
+            .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_has_any_rules_cache_hit_returns_false() {
+        let service = lazy_service();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut rules = service.rules_cache.write().unwrap();
+            rules.insert(
+                RulesCacheKey::new("artifact", target_id),
+                RulesCacheEntry {
+                    exists: false,
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        let result = service
+            .has_any_rules_for_target("artifact", target_id)
+            .await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::has_any_rules_for_target -- cache miss / expired
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_has_any_rules_expired_cache_falls_through_to_db_error() {
+        let service = lazy_service();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut rules = service.rules_cache.write().unwrap();
+            rules.insert(
+                RulesCacheKey::new("repository", target_id),
+                RulesCacheEntry {
+                    exists: true,
+                    inserted_at: Instant::now() - CACHE_TTL - Duration::from_secs(5),
+                },
+            );
+        }
+
+        let result = service
+            .has_any_rules_for_target("repository", target_id)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_has_any_rules_no_cache_entry_falls_through_to_db_error() {
+        let service = lazy_service();
+        let result = service
+            .has_any_rules_for_target("repository", Uuid::new_v4())
+            .await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::resolve_actions -- cache hit returns cached actions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_resolve_actions_cache_hit_returns_actions() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        let actions = service
+            .resolve_actions(user_id, "repository", target_id)
+            .await
+            .unwrap();
+        assert_eq!(actions.len(), 3);
+        assert!(actions.contains(&"read".to_string()));
+        assert!(actions.contains(&"write".to_string()));
+        assert!(actions.contains(&"admin".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_actions_expired_entry_triggers_db_error() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "artifact", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string()],
+                    inserted_at: Instant::now() - CACHE_TTL - Duration::from_secs(10),
+                },
+            );
+        }
+
+        let result = service
+            .resolve_actions(user_id, "artifact", target_id)
+            .await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService: invalidate after cache population round-trip
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cache_population_then_invalidate_then_miss() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        // Populate both caches through the service's internal locks.
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+        {
+            let mut rules = service.rules_cache.write().unwrap();
+            rules.insert(
+                RulesCacheKey::new("repository", target_id),
+                RulesCacheEntry {
+                    exists: true,
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        // Verify cache hit works before invalidation.
+        let granted = service
+            .check_permission(user_id, "repository", target_id, "read", false)
+            .await
+            .unwrap();
+        assert!(granted);
+
+        let has_rules = service
+            .has_any_rules_for_target("repository", target_id)
+            .await
+            .unwrap();
+        assert!(has_rules);
+
+        // Invalidate.
+        service.invalidate_cache();
+
+        // After invalidation, both should miss cache and hit the (broken) DB.
+        let result = service
+            .check_permission(user_id, "repository", target_id, "read", false)
+            .await;
+        assert!(result.is_err());
+
+        let rules_result = service
+            .has_any_rules_for_target("repository", target_id)
+            .await;
+        assert!(rules_result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionService::new creates empty caches
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_new_service_has_empty_caches() {
+        let service = lazy_service();
+        assert!(service.cache.read().unwrap().is_empty());
+        assert!(service.rules_cache.read().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache key isolation: different target types are separate entries
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cache_isolates_by_target_type() {
+        let service = lazy_service();
+        let user_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+
+        {
+            let mut cache = service.cache.write().unwrap();
+            cache.insert(
+                CacheKey::new(user_id, "repository", target_id),
+                CacheEntry {
+                    actions: vec!["read".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+            cache.insert(
+                CacheKey::new(user_id, "artifact", target_id),
+                CacheEntry {
+                    actions: vec!["delete".to_string()],
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+
+        // "repository" grants "read" but not "delete".
+        let repo_read = service
+            .check_permission(user_id, "repository", target_id, "read", false)
+            .await
+            .unwrap();
+        assert!(repo_read);
+
+        let repo_delete = service
+            .check_permission(user_id, "repository", target_id, "delete", false)
+            .await
+            .unwrap();
+        assert!(!repo_delete);
+
+        // "artifact" grants "delete" but not "read".
+        let art_delete = service
+            .check_permission(user_id, "artifact", target_id, "delete", false)
+            .await
+            .unwrap();
+        assert!(art_delete);
+
+        let art_read = service
+            .check_permission(user_id, "artifact", target_id, "read", false)
+            .await
+            .unwrap();
+        assert!(!art_read);
+    }
 }
