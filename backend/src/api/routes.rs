@@ -165,6 +165,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_api_per_window,
         state.config.rate_limit_window_secs,
     ));
+    let search_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_search_per_window,
+        state.config.rate_limit_window_secs,
+    ));
 
     let auth_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&auth_rate_limiter),
@@ -174,18 +178,24 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         limiter: Arc::clone(&api_rate_limiter),
         exemptions: Arc::clone(&exemptions),
     };
+    let search_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&search_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+    };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
     {
         let auth_cleanup = Arc::clone(&auth_rate_limiter);
         let api_cleanup = Arc::clone(&api_rate_limiter);
+        let search_cleanup = Arc::clone(&search_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 auth_cleanup.cleanup_expired().await;
                 api_cleanup.cleanup_expired().await;
+                search_cleanup.cleanup_expired().await;
             }
         });
     }
@@ -311,13 +321,18 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // Search routes with optional auth
+        // Search routes with optional auth and dedicated rate limiting (300 req/min)
         .nest(
             "/search",
-            handlers::search::router().layer(middleware::from_fn_with_state(
-                auth_service.clone(),
-                optional_auth_middleware,
-            )),
+            handlers::search::router()
+                .layer(middleware::from_fn_with_state(
+                    auth_service.clone(),
+                    optional_auth_middleware,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    search_rate_limit_state,
+                    rate_limit_middleware,
+                )),
         )
         // Peer instance routes with auth middleware
         .nest(

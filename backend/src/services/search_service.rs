@@ -42,6 +42,12 @@ pub struct SearchQuery {
     /// When true, only return results from public repositories.
     #[serde(default)]
     pub public_only: bool,
+    /// Repository IDs the caller is allowed to see. `None` means no filter
+    /// (admin or unrestricted). `Some(ids)` restricts results to those repos.
+    /// When set, `public_only` is ignored because this list already encodes
+    /// the correct visibility.
+    #[serde(skip)]
+    pub accessible_repo_ids: Option<Vec<Uuid>>,
 }
 
 /// Search response with pagination and facets
@@ -158,7 +164,9 @@ impl SearchService {
 
         let items = self.execute_search(&query, offset, limit).await?;
         let total = self.count_results(&query).await?;
-        let facets = self.get_facets().await?;
+        let facets = self
+            .get_facets(query.accessible_repo_ids.as_deref(), query.public_only)
+            .await?;
 
         Ok(SearchResponse {
             items,
@@ -178,6 +186,9 @@ impl SearchService {
         let q_filter = build_tsquery_filter(query.q.as_deref());
         let name_filter = build_name_filter(query.name.as_deref());
 
+        // When accessible_repo_ids is provided, filter by that list instead of
+        // the coarse public_only flag. An empty list means "no repos visible"
+        // (should not normally happen). None means "all repos" (admin).
         let rows: Vec<SearchResultRow> = sqlx::query_as(
                 r#"
                 SELECT
@@ -199,6 +210,7 @@ impl SearchService {
                   AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
                   AND ($2::text IS NULL OR r.format::text = $2)
                   AND ($3::text IS NULL OR a.name ILIKE $3)
+                  AND ($7::uuid[] IS NULL OR r.id = ANY($7))
                   AND ($6 = false OR r.is_public = true)
                 ORDER BY a.created_at DESC
                 OFFSET $4
@@ -211,6 +223,7 @@ impl SearchService {
             .bind(offset)
             .bind(limit)
             .bind(query.public_only)
+            .bind(&query.accessible_repo_ids)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -231,6 +244,7 @@ impl SearchService {
               AND ($1::text IS NULL OR to_tsvector('english', a.name || ' ' || a.path || ' ' || COALESCE(a.version, '')) @@ to_tsquery('english', $1))
               AND ($2::text IS NULL OR r.format::text = $2)
               AND ($3::text IS NULL OR a.name ILIKE $3)
+              AND ($5::uuid[] IS NULL OR r.id = ANY($5))
               AND ($4 = false OR r.is_public = true)
             "#,
         )
@@ -238,6 +252,7 @@ impl SearchService {
         .bind(&query.format)
         .bind(&name_filter)
         .bind(query.public_only)
+        .bind(&query.accessible_repo_ids)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -245,99 +260,97 @@ impl SearchService {
         Ok(count.0)
     }
 
-    async fn get_facets(&self) -> Result<SearchFacets> {
-        // Format facets
-        let format_facets = sqlx::query!(
+    /// Fetch a single facet dimension (e.g. format, repository key, content type).
+    ///
+    /// `group_expr` is the SQL expression that appears in both SELECT and
+    /// GROUP BY (e.g. `"r.format::text"` or `"a.content_type"`).
+    async fn fetch_facet_counts(
+        &self,
+        group_expr: &str,
+        accessible_repo_ids: Option<&[Uuid]>,
+        public_only: bool,
+    ) -> Result<Vec<FacetCount>> {
+        let sql = format!(
             r#"
-            SELECT r.format::text as "value!", COUNT(*) as "count!"
+            SELECT {expr}, COUNT(*)::BIGINT
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = false
-            GROUP BY r.format
+              AND ($1::uuid[] IS NULL OR r.id = ANY($1))
+              AND ($2 = false OR r.is_public = true)
+            GROUP BY {expr}
             ORDER BY 2 DESC
             LIMIT 20
-            "#
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#,
+            expr = group_expr,
+        );
 
-        // Repository facets
-        let repo_facets = sqlx::query!(
-            r#"
-            SELECT r.key as "value!", COUNT(*) as "count!"
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.is_deleted = false
-            GROUP BY r.key
-            ORDER BY 2 DESC
-            LIMIT 20
-            "#
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+            .bind(accessible_repo_ids)
+            .bind(public_only)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Content type facets
-        let ct_facets = sqlx::query!(
-            r#"
-            SELECT a.content_type as "value!", COUNT(*) as "count!"
-            FROM artifacts a
-            WHERE a.is_deleted = false
-            GROUP BY a.content_type
-            ORDER BY 2 DESC
-            LIMIT 20
-            "#
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(value, count)| FacetCount { value, count })
+            .collect())
+    }
+
+    async fn get_facets(
+        &self,
+        accessible_repo_ids: Option<&[Uuid]>,
+        public_only: bool,
+    ) -> Result<SearchFacets> {
+        let formats = self
+            .fetch_facet_counts("r.format::text", accessible_repo_ids, public_only)
+            .await?;
+        let repositories = self
+            .fetch_facet_counts("r.key", accessible_repo_ids, public_only)
+            .await?;
+        let content_types = self
+            .fetch_facet_counts("a.content_type", accessible_repo_ids, public_only)
+            .await?;
 
         Ok(SearchFacets {
-            formats: format_facets
-                .into_iter()
-                .map(|r| FacetCount {
-                    value: r.value,
-                    count: r.count,
-                })
-                .collect(),
-            repositories: repo_facets
-                .into_iter()
-                .map(|r| FacetCount {
-                    value: r.value,
-                    count: r.count,
-                })
-                .collect(),
-            content_types: ct_facets
-                .into_iter()
-                .map(|r| FacetCount {
-                    value: r.value,
-                    count: r.count,
-                })
-                .collect(),
+            formats,
+            repositories,
+            content_types,
         })
     }
 
-    /// Suggest completions for search terms
-    pub async fn suggest(&self, prefix: &str, limit: i64) -> Result<Vec<String>> {
+    /// Suggest completions for search terms, scoped to accessible repositories.
+    pub async fn suggest(
+        &self,
+        prefix: &str,
+        limit: i64,
+        accessible_repo_ids: Option<&[Uuid]>,
+        public_only: bool,
+    ) -> Result<Vec<String>> {
         let pattern = build_suggest_pattern(prefix);
 
-        let suggestions = sqlx::query_scalar!(
+        let suggestions: Vec<(String,)> = sqlx::query_as(
             r#"
-            SELECT DISTINCT name
-            FROM artifacts
-            WHERE name ILIKE $1 AND is_deleted = false
-            ORDER BY name
+            SELECT DISTINCT a.name
+            FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
+            WHERE a.name ILIKE $1 AND a.is_deleted = false
+              AND ($3::uuid[] IS NULL OR r.id = ANY($3))
+              AND ($4 = false OR r.is_public = true)
+            ORDER BY a.name
             LIMIT $2
             "#,
-            pattern,
-            limit
         )
+        .bind(&pattern)
+        .bind(limit)
+        .bind(accessible_repo_ids)
+        .bind(public_only)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(suggestions)
+        Ok(suggestions.into_iter().map(|(name,)| name).collect())
     }
 
     /// Get trending artifacts (most downloaded recently)
@@ -346,6 +359,7 @@ impl SearchService {
         days: i32,
         limit: i64,
         public_only: bool,
+        accessible_repo_ids: Option<&[Uuid]>,
     ) -> Result<Vec<SearchResult>> {
         let rows: Vec<SearchResultRow> = sqlx::query_as(
             r#"
@@ -367,6 +381,7 @@ impl SearchService {
                 LEFT JOIN download_statistics ds ON ds.artifact_id = a.id
                     AND ds.downloaded_at >= NOW() - make_interval(days => $1)
                 WHERE a.is_deleted = false
+                  AND ($4::uuid[] IS NULL OR r.id = ANY($4))
                   AND ($3 = false OR r.is_public = true)
                 GROUP BY a.id, r.id
                 ORDER BY 11 DESC
@@ -376,6 +391,7 @@ impl SearchService {
         .bind(days)
         .bind(limit)
         .bind(public_only)
+        .bind(accessible_repo_ids)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -384,7 +400,12 @@ impl SearchService {
     }
 
     /// Get recently added artifacts
-    pub async fn recent(&self, limit: i64, public_only: bool) -> Result<Vec<SearchResult>> {
+    pub async fn recent(
+        &self,
+        limit: i64,
+        public_only: bool,
+        accessible_repo_ids: Option<&[Uuid]>,
+    ) -> Result<Vec<SearchResult>> {
         let rows: Vec<SearchResultRow> = sqlx::query_as(
             r#"
                 SELECT
@@ -403,6 +424,7 @@ impl SearchService {
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
+                  AND ($3::uuid[] IS NULL OR r.id = ANY($3))
                   AND ($2 = false OR r.is_public = true)
                 ORDER BY a.created_at DESC
                 LIMIT $1
@@ -410,6 +432,7 @@ impl SearchService {
             )
             .bind(limit)
             .bind(public_only)
+            .bind(accessible_repo_ids)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -820,5 +843,81 @@ mod tests {
         let result = row_to_search_result(row);
         assert_eq!(result.format, ""); // unwrap_or_default
         assert!(result.version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchQuery accessible_repo_ids field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_default_none() {
+        let query = SearchQuery::default();
+        assert!(query.accessible_repo_ids.is_none());
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_skipped_in_deserialization() {
+        // accessible_repo_ids has #[serde(skip)], so even if provided in JSON
+        // it should not be deserialized.
+        let json =
+            r#"{"q": "test", "accessible_repo_ids": ["12345678-1234-1234-1234-123456789abc"]}"#;
+        let query: SearchQuery = serde_json::from_str(json).unwrap();
+        assert!(query.accessible_repo_ids.is_none());
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_set_programmatically() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let query = SearchQuery {
+            accessible_repo_ids: Some(vec![id1, id2]),
+            ..Default::default()
+        };
+        let ids = query.accessible_repo_ids.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_empty_vec() {
+        let query = SearchQuery {
+            accessible_repo_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(query.accessible_repo_ids.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_as_deref() {
+        let id = Uuid::new_v4();
+        let query = SearchQuery {
+            accessible_repo_ids: Some(vec![id]),
+            ..Default::default()
+        };
+        let slice: Option<&[Uuid]> = query.accessible_repo_ids.as_deref();
+        assert_eq!(slice.unwrap().len(), 1);
+        assert_eq!(slice.unwrap()[0], id);
+
+        let empty_query = SearchQuery::default();
+        assert!(empty_query.accessible_repo_ids.as_deref().is_none());
+    }
+
+    #[test]
+    fn test_search_query_with_all_fields_and_accessible_repo_ids() {
+        let id = Uuid::new_v4();
+        let query = SearchQuery {
+            q: Some("spring-boot".to_string()),
+            format: Some("maven".to_string()),
+            name: Some("spring*".to_string()),
+            offset: Some(10),
+            limit: Some(25),
+            public_only: false,
+            accessible_repo_ids: Some(vec![id]),
+        };
+        assert_eq!(query.q.as_deref(), Some("spring-boot"));
+        assert_eq!(query.format.as_deref(), Some("maven"));
+        assert_eq!(query.accessible_repo_ids.as_ref().unwrap().len(), 1);
+        assert!(!query.public_only);
     }
 }

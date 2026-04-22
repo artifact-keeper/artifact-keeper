@@ -70,6 +70,7 @@ fn test_config(storage_path: &str) -> Config {
         database_max_lifetime_secs: 1800,
         rate_limit_auth_per_window: 120,
         rate_limit_api_per_window: 5000,
+        rate_limit_search_per_window: 300,
         rate_limit_window_secs: 60,
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
