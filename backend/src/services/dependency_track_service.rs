@@ -384,7 +384,9 @@ pub fn is_private_network_url(raw_url: &str) -> bool {
             return v6.is_loopback()        // ::1
                 || v6.is_unspecified()     // ::
                 // fe80::/10 (link-local) -- no stable std method yet
-                || (v6.segments()[0] & 0xffc0) == 0xfe80;
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // fc00::/7 (unique local addresses)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00;
         }
         url::Host::Domain(_) => {}
     }
@@ -432,10 +434,12 @@ impl DependencyTrackService {
                 "Dependency-Track base_url is not HTTPS and not a private network address. \
                  Set ALLOW_HTTP_INTEGRATIONS=1 to allow plain HTTP connections."
             );
-        } else if is_private && !config.base_url.starts_with("https://") && !explicit_allow_http {
+        }
+
+        if is_private && !config.base_url.starts_with("https://") && !explicit_allow_http {
             info!(
                 url = %config.base_url,
-                "Dependency-Track base_url is HTTP on a private network address, allowing automatically"
+                "Auto-allowing HTTP for private network URL: {}", config.base_url
             );
         }
 
@@ -1785,6 +1789,11 @@ mod tests {
     #[test]
     fn test_private_url_ipv6_link_local() {
         assert!(is_private_network_url("http://[fe80::1]:8080"));
+    }
+
+    #[test]
+    fn test_private_url_ipv6_unique_local() {
+        assert!(is_private_network_url("http://[fd12::1]:8080"));
     }
 
     // ===================================================================

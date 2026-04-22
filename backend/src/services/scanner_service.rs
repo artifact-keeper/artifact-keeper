@@ -43,6 +43,35 @@ pub(crate) fn sanitize_artifact_filename(name: &str) -> String {
         .to_string()
 }
 
+/// Map a repository format string to the corresponding purl type.
+///
+/// Common formats (pypi, npm, maven, etc.) get their standard purl type.
+/// Unknown formats fall back to `"generic"`.
+fn format_to_purl_type(format: &str) -> &str {
+    match format.to_lowercase().as_str() {
+        "pypi" => "pypi",
+        "npm" => "npm",
+        "cargo" | "crates" => "cargo",
+        "maven" => "maven",
+        "go" | "golang" => "golang",
+        "nuget" => "nuget",
+        "rubygems" | "gem" => "gem",
+        "docker" | "oci" | "container" => "docker",
+        "composer" | "php" => "composer",
+        "cocoapods" | "pods" => "cocoapods",
+        "swift" => "swift",
+        "hex" | "elixir" => "hex",
+        "pub" | "dart" => "pub",
+        "conan" | "cpp" => "conan",
+        "conda" => "conda",
+        "hackage" | "haskell" => "hackage",
+        "rpm" => "rpm",
+        "deb" | "debian" | "apt" => "deb",
+        "apk" | "alpine" => "apk",
+        _ => "generic",
+    }
+}
+
 /// Shared scan workspace utilities for scanners that need to write artifact
 /// content to disk, optionally extract archives, and clean up after scanning.
 pub(crate) struct ScanWorkspace;
@@ -1364,16 +1393,24 @@ impl ScannerService {
         use crate::models::sbom::SbomFormat;
         use crate::services::sbom_service::{DependencyInfo, SbomService};
 
-        // Fetch repository name for the DT project
-        let repo_name: Option<String> =
-            sqlx::query_scalar("SELECT name FROM repositories WHERE id = $1")
+        // Fetch repository name and format for the DT project
+        let repo_row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT name, format FROM repositories WHERE id = $1")
                 .bind(artifact.repository_id)
                 .fetch_optional(&self.db)
                 .await
                 .ok()
                 .flatten();
 
-        let project_name = repo_name.unwrap_or_else(|| artifact.repository_id.to_string());
+        let (project_name, repo_format) = match repo_row {
+            Some((name, format)) => (name, format),
+            None => (artifact.repository_id.to_string(), None),
+        };
+
+        let purl_type = repo_format
+            .as_deref()
+            .map(format_to_purl_type)
+            .unwrap_or("generic");
 
         // Fetch scan findings to build dependency info for the SBOM.
         // The scan_findings table stores affected components in the
@@ -1398,7 +1435,7 @@ impl ScannerService {
             .map(|(name, version, _source)| {
                 let purl = version
                     .as_deref()
-                    .map(|v| format!("pkg:generic/{}@{}", name, v));
+                    .map(|v| format!("pkg:{}/{}@{}", purl_type, name, v));
                 DependencyInfo {
                     name,
                     version,
