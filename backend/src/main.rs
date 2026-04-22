@@ -48,8 +48,8 @@ use artifact_keeper_backend::{
     services::{
         auth_service::AuthService,
         dependency_track_service::DependencyTrackService,
-        meili_service::MeiliService,
         metrics_service,
+        opensearch_service::OpenSearchService,
         plugin_registry::PluginRegistry,
         proxy_service::ProxyService,
         scan_config_service::ScanConfigService,
@@ -200,23 +200,23 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let (plugin_registry, wasm_plugin_service) =
         initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
 
-    // Initialize Meilisearch (optional, graceful fallback)
-    let meili_service = match (&config.meilisearch_url, &config.meilisearch_api_key) {
-        (Some(url), Some(api_key)) => {
-            tracing::info!("Initializing Meilisearch at {}", url);
-            match MeiliService::new(url, api_key) {
+    // Initialize OpenSearch (optional, graceful fallback)
+    let search_service = match &config.meilisearch_url {
+        Some(url) => {
+            tracing::info!("Initializing OpenSearch at {}", url);
+            match OpenSearchService::new(url, None, None, false) {
                 Ok(s) => {
                     let service = Arc::new(s);
                     match service.configure_indexes().await {
                         Ok(()) => {
-                            tracing::info!("Meilisearch indexes configured");
+                            tracing::info!("OpenSearch indexes configured");
                             let svc = service.clone();
                             let pool = db_pool.clone();
                             tokio::spawn(async move {
                                 match svc.is_index_empty().await {
                                     Ok(true) => {
                                         tracing::info!(
-                                            "Meilisearch index is empty, starting background reindex"
+                                            "OpenSearch index is empty, starting background reindex"
                                         );
                                         if let Err(e) = svc.full_reindex(&pool).await {
                                             tracing::error!("Background reindex failed: {}", e);
@@ -224,12 +224,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                                     }
                                     Ok(false) => {
                                         tracing::info!(
-                                            "Meilisearch index already populated, skipping reindex"
+                                            "OpenSearch index already populated, skipping reindex"
                                         );
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            "Failed to check Meilisearch index status: {}",
+                                            "Failed to check OpenSearch index status: {}",
                                             e
                                         );
                                     }
@@ -239,7 +239,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to configure Meilisearch indexes, continuing without search: {}",
+                                "Failed to configure OpenSearch indexes, continuing without search: {}",
                                 e
                             );
                             None
@@ -248,7 +248,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to initialize Meilisearch client, continuing without search: {}",
+                        "Failed to initialize OpenSearch client, continuing without search: {}",
                         e
                     );
                     None
@@ -256,7 +256,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             }
         }
         _ => {
-            tracing::info!("Meilisearch not configured, search indexing disabled");
+            tracing::info!("OpenSearch not configured, search indexing disabled");
             None
         }
     };
@@ -417,8 +417,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ),
     );
     app_state.set_quality_check_service(quality_check_service);
-    if let Some(meili) = meili_service {
-        app_state.set_meili_service(meili);
+    if let Some(search) = search_service {
+        app_state.set_search_service(search);
     }
     if let Some(dt) = dt_service_arc {
         app_state.set_dependency_track(dt);
