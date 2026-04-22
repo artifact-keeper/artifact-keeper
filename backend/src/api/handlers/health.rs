@@ -36,7 +36,7 @@ pub struct HealthChecks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_scanner: Option<CheckStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub meilisearch: Option<CheckStatus>,
+    pub opensearch: Option<CheckStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ldap: Option<CheckStatus>,
 }
@@ -108,10 +108,60 @@ async fn check_service_health(
     }
 }
 
-/// Health check endpoint — rich status page for dashboards.
+/// Probe OpenSearch cluster health via `/_cluster/health`.
+///
+/// Maps cluster status: green/yellow -> healthy, red -> unhealthy.
+async fn check_opensearch_health(base_url: &str) -> CheckStatus {
+    let client = crate::services::http_client::base_client_builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let url = format!("{}/_cluster/health", base_url.trim_end_matches('/'));
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            // Parse the cluster status from the response body
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => {
+                    let status = body
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    match status {
+                        "green" | "yellow" => CheckStatus {
+                            status: "healthy".to_string(),
+                            message: None,
+                        },
+                        "red" => CheckStatus {
+                            status: "unhealthy".to_string(),
+                            message: Some("OpenSearch cluster status is red".to_string()),
+                        },
+                        other => CheckStatus {
+                            status: "unhealthy".to_string(),
+                            message: Some(format!("OpenSearch cluster status: {}", other)),
+                        },
+                    }
+                }
+                Err(e) => CheckStatus {
+                    status: "unhealthy".to_string(),
+                    message: Some(format!("Failed to parse OpenSearch health response: {}", e)),
+                },
+            }
+        }
+        Ok(resp) => CheckStatus {
+            status: "unhealthy".to_string(),
+            message: Some(format!("OpenSearch returned status {}", resp.status())),
+        },
+        Err(e) => CheckStatus {
+            status: "unavailable".to_string(),
+            message: Some(format!("OpenSearch unreachable: {}", e)),
+        },
+    }
+}
+
+/// Health check endpoint -- rich status page for dashboards.
 ///
 /// Checks database, storage (real write/read probe), optional services (Trivy,
-/// Meilisearch), and exposes DB connection pool statistics.
+/// OpenSearch), and exposes DB connection pool statistics.
 #[utoipa::path(
     get,
     path = "/health",
@@ -141,8 +191,8 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         None => None,
     };
 
-    let meili_check = match &state.config.meilisearch_url {
-        Some(url) => Some(check_service_health(url, "/health", "Meilisearch").await),
+    let opensearch_check = match &state.config.opensearch_url {
+        Some(url) => Some(check_opensearch_health(url).await),
         None => None,
     };
 
@@ -177,9 +227,11 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
     };
 
     let storage_healthy = storage_check.status == "healthy";
-    let meilisearch_healthy = meili_check.as_ref().map_or(true, |m| m.status == "healthy");
+    let opensearch_healthy = opensearch_check
+        .as_ref()
+        .map_or(true, |c| c.status == "healthy");
 
-    let overall_status = if db_check.status == "healthy" && storage_healthy && meilisearch_healthy {
+    let overall_status = if db_check.status == "healthy" && storage_healthy && opensearch_healthy {
         "healthy"
     } else {
         "unhealthy"
@@ -208,7 +260,7 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
             database: db_check,
             storage: storage_check,
             security_scanner: scanner_check,
-            meilisearch: meili_check,
+            opensearch: opensearch_check,
             ldap: ldap_check,
         },
         db_pool: Some(pool_stats),
@@ -615,7 +667,7 @@ mod tests {
                     message: Some("Connected".to_string()),
                 },
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: Some(sample_pool_stats()),
@@ -647,7 +699,7 @@ mod tests {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -669,7 +721,7 @@ mod tests {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: Some(healthy_check()),
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -711,7 +763,7 @@ mod tests {
                 },
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -895,7 +947,7 @@ mod tests {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,
@@ -918,7 +970,7 @@ mod tests {
                 database: healthy_check(),
                 storage: healthy_check(),
                 security_scanner: None,
-                meilisearch: None,
+                opensearch: None,
                 ldap: None,
             },
             db_pool: None,

@@ -2,7 +2,7 @@
 //!
 //! Provides asynchronous email sending via an SMTP relay. When `SMTP_HOST` is
 //! not set in the environment the service operates as a silent no-op, matching
-//! the optional-service pattern used by Meilisearch and other integrations.
+//! the optional-service pattern used by OpenSearch and other integrations.
 
 use crate::config::Config;
 use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};

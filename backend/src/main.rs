@@ -201,10 +201,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         initialize_wasm_plugins(db_pool.clone(), plugins_dir).await?;
 
     // Initialize OpenSearch (optional, graceful fallback)
-    let search_service = match &config.meilisearch_url {
+    let search_service = match &config.opensearch_url {
         Some(url) => {
             tracing::info!("Initializing OpenSearch at {}", url);
-            match OpenSearchService::new(url, None, None, false) {
+            match OpenSearchService::new(
+                url,
+                config.opensearch_username.as_deref(),
+                config.opensearch_password.as_deref(),
+                config.opensearch_allow_invalid_certs,
+            ) {
                 Ok(s) => {
                     let service = Arc::new(s);
                     match service.configure_indexes().await {

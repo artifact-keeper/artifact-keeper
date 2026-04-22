@@ -77,11 +77,17 @@ pub struct Config {
     /// OpenSCAP SCAP profile to evaluate (default: standard)
     pub openscap_profile: String,
 
-    /// Meilisearch URL for search indexing (optional)
-    pub meilisearch_url: Option<String>,
+    /// OpenSearch URL for search indexing (optional)
+    pub opensearch_url: Option<String>,
 
-    /// Meilisearch API key
-    pub meilisearch_api_key: Option<String>,
+    /// OpenSearch username for authentication (optional)
+    pub opensearch_username: Option<String>,
+
+    /// OpenSearch password for authentication (optional)
+    pub opensearch_password: Option<String>,
+
+    /// Allow invalid TLS certificates when connecting to OpenSearch (default: false)
+    pub opensearch_allow_invalid_certs: bool,
 
     /// Path for scan workspace shared with Trivy
     pub scan_workspace_path: String,
@@ -279,8 +285,10 @@ redacted_debug!(Config {
     show trivy_url,
     show openscap_url,
     show openscap_profile,
-    show meilisearch_url,
-    redact_option meilisearch_api_key,
+    show opensearch_url,
+    show opensearch_username,
+    redact_option opensearch_password,
+    show opensearch_allow_invalid_certs,
     show scan_workspace_path,
     show demo_mode,
     show peer_instance_name,
@@ -354,8 +362,10 @@ impl Default for Config {
             trivy_url: None,
             openscap_url: None,
             openscap_profile: "xccdf_org.ssgproject.content_profile_standard".into(),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
+            opensearch_url: None,
+            opensearch_username: None,
+            opensearch_password: None,
+            opensearch_allow_invalid_certs: false,
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
             peer_instance_name: "test-instance".into(),
@@ -449,8 +459,13 @@ impl Config {
             openscap_url: env::var("OPENSCAP_URL").ok(),
             openscap_profile: env::var("OPENSCAP_PROFILE")
                 .unwrap_or_else(|_| "xccdf_org.ssgproject.content_profile_standard".into()),
-            meilisearch_url: env::var("MEILISEARCH_URL").ok(),
-            meilisearch_api_key: env::var("MEILISEARCH_API_KEY").ok(),
+            opensearch_url: env::var("OPENSEARCH_URL").ok(),
+            opensearch_username: env::var("OPENSEARCH_USERNAME").ok(),
+            opensearch_password: env::var("OPENSEARCH_PASSWORD").ok(),
+            opensearch_allow_invalid_certs: matches!(
+                env::var("OPENSEARCH_ALLOW_INVALID_CERTS").as_deref(),
+                Ok("true" | "1")
+            ),
             scan_workspace_path: env::var("SCAN_WORKSPACE_PATH").unwrap_or_else(|_| {
                 if cfg!(windows) {
                     r"C:\ProgramData\ArtifactKeeper\scan-workspace".into()

@@ -137,7 +137,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      meilisearch:
+      opensearch:
         condition: service_healthy
     entrypoint:
       - /bin/sh
@@ -176,8 +176,7 @@ services:
       TRIVY_URL: http://trivy:8090
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
-      MEILISEARCH_URL: http://meilisearch:7700
-      MEILISEARCH_API_KEY: ${MEILI_MASTER_KEY:-artifact-keeper-dev-key}
+      OPENSEARCH_URL: http://opensearch:9200
       # Dependency-Track integration (API key auto-provisioned by dtrack-init)
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-true}
@@ -194,7 +193,7 @@ services:
       # corporate proxies instead of the compose network. We append internal
       # service names so they always resolve directly.
       # ref: https://github.com/artifact-keeper/artifact-keeper/issues/395
-      no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,meilisearch,trivy,openscap,dependency-track-apiserver"
+      no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,opensearch,trivy,openscap,dependency-track-apiserver"
       HOST: 0.0.0.0
       PORT: 8080
     volumes:
@@ -212,26 +211,27 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Meilisearch (full-text search engine)
+  # OpenSearch (full-text search engine)
   # ---------------------------------------------------------------------------
-  # Powers artifact and package search in the UI and API. The default master
-  # key below is for local evaluation only. In production, set a strong
-  # MEILI_MASTER_KEY and match it in the backend's MEILISEARCH_API_KEY.
-  meilisearch:
-    image: getmeili/meilisearch:v1.12
-    container_name: artifact-keeper-meilisearch
+  # Powers artifact and package search in the UI and API.
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    container_name: artifact-keeper-opensearch
     environment:
-      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:-artifact-keeper-dev-key}
-      MEILI_ENV: development
+      discovery.type: single-node
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
     volumes:
-      - meilisearch_data:/meili_data
+      - opensearch_data:/usr/share/opensearch/data
     ports:
-      - "7700:7700"
+      - "9200:9200"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -406,7 +406,7 @@ volumes:
     driver: local
   trivy_cache:
     driver: local
-  meilisearch_data:
+  opensearch_data:
     driver: local
   scan_workspace:
     driver: local
@@ -425,7 +425,7 @@ volumes:
 # Network
 # =============================================================================
 # A single bridge network for all services. All inter-container communication
-# stays on this network; only Caddy (and optionally Postgres/Meilisearch for
+# stays on this network; only Caddy (and optionally Postgres/OpenSearch for
 # debugging) expose ports to the host.
 networks:
   default:

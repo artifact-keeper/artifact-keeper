@@ -1149,7 +1149,7 @@ mod tests {
         assert!(validate_webhook_url("http://backend/api").is_err());
         assert!(validate_webhook_url("http://postgres/").is_err());
         assert!(validate_webhook_url("http://redis/").is_err());
-        assert!(validate_webhook_url("http://meilisearch/").is_err());
+        assert!(validate_webhook_url("http://opensearch/").is_err());
         assert!(validate_webhook_url("http://trivy/").is_err());
     }
 
