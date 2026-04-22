@@ -260,84 +260,63 @@ impl SearchService {
         Ok(count.0)
     }
 
+    /// Fetch a single facet dimension (e.g. format, repository key, content type).
+    ///
+    /// `group_expr` is the SQL expression that appears in both SELECT and
+    /// GROUP BY (e.g. `"r.format::text"` or `"a.content_type"`).
+    async fn fetch_facet_counts(
+        &self,
+        group_expr: &str,
+        accessible_repo_ids: Option<&[Uuid]>,
+        public_only: bool,
+    ) -> Result<Vec<FacetCount>> {
+        let sql = format!(
+            r#"
+            SELECT {expr}, COUNT(*)::BIGINT
+            FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
+            WHERE a.is_deleted = false
+              AND ($1::uuid[] IS NULL OR r.id = ANY($1))
+              AND ($2 = false OR r.is_public = true)
+            GROUP BY {expr}
+            ORDER BY 2 DESC
+            LIMIT 20
+            "#,
+            expr = group_expr,
+        );
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+            .bind(accessible_repo_ids)
+            .bind(public_only)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(value, count)| FacetCount { value, count })
+            .collect())
+    }
+
     async fn get_facets(
         &self,
         accessible_repo_ids: Option<&[Uuid]>,
         public_only: bool,
     ) -> Result<SearchFacets> {
-        // Format facets -- filtered by accessible repos
-        let format_facets: Vec<(String, i64)> = sqlx::query_as(
-            r#"
-            SELECT r.format::text, COUNT(*)::BIGINT
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.is_deleted = false
-              AND ($1::uuid[] IS NULL OR r.id = ANY($1))
-              AND ($2 = false OR r.is_public = true)
-            GROUP BY r.format
-            ORDER BY 2 DESC
-            LIMIT 20
-            "#,
-        )
-        .bind(accessible_repo_ids)
-        .bind(public_only)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // Repository facets -- filtered by accessible repos
-        let repo_facets: Vec<(String, i64)> = sqlx::query_as(
-            r#"
-            SELECT r.key, COUNT(*)::BIGINT
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.is_deleted = false
-              AND ($1::uuid[] IS NULL OR r.id = ANY($1))
-              AND ($2 = false OR r.is_public = true)
-            GROUP BY r.key
-            ORDER BY 2 DESC
-            LIMIT 20
-            "#,
-        )
-        .bind(accessible_repo_ids)
-        .bind(public_only)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        // Content type facets -- filtered by accessible repos
-        let ct_facets: Vec<(String, i64)> = sqlx::query_as(
-            r#"
-            SELECT a.content_type, COUNT(*)::BIGINT
-            FROM artifacts a
-            JOIN repositories r ON r.id = a.repository_id
-            WHERE a.is_deleted = false
-              AND ($1::uuid[] IS NULL OR r.id = ANY($1))
-              AND ($2 = false OR r.is_public = true)
-            GROUP BY a.content_type
-            ORDER BY 2 DESC
-            LIMIT 20
-            "#,
-        )
-        .bind(accessible_repo_ids)
-        .bind(public_only)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        let formats = self
+            .fetch_facet_counts("r.format::text", accessible_repo_ids, public_only)
+            .await?;
+        let repositories = self
+            .fetch_facet_counts("r.key", accessible_repo_ids, public_only)
+            .await?;
+        let content_types = self
+            .fetch_facet_counts("a.content_type", accessible_repo_ids, public_only)
+            .await?;
 
         Ok(SearchFacets {
-            formats: format_facets
-                .into_iter()
-                .map(|(value, count)| FacetCount { value, count })
-                .collect(),
-            repositories: repo_facets
-                .into_iter()
-                .map(|(value, count)| FacetCount { value, count })
-                .collect(),
-            content_types: ct_facets
-                .into_iter()
-                .map(|(value, count)| FacetCount { value, count })
-                .collect(),
+            formats,
+            repositories,
+            content_types,
         })
     }
 
@@ -864,5 +843,81 @@ mod tests {
         let result = row_to_search_result(row);
         assert_eq!(result.format, ""); // unwrap_or_default
         assert!(result.version.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchQuery accessible_repo_ids field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_default_none() {
+        let query = SearchQuery::default();
+        assert!(query.accessible_repo_ids.is_none());
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_skipped_in_deserialization() {
+        // accessible_repo_ids has #[serde(skip)], so even if provided in JSON
+        // it should not be deserialized.
+        let json =
+            r#"{"q": "test", "accessible_repo_ids": ["12345678-1234-1234-1234-123456789abc"]}"#;
+        let query: SearchQuery = serde_json::from_str(json).unwrap();
+        assert!(query.accessible_repo_ids.is_none());
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_set_programmatically() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let query = SearchQuery {
+            accessible_repo_ids: Some(vec![id1, id2]),
+            ..Default::default()
+        };
+        let ids = query.accessible_repo_ids.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_empty_vec() {
+        let query = SearchQuery {
+            accessible_repo_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(query.accessible_repo_ids.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_search_query_accessible_repo_ids_as_deref() {
+        let id = Uuid::new_v4();
+        let query = SearchQuery {
+            accessible_repo_ids: Some(vec![id]),
+            ..Default::default()
+        };
+        let slice: Option<&[Uuid]> = query.accessible_repo_ids.as_deref();
+        assert_eq!(slice.unwrap().len(), 1);
+        assert_eq!(slice.unwrap()[0], id);
+
+        let empty_query = SearchQuery::default();
+        assert!(empty_query.accessible_repo_ids.as_deref().is_none());
+    }
+
+    #[test]
+    fn test_search_query_with_all_fields_and_accessible_repo_ids() {
+        let id = Uuid::new_v4();
+        let query = SearchQuery {
+            q: Some("spring-boot".to_string()),
+            format: Some("maven".to_string()),
+            name: Some("spring*".to_string()),
+            offset: Some(10),
+            limit: Some(25),
+            public_only: false,
+            accessible_repo_ids: Some(vec![id]),
+        };
+        assert_eq!(query.q.as_deref(), Some("spring-boot"));
+        assert_eq!(query.format.as_deref(), Some("maven"));
+        assert_eq!(query.accessible_repo_ids.as_ref().unwrap().len(), 1);
+        assert!(!query.public_only);
     }
 }

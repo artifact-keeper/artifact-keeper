@@ -52,6 +52,47 @@ pub fn router() -> Router<SharedState> {
 // Repository visibility resolution
 // ---------------------------------------------------------------------------
 
+/// How the current caller's repository access should be resolved.
+///
+/// This is a pure classification of the auth state -- no DB queries -- making
+/// it easy to test all branches in isolation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RepoAccessMode {
+    /// Admin: all repos visible, no filter needed.
+    All,
+    /// Authenticated non-admin: public repos plus repos where the user holds
+    /// a role assignment.  The contained `Uuid` is the user ID.
+    UserScoped(Uuid),
+    /// Unauthenticated (or missing auth): only public repos.
+    PublicOnly,
+}
+
+/// Classify the caller's repository access mode from the auth extension.
+///
+/// This is a pure function (no IO) so it can be unit-tested exhaustively.
+pub(crate) fn classify_repo_access(auth: &Option<AuthExtension>) -> RepoAccessMode {
+    match auth {
+        Some(a) if a.is_admin => RepoAccessMode::All,
+        Some(a) => RepoAccessMode::UserScoped(a.user_id),
+        None => RepoAccessMode::PublicOnly,
+    }
+}
+
+/// Map a checksum algorithm name to the corresponding SQL column expression.
+///
+/// Returns an error for unsupported algorithm names. This is a pure function
+/// extracted from the checksum_search handler for testability.
+pub(crate) fn resolve_checksum_column(algorithm: &str) -> Result<&'static str> {
+    match algorithm {
+        "sha256" => Ok("a.checksum_sha256"),
+        "sha1" => Ok("a.checksum_sha1"),
+        "md5" => Ok("a.checksum_md5"),
+        other => Err(AppError::Validation(format!(
+            "Unsupported checksum algorithm: {other}. Use sha256, sha1, or md5."
+        ))),
+    }
+}
+
 /// Resolve which repository IDs the current caller is allowed to see.
 ///
 /// - Unauthenticated: returns `Some(ids)` containing only public repo IDs.
@@ -65,13 +106,9 @@ async fn resolve_accessible_repos(
     db: &PgPool,
     auth: &Option<AuthExtension>,
 ) -> Result<Option<Vec<Uuid>>> {
-    match auth {
-        Some(a) if a.is_admin => {
-            // Admins see everything -- no filter.
-            Ok(None)
-        }
-        Some(a) => {
-            // Authenticated non-admin: public repos + repos with role assignment.
+    match classify_repo_access(auth) {
+        RepoAccessMode::All => Ok(None),
+        RepoAccessMode::UserScoped(user_id) => {
             let rows: Vec<(Uuid,)> = sqlx::query_as(
                 r#"
                 SELECT r.id
@@ -85,15 +122,14 @@ async fn resolve_accessible_repos(
                   AND (ra.repository_id IS NOT NULL OR r2.id IS NOT NULL)
                 "#,
             )
-            .bind(a.user_id)
+            .bind(user_id)
             .fetch_all(db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
             Ok(Some(rows.into_iter().map(|(id,)| id).collect()))
         }
-        None => {
-            // Unauthenticated: only public repos.
+        RepoAccessMode::PublicOnly => {
             let rows: Vec<(Uuid,)> = sqlx::query_as(
                 r#"
                 SELECT r.id FROM repositories r WHERE r.is_public = true
@@ -410,16 +446,7 @@ pub async fn checksum_search(
 
     let accessible_repo_ids = resolve_accessible_repos(&state.db, &auth).await?;
 
-    let checksum_column = match algorithm {
-        "sha256" => "a.checksum_sha256",
-        "sha1" => "a.checksum_sha1",
-        "md5" => "a.checksum_md5",
-        other => {
-            return Err(AppError::Validation(format!(
-                "Unsupported checksum algorithm: {other}. Use sha256, sha1, or md5."
-            )));
-        }
-    };
+    let checksum_column = resolve_checksum_column(algorithm)?;
 
     // Build the query dynamically to select the correct checksum column.
     // The repo visibility filter ($2) uses the same pattern as other search
@@ -1158,5 +1185,249 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["status"], "started");
         assert_eq!(json["message"], "Full reindex triggered");
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_repo_access (pure function, all branches)
+    // -----------------------------------------------------------------------
+
+    fn make_auth(is_admin: bool, is_service_account: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "testuser".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_classify_repo_access_admin() {
+        let auth = Some(make_auth(true, false));
+        assert_eq!(classify_repo_access(&auth), RepoAccessMode::All);
+    }
+
+    #[test]
+    fn test_classify_repo_access_admin_service_account() {
+        let auth = Some(make_auth(true, true));
+        assert_eq!(classify_repo_access(&auth), RepoAccessMode::All);
+    }
+
+    #[test]
+    fn test_classify_repo_access_regular_user() {
+        let auth_ext = make_auth(false, false);
+        let user_id = auth_ext.user_id;
+        let auth = Some(auth_ext);
+        assert_eq!(
+            classify_repo_access(&auth),
+            RepoAccessMode::UserScoped(user_id)
+        );
+    }
+
+    #[test]
+    fn test_classify_repo_access_service_account_non_admin() {
+        let auth_ext = make_auth(false, true);
+        let user_id = auth_ext.user_id;
+        let auth = Some(auth_ext);
+        assert_eq!(
+            classify_repo_access(&auth),
+            RepoAccessMode::UserScoped(user_id)
+        );
+    }
+
+    #[test]
+    fn test_classify_repo_access_anonymous() {
+        let auth: Option<AuthExtension> = None;
+        assert_eq!(classify_repo_access(&auth), RepoAccessMode::PublicOnly);
+    }
+
+    #[test]
+    fn test_classify_repo_access_preserves_user_id() {
+        let specific_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let auth = Some(AuthExtension {
+            user_id: specific_id,
+            username: "specific-user".to_string(),
+            email: "specific@example.com".to_string(),
+            is_admin: false,
+            is_api_token: true,
+            is_service_account: false,
+            scopes: Some(vec!["read".to_string()]),
+            allowed_repo_ids: None,
+        });
+        match classify_repo_access(&auth) {
+            RepoAccessMode::UserScoped(uid) => assert_eq!(uid, specific_id),
+            other => panic!("Expected UserScoped, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_checksum_column (pure function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_checksum_column_sha256() {
+        assert_eq!(
+            resolve_checksum_column("sha256").unwrap(),
+            "a.checksum_sha256"
+        );
+    }
+
+    #[test]
+    fn test_resolve_checksum_column_sha1() {
+        assert_eq!(resolve_checksum_column("sha1").unwrap(), "a.checksum_sha1");
+    }
+
+    #[test]
+    fn test_resolve_checksum_column_md5() {
+        assert_eq!(resolve_checksum_column("md5").unwrap(), "a.checksum_md5");
+    }
+
+    #[test]
+    fn test_resolve_checksum_column_invalid() {
+        let result = resolve_checksum_column("sha512");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_checksum_column_empty() {
+        let result = resolve_checksum_column("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_checksum_column_uppercase_rejected() {
+        // The function expects lowercase algorithm names
+        let result = resolve_checksum_column("SHA256");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_checksum_column_error_message_contains_algorithm() {
+        let result = resolve_checksum_column("blake2b");
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("blake2b"));
+                assert!(msg.contains("sha256"));
+                assert!(msg.contains("sha1"));
+                assert!(msg.contains("md5"));
+            }
+            other => panic!("Expected Validation error, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // RepoAccessMode enum
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repo_access_mode_debug() {
+        let mode = RepoAccessMode::All;
+        let debug = format!("{:?}", mode);
+        assert!(debug.contains("All"));
+    }
+
+    #[test]
+    fn test_repo_access_mode_clone() {
+        let id = Uuid::new_v4();
+        let mode = RepoAccessMode::UserScoped(id);
+        let cloned = mode.clone();
+        assert_eq!(mode, cloned);
+    }
+
+    #[test]
+    fn test_repo_access_mode_equality() {
+        assert_eq!(RepoAccessMode::All, RepoAccessMode::All);
+        assert_eq!(RepoAccessMode::PublicOnly, RepoAccessMode::PublicOnly);
+        assert_ne!(RepoAccessMode::All, RepoAccessMode::PublicOnly);
+
+        let id = Uuid::new_v4();
+        assert_eq!(
+            RepoAccessMode::UserScoped(id),
+            RepoAccessMode::UserScoped(id)
+        );
+        assert_ne!(
+            RepoAccessMode::UserScoped(Uuid::new_v4()),
+            RepoAccessMode::UserScoped(Uuid::new_v4())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ChecksumRow struct (derive(sqlx::FromRow))
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checksum_row_construction() {
+        let now = chrono::Utc::now();
+        let row = ChecksumRow {
+            id: Uuid::nil(),
+            repository_key: "test-repo".to_string(),
+            path: "/path/to/artifact".to_string(),
+            name: "my-artifact".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 4096,
+            checksum_sha256: "abcdef1234567890".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            created_at: now,
+            download_count: 7,
+        };
+        assert_eq!(row.id, Uuid::nil());
+        assert_eq!(row.repository_key, "test-repo");
+        assert_eq!(row.name, "my-artifact");
+        assert_eq!(row.version.as_deref(), Some("1.0.0"));
+        assert_eq!(row.size_bytes, 4096);
+        assert_eq!(row.download_count, 7);
+    }
+
+    #[test]
+    fn test_checksum_row_version_none() {
+        let row = ChecksumRow {
+            id: Uuid::new_v4(),
+            repository_key: "generic".to_string(),
+            path: "/files/data.bin".to_string(),
+            name: "data.bin".to_string(),
+            version: None,
+            size_bytes: 0,
+            checksum_sha256: "0000000000000000".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            created_at: chrono::Utc::now(),
+            download_count: 0,
+        };
+        assert!(row.version.is_none());
+    }
+
+    #[test]
+    fn test_checksum_row_to_checksum_artifact_conversion() {
+        let now = chrono::Utc::now();
+        let id = Uuid::new_v4();
+        let row = ChecksumRow {
+            id,
+            repository_key: "maven-central".to_string(),
+            path: "/com/example/lib-1.0.jar".to_string(),
+            name: "lib-1.0.jar".to_string(),
+            version: Some("1.0".to_string()),
+            size_bytes: 8192,
+            checksum_sha256: "sha256hash".to_string(),
+            content_type: "application/java-archive".to_string(),
+            created_at: now,
+            download_count: 99,
+        };
+        let artifact = ChecksumArtifact {
+            id: row.id,
+            repository_key: row.repository_key.clone(),
+            path: row.path.clone(),
+            name: row.name.clone(),
+            version: row.version.clone(),
+            size_bytes: row.size_bytes,
+            checksum_sha256: row.checksum_sha256.clone(),
+            content_type: row.content_type.clone(),
+            download_count: row.download_count,
+            created_at: row.created_at,
+        };
+        assert_eq!(artifact.id, id);
+        assert_eq!(artifact.repository_key, "maven-central");
+        assert_eq!(artifact.download_count, 99);
     }
 }
