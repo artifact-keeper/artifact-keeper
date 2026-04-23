@@ -30,7 +30,7 @@ bcrypt = "0.19"
 
 # Checksums
 sha2 = "0.10"
-md-5 = "0.10"
+md-5 = "0.11"
 sha1 = "0.10"
 hmac = "0.12"
 
