@@ -108,56 +108,6 @@ async fn check_service_health(
     }
 }
 
-/// Probe OpenSearch cluster health via `/_cluster/health`.
-///
-/// Maps cluster status: green/yellow -> healthy, red -> unhealthy.
-async fn check_opensearch_health(base_url: &str) -> CheckStatus {
-    let client = crate::services::http_client::base_client_builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-    let url = format!("{}/_cluster/health", base_url.trim_end_matches('/'));
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            // Parse the cluster status from the response body
-            match resp.json::<serde_json::Value>().await {
-                Ok(body) => {
-                    let status = body
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    match status {
-                        "green" | "yellow" => CheckStatus {
-                            status: "healthy".to_string(),
-                            message: None,
-                        },
-                        "red" => CheckStatus {
-                            status: "unhealthy".to_string(),
-                            message: Some("OpenSearch cluster status is red".to_string()),
-                        },
-                        other => CheckStatus {
-                            status: "unhealthy".to_string(),
-                            message: Some(format!("OpenSearch cluster status: {}", other)),
-                        },
-                    }
-                }
-                Err(e) => CheckStatus {
-                    status: "unhealthy".to_string(),
-                    message: Some(format!("Failed to parse OpenSearch health response: {}", e)),
-                },
-            }
-        }
-        Ok(resp) => CheckStatus {
-            status: "unhealthy".to_string(),
-            message: Some(format!("OpenSearch returned status {}", resp.status())),
-        },
-        Err(e) => CheckStatus {
-            status: "unavailable".to_string(),
-            message: Some(format!("OpenSearch unreachable: {}", e)),
-        },
-    }
-}
-
 /// Health check endpoint -- rich status page for dashboards.
 ///
 /// Checks database, storage (real write/read probe), optional services (Trivy,
