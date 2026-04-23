@@ -2229,4 +2229,1542 @@ mod tests {
         };
         assert_eq!(doc.doc_id(), "repo-id-456");
     }
+
+    // -----------------------------------------------------------------------
+    // build_artifact_batch: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_artifact_batch_single_row() {
+        let id = Uuid::new_v4();
+        let rows = vec![make_artifact_row(id)];
+        let mut counts = HashMap::new();
+        counts.insert(id, 99);
+        let docs = build_artifact_batch(rows, &counts);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].download_count, 99);
+        assert_eq!(docs[0].id, id.to_string());
+    }
+
+    #[test]
+    fn test_build_artifact_batch_no_download_counts_at_all() {
+        let rows = vec![
+            make_artifact_row(Uuid::new_v4()),
+            make_artifact_row(Uuid::new_v4()),
+            make_artifact_row(Uuid::new_v4()),
+        ];
+        let docs = build_artifact_batch(rows, &HashMap::new());
+        assert_eq!(docs.len(), 3);
+        for doc in &docs {
+            assert_eq!(doc.download_count, 0);
+        }
+    }
+
+    #[test]
+    fn test_build_artifact_batch_preserves_order() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let rows = vec![
+            make_artifact_row(id1),
+            make_artifact_row(id2),
+            make_artifact_row(id3),
+        ];
+        let docs = build_artifact_batch(rows, &HashMap::new());
+        assert_eq!(docs[0].id, id1.to_string());
+        assert_eq!(docs[1].id, id2.to_string());
+        assert_eq!(docs[2].id, id3.to_string());
+    }
+
+    #[test]
+    fn test_build_artifact_batch_large_download_count() {
+        let id = Uuid::new_v4();
+        let rows = vec![make_artifact_row(id)];
+        let mut counts = HashMap::new();
+        counts.insert(id, i64::MAX);
+        let docs = build_artifact_batch(rows, &counts);
+        assert_eq!(docs[0].download_count, i64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_repository_batch: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_repository_batch_single() {
+        let id = Uuid::new_v4();
+        let rows = vec![make_repository_row(id)];
+        let docs = build_repository_batch(rows);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, id.to_string());
+    }
+
+    #[test]
+    fn test_build_repository_batch_preserves_order() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let id4 = Uuid::new_v4();
+        let rows = vec![
+            make_repository_row(id1),
+            make_repository_row(id2),
+            make_repository_row(id3),
+            make_repository_row(id4),
+        ];
+        let docs = build_repository_batch(rows);
+        assert_eq!(docs.len(), 4);
+        assert_eq!(docs[0].id, id1.to_string());
+        assert_eq!(docs[1].id, id2.to_string());
+        assert_eq!(docs[2].id, id3.to_string());
+        assert_eq!(docs[3].id, id4.to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // artifact_document_from_row: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_document_from_row_none_version() {
+        let row = ArtifactRow {
+            id: Uuid::new_v4(),
+            name: "no-version".to_string(),
+            path: "pkg/no-version".to_string(),
+            version: None,
+            content_type: "application/octet-stream".to_string(),
+            size_bytes: 0,
+            created_at: Utc::now(),
+            repository_id: Uuid::new_v4(),
+            repository_key: "generic-local".to_string(),
+            repository_name: "Generic".to_string(),
+            format: "generic".to_string(),
+            is_public: true,
+        };
+        let doc = artifact_document_from_row(row, 0);
+        assert!(doc.version.is_none());
+        assert_eq!(doc.size_bytes, 0);
+    }
+
+    #[test]
+    fn test_artifact_document_from_row_large_size() {
+        let row = ArtifactRow {
+            id: Uuid::new_v4(),
+            name: "big-file".to_string(),
+            path: "pkg/big-file".to_string(),
+            version: Some("2.0.0".to_string()),
+            content_type: "application/gzip".to_string(),
+            size_bytes: 10_737_418_240, // 10 GB
+            created_at: Utc::now(),
+            repository_id: Uuid::new_v4(),
+            repository_key: "npm-local".to_string(),
+            repository_name: "NPM".to_string(),
+            format: "npm".to_string(),
+            is_public: false,
+        };
+        let doc = artifact_document_from_row(row, 500);
+        assert_eq!(doc.size_bytes, 10_737_418_240);
+        assert_eq!(doc.download_count, 500);
+        assert!(!doc.is_public);
+    }
+
+    #[test]
+    fn test_artifact_document_from_row_timestamp_conversion() {
+        let ts = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let row = ArtifactRow {
+            id: Uuid::new_v4(),
+            name: "ts-test".to_string(),
+            path: "pkg/ts-test".to_string(),
+            version: None,
+            content_type: "text/plain".to_string(),
+            size_bytes: 1,
+            created_at: ts,
+            repository_id: Uuid::new_v4(),
+            repository_key: "generic-local".to_string(),
+            repository_name: "Generic".to_string(),
+            format: "generic".to_string(),
+            is_public: true,
+        };
+        let doc = artifact_document_from_row(row, 0);
+        assert_eq!(doc.created_at, 1_700_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // repository_document_from_row: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repository_document_from_row_none_description() {
+        let row = RepositoryRow {
+            id: Uuid::new_v4(),
+            name: "No Desc".to_string(),
+            key: "no-desc".to_string(),
+            description: None,
+            format: "pypi".to_string(),
+            repo_type: "remote".to_string(),
+            is_public: false,
+            created_at: Utc::now(),
+        };
+        let doc = repository_document_from_row(row);
+        assert!(doc.description.is_none());
+        assert_eq!(doc.repo_type, "remote");
+    }
+
+    #[test]
+    fn test_repository_document_from_row_empty_description() {
+        let row = RepositoryRow {
+            id: Uuid::new_v4(),
+            name: "Empty Desc".to_string(),
+            key: "empty-desc".to_string(),
+            description: Some("".to_string()),
+            format: "cargo".to_string(),
+            repo_type: "local".to_string(),
+            is_public: true,
+            created_at: Utc::now(),
+        };
+        let doc = repository_document_from_row(row);
+        assert_eq!(doc.description, Some("".to_string()));
+    }
+
+    #[test]
+    fn test_repository_document_from_row_timestamp_conversion() {
+        let ts = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let row = RepositoryRow {
+            id: Uuid::new_v4(),
+            name: "TS Repo".to_string(),
+            key: "ts-repo".to_string(),
+            description: Some("Testing timestamps".to_string()),
+            format: "docker".to_string(),
+            repo_type: "virtual".to_string(),
+            is_public: true,
+            created_at: ts,
+        };
+        let doc = repository_document_from_row(row);
+        assert_eq!(doc.created_at, 1_600_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_search_response: comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_search_response_missing_hits_array() {
+        let body = json!({
+            "took": 3,
+            "hits": {
+                "total": { "value": 0 }
+            }
+        });
+        let result: SearchResults<ArtifactDocument> =
+            parse_search_response("query", &body).unwrap();
+        assert!(result.hits.is_empty());
+        assert_eq!(result.total_hits, 0);
+    }
+
+    #[test]
+    fn test_parse_search_response_missing_took() {
+        let body = json!({
+            "hits": {
+                "total": { "value": 0 },
+                "hits": []
+            }
+        });
+        let result: SearchResults<ArtifactDocument> = parse_search_response("q", &body).unwrap();
+        assert_eq!(result.processing_time_ms, 0);
+    }
+
+    #[test]
+    fn test_parse_search_response_missing_total() {
+        let body = json!({
+            "took": 7,
+            "hits": {
+                "hits": []
+            }
+        });
+        let result: SearchResults<RepositoryDocument> = parse_search_response("q", &body).unwrap();
+        assert_eq!(result.total_hits, 0);
+    }
+
+    #[test]
+    fn test_parse_search_response_malformed_source_skipped() {
+        let body = json!({
+            "took": 2,
+            "hits": {
+                "total": { "value": 2 },
+                "hits": [
+                    {
+                        "_id": "good",
+                        "_source": {
+                            "id": "good",
+                            "name": "Good Repo",
+                            "key": "good-repo",
+                            "description": null,
+                            "format": "npm",
+                            "repo_type": "local",
+                            "is_public": true,
+                            "created_at": 1700000000
+                        }
+                    },
+                    {
+                        "_id": "bad",
+                        "_source": {
+                            "totally": "wrong shape"
+                        }
+                    }
+                ]
+            }
+        });
+        let result: SearchResults<RepositoryDocument> =
+            parse_search_response("mixed", &body).unwrap();
+        assert_eq!(result.hits.len(), 1, "malformed _source should be skipped");
+        assert_eq!(result.hits[0].name, "Good Repo");
+        assert_eq!(result.total_hits, 2);
+    }
+
+    #[test]
+    fn test_parse_search_response_multiple_artifact_hits() {
+        let body = json!({
+            "took": 15,
+            "hits": {
+                "total": { "value": 3 },
+                "hits": [
+                    {
+                        "_id": "a1",
+                        "_source": {
+                            "id": "a1",
+                            "name": "artifact-1",
+                            "path": "pkg/a1",
+                            "version": "1.0",
+                            "format": "maven",
+                            "repository_id": "r1",
+                            "repository_key": "maven-local",
+                            "repository_name": "Maven Local",
+                            "content_type": "application/java-archive",
+                            "size_bytes": 100,
+                            "download_count": 5,
+                            "is_public": true,
+                            "created_at": 1700000000
+                        }
+                    },
+                    {
+                        "_id": "a2",
+                        "_source": {
+                            "id": "a2",
+                            "name": "artifact-2",
+                            "path": "pkg/a2",
+                            "version": "2.0",
+                            "format": "npm",
+                            "repository_id": "r2",
+                            "repository_key": "npm-local",
+                            "repository_name": "NPM Local",
+                            "content_type": "application/gzip",
+                            "size_bytes": 200,
+                            "download_count": 10,
+                            "is_public": false,
+                            "created_at": 1700000001
+                        }
+                    },
+                    {
+                        "_id": "a3",
+                        "_source": {
+                            "id": "a3",
+                            "name": "artifact-3",
+                            "path": "pkg/a3",
+                            "version": null,
+                            "format": "pypi",
+                            "repository_id": "r3",
+                            "repository_key": "pypi-local",
+                            "repository_name": "PyPI Local",
+                            "content_type": "application/x-tar",
+                            "size_bytes": 300,
+                            "download_count": 0,
+                            "is_public": true,
+                            "created_at": 1700000002
+                        }
+                    }
+                ]
+            }
+        });
+        let result: SearchResults<ArtifactDocument> =
+            parse_search_response("artifact", &body).unwrap();
+        assert_eq!(result.total_hits, 3);
+        assert_eq!(result.hits.len(), 3);
+        assert_eq!(result.hits[0].name, "artifact-1");
+        assert_eq!(result.hits[1].name, "artifact-2");
+        assert_eq!(result.hits[2].name, "artifact-3");
+        assert_eq!(result.processing_time_ms, 15);
+    }
+
+    #[test]
+    fn test_parse_search_response_preserves_query_string() {
+        let body = json!({
+            "took": 1,
+            "hits": { "total": { "value": 0 }, "hits": [] }
+        });
+        let result: SearchResults<ArtifactDocument> =
+            parse_search_response("my complex query", &body).unwrap();
+        assert_eq!(result.query, "my complex query");
+    }
+
+    #[test]
+    fn test_parse_search_response_empty_query_string() {
+        let body = json!({
+            "took": 0,
+            "hits": { "total": { "value": 0 }, "hits": [] }
+        });
+        let result: SearchResults<RepositoryDocument> = parse_search_response("", &body).unwrap();
+        assert_eq!(result.query, "");
+    }
+
+    #[test]
+    fn test_parse_search_response_large_total_hits() {
+        let body = json!({
+            "took": 50,
+            "hits": {
+                "total": { "value": 100000 },
+                "hits": []
+            }
+        });
+        let result: SearchResults<ArtifactDocument> =
+            parse_search_response("search", &body).unwrap();
+        assert_eq!(result.total_hits, 100000);
+        assert!(result.hits.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // translate_filter: comprehensive edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_translate_filter_triple_and() {
+        let clauses = translate_filter(
+            "format = maven AND is_public = true AND repository_key = libs-release",
+        );
+        assert_eq!(clauses.len(), 3);
+        assert_eq!(clauses[0], json!({ "term": { "format": "maven" } }));
+        assert_eq!(clauses[1], json!({ "term": { "is_public": true } }));
+        assert_eq!(
+            clauses[2],
+            json!({ "term": { "repository_key": "libs-release" } })
+        );
+    }
+
+    #[test]
+    fn test_translate_filter_range_with_both_bounds_separate() {
+        let lower = translate_filter("size_bytes >= 100");
+        let upper = translate_filter("size_bytes <= 9999");
+        assert_eq!(lower.len(), 1);
+        assert_eq!(upper.len(), 1);
+        assert_eq!(
+            lower[0],
+            json!({ "range": { "size_bytes": { "gte": 100 } } })
+        );
+        assert_eq!(
+            upper[0],
+            json!({ "range": { "size_bytes": { "lte": 9999 } } })
+        );
+    }
+
+    #[test]
+    fn test_translate_filter_range_combined_with_and() {
+        let clauses = translate_filter("size_bytes >= 100 AND size_bytes < 5000");
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(
+            clauses[0],
+            json!({ "range": { "size_bytes": { "gte": 100 } } })
+        );
+        assert_eq!(
+            clauses[1],
+            json!({ "range": { "size_bytes": { "lt": 5000 } } })
+        );
+    }
+
+    #[test]
+    fn test_translate_filter_quoted_value_single_quotes() {
+        let clauses = translate_filter("format = 'docker'");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0], json!({ "term": { "format": "docker" } }));
+    }
+
+    #[test]
+    fn test_translate_filter_quoted_value_double_quotes() {
+        let clauses = translate_filter("format = \"docker\"");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0], json!({ "term": { "format": "docker" } }));
+    }
+
+    #[test]
+    fn test_translate_filter_whitespace_only() {
+        let clauses = translate_filter("   ");
+        assert!(clauses.is_empty());
+    }
+
+    #[test]
+    fn test_translate_filter_inequality_with_boolean() {
+        let clauses = translate_filter("is_public != true");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(
+            clauses[0],
+            json!({ "bool": { "must_not": [{ "term": { "is_public": true } }] } })
+        );
+    }
+
+    #[test]
+    fn test_translate_filter_inequality_with_integer() {
+        let clauses = translate_filter("download_count != 0");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(
+            clauses[0],
+            json!({ "bool": { "must_not": [{ "term": { "download_count": 0 } }] } })
+        );
+    }
+
+    #[test]
+    fn test_translate_filter_gt_with_negative_number() {
+        let clauses = translate_filter("size_bytes > -1");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(
+            clauses[0],
+            json!({ "range": { "size_bytes": { "gt": -1 } } })
+        );
+    }
+
+    #[test]
+    fn test_translate_filter_string_with_hyphens() {
+        let clauses = translate_filter("repository_key = my-repo-name");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(
+            clauses[0],
+            json!({ "term": { "repository_key": "my-repo-name" } })
+        );
+    }
+
+    #[test]
+    fn test_translate_filter_four_conditions() {
+        let clauses = translate_filter(
+            "format = maven AND is_public = true AND size_bytes > 0 AND download_count >= 10",
+        );
+        assert_eq!(clauses.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_single_filter: direct tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_filter_equality() {
+        let result = parse_single_filter("format = maven");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), json!({ "term": { "format": "maven" } }));
+    }
+
+    #[test]
+    fn test_parse_single_filter_not_equal() {
+        let result = parse_single_filter("format != docker");
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            json!({ "bool": { "must_not": [{ "term": { "format": "docker" } }] } })
+        );
+    }
+
+    #[test]
+    fn test_parse_single_filter_gt() {
+        let result = parse_single_filter("size_bytes > 512");
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            json!({ "range": { "size_bytes": { "gt": 512 } } })
+        );
+    }
+
+    #[test]
+    fn test_parse_single_filter_gte() {
+        let result = parse_single_filter("created_at >= 1000");
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            json!({ "range": { "created_at": { "gte": 1000 } } })
+        );
+    }
+
+    #[test]
+    fn test_parse_single_filter_lt() {
+        let result = parse_single_filter("download_count < 50");
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            json!({ "range": { "download_count": { "lt": 50 } } })
+        );
+    }
+
+    #[test]
+    fn test_parse_single_filter_lte() {
+        let result = parse_single_filter("size_bytes <= 2048");
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            json!({ "range": { "size_bytes": { "lte": 2048 } } })
+        );
+    }
+
+    #[test]
+    fn test_parse_single_filter_no_operator() {
+        let result = parse_single_filter("just some text");
+        // "just some text" does not contain any operator in a meaningful position
+        // The function tries to find operators and may or may not match depending
+        // on whitespace. If it finds "=" or similar, it would try to parse.
+        // "just some text" has no = != >= <= > < so result should be None.
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_single_filter_boolean_true() {
+        let result = parse_single_filter("is_public = true");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), json!({ "term": { "is_public": true } }));
+    }
+
+    #[test]
+    fn test_parse_single_filter_boolean_false() {
+        let result = parse_single_filter("is_public = false");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), json!({ "term": { "is_public": false } }));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_filter_value: comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_filter_value_large_integer() {
+        assert_eq!(parse_filter_value("1700000000"), json!(1_700_000_000_i64));
+    }
+
+    #[test]
+    fn test_parse_filter_value_negative_integer() {
+        assert_eq!(parse_filter_value("-100"), json!(-100));
+    }
+
+    #[test]
+    fn test_parse_filter_value_zero() {
+        assert_eq!(parse_filter_value("0"), json!(0));
+    }
+
+    #[test]
+    fn test_parse_filter_value_float() {
+        let val = parse_filter_value("2.5");
+        assert!(val.is_number());
+        assert_eq!(val.as_f64().unwrap(), 2.5);
+    }
+
+    #[test]
+    fn test_parse_filter_value_negative_float() {
+        let val = parse_filter_value("-0.5");
+        assert!(val.is_number());
+        assert_eq!(val.as_f64().unwrap(), -0.5);
+    }
+
+    #[test]
+    fn test_parse_filter_value_string_with_dots() {
+        let val = parse_filter_value("com.example.artifact");
+        assert_eq!(val, json!("com.example.artifact"));
+    }
+
+    #[test]
+    fn test_parse_filter_value_string_with_slashes() {
+        let val = parse_filter_value("org/example/lib");
+        assert_eq!(val, json!("org/example/lib"));
+    }
+
+    #[test]
+    fn test_parse_filter_value_empty_string() {
+        let val = parse_filter_value("");
+        assert_eq!(val, json!(""));
+    }
+
+    #[test]
+    fn test_parse_filter_value_string_true_case_sensitive() {
+        // "True" (capitalized) should be treated as string, not bool
+        assert_eq!(parse_filter_value("True"), json!("True"));
+    }
+
+    #[test]
+    fn test_parse_filter_value_string_false_case_sensitive() {
+        assert_eq!(parse_filter_value("False"), json!("False"));
+    }
+
+    // -----------------------------------------------------------------------
+    // translate_sort: comprehensive tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_translate_sort_version_field_uses_keyword() {
+        let sort = translate_sort(&["version:desc"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0], json!({ "version.keyword": { "order": "desc" } }));
+    }
+
+    #[test]
+    fn test_translate_sort_key_field_uses_keyword() {
+        let sort = translate_sort(&["key:asc"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0], json!({ "key.keyword": { "order": "asc" } }));
+    }
+
+    #[test]
+    fn test_translate_sort_repository_name_uses_keyword() {
+        let sort = translate_sort(&["repository_name:desc"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(
+            sort[0],
+            json!({ "repository_name.keyword": { "order": "desc" } })
+        );
+    }
+
+    #[test]
+    fn test_translate_sort_format_no_keyword() {
+        let sort = translate_sort(&["format:asc"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0], json!({ "format": { "order": "asc" } }));
+    }
+
+    #[test]
+    fn test_translate_sort_size_bytes_no_keyword() {
+        let sort = translate_sort(&["size_bytes:desc"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0], json!({ "size_bytes": { "order": "desc" } }));
+    }
+
+    #[test]
+    fn test_translate_sort_download_count_no_keyword() {
+        let sort = translate_sort(&["download_count:desc"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0], json!({ "download_count": { "order": "desc" } }));
+    }
+
+    #[test]
+    fn test_translate_sort_is_public_no_keyword() {
+        let sort = translate_sort(&["is_public:asc"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0], json!({ "is_public": { "order": "asc" } }));
+    }
+
+    #[test]
+    fn test_translate_sort_three_fields() {
+        let sort = translate_sort(&["name:asc", "created_at:desc", "size_bytes:asc"]);
+        assert_eq!(sort.len(), 3);
+        assert_eq!(sort[0], json!({ "name.keyword": { "order": "asc" } }));
+        assert_eq!(sort[1], json!({ "created_at": { "order": "desc" } }));
+        assert_eq!(sort[2], json!({ "size_bytes": { "order": "asc" } }));
+    }
+
+    #[test]
+    fn test_translate_sort_field_without_colon_defaults_asc() {
+        let sort = translate_sort(&["created_at"]);
+        assert_eq!(sort.len(), 1);
+        assert_eq!(sort[0], json!({ "created_at": { "order": "asc" } }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Index body validation: deep structure tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifacts_index_body_shard_count() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(body["settings"]["number_of_shards"], json!(1));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_replica_count() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(body["settings"]["number_of_replicas"], json!(0));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_name_ngram_analyzer_config() {
+        let body = OpenSearchService::artifacts_index_body();
+        let analyzer = &body["settings"]["analysis"]["analyzer"]["name_ngram_analyzer"];
+        assert_eq!(analyzer["tokenizer"], json!("standard"));
+        let filters = analyzer["filter"].as_array().unwrap();
+        assert!(filters.contains(&json!("lowercase")));
+        assert!(filters.contains(&json!("edge_ngram_filter")));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_edge_ngram_min_max() {
+        let body = OpenSearchService::artifacts_index_body();
+        let filter = &body["settings"]["analysis"]["filter"]["edge_ngram_filter"];
+        assert_eq!(filter["min_gram"], json!(2));
+        assert_eq!(filter["max_gram"], json!(20));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_path_analyzer_config() {
+        let body = OpenSearchService::artifacts_index_body();
+        let analyzer = &body["settings"]["analysis"]["analyzer"]["path_analyzer"];
+        assert_eq!(analyzer["tokenizer"], json!("path_tokenizer"));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_id_is_keyword() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["id"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_name_is_text_with_keyword_subfield() {
+        let body = OpenSearchService::artifacts_index_body();
+        let name = &body["mappings"]["properties"]["name"];
+        assert_eq!(name["type"], json!("text"));
+        assert_eq!(name["fields"]["keyword"]["type"], json!("keyword"));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_name_uses_ngram_analyzer() {
+        let body = OpenSearchService::artifacts_index_body();
+        let name = &body["mappings"]["properties"]["name"];
+        assert_eq!(name["analyzer"], json!("name_ngram_analyzer"));
+        assert_eq!(name["search_analyzer"], json!("standard"));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_path_uses_path_analyzer() {
+        let body = OpenSearchService::artifacts_index_body();
+        let path = &body["mappings"]["properties"]["path"];
+        assert_eq!(path["analyzer"], json!("path_analyzer"));
+        assert_eq!(path["fields"]["keyword"]["type"], json!("keyword"));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_format_is_keyword() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["format"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_size_bytes_is_long() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["size_bytes"]["type"],
+            json!("long")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_download_count_is_long() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["download_count"]["type"],
+            json!("long")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_created_at_is_long() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["created_at"]["type"],
+            json!("long")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_content_type_is_keyword() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["content_type"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_repository_id_is_keyword() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["repository_id"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_repository_key_is_keyword() {
+        let body = OpenSearchService::artifacts_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["repository_key"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_artifacts_index_body_version_is_text_with_keyword() {
+        let body = OpenSearchService::artifacts_index_body();
+        let version = &body["mappings"]["properties"]["version"];
+        assert_eq!(version["type"], json!("text"));
+        assert_eq!(version["fields"]["keyword"]["type"], json!("keyword"));
+    }
+
+    #[test]
+    fn test_artifacts_index_body_repository_name_is_text_with_keyword() {
+        let body = OpenSearchService::artifacts_index_body();
+        let rn = &body["mappings"]["properties"]["repository_name"];
+        assert_eq!(rn["type"], json!("text"));
+        assert_eq!(rn["fields"]["keyword"]["type"], json!("keyword"));
+    }
+
+    #[test]
+    fn test_repositories_index_body_shard_count() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(body["settings"]["number_of_shards"], json!(1));
+    }
+
+    #[test]
+    fn test_repositories_index_body_replica_count() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(body["settings"]["number_of_replicas"], json!(0));
+    }
+
+    #[test]
+    fn test_repositories_index_body_edge_ngram_min_max() {
+        let body = OpenSearchService::repositories_index_body();
+        let filter = &body["settings"]["analysis"]["filter"]["edge_ngram_filter"];
+        assert_eq!(filter["min_gram"], json!(2));
+        assert_eq!(filter["max_gram"], json!(20));
+    }
+
+    #[test]
+    fn test_repositories_index_body_id_is_keyword() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["id"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_repositories_index_body_name_uses_ngram_analyzer() {
+        let body = OpenSearchService::repositories_index_body();
+        let name = &body["mappings"]["properties"]["name"];
+        assert_eq!(name["analyzer"], json!("name_ngram_analyzer"));
+        assert_eq!(name["search_analyzer"], json!("standard"));
+    }
+
+    #[test]
+    fn test_repositories_index_body_key_is_text_with_keyword() {
+        let body = OpenSearchService::repositories_index_body();
+        let key = &body["mappings"]["properties"]["key"];
+        assert_eq!(key["type"], json!("text"));
+        assert_eq!(key["fields"]["keyword"]["type"], json!("keyword"));
+    }
+
+    #[test]
+    fn test_repositories_index_body_description_is_text() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["description"]["type"],
+            json!("text")
+        );
+    }
+
+    #[test]
+    fn test_repositories_index_body_format_is_keyword() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["format"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_repositories_index_body_repo_type_is_keyword() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["repo_type"]["type"],
+            json!("keyword")
+        );
+    }
+
+    #[test]
+    fn test_repositories_index_body_is_public_is_boolean() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["is_public"]["type"],
+            json!("boolean")
+        );
+    }
+
+    #[test]
+    fn test_repositories_index_body_created_at_is_long() {
+        let body = OpenSearchService::repositories_index_body();
+        assert_eq!(
+            body["mappings"]["properties"]["created_at"]["type"],
+            json!("long")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Constructor variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_new_with_only_username_no_password() {
+        // Only username but no password: should still construct (auth not applied)
+        let result = OpenSearchService::new("http://localhost:9200", Some("admin"), None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_new_with_only_password_no_username() {
+        let result = OpenSearchService::new("http://localhost:9200", None, Some("secret"), false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_new_with_https_url() {
+        let result = OpenSearchService::new("https://search.example.com:9200", None, None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_new_with_allow_invalid_certs_no_auth() {
+        let result = OpenSearchService::new("https://localhost:9200", None, None, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_new_empty_url() {
+        let result = OpenSearchService::new("", None, None, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_url_with_path() {
+        let result = OpenSearchService::new("http://localhost:9200/prefix", None, None, false);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_opensearch_service_debug_does_not_leak_credentials() {
+        let service = OpenSearchService::new(
+            "http://localhost:9200",
+            Some("admin"),
+            Some("supersecret"),
+            false,
+        )
+        .unwrap();
+        let debug_str = format!("{:?}", service);
+        assert!(debug_str.contains("OpenSearchService"));
+        assert!(debug_str.contains("<OpenSearch>"));
+        assert!(!debug_str.contains("supersecret"));
+        assert!(!debug_str.contains("admin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Source-code analysis tests: verify async methods contain expected patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_artifacts_uses_multi_match() {
+        let source = function_source(opensearch_service_source(), "search_artifacts");
+        assert!(
+            source.contains("multi_match"),
+            "search_artifacts should use multi_match query"
+        );
+    }
+
+    #[test]
+    fn test_search_artifacts_uses_fuzziness() {
+        let source = function_source(opensearch_service_source(), "search_artifacts");
+        assert!(
+            source.contains("fuzziness"),
+            "search_artifacts should enable fuzziness for typo tolerance"
+        );
+    }
+
+    #[test]
+    fn test_search_artifacts_uses_match_all_for_empty_query() {
+        let source = function_source(opensearch_service_source(), "search_artifacts");
+        assert!(
+            source.contains("match_all"),
+            "search_artifacts should use match_all for empty queries"
+        );
+    }
+
+    #[test]
+    fn test_search_artifacts_tracks_total_hits() {
+        let source = function_source(opensearch_service_source(), "search_artifacts");
+        assert!(
+            source.contains("track_total_hits"),
+            "search_artifacts should set track_total_hits for accurate totals"
+        );
+    }
+
+    #[test]
+    fn test_search_artifacts_boosts_name_field() {
+        let source = function_source(opensearch_service_source(), "search_artifacts");
+        assert!(
+            source.contains("name^3"),
+            "search_artifacts should boost the name field"
+        );
+    }
+
+    #[test]
+    fn test_search_artifacts_boosts_path_field() {
+        let source = function_source(opensearch_service_source(), "search_artifacts");
+        assert!(
+            source.contains("path^2"),
+            "search_artifacts should boost the path field"
+        );
+    }
+
+    #[test]
+    fn test_search_repositories_uses_multi_match() {
+        let source = function_source(opensearch_service_source(), "search_repositories");
+        assert!(
+            source.contains("multi_match"),
+            "search_repositories should use multi_match query"
+        );
+    }
+
+    #[test]
+    fn test_search_repositories_uses_fuzziness() {
+        let source = function_source(opensearch_service_source(), "search_repositories");
+        assert!(
+            source.contains("fuzziness"),
+            "search_repositories should enable fuzziness"
+        );
+    }
+
+    #[test]
+    fn test_search_repositories_boosts_name_field() {
+        let source = function_source(opensearch_service_source(), "search_repositories");
+        assert!(
+            source.contains("name^3"),
+            "search_repositories should boost the name field"
+        );
+    }
+
+    #[test]
+    fn test_search_repositories_boosts_key_field() {
+        let source = function_source(opensearch_service_source(), "search_repositories");
+        assert!(
+            source.contains("key^2"),
+            "search_repositories should boost the key field"
+        );
+    }
+
+    #[test]
+    fn test_search_repositories_uses_match_all_for_empty_query() {
+        let source = function_source(opensearch_service_source(), "search_repositories");
+        assert!(
+            source.contains("match_all"),
+            "search_repositories should use match_all for empty queries"
+        );
+    }
+
+    #[test]
+    fn test_bulk_index_uses_bulk_api() {
+        let source = opensearch_service_source();
+        assert!(
+            source.contains("BulkParts"),
+            "bulk_index should use the _bulk endpoint"
+        );
+    }
+
+    #[test]
+    fn test_bulk_index_returns_early_for_empty() {
+        let source = opensearch_service_source();
+        assert!(
+            source.contains("if docs.is_empty()"),
+            "bulk_index should short-circuit on empty input"
+        );
+    }
+
+    #[test]
+    fn test_bulk_index_checks_per_item_errors() {
+        let source = opensearch_service_source();
+        // The bulk_index method checks the "errors" field in the response
+        assert!(
+            source.contains("errors\"].as_bool()"),
+            "bulk_index should check for per-item errors in bulk response"
+        );
+    }
+
+    #[test]
+    fn test_remove_artifact_treats_404_as_success() {
+        let source = function_source(opensearch_service_source(), "remove_artifact");
+        assert!(
+            source.contains("404"),
+            "remove_artifact should treat 404 as success (document already deleted)"
+        );
+    }
+
+    #[test]
+    fn test_remove_repository_treats_404_as_success() {
+        let source = function_source(opensearch_service_source(), "remove_repository");
+        assert!(
+            source.contains("404"),
+            "remove_repository should treat 404 as success (document already deleted)"
+        );
+    }
+
+    #[test]
+    fn test_index_artifact_uses_index_parts() {
+        let source = function_source(opensearch_service_source(), "index_artifact");
+        assert!(
+            source.contains("IndexParts::IndexId"),
+            "index_artifact should use IndexParts::IndexId to upsert by ID"
+        );
+    }
+
+    #[test]
+    fn test_index_repository_uses_index_parts() {
+        let source = function_source(opensearch_service_source(), "index_repository");
+        assert!(
+            source.contains("IndexParts::IndexId"),
+            "index_repository should use IndexParts::IndexId to upsert by ID"
+        );
+    }
+
+    #[test]
+    fn test_set_refresh_interval_uses_put_settings() {
+        let source = function_source(opensearch_service_source(), "set_refresh_interval");
+        assert!(
+            source.contains("put_settings"),
+            "set_refresh_interval should use the put_settings API"
+        );
+    }
+
+    #[test]
+    fn test_force_refresh_uses_refresh_api() {
+        let source = function_source(opensearch_service_source(), "force_refresh");
+        assert!(
+            source.contains("IndicesRefreshParts"),
+            "force_refresh should use IndicesRefreshParts"
+        );
+    }
+
+    #[test]
+    fn test_full_reindex_artifacts_disables_refresh_during_bulk() {
+        let source = function_source(opensearch_service_source(), "full_reindex_artifacts");
+        assert!(
+            source.contains("set_refresh_interval"),
+            "full_reindex_artifacts should disable/restore refresh interval"
+        );
+        assert!(
+            source.contains("\"-1\""),
+            "full_reindex_artifacts should disable refresh with -1"
+        );
+        assert!(
+            source.contains("\"1s\""),
+            "full_reindex_artifacts should restore refresh to 1s"
+        );
+    }
+
+    #[test]
+    fn test_full_reindex_artifacts_forces_refresh_at_end() {
+        let source = function_source(opensearch_service_source(), "full_reindex_artifacts");
+        assert!(
+            source.contains("force_refresh"),
+            "full_reindex_artifacts should force a refresh after bulk indexing"
+        );
+    }
+
+    #[test]
+    fn test_full_reindex_repositories_disables_refresh_during_bulk() {
+        let source = function_source(opensearch_service_source(), "full_reindex_repositories");
+        assert!(
+            source.contains("set_refresh_interval"),
+            "full_reindex_repositories should disable/restore refresh interval"
+        );
+    }
+
+    #[test]
+    fn test_full_reindex_repositories_forces_refresh_at_end() {
+        let source = function_source(opensearch_service_source(), "full_reindex_repositories");
+        assert!(
+            source.contains("force_refresh"),
+            "full_reindex_repositories should force a refresh after bulk indexing"
+        );
+    }
+
+    #[test]
+    fn test_ensure_index_checks_existence_before_creating() {
+        let source = function_source(opensearch_service_source(), "ensure_index");
+        assert!(
+            source.contains("IndicesExistsParts"),
+            "ensure_index should check for index existence before creating"
+        );
+        assert!(
+            source.contains("IndicesCreateParts"),
+            "ensure_index should create the index if it does not exist"
+        );
+    }
+
+    #[test]
+    fn test_is_index_empty_uses_count_api() {
+        let source = function_source(opensearch_service_source(), "is_index_empty");
+        assert!(
+            source.contains("CountParts"),
+            "is_index_empty should use the count API"
+        );
+    }
+
+    #[test]
+    fn test_is_index_empty_treats_404_as_empty() {
+        let source = function_source(opensearch_service_source(), "is_index_empty");
+        assert!(
+            source.contains("404"),
+            "is_index_empty should treat 404 as an empty (nonexistent) index"
+        );
+    }
+
+    #[test]
+    fn test_cluster_health_uses_cluster_health_api() {
+        let source = function_source(opensearch_service_source(), "cluster_health");
+        assert!(
+            source.contains("ClusterHealthParts"),
+            "cluster_health should use the cluster health endpoint"
+        );
+    }
+
+    #[test]
+    fn test_cluster_health_defaults_to_red_on_missing_status() {
+        let source = function_source(opensearch_service_source(), "cluster_health");
+        assert!(
+            source.contains("unwrap_or(\"red\")"),
+            "cluster_health should default to red if status field is missing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ArtifactDocument and RepositoryDocument: additional serialization edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_document_with_special_characters_in_name() {
+        let doc = ArtifactDocument {
+            id: "special".to_string(),
+            name: "my-artifact@2.0.0-beta.1".to_string(),
+            path: "@scope/my-artifact/-/my-artifact-2.0.0-beta.1.tgz".to_string(),
+            version: Some("2.0.0-beta.1".to_string()),
+            format: "npm".to_string(),
+            repository_id: "repo".to_string(),
+            repository_key: "npm-local".to_string(),
+            repository_name: "NPM Local".to_string(),
+            content_type: "application/gzip".to_string(),
+            size_bytes: 4096,
+            download_count: 0,
+            is_public: true,
+            created_at: 1700000000,
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let roundtripped: ArtifactDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.name, "my-artifact@2.0.0-beta.1");
+        assert_eq!(
+            roundtripped.path,
+            "@scope/my-artifact/-/my-artifact-2.0.0-beta.1.tgz"
+        );
+    }
+
+    #[test]
+    fn test_artifact_document_with_unicode_name() {
+        let doc = ArtifactDocument {
+            id: "unicode".to_string(),
+            name: "bibliothek-deutsch".to_string(),
+            path: "de/bibliothek".to_string(),
+            version: Some("1.0".to_string()),
+            format: "maven".to_string(),
+            repository_id: "r".to_string(),
+            repository_key: "maven-local".to_string(),
+            repository_name: "Maven".to_string(),
+            content_type: "application/java-archive".to_string(),
+            size_bytes: 1024,
+            download_count: 3,
+            is_public: false,
+            created_at: 0,
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let roundtripped: ArtifactDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.name, "bibliothek-deutsch");
+    }
+
+    #[test]
+    fn test_repository_document_with_long_description() {
+        let long_desc = "A".repeat(10000);
+        let doc = RepositoryDocument {
+            id: "long-desc".to_string(),
+            name: "repo".to_string(),
+            key: "repo".to_string(),
+            description: Some(long_desc.clone()),
+            format: "generic".to_string(),
+            repo_type: "local".to_string(),
+            is_public: true,
+            created_at: 0,
+        };
+        let json = serde_json::to_string(&doc).unwrap();
+        let roundtripped: RepositoryDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.description.unwrap().len(), 10000);
+    }
+
+    #[test]
+    fn test_artifact_document_zero_size_bytes() {
+        let doc = ArtifactDocument {
+            id: "zero-size".to_string(),
+            name: "empty-file".to_string(),
+            path: "empty".to_string(),
+            version: None,
+            format: "generic".to_string(),
+            repository_id: "r".to_string(),
+            repository_key: "k".to_string(),
+            repository_name: "n".to_string(),
+            content_type: "text/plain".to_string(),
+            size_bytes: 0,
+            download_count: 0,
+            is_public: true,
+            created_at: 0,
+        };
+        let val = serde_json::to_value(&doc).unwrap();
+        assert_eq!(val["size_bytes"], json!(0));
+    }
+
+    #[test]
+    fn test_artifact_document_max_size_bytes() {
+        let doc = ArtifactDocument {
+            id: "max-size".to_string(),
+            name: "huge".to_string(),
+            path: "huge".to_string(),
+            version: None,
+            format: "generic".to_string(),
+            repository_id: "r".to_string(),
+            repository_key: "k".to_string(),
+            repository_name: "n".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            size_bytes: i64::MAX,
+            download_count: 0,
+            is_public: false,
+            created_at: 0,
+        };
+        let val = serde_json::to_value(&doc).unwrap();
+        assert_eq!(val["size_bytes"], json!(i64::MAX));
+    }
+
+    // -----------------------------------------------------------------------
+    // SearchResults: additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_results_debug_impl() {
+        let results: SearchResults<ArtifactDocument> = SearchResults {
+            hits: vec![],
+            total_hits: 42,
+            processing_time_ms: 7,
+            query: "debug-test".to_string(),
+        };
+        let debug = format!("{:?}", results);
+        assert!(debug.contains("42"));
+        assert!(debug.contains("debug-test"));
+    }
+
+    #[test]
+    fn test_search_results_clone_with_hits() {
+        let doc = RepositoryDocument {
+            id: "clone-test".to_string(),
+            name: "test".to_string(),
+            key: "test-key".to_string(),
+            description: Some("cloned".to_string()),
+            format: "npm".to_string(),
+            repo_type: "local".to_string(),
+            is_public: true,
+            created_at: 0,
+        };
+        let results = SearchResults {
+            hits: vec![doc],
+            total_hits: 1,
+            processing_time_ms: 10,
+            query: "clone".to_string(),
+        };
+        let cloned = results.clone();
+        assert_eq!(cloned.hits.len(), 1);
+        assert_eq!(cloned.hits[0].id, "clone-test");
+        assert_eq!(cloned.total_hits, 1);
+        assert_eq!(cloned.processing_time_ms, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // configure_indexes source analysis
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_configure_indexes_creates_both_indexes() {
+        let source = function_source(opensearch_service_source(), "configure_indexes");
+        assert!(
+            source.contains("ARTIFACTS_INDEX"),
+            "configure_indexes should create the artifacts index"
+        );
+        assert!(
+            source.contains("REPOSITORIES_INDEX"),
+            "configure_indexes should create the repositories index"
+        );
+    }
+
+    #[test]
+    fn test_configure_indexes_logs_success() {
+        let source = function_source(opensearch_service_source(), "configure_indexes");
+        assert!(
+            source.contains("indexes configured successfully"),
+            "configure_indexes should log success"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Misc coverage: HasId doc_id for various IDs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_doc_id_with_uuid_format() {
+        let uuid = Uuid::new_v4().to_string();
+        let doc = ArtifactDocument {
+            id: uuid.clone(),
+            name: "n".to_string(),
+            path: "p".to_string(),
+            version: None,
+            format: "generic".to_string(),
+            repository_id: "r".to_string(),
+            repository_key: "k".to_string(),
+            repository_name: "n".to_string(),
+            content_type: "a".to_string(),
+            size_bytes: 0,
+            download_count: 0,
+            is_public: false,
+            created_at: 0,
+        };
+        assert_eq!(doc.doc_id(), uuid.as_str());
+        assert_eq!(doc.doc_id().len(), 36); // UUID v4 string length
+    }
+
+    #[test]
+    fn test_repository_doc_id_with_uuid_format() {
+        let uuid = Uuid::new_v4().to_string();
+        let doc = RepositoryDocument {
+            id: uuid.clone(),
+            name: "n".to_string(),
+            key: "k".to_string(),
+            description: None,
+            format: "npm".to_string(),
+            repo_type: "local".to_string(),
+            is_public: false,
+            created_at: 0,
+        };
+        assert_eq!(doc.doc_id(), uuid.as_str());
+    }
 }
