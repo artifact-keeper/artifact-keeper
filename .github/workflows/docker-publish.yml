@@ -295,7 +295,7 @@ jobs:
           trivy --version
 
       - name: Trivy scan - Backend
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ steps.refs.outputs.backend }}
           format: 'sarif'
@@ -306,7 +306,7 @@ jobs:
           skip-setup-trivy: true
 
       - name: Trivy scan - OpenSCAP
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
         with:
           image-ref: ${{ steps.refs.outputs.openscap }}
@@ -318,7 +318,7 @@ jobs:
           skip-setup-trivy: true
 
       - name: Trivy scan - Backend Alpine
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         if: always()
         with:
           image-ref: ${{ steps.refs.outputs.backend-alpine }}
