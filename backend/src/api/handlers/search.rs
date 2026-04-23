@@ -1,7 +1,7 @@
 //! Search handlers.
 //!
 //! Provides quick search, advanced search, checksum lookup, suggestions,
-//! trending, and recent artifact endpoints. Uses Meilisearch when available,
+//! trending, and recent artifact endpoints. Uses OpenSearch when available,
 //! falling back to PostgreSQL full-text search.
 //!
 //! All search endpoints enforce repository visibility: unauthenticated callers
@@ -677,7 +677,7 @@ pub struct ReindexResponse {
     pub message: String,
 }
 
-/// Trigger a full reindex of all artifacts and repositories in Meilisearch.
+/// Trigger a full reindex of all artifacts and repositories in OpenSearch.
 ///
 /// The reindex runs asynchronously in the background. The endpoint returns
 /// immediately with a confirmation that the task was started.

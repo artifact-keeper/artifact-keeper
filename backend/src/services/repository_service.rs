@@ -705,7 +705,7 @@ impl RepositoryService {
         }
     }
 
-    /// Convert a Repository model to a Meilisearch RepositoryDocument.
+    /// Convert a Repository model to a search RepositoryDocument.
     fn repo_to_search_doc(repo: &Repository) -> RepositoryDocument {
         RepositoryDocument {
             id: repo.id.to_string(),

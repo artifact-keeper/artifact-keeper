@@ -744,7 +744,7 @@ pub struct ReindexResponse {
     pub repositories_indexed: i64,
 }
 
-/// Trigger a full Meilisearch reindex of all artifacts and repositories.
+/// Trigger a full OpenSearch reindex of all artifacts and repositories.
 ///
 /// Requires admin privileges and Meilisearch to be configured.
 #[utoipa::path(

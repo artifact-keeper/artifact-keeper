@@ -21,7 +21,7 @@ An enterprise-grade, open-source artifact registry supporting **45+ package form
 - **Security Scanning** - Automated vulnerability detection with Trivy and Grype, policy engine, quarantine workflow
 - **Hardened Containers** - All images built on [DISA STIG](https://www.cyber.mil/stigs/)-approved Red Hat UBI 9 base images, non-root execution, no shell or package manager in runtime
 - **Borg Replication** - Recursive peer mesh with swarm-based artifact distribution and P2P transfers
-- **Full-Text Search** - Meilisearch-powered search across all repositories and artifacts
+- **Full-Text Search** - OpenSearch-powered search across all repositories and artifacts
 - **Multi-Auth** - JWT, OpenID Connect, LDAP, SAML 2.0, and API token support
 - **Artifactory Migration** - Built-in tooling to migrate repositories, artifacts, and permissions from JFrog Artifactory
 - **Artifact Signing** - GPG and RSA signing integrated into Debian, RPM, Alpine, and Conda handlers
@@ -34,7 +34,7 @@ graph LR
     Backend["Backend<br/>Rust · Axum<br/>45+ format handlers"]
     DB[(PostgreSQL 16)]
     Storage["Storage<br/>Filesystem / S3"]
-    Meili["Meilisearch<br/>Full-text search"]
+    Meili["OpenSearch<br/>Full-text search"]
     Trivy["Trivy<br/>Container & FS scanning"]
     Grype["Grype<br/>Dependency scanning"]
     OpenSCAP["OpenSCAP<br/>Compliance scanning"]
@@ -275,7 +275,7 @@ artifact-keeper/
 | Backend language | **Rust** | Memory safety, performance, strong type system |
 | Web framework | **Axum** | Tower middleware ecosystem, async-first |
 | Database | **PostgreSQL 16** | JSONB for metadata, mature ecosystem |
-| Search | **Meilisearch** | Fast full-text search, easy to operate |
+| Search | **OpenSearch** | Fast full-text search, easy to operate |
 | Security scanning | **Trivy + Grype + OpenSCAP** | Complementary coverage, industry standard |
 | Plugin runtime | **Wasmtime** | Sandboxed, portable, WIT contract system |
 | Storage | **Filesystem / S3** | Simple default, cloud-ready upgrade path |

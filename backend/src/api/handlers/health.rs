@@ -191,8 +191,23 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         None => None,
     };
 
-    let opensearch_check = match &state.config.opensearch_url {
-        Some(url) => Some(check_opensearch_health(url).await),
+    let opensearch_check = match &state.search_service {
+        Some(ref svc) => match svc.cluster_health().await {
+            Ok(status) => match status.as_str() {
+                "green" | "yellow" => Some(CheckStatus {
+                    status: "healthy".to_string(),
+                    message: None,
+                }),
+                other => Some(CheckStatus {
+                    status: "unhealthy".to_string(),
+                    message: Some(format!("OpenSearch cluster status: {}", other)),
+                }),
+            },
+            Err(e) => Some(CheckStatus {
+                status: "unavailable".to_string(),
+                message: Some(format!("OpenSearch unreachable: {}", e)),
+            }),
+        },
         None => None,
     };
 

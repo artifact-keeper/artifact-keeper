@@ -16,7 +16,7 @@ Rationale: supporting two search backends doubles the test surface for minimal g
 
 ## Critical Pre-Migration: Search Authorization Bugs
 
-All 6 agents identified authorization gaps in the current search system. These MUST be fixed during the migration:
+All 6 agents identified authorization gaps in the current search system. These were fixed in PR #829 (merged separately):
 
 1. **Authenticated users can search ALL private repos** without permission checks. The `public_only` flag in `search_service.rs` is binary (auth vs no auth), not per-repo.
 2. **`/search/suggest`** has zero visibility filtering, leaks all artifact names.

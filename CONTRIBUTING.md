@@ -24,7 +24,7 @@ Thanks for your interest in contributing! Here's how to get started.
 
 ```bash
 # Start dependencies
-docker compose up -d postgres meilisearch
+docker compose up -d postgres opensearch
 
 # Run the backend
 cargo run
