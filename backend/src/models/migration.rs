@@ -128,6 +128,12 @@ pub struct MigrationConfig {
     pub concurrent_transfers: i32,
     #[serde(default = "default_throttle_delay")]
     pub throttle_delay_ms: i32,
+    /// Whether to verify that locally computed checksums match the digests
+    /// advertised by the source registry. Defaults to `true`. Set to
+    /// `false` to disable verification when the source registry is known
+    /// to return inaccurate digests (issue #856).
+    #[serde(default = "default_true")]
+    pub verify_checksums: bool,
     pub date_from: Option<DateTime<Utc>>,
     pub date_to: Option<DateTime<Utc>>,
 }
@@ -498,6 +504,31 @@ mod tests {
         let config: MigrationConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.conflict_resolution, "overwrite");
         assert!(!config.dry_run);
+    }
+
+    #[test]
+    fn test_migration_config_verify_checksums_serde_default_true() {
+        // Issue #856: when `verify_checksums` is absent from the API
+        // payload, the serde default must be `true` so existing migrations
+        // continue to validate digests after upgrade. (Note: Rust's
+        // `Default::default()` for this struct returns the all-zero value
+        // because it is derived, not the serde default. API ingress always
+        // goes through deserialization, so the serde default is what
+        // matters on the wire.)
+        let json = r#"{}"#;
+        let config: MigrationConfig = serde_json::from_str(json).unwrap();
+        assert!(config.verify_checksums);
+    }
+
+    #[test]
+    fn test_migration_config_verify_checksums_can_be_disabled() {
+        // Issue #856: setting the field to false through the API must
+        // actually disable verification end to end. This test guards the
+        // deserialization half of that contract; the worker half is
+        // covered by test_worker_config_verify_checksums_can_be_disabled.
+        let json = r#"{"verify_checksums": false}"#;
+        let config: MigrationConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.verify_checksums);
     }
 }
 
