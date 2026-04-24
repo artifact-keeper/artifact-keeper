@@ -211,12 +211,44 @@ impl MigrationService {
         ArtifactoryClient::new(config).map_err(Into::into)
     }
 
-    /// Get the compatibility level for a package format
+    /// Normalize a source-specific package type name to the canonical
+    /// Artifact Keeper format name.
+    ///
+    /// Different source registries use different identifiers for the same
+    /// logical format. For example, Nexus 3 reports Maven repositories as
+    /// `maven2`, Yum repositories as `yum`, and generic binary repositories
+    /// as `raw`, while Artifact Keeper and Artifactory use `maven`, `rpm`,
+    /// and `generic` respectively. This function performs that translation
+    /// so downstream compatibility lookups can rely on canonical names.
+    ///
+    /// Unknown formats are returned unchanged (lowercased) so that the
+    /// existing `Unsupported` path still triggers for truly unsupported
+    /// types.
+    pub fn normalize_package_type(package_type: &str) -> String {
+        let lower = package_type.to_lowercase();
+        match lower.as_str() {
+            // Nexus uses `maven2` for Maven 2 and Maven 3 repositories
+            "maven2" => "maven".to_string(),
+            // Nexus uses `raw` for its unstructured binary format
+            "raw" => "generic".to_string(),
+            // Nexus uses `yum`, Artifact Keeper's equivalent is `rpm`
+            "yum" => "rpm".to_string(),
+            // RubyGems is sometimes reported as `gems` or `rubygems`
+            "gems" => "rubygems".to_string(),
+            _ => lower,
+        }
+    }
+
+    /// Get the compatibility level for a package format.
+    ///
+    /// Source-specific names are normalized before lookup so that Nexus
+    /// formats like `maven2`, `yum`, and `raw` map to the correct Artifact
+    /// Keeper compatibility level.
     pub fn get_format_compatibility(package_type: &str) -> FormatCompatibility {
-        match package_type.to_lowercase().as_str() {
-            "maven" | "npm" | "docker" | "pypi" | "helm" | "nuget" | "cargo" | "go" | "generic" => {
-                FormatCompatibility::Full
-            }
+        let normalized = Self::normalize_package_type(package_type);
+        match normalized.as_str() {
+            "maven" | "npm" | "docker" | "pypi" | "helm" | "nuget" | "cargo" | "go" | "generic"
+            | "rubygems" => FormatCompatibility::Full,
             "conan" | "conda" | "debian" | "rpm" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
         }
@@ -253,12 +285,15 @@ impl MigrationService {
         })?;
 
         let format_compatibility = Self::get_format_compatibility(&repo.package_type);
+        // Canonicalize source-specific names like `maven2` or `yum` so the
+        // rest of the migration pipeline sees Artifact Keeper's native names.
+        let normalized_package_type = Self::normalize_package_type(&repo.package_type);
 
         Ok(RepositoryMigrationConfig {
             source_key: repo.key.clone(),
             target_key: repo.key.clone(), // Same name by default
             repo_type,
-            package_type: repo.package_type.clone(),
+            package_type: normalized_package_type,
             description: repo.description.clone(),
             format_compatibility,
             upstream_url: None, // Will be set from repo_config for remote repos
@@ -1190,7 +1225,10 @@ mod tests {
 
     #[test]
     fn test_format_compatibility_unsupported() {
-        let unsupported = ["bower", "gitlfs", "p2", "yum", ""];
+        // `yum` is now normalized to `rpm` (Partial) and `raw` to `generic`
+        // (Full), so those are no longer in the unsupported list. See
+        // test_format_compatibility_nexus_aliases.
+        let unsupported = ["bower", "gitlfs", "p2", "vagrant", ""];
         for fmt in &unsupported {
             assert_eq!(
                 MigrationService::get_format_compatibility(fmt),
@@ -1199,6 +1237,107 @@ mod tests {
                 fmt
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Source-specific format name normalization (issue #857)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_package_type_nexus_aliases() {
+        // Nexus uses `maven2` for its Maven repository format.
+        assert_eq!(MigrationService::normalize_package_type("maven2"), "maven");
+        assert_eq!(MigrationService::normalize_package_type("MAVEN2"), "maven");
+
+        // Nexus uses `raw` for its unstructured binary format.
+        assert_eq!(MigrationService::normalize_package_type("raw"), "generic");
+        assert_eq!(MigrationService::normalize_package_type("RAW"), "generic");
+
+        // Nexus uses `yum`; Artifact Keeper's equivalent is `rpm`.
+        assert_eq!(MigrationService::normalize_package_type("yum"), "rpm");
+        assert_eq!(MigrationService::normalize_package_type("Yum"), "rpm");
+
+        // Some sources report RubyGems as `gems`.
+        assert_eq!(MigrationService::normalize_package_type("gems"), "rubygems");
+    }
+
+    #[test]
+    fn test_normalize_package_type_passthrough() {
+        // Known canonical names pass through unchanged (lowercased).
+        assert_eq!(MigrationService::normalize_package_type("maven"), "maven");
+        assert_eq!(MigrationService::normalize_package_type("npm"), "npm");
+        assert_eq!(MigrationService::normalize_package_type("Docker"), "docker");
+        // Unknown formats are also returned lowercased (but remain unsupported).
+        assert_eq!(MigrationService::normalize_package_type("bower"), "bower");
+    }
+
+    #[test]
+    fn test_format_compatibility_nexus_aliases() {
+        // Regression test for issue #857: Nexus-specific format names used
+        // to be reported as unsupported. They must now map correctly.
+
+        // Maven 2 repositories in Nexus are fully supported.
+        assert_eq!(
+            MigrationService::get_format_compatibility("maven2"),
+            FormatCompatibility::Full
+        );
+
+        // Raw repositories map to AK's generic format (fully supported).
+        assert_eq!(
+            MigrationService::get_format_compatibility("raw"),
+            FormatCompatibility::Full
+        );
+
+        // Yum repositories map to AK's rpm format (partial support).
+        assert_eq!(
+            MigrationService::get_format_compatibility("yum"),
+            FormatCompatibility::Partial
+        );
+    }
+
+    #[test]
+    fn test_prepare_repository_migration_normalizes_nexus_maven2() {
+        // Regression test for issue #857: when Nexus reports `maven2`, the
+        // prepared config should carry the canonical `maven` name so the
+        // created repository uses the correct AK format.
+        let repo = RepositoryListItem {
+            key: "releases".to_string(),
+            repo_type: "local".to_string(),
+            package_type: "maven2".to_string(),
+            url: None,
+            description: None,
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.package_type, "maven");
+        assert_eq!(config.format_compatibility, FormatCompatibility::Full);
+    }
+
+    #[test]
+    fn test_prepare_repository_migration_normalizes_nexus_yum() {
+        let repo = RepositoryListItem {
+            key: "yum".to_string(),
+            repo_type: "local".to_string(),
+            package_type: "yum".to_string(),
+            url: None,
+            description: None,
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.package_type, "rpm");
+        assert_eq!(config.format_compatibility, FormatCompatibility::Partial);
+    }
+
+    #[test]
+    fn test_prepare_repository_migration_normalizes_nexus_raw() {
+        let repo = RepositoryListItem {
+            key: "resources".to_string(),
+            repo_type: "local".to_string(),
+            package_type: "raw".to_string(),
+            url: None,
+            description: None,
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.package_type, "generic");
+        assert_eq!(config.format_compatibility, FormatCompatibility::Full);
     }
 
     #[test]
