@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---------- Base: Rust toolchain on Alpine ----------
-FROM rust:1.94-alpine3.21 AS rust-alpine-base
+FROM rust:1.95-alpine3.21 AS rust-alpine-base
 RUN apk add --no-cache \
     build-base pkgconfig perl openssl-dev openssl-libs-static \
     zlib-dev zlib-static xz-dev xz-static \
@@ -48,7 +48,7 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 
 # ---------- Stage 4: Copy scanner CLIs from official images ----------
 FROM ghcr.io/aquasecurity/trivy:0.70.0 AS trivy-bin
-FROM ghcr.io/anchore/grype:v0.111.0 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.111.1 AS grype-bin
 
 # ---------- Stage 5: Alpine runtime ----------
 FROM alpine:3.23
