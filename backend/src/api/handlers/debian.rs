@@ -61,23 +61,12 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/dists/:distribution/gpg-key.asc",
             get(gpg_key_asc),
         )
-        // Packages index
-        .route(
-            "/:repo_key/dists/:distribution/:component/:binary_arch/Packages",
-            get(packages_index),
-        )
-        .route(
-            "/:repo_key/dists/:distribution/:component/:binary_arch/Packages.gz",
-            get(packages_index_gz),
-        )
-        .route(
-            "/:repo_key/dists/:distribution/:component/:binary_arch/Packages.xz",
-            get(packages_index_xz),
-        )
-        // Catch-all for other dists metadata (i18n/Translation-*.xz, Sources, etc.)
+        // Packages indices and i18n/Sources/etc. share a single wildcard route
+        // and are dispatched in-handler. axum's matchit router rejects
+        // `:component` and `*dists_path` as siblings under the same parent.
         .route(
             "/:repo_key/dists/:distribution/*dists_path",
-            get(dists_proxy_catchall),
+            get(dists_dispatch),
         )
         // Pool: download and upload
         .route(
@@ -700,8 +689,62 @@ async fn packages_index_xz(
 }
 
 // ---------------------------------------------------------------------------
-// GET /debian/{repo_key}/dists/{distribution}/*dists_path -- Catch-all proxy
+// GET /debian/{repo_key}/dists/{distribution}/*dists_path -- Dispatcher
 // ---------------------------------------------------------------------------
+
+/// Result of parsing a `dists/{distribution}/*dists_path` sub-path to see
+/// whether it targets a Packages index.
+struct PackagesRequest {
+    component: String,
+    binary_arch: String,
+    ext: PackagesExt,
+}
+
+enum PackagesExt {
+    Plain,
+    Gz,
+    Xz,
+}
+
+/// Recognise `{component}/binary-{arch}/Packages{,.gz,.xz}` inside the
+/// wildcard path. Returns None for any other shape so the caller can fall
+/// through to the upstream proxy.
+fn parse_packages_request(dists_path: &str) -> Option<PackagesRequest> {
+    let segments: Vec<&str> = dists_path.split('/').collect();
+    if segments.len() != 3 || !segments[1].starts_with("binary-") {
+        return None;
+    }
+    let ext = match segments[2] {
+        "Packages" => PackagesExt::Plain,
+        "Packages.gz" => PackagesExt::Gz,
+        "Packages.xz" => PackagesExt::Xz,
+        _ => return None,
+    };
+    Some(PackagesRequest {
+        component: segments[0].to_string(),
+        binary_arch: segments[1].to_string(),
+        ext,
+    })
+}
+
+/// Single entry point for all `dists/{distribution}/...` requests after
+/// the static Release/InRelease/Release.gpg/gpg-key.asc routes. Dispatches
+/// `{component}/binary-{arch}/Packages{,.gz,.xz}` to the matching Packages
+/// handler and forwards everything else to the upstream proxy catch-all.
+async fn dists_dispatch(
+    state: State<SharedState>,
+    Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
+) -> Result<Response, Response> {
+    if let Some(req) = parse_packages_request(&dists_path) {
+        let path = Path((repo_key, distribution, req.component, req.binary_arch));
+        return match req.ext {
+            PackagesExt::Plain => packages_index(state, path).await,
+            PackagesExt::Gz => packages_index_gz(state, path).await,
+            PackagesExt::Xz => packages_index_xz(state, path).await,
+        };
+    }
+    dists_proxy_catchall(state, Path((repo_key, distribution, dists_path))).await
+}
 
 /// Catch-all handler for dists metadata that does not have a dedicated route.
 /// This covers files like `i18n/Translation-en.xz`, `i18n/Translation-en.gz`,
@@ -1236,6 +1279,62 @@ async fn upload_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Router construction
+    //
+    // Regression guard for #832: axum's matchit router panics at startup
+    // if wildcard and parameter children coexist under the same parent.
+    // Building the router exercises those insertions.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_router_builds_without_panic() {
+        let _router: Router<SharedState> = router();
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_packages_request
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_packages_request_plain() {
+        let req = parse_packages_request("main/binary-amd64/Packages").unwrap();
+        assert_eq!(req.component, "main");
+        assert_eq!(req.binary_arch, "binary-amd64");
+        assert!(matches!(req.ext, PackagesExt::Plain));
+    }
+
+    #[test]
+    fn test_parse_packages_request_gz() {
+        let req = parse_packages_request("main/binary-amd64/Packages.gz").unwrap();
+        assert!(matches!(req.ext, PackagesExt::Gz));
+    }
+
+    #[test]
+    fn test_parse_packages_request_xz() {
+        let req = parse_packages_request("contrib/binary-arm64/Packages.xz").unwrap();
+        assert_eq!(req.component, "contrib");
+        assert_eq!(req.binary_arch, "binary-arm64");
+        assert!(matches!(req.ext, PackagesExt::Xz));
+    }
+
+    #[test]
+    fn test_parse_packages_request_rejects_i18n() {
+        assert!(parse_packages_request("main/i18n/Translation-en.xz").is_none());
+    }
+
+    #[test]
+    fn test_parse_packages_request_rejects_sources() {
+        assert!(parse_packages_request("main/source/Sources.gz").is_none());
+        assert!(parse_packages_request("main/binary-amd64/Contents-amd64.gz").is_none());
+    }
+
+    #[test]
+    fn test_parse_packages_request_rejects_wrong_depth() {
+        assert!(parse_packages_request("main/binary-amd64").is_none());
+        assert!(parse_packages_request("main/binary-amd64/extra/Packages").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // parse_deb_filename
