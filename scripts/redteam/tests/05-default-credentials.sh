@@ -1,7 +1,7 @@
 #!/bin/bash
 # Red Team Test 05: Default Credentials
 # Tests whether default/well-known credentials are still active in production.
-# Checks admin login, peer API key, Meilisearch, and PostgreSQL.
+# Checks admin login, peer API key, OpenSearch, and PostgreSQL.
 
 source "$(dirname "$0")/../lib.sh"
 
@@ -83,37 +83,53 @@ else
     info "Response: $(echo "$PEER_BODY" | head -c 300)"
 fi
 
-# --- Test 4: Meilisearch with default dev API key ---
-MEILI_URL="${MEILI_URL:-http://meilisearch:7700}"
-info "Testing Meilisearch at ${MEILI_URL} with default dev key (artifact-keeper-dev-key)"
+# --- Test 4: OpenSearch exposure and default credentials ---
+# In the default self-host docker compose, OpenSearch runs in single-node mode
+# with the security plugin disabled and is bound to the internal compose
+# network only. If it is reachable from outside the cluster, that is itself a
+# finding regardless of whether credentials are set.
+OPENSEARCH_URL="${OPENSEARCH_URL:-http://opensearch:9200}"
+info "Testing OpenSearch at ${OPENSEARCH_URL} for exposure and default credentials"
 
-MEILI_RESPONSE=$(curl -s -w "\n%{http_code}" --connect-timeout 5 \
-    -H "Authorization: Bearer artifact-keeper-dev-key" \
-    "${MEILI_URL}/indexes" 2>&1) || true
+# Try unauthenticated access first (security plugin disabled scenario).
+OPENSEARCH_NOAUTH=$(curl -s -w "\n%{http_code}" --connect-timeout 5 \
+    "${OPENSEARCH_URL}/_cluster/health" 2>&1) || true
 
-MEILI_BODY=$(echo "$MEILI_RESPONSE" | head -n -1)
-MEILI_STATUS=$(echo "$MEILI_RESPONSE" | tail -n 1)
+OPENSEARCH_NOAUTH_BODY=$(echo "$OPENSEARCH_NOAUTH" | head -n -1)
+OPENSEARCH_NOAUTH_STATUS=$(echo "$OPENSEARCH_NOAUTH" | tail -n 1)
 
-if [ "$MEILI_STATUS" = "000" ] || [ -z "$MEILI_STATUS" ]; then
-    info "Meilisearch not reachable at ${MEILI_URL} (connection refused or timed out)"
-elif [ "$MEILI_STATUS" = "200" ]; then
-    fail "Meilisearch accessible with default dev API key"
-    add_finding "MEDIUM" "default-creds/meilisearch-dev-key" \
-        "Meilisearch is accessible with the default development API key (artifact-keeper-dev-key). An attacker could read or modify search indexes, potentially extracting metadata about all artifacts and repositories." \
-        "GET ${MEILI_URL}/indexes with Bearer artifact-keeper-dev-key returned HTTP 200. Indexes: $(echo "$MEILI_BODY" | head -c 500)"
-elif [ "$MEILI_STATUS" = "401" ] || [ "$MEILI_STATUS" = "403" ]; then
-    pass "Meilisearch rejected default dev key (HTTP ${MEILI_STATUS})"
+if [ "$OPENSEARCH_NOAUTH_STATUS" = "000" ] || [ -z "$OPENSEARCH_NOAUTH_STATUS" ]; then
+    info "OpenSearch not reachable at ${OPENSEARCH_URL} (connection refused or timed out)"
+    info "This is expected when OpenSearch is bound to the internal compose network only"
+elif [ "$OPENSEARCH_NOAUTH_STATUS" = "200" ]; then
+    fail "OpenSearch accessible without authentication"
+    add_finding "MEDIUM" "default-creds/opensearch-no-auth" \
+        "OpenSearch is reachable from the test container without any credentials. The security plugin is disabled (the default for local self-host), so an attacker with network access can read or modify search indexes and extract metadata about all artifacts and repositories. For production, enable the security plugin and bind OpenSearch to the internal network only." \
+        "GET ${OPENSEARCH_URL}/_cluster/health returned HTTP 200. Body: $(echo "$OPENSEARCH_NOAUTH_BODY" | head -c 500)"
+elif [ "$OPENSEARCH_NOAUTH_STATUS" = "401" ] || [ "$OPENSEARCH_NOAUTH_STATUS" = "403" ]; then
+    pass "OpenSearch requires authentication (HTTP ${OPENSEARCH_NOAUTH_STATUS})"
+
+    # Security plugin is enabled. Try well-known default credential pairs.
+    info "Trying default OpenSearch credentials (admin:admin, admin:openSearch)"
+    for pair in "admin:admin" "admin:openSearch" "admin:changeme"; do
+        os_user="${pair%%:*}"
+        os_pass="${pair#*:}"
+
+        OS_RESP=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
+            -u "${os_user}:${os_pass}" \
+            "${OPENSEARCH_URL}/_cluster/health" 2>&1) || true
+
+        if [ "$OS_RESP" = "200" ]; then
+            fail "OpenSearch default credentials accepted: ${os_user}:${os_pass}"
+            add_finding "HIGH" "default-creds/opensearch-default-admin" \
+                "OpenSearch accepts the default admin credentials (${os_user}:${os_pass}). An attacker could read or modify all search indexes. Set OPENSEARCH_INITIAL_ADMIN_PASSWORD (OpenSearch 2.12+) or reset the admin password via the internalusers.yml security config." \
+                "GET ${OPENSEARCH_URL}/_cluster/health authenticated as ${os_user} returned HTTP 200."
+        else
+            pass "OpenSearch rejected ${os_user}:${os_pass} (HTTP ${OS_RESP})"
+        fi
+    done
 else
-    warn "Unexpected Meilisearch response: HTTP ${MEILI_STATUS}"
-fi
-
-# Also check if Meilisearch is accessible without any key
-MEILI_NOKEY=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
-    "${MEILI_URL}/health" 2>&1) || true
-
-if [ "$MEILI_NOKEY" = "200" ]; then
-    warn "Meilisearch health endpoint is publicly accessible (no auth required)"
-    info "This is expected for /health but verify other endpoints require auth"
+    warn "Unexpected OpenSearch response: HTTP ${OPENSEARCH_NOAUTH_STATUS}"
 fi
 
 # --- Test 5: PostgreSQL direct access with default credentials ---

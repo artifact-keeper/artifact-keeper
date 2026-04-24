@@ -127,7 +127,6 @@ done
 info "Generating secure credentials..."
 
 JWT_SECRET="$(generate_password)$(generate_password)"
-MEILI_KEY="$(generate_password)"
 DB_PASSWORD="$(generate_password)"
 
 if [ -z "$AK_ADMIN_PASSWORD" ]; then
@@ -190,7 +189,14 @@ ADMIN_PASSWORD=${AK_ADMIN_PASSWORD}
 
 # Security keys (auto-generated, keep these secret)
 JWT_SECRET=${JWT_SECRET}
-MEILI_MASTER_KEY=${MEILI_KEY}
+
+# Search backend (OpenSearch runs in single-node mode with the security
+# plugin disabled for local self-host deployments. The service is bound to
+# the internal docker network only and is not exposed to the host. For
+# multi-node or public-facing setups, enable the security plugin and set
+# OPENSEARCH_USERNAME / OPENSEARCH_PASSWORD here.)
+# OPENSEARCH_USERNAME=
+# OPENSEARCH_PASSWORD=
 
 # Ports
 HTTP_PORT=${AK_HTTP_PORT}
@@ -230,7 +236,7 @@ info "Pulling container images (this may take a few minutes)..."
 
 if [ "$AK_MINIMAL" = "1" ]; then
     # Skip scanner services
-    $COMPOSE_CMD pull postgres meilisearch backend web caddy 2>&1 | tail -1
+    $COMPOSE_CMD pull postgres opensearch backend web caddy 2>&1 | tail -1
 else
     $COMPOSE_CMD pull 2>&1 | tail -1
 fi
