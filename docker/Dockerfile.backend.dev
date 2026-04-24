@@ -1,5 +1,5 @@
 # Development Dockerfile for backend with cargo-watch hot-reload
-FROM rust:1.94-bookworm
+FROM rust:1.95-bookworm
 
 # Install build dependencies, cargo-watch, and sccache
 RUN apt-get update && apt-get install -y --no-install-recommends \
