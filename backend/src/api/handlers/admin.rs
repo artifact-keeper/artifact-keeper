@@ -744,7 +744,7 @@ pub struct ReindexResponse {
     pub repositories_indexed: i64,
 }
 
-/// Trigger a full Meilisearch reindex of all artifacts and repositories.
+/// Trigger a full OpenSearch reindex of all artifacts and repositories.
 ///
 /// Requires admin privileges and Meilisearch to be configured.
 #[utoipa::path(
@@ -769,12 +769,12 @@ pub async fn trigger_reindex(
         ));
     }
 
-    let meili = state
-        .meili_service
+    let search = state
+        .search_service
         .as_ref()
-        .ok_or_else(|| AppError::Internal("Meilisearch is not configured".to_string()))?;
+        .ok_or_else(|| AppError::Internal("Search engine is not configured".to_string()))?;
 
-    let (artifacts, repositories) = meili.full_reindex(&state.db).await?;
+    let (artifacts, repositories) = search.full_reindex(&state.db).await?;
 
     Ok(Json(ReindexResponse {
         message: "Full reindex completed successfully".to_string(),

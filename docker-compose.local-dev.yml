@@ -17,7 +17,7 @@
 #   Backend gRPC:   9090
 #   Web UI:         3000
 #   Postgres:       30432
-#   Meilisearch:    7700
+#   OpenSearch:     9200
 #   Trivy:          8090
 #   OpenSCAP:       8091
 #   Dependency-Track: 8092
@@ -44,21 +44,24 @@ services:
       retries: 5
     restart: unless-stopped
 
-  meilisearch:
-    image: getmeili/meilisearch:v1.12
-    container_name: artifact-keeper-dev-meilisearch
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    container_name: artifact-keeper-dev-opensearch
     environment:
-      MEILI_MASTER_KEY: artifact-keeper-dev-key
-      MEILI_ENV: development
+      discovery.type: single-node
+      OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
     volumes:
-      - dev_meilisearch_data:/meili_data
+      - dev_opensearch_data:/usr/share/opensearch/data
     ports:
-      - "7700:7700"
+      - "9200:9200"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
   trivy:
@@ -154,7 +157,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      meilisearch:
+      opensearch:
         condition: service_healthy
     entrypoint:
       - /bin/sh
@@ -177,8 +180,7 @@ services:
       TRIVY_URL: http://trivy:8090
       OPENSCAP_URL: http://openscap:8091
       SCAN_WORKSPACE_PATH: /scan-workspace
-      MEILISEARCH_URL: http://meilisearch:7700
-      MEILISEARCH_API_KEY: artifact-keeper-dev-key
+      OPENSEARCH_URL: http://opensearch:9200
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: "true"
       ALLOW_HTTP_INTEGRATIONS: "1"
@@ -189,7 +191,7 @@ services:
       ALL_PROXY: ${ALL_PROXY:-}
       # Prevent host proxy settings from intercepting container-to-container
       # traffic on the compose network. See docker-compose.yml for details.
-      no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,meilisearch,trivy,openscap,dependency-track-apiserver"
+      no_proxy: "${NO_PROXY:-},localhost,127.0.0.1,db,postgres,opensearch,trivy,openscap,dependency-track-apiserver"
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_SERVICE_NAME: artifact-keeper
       HOST: 0.0.0.0
@@ -248,7 +250,7 @@ services:
 
 volumes:
   dev_postgres_data:
-  dev_meilisearch_data:
+  dev_opensearch_data:
   dev_trivy_cache:
   dev_dtrack_data:
   dev_shared_config:

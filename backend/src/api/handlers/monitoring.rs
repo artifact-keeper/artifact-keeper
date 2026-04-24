@@ -168,9 +168,9 @@ mod tests {
 
     #[test]
     fn test_health_log_query_both_params() {
-        let json = r#"{"service": "meilisearch", "limit": 25}"#;
+        let json = r#"{"service": "opensearch", "limit": 25}"#;
         let q: HealthLogQuery = serde_json::from_str(json).unwrap();
-        assert_eq!(q.service, Some("meilisearch".to_string()));
+        assert_eq!(q.service, Some("opensearch".to_string()));
         assert_eq!(q.limit, Some(25));
     }
 
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn test_service_health_entry_minimal() {
         let entry = ServiceHealthEntry {
-            service_name: "meilisearch".to_string(),
+            service_name: "opensearch".to_string(),
             status: "unknown".to_string(),
             previous_status: None,
             message: None,
@@ -288,7 +288,7 @@ mod tests {
             checked_at: chrono::Utc::now(),
         };
         let json = serde_json::to_value(&entry).unwrap();
-        assert_eq!(json["service_name"], "meilisearch");
+        assert_eq!(json["service_name"], "opensearch");
         assert!(json["previous_status"].is_null());
         assert!(json["message"].is_null());
         assert!(json["response_time_ms"].is_null());
