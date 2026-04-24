@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-24
+
+### Sponsors
+
+Thank you to our backers for supporting ongoing development:
+
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper)
+
+### Thank You
+
+- @thimomulder for the OpenSearch backend request that drove the search engine migration (#462), and for an extensive backlog of enhancement requests around password policy, notifications, SMTP, and rate limiting that shaped the v1.2.0 roadmap
+- @Firjens for three high-quality bug reports with clean reproductions: OTLP gRPC `FRAME_SIZE_ERROR` behind Envoy Gateway (#729), Dependency-Track HTTP rejection on private networks (#764), and the matchit route conflict that blocked startup after the Debian fix (#832). Also for the OpenTelemetry http/protobuf prototype PR (#733) that became #812.
+- @ReneBeszon for reporting that virtual Maven repos could not serve SNAPSHOT artifacts (#839)
+- @ddevz for two Debian remote proxy bugs: missing `.xz` index support (#810) and `admin.password` not appearing on first boot in some volume configurations (#787)
+- @junsung-cho for catching the OCI 401 loop where blob `HEAD` requests dropped the bearer token because `WWW-Authenticate` omitted `scope` (#811)
+- @Dreamacro for the S3 HTTP connection pool tuning PR (#772), which fixes TIME_WAIT exhaustion under sustained load
+
+### Breaking Changes
+
+- **Search backend replaced**: Meilisearch has been removed in favor of OpenSearch 2.x as the indexing backend (#462, #830). This enables HA search clustering without Meilisearch's Enterprise license.
+  - Removed environment variables: `MEILISEARCH_URL`, `MEILISEARCH_API_KEY`
+  - Added environment variables: `OPENSEARCH_URL`, `OPENSEARCH_USERNAME`, `OPENSEARCH_PASSWORD`, `OPENSEARCH_ALLOW_INVALID_CERTS`
+  - Default port changed from 7700 to 9200
+  - Health response field renamed from `meilisearch` to `opensearch`
+  - No data migration required. The backend auto-reindexes from PostgreSQL on startup.
+  - Operators using the bundled Docker Compose stack should pull the updated `docker-compose.yml` and `install.sh` (#858) before upgrading.
+
+### Added
+
+- **OpenSearch search backend** (#462, #830) - new `opensearch_service.rs` using the `opensearch` crate v2.x, with path_hierarchy tokenizer, edge_ngram analyzer, text+keyword multi-fields, bulk indexing via `_bulk` NDJSON, and refresh disabled during full reindex. `ArtifactDocument` gains an `is_public` field used for visibility filtering. 64 unit tests added.
+- **OTLP http/protobuf transport** (#729, #812) - selectable via the standard `OTEL_EXPORTER_OTLP_PROTOCOL` environment variable. Works around the h2/tonic `FRAME_SIZE_ERROR` that occurred when running behind Envoy Gateway. Based on the prototype contributed by @Firjens in #733.
+- **PermissionService for fine-grained access control** (#816, #824) - resolves user-direct and group-based permissions via a single SQL query against the `permissions` and `user_group_members` tables (migration 018). Provides `check_permission`, `list_user_permissions`, and helpers for evaluating effective access.
+- **Repository-level permission enforcement in visibility middleware** (#817, #826) - `repo_visibility_middleware` now consults PermissionService after existing visibility and token-scope checks. Admin users bypass; rules are silently ignored when no rules exist on a repository, preserving existing behavior for installations that have not configured permissions.
+- **Fine-grained permission checks on admin-level endpoints** (#818, #827) - `create_repository`, `update_repository`, and `delete_repository` now accept non-admin users that hold the relevant permission action on the system sentinel or target repository.
+- **`enforcement_enabled` exposed in system config** (#819, #828) - the `/api/v1/system/config` endpoint reports `enforcement_enabled: true` so frontends can surface permission UI affordances.
+- **Configurable S3 HTTP connection pool** (#772) - new `S3_POOL_MAX_IDLE_PER_HOST` (default 256) and `S3_POOL_IDLE_TIMEOUT_SECS` (default 90) environment variables let operators tune connection reuse and prevent TIME_WAIT exhaustion under sustained load. Contributed by @Dreamacro.
+- **Group detail endpoint returns members** (#813) - `GET /api/v1/groups/{id}` now returns a `GroupDetailResponse` including the actual member list, fixing a frontend rendering bug where every group appeared empty.
+
+### Changed
+
+- **Search authorization model** (#829) - all six search endpoints now resolve the caller's accessible repository IDs from `role_assignments` and filter results accordingly, replacing the previous binary `public_only` flag. Closes five High-severity authorization findings discovered during OpenSearch migration review.
+- **Coverage gate scope** (#822) - the new-code coverage gate now parses unified diffs and measures only added or modified lines, rather than the entire file. This unblocks small fixes to large handler files (e.g., `debian.rs`, `oci_v2.rs`) that previously could not meet the 70% threshold for unrelated existing code.
+- **Coverage workflow skipped on non-Rust changes** (#855) - dependabot bumps and other non-`.rs` changes no longer trigger the 3-5 minute instrumented coverage build.
+- **Bundled Trivy bumped from 0.69.3 to 0.70.0** (#807, #823) - resolves 1 CRITICAL and ~16 HIGH container scan findings in the bundled scanner binary.
+- **Permission gap warnings** (#794, #820) - the backend now emits `warn!` log entries on startup when permission rules exist in the database but enforcement middleware is not active, making the previously silent gap visible to operators upgrading from earlier 1.1.x versions.
+- Dependency bumps: rust 1.94-bookworm to 1.95-bookworm (#846), anchore/grype v0.111.0 to v0.111.1 (#845), openssl 0.10.76 to 0.10.78 (#849), aquasecurity/trivy-action 0.35.0 to 0.36.0 (#842), actions/setup-node 4 to 6 (#843), docker/build-push-action 7.0.0 to 7.1.0 (#841).
+
+### Fixed
+
+- **Maven virtual repos serve SNAPSHOT artifacts** (#839, #859) - both the version-level `maven-metadata.xml` and the SNAPSHOT JAR/POM download paths now traverse member repositories and resolve correctly. Reported by @ReneBeszon.
+- **Debian backend panics on startup** (#832, #854) - axum's matchit router rejected the wildcard and parameter routes introduced in #814 because they shared a prefix segment. The catch-all dists proxy has been restructured so the router accepts both routes. This was causing a panic loop on every backend start since the Debian remote proxy fix landed.
+- **Debian remote proxy `.xz` indices** (#810, #814) - remote Debian repos now serve `.xz`-compressed `Packages` files (using the `xz2` crate already in the dep tree) and proxy unrecognized files under `dists/` through to the upstream, fixing 404s on i18n Translation files. Reported by @ddevz.
+- **OCI bearer token loop on blob HEAD** (#811, #821) - the `WWW-Authenticate` challenge now includes the OCI Distribution Spec `scope` parameter, so Docker clients correctly key their token cache and attach the token to subsequent blob and manifest requests. All OCI endpoints now accept Basic auth in addition to Bearer. Reported by @junsung-cho.
+- **Dependency-Track HTTP rejection on private networks** (#764, #825) - the reqwest client previously enforced `https_only(true)`, causing opaque "builder error for url" failures when `DEPENDENCY_TRACK_URL` pointed at localhost, RFC 1918 private networks, or in-cluster Kubernetes services. The client now allows HTTP for private network targets. Also fixes the missing SBOM submission path so SBOMs are uploaded after artifact ingest. Reported by @Firjens.
+- **`admin.password` missing on first boot** (#787, #815) - the storage directory is now created explicitly before the password file is written, fixing first-boot under bind mounts, Podman rootless, Kubernetes `emptyDir`, and custom `STORAGE_PATH` values. Reported by @ddevz.
+- **OTLP http/protobuf NoHttpClient panic** (#812, #835) - added `opentelemetry-http` with the `reqwest` feature as a direct dependency to ensure the HTTP client registers when two `reqwest` versions coexist in the dep tree.
+- **jsonwebtoken CryptoProvider test failures** (#835) - enabled the `aws_lc_rs` feature on `jsonwebtoken 10.3` so unit tests that bypass `main()` no longer panic on missing CryptoProvider. Fixes 11 pre-existing test failures in `auth_service` and `grpc::auth_interceptor`.
+- **Search results leaked private repos to authenticated users** (#829) - any authenticated user previously saw all repository search results regardless of role assignments. Now filtered per-caller using `role_assignments`.
+
+### Security
+
+- **rustls-webpki CRL parsing panic** (#835) - bumped `rustls-webpki` from 0.103.12 to 0.103.13 (RUSTSEC-2026-0104, reachable panic in CRL parsing).
+- **Permission enforcement gap closed** (#794, #816, #817, #818, #819, #820, #824, #826, #827, #828) - the `permissions` table introduced in migration 018 was previously CRUD-only with no enforcement, so administrators could create rules that the backend silently ignored. Phases 1 through 4 of the enforcement plan are now merged: PermissionService, repo_visibility_middleware enforcement, handler-level checks on admin endpoints, and the `enforcement_enabled` system-config flag. Operators upgrading from 1.1.x with existing permission rules should review the rules before deploying 1.2.0, since they will now be enforced.
+- **Search authorization tightened** (#829) - five High-severity authorization findings resolved by replacing the binary `public_only` model with per-caller repo ID resolution.
+
 ## [1.1.2] - 2026-04-09
 
 ### Sponsors
