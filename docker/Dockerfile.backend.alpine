@@ -48,7 +48,7 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 
 # ---------- Stage 4: Copy scanner CLIs from official images ----------
 FROM ghcr.io/aquasecurity/trivy:0.70.0 AS trivy-bin
-FROM ghcr.io/anchore/grype:v0.111.0 AS grype-bin
+FROM ghcr.io/anchore/grype:v0.111.1 AS grype-bin
 
 # ---------- Stage 5: Alpine runtime ----------
 FROM alpine:3.23
