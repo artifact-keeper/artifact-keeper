@@ -68,6 +68,7 @@ Thank you to our backers for supporting ongoing development:
 - **OTLP http/protobuf NoHttpClient panic** (#812, #835) - added `opentelemetry-http` with the `reqwest` feature as a direct dependency to ensure the HTTP client registers when two `reqwest` versions coexist in the dep tree.
 - **jsonwebtoken CryptoProvider test failures** (#835) - enabled the `aws_lc_rs` feature on `jsonwebtoken 10.3` so unit tests that bypass `main()` no longer panic on missing CryptoProvider. Fixes 11 pre-existing test failures in `auth_service` and `grpc::auth_interceptor`.
 - **Search results leaked private repos to authenticated users** (#829) - any authenticated user previously saw all repository search results regardless of role assignments. Now filtered per-caller using `role_assignments`.
+- **Conan `recipe_latest` and `recipe_revisions` now scope by user/channel** - the two endpoints previously ignored the `{user}` and `{channel}` path segments, so a recipe uploaded as `mylib/1.0.0@myuser/stable` could appear in the latest/revisions response for `mylib/1.0.0@_/_` (and vice versa), breaking dependency resolution for Conan clients that share a recipe name across namespaces. Both queries now filter on `am.metadata->>'user'` and `am.metadata->>'channel'`, matching the existing pattern in `recipe_files_list` and the package download handler. Discovered during the v1.2.0-rc.1 release-gate run (24934467423).
 
 ### Security
 
