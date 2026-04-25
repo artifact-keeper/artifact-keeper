@@ -379,18 +379,14 @@ async fn search(
 
 async fn recipe_latest(
     State(state): State<SharedState>,
-    Path((repo_key, name, version, _user, _channel)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
+    Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
 
     // Find the latest recipe revision by looking at the most recently created artifact
-    // with a revision in its metadata.
+    // with a revision in its metadata. Must filter by user/channel so revisions
+    // uploaded under one namespace (e.g. myuser/stable) do not leak into the
+    // latest response for another (e.g. _/_).
     let row = sqlx::query!(
         r#"
         SELECT am.metadata->>'revision' as "revision?"
@@ -401,6 +397,8 @@ async fn recipe_latest(
           AND am.format = 'conan'
           AND a.name = $2
           AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
           AND am.metadata->>'revision' IS NOT NULL
         ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
@@ -408,6 +406,8 @@ async fn recipe_latest(
         repo.id,
         name,
         version,
+        normalize_user(&user),
+        normalize_channel(&channel),
     )
     .fetch_optional(&state.db)
     .await
@@ -442,16 +442,13 @@ async fn recipe_latest(
 
 async fn recipe_revisions(
     State(state): State<SharedState>,
-    Path((repo_key, name, version, _user, _channel)): Path<(
-        String,
-        String,
-        String,
-        String,
-        String,
-    )>,
+    Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
 
+    // Must filter by user/channel so revisions uploaded under one namespace
+    // (e.g. myuser/stable) do not appear in the revisions list for a different
+    // namespace (e.g. _/_).
     let rows = sqlx::query!(
         r#"
         SELECT am.metadata->>'revision' as "revision?",
@@ -463,6 +460,8 @@ async fn recipe_revisions(
           AND am.format = 'conan'
           AND a.name = $2
           AND a.version = $3
+          AND am.metadata->>'user' = $4
+          AND am.metadata->>'channel' = $5
           AND am.metadata->>'revision' IS NOT NULL
         GROUP BY am.metadata->>'revision'
         ORDER BY "created_at!" DESC
@@ -470,6 +469,8 @@ async fn recipe_revisions(
         repo.id,
         name,
         version,
+        normalize_user(&user),
+        normalize_channel(&channel),
     )
     .fetch_all(&state.db)
     .await
@@ -2719,6 +2720,272 @@ mod tests {
             revisions[1].get("revision").and_then(|v| v.as_str()),
             Some("rev_old"),
         );
+
+        f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // recipe_latest / recipe_revisions: user/channel scoping regression tests.
+    //
+    // Bug: previously, recipe_latest and recipe_revisions ignored the
+    // {user}/{channel} path segments. Uploads under one namespace
+    // (e.g. myuser/stable) leaked into responses for another (e.g. _/_).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn recipe_latest_scopes_to_default_user_channel() {
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
+            return;
+        };
+
+        // Upload one revision under _/_ and an unrelated revision under
+        // myuser/stable for the same name+version. recipe_latest for _/_
+        // must only see the _/_ revision.
+        let _ = test_helpers::seed_recipe_row(
+            &f.pool,
+            f.repo_id,
+            "scopelib",
+            "1.0",
+            "_",
+            "_",
+            "rev_default",
+            "conanfile.py",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Seeded later so its created_at is newer; if scoping is broken,
+        // the buggy query would return rev_user_stable here.
+        let _ = test_helpers::seed_recipe_row(
+            &f.pool,
+            f.repo_id,
+            "scopelib",
+            "1.0",
+            "myuser",
+            "stable",
+            "rev_user_stable",
+            "conanfile.py",
+        )
+        .await;
+
+        let (status, body) = f
+            .get(format!("/{}/v2/conans/scopelib/1.0/_/_/latest", f.repo_key))
+            .await;
+        let body_str = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(status, StatusCode::OK, "body: {}", body_str);
+
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(
+            json.get("revision").and_then(|v| v.as_str()),
+            Some("rev_default"),
+            "latest for _/_ must NOT leak revision uploaded under myuser/stable; got: {}",
+            body_str,
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn recipe_latest_scopes_to_custom_user_channel() {
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
+            return;
+        };
+
+        // Inverse direction: querying myuser/stable must not return _/_ revisions.
+        let _ = test_helpers::seed_recipe_row(
+            &f.pool,
+            f.repo_id,
+            "scopelib",
+            "1.0",
+            "_",
+            "_",
+            "rev_default",
+            "conanfile.py",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = test_helpers::seed_recipe_row(
+            &f.pool,
+            f.repo_id,
+            "scopelib",
+            "1.0",
+            "myuser",
+            "stable",
+            "rev_user_stable",
+            "conanfile.py",
+        )
+        .await;
+
+        let (status, body) = f
+            .get(format!(
+                "/{}/v2/conans/scopelib/1.0/myuser/stable/latest",
+                f.repo_key
+            ))
+            .await;
+        let body_str = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(status, StatusCode::OK, "body: {}", body_str);
+
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(
+            json.get("revision").and_then(|v| v.as_str()),
+            Some("rev_user_stable"),
+            "latest for myuser/stable must NOT return _/_ revision; got: {}",
+            body_str,
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn recipe_latest_404_when_namespace_empty() {
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
+            return;
+        };
+
+        // Upload only under myuser/stable. _/_ should 404.
+        let _ = test_helpers::seed_recipe_row(
+            &f.pool,
+            f.repo_id,
+            "scopelib",
+            "1.0",
+            "myuser",
+            "stable",
+            "rev_only",
+            "conanfile.py",
+        )
+        .await;
+
+        let (status, _body) = f
+            .get(format!("/{}/v2/conans/scopelib/1.0/_/_/latest", f.repo_key))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "_/_ namespace has no revisions; must 404",
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn recipe_revisions_scopes_to_default_user_channel() {
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
+            return;
+        };
+
+        // Two revisions under _/_, two under myuser/stable. The _/_ query
+        // must return only the two _/_ revisions.
+        for rev in ["rev_a", "rev_b"] {
+            let _ = test_helpers::seed_recipe_row(
+                &f.pool,
+                f.repo_id,
+                "scopelib",
+                "1.0",
+                "_",
+                "_",
+                rev,
+                "conanfile.py",
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        for rev in ["rev_x", "rev_y"] {
+            let _ = test_helpers::seed_recipe_row(
+                &f.pool,
+                f.repo_id,
+                "scopelib",
+                "1.0",
+                "myuser",
+                "stable",
+                rev,
+                "conanfile.py",
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let (status, body) = f
+            .get(format!(
+                "/{}/v2/conans/scopelib/1.0/_/_/revisions",
+                f.repo_key
+            ))
+            .await;
+        let body_str = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(status, StatusCode::OK, "body: {}", body_str);
+
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        let revisions = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("revisions array");
+        let names: Vec<&str> = revisions
+            .iter()
+            .filter_map(|r| r.get("revision").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "_/_ revisions must not include myuser/stable rows; got: {:?}",
+            names,
+        );
+        assert!(names.contains(&"rev_a"));
+        assert!(names.contains(&"rev_b"));
+        assert!(
+            !names.contains(&"rev_x") && !names.contains(&"rev_y"),
+            "myuser/stable revisions leaked into _/_ response: {:?}",
+            names,
+        );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn recipe_revisions_scopes_to_custom_user_channel() {
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
+            return;
+        };
+
+        let _ = test_helpers::seed_recipe_row(
+            &f.pool,
+            f.repo_id,
+            "scopelib",
+            "1.0",
+            "_",
+            "_",
+            "rev_default",
+            "conanfile.py",
+        )
+        .await;
+        let _ = test_helpers::seed_recipe_row(
+            &f.pool,
+            f.repo_id,
+            "scopelib",
+            "1.0",
+            "myuser",
+            "stable",
+            "rev_user_stable",
+            "conanfile.py",
+        )
+        .await;
+
+        let (status, body) = f
+            .get(format!(
+                "/{}/v2/conans/scopelib/1.0/myuser/stable/revisions",
+                f.repo_key
+            ))
+            .await;
+        let body_str = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(status, StatusCode::OK, "body: {}", body_str);
+
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        let revisions = json
+            .get("revisions")
+            .and_then(|v| v.as_array())
+            .expect("revisions array");
+        let names: Vec<&str> = revisions
+            .iter()
+            .filter_map(|r| r.get("revision").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(names, vec!["rev_user_stable"], "got: {}", body_str);
 
         f.teardown().await;
     }
