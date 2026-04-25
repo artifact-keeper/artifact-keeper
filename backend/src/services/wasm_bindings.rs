@@ -16,7 +16,8 @@ pub mod v1 {
     wasmtime::component::bindgen!({
         world: "format-plugin",
         path: "src/wit/format-plugin.wit",
-        async: true,
+        imports: { default: async | trappable },
+        exports: { default: async },
     });
 }
 
@@ -25,7 +26,8 @@ pub mod v2 {
     wasmtime::component::bindgen!({
         world: "format-plugin-v2",
         path: "src/wit/format-plugin.wit",
-        async: true,
+        imports: { default: async | trappable },
+        exports: { default: async },
     });
 }
 

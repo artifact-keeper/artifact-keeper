@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::models::plugin::PluginResourceLimits;
 
@@ -101,12 +101,11 @@ impl PluginContext {
 }
 
 impl WasiView for PluginContext {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.resource_table
-    }
-
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.resource_table,
+        }
     }
 }
 
@@ -122,9 +121,9 @@ impl ResourceLimiter for PluginContext {
 
     fn table_growing(
         &mut self,
-        current: u32,
-        desired: u32,
-        maximum: Option<u32>,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
     ) -> anyhow::Result<bool> {
         self.limits.table_growing(current, desired, maximum)
     }
@@ -216,7 +215,7 @@ impl WasmRuntime {
 
         // Add minimal WASI imports for basic I/O
         // We only expose wasi:io/streams for artifact data
-        wasmtime_wasi::add_to_linker_async(&mut linker)
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| WasmError::EngineError(format!("Failed to add WASI: {}", e)))?;
 
         info!("Compiled WASM component ({} bytes)", wasm_bytes.len());
@@ -1092,5 +1091,63 @@ mod tests {
     #[test]
     fn test_fuel_per_second_constant() {
         assert_eq!(FUEL_PER_SECOND, 100_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // wasmtime 36.x migration - WasiView / WasiCtxView shape
+    // -----------------------------------------------------------------------
+
+    /// Exercises the new `WasiView::ctx(&mut self) -> WasiCtxView<'_>` shape
+    /// introduced in wasmtime-wasi 30.x (split out of the old dual-method
+    /// trait). Before the migration this used `table()` + `ctx()`.
+    #[test]
+    fn test_wasi_view_returns_ctx_view_with_both_refs() {
+        let limits = PluginResourceLimits::default();
+        let mut context = PluginContext::new("wv".to_string(), "wv-fmt".to_string(), &limits);
+
+        let view: WasiCtxView<'_> = context.ctx();
+        // Both refs must be populated - just de-reference them to prove
+        // they're live references into the same PluginContext.
+        let _ctx_ptr: *const WasiCtx = view.ctx;
+        let _table_ptr: *const wasmtime::component::ResourceTable = view.table;
+    }
+
+    /// Compiles a minimal valid component and creates a Store from it. This
+    /// exercises the full v36 code path: `Engine::new(&Config)`, component
+    /// parsing, `Linker::new`, `wasmtime_wasi::p2::add_to_linker_async`, and
+    /// `Store::new` with a `PluginContext` (which requires `WasiView`).
+    #[test]
+    fn test_compile_and_store_roundtrip_with_minimal_component() {
+        let runtime = WasmRuntime::new().unwrap();
+        // `(component)` is the minimal valid component in WAT text form.
+        let compiled = runtime
+            .compile(b"(component)")
+            .expect("minimal component should compile");
+
+        let limits = PluginResourceLimits::default();
+        let store = runtime
+            .create_store(&compiled, "rt-id", "rt-fmt", &limits)
+            .expect("store creation should succeed");
+
+        // If we got a Store back the WasiView + ResourceLimiter plumbing is
+        // wired up correctly for the new 36.x API.
+        assert_eq!(store.data().plugin_id, "rt-id");
+        assert_eq!(store.data().format_key, "rt-fmt");
+    }
+
+    /// Verifies the ResourceLimiter impl uses the 36.x `usize` signature for
+    /// `table_growing` (it was `u32` in 24.x). If this compiles, the shape
+    /// is correct; asserting the call returns Ok for a growth below the
+    /// default cap gives us confidence the delegation to StoreLimits still
+    /// works after the type change.
+    #[test]
+    fn test_resource_limiter_table_growing_usize_signature() {
+        let limits = PluginResourceLimits::default();
+        let mut context = PluginContext::new("rl".to_string(), "rl-fmt".to_string(), &limits);
+
+        let ok = context
+            .table_growing(0_usize, 16_usize, Some(10_000_usize))
+            .expect("table growth should be allowed under the default limit");
+        assert!(ok);
     }
 }
