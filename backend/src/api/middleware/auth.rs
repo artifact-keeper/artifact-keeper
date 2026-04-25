@@ -689,8 +689,14 @@ pub async fn repo_visibility_middleware(
         }
     };
 
-    // If no repo found for this key, let the handler return its own 404.
+    // If no repo found for this key, still inject Option<AuthExtension> so
+    // handlers that declare `Extension<Option<AuthExtension>>` don't fail
+    // Axum extraction with HTTP 500 (MissingExtension). The handler itself
+    // is responsible for returning the 404 once it tries to resolve the repo.
     let Some(repo) = repo else {
+        let extracted = extract_token(&request);
+        let auth_ext = try_resolve_auth(&vis_state.auth_service, extracted).await;
+        request.extensions_mut().insert(auth_ext);
         return next.run(request).await;
     };
 
