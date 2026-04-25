@@ -208,7 +208,7 @@ pub async fn require_auth_with_bearer_fallback(
 
 /// Token extraction result
 #[derive(Debug)]
-enum ExtractedToken<'a> {
+pub(crate) enum ExtractedToken<'a> {
     /// JWT or API token from Bearer scheme
     Bearer(&'a str),
     /// API token from ApiKey scheme
@@ -239,7 +239,7 @@ fn extract_token_from_auth_header(auth_header: &str) -> ExtractedToken<'_> {
 
 /// Extract token from request headers
 /// Checks: Authorization (Bearer/ApiKey), X-API-Key
-fn extract_token(request: &Request) -> ExtractedToken<'_> {
+pub(crate) fn extract_token(request: &Request) -> ExtractedToken<'_> {
     // First, check Authorization header
     if let Some(auth_header) = request
         .headers()
@@ -388,7 +388,7 @@ async fn validate_api_token_with_scopes(
 /// token is present, and `None` otherwise (missing, invalid, or expired).
 /// This is the shared logic used by [`optional_auth_middleware`] and
 /// [`repo_visibility_middleware`].
-async fn try_resolve_auth(
+pub(crate) async fn try_resolve_auth(
     auth_service: &AuthService,
     extracted: ExtractedToken<'_>,
 ) -> Option<AuthExtension> {

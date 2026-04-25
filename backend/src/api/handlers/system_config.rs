@@ -56,6 +56,12 @@ pub struct SystemConfigResponse {
     pub max_upload_size_bytes: u64,
     /// Whether the instance is running in demo mode (writes blocked).
     pub demo_mode: bool,
+    /// Whether anonymous (unauthenticated) access is permitted at all (issue #850).
+    /// When `false`, the server rejects all unauthenticated requests except for
+    /// the login, setup, health, and OCI challenge endpoints. Frontends should
+    /// hide UI affordances that imply public access (e.g. the "public repo"
+    /// toggle) and redirect unauthenticated users to the login page.
+    pub guest_access_enabled: bool,
     /// Scanner availability.
     pub scanners: ScannersConfig,
     /// Search engine type: "opensearch" when configured, "database" otherwise.
@@ -126,6 +132,7 @@ pub async fn get_system_config(State(state): State<SharedState>) -> Json<SystemC
     Json(SystemConfigResponse {
         max_upload_size_bytes: config.max_upload_size_bytes,
         demo_mode: config.demo_mode,
+        guest_access_enabled: config.guest_access_enabled,
         scanners,
         search_engine,
         storage_backend: config.storage_backend.clone(),
@@ -151,6 +158,7 @@ mod tests {
         SystemConfigResponse {
             max_upload_size_bytes: 10_737_418_240,
             demo_mode: false,
+            guest_access_enabled: true,
             scanners: ScannersConfig {
                 trivy_enabled: false,
                 openscap_enabled: false,
@@ -178,6 +186,7 @@ mod tests {
 
         assert!(json.contains("\"max_upload_size_bytes\":10737418240"));
         assert!(json.contains("\"demo_mode\":false"));
+        assert!(json.contains("\"guest_access_enabled\":true"));
         assert!(json.contains("\"search_engine\":\"database\""));
         assert!(json.contains("\"storage_backend\":\"filesystem\""));
         assert!(json.contains("\"trivy_enabled\":false"));
@@ -198,6 +207,7 @@ mod tests {
         let response = SystemConfigResponse {
             max_upload_size_bytes: 21_474_836_480,
             demo_mode: true,
+            guest_access_enabled: false,
             scanners: ScannersConfig {
                 trivy_enabled: true,
                 openscap_enabled: true,
@@ -329,6 +339,32 @@ mod tests {
         let json = serde_json::to_string(&perms).unwrap();
         assert!(json.contains("\"rules_exist\":false"));
         assert!(json.contains("\"enforcement_enabled\":false"));
+    }
+
+    #[test]
+    fn test_system_config_guest_access_enabled_default_true() {
+        // Issue #850: when the server is configured with guests enabled (the
+        // default), the response advertises that fact so frontends keep
+        // showing public-repo affordances.
+        let response = minimal_response();
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["guest_access_enabled"], true);
+    }
+
+    #[test]
+    fn test_system_config_guest_access_disabled_serialized_false() {
+        // Issue #850: frontends rely on this flag to hide the "public repo"
+        // toggle and to short-circuit anonymous browsing, so the value must
+        // round-trip through serde without surprises.
+        let response = SystemConfigResponse {
+            guest_access_enabled: false,
+            ..minimal_response()
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["guest_access_enabled"], false);
+        assert!(json.contains("\"guest_access_enabled\":false"));
     }
 
     #[test]

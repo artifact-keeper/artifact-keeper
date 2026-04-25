@@ -54,6 +54,7 @@ fn test_config(storage_path: &str) -> Config {
         opensearch_allow_invalid_certs: false,
         scan_workspace_path: "/tmp/scan".into(),
         demo_mode: false,
+        guest_access_enabled: true,
         peer_instance_name: "test".into(),
         peer_public_endpoint: "http://localhost:8080".into(),
         peer_api_key: "test-key".into(),
