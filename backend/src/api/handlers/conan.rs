@@ -381,16 +381,20 @@ async fn search(
 // GET /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/latest
 // ---------------------------------------------------------------------------
 
-async fn recipe_latest(
-    State(state): State<SharedState>,
-    Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
-
-    // Find the latest recipe revision by looking at the most recently created artifact
-    // with a revision in its metadata. Must filter by user/channel so revisions
-    // uploaded under one namespace (e.g. myuser/stable) do not leak into the
-    // latest response for another (e.g. _/_).
+/// Look up the latest recipe revision for a single repository.
+///
+/// Pure helper extracted from [`recipe_latest`] so the per-repo query can be
+/// reused both for the non-virtual fast path and for virtual fan-out across
+/// member repositories. Returns `Ok(None)` when the repository has no
+/// matching recipe rows.
+async fn latest_recipe_revision_for_repo(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    name: &str,
+    version: &str,
+    user: &str,
+    channel: &str,
+) -> Result<Option<String>, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         SELECT am.metadata->>'revision' as "revision?"
@@ -407,26 +411,60 @@ async fn recipe_latest(
         ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
         "#,
-        repo.id,
+        repository_id,
         name,
         version,
-        normalize_user(&user),
-        normalize_channel(&channel),
+        normalize_user(user),
+        normalize_channel(channel),
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?;
+    .fetch_optional(db)
+    .await?;
 
-    let revision = row
-        .revision
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?;
+    Ok(row.and_then(|r| r.revision))
+}
+
+async fn recipe_latest(
+    State(state): State<SharedState>,
+    Path((repo_key, name, version, user, channel)): Path<(String, String, String, String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+
+    // Find the latest recipe revision by looking at the most recently created
+    // artifact with a revision in its metadata. Must filter by user/channel so
+    // revisions uploaded under one namespace (e.g. myuser/stable) do not leak
+    // into the latest response for another (e.g. _/_).
+    //
+    // For virtual repos, fan out to each member in priority order and return
+    // the first member that has a matching revision. This mirrors the pattern
+    // used by `recipe_file_download`. Remote member aggregation is deferred to
+    // a follow-up; only hosted (Local/Staging) members are consulted here.
+    let revision = if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let mut found: Option<String> = None;
+        for member in &members {
+            if !member.repo_type.is_hosted() {
+                continue;
+            }
+            match latest_recipe_revision_for_repo(
+                &state.db, member.id, &name, &version, &user, &channel,
+            )
+            .await
+            .map_err(map_db_err)?
+            {
+                Some(rev) => {
+                    found = Some(rev);
+                    break;
+                }
+                None => continue,
+            }
+        }
+        found.ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?
+    } else {
+        latest_recipe_revision_for_repo(&state.db, repo.id, &name, &version, &user, &channel)
+            .await
+            .map_err(map_db_err)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "No revisions found").into_response())?
+    };
 
     let json = serde_json::json!({
         "revision": revision,
@@ -5121,6 +5159,102 @@ mod agent2_recipe_reads {
 
         cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Virtual fan-out regression: a virtual repo whose only member is a
+    /// local repo with revisions for the requested name/version must return
+    /// 200 with the member's latest revision. Before the fix, `recipe_latest`
+    /// queried `repository_id = virtual_repo.id` directly and returned 404
+    /// because virtual repos never own artifact rows themselves.
+    ///
+    /// Surfaced by `tests/formats/test-conan-remote.sh` assertion
+    /// "Fetch locallib latest through virtual repo matches local"
+    /// in release-gate run 24938542187.
+    #[tokio::test]
+    async fn recipe_latest_aggregates_across_virtual_members() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, _username, _pw) = create_user(&pool).await;
+        let (local_repo_id, _local_key, local_storage_dir) =
+            create_conan_repo(&pool, "local").await;
+        let (virtual_repo_id, virtual_key, virtual_storage_dir) =
+            create_conan_repo(&pool, "virtual").await;
+        let state = build_state(pool.clone(), virtual_storage_dir.to_str().unwrap());
+        let auth = make_auth(user_id, "dummy");
+
+        // Link the local repo as a member of the virtual repo.
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 0)",
+        )
+        .bind(virtual_repo_id)
+        .bind(local_repo_id)
+        .execute(&pool)
+        .await
+        .expect("link virtual member");
+
+        // Seed two revisions in the local member; the newer one should win.
+        let _ = seed_recipe_row(
+            &pool,
+            local_repo_id,
+            "locallib",
+            "1.0.0",
+            "_",
+            "_",
+            "rev_old_v",
+            "conanfile.py",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = seed_recipe_row(
+            &pool,
+            local_repo_id,
+            "locallib",
+            "1.0.0",
+            "_",
+            "_",
+            "rev_new_v",
+            "conanfile.py",
+        )
+        .await;
+
+        let app = router_with_auth(state, auth);
+        let (status, body) = send(
+            app,
+            get(format!(
+                "/{}/v2/conans/locallib/1.0.0/_/_/latest",
+                virtual_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "virtual repo should aggregate to local member; body={}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            json.get("revision").and_then(|v| v.as_str()),
+            Some("rev_new_v"),
+            "expected newest revision from local member; body={}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Cleanup: drop the membership row first, then the artifacts/repos.
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_repo_id)
+            .execute(&pool)
+            .await;
+        cleanup(&pool, local_repo_id, user_id).await;
+        // Virtual repo has no artifacts; just drop the row.
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&local_storage_dir);
+        let _ = std::fs::remove_dir_all(&virtual_storage_dir);
     }
 
     // -----------------------------------------------------------------------
