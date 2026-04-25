@@ -238,12 +238,16 @@ fn content_type_for_conan_file(path: &str) -> &'static str {
 // GET /conan/{repo_key}/v2/ping
 // ---------------------------------------------------------------------------
 
-async fn ping() -> Response {
-    Response::builder()
+async fn ping(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let _repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header("X-Conan-Server-Capabilities", "revisions")
         .body(Body::empty())
-        .unwrap()
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,18 +1397,52 @@ mod tests {
 
     #[tokio::test]
     async fn ping_returns_revisions_capability() {
-        let response = ping().await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let capabilities = response
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
+            return;
+        };
+
+        let app = f.router();
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{}/v2/ping", f.repo_key))
+            .body(Body::empty())
+            .expect("build request");
+        let resp = tower::ServiceExt::oneshot(app, req).await.expect("oneshot");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let capabilities = resp
             .headers()
             .get("x-conan-server-capabilities")
             .expect("x-conan-server-capabilities header must be present")
             .to_str()
-            .expect("header value must be ASCII");
+            .expect("header value must be ASCII")
+            .to_string();
         assert!(
             capabilities.contains("revisions"),
             "capability header must advertise 'revisions', got: {capabilities}"
         );
+
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn ping_returns_404_when_repo_missing() {
+        let Some(f) = test_helpers::TestFixture::setup("local").await else {
+            return;
+        };
+
+        let bogus_key = format!("nonexistent-{}", uuid::Uuid::new_v4());
+        let app = f.router();
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/{}/v2/ping", bogus_key))
+            .body(Body::empty())
+            .expect("build request");
+        let resp = tower::ServiceExt::oneshot(app, req).await.expect("oneshot");
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        f.teardown().await;
     }
 
     #[test]
