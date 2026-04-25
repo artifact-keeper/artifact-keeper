@@ -95,6 +95,16 @@ pub struct Config {
     /// Demo mode: blocks all write operations (POST/PUT/DELETE/PATCH) except auth
     pub demo_mode: bool,
 
+    /// When true (default), unauthenticated requests are allowed to reach
+    /// public repositories and other endpoints that explicitly opt in to
+    /// optional auth. When false, every request that hits a route protected
+    /// by `optional_auth_middleware` or `repo_visibility_middleware` must
+    /// resolve a valid `AuthExtension`, otherwise the `guest_access_guard`
+    /// returns 401. A small allowlist (login, refresh, setup status,
+    /// /api/v1/system/config, health probes, OCI /v2/ challenge) is always
+    /// permitted so users can authenticate and clients can negotiate.
+    pub guest_access_enabled: bool,
+
     /// Peer instance name for mesh identification
     pub peer_instance_name: String,
 
@@ -291,6 +301,7 @@ redacted_debug!(Config {
     show opensearch_allow_invalid_certs,
     show scan_workspace_path,
     show demo_mode,
+    show guest_access_enabled,
     show peer_instance_name,
     show peer_public_endpoint,
     redact peer_api_key,
@@ -368,6 +379,7 @@ impl Default for Config {
             opensearch_allow_invalid_certs: false,
             scan_workspace_path: "/tmp/scan-workspace".into(),
             demo_mode: false,
+            guest_access_enabled: true,
             peer_instance_name: "test-instance".into(),
             peer_public_endpoint: "http://localhost:8080".into(),
             peer_api_key: "test-peer-api-key".into(),
@@ -474,6 +486,12 @@ impl Config {
                 }
             }),
             demo_mode: matches!(env::var("DEMO_MODE").as_deref(), Ok("true" | "1")),
+            // Default to true for zero-impact upgrades; only "false"/"0" disables guests.
+            // Any other value (including unset, garbage, or empty) keeps guests enabled.
+            guest_access_enabled: !matches!(
+                env::var("AK_GUEST_ACCESS_ENABLED").as_deref(),
+                Ok("false" | "0")
+            ),
             peer_instance_name: env::var("PEER_INSTANCE_NAME")
                 .unwrap_or_else(|_| "artifact-keeper-local".into()),
             peer_public_endpoint: env::var("PEER_PUBLIC_ENDPOINT")
@@ -1024,6 +1042,98 @@ mod tests {
         } else {
             env::remove_var("DEMO_MODE");
         }
+    }
+
+    #[test]
+    fn test_config_guest_access_enabled_default_true() {
+        // Issue #850: zero-impact upgrades. When the env var is unset the
+        // server must keep behaving exactly as it did before, which means
+        // anonymous (guest) access stays enabled.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+        env::remove_var("AK_GUEST_ACCESS_ENABLED");
+
+        let config = Config::from_env().unwrap();
+        assert!(config.guest_access_enabled);
+
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", v);
+        } else {
+            env::remove_var("AK_GUEST_ACCESS_ENABLED");
+        }
+    }
+
+    #[test]
+    fn test_config_guest_access_enabled_explicit_values() {
+        // Verify that "false" and "0" disable guest access, while anything
+        // else (including "true", "1", garbage, and empty string) keeps it
+        // enabled. The "fail open" behaviour on garbage values is intentional
+        // so a typo in deployment does not lock administrators out without
+        // warning.
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_flag = env::var("AK_GUEST_ACCESS_ENABLED").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/testdb");
+        env::set_var("JWT_SECRET", "secret");
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "false");
+        assert!(!Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "0");
+        assert!(!Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "true");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "1");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "yes");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        env::set_var("AK_GUEST_ACCESS_ENABLED", "");
+        assert!(Config::from_env().unwrap().guest_access_enabled);
+
+        if let Some(v) = saved_db {
+            env::set_var("DATABASE_URL", v);
+        } else {
+            env::remove_var("DATABASE_URL");
+        }
+        if let Some(v) = saved_jwt {
+            env::set_var("JWT_SECRET", v);
+        } else {
+            env::remove_var("JWT_SECRET");
+        }
+        if let Some(v) = saved_flag {
+            env::set_var("AK_GUEST_ACCESS_ENABLED", v);
+        } else {
+            env::remove_var("AK_GUEST_ACCESS_ENABLED");
+        }
+    }
+
+    #[test]
+    fn test_config_default_guest_access_enabled() {
+        // The Config::default() helper returns guest_access_enabled = true,
+        // which is what test_config() relies on.
+        let config = Config::default();
+        assert!(config.guest_access_enabled);
     }
 
     #[test]

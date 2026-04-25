@@ -1395,6 +1395,7 @@ mod tests {
             opensearch_allow_invalid_certs: false,
             scan_workspace_path: "/tmp".to_string(),
             demo_mode: false,
+            guest_access_enabled: true,
             peer_instance_name: "test".to_string(),
             peer_public_endpoint: "http://localhost:8080".to_string(),
             peer_api_key: "test-key".to_string(),

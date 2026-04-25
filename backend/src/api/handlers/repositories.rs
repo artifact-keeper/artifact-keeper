@@ -35,6 +35,36 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
+/// Coerce the requested `is_public` value against the server-wide guest-access
+/// policy (issue #850).
+///
+/// When guest access is disabled, public repositories are meaningless: anonymous
+/// users will never reach them. We therefore silently coerce `true` to `false`
+/// on create/update so the persisted state matches the runtime policy. Returns
+/// the value to persist, plus a flag indicating whether coercion happened so
+/// the caller can emit a structured `tracing::warn!` log.
+fn coerce_is_public_for_create(requested: bool, guest_access_enabled: bool) -> (bool, bool) {
+    if requested && !guest_access_enabled {
+        (false, true)
+    } else {
+        (requested, false)
+    }
+}
+
+/// Update-side counterpart of [`coerce_is_public_for_create`]. The update
+/// payload uses `Option<bool>` because callers can leave the flag unchanged;
+/// only an explicit `Some(true)` is coerced.
+fn coerce_is_public_for_update(
+    requested: Option<bool>,
+    guest_access_enabled: bool,
+) -> (Option<bool>, bool) {
+    if matches!(requested, Some(true)) && !guest_access_enabled {
+        (Some(false), true)
+    } else {
+        (requested, false)
+    }
+}
+
 /// Check that the authenticated user can access a specific repository.
 /// If `allowed_repo_ids` is set on the token, the repo must be in that set.
 fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
@@ -702,7 +732,18 @@ pub async fn create_repository(
         payload.key.clone()
     };
 
-    let is_public = payload.effective_is_public();
+    // Issue #850: silently coerce `is_public` to false when guest access is
+    // disabled server-wide so the persisted state matches the runtime policy.
+    let (is_public, coerced) = coerce_is_public_for_create(
+        payload.effective_is_public(),
+        state.config.guest_access_enabled,
+    );
+    if coerced {
+        tracing::warn!(
+            repo_key = %payload.key,
+            "Coercing repository to private: AK_GUEST_ACCESS_ENABLED=false disables public repos"
+        );
+    }
 
     let service = state.create_repository_service();
     let repo = service
@@ -884,7 +925,19 @@ pub async fn update_repository(
         }
     }
 
-    let effective_is_public = payload.effective_is_public();
+    // Issue #850: ignore any attempt to flip a repository back to public when
+    // guest access is disabled. The web UI hides the toggle, but API clients
+    // and stale forms may still send `true`.
+    let (effective_is_public, coerced) = coerce_is_public_for_update(
+        payload.effective_is_public(),
+        state.config.guest_access_enabled,
+    );
+    if coerced {
+        tracing::warn!(
+            repo_key = %key,
+            "Ignoring is_public=true on update: AK_GUEST_ACCESS_ENABLED=false disables public repos"
+        );
+    }
 
     let repo = service
         .update(
@@ -4798,5 +4851,68 @@ mod tests {
     fn test_delete_repo_permission_check_non_admin_without_grant() {
         let auth = make_auth(false);
         assert!(!check_permission_gate(auth.is_admin, &[], "admin"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Guest-access coercion (issue #850)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn coerce_create_passthrough_when_guests_enabled() {
+        // When guests are enabled (the default), the requested value is
+        // returned unchanged regardless of whether it is true or false.
+        assert_eq!(coerce_is_public_for_create(true, true), (true, false));
+        assert_eq!(coerce_is_public_for_create(false, true), (false, false));
+    }
+
+    #[test]
+    fn coerce_create_forces_private_when_guests_disabled() {
+        assert_eq!(coerce_is_public_for_create(true, false), (false, true));
+    }
+
+    #[test]
+    fn coerce_create_already_private_is_noop_when_guests_disabled() {
+        // No coercion needed when the request is already private; the flag
+        // returned in `.1` must be `false` so the caller does not log a
+        // misleading warning.
+        assert_eq!(coerce_is_public_for_create(false, false), (false, false));
+    }
+
+    #[test]
+    fn coerce_update_passthrough_when_guests_enabled() {
+        assert_eq!(
+            coerce_is_public_for_update(Some(true), true),
+            (Some(true), false)
+        );
+        assert_eq!(
+            coerce_is_public_for_update(Some(false), true),
+            (Some(false), false)
+        );
+        assert_eq!(coerce_is_public_for_update(None, true), (None, false));
+    }
+
+    #[test]
+    fn coerce_update_forces_private_when_guests_disabled_and_some_true() {
+        assert_eq!(
+            coerce_is_public_for_update(Some(true), false),
+            (Some(false), true)
+        );
+    }
+
+    #[test]
+    fn coerce_update_some_false_is_noop_when_guests_disabled() {
+        assert_eq!(
+            coerce_is_public_for_update(Some(false), false),
+            (Some(false), false)
+        );
+    }
+
+    #[test]
+    fn coerce_update_none_is_noop_when_guests_disabled() {
+        // An update payload that does not touch the visibility field must
+        // remain `None` so the service layer leaves the existing value
+        // untouched. We never silently flip an existing public repo to
+        // private on unrelated updates.
+        assert_eq!(coerce_is_public_for_update(None, false), (None, false));
     }
 }

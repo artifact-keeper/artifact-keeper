@@ -10,6 +10,7 @@ use super::middleware::auth::{
     RepoVisibilityState,
 };
 use super::middleware::demo::demo_guard;
+use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::rate_limit::{
     rate_limit_middleware, RateLimitExemptions, RateLimitState, RateLimiter,
 };
@@ -123,6 +124,23 @@ pub fn create_router(state: SharedState) -> Router {
     // uploads on routes that lack an explicit limit. Individual format handlers
     // set their own limits where appropriate (e.g. 512 MB for most formats).
     router = router.layer(DefaultBodyLimit::disable());
+
+    // Apply guest-access guard (issue #850). When guest access is disabled,
+    // unauthenticated requests are rejected with 401 (with an allowlist for
+    // login/setup/health/OCI challenge). The guard performs its own token
+    // resolution so it can run as a global outer layer regardless of which
+    // inner auth middleware (if any) the matched route uses.
+    let guest_access_state = GuestAccessState {
+        guest_access_enabled: state.config.guest_access_enabled,
+        auth_service: Arc::new(AuthService::new(
+            state.db.clone(),
+            Arc::new(state.config.clone()),
+        )),
+    };
+    router = router.layer(middleware::from_fn_with_state(
+        guest_access_state,
+        guest_access_guard,
+    ));
 
     // Apply setup guard (locks API until admin password is changed)
     router = router.layer(middleware::from_fn_with_state(state.clone(), setup_guard));
