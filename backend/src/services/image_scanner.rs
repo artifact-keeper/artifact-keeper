@@ -332,19 +332,21 @@ impl Scanner for ImageScanner {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_is_container_image() {
-        let mut artifact = Artifact {
+    /// Build an Artifact fixture for scanner tests. Most fields are not
+    /// load-bearing for the scanner — the scanner only branches on `path`
+    /// and `content_type` — so we collapse the boilerplate here.
+    fn make_test_artifact(path: &str, content_type: &str) -> Artifact {
+        Artifact {
             id: uuid::Uuid::new_v4(),
             repository_id: uuid::Uuid::new_v4(),
-            path: "v2/myapp/manifests/latest".to_string(),
-            name: "myapp".to_string(),
-            version: Some("latest".to_string()),
+            path: path.to_string(),
+            name: "test".to_string(),
+            version: None,
             size_bytes: 1000,
             checksum_sha256: "abc123".to_string(),
             checksum_md5: None,
             checksum_sha1: None,
-            content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            content_type: content_type.to_string(),
             storage_key: "test".to_string(),
             is_deleted: false,
             uploaded_by: None,
@@ -352,7 +354,15 @@ mod tests {
             quarantine_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-        };
+        }
+    }
+
+    #[test]
+    fn test_is_container_image() {
+        let mut artifact = make_test_artifact(
+            "v2/myapp/manifests/latest",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
         assert!(ImageScanner::is_container_image(&artifact));
 
         artifact.content_type = "application/json".to_string();
@@ -362,25 +372,10 @@ mod tests {
 
     #[test]
     fn test_extract_image_ref() {
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "v2/myapp/manifests/v1.0.0".to_string(),
-            name: "myapp".to_string(),
-            version: Some("v1.0.0".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let artifact = make_test_artifact(
+            "v2/myapp/manifests/v1.0.0",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
         assert_eq!(
             ImageScanner::extract_image_ref(&artifact),
             Some("myapp:v1.0.0".to_string())
@@ -389,25 +384,10 @@ mod tests {
 
     #[test]
     fn test_extract_image_ref_with_namespace() {
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "v2/org/myapp/manifests/sha256:abc123".to_string(),
-            name: "myapp".to_string(),
-            version: None,
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/vnd.docker.distribution.manifest.v2+json".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let artifact = make_test_artifact(
+            "v2/org/myapp/manifests/sha256:abc123",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        );
         assert_eq!(
             ImageScanner::extract_image_ref(&artifact),
             Some("org/myapp:sha256:abc123".to_string())
@@ -416,25 +396,7 @@ mod tests {
 
     #[test]
     fn test_extract_image_ref_invalid_path() {
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "some/random/path".to_string(),
-            name: "test".to_string(),
-            version: None,
-            size_bytes: 0,
-            checksum_sha256: "abc".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/json".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let artifact = make_test_artifact("some/random/path", "application/json");
         assert_eq!(ImageScanner::extract_image_ref(&artifact), None);
     }
 
@@ -513,26 +475,10 @@ mod tests {
         // Use an unrouteable port so /healthz cannot succeed. Port 1 is
         // reserved and any client binding to it will get a connection error.
         let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
-
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "v2/myapp/manifests/latest".to_string(),
-            name: "myapp".to_string(),
-            version: Some("latest".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc123".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let artifact = make_test_artifact(
+            "v2/myapp/manifests/latest",
+            "application/vnd.oci.image.manifest.v1+json",
+        );
 
         let result = scanner.scan(&artifact, None, &Bytes::new()).await;
 
@@ -608,25 +554,7 @@ mod tests {
     #[tokio::test]
     async fn test_scan_non_image_returns_ok_empty_without_trivy() {
         let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
-        let artifact = Artifact {
-            id: uuid::Uuid::new_v4(),
-            repository_id: uuid::Uuid::new_v4(),
-            path: "pypi/pkg/1.0.0/pkg-1.0.0.tar.gz".to_string(),
-            name: "pkg".to_string(),
-            version: Some("1.0.0".to_string()),
-            size_bytes: 1000,
-            checksum_sha256: "abc".to_string(),
-            checksum_md5: None,
-            checksum_sha1: None,
-            content_type: "application/gzip".to_string(),
-            storage_key: "test".to_string(),
-            is_deleted: false,
-            uploaded_by: None,
-            quarantine_status: None,
-            quarantine_until: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
+        let artifact = make_test_artifact("pypi/pkg/1.0.0/pkg-1.0.0.tar.gz", "application/gzip");
         let result = scanner.scan(&artifact, None, &Bytes::new()).await;
         assert!(
             result.is_ok(),
