@@ -1,6 +1,21 @@
 ## Summary
 <!-- What does this PR do and why? -->
 
+## Regression test (required for `fix/*` PRs)
+<!--
+Hardening Core (https://github.com/orgs/artifact-keeper/projects/2) requires
+every bug-fix PR to land with a regression test that fails on `main` and
+passes on this PR. Choose one that fits the bug:
+  - unit test (closest to the buggy logic)
+  - integration test (requires DB/storage/etc.)
+  - end-to-end test in artifact-keeper-test (exercises the user flow)
+
+For non-fix PRs (feat/, chore/, docs/, ci/, refactor/) check N/A.
+Reviewers should not approve fix/* PRs without a checked box.
+-->
+- [ ] This PR is a `fix/*` AND adds/updates a test that would have caught the bug
+- [ ] N/A — this is not a bug fix
+
 ## Test Checklist
 - [ ] Unit tests added/updated
 - [ ] Integration tests added/updated (if applicable)
