@@ -56,17 +56,7 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host_str);
     if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
-        let is_blocked = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-            }
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if is_blocked {
+        if is_blocked_ip(ip) {
             return Err(AppError::Validation(format!(
                 "{} IP '{}' is not allowed (private/internal network)",
                 label, ip
@@ -75,6 +65,75 @@ pub fn validate_outbound_url(url_str: &str, label: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Return true when an IP must not be contacted from server-side requests.
+///
+/// Covers:
+/// - IPv4 loopback / RFC1918 private / link-local / unspecified / broadcast
+/// - Cloud-provider metadata IPs that fall outside RFC1918 (Oracle Cloud
+///   `192.0.0.192`, Alibaba Cloud `100.100.100.200` in the CGNAT range)
+/// - IPv6 loopback (`::1`), unspecified (`::`), link-local (`fe80::/10`),
+///   unique-local (`fc00::/7`)
+/// - IPv4-mapped IPv6 (`::ffff:0:0/96`) — these would otherwise let an
+///   attacker bypass the IPv4 checks by writing
+///   `http://[::ffff:169.254.169.254]/` or `http://[::ffff:127.0.0.1]/`.
+///   We unwrap the embedded IPv4 and re-evaluate the IPv4 rules.
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            // Unwrap IPv4-mapped IPv6 so the IPv4 rules apply.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ipv4(v4);
+            }
+            // The deprecated IPv4-compatible IPv6 form (::a.b.c.d) is also
+            // treated as an IPv4 alias for safety.
+            if let Some(v4) = v6.to_ipv4() {
+                if !v6.is_loopback() && !v6.is_unspecified() {
+                    return is_blocked_ipv4(v4);
+                }
+            }
+
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+
+            // IPv6 link-local: fe80::/10
+            let segs = v6.segments();
+            if segs[0] & 0xffc0 == 0xfe80 {
+                return true;
+            }
+            // IPv6 unique-local: fc00::/7
+            if segs[0] & 0xfe00 == 0xfc00 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+fn is_blocked_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    if v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+    {
+        return true;
+    }
+    let octets = v4.octets();
+    // Oracle Cloud metadata: 192.0.0.192 (in IETF Protocol Assignments range).
+    if octets == [192, 0, 0, 192] {
+        return true;
+    }
+    // Alibaba Cloud metadata: 100.100.100.200 lives in the CGNAT range
+    // (100.64.0.0/10, RFC 6598). Block the entire CGNAT range to cover
+    // metadata IPs and other carrier-internal addresses.
+    if octets[0] == 100 && (octets[1] & 0xc0) == 0x40 {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -163,6 +222,78 @@ mod tests {
     #[test]
     fn test_rejects_ipv6_loopback() {
         assert!(validate_outbound_url("http://[::1]:8080/api", "Test URL").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF bypasses via IPv4-mapped IPv6 addresses (e.g. via upstream
+    // config.json `dl` field for Cargo registries). Without explicit
+    // handling, `::ffff:169.254.169.254` parses as an IPv6 address whose
+    // `is_loopback()` / `is_unspecified()` are false, slipping past the
+    // private-IP check.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rejects_ipv4_mapped_loopback() {
+        assert!(
+            validate_outbound_url("http://[::ffff:127.0.0.1]/api", "Test URL").is_err(),
+            "::ffff:127.0.0.1 must be rejected (IPv4-mapped loopback)"
+        );
+    }
+
+    #[test]
+    fn test_rejects_ipv4_mapped_aws_metadata() {
+        assert!(
+            validate_outbound_url(
+                "http://[::ffff:169.254.169.254]/latest/meta-data",
+                "Cargo upstream download URL"
+            )
+            .is_err(),
+            "::ffff:169.254.169.254 must be rejected (IPv4-mapped AWS metadata)"
+        );
+    }
+
+    #[test]
+    fn test_rejects_ipv4_mapped_private_10() {
+        assert!(
+            validate_outbound_url("http://[::ffff:10.0.0.1]/api", "Test URL").is_err(),
+            "::ffff:10.0.0.1 must be rejected (IPv4-mapped RFC1918)"
+        );
+    }
+
+    #[test]
+    fn test_rejects_ipv6_link_local() {
+        assert!(
+            validate_outbound_url("http://[fe80::1]/api", "Test URL").is_err(),
+            "fe80::/10 link-local must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rejects_ipv6_unique_local() {
+        assert!(
+            validate_outbound_url("http://[fc00::1]/api", "Test URL").is_err(),
+            "fc00::/7 unique-local (fc00::1) must be rejected"
+        );
+        assert!(
+            validate_outbound_url("http://[fd12:3456:789a::1]/api", "Test URL").is_err(),
+            "fc00::/7 unique-local (fd00::/8) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rejects_oracle_cloud_metadata_ip() {
+        assert!(
+            validate_outbound_url("http://192.0.0.192/opc/v2/instance", "Test URL").is_err(),
+            "Oracle Cloud metadata IP 192.0.0.192 must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_rejects_alibaba_metadata_ip() {
+        assert!(
+            validate_outbound_url("http://100.100.100.200/latest/meta-data", "Test URL").is_err(),
+            "Alibaba Cloud metadata IP 100.100.100.200 must be rejected"
+        );
     }
 
     // -----------------------------------------------------------------------
