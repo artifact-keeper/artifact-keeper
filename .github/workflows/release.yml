@@ -181,61 +181,92 @@ jobs:
       needs.build-binaries.result == 'success'
     timeout-minutes: 35
     steps:
-      - name: Wait for and verify required images on ghcr.io
+      - name: Wait for and verify required images on ghcr.io and docker.io
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
           VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "Verifying required images on ghcr.io for version: ${VERSION}"
+          echo "Verifying required images for version: ${VERSION}"
+          echo "Both registries (ghcr.io and docker.io) must have every image."
 
-          # Poll ghcr.io for up to 30 minutes for each image to appear.
-          # docker-publish workflows on backend, openSCAP and the separate
-          # web repo all run on the same tag-push event but have variable
-          # completion times (multi-arch + signing + provenance can take
-          # 15-25 minutes), so we wait rather than fail-fast.
+          # Poll both registries for up to 30 minutes per image. Multi-arch
+          # builds, cosign signing and provenance attestation routinely take
+          # 15-25 minutes, so we wait rather than fail-fast.
           DEADLINE=$(($(date +%s) + 30*60))
 
-          # Required image set. If any one of these is missing on ghcr.io,
-          # the release stays a draft.
+          # Required image set. Each entry is "<registry>|<name>:<tag>".
+          # ghcr.io uses the artifact-keeper org / hyphenated names.
+          # docker.io uses the artifactkeeper namespace / shorter names.
+          # Missing on EITHER registry blocks the release.
           IMAGES=(
-            "artifact-keeper/artifact-keeper-backend:${VERSION}"
-            "artifact-keeper/artifact-keeper-backend:${VERSION}-alpine"
-            "artifact-keeper/artifact-keeper-openscap:${VERSION}"
-            "artifact-keeper/artifact-keeper-web:${VERSION}"
+            "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}"
+            "ghcr.io|artifact-keeper/artifact-keeper-backend:${VERSION}-alpine"
+            "ghcr.io|artifact-keeper/artifact-keeper-openscap:${VERSION}"
+            "ghcr.io|artifact-keeper/artifact-keeper-web:${VERSION}"
+            "docker.io|artifactkeeper/backend:${VERSION}"
+            "docker.io|artifactkeeper/backend:${VERSION}-alpine"
+            "docker.io|artifactkeeper/openscap:${VERSION}"
+            "docker.io|artifactkeeper/web:${VERSION}"
           )
 
-          probe_image() {
-            local img="$1"
-            local name="${img%:*}"
-            local tag="${img#*:}"
-            # ghcr.io requires a Bearer token even for read; exchange the
-            # GITHUB_TOKEN for a registry token and HEAD the manifest.
+          # Common Accept headers cover OCI index, Docker manifest list,
+          # and Docker manifest v2 (different registries return different
+          # default media types).
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          probe_ghcr() {
+            local name="$1"; local tag="$2"
             local token
             token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               | jq -r '.token // empty')
             [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
             curl -sfL -o /dev/null \
               -H "Authorization: Bearer ${token}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json" \
-              -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
-              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              ${MANIFEST_ACCEPT} \
               "https://ghcr.io/v2/${name}/manifests/${tag}"
           }
 
+          probe_dockerhub() {
+            local name="$1"; local tag="$2"
+            # Docker Hub anonymous token (works for public repos).
+            local token
+            token=$(curl -sf "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            curl -sfL -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://registry-1.docker.io/v2/${name}/manifests/${tag}"
+          }
+
+          probe() {
+            local registry="$1"; local img="$2"
+            local name="${img%:*}"; local tag="${img#*:}"
+            case "${registry}" in
+              ghcr.io)   probe_ghcr "${name}" "${tag}" ;;
+              docker.io) probe_dockerhub "${name}" "${tag}" ;;
+              *) echo "::error::unknown registry ${registry}"; return 2 ;;
+            esac
+          }
+
           missing=()
-          for img in "${IMAGES[@]}"; do
+          for entry in "${IMAGES[@]}"; do
+            registry="${entry%%|*}"
+            img="${entry#*|}"
             echo ""
-            echo "Polling ghcr.io/${img}"
+            echo "Polling ${registry}/${img}"
             while true; do
-              if probe_image "${img}"; then
-                echo "  ✓ ghcr.io/${img}"
+              if probe "${registry}" "${img}"; then
+                echo "  ✓ ${registry}/${img}"
                 break
               fi
               if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-                echo "::error::Required image missing on ghcr.io after 30m: ${img}"
-                missing+=("${img}")
+                echo "::error::Required image missing on ${registry} after 30m: ${img}"
+                missing+=("${registry}/${img}")
                 break
               fi
               echo "  not yet present, waiting 30s..."
@@ -245,12 +276,12 @@ jobs:
 
           if [ "${#missing[@]}" -gt 0 ]; then
             echo ""
-            echo "::error::One or more required images are missing on ghcr.io after the deadline. The GitHub Release will be marked DRAFT and will not promote to stable until every required image is published."
+            echo "::error::One or more required images are missing on ghcr.io and/or docker.io after the deadline. The GitHub Release will be marked DRAFT and will not promote to stable until every required image is published on both registries."
             printf '  - %s\n' "${missing[@]}"
             exit 1
           fi
           echo ""
-          echo "All required images present on ghcr.io for version ${VERSION}."
+          echo "All required images present on ghcr.io AND docker.io for version ${VERSION}."
 
   # ════════════════════════════════════════════════════════════════════════════
   # CREATE RELEASE
