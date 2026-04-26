@@ -43,6 +43,19 @@ pub fn record_security_scan(scanner: &str, success: bool, duration_secs: f64) {
         .record(duration_secs);
 }
 
+/// Record a scanner backend health-check failure. Distinct from
+/// `record_security_scan` so dashboards can separate "Trivy was down" from
+/// "scan ran and failed mid-execution". `reason` is "unreachable" (network
+/// error / timeout) or "unhealthy" (non-2xx response).
+pub fn record_scanner_health_check_failure(scanner: &str, reason: &str) {
+    counter!(
+        "ak_scanner_health_check_failures_total",
+        "scanner" => scanner.to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
 /// Record a webhook delivery event.
 pub fn record_webhook_delivery(event: &str, success: bool) {
     let status = if success { "success" } else { "failure" };
@@ -110,6 +123,12 @@ mod tests {
     fn test_record_security_scan_does_not_panic() {
         record_security_scan("trivy", true, 5.0);
         record_security_scan("openscap", false, 1.2);
+    }
+
+    #[test]
+    fn test_record_scanner_health_check_failure_does_not_panic() {
+        record_scanner_health_check_failure("trivy", "unreachable");
+        record_scanner_health_check_failure("trivy", "unhealthy");
     }
 
     #[test]

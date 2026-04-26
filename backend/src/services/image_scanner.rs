@@ -90,26 +90,78 @@ impl ImageScanner {
         None
     }
 
+    /// Number of `/healthz` attempts before declaring the Trivy server down.
+    /// Three attempts with backoff covers a 30-60s pod restart without
+    /// permanently failing in-flight scans, which would otherwise flag the
+    /// underlying artifacts. See issue #888.
+    const HEALTH_CHECK_ATTEMPTS: u32 = 3;
+    /// Per-attempt timeout for `/healthz`. Independent of the 300s scan
+    /// timeout so a NetworkPolicy-blocked or hung Trivy does not tie up a
+    /// worker for five minutes per scan.
+    const HEALTH_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Backoff between health-check attempts. Short on purpose: the goal is
+    /// to absorb a pod-restart blip, not to wait out a sustained outage.
+    const HEALTH_CHECK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
     /// Check if the Trivy server is available.
     ///
-    /// Returns `Ok(())` when `/healthz` responds 2xx. Any other outcome
-    /// (network error, non-2xx status) is surfaced as an `AppError` so the
-    /// scan orchestrator can mark the scan FAILED with a descriptive
-    /// message rather than silently completing with zero findings.
+    /// Returns `Ok(())` when `/healthz` responds 2xx. On failure, retries
+    /// `HEALTH_CHECK_ATTEMPTS` times with `HEALTH_CHECK_BACKOFF` between
+    /// attempts before surfacing an `AppError::BadGateway` so the scan
+    /// orchestrator can mark the scan FAILED with a descriptive message
+    /// rather than silently completing with zero findings (issue #888).
+    ///
+    /// Each attempt has its own `HEALTH_CHECK_TIMEOUT` so a hung Trivy does
+    /// not block a worker for the full 300s scan timeout.
     async fn check_trivy_health(&self) -> Result<()> {
         let url = format!("{}/healthz", self.trivy_url);
-        match self.http.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => Ok(()),
-            Ok(resp) => Err(AppError::Internal(format!(
-                "Trivy server at {} is unhealthy: HTTP {}",
-                self.trivy_url,
-                resp.status()
-            ))),
-            Err(e) => Err(AppError::Internal(format!(
-                "Trivy server at {} is unreachable: {}",
-                self.trivy_url, e
-            ))),
+        let mut last_err: Option<AppError> = None;
+
+        for attempt in 1..=Self::HEALTH_CHECK_ATTEMPTS {
+            let result = self
+                .http
+                .get(&url)
+                .timeout(Self::HEALTH_CHECK_TIMEOUT)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    let msg = format!(
+                        "Trivy server at {} is unhealthy: HTTP {}",
+                        self.trivy_url,
+                        resp.status()
+                    );
+                    crate::services::metrics_service::record_scanner_health_check_failure(
+                        "trivy",
+                        "unhealthy",
+                    );
+                    warn!("Trivy /healthz attempt {} failed: {}", attempt, msg);
+                    last_err = Some(AppError::BadGateway(msg));
+                }
+                Err(e) => {
+                    let msg = format!("Trivy server at {} is unreachable: {}", self.trivy_url, e);
+                    crate::services::metrics_service::record_scanner_health_check_failure(
+                        "trivy",
+                        "unreachable",
+                    );
+                    warn!("Trivy /healthz attempt {} failed: {}", attempt, msg);
+                    last_err = Some(AppError::BadGateway(msg));
+                }
+            }
+
+            if attempt < Self::HEALTH_CHECK_ATTEMPTS {
+                tokio::time::sleep(Self::HEALTH_CHECK_BACKOFF).await;
+            }
         }
+
+        Err(last_err.unwrap_or_else(|| {
+            AppError::BadGateway(format!(
+                "Trivy server at {} health check failed",
+                self.trivy_url
+            ))
+        }))
     }
 
     /// Scan an image reference using the Trivy CLI with server mode.
@@ -255,7 +307,7 @@ impl Scanner for ImageScanner {
         // Ok(vec![]) here would silently mark the scan COMPLETED with zero
         // findings even though no scanning ever happened (issue #888).
         if let Err(e) = self.check_trivy_health().await {
-            return Err(AppError::Internal(format!(
+            return Err(AppError::BadGateway(format!(
                 "Trivy image scan failed for {}: {}",
                 image_ref, e
             )));
@@ -509,6 +561,44 @@ mod tests {
             msg.contains("unreachable") || msg.contains("unhealthy"),
             "error message should describe the health-check failure, got: {}",
             msg
+        );
+    }
+
+    /// `check_trivy_health` retries before declaring failure so a brief
+    /// Trivy pod restart does not hard-fail every concurrent scan. Verified
+    /// indirectly by elapsed time: with ATTEMPTS=3 and BACKOFF=500ms there
+    /// are two backoff sleeps, so a fully-failed run takes >= ~900ms.
+    #[tokio::test]
+    async fn test_check_trivy_health_retries_before_failing() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let start = std::time::Instant::now();
+        let result = scanner.check_trivy_health().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        let expected_min =
+            ImageScanner::HEALTH_CHECK_BACKOFF * (ImageScanner::HEALTH_CHECK_ATTEMPTS - 1);
+        assert!(
+            elapsed >= expected_min - std::time::Duration::from_millis(100),
+            "expected at least {:?} of backoff across {} attempts, got {:?}",
+            expected_min,
+            ImageScanner::HEALTH_CHECK_ATTEMPTS,
+            elapsed
+        );
+    }
+
+    /// `check_trivy_health` returns BadGateway, not Internal. The
+    /// orchestrator does not currently translate AppError to HTTP, but
+    /// classifying upstream-scanner failures as 502 keeps internal-error
+    /// alerting clean. Pinned because we just changed the variant.
+    #[tokio::test]
+    async fn test_check_trivy_health_error_is_bad_gateway() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let err = scanner.check_trivy_health().await.unwrap_err();
+        assert!(
+            matches!(err, AppError::BadGateway(_)),
+            "expected BadGateway, got {:?}",
+            err
         );
     }
 
