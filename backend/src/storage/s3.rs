@@ -277,6 +277,17 @@ impl S3Config {
     }
 }
 
+/// True if `S3_ALLOW_ANONYMOUS` is set to a truthy value (`true`, `True`,
+/// `TRUE`, `1`). When enabled, the operator opts into unsigned S3 requests
+/// for genuinely public buckets and `S3Backend::new` no longer requires
+/// credentials. Used by both the credential-chain logic in `build_store`
+/// and the startup check in `validate_credentials_present`.
+fn anonymous_s3_enabled() -> bool {
+    std::env::var("S3_ALLOW_ANONYMOUS")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
 /// Generate the full S3 key with optional prefix.
 fn make_full_key(prefix: Option<&str>, key: &str) -> String {
     match prefix {
@@ -426,6 +437,12 @@ impl S3Backend {
             if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
                 builder = builder.with_token(token);
             }
+        } else if anonymous_s3_enabled() {
+            tracing::warn!(
+                "S3 storage configured with no credentials and S3_ALLOW_ANONYMOUS=true; \
+                 using unsigned requests"
+            );
+            builder = builder.with_skip_signature(true);
         }
 
         builder
@@ -433,8 +450,56 @@ impl S3Backend {
             .map_err(|e| AppError::Config(format!("Failed to build S3 client: {}", e)))
     }
 
+    /// Validate at startup that some recognized credential source is configured.
+    ///
+    /// Without this check, `S3Backend::new` would silently construct a client
+    /// whose default credential provider falls back to EC2 instance metadata
+    /// (169.254.169.254) at first request, causing 5-15s timeouts per storage
+    /// operation in non-AWS deployments (issue #871).
+    ///
+    /// Only enforced when a custom `S3_ENDPOINT` is set: a custom endpoint is
+    /// definitively not AWS, so IMDS is never the right fallback. For AWS S3
+    /// itself (no custom endpoint), IMDS is a legitimate fallback when running
+    /// on EC2 with an instance role, so the chain is left alone there.
+    fn validate_credentials_present(config: &S3Config) -> Result<()> {
+        if config.endpoint.is_none() {
+            return Ok(());
+        }
+        if anonymous_s3_enabled() {
+            return Ok(());
+        }
+        let has_static_creds = (std::env::var("S3_ACCESS_KEY_ID").is_ok()
+            && std::env::var("S3_SECRET_ACCESS_KEY").is_ok())
+            || (std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+                && std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+        let has_cloud_chain = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI").is_ok()
+            || std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI").is_ok()
+            || std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_ok();
+        if has_static_creds || has_cloud_chain {
+            return Ok(());
+        }
+        Err(AppError::Config(
+            "S3 storage configured with custom endpoint but no credentials found. \
+             Set S3_ACCESS_KEY_ID + S3_SECRET_ACCESS_KEY (or AWS_ACCESS_KEY_ID + \
+             AWS_SECRET_ACCESS_KEY), one of the cloud credential chains \
+             (ECS via AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, EKS Pod Identity via \
+             AWS_CONTAINER_CREDENTIALS_FULL_URI, or IRSA via \
+             AWS_WEB_IDENTITY_TOKEN_FILE), or S3_ALLOW_ANONYMOUS=true for unsigned \
+             access. Without explicit credentials the AWS SDK falls back to EC2 \
+             instance metadata (169.254.169.254), which is unreachable in non-AWS \
+             deployments and causes every storage request to time out (issue #871)."
+                .to_string(),
+        ))
+    }
+
     /// Create new S3 backend from configuration
     pub async fn new(config: S3Config) -> Result<Self> {
+        // Issue #871: validate credentials are present before constructing
+        // the client. Without this, a non-AWS deployment with a custom
+        // S3_ENDPOINT and no creds would fall back to EC2 instance metadata
+        // at first request, causing every storage operation to stall 5-15s.
+        Self::validate_credentials_present(&config)?;
+
         let store = Self::build_store(&config, None, None)?;
 
         let signing_store = match (&config.presign_access_key, &config.presign_secret_key) {
@@ -1527,6 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_minimal() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1539,6 +1605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_with_signing_store() {
+        let _env = AnonymousS3TestEnv::enter();
         let mut config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1554,6 +1621,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_with_tls_config() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1567,6 +1635,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_migration_path_format() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1580,6 +1649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_supports_redirect_false_by_default() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1592,6 +1662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_supports_redirect_when_enabled() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1605,6 +1676,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_full_key_integration() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1618,6 +1690,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_fallback_integration() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1640,6 +1713,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_from_env_with_env_vars() {
+        let _env = AnonymousS3TestEnv::enter();
         // Save originals
         let orig_bucket = std::env::var("S3_BUCKET").ok();
         let orig_region = std::env::var("S3_REGION").ok();
@@ -1671,6 +1745,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_s3_backend_new_invalid_ca_cert_fails() {
+        let _env = AnonymousS3TestEnv::enter();
         let config = S3Config::new(
             "test-bucket".to_string(),
             "us-east-1".to_string(),
@@ -1705,6 +1780,7 @@ mod tests {
         "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AWS_ROLE_ARN",
+        "S3_ALLOW_ANONYMOUS",
     ];
 
     /// Save current values for all credential env vars.
@@ -1732,6 +1808,36 @@ mod tests {
         }
     }
 
+    /// RAII helper for tests that exercise `S3Backend::new` construction
+    /// behavior without caring about the credential chain. Enters the
+    /// CRED_ENV_MUTEX, clears every credential env var, and sets
+    /// `S3_ALLOW_ANONYMOUS=true` so `validate_credentials_present` succeeds
+    /// regardless of the host environment. On drop, restores the prior
+    /// values and releases the mutex.
+    ///
+    /// Use this in any test that calls `S3Backend::new` with a custom
+    /// (localhost / fake) endpoint to avoid the issue #871 startup check.
+    struct AnonymousS3TestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl AnonymousS3TestEnv {
+        fn enter() -> Self {
+            let lock = CRED_ENV_MUTEX.lock().unwrap();
+            let saved = save_cred_env();
+            clear_cred_env();
+            std::env::set_var("S3_ALLOW_ANONYMOUS", "true");
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for AnonymousS3TestEnv {
+        fn drop(&mut self) {
+            restore_cred_env(std::mem::take(&mut self.saved));
+        }
+    }
+
     /// Helper: build an S3Config pointing at a fake http endpoint so
     /// the builder never tries a real TLS handshake.
     fn test_config() -> S3Config {
@@ -1743,18 +1849,230 @@ mod tests {
         )
     }
 
+    // --- Issue #871: startup credential validation ---
+
     #[test]
-    fn test_build_store_succeeds_with_no_aws_env_vars() {
+    fn test_validate_creds_fails_fast_with_custom_endpoint_and_no_creds() {
+        // Issue #871: a custom S3 endpoint with no credentials must fail at
+        // startup with a clear Config error, not silently fall through to
+        // IMDS at first request and time out for 5-15s per call.
         let _lock = CRED_ENV_MUTEX.lock().unwrap();
         let saved = save_cred_env();
         clear_cred_env();
 
-        let result = S3Backend::build_store(&test_config(), None, None);
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_err(),
+            "validate_credentials_present with custom endpoint + no creds must fail fast"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("169.254.169.254") && msg.contains("S3_ACCESS_KEY_ID"),
+            "error must explain the IMDS fallback and how to fix it: {}",
+            msg
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_aws_endpoint_and_no_creds() {
+        // Without a custom endpoint we are talking to real AWS S3, where
+        // IMDS is a legitimate fallback (EC2 instance role). Don't error.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        let aws_config = S3Config::new(
+            "aws-bucket".to_string(),
+            "us-east-1".to_string(),
+            None, // no custom endpoint = AWS S3
+            None,
+        );
+        let result = S3Backend::validate_credentials_present(&aws_config);
         assert!(
             result.is_ok(),
-            "build_store should succeed without any AWS env vars: {:?}",
+            "AWS endpoint with no explicit creds should pass validation (IMDS is the legit fallback): {:?}",
             result.err()
         );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_static_creds() {
+        // The most common case: operator sets S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("S3_ACCESS_KEY_ID", "AKIA");
+        std::env::set_var("S3_SECRET_ACCESS_KEY", "secret");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with S3_* creds should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_aws_static_creds() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIA");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with AWS_* creds should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_partial_static_keys_treated_as_no_creds() {
+        // Only AWS_ACCESS_KEY_ID without secret = misconfigured = same path
+        // as no creds at all. Static cred chain in build_store also requires
+        // both; this validator must agree to surface the error at startup.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("S3_ACCESS_KEY_ID", "AKIA");
+        // no S3_SECRET_ACCESS_KEY
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_err(),
+            "validate must reject access key without secret key"
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_irsa() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+        );
+        std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/my-role");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with IRSA should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_ecs() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "/v2/credentials/some-uuid",
+        );
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with ECS task role should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_succeeds_with_eks_pod_identity() {
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "http://169.254.170.23/v1/credentials",
+        );
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with EKS Pod Identity should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_anonymous_with_custom_endpoint() {
+        // S3_ALLOW_ANONYMOUS=true opts the operator into unsigned requests
+        // for genuinely public buckets. Validation must accept this without
+        // requiring further credentials.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        std::env::set_var("S3_ALLOW_ANONYMOUS", "true");
+
+        let result = S3Backend::validate_credentials_present(&test_config());
+        assert!(
+            result.is_ok(),
+            "validate with S3_ALLOW_ANONYMOUS=true should succeed: {:?}",
+            result.err()
+        );
+
+        restore_cred_env(saved);
+    }
+
+    #[test]
+    fn test_validate_creds_anonymous_truthy_parsing() {
+        // S3_ALLOW_ANONYMOUS uses standard truthy values: true, True, TRUE, 1.
+        // Anything else (including "no", "false", empty) should NOT enable it.
+        let _lock = CRED_ENV_MUTEX.lock().unwrap();
+        let saved = save_cred_env();
+        clear_cred_env();
+
+        for v in &["1", "TRUE", "True", "true"] {
+            std::env::set_var("S3_ALLOW_ANONYMOUS", v);
+            let result = S3Backend::validate_credentials_present(&test_config());
+            assert!(
+                result.is_ok(),
+                "S3_ALLOW_ANONYMOUS={} should be truthy: {:?}",
+                v,
+                result.err()
+            );
+        }
+        // Non-truthy values must still trigger the no-creds error.
+        for v in &["no", "false", "FALSE", "0", ""] {
+            std::env::set_var("S3_ALLOW_ANONYMOUS", v);
+            let result = S3Backend::validate_credentials_present(&test_config());
+            assert!(
+                result.is_err(),
+                "S3_ALLOW_ANONYMOUS={:?} must NOT enable anonymous mode",
+                v
+            );
+        }
 
         restore_cred_env(saved);
     }
