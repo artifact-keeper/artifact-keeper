@@ -223,7 +223,9 @@ jobs:
               | jq -r '.token // empty')
             [ -n "${token}" ] || return 1
             # shellcheck disable=SC2086
-            curl -sfL -o /dev/null \
+            # --proto =https refuses to follow HTTPS->HTTP redirects so the
+            # Bearer token can never leak over plaintext.
+            curl -sfL --proto =https -o /dev/null \
               -H "Authorization: Bearer ${token}" \
               ${MANIFEST_ACCEPT} \
               "https://ghcr.io/v2/${name}/manifests/${tag}"
@@ -237,7 +239,9 @@ jobs:
               | jq -r '.token // empty')
             [ -n "${token}" ] || return 1
             # shellcheck disable=SC2086
-            curl -sfL -o /dev/null \
+            # --proto =https refuses to follow HTTPS->HTTP redirects so the
+            # Bearer token can never leak over plaintext.
+            curl -sfL --proto =https -o /dev/null \
               -H "Authorization: Bearer ${token}" \
               ${MANIFEST_ACCEPT} \
               "https://registry-1.docker.io/v2/${name}/manifests/${tag}"
