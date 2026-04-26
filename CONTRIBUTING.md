@@ -48,6 +48,31 @@ cargo test --workspace --lib
 - Add tests for new functionality
 - Update documentation if your change affects user-facing behavior
 
+## Regression-test contract for bug fixes
+
+Every PR that fixes a bug must land with a regression test that fails on
+`main` and passes on the PR. This is enforced by checkbox in the PR
+template and by reviewer policy: `fix/*` PRs are not approved without
+the box checked.
+
+The test can live wherever fits the bug:
+
+- **Unit test** in the same crate as the fixed code, when the bug is
+  in pure logic.
+- **Integration test** in the same repo, when the bug requires a real
+  database, storage backend, or HTTP client.
+- **End-to-end test** in
+  [`artifact-keeper-test`](https://github.com/artifact-keeper/artifact-keeper-test),
+  when the bug surfaces only when the deployed system is exercised
+  through its native client (`mvn`, `npm`, `docker pull`, etc.).
+
+For PRs that aren't bug fixes (`feat/`, `chore/`, `docs/`, `ci/`,
+`refactor/`), check the "N/A" box on the template.
+
+This is part of [Hardening Core](https://github.com/orgs/artifact-keeper/projects/2),
+the stability program tracking the work to make every release deploy
+clean from a fresh helm install.
+
 ## Reporting Security Issues
 
 Please do **not** open a public issue for security vulnerabilities. Instead, email the maintainers directly or use GitHub's private vulnerability reporting.
