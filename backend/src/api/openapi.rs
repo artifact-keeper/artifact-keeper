@@ -493,7 +493,7 @@ mod tests {
         ];
 
         // Sort by prefix length descending so longest match wins
-        handler_sources.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        handler_sources.sort_by_key(|h| std::cmp::Reverse(h.0.len()));
 
         let mut missing = Vec::new();
 
