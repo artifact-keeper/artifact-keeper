@@ -91,15 +91,24 @@ impl ImageScanner {
     }
 
     /// Check if the Trivy server is available.
-    async fn check_trivy_health(&self) -> bool {
-        match self
-            .http
-            .get(format!("{}/healthz", self.trivy_url))
-            .send()
-            .await
-        {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+    ///
+    /// Returns `Ok(())` when `/healthz` responds 2xx. Any other outcome
+    /// (network error, non-2xx status) is surfaced as an `AppError` so the
+    /// scan orchestrator can mark the scan FAILED with a descriptive
+    /// message rather than silently completing with zero findings.
+    async fn check_trivy_health(&self) -> Result<()> {
+        let url = format!("{}/healthz", self.trivy_url);
+        match self.http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => Err(AppError::Internal(format!(
+                "Trivy server at {} is unhealthy: HTTP {}",
+                self.trivy_url,
+                resp.status()
+            ))),
+            Err(e) => Err(AppError::Internal(format!(
+                "Trivy server at {} is unreachable: {}",
+                self.trivy_url, e
+            ))),
         }
     }
 
@@ -241,13 +250,15 @@ impl Scanner for ImageScanner {
             }
         };
 
-        // Check if Trivy server is healthy
-        if !self.check_trivy_health().await {
-            warn!(
-                "Trivy server at {} is not available, skipping image scan for {}",
-                self.trivy_url, image_ref
-            );
-            return Ok(vec![]);
+        // Check if Trivy server is healthy. If it is not reachable we must
+        // surface an error so the scan record is marked FAILED. Returning
+        // Ok(vec![]) here would silently mark the scan COMPLETED with zero
+        // findings even though no scanning ever happened (issue #888).
+        if let Err(e) = self.check_trivy_health().await {
+            return Err(AppError::Internal(format!(
+                "Trivy image scan failed for {}: {}",
+                image_ref, e
+            )));
         }
 
         info!("Starting Trivy scan for image: {}", image_ref);
@@ -439,6 +450,99 @@ mod tests {
 
         let findings = ImageScanner::convert_findings(&report);
         assert_eq!(findings.len(), 0);
+    }
+
+    /// Regression test for issue #888: when the Trivy server is
+    /// unreachable, `scan` must return Err so the orchestrator marks the
+    /// scan FAILED. Returning Ok(vec![]) would silently complete the scan
+    /// with zero findings even though Trivy never ran.
+    #[tokio::test]
+    async fn test_scan_fails_when_trivy_unreachable() {
+        // Use an unrouteable port so /healthz cannot succeed. Port 1 is
+        // reserved and any client binding to it will get a connection error.
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+
+        let artifact = Artifact {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            path: "v2/myapp/manifests/latest".to_string(),
+            name: "myapp".to_string(),
+            version: Some("latest".to_string()),
+            size_bytes: 1000,
+            checksum_sha256: "abc123".to_string(),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            storage_key: "test".to_string(),
+            is_deleted: false,
+            uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let result = scanner.scan(&artifact, None, &Bytes::new()).await;
+
+        assert!(
+            result.is_err(),
+            "scan() must return Err when Trivy is unreachable, not Ok(vec![]); \
+             a silent Ok(vec![]) is what caused the scan to be marked COMPLETED \
+             instead of FAILED in issue #888"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Trivy") && err_msg.contains("myapp:latest"),
+            "error must identify the failed scanner and image, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_trivy_health_returns_err_on_unreachable() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let result = scanner.check_trivy_health().await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unreachable") || msg.contains("unhealthy"),
+            "error message should describe the health-check failure, got: {}",
+            msg
+        );
+    }
+
+    /// When the artifact is not a container image, the scanner returns
+    /// Ok(vec![]) without ever contacting Trivy. This must remain true
+    /// even after the #888 fix — non-applicable artifacts are not failures.
+    #[tokio::test]
+    async fn test_scan_non_image_returns_ok_empty_without_trivy() {
+        let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
+        let artifact = Artifact {
+            id: uuid::Uuid::new_v4(),
+            repository_id: uuid::Uuid::new_v4(),
+            path: "pypi/pkg/1.0.0/pkg-1.0.0.tar.gz".to_string(),
+            name: "pkg".to_string(),
+            version: Some("1.0.0".to_string()),
+            size_bytes: 1000,
+            checksum_sha256: "abc".to_string(),
+            checksum_md5: None,
+            checksum_sha1: None,
+            content_type: "application/gzip".to_string(),
+            storage_key: "test".to_string(),
+            is_deleted: false,
+            uploaded_by: None,
+            quarantine_status: None,
+            quarantine_until: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let result = scanner.scan(&artifact, None, &Bytes::new()).await;
+        assert!(
+            result.is_ok(),
+            "non-container artifacts should not cause the image scanner to error"
+        );
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
