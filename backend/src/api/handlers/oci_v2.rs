@@ -2056,6 +2056,7 @@ struct UpstreamTagsPage {
     next_last: Option<String>,
 }
 
+#[rustfmt::skip]
 async fn fetch_upstream_tags_page(
     state: &SharedState,
     repo_id: Uuid,
