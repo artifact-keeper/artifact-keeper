@@ -2254,9 +2254,31 @@ pub async fn update_virtual_members(
         ));
     }
 
-    // Update priorities for each member
+    // Update priorities for each member.
+    //
+    // The current contract is "update existing rows only", so cycles cannot
+    // be introduced here. The defensive checks below exist so that if the
+    // contract is ever extended to insert missing rows, self-membership and
+    // cycles still cannot slip in. See issue #915.
     for member in &payload.members {
         let member_repo = service.get_by_key(&member.member_key).await?;
+
+        if member_repo.id == virtual_repo.id {
+            return Err(AppError::Validation(
+                "A virtual repository cannot be a member of itself".to_string(),
+            ));
+        }
+
+        if member_repo.repo_type == RepositoryType::Virtual
+            && service
+                .would_create_cycle(virtual_repo.id, member_repo.id)
+                .await?
+        {
+            return Err(AppError::Validation(format!(
+                "Updating member {} would leave virtual repository {} in a cycle",
+                member_repo.key, virtual_repo.key
+            )));
+        }
 
         sqlx::query(
             "UPDATE virtual_repo_members SET priority = $1 WHERE virtual_repo_id = $2 AND member_repo_id = $3",
