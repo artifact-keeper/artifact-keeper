@@ -104,6 +104,53 @@ fn require_visible(
     }
 }
 
+/// Issue #913: authorize a virtual-member mutation.
+///
+/// All three mutating handlers (`add_virtual_member`, `remove_virtual_member`,
+/// per-iteration step of `update_virtual_members`) must check access on BOTH
+/// the virtual parent and the member repo. A caller with write scope on the
+/// virtual parent must not be able to add/remove/reorder members they have no
+/// rights to. Tokens with `allowed_repo_ids = None` (admins, JWT sessions,
+/// unrestricted API tokens) bypass these checks naturally.
+///
+/// On denial of the member-repo check, emit a structured `tracing::warn!` so
+/// the event is recoverable from logs (the parent-repo denial is left to the
+/// existing `require_repo_access` callers that warn elsewhere in this module).
+fn authorize_virtual_member_mutation(
+    auth: &AuthExtension,
+    virtual_repo: &crate::models::repository::Repository,
+    member_repo: &crate::models::repository::Repository,
+    action: &str,
+) -> Result<()> {
+    if let Err(e) = require_repo_access(auth, virtual_repo.id) {
+        tracing::warn!(
+            actor_user_id = %auth.user_id,
+            actor_username = %auth.username,
+            virtual_repo_id = %virtual_repo.id,
+            virtual_repo_key = %virtual_repo.key,
+            member_repo_id = %member_repo.id,
+            member_repo_key = %member_repo.key,
+            action = action,
+            "denied virtual-member mutation: caller lacks access to virtual parent repo"
+        );
+        return Err(e);
+    }
+    if let Err(e) = require_repo_access(auth, member_repo.id) {
+        tracing::warn!(
+            actor_user_id = %auth.user_id,
+            actor_username = %auth.username,
+            virtual_repo_id = %virtual_repo.id,
+            virtual_repo_key = %virtual_repo.key,
+            member_repo_id = %member_repo.id,
+            member_repo_key = %member_repo.key,
+            action = action,
+            "denied virtual-member mutation: caller lacks access to member repo"
+        );
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Generic upsert helper for repository_config key-value pairs.
 ///
 /// Inserts a new row or updates an existing one for the given repository and
@@ -2038,16 +2085,25 @@ struct VirtualMemberRow {
     params(
         ("key" = String, Path, description = "Repository key"),
     ),
+    security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "List of virtual repository members", body = VirtualMembersListResponse),
+        (status = 200, description = "List of virtual repository members (filtered to caller-visible members)", body = VirtualMembersListResponse),
         (status = 400, description = "Repository is not virtual"),
+        (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found"),
     )
 )]
 pub async fn list_virtual_members(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
 ) -> Result<Json<VirtualMembersListResponse>> {
+    // Issue #913 (read side): require auth and filter the response to members
+    // the caller can actually see. Without this, a token restricted to a single
+    // repo (or any authenticated user, prior to this fix) could enumerate the
+    // full member set including key, name, and repo_type for repos they have
+    // no rights to. Mirrors the write-side authz that add/remove/update apply.
+    let auth = require_auth(auth)?;
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
@@ -2056,6 +2112,9 @@ pub async fn list_virtual_members(
             "Only virtual repositories have members".to_string(),
         ));
     }
+
+    // Caller must be able to see the virtual parent itself.
+    require_repo_access(&auth, repo.id)?;
 
     // Query members with their repository info
     let members: Vec<VirtualMemberRow> = sqlx::query_as(
@@ -2079,7 +2138,14 @@ pub async fn list_virtual_members(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let members = members.into_iter().map(map_member_row).collect();
+    // Filter to members the caller has access to. Tokens with
+    // allowed_repo_ids = None (admins, JWT sessions, unrestricted API tokens)
+    // see everything by virtue of `can_access_repo` returning true.
+    let members = members
+        .into_iter()
+        .filter(|row| auth.can_access_repo(row.member_repo_id))
+        .map(map_member_row)
+        .collect();
 
     Ok(Json(VirtualMembersListResponse { members }))
 }
@@ -2112,13 +2178,8 @@ pub async fn add_virtual_member(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, virtual_repo.id)?;
     let member_repo = service.get_by_key(&payload.member_key).await?;
-    // Issue #913: also require access on the member repo so a caller with
-    // write scope on the virtual parent cannot add a member they have no
-    // rights to. Tokens with `allowed_repo_ids = None` (admins, full-access
-    // JWT sessions, unrestricted API tokens) bypass this naturally.
-    require_repo_access(&auth, member_repo.id)?;
+    authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "add")?;
 
     // Get current max priority if not specified
     let priority = match payload.priority {
@@ -2201,16 +2262,17 @@ pub async fn remove_virtual_member(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, virtual_repo.id)?;
-    let member_repo = service.get_by_key(&member_key).await?;
-    // Issue #913: also require access on the member repo (see add_virtual_member).
-    require_repo_access(&auth, member_repo.id)?;
-
+    // Validate repo type BEFORE any access check so a caller without rights
+    // on a non-virtual repo gets 400 (validation), not 403 (authz). The 403
+    // path would otherwise act as an enumeration oracle: it tells an
+    // unauthorized caller the key exists.
     if virtual_repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
             "Only virtual repositories have members".to_string(),
         ));
     }
+    let member_repo = service.get_by_key(&member_key).await?;
+    authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "remove")?;
 
     sqlx::query(
         "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2",
@@ -2253,8 +2315,9 @@ pub async fn update_virtual_members(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, virtual_repo.id)?;
-
+    // Validate repo type BEFORE any access check so a caller without rights
+    // on a non-virtual repo gets 400 (validation), not 403 (authz). Avoids
+    // the same enumeration oracle remove_virtual_member guards against.
     if virtual_repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
             "Only virtual repositories have members".to_string(),
@@ -2264,8 +2327,7 @@ pub async fn update_virtual_members(
     // Update priorities for each member
     for member in &payload.members {
         let member_repo = service.get_by_key(&member.member_key).await?;
-        // Issue #913: also require access on each member repo (see add_virtual_member).
-        require_repo_access(&auth, member_repo.id)?;
+        authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "update")?;
 
         sqlx::query(
             "UPDATE virtual_repo_members SET priority = $1 WHERE virtual_repo_id = $2 AND member_repo_id = $3",
@@ -2278,8 +2340,9 @@ pub async fn update_virtual_members(
         .map_err(|e| AppError::Database(e.to_string()))?;
     }
 
-    // Return updated list
-    list_virtual_members(State(state), Path(key)).await
+    // Return updated list. Pass the same auth context so the listing is
+    // filtered to caller-visible members consistently.
+    list_virtual_members(State(state), Extension(Some(auth)), Path(key)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -4036,20 +4099,40 @@ mod tests {
     // -----------------------------------------------------------------------
     // Issue #913: virtual member endpoints must check access on BOTH the
     // virtual parent and each member repo before mutating membership. These
-    // tests model the per-member check the handlers now perform.
+    // tests now drive the production `authorize_virtual_member_mutation`
+    // helper directly (no test-only re-implementation), so a refactor that
+    // changes the auth model is forced through the same code path.
     // -----------------------------------------------------------------------
 
-    /// Simulate the parent + member access check that
-    /// `add_virtual_member`, `remove_virtual_member`, and the per-iteration
-    /// step of `update_virtual_members` perform after resolving the repos.
-    fn check_virtual_member_authz(
-        auth: &AuthExtension,
-        virtual_repo_id: Uuid,
-        member_repo_id: Uuid,
-    ) -> Result<()> {
-        require_repo_access(auth, virtual_repo_id)?;
-        require_repo_access(auth, member_repo_id)?;
-        Ok(())
+    /// Build a minimal `Repository` value with a caller-chosen id, suitable
+    /// for passing to `authorize_virtual_member_mutation`.
+    fn make_repo_with_id(id: Uuid, key: &str) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository};
+        let now = chrono::Utc::now();
+        Repository {
+            id,
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Pypi,
+            storage_backend: "filesystem".to_string(),
+            repo_type: RepositoryType::Local,
+            storage_path: format!("/data/{}", key),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::Scheduled,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     #[test]
@@ -4057,8 +4140,10 @@ mod tests {
         // Caller has access to V but not M -> 403.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
+        let v = make_repo_with_id(virtual_id, "v");
+        let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![virtual_id]));
-        let result = check_virtual_member_authz(&ext, virtual_id, member_id);
+        let result = authorize_virtual_member_mutation(&ext, &v, &m, "add");
         assert!(
             result.is_err(),
             "caller with access to parent only must be denied"
@@ -4076,8 +4161,10 @@ mod tests {
         // Caller has access to M but not V -> 403.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
+        let v = make_repo_with_id(virtual_id, "v");
+        let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![member_id]));
-        let result = check_virtual_member_authz(&ext, virtual_id, member_id);
+        let result = authorize_virtual_member_mutation(&ext, &v, &m, "remove");
         assert!(
             result.is_err(),
             "caller with access to member only must be denied"
@@ -4089,8 +4176,10 @@ mod tests {
         // Caller has access to both V and M -> ok.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
+        let v = make_repo_with_id(virtual_id, "v");
+        let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![virtual_id, member_id]));
-        assert!(check_virtual_member_authz(&ext, virtual_id, member_id).is_ok());
+        assert!(authorize_virtual_member_mutation(&ext, &v, &m, "update").is_ok());
     }
 
     #[test]
@@ -4099,8 +4188,10 @@ mod tests {
         // unrestricted API tokens) bypass the per-member check.
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
+        let v = make_repo_with_id(virtual_id, "v");
+        let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(None);
-        assert!(check_virtual_member_authz(&ext, virtual_id, member_id).is_ok());
+        assert!(authorize_virtual_member_mutation(&ext, &v, &m, "add").is_ok());
     }
 
     #[test]
@@ -4109,33 +4200,24 @@ mod tests {
         let virtual_id = Uuid::new_v4();
         let member_id = Uuid::new_v4();
         let other = Uuid::new_v4();
+        let v = make_repo_with_id(virtual_id, "v");
+        let m = make_repo_with_id(member_id, "m");
         let ext = make_auth_ext(Some(vec![other]));
-        assert!(check_virtual_member_authz(&ext, virtual_id, member_id).is_err());
+        assert!(authorize_virtual_member_mutation(&ext, &v, &m, "add").is_err());
     }
 
-    /// Issue #913 binding test (API Tester finding):
+    /// Issue #913 binding test:
     ///
-    /// The five tests above use a test-only `check_virtual_member_authz`
-    /// helper that re-implements the two `require_repo_access` calls each
-    /// production handler performs. If a refactor accidentally drops the
-    /// member-repo check from one of the actual handlers, those tests still
-    /// pass because they never touch the production code path.
-    ///
-    /// Invoking the real handlers from a unit test would require a full
-    /// `SharedState` (postgres pool, storage backend, etc.) which the rest
-    /// of this `mod tests` block deliberately avoids. Instead, this test
-    /// reads the handler source as a string and asserts that each of the
-    /// three mutating handlers literally contains
-    /// `require_repo_access(&auth, member_repo.id)` so the wiring cannot
-    /// silently regress. Ugly, but it gives us a single point of failure
-    /// for the API Tester finding without dragging the DB into unit tests.
+    /// The unit tests above call the production helper directly, but they
+    /// can't catch a handler that simply forgets to call it. Read the
+    /// handler source and assert each mutating handler invokes
+    /// `authorize_virtual_member_mutation`. The handlers require a full
+    /// `SharedState` (postgres pool, storage) which the rest of this mod
+    /// deliberately avoids, so a string-grep is the cheapest pin.
     #[test]
-    fn test_virtual_member_handlers_contain_member_repo_access_check() {
+    fn test_virtual_member_handlers_call_authz_helper() {
         let source = include_str!("repositories.rs");
 
-        // Locate each handler's body and assert it contains the per-member
-        // access check. Splitting on the `pub async fn <name>(` marker keeps
-        // us from matching only the doc comment or signature.
         for handler in [
             "add_virtual_member",
             "remove_virtual_member",
@@ -4145,8 +4227,6 @@ mod tests {
             let start = source
                 .find(&marker)
                 .unwrap_or_else(|| panic!("handler `{}` not found in repositories.rs", handler));
-            // Bound the search to the next `pub async fn` (or EOF) so we
-            // only inspect this handler's body.
             let rest = &source[start + marker.len()..];
             let end = rest
                 .find("\npub async fn ")
@@ -4155,13 +4235,93 @@ mod tests {
             let body = &rest[..end];
 
             assert!(
-                body.contains("require_repo_access(&auth, member_repo.id)"),
-                "handler `{}` is missing `require_repo_access(&auth, member_repo.id)` \
-                 (issue #913). If you intentionally removed it, also remove this test \
-                 and document the new authz model.",
+                body.contains("authorize_virtual_member_mutation("),
+                "handler `{}` does not call `authorize_virtual_member_mutation` \
+                 (issue #913). If you intentionally restructured the authz model, \
+                 update this test to match.",
                 handler
             );
         }
+    }
+
+    /// Issue #913 (validation order):
+    ///
+    /// `remove_virtual_member` must validate `repo_type == Virtual` BEFORE
+    /// any `require_repo_access` / `authorize_virtual_member_mutation` call,
+    /// otherwise a caller without rights to a non-virtual repo gets 403
+    /// instead of 400 — a small enumeration oracle. Same goes for
+    /// `update_virtual_members`. The handlers need DB state to invoke
+    /// directly, so we string-grep the source for ordering.
+    #[test]
+    fn test_remove_and_update_validate_repo_type_before_authz() {
+        let source = include_str!("repositories.rs");
+
+        for handler in ["remove_virtual_member", "update_virtual_members"] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest
+                .find("\npub async fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            let validation_pos = body
+                .find("repo_type != RepositoryType::Virtual")
+                .unwrap_or_else(|| panic!("handler `{}` is missing repo_type validation", handler));
+            let access_pos = body
+                .find("require_repo_access(&auth")
+                .or_else(|| body.find("authorize_virtual_member_mutation("))
+                .unwrap_or_else(|| panic!("handler `{}` is missing access check", handler));
+
+            assert!(
+                validation_pos < access_pos,
+                "handler `{}` runs access check before repo_type validation \
+                 (creates 403-vs-400 enumeration oracle, issue #913)",
+                handler
+            );
+        }
+    }
+
+    /// Issue #913 (read side): `list_virtual_members` must take an
+    /// `Extension<Option<AuthExtension>>` and filter the response to
+    /// caller-visible members. Without this, anyone with network access can
+    /// enumerate the full member set including key, name, repo_type. String-
+    /// grep because the handler needs a real DB to run.
+    #[test]
+    fn test_list_virtual_members_requires_auth_and_filters() {
+        let source = include_str!("repositories.rs");
+
+        let marker = "pub async fn list_virtual_members(";
+        let start = source
+            .find(marker)
+            .expect("list_virtual_members handler not found");
+        let rest = &source[start + marker.len()..];
+        let end = rest
+            .find("\npub async fn ")
+            .or_else(|| rest.find("\npub fn "))
+            .or_else(|| rest.find("\nfn "))
+            .unwrap_or(rest.len());
+        // The signature is part of `rest` before the body proper; capture
+        // both signature and body together.
+        let sig_and_body = &rest[..end];
+
+        assert!(
+            sig_and_body.contains("Extension(auth): Extension<Option<AuthExtension>>"),
+            "list_virtual_members must take Extension<Option<AuthExtension>> \
+             so the response can be filtered (issue #913)"
+        );
+        assert!(
+            sig_and_body.contains("require_auth(auth)"),
+            "list_virtual_members must call require_auth (issue #913)"
+        );
+        assert!(
+            sig_and_body.contains("auth.can_access_repo(row.member_repo_id)"),
+            "list_virtual_members must filter the response by \
+             can_access_repo(member_repo_id) (issue #913)"
+        );
     }
 
     // -----------------------------------------------------------------------
