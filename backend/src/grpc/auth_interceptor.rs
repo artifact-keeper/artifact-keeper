@@ -90,6 +90,7 @@ mod tests {
             iat: chrono::Utc::now().timestamp(),
             exp: chrono::Utc::now().timestamp() + 3600,
             token_type: token_type.to_string(),
+            jti: None,
         };
         encode(
             &Header::default(),
@@ -213,6 +214,7 @@ mod tests {
             iat,
             exp: iat + 3600,
             token_type: "access".to_string(),
+            jti: None,
         };
         let token = encode(
             &Header::default(),

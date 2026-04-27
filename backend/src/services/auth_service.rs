@@ -73,6 +73,15 @@ pub struct Claims {
     pub exp: i64,
     /// Token type: "access" or "refresh"
     pub token_type: String,
+    /// JWT ID. Used for refresh-token rotation: once a refresh token's jti
+    /// has been redeemed, the token is recorded in `used_refresh_jtis` and
+    /// further refresh attempts using the same token are rejected.
+    ///
+    /// Optional for backwards compatibility: tokens minted before issue
+    /// #929 do not carry a jti. Such legacy tokens are accepted once and
+    /// forced onto the rotation scheme. New tokens always include a jti.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<Uuid>,
 }
 
 /// Token pair response
@@ -261,6 +270,43 @@ pub(crate) fn is_user_api_tokens_invalidated_after(user_id: Uuid, cached_at: Ins
     false
 }
 
+/// In-memory guard for refresh tokens minted before issue #929 (no jti).
+/// Keyed by (user_id, iat) which uniquely identifies a legacy token within
+/// a single second; collisions are acceptable because they would also collide
+/// in the JWT itself. Entries are reaped opportunistically on each insert.
+static LEGACY_REFRESH_USED: OnceLock<RwLock<HashMap<(Uuid, i64), i64>>> = OnceLock::new();
+
+fn legacy_refresh_used_map() -> &'static RwLock<HashMap<(Uuid, i64), i64>> {
+    LEGACY_REFRESH_USED.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Atomically record a legacy (pre-#929) refresh token as used. Returns true
+/// if this call claimed the token, false if it had already been claimed.
+pub(crate) fn claim_legacy_refresh(user_id: Uuid, issued_at: i64) -> bool {
+    let now = Utc::now().timestamp();
+    let cutoff = now - INVALIDATION_RETENTION_SECS;
+    if let Ok(mut map) = legacy_refresh_used_map().write() {
+        map.retain(|_, ts| *ts > cutoff);
+        if map.contains_key(&(user_id, issued_at)) {
+            return false;
+        }
+        map.insert((user_id, issued_at), now);
+        true
+    } else {
+        // If the lock is poisoned, fail closed: treat as already used.
+        false
+    }
+}
+
+/// Test-only helper to clear the legacy-refresh in-memory guard so individual
+/// tests do not interfere with each other.
+#[cfg(test)]
+pub(crate) fn reset_legacy_refresh_used() {
+    if let Ok(mut map) = legacy_refresh_used_map().write() {
+        map.clear();
+    }
+}
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
@@ -375,8 +421,12 @@ impl AuthService {
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
+            jti: Some(Uuid::new_v4()),
         };
 
+        // Refresh tokens carry a jti so we can reject replays after a single
+        // use (issue #929). The jti is recorded in `used_refresh_jtis` when
+        // the token is consumed by `refresh_tokens`.
         let refresh_claims = Claims {
             sub: user.id,
             username: user.username.clone(),
@@ -385,6 +435,7 @@ impl AuthService {
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(Uuid::new_v4()),
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
@@ -416,6 +467,17 @@ impl AuthService {
         Ok(token_data.claims)
     }
 
+    /// Exchange a refresh token for a fresh token pair.
+    ///
+    /// Refresh tokens are single-use: the supplied token's jti is recorded in
+    /// `used_refresh_jtis` after a successful exchange, and any later attempt
+    /// to refresh with the same token is rejected as a replay (issue #929).
+    ///
+    /// Tokens minted before #929 do not carry a jti. They are still accepted,
+    /// but only once: the first successful refresh issues a jti-bearing pair
+    /// and forces all clients onto the rotation scheme. To still defend
+    /// against parallel replays of legacy tokens, we rate-limit through the
+    /// in-memory `LEGACY_REFRESH_USED` set keyed by (user_id, iat).
     pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<(User, TokenPair)> {
         let token_data = self.decode_token(refresh_token)?;
 
@@ -427,6 +489,45 @@ impl AuthService {
 
         if token_data.claims.token_type != "refresh" {
             return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+
+        // Single-use rotation: if the token carries a jti, ensure it has not
+        // already been redeemed. The atomic INSERT below acts as the
+        // claim-the-jti step; if it returns 0 rows, another caller already
+        // claimed it, which means this request is a replay.
+        if let Some(jti) = token_data.claims.jti {
+            let inserted = sqlx::query!(
+                r#"
+                INSERT INTO used_refresh_jtis (jti, user_id)
+                VALUES ($1, $2)
+                ON CONFLICT (jti) DO NOTHING
+                "#,
+                jti,
+                token_data.claims.sub
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if inserted.rows_affected() == 0 {
+                // Replay detected. Invalidate the user's existing access
+                // tokens issued at-or-before this refresh so a leaked pair
+                // is fully neutralized rather than letting the attacker keep
+                // using a still-valid access token until natural expiry.
+                invalidate_user_tokens(token_data.claims.sub);
+                return Err(AppError::Authentication(
+                    "Refresh token has already been used".to_string(),
+                ));
+            }
+        } else {
+            // Legacy token (pre-#929): no jti to record. Accept once via an
+            // in-memory guard keyed by (user_id, iat). After the first use
+            // the caller receives a jti-bearing pair and is on the new path.
+            if !claim_legacy_refresh(token_data.claims.sub, token_data.claims.iat) {
+                return Err(AppError::Authentication(
+                    "Refresh token has already been used".to_string(),
+                ));
+            }
         }
 
         // Fetch fresh user data
@@ -451,6 +552,21 @@ impl AuthService {
 
         let tokens = self.generate_tokens(&user)?;
         Ok((user, tokens))
+    }
+
+    /// Garbage-collect refresh-token jti records that are older than the
+    /// refresh-token TTL. After that point, the corresponding tokens would
+    /// fail JWT exp validation anyway, so the jti row is no longer load-bearing.
+    ///
+    /// Returns the number of rows deleted.
+    pub async fn gc_used_refresh_jtis(&self) -> Result<u64> {
+        let ttl_days = self.config.jwt_refresh_token_expiry_days.max(1);
+        let cutoff = Utc::now() - Duration::days(ttl_days);
+        let result = sqlx::query!("DELETE FROM used_refresh_jtis WHERE used_at < $1", cutoff)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
     }
 
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
@@ -1274,6 +1390,7 @@ impl AuthService {
             iat: now.timestamp(),
             exp: exp.timestamp(),
             token_type: "totp_pending".to_string(),
+            jti: None,
         };
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
@@ -1481,6 +1598,7 @@ mod tests {
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
+            jti: Some(Uuid::new_v4()),
         };
 
         let refresh_claims = Claims {
@@ -1491,6 +1609,7 @@ mod tests {
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(Uuid::new_v4()),
         };
 
         let access_token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
@@ -1535,6 +1654,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::days(7)).timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(Uuid::new_v4()),
         };
 
         let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
@@ -1562,6 +1682,7 @@ mod tests {
             iat: (now - Duration::hours(2)).timestamp(),
             exp: (now - Duration::hours(1)).timestamp(), // expired 1 hour ago
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -1583,6 +1704,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -1605,6 +1727,7 @@ mod tests {
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -2513,6 +2636,7 @@ mod tests {
             iat: Utc::now().timestamp(),
             exp: (Utc::now() + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
+            jti: None,
         };
         let payload_json = serde_json::to_vec(&claims).unwrap();
         let payload_b64 = {
@@ -2523,5 +2647,114 @@ mod tests {
         let validation = Validation::new(Algorithm::HS256);
         let result = decode::<Claims>(&forged_token, &decoding_key, &validation);
         assert!(result.is_err(), "alg=none token must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Refresh-token rotation: legacy in-memory guard (#929)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_claim_legacy_refresh_first_use_succeeds() {
+        reset_legacy_refresh_used();
+        let user = Uuid::new_v4();
+        let iat = Utc::now().timestamp();
+        assert!(claim_legacy_refresh(user, iat), "first claim must succeed");
+    }
+
+    #[test]
+    fn test_claim_legacy_refresh_replay_rejected() {
+        reset_legacy_refresh_used();
+        let user = Uuid::new_v4();
+        let iat = Utc::now().timestamp();
+        assert!(claim_legacy_refresh(user, iat));
+        assert!(
+            !claim_legacy_refresh(user, iat),
+            "second claim with same (user, iat) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_claim_legacy_refresh_distinct_iats_independent() {
+        reset_legacy_refresh_used();
+        let user = Uuid::new_v4();
+        let iat = Utc::now().timestamp();
+        assert!(claim_legacy_refresh(user, iat));
+        // A different iat (e.g. a freshly-issued token) must not be blocked
+        // by an earlier token's claim.
+        assert!(claim_legacy_refresh(user, iat + 1));
+    }
+
+    #[test]
+    fn test_claim_legacy_refresh_distinct_users_independent() {
+        reset_legacy_refresh_used();
+        let iat = Utc::now().timestamp();
+        let user_a = Uuid::new_v4();
+        let user_b = Uuid::new_v4();
+        assert!(claim_legacy_refresh(user_a, iat));
+        // A different user's claim at the same iat must not collide.
+        assert!(claim_legacy_refresh(user_b, iat));
+    }
+
+    // -----------------------------------------------------------------------
+    // Claims jti serialization (#929)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_claims_jti_serializes_when_present() {
+        let jti = Uuid::new_v4();
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            username: "u".to_string(),
+            email: "u@e.com".to_string(),
+            is_admin: false,
+            iat: 1000,
+            exp: 2000,
+            token_type: "refresh".to_string(),
+            jti: Some(jti),
+        };
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(
+            json.contains(&jti.to_string()),
+            "jti should be serialized when Some: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_claims_jti_omitted_when_none() {
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            username: "u".to_string(),
+            email: "u@e.com".to_string(),
+            is_admin: false,
+            iat: 1000,
+            exp: 2000,
+            token_type: "refresh".to_string(),
+            jti: None,
+        };
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(
+            !json.contains("\"jti\""),
+            "jti must be skipped when None: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_claims_legacy_token_without_jti_decodes() {
+        // Tokens minted before #929 do not carry a jti. Verify that such a
+        // payload still deserializes cleanly with jti = None.
+        let payload = r#"{
+            "sub": "00000000-0000-0000-0000-000000000001",
+            "username": "legacy",
+            "email": "legacy@x.com",
+            "is_admin": false,
+            "iat": 1000,
+            "exp": 2000,
+            "token_type": "refresh"
+        }"#;
+        let claims: Claims = serde_json::from_str(payload).unwrap();
+        assert!(claims.jti.is_none());
+        assert_eq!(claims.token_type, "refresh");
     }
 }

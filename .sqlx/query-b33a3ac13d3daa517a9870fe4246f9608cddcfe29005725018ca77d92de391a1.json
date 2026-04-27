@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM used_refresh_jtis WHERE used_at < $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b33a3ac13d3daa517a9870fe4246f9608cddcfe29005725018ca77d92de391a1"
+}

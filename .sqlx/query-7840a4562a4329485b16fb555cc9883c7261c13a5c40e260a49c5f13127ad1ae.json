@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO used_refresh_jtis (jti, user_id)\n                VALUES ($1, $2)\n                ON CONFLICT (jti) DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7840a4562a4329485b16fb555cc9883c7261c13a5c40e260a49c5f13127ad1ae"
+}
