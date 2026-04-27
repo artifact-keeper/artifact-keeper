@@ -2264,6 +2264,12 @@ pub async fn update_virtual_members(
         resolved.push((member.priority, member_repo.id));
     }
 
+    // Sort by member_repo_id to enforce a deterministic row-lock acquisition
+    // order. Two concurrent PUTs with overlapping member sets supplied in
+    // different request orders would otherwise grab row locks in conflicting
+    // sequences and deadlock under contention.
+    resolved.sort_by_key(|(_, member_repo_id)| *member_repo_id);
+
     // Run all UPDATEs inside a single transaction so concurrent PUTs cannot
     // interleave at row granularity and produce partially-applied bulk
     // updates. Either every priority change commits together or none do.
@@ -2274,7 +2280,14 @@ pub async fn update_virtual_members(
         .map_err(|e| AppError::Database(e.to_string()))?;
 
     for (priority, member_repo_id) in &resolved {
-        sqlx::query(
+        // TOCTOU guard: the resolution pass above ran outside the tx, so a
+        // concurrent DELETE could have removed the row between resolve and
+        // UPDATE. Postgres reports 0 rows affected in that case. Without this
+        // check the handler would commit silently and return stale data with
+        // a misleading 200. rows_affected != 1 means the membership row no
+        // longer satisfies the (virtual_repo_id, member_repo_id) predicate;
+        // roll back and surface a 404 so callers can retry.
+        let result = sqlx::query(
             "UPDATE virtual_repo_members SET priority = $1 WHERE virtual_repo_id = $2 AND member_repo_id = $3",
         )
         .bind(*priority)
@@ -2283,6 +2296,19 @@ pub async fn update_virtual_members(
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if result.rows_affected() != 1 {
+            // Drop the tx explicitly so the rollback is visible in logs.
+            // Falling out of scope would also roll it back, but being
+            // explicit keeps the intent obvious.
+            tx.rollback()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            return Err(AppError::NotFound(format!(
+                "Member {} not found in virtual repository {}",
+                member_repo_id, virtual_repo.id
+            )));
+        }
     }
 
     tx.commit()
@@ -3599,42 +3625,13 @@ mod tests {
         assert_eq!(req.members[1].priority, 2);
     }
 
-    /// Smoke test for the resolution step in `update_virtual_members`. The
-    /// handler resolves all `member_key` lookups into `(priority, repo_id)`
-    /// tuples *before* opening the transaction so a bad key fails fast with
-    /// 404 and the tx never opens. This test covers that the (priority,
-    /// repo_id) pairing preserves request order, which is the invariant the
-    /// transactional UPDATE loop depends on.
-    ///
-    /// Follow-up: a DB-backed integration test should assert that a failure
-    /// mid-loop rolls back already-applied UPDATEs (#912 follow-up). That
-    /// requires PostgreSQL and is tracked separately because the existing
-    /// integration tests run against a live HTTP server.
-    #[test]
-    fn test_update_virtual_members_resolution_preserves_order() {
-        let json = r#"{
-            "members": [
-                {"member_key": "repo-c", "priority": 30},
-                {"member_key": "repo-a", "priority": 10},
-                {"member_key": "repo-b", "priority": 20}
-            ]
-        }"#;
-        let req: UpdateVirtualMembersRequest = serde_json::from_str(json).unwrap();
-
-        // Simulate the resolution step: pair each request entry with a
-        // resolved repo id (using a stub UUID per key) and assert the
-        // resulting tuples preserve the request-order priorities.
-        let resolved: Vec<(i32, Uuid)> = req
-            .members
-            .iter()
-            .map(|m| (m.priority, Uuid::new_v4()))
-            .collect();
-
-        assert_eq!(resolved.len(), 3);
-        assert_eq!(resolved[0].0, 30);
-        assert_eq!(resolved[1].0, 10);
-        assert_eq!(resolved[2].0, 20);
-    }
+    // Note: the original `test_update_virtual_members_resolution_preserves_order`
+    // unit test was removed during code review. It exercised
+    // `Vec::iter().map().collect()` and `serde_json::from_str`, neither of
+    // which touches the transactional UPDATE loop or the rows_affected check
+    // that fixes the #912 bug. A real DB-backed regression test now lives in
+    // `backend/tests/virtual_members_atomicity_test.rs` and would catch a
+    // regression of the partial-application behaviour.
 
     #[test]
     fn test_virtual_member_response_serialization() {
