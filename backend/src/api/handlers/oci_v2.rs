@@ -2075,26 +2075,21 @@ async fn fetch_upstream_tags_page(
     })?;
 
     let upstream_path = format!("v2/{}/{}", image, build_remote_tags_list_path(n, last));
-    let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        &upstream_path,
-    )
-    .await
-    .map_err(|resp| match resp.status() {
-        StatusCode::NOT_FOUND => oci_error(
-            StatusCode::NOT_FOUND,
-            "NAME_UNKNOWN",
-            "repository not found upstream",
-        ),
-        _ => oci_error(
-            StatusCode::BAD_GATEWAY,
-            "UNKNOWN",
-            "failed to fetch tags from upstream",
-        ),
-    })?;
+    let (content, _ct, link) =
+        proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, upstream_url, &upstream_path)
+            .await
+            .map_err(|resp| match resp.status() {
+                StatusCode::NOT_FOUND => oci_error(
+                    StatusCode::NOT_FOUND,
+                    "NAME_UNKNOWN",
+                    "repository not found upstream",
+                ),
+                _ => oci_error(
+                    StatusCode::BAD_GATEWAY,
+                    "UNKNOWN",
+                    "failed to fetch tags from upstream",
+                ),
+            })?;
 
     let parsed = serde_json::from_slice::<serde_json::Value>(&content).map_err(|e| {
         warn!("Invalid upstream tags/list response for {}: {}", image, e);
@@ -2121,7 +2116,11 @@ async fn fetch_upstream_tags_page(
             .iter()
             .filter_map(|t| t.as_str().map(String::from))
             .collect(),
-        next_last: if link.is_empty() { None } else { parse_upstream_pagination_last(&link) },
+        next_last: if link.is_empty() {
+            None
+        } else {
+            parse_upstream_pagination_last(&link)
+        },
     })
 }
 
