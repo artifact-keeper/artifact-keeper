@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Proxy stampede protection.** Bounded concurrent in-flight upstream fetches
+  across remote/proxy repositories via a `tokio::sync::Semaphore` (default 20
+  permits, 10s queue timeout). When the queue saturates, requests return 503
+  Service Unavailable (new `OVERLOADED` error code) so clients can back off
+  rather than blocking indefinitely. Closes the cache-stampede / thundering-
+  herd failure mode from discussion #872. The acquire path is the chokepoint
+  inside `fetch_from_upstream`, so all upstream HTTP entry points are bounded
+  uniformly. Operators can disable via `PROXY_MAX_CONCURRENT_FETCHES=0`
+  (logs a startup warning).
+- **Proxy observability metrics.** `ak_proxy_upstream_inflight` (gauge) for
+  current saturation, `ak_proxy_queue_full_total` (counter) for 503 events,
+  and `ak_proxy_queue_wait_seconds` (histogram) for permit acquire latency.
+- **`AppError::Overloaded`** variant mapped to HTTP 503 with code
+  `OVERLOADED` for capacity-related rejections, distinct from `BAD_GATEWAY`
+  upstream-failure responses.
+
 ## [1.2.0] - 2026-04-24
 
 ### Sponsors

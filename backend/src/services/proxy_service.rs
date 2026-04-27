@@ -27,10 +27,15 @@ const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
 /// HTTP client timeout in seconds
 const HTTP_TIMEOUT_SECS: u64 = 60;
 
-/// Default cap on concurrent in-flight upstream fetches when the
-/// caller-supplied limit is zero (treated as "unbounded" for tests, but
-/// always at least 1 permit so `acquire` never deadlocks).
-const MIN_FETCH_PERMITS: usize = 1;
+/// Default upstream-fetch concurrency cap when no explicit value is supplied
+/// (e.g. the deprecated zero-arg `ProxyService::new` constructor).
+const DEFAULT_MAX_CONCURRENT_FETCHES: usize = 20;
+
+/// Default queue-wait budget per upstream fetch when no explicit value is
+/// supplied. Tuned to be tighter than typical client read timeouts (npm,
+/// cargo, pip) so a saturated proxy returns 503 fast rather than the
+/// client timing out first.
+const DEFAULT_QUEUE_TIMEOUT_SECS: u64 = 10;
 
 /// Response from an upstream registry fetch.
 struct UpstreamResponse {
@@ -81,112 +86,118 @@ pub struct ProxyService {
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
     token_cache: RwLock<HashMap<String, (String, Instant, u64)>>,
-    /// Caps the number of concurrent in-flight upstream fetches. A cache
-    /// stampede (N concurrent clients all hitting the same cold key) used
-    /// to fan out N concurrent upstream requests, drowning the upstream
-    /// or the backend's own connection budget. The semaphore bounds peak
-    /// at `proxy_max_concurrent_fetches` permits; requests that wait
-    /// longer than `queue_timeout` for a permit get a 503 (Overloaded).
-    /// Customer pain reference: discussion #872.
-    upstream_fetch_sem: Arc<Semaphore>,
-    /// Total permits (read-only, set at construction). Tracked separately
-    /// because `Semaphore::available_permits()` reports the *current*
-    /// available count, not the configured cap, and we want the cap in
-    /// the 503 message and metrics.
+    /// Bounds peak concurrent in-flight upstream fetches. When N concurrent
+    /// clients hit the same cold cache key, the proxy used to fan out N
+    /// concurrent upstream requests; this caps the fan-out at
+    /// `proxy_max_concurrent_fetches` (#872). The permit is acquired inside
+    /// [`Self::fetch_from_upstream`] (the single chokepoint for upstream HTTP)
+    /// and is held only for the duration of the HTTP call: cache writes,
+    /// stale-fallback DB/storage reads, and OCI token-exchange retries all
+    /// run outside the permit so a slow disk or upstream error cannot
+    /// block other repos' fetches.
+    ///
+    /// `None` = stampede protection disabled (operator set
+    /// `PROXY_MAX_CONCURRENT_FETCHES=0`). The acquire path becomes a no-op.
+    ///
+    /// NOTE: this bounds the *peak* of redundant fetches but does not
+    /// coalesce them. 20 clients on a single cold key still issue up to 20
+    /// upstream GETs. Single-flight coalescing (request-deduplication
+    /// keyed by cache_key) is a separate, complementary mechanism tracked
+    /// as a follow-up issue.
+    upstream_fetch_sem: Option<Arc<Semaphore>>,
+    /// Configured permit count (0 = disabled). Cached separately because
+    /// `Semaphore::available_permits()` reports current availability, not
+    /// the configured cap, and we want the cap in error messages and the
+    /// `ak_proxy_upstream_inflight` gauge.
     fetch_concurrency_limit: usize,
     /// Time a fetch will wait for a permit before giving up with 503.
     queue_timeout: Duration,
 }
 
 impl ProxyService {
-    /// Create a new proxy service with default fetch concurrency (20 permits,
-    /// 30s queue timeout). Prefer `with_concurrency` when the caller has
-    /// explicit configured values.
-    pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
-        Self::with_concurrency(db, storage, 20, Duration::from_secs(30))
-    }
-
     /// Create a new proxy service with explicit upstream-fetch concurrency
-    /// limits. Pass 0 for `max_concurrent_fetches` to effectively disable
-    /// the cap (one permit; not a real bypass, but avoids deadlock).
+    /// limits. Pass `0` for `max_concurrent_fetches` to disable stampede
+    /// protection entirely (no semaphore allocated, acquire is a no-op).
     pub fn with_concurrency(
         db: PgPool,
         storage: Arc<StorageService>,
         max_concurrent_fetches: usize,
         queue_timeout: Duration,
     ) -> Self {
-        let permits = max_concurrent_fetches.max(MIN_FETCH_PERMITS);
         let http_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .user_agent("artifact-keeper-proxy/1.0")
             .build()
             .expect("Failed to create HTTP client");
 
+        let upstream_fetch_sem = if max_concurrent_fetches == 0 {
+            tracing::warn!(
+                "PROXY_MAX_CONCURRENT_FETCHES=0; upstream-fetch stampede protection is DISABLED. \
+                 Set a positive value to bound concurrent upstream requests."
+            );
+            None
+        } else {
+            Some(Arc::new(Semaphore::new(max_concurrent_fetches)))
+        };
+
         Self {
             db,
             storage,
             http_client,
             token_cache: RwLock::new(HashMap::new()),
-            upstream_fetch_sem: Arc::new(Semaphore::new(permits)),
-            fetch_concurrency_limit: permits,
+            upstream_fetch_sem,
+            fetch_concurrency_limit: max_concurrent_fetches,
             queue_timeout,
         }
     }
 
-    /// Test-only: build a ProxyService whose db / storage / http_client are
-    /// minimally-initialized stubs so unit tests can exercise the upstream
-    /// fetch semaphore without spinning up Postgres or wiremock. This must
-    /// stay #[cfg(test)] so production builds never accept a fake DB.
-    #[cfg(test)]
-    fn test_with_semaphore(max_concurrent: usize, queue_timeout: Duration) -> std::sync::Arc<Self> {
-        let permits = max_concurrent.max(MIN_FETCH_PERMITS);
-        let http_client = crate::services::http_client::base_client_builder()
-            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .build()
-            .expect("test http client");
-        // PgPool::connect_lazy with an obviously-invalid URL gives us a pool
-        // that never resolves; the semaphore tests never call into it.
-        let db =
-            sqlx::PgPool::connect_lazy("postgres://test:test@localhost:0/test").expect("lazy pool");
-        // Filesystem-backed StorageService at a uuid-isolated path so the
-        // test never collides with concurrent test runs or other sessions
-        // (see CLAUDE.md /tmp Workspace Hygiene).
-        let storage_root =
-            std::env::temp_dir().join(format!("ak-proxy-test-{}", uuid::Uuid::new_v4()));
-        let backend: std::sync::Arc<dyn crate::services::storage_service::StorageBackend> =
-            std::sync::Arc::new(crate::services::storage_service::FilesystemBackend::new(
-                storage_root,
-            ));
-        let storage = std::sync::Arc::new(crate::services::storage_service::StorageService::new(
-            backend,
-        ));
-        std::sync::Arc::new(Self {
+    /// Convenience constructor with documented defaults (20 permits, 10s
+    /// queue timeout). Prefer `with_concurrency` so config knobs propagate
+    /// from `Config` to a single source of truth.
+    pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
+        Self::with_concurrency(
             db,
             storage,
-            http_client,
-            token_cache: RwLock::new(HashMap::new()),
-            upstream_fetch_sem: Arc::new(Semaphore::new(permits)),
-            fetch_concurrency_limit: permits,
-            queue_timeout,
-        })
+            DEFAULT_MAX_CONCURRENT_FETCHES,
+            Duration::from_secs(DEFAULT_QUEUE_TIMEOUT_SECS),
+        )
     }
 
     /// Acquire a permit for an upstream fetch, waiting up to `queue_timeout`.
-    /// Returns Err(AppError::Overloaded) when the queue is saturated and the
-    /// timeout fires. The returned guard automatically releases the permit
-    /// when dropped (i.e. when the caller's fetch_from_upstream completes).
-    async fn acquire_fetch_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        match tokio_timeout(
-            self.queue_timeout,
-            self.upstream_fetch_sem.clone().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) => Err(AppError::Internal(
-                "proxy upstream-fetch semaphore is closed".to_string(),
-            )),
+    ///
+    /// Returns `Ok(None)` when stampede protection is disabled (operator set
+    /// the limit to 0). Returns `Ok(Some(permit))` after acquiring a permit;
+    /// the guard automatically releases on drop. Returns
+    /// `Err(AppError::Overloaded)` when the queue is saturated and the
+    /// timeout fires, after emitting `ak_proxy_queue_full_total`.
+    ///
+    /// Emits `ak_proxy_queue_wait_seconds` for every acquire attempt
+    /// (success or timeout) so operators can dashboard p50/p95 wait time.
+    async fn acquire_fetch_permit(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let Some(sem) = &self.upstream_fetch_sem else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let result = tokio_timeout(self.queue_timeout, sem.clone().acquire_owned()).await;
+        let waited = started.elapsed();
+        crate::services::metrics_service::record_proxy_queue_wait(waited.as_secs_f64());
+
+        match result {
+            Ok(Ok(permit)) => {
+                let inflight = self
+                    .fetch_concurrency_limit
+                    .saturating_sub(sem.available_permits());
+                crate::services::metrics_service::set_proxy_upstream_inflight(inflight as f64);
+                Ok(Some(permit))
+            }
+            Ok(Err(_)) => {
+                // The semaphore is owned by this ProxyService instance and
+                // is never explicitly closed. Reaching this branch implies a
+                // logic error elsewhere, not a runtime condition.
+                unreachable!("upstream_fetch_sem is never closed")
+            }
             Err(_) => {
+                crate::services::metrics_service::record_proxy_queue_full();
                 tracing::warn!(
                     limit = self.fetch_concurrency_limit,
                     timeout_secs = self.queue_timeout.as_secs(),
@@ -260,14 +271,12 @@ impl ProxyService {
             return Ok((content, content_type));
         }
 
-        // Cache miss: acquire a permit before dialing upstream. Bounds peak
-        // concurrent upstream fetches to `proxy_max_concurrent_fetches` to
-        // prevent thundering-herd against the upstream registry. Permit is
-        // released when `_permit` drops at end of scope (after the fetch
-        // and the cache write complete).
-        let _permit = self.acquire_fetch_permit().await?;
-
-        // Fetch from upstream using the real fetch_path
+        // Fetch from upstream using the real fetch_path. The stampede-
+        // protection permit is acquired inside fetch_from_upstream itself
+        // (the chokepoint) so callers like fetch_upstream_direct that don't
+        // go through this cache-aware path are also bounded. The permit is
+        // released as soon as the upstream HTTP call completes; the cache
+        // write below and the stale-fallback branch run unguarded.
         let full_url = Self::build_upstream_url(upstream_url, fetch_path);
         let upstream_result = self.fetch_from_upstream(&full_url, repo.id).await;
 
@@ -527,6 +536,16 @@ impl ProxyService {
     /// cached in memory with their advertised TTL so subsequent requests to
     /// the same registry/scope don't repeat the exchange.
     async fn fetch_from_upstream(&self, url: &str, repo_id: Uuid) -> Result<UpstreamResponse> {
+        // Stampede protection: every upstream HTTP call funnels through
+        // this method, so acquiring the permit here bounds concurrent
+        // fan-out across ALL paths (fetch_artifact_with_cache_path,
+        // fetch_upstream_direct, fetch_upstream_direct_with_link, OCI
+        // bearer-token retries, ETag conditional fetches, etc.) without
+        // each caller having to remember to acquire. The permit is
+        // released when this function returns; the caller's cache write
+        // / stale fallback / metadata persistence run unguarded.
+        let _permit = self.acquire_fetch_permit().await?;
+
         tracing::info!("Fetching artifact from upstream: {}", url);
 
         let upstream_auth =
@@ -2134,44 +2153,70 @@ mod tests {
     // =======================================================================
     // upstream-fetch semaphore tests (proxy_stampede_protection)
     //
-    // These validate the bounded-concurrency behavior of acquire_fetch_permit
-    // directly, without spinning up a database or upstream. They deliberately
-    // measure peak concurrency the same way the cache-stampede E2E test does,
-    // so a regression here will fire long before the gate.
+    // Validate acquire_fetch_permit directly without DB or wiremock. The
+    // critical bound-concurrency test gates task release through a Barrier,
+    // so the observed peak is deterministic and not coupled to wallclock
+    // sleep — a starved CI runner cannot mask a regression.
     // =======================================================================
 
-    fn make_semaphore_only_proxy(
+    /// Build a ProxyService for permit-only tests. Returns the service plus
+    /// the TempDir guard; the guard MUST be kept alive for the duration of
+    /// the test or the storage backend's tempdir is unlinked early.
+    ///
+    /// IMPORTANT: this service's `db` is `PgPool::connect_lazy` against an
+    /// invalid URL. Any test that calls a method touching `self.db` will
+    /// hang on connect. Stick to `acquire_fetch_permit` and direct field
+    /// access on `upstream_fetch_sem`.
+    fn make_permit_only_proxy(
         max_concurrent: usize,
         queue_timeout: Duration,
-    ) -> std::sync::Arc<ProxyService> {
-        // Build a ProxyService whose db/storage are unused by the permit
-        // acquire path. We construct only the fields acquire_fetch_permit
-        // touches (semaphore, fetch_concurrency_limit, queue_timeout) and
-        // leave the rest as cheap placeholders. The struct is private so we
-        // construct via a test-only constructor.
-        ProxyService::test_with_semaphore(max_concurrent, queue_timeout)
+    ) -> (std::sync::Arc<ProxyService>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("create tempdir for permit-only proxy test");
+        let backend: std::sync::Arc<dyn crate::services::storage_service::StorageBackend> =
+            std::sync::Arc::new(crate::services::storage_service::FilesystemBackend::new(
+                temp_dir.path().to_path_buf(),
+            ));
+        let storage = std::sync::Arc::new(crate::services::storage_service::StorageService::new(
+            backend,
+        ));
+        let db = sqlx::PgPool::connect_lazy("postgres://invalid-host/test")
+            .expect("lazy pool construction");
+        let svc = ProxyService::with_concurrency(db, storage, max_concurrent, queue_timeout);
+        (std::sync::Arc::new(svc), temp_dir)
     }
 
     #[tokio::test]
-    async fn test_acquire_permit_bounds_concurrency_at_limit() {
+    async fn test_acquire_permit_bounds_concurrency_at_limit_deterministic() {
+        // Deterministic peak measurement: each task acquires a permit, ticks
+        // a Barrier waiting for LIMIT tasks to be inside the critical region,
+        // then releases. This proves peak == LIMIT exactly; a starved runner
+        // cannot make peak appear lower than LIMIT.
         const LIMIT: usize = 3;
         const N: usize = 12;
-        let svc = make_semaphore_only_proxy(LIMIT, Duration::from_secs(5));
+        let (svc, _td) = make_permit_only_proxy(LIMIT, Duration::from_secs(30));
 
         let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Barrier of LIMIT: only LIMIT permit-holders fit at once, so once
+        // LIMIT tasks have acquired they all proceed past the barrier
+        // together; the rest stay queued at acquire_fetch_permit until a
+        // permit drops, repeat the cycle.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(LIMIT));
+
         let mut handles = Vec::new();
         for _ in 0..N {
             let svc = svc.clone();
             let inflight = inflight.clone();
             let peak = peak.clone();
+            let barrier = barrier.clone();
             handles.push(tokio::spawn(async move {
                 let permit = svc.acquire_fetch_permit().await.expect("permit");
                 let cur = inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 peak.fetch_max(cur, std::sync::atomic::Ordering::SeqCst);
-                // Simulate a non-trivial upstream fetch so concurrent tasks
-                // actually overlap inside the critical section.
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // Wait until exactly LIMIT permit-holders are in the
+                // critical region. This guarantees observed peak == LIMIT
+                // without depending on scheduler timing.
+                barrier.wait().await;
                 inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 drop(permit);
             }));
@@ -2181,29 +2226,24 @@ mod tests {
         }
 
         let peak_observed = peak.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            peak_observed <= LIMIT,
-            "peak concurrent fetches {} exceeded configured limit {}",
-            peak_observed,
-            LIMIT
-        );
-        assert!(
-            peak_observed >= 1,
-            "expected at least one concurrent fetch; got {}",
-            peak_observed
+        assert_eq!(
+            peak_observed, LIMIT,
+            "expected peak concurrent fetches to equal LIMIT={LIMIT}, got {peak_observed}"
         );
     }
 
     #[tokio::test]
     async fn test_acquire_permit_returns_overloaded_on_queue_timeout() {
         // Limit=1 + a held permit => the next acquire must time out.
-        let svc = make_semaphore_only_proxy(1, Duration::from_millis(150));
-        let _held = svc
+        // 500ms timeout gives ~3x scheduler-jitter margin over the previous
+        // 150ms; total test runtime stays well under a second.
+        let (svc, _td) = make_permit_only_proxy(1, Duration::from_millis(500));
+        let sem = svc
             .upstream_fetch_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("hold permit");
+            .as_ref()
+            .expect("limit=1 must allocate a semaphore")
+            .clone();
+        let _held = sem.acquire_owned().await.expect("hold permit");
 
         let result = svc.acquire_fetch_permit().await;
         match result {
@@ -2225,29 +2265,88 @@ mod tests {
     async fn test_acquire_permit_succeeds_after_release() {
         // Verify the semaphore is not poisoned by a queue-timeout: after a
         // held permit is released, the next acquire succeeds normally.
-        let svc = make_semaphore_only_proxy(1, Duration::from_millis(150));
+        let (svc, _td) = make_permit_only_proxy(1, Duration::from_millis(500));
         {
-            let _held = svc
+            let sem = svc
                 .upstream_fetch_sem
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("hold permit");
+                .as_ref()
+                .expect("limit=1 must allocate a semaphore")
+                .clone();
+            let _held = sem.acquire_owned().await.expect("hold permit");
             let _ = svc.acquire_fetch_permit().await; // expected to time out
         }
         let permit = svc
             .acquire_fetch_permit()
             .await
             .expect("post-release acquire");
+        assert!(
+            permit.is_some(),
+            "expected Some(permit) after holder released; got None (limit > 0 should always allocate)"
+        );
         drop(permit);
     }
 
     #[tokio::test]
-    async fn test_zero_max_concurrent_normalizes_to_one_permit() {
-        // Pass 0 => MIN_FETCH_PERMITS guarantees 1 permit (no deadlock).
-        let svc = make_semaphore_only_proxy(0, Duration::from_secs(1));
-        assert_eq!(svc.fetch_concurrency_limit, 1);
-        let permit = svc.acquire_fetch_permit().await.expect("acquire");
-        drop(permit);
+    async fn test_zero_max_concurrent_disables_stampede_protection() {
+        // Operator kill switch: PROXY_MAX_CONCURRENT_FETCHES=0 must DISABLE
+        // the limiter entirely (no semaphore allocated, acquire is a no-op).
+        // The previous behavior of clamping to 1 permit was a footgun: an
+        // operator's instinct ("0 = disabled") tightened the cap instead.
+        let (svc, _td) = make_permit_only_proxy(0, Duration::from_secs(1));
+        assert_eq!(svc.fetch_concurrency_limit, 0);
+        assert!(
+            svc.upstream_fetch_sem.is_none(),
+            "limit=0 must allocate no semaphore; got Some(_)"
+        );
+        // Acquire is a no-op fast path that returns Ok(None).
+        let permit = svc.acquire_fetch_permit().await.expect("no-op acquire");
+        assert!(
+            permit.is_none(),
+            "limit=0 acquire must return Ok(None); got Some(_)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_acquire_permit_no_op_does_not_block_under_concurrency() {
+        // With stampede protection disabled, N concurrent acquires must all
+        // return immediately without any semaphore contention. Catches a
+        // regression where the disabled path accidentally still sequences.
+        let (svc, _td) = make_permit_only_proxy(0, Duration::from_secs(1));
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let svc = svc.clone();
+            handles.push(tokio::spawn(async move {
+                svc.acquire_fetch_permit().await.expect("acquire").is_none()
+            }));
+        }
+        for h in handles {
+            assert!(h.await.expect("task"), "expected None permit on disabled");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_error_maps_to_503_service_unavailable() {
+        // Documents the AppError::Overloaded → 503 contract. The proxy 503
+        // is the load-bearing client signal: if this drifts to 500 or
+        // 502, clients will retry too aggressively or stop retrying
+        // entirely. Worth a unit test rather than relying on the E2E gate.
+        let err = AppError::Overloaded("queue full".to_string());
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_with_concurrency_default_construction() {
+        // Validate the documented defaults wired by ProxyService::new().
+        let (svc, _td) = make_permit_only_proxy(
+            DEFAULT_MAX_CONCURRENT_FETCHES,
+            Duration::from_secs(DEFAULT_QUEUE_TIMEOUT_SECS),
+        );
+        assert_eq!(svc.fetch_concurrency_limit, DEFAULT_MAX_CONCURRENT_FETCHES);
+        assert_eq!(
+            svc.queue_timeout,
+            Duration::from_secs(DEFAULT_QUEUE_TIMEOUT_SECS)
+        );
+        assert!(svc.upstream_fetch_sem.is_some());
     }
 }
