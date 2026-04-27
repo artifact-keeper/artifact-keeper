@@ -270,7 +270,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
 
     tracing::debug!("Proxying sumdb request to {}", url);
 
-    let client = reqwest::Client::new();
+    let client = crate::services::http_client::default_client();
     let upstream_resp = client.get(&url).send().await.map_err(|e| {
         tracing::warn!("sumdb proxy request failed for {}: {}", url, e);
         (

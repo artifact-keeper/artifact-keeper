@@ -2795,69 +2795,23 @@ mod tests {
         );
     }
 
-    /// Regression test for chained-SSRF via upstream `config.json` `dl` field
-    /// using IPv4-mapped IPv6 addresses and IPv6 link-local / unique-local
-    /// addresses. A malicious upstream registry can return a `dl` of the form
-    /// `http://[::ffff:169.254.169.254]/...` which slips past a naive
-    /// `is_loopback()` / `is_private()` check on the parsed IPv6 address.
+    /// Smoke test that the cargo `dl` field flows through
+    /// `validate_outbound_url`. The detailed coverage of each bypass
+    /// class lives in `api::validation::tests`; this test pins the
+    /// integration: a malicious upstream `config.json` returning a
+    /// crafted `dl` cannot reach AWS IMDS via the cargo download path.
+    /// One realistic case is sufficient — duplicating the full bypass
+    /// matrix here would shadow the validator's own tests.
     #[test]
-    fn test_build_download_url_rejects_ipv6_ssrf_bypasses() {
+    fn test_build_download_url_rejects_ipv6_ssrf_bypass() {
         use crate::api::validation::validate_outbound_url;
-
-        // IPv4-mapped IPv6 -> AWS IMDS metadata
-        let dl = "http://[::ffff:169.254.169.254]/latest/meta-data";
+        let dl = "http://[::ffff:169.254.169.254]";
         let url = build_download_url(dl, "evil", "1.0.0");
+        let err = validate_outbound_url(&url, "Cargo upstream download URL")
+            .expect_err("IPv4-mapped AWS IMDS via dl must be rejected");
         assert!(
-            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
-            "IPv4-mapped IPv6 AWS metadata must be rejected"
-        );
-
-        // IPv4-mapped IPv6 -> loopback
-        let dl = "http://[::ffff:127.0.0.1]/admin";
-        let url = build_download_url(dl, "evil", "1.0.0");
-        assert!(
-            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
-            "IPv4-mapped IPv6 loopback must be rejected"
-        );
-
-        // IPv4-mapped IPv6 -> RFC1918 (10.0.0.1)
-        let dl = "http://[::ffff:10.0.0.1]/internal";
-        let url = build_download_url(dl, "evil", "1.0.0");
-        assert!(
-            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
-            "IPv4-mapped IPv6 private network must be rejected"
-        );
-
-        // IPv6 link-local
-        let dl = "http://[fe80::1]/api";
-        let url = build_download_url(dl, "evil", "1.0.0");
-        assert!(
-            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
-            "IPv6 link-local must be rejected"
-        );
-
-        // IPv6 unique-local
-        let dl = "http://[fd00::1]/api";
-        let url = build_download_url(dl, "evil", "1.0.0");
-        assert!(
-            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
-            "IPv6 unique-local must be rejected"
-        );
-
-        // Oracle Cloud metadata
-        let dl = "http://192.0.0.192/opc/v2/instance";
-        let url = build_download_url(dl, "evil", "1.0.0");
-        assert!(
-            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
-            "Oracle Cloud metadata IP must be rejected"
-        );
-
-        // Alibaba Cloud metadata (CGNAT range)
-        let dl = "http://100.100.100.200/latest/meta-data";
-        let url = build_download_url(dl, "evil", "1.0.0");
-        assert!(
-            validate_outbound_url(&url, "Cargo upstream download URL").is_err(),
-            "Alibaba Cloud metadata IP must be rejected"
+            err.to_string().contains("private/internal network"),
+            "expected SSRF rejection reason in error message, got: {err}"
         );
     }
 }

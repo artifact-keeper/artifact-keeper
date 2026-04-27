@@ -6,8 +6,14 @@
 //! custom CA certificates (configured via `CUSTOM_CA_CERT_PATH`) are loaded
 //! consistently across the application.
 
+use reqwest::redirect::Policy;
 use reqwest::tls::Certificate;
 use reqwest::ClientBuilder;
+
+/// Maximum number of redirects we will follow even if every hop passes
+/// the SSRF check. Matches reqwest's historical default and prevents
+/// loops or pathological chains from tying up workers.
+const MAX_REDIRECTS: usize = 10;
 
 /// Return a [`ClientBuilder`] pre-loaded with custom CA certificates when
 /// the `CUSTOM_CA_CERT_PATH` environment variable is set.
@@ -52,7 +58,7 @@ fn log_proxy_env() {
 pub fn base_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().redirect(ssrf_redirect_policy());
 
     if let Ok(ca_path) = std::env::var("CUSTOM_CA_CERT_PATH") {
         match std::fs::read(&ca_path) {
@@ -97,6 +103,32 @@ pub fn default_client() -> reqwest::Client {
     base_client_builder()
         .build()
         .expect("failed to build default HTTP client")
+}
+
+/// Redirect policy that re-runs the SSRF allow-list on every hop. An
+/// upstream returning `302 Location: http://[::ffff:127.0.0.1]/` would
+/// otherwise defeat the entry-point validator. Caps at
+/// [`MAX_REDIRECTS`] hops so a redirect loop cannot tie up a worker.
+fn ssrf_redirect_policy() -> Policy {
+    Policy::custom(|attempt| {
+        if let Some(reason) = crate::api::validation::is_blocked_url(attempt.url()) {
+            tracing::warn!(
+                target: "security",
+                redirect_url = %attempt.url(),
+                reason = reason.metric_label(),
+                "blocking redirect to disallowed address"
+            );
+            crate::services::metrics_service::record_outbound_url_blocked(
+                reason.metric_label(),
+                "http-client redirect",
+            );
+            return attempt.error("redirect target rejected by SSRF policy");
+        }
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        attempt.follow()
+    })
 }
 
 #[cfg(test)]
@@ -165,5 +197,57 @@ mod tests {
         let client = base_client_builder().build();
         assert!(client.is_ok());
         std::env::remove_var("CUSTOM_CA_CERT_PATH");
+    }
+
+    /// Regression test for the SSRF redirect-follow bypass: any redirect
+    /// hop pointing at a blocked address must abort the request, not
+    /// silently follow. A bare `reqwest::Client` would tolerate such a
+    /// redirect; the policy installed by `base_client_builder` must not.
+    #[tokio::test]
+    async fn test_redirect_to_blocked_ip_is_refused() {
+        // Spin up a tiny TCP listener that always returns
+        // `302 Location: http://[::ffff:127.0.0.1]/` and tear down
+        // after one connection.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Accept one connection, ignore the request, send a 302 to
+            // an SSRF-bypass target. The client should refuse to
+            // follow.
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\n\
+                          Location: http://[::ffff:127.0.0.1]/admin\r\n\
+                          Content-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+
+        let client = base_client_builder().build().unwrap();
+        let url = format!("http://127.0.0.1:{}/start", addr.port());
+        // Bypassing `validate_outbound_url` deliberately — this test
+        // exercises the redirect policy specifically. A request that
+        // starts at 127.0.0.1 and is refused for THAT reason wouldn't
+        // tell us anything about redirect protection. To target only
+        // the redirect path, point at the listener and assert the
+        // failure mentions the redirect.
+        let result = client.get(&url).send().await;
+
+        // Drain the server task.
+        let _ = server.await;
+
+        let err = result.expect_err("redirect to ::ffff:127.0.0.1 must be refused");
+        assert!(
+            err.to_string().contains("SSRF") || err.is_redirect(),
+            "expected redirect-rejection error, got: {err}"
+        );
     }
 }
