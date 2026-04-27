@@ -362,6 +362,27 @@ struct OciRepoInfo {
 
 /// Resolve the first path segment as a repository key and the rest as the
 /// image name within the repository.
+/// Read `AK_DEFAULT_DOCKER_MIRROR_REPO` once. Returns the configured proxy
+/// repo key, or None if the variable is unset / empty. Cached for the
+/// lifetime of the process; changes require a pod restart.
+///
+/// When set, this enables "Docker daemon mirror mode": requests to
+/// `/v2/<image>/...` (no AK repo prefix, the path layout dockerd's
+/// `registry-mirrors` produces) fall back through the named proxy repo,
+/// using the full original image_name as the upstream image path. Without
+/// this, only `/v2/<repo-key>/<image>/...` works and dockerd's mirror
+/// config is silently bypassed.
+fn default_docker_mirror_repo() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            std::env::var("AK_DEFAULT_DOCKER_MIRROR_REPO")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
 async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
     use sqlx::Row;
     // Split: "test/python" → repo_key="test", image="python"
@@ -371,21 +392,57 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
         None => (image_name, image_name),
     };
 
-    let repo = sqlx::query(
-        "SELECT id, key, storage_backend, storage_path, repo_type::text as repo_type, \
-         upstream_url, is_public FROM repositories WHERE key = $1",
-    )
-    .bind(repo_key)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
+    let map_db_err = |e: sqlx::Error| {
         oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             &e.to_string(),
         )
-    })?
-    .ok_or_else(|| {
+    };
+
+    let select_repo_by_key = |key: String| async move {
+        sqlx::query(
+            "SELECT id, key, storage_backend, storage_path, repo_type::text as repo_type, \
+             upstream_url, is_public FROM repositories WHERE key = $1",
+        )
+        .bind(key)
+        .fetch_optional(db)
+        .await
+    };
+
+    // 1. Try the literal repo_key first (existing behavior preserved).
+    let mut repo = select_repo_by_key(repo_key.to_string())
+        .await
+        .map_err(map_db_err)?;
+    let mut effective_image = image.to_string();
+
+    // 2. Mirror-mode fallback: if the literal lookup missed AND a default
+    //    Docker mirror repo is configured, re-resolve through it with the
+    //    full original image_name as the image path. This makes dockerd's
+    //    `registry-mirrors` config work end-to-end: a pull of
+    //    `library/postgres:16-alpine` arrives as
+    //    `/v2/library/postgres/manifests/16-alpine`, repo_key="library"
+    //    misses, fallback re-resolves the configured proxy repo (e.g.
+    //    `docker-hub-cache`), and the proxy code path (`is_docker_hub`,
+    //    `normalize_docker_image`, blob/manifest cache) takes over with
+    //    image="library/postgres".
+    if repo.is_none() {
+        if let Some(mirror_key) = default_docker_mirror_repo() {
+            // Don't infinitely recurse: only attempt the fallback when the
+            // miss was on a different key than the mirror itself.
+            if mirror_key != repo_key {
+                if let Some(row) = select_repo_by_key(mirror_key.to_string())
+                    .await
+                    .map_err(map_db_err)?
+                {
+                    repo = Some(row);
+                    effective_image = image_name.to_string();
+                }
+            }
+        }
+    }
+
+    let repo = repo.ok_or_else(|| {
         oci_error(
             StatusCode::NOT_FOUND,
             "NAME_UNKNOWN",
@@ -405,7 +462,7 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
         repo_type: repo.try_get("repo_type").unwrap_or_default(),
         upstream_url: repo.try_get("upstream_url").ok(),
         is_public: repo.try_get("is_public").unwrap_or(false),
-        image: image.to_string(),
+        image: effective_image,
     })
 }
 
