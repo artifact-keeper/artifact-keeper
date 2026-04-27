@@ -76,6 +76,17 @@ fn encryptor() -> Result<CredentialEncryption> {
     Ok(CredentialEncryption::new(&key)?)
 }
 
+/// Validate that `AK_WEBHOOK_SECRET_KEY` is configured and well-formed.
+///
+/// Intended for use at process startup so the operator gets a fast, loud
+/// failure when the encryption key is missing, mistyped, or the wrong
+/// length, instead of discovering it only when the first webhook create
+/// or rotate-secret request fails with HTTP 500. The decoded key is
+/// discarded immediately after validation.
+pub fn ensure_configured() -> Result<()> {
+    load_key().map(|_| ())
+}
+
 /// Generate a fresh webhook secret string of the form `whsec_<base64url>`.
 ///
 /// Uses the OS CSPRNG. The unprefixed body has at least 192 bits of entropy.
@@ -106,17 +117,26 @@ pub fn decrypt_secret(ciphertext: &[u8]) -> Result<String> {
 /// list/get responses so operators can distinguish secrets without exposing
 /// them. Format: `<prefix>...<last4>` where the prefix is the literal
 /// `whsec_` (or whatever prefix the secret already carries) and the last
-/// four characters of the secret body are the only material revealed.
+/// four *characters* of the secret body are the only material revealed.
 ///
 /// For secrets shorter than 8 characters the digest is the full secret;
-/// such inputs only occur in tests.
+/// such inputs only occur in tests. Operates over `char` boundaries (not
+/// raw byte indices) so a caller-supplied secret that contains multibyte
+/// UTF-8 cannot panic this function.
 pub fn digest_for_display(secret: &str) -> String {
-    if secret.len() < 8 {
+    let char_count = secret.chars().count();
+    if char_count < 8 {
         return secret.to_string();
     }
-    let last4 = &secret[secret.len() - 4..];
+    // Take the last 4 characters by iterating from the end, then reversing,
+    // so we never index into the middle of a multibyte UTF-8 sequence.
+    let last4: String = {
+        let mut tail: Vec<char> = secret.chars().rev().take(4).collect();
+        tail.reverse();
+        tail.into_iter().collect()
+    };
     if let Some(rest) = secret.strip_prefix(SECRET_PREFIX) {
-        if rest.len() <= 4 {
+        if rest.chars().count() <= 4 {
             return secret.to_string();
         }
         return format!("{}...{}", SECRET_PREFIX, last4);
@@ -184,6 +204,29 @@ mod tests {
         assert_ne!(a, b, "ciphertexts must differ due to random nonce");
         // First 12 bytes are the nonce; they should differ.
         assert_ne!(&a[..12], &b[..12]);
+    }
+
+    #[test]
+    fn test_nonce_uniqueness_at_scale() {
+        // Birthday-bound check: 1000 encryptions of the same plaintext
+        // must produce 1000 distinct nonces. AES-GCM is catastrophic on
+        // nonce reuse, so the bar is no collisions, ever.
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        let plaintext = "same plaintext";
+        let mut nonces: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let ct = encrypt_secret(plaintext).expect("encrypt");
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&ct[..12]);
+            nonces.insert(nonce);
+        }
+        assert_eq!(
+            nonces.len(),
+            1000,
+            "expected 1000 unique nonces from 1000 encryptions, got {}",
+            nonces.len()
+        );
     }
 
     #[test]
@@ -264,5 +307,56 @@ mod tests {
     fn test_digest_non_prefixed_secret() {
         let digest = digest_for_display("hello-world-1234");
         assert_eq!(digest, "hell...1234");
+    }
+
+    #[test]
+    fn test_digest_does_not_panic_on_multibyte_utf8() {
+        // Regression: `&secret[secret.len() - 4..]` panics if the byte at
+        // that offset is mid-multibyte. Operate on chars and the function
+        // is total over any &str input.
+        let secret = "whsec_naïveöü";
+        let digest = digest_for_display(secret);
+        // Just make sure it does not panic and returns a non-empty result;
+        // the exact suffix is implementation-defined for non-ASCII tails.
+        assert!(!digest.is_empty());
+    }
+
+    #[test]
+    fn test_digest_handles_emoji_tail() {
+        // A pathological caller-supplied secret with a 4-byte char tail.
+        let secret = "whsec_abcdefghi😀";
+        let digest = digest_for_display(secret);
+        assert!(digest.starts_with(SECRET_PREFIX));
+    }
+
+    #[test]
+    fn test_ensure_configured_ok() {
+        let _g = ENV_LOCK.lock().unwrap();
+        set_test_key();
+        assert!(ensure_configured().is_ok());
+    }
+
+    #[test]
+    fn test_ensure_configured_missing_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_KEY);
+        }
+        assert!(matches!(
+            ensure_configured(),
+            Err(WebhookSecretError::KeyMissing)
+        ));
+    }
+
+    #[test]
+    fn test_ensure_configured_wrong_length() {
+        let _g = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var(ENV_KEY, B64.encode([0u8; 16]));
+        }
+        assert!(matches!(
+            ensure_configured(),
+            Err(WebhookSecretError::KeyWrongLength(16))
+        ));
     }
 }

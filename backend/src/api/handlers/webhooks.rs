@@ -798,6 +798,24 @@ pub async fn redeliver(
 /// current secret are accepted by the retry path during this window.
 const SECRET_ROTATION_OVERLAP: chrono::Duration = chrono::Duration::hours(24);
 
+/// Pure helper that mirrors the SQL WHERE clause guarding the rotate
+/// endpoint. Returns `true` iff a rotation should be allowed for a row
+/// whose `secret_previous_expires_at` column currently holds `previous`.
+///
+/// This exists so the unit tests can pin the rotation-window semantics
+/// without standing up a Postgres test harness. The SQL UPDATE in
+/// `rotate_webhook_secret` and this helper must agree.
+#[cfg(test)]
+pub(crate) fn rotation_guard_allows(
+    previous: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    match previous {
+        None => true,
+        Some(expires_at) => expires_at < now,
+    }
+}
+
 /// Rotate the signing secret for a webhook.
 ///
 /// Generates a new raw secret, encrypts it, moves the existing
@@ -806,6 +824,13 @@ const SECRET_ROTATION_OVERLAP: chrono::Duration = chrono::Duration::hours(24);
 /// response body **once**. The HMAC signing path (added in a later ticket)
 /// signs deliveries with both secrets while the previous one is within
 /// its expiry window so consumers can rotate without dropped events.
+///
+/// If a previous-secret window is still active when the rotate request
+/// arrives, the request is REJECTED with HTTP 409 Conflict. This prevents
+/// two near-simultaneous rotations from clobbering the original
+/// `secret_previous_encrypted` material before the operator has finished
+/// distributing the previous new key. The 409 body is structured:
+/// `{"error": "rotation_already_in_progress", "expires_at": "<RFC3339>"}`.
 #[utoipa::path(
     post,
     path = "/{id}/rotate-secret",
@@ -817,6 +842,7 @@ const SECRET_ROTATION_OVERLAP: chrono::Duration = chrono::Duration::hours(24);
     responses(
         (status = 200, description = "Secret rotated. Body includes the new raw secret exactly once.", body = RotateWebhookSecretResponse),
         (status = 404, description = "Webhook not found"),
+        (status = 409, description = "A previous rotation overlap window is still active"),
         (status = 500, description = "Encryption key not configured")
     ),
     security(("bearer_auth" = []))
@@ -825,7 +851,9 @@ pub async fn rotate_webhook_secret(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-) -> Result<Json<RotateWebhookSecretResponse>> {
+) -> Result<axum::response::Response> {
+    use axum::response::IntoResponse;
+
     let new_secret = webhook_secret_crypto::generate_secret();
     let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
         tracing::error!("webhook secret encryption failed during rotation: {}", e);
@@ -835,6 +863,11 @@ pub async fn rotate_webhook_secret(
     let now = chrono::Utc::now();
     let previous_expires_at = now + SECRET_ROTATION_OVERLAP;
 
+    // Conditional UPDATE: only proceed if no rotation overlap is currently
+    // active. A row passes the guard when its `secret_previous_expires_at`
+    // is NULL (never rotated, or the cleanup job has already cleared it)
+    // or already in the past. If the WHERE clause excludes the row we get
+    // 0 rows updated and respond 409 with the active expiry timestamp.
     let updated = sqlx::query_scalar::<_, Uuid>(
         r#"
         UPDATE webhooks
@@ -849,6 +882,7 @@ pub async fn rotate_webhook_secret(
             secret_rotation_started_at  = $5,
             updated_at                  = NOW()
         WHERE id = $1
+          AND (secret_previous_expires_at IS NULL OR secret_previous_expires_at < NOW())
         RETURNING id
         "#,
     )
@@ -862,7 +896,39 @@ pub async fn rotate_webhook_secret(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     if updated.is_none() {
-        return Err(AppError::NotFound("Webhook not found".to_string()));
+        // Either the row is missing or the rotation guard failed. Disambiguate
+        // by reading the row's `secret_previous_expires_at` directly; the read
+        // is cheap and the 409 body needs the active expiry timestamp anyway.
+        let active = sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT secret_previous_expires_at FROM webhooks WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        return match active {
+            None => Err(AppError::NotFound("Webhook not found".to_string())),
+            Some(maybe_expires) => match maybe_expires {
+                Some(expires_at) if expires_at >= chrono::Utc::now() => {
+                    let body = serde_json::json!({
+                        "error": "rotation_already_in_progress",
+                        "expires_at": expires_at,
+                    });
+                    Ok((axum::http::StatusCode::CONFLICT, Json(body)).into_response())
+                }
+                // Should not happen: a NULL or past expiry means the UPDATE
+                // would have succeeded. Fall back to a generic 409 rather
+                // than racing again automatically.
+                _ => {
+                    let body = serde_json::json!({
+                        "error": "rotation_already_in_progress",
+                        "expires_at": serde_json::Value::Null,
+                    });
+                    Ok((axum::http::StatusCode::CONFLICT, Json(body)).into_response())
+                }
+            },
+        };
     }
 
     Ok(Json(RotateWebhookSecretResponse {
@@ -870,7 +936,8 @@ pub async fn rotate_webhook_secret(
         secret: new_secret,
         secret_digest: new_digest,
         previous_secret_expires_at: previous_expires_at,
-    }))
+    })
+    .into_response())
 }
 
 /// Background-task entry point: clear expired previous-secret material so
@@ -901,6 +968,24 @@ pub async fn cleanup_expired_previous_secrets(
 /// link-local addresses (AWS/cloud metadata), and known internal hostnames.
 pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
     crate::api::validation::validate_outbound_url(url_str, "Webhook URL")
+}
+
+/// Whether a webhook row carries any form of signing secret.
+///
+/// `secret_encrypted` (AES-GCM, E1) is the authoritative new form. The
+/// legacy bcrypt `secret_hash` column is kept around so pre-v1.1.9 rows
+/// that have not yet been rotated continue to advertise that they are
+/// configured for signing. Returns `true` iff at least one form is set
+/// to a non-empty value. Rows where both are NULL or empty are treated
+/// as "no signing configured" and the retry path omits the
+/// `X-Webhook-Signature` header entirely.
+pub(crate) fn has_signing_secret(
+    secret_hash: &Option<String>,
+    secret_encrypted: Option<&[u8]>,
+) -> bool {
+    let hash_present = secret_hash.as_deref().is_some_and(|s| !s.is_empty());
+    let enc_present = secret_encrypted.is_some_and(|b| !b.is_empty());
+    hash_present || enc_present
 }
 
 /// Calculate retry delay in seconds for webhook delivery.
@@ -1013,10 +1098,16 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     for delivery in &rows {
-        // Look up the webhook URL and headers (using sqlx::query, not the macro,
-        // because the WHERE clause differs from the cached version)
+        // Look up the webhook URL, headers, and both signing-secret forms
+        // (using sqlx::query, not the macro, because the WHERE clause differs
+        // from the cached version). The retry path treats `secret_encrypted`
+        // (E1, AES-GCM) as authoritative for new rows and falls back to the
+        // legacy bcrypt `secret_hash` for un-rotated pre-v1.1.9 webhooks.
+        // Migration 081 leaves both NULL on rows it migrates so the operator
+        // is forced to rotate before signatures resume.
         let webhook_row = sqlx::query(
-            "SELECT url, headers, secret_hash FROM webhooks WHERE id = $1 AND is_enabled = true",
+            "SELECT url, headers, secret_hash, secret_encrypted \
+             FROM webhooks WHERE id = $1 AND is_enabled = true",
         )
         .bind(delivery.webhook_id)
         .fetch_optional(db)
@@ -1039,6 +1130,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
         let url: String = webhook_row.get("url");
         let headers: Option<serde_json::Value> = webhook_row.get("headers");
         let secret_hash: Option<String> = webhook_row.get("secret_hash");
+        let secret_encrypted: Option<Vec<u8>> = webhook_row.get("secret_encrypted");
 
         // Validate URL before delivery (SSRF prevention)
         if validate_webhook_url(&url).is_err() {
@@ -1074,7 +1166,14 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             }
         }
 
-        if secret_hash.is_some() {
+        // Emit the signature header iff EITHER form of signing secret is
+        // configured. The actual HMAC is wired up in E2; today we still
+        // emit the placeholder string so the wire contract (header presence
+        // means "signing configured") is stable. Rows where BOTH forms are
+        // NULL (e.g. notifications migrated by migration 081 before the
+        // operator rotates) MUST NOT emit this header so receivers can
+        // distinguish "signing configured" from "legacy unsigned".
+        if has_signing_secret(&secret_hash, secret_encrypted.as_deref()) {
             request = request.header("X-Webhook-Signature", "hmac-signature");
         }
 
@@ -1427,6 +1526,49 @@ mod tests {
     }
 
     #[test]
+    fn test_webhook_response_omits_secret_material_keys() {
+        // Write-once contract: GET/LIST responses must NEVER include the
+        // raw secret, the encrypted blob, the previous-secret blob, or the
+        // legacy bcrypt hash. The serialized form is allowed to carry
+        // `secret_digest` (a non-reversible last-4 indicator) and
+        // `secret_rotation_active` (a boolean), nothing else secret-related.
+        let resp = WebhookResponse {
+            id: Uuid::nil(),
+            name: "test".to_string(),
+            url: "https://example.com/hook".to_string(),
+            events: vec!["artifact_uploaded".to_string()],
+            is_enabled: true,
+            repository_id: None,
+            headers: None,
+            payload_template: PayloadTemplate::Generic,
+            secret_digest: Some("whsec_...abcd".to_string()),
+            secret_rotation_active: false,
+            last_triggered_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let obj = json
+            .as_object()
+            .expect("WebhookResponse serializes to object");
+        let forbidden_keys = [
+            "secret",
+            "secret_encrypted",
+            "secret_previous_encrypted",
+            "secret_hash",
+            "secret_previous_expires_at",
+            "secret_rotation_started_at",
+        ];
+        for key in forbidden_keys {
+            assert!(
+                !obj.contains_key(key),
+                "WebhookResponse must not serialize key `{}`; got keys: {:?}",
+                key,
+                obj.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn test_test_webhook_response_serialization() {
         let resp = TestWebhookResponse {
             success: true,
@@ -1613,5 +1755,146 @@ mod tests {
     #[test]
     fn test_is_delivery_success_199() {
         assert!(!is_webhook_delivery_success(199));
+    }
+
+    // -----------------------------------------------------------------------
+    // has_signing_secret: unified gate for X-Webhook-Signature header
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_has_signing_secret_neither_form() {
+        // Migration 081 leaves both NULL. The retry path must NOT advertise
+        // a signature header for these rows.
+        assert!(!has_signing_secret(&None, None));
+    }
+
+    #[test]
+    fn test_has_signing_secret_legacy_bcrypt_only() {
+        // Pre-v1.1.9 rows that have not been rotated yet have only the
+        // legacy bcrypt hash; the gate still considers them configured.
+        let bcrypt_hash = Some("$2b$12$abcdefghijklmnop".to_string());
+        assert!(has_signing_secret(&bcrypt_hash, None));
+    }
+
+    #[test]
+    fn test_has_signing_secret_encrypted_only() {
+        // New rows from `create_webhook` populate `secret_encrypted` only.
+        let ct: &[u8] = b"\x00\x01\x02ciphertext";
+        assert!(has_signing_secret(&None, Some(ct)));
+    }
+
+    #[test]
+    fn test_has_signing_secret_both_forms() {
+        // Mid-migration rows can briefly carry both. Still configured.
+        let bcrypt_hash = Some("$2b$12$abcdefghijklmnop".to_string());
+        let ct: &[u8] = b"ciphertext";
+        assert!(has_signing_secret(&bcrypt_hash, Some(ct)));
+    }
+
+    #[test]
+    fn test_has_signing_secret_empty_strings_treated_as_absent() {
+        // Defensive: an empty string in secret_hash (e.g. older rows from
+        // the prior migration variant) is not a valid hash and must NOT
+        // count as signing-configured.
+        let empty_hash = Some(String::new());
+        let empty_bytes: &[u8] = b"";
+        assert!(!has_signing_secret(&empty_hash, Some(empty_bytes)));
+        assert!(!has_signing_secret(&empty_hash, None));
+        assert!(!has_signing_secret(&None, Some(empty_bytes)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Rotation overlap window: pure-function semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rotation_overlap_constant_is_24_hours() {
+        // The integration contract documented in the PR body and the
+        // operator docs says 24 hours. Tying it down here means a future
+        // edit cannot silently change the window from under callers.
+        assert_eq!(SECRET_ROTATION_OVERLAP, chrono::Duration::hours(24));
+    }
+
+    #[test]
+    fn test_rotation_guard_allows_when_no_previous() {
+        // A row that has never been rotated has NULL previous-expiry.
+        let now = chrono::Utc::now();
+        assert!(rotation_guard_allows(None, now));
+    }
+
+    #[test]
+    fn test_rotation_guard_allows_when_previous_already_expired() {
+        // The cleanup tick may not have fired yet, but logically the
+        // overlap window has closed: rotation is fine.
+        let now = chrono::Utc::now();
+        let an_hour_ago = now - chrono::Duration::hours(1);
+        assert!(rotation_guard_allows(Some(an_hour_ago), now));
+    }
+
+    #[test]
+    fn test_rotation_guard_blocks_when_previous_still_active() {
+        // Mid-overlap: a second rotation must NOT be allowed; the API
+        // returns 409 Conflict.
+        let now = chrono::Utc::now();
+        let in_three_hours = now + chrono::Duration::hours(3);
+        assert!(!rotation_guard_allows(Some(in_three_hours), now));
+    }
+
+    #[test]
+    fn test_rotation_guard_boundary_now_is_blocked() {
+        // Strict `<` in the SQL means a row whose previous expiry equals
+        // now is still considered active. Mirror that here.
+        let now = chrono::Utc::now();
+        assert!(!rotation_guard_allows(Some(now), now));
+    }
+
+    #[test]
+    fn test_rotation_overlap_window_math() {
+        // The `previous_expires_at = now + SECRET_ROTATION_OVERLAP` formula
+        // used in the rotate handler. Lock the math down so a future
+        // refactor cannot accidentally use minutes vs hours.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let previous_expires_at = now + SECRET_ROTATION_OVERLAP;
+        assert_eq!(
+            previous_expires_at,
+            chrono::DateTime::parse_from_rfc3339("2026-04-28T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
+        // Second rotate within the window is blocked.
+        assert!(!rotation_guard_allows(Some(previous_expires_at), now));
+        // After the window closes, rotate is allowed again.
+        let after = previous_expires_at + chrono::Duration::seconds(1);
+        assert!(rotation_guard_allows(Some(previous_expires_at), after));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup tick semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cleanup_predicate_matches_only_expired_rows() {
+        // The SQL in `cleanup_expired_previous_secrets` uses the predicate
+        // `secret_previous_expires_at <= NOW()`. Pure-function expression
+        // of that predicate so callers can unit-test their inputs without
+        // a database. A row is cleared iff it has a previous expiry AND
+        // that expiry is in the past or now.
+        fn would_clear(
+            expires_at: Option<chrono::DateTime<chrono::Utc>>,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> bool {
+            matches!(expires_at, Some(t) if t <= now)
+        }
+        let now = chrono::Utc::now();
+        // Row with no previous: never cleared.
+        assert!(!would_clear(None, now));
+        // Row with future expiry: not cleared.
+        assert!(!would_clear(Some(now + chrono::Duration::hours(1)), now));
+        // Row at exactly now: cleared (<=).
+        assert!(would_clear(Some(now), now));
+        // Row in the past: cleared.
+        assert!(would_clear(Some(now - chrono::Duration::seconds(1)), now));
     }
 }

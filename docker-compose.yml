@@ -181,6 +181,16 @@ services:
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: ${DEPENDENCY_TRACK_ENABLED:-true}
       ALLOW_HTTP_INTEGRATIONS: "1"
+      # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
+      # Generate with: openssl rand -base64 32. The placeholder below is for
+      # evaluation only; replace it before exposing this stack to real
+      # webhook receivers. Without a key set, webhook create and
+      # rotate-secret endpoints return HTTP 500.
+      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-ZGV2LWtleS1ub3QtZm9yLXByb2QtdXNlLWluLXByb2Q=}
+      # Toggle the webhooks v2 EventBus producer. Default off. Flip to true
+      # once you have rotated migrated webhook secrets via /rotate-secret
+      # and verified delivery against your receivers.
+      WEBHOOKS_V2_PRODUCER_ENABLED: ${WEBHOOKS_V2_PRODUCER_ENABLED:-false}
       # Forward host proxy settings so the backend can reach external services
       # (OIDC providers, remote registries, webhook endpoints) through a
       # corporate proxy. reqwest honours these natively.

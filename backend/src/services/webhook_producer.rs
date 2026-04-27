@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use sqlx::{PgPool, Row};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use crate::services::event_bus::{DomainEvent, EventBus};
 
@@ -57,14 +58,34 @@ pub fn map_event_type(event_type: &str) -> Option<&'static str> {
 /// The shape is intentionally minimal in v1.1.9. E4 will add
 /// `event_schema_version` and richer event-specific fields. Consumers that
 /// rely on these fields today should pin to a specific producer version.
+///
+/// v1 OMITS the `payload` key entirely (rather than serialising it as
+/// `null`) when no enriched payload is available yet, so receivers can
+/// distinguish "v1 producer with no enrichment" from "v2 producer that
+/// chose to emit a null payload". E4 will populate the key.
 pub fn build_event_payload(event: &DomainEvent, mapped_event: &str) -> serde_json::Value {
-    serde_json::json!({
-        "event": mapped_event,
-        "entity_id": event.entity_id,
-        "actor": event.actor,
-        "timestamp": event.timestamp,
-        "payload": serde_json::Value::Null,
-    })
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "event".into(),
+        serde_json::Value::String(mapped_event.into()),
+    );
+    map.insert(
+        "entity_id".into(),
+        serde_json::Value::String(event.entity_id.clone()),
+    );
+    map.insert(
+        "actor".into(),
+        match &event.actor {
+            Some(a) => serde_json::Value::String(a.clone()),
+            None => serde_json::Value::Null,
+        },
+    );
+    map.insert(
+        "timestamp".into(),
+        serde_json::Value::String(event.timestamp.clone()),
+    );
+    // v1 omits `payload` when not yet enriched; v2 (E4) will populate it.
+    serde_json::Value::Object(map)
 }
 
 /// Row type for the webhook lookup query.
@@ -77,43 +98,62 @@ struct MatchingWebhookRow {
 ///
 /// Spawns a tokio task that subscribes to the EventBus and, for each received
 /// event, looks up all enabled matching webhooks and enqueues a row into
-/// `webhook_deliveries`. The task runs until the broadcast channel is closed
-/// (i.e. the EventBus is dropped at shutdown).
+/// `webhook_deliveries`. The task runs until either the broadcast channel is
+/// closed (the EventBus was dropped) or `shutdown_token` is cancelled by the
+/// HTTP/gRPC server lifecycle.
 ///
-/// # Idempotency
+/// # Delivery semantics: at-most-once with explicit lag drops
 ///
-/// Tokio broadcast channels can deliver duplicates if a slow subscriber lags
-/// the buffer. This module accepts rare duplicates rather than adding a
-/// migration to dedupe at insert time. The downstream retry scheduler is
-/// idempotent at the row level: a duplicate row just produces one extra
-/// delivery. Correctness is preserved; the cost is at-most-once becomes
-/// at-least-once. This is the standard tradeoff for Postgres-backed work
-/// queues and it matches what other Artifact Keeper consumers expect.
-pub fn start_webhook_producer(event_bus: Arc<EventBus>, db: PgPool) {
+/// Tokio broadcast channels DO NOT duplicate events. On subscriber lag they
+/// surface `RecvError::Lagged(n)` which means the n oldest events were
+/// silently DROPPED from this subscriber's view. The producer logs lag at
+/// warn-level but cannot recover the dropped events: at-most-once is the
+/// best the in-process bus can offer. Customers requiring at-least-once for
+/// missed deliveries must fall back to the polling/manual-replay UI on
+/// `/api/v1/webhooks/{id}/deliveries` (or the GET-then-redeliver flow).
+/// This is acceptable for v1.1.9; v1.2.0 will introduce a durable event log
+/// if reviewers determine in-process broadcast is insufficient.
+pub fn start_webhook_producer(
+    event_bus: Arc<EventBus>,
+    db: PgPool,
+    shutdown_token: CancellationToken,
+) {
     let mut rx = event_bus.subscribe();
 
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Err(e) = enqueue_for_event(&db, &event).await {
-                        tracing::warn!(
-                            event_type = %event.event_type,
-                            entity_id = %event.entity_id,
-                            error = %e,
-                            "Failed to enqueue webhook deliveries for event"
-                        );
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(
-                        skipped = n,
-                        "Webhook producer lagged, some events were dropped"
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {
+                    tracing::info!(
+                        "Shutdown signalled, webhook producer draining and exiting"
                     );
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    tracing::info!("EventBus closed, webhook producer shutting down");
                     break;
+                }
+                recv = rx.recv() => {
+                    match recv {
+                        Ok(event) => {
+                            if let Err(e) = enqueue_for_event(&db, &event).await {
+                                tracing::warn!(
+                                    event_type = %event.event_type,
+                                    entity_id = %event.entity_id,
+                                    error = %e,
+                                    "Failed to enqueue webhook deliveries for event"
+                                );
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(
+                                skipped = n,
+                                "Webhook producer lagged; events were dropped (at-most-once)"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                "EventBus closed, webhook producer shutting down"
+                            );
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -127,6 +167,22 @@ pub fn start_webhook_producer(event_bus: Arc<EventBus>, db: PgPool) {
 /// event's entity_id when interpretable as a UUID. For each match, INSERTs a
 /// row into `webhook_deliveries` with `attempts = 0`, `next_retry_at = NOW()`,
 /// `success = false`. The retry scheduler picks these up on its tick.
+///
+/// # Repository scoping limitation
+///
+/// `event.entity_id` is parsed as a `repository_id`. This works correctly
+/// for `repository.*` events because the EventBus carries the repo UUID in
+/// `entity_id`. It is a category error for `user.*`, `build.*`, and
+/// `artifact.*` events: their `entity_id` is the user/build/artifact UUID
+/// respectively, not the owning repository. For those events, the
+/// `repository_id = $2` arm of the WHERE clause never matches, so only
+/// global-scoped webhooks (repository_id IS NULL) fire. The same flaw
+/// exists in `notification_dispatcher.rs::dispatch_event`.
+///
+/// FIXME(#948): Thread an explicit `repository_id: Option<Uuid>` through
+/// `DomainEvent` so this scoping is correct for non-repo events. Until
+/// then, scoping non-repo events requires the operator to use a global
+/// webhook subscription.
 ///
 /// Uses `sqlx::query()` (not the macro) to avoid contention on the offline
 /// SQLx query cache while parallel webhook PRs are in flight (E1, E2, E4).
@@ -193,6 +249,10 @@ async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Res
                     event = mapped_event,
                     error = %e,
                     "Failed to insert webhook_deliveries row"
+                );
+                crate::services::metrics_service::record_webhook_delivery_enqueue_failed(
+                    mapped_event,
+                    "db_error",
                 );
             }
         }
@@ -293,33 +353,57 @@ mod tests {
 
     #[test]
     fn test_map_covers_all_webhook_event_variants() {
-        // This is a fence test: the WebhookEvent enum has 9 variants.
-        // We must produce a mapping for each one. If a new variant is added,
-        // update this list and the match arm above.
-        let expected_outputs = [
-            "artifact_uploaded",
-            "artifact_deleted",
-            "repository_created",
-            "repository_deleted",
-            "user_created",
-            "user_deleted",
-            "build_started",
-            "build_completed",
-            "build_failed",
+        // Compile-time fence: an exhaustive match over `WebhookEvent`
+        // produces the (event_bus_input, expected_output) pair for every
+        // variant. If a new variant is added to `WebhookEvent`, this match
+        // FAILS TO COMPILE until both the match arm here AND the runtime
+        // dispatch in `map_event_type` above are updated. That is the
+        // entire point: hand-maintained lists drift silently.
+        use crate::api::handlers::webhooks::WebhookEvent;
+
+        fn expected_pair(v: &WebhookEvent) -> (&'static str, &'static str) {
+            match v {
+                WebhookEvent::ArtifactUploaded => ("artifact.uploaded", "artifact_uploaded"),
+                WebhookEvent::ArtifactDeleted => ("artifact.deleted", "artifact_deleted"),
+                WebhookEvent::RepositoryCreated => ("repository.created", "repository_created"),
+                WebhookEvent::RepositoryDeleted => ("repository.deleted", "repository_deleted"),
+                WebhookEvent::UserCreated => ("user.created", "user_created"),
+                WebhookEvent::UserDeleted => ("user.deleted", "user_deleted"),
+                WebhookEvent::BuildStarted => ("build.started", "build_started"),
+                WebhookEvent::BuildCompleted => ("build.completed", "build_completed"),
+                WebhookEvent::BuildFailed => ("build.failed", "build_failed"),
+            }
+        }
+
+        // Hand-listed for the body of the test; the exhaustive match above
+        // is what the fence relies on. If you add a variant, the compiler
+        // forces you to extend `expected_pair`, and you should also extend
+        // this list so the runtime side actually exercises every variant.
+        let all_variants = [
+            WebhookEvent::ArtifactUploaded,
+            WebhookEvent::ArtifactDeleted,
+            WebhookEvent::RepositoryCreated,
+            WebhookEvent::RepositoryDeleted,
+            WebhookEvent::UserCreated,
+            WebhookEvent::UserDeleted,
+            WebhookEvent::BuildStarted,
+            WebhookEvent::BuildCompleted,
+            WebhookEvent::BuildFailed,
         ];
-        let event_bus_inputs = [
-            "artifact.uploaded",
-            "artifact.deleted",
-            "repository.created",
-            "repository.deleted",
-            "user.created",
-            "user.deleted",
-            "build.started",
-            "build.completed",
-            "build.failed",
-        ];
-        for (input, expected) in event_bus_inputs.iter().zip(expected_outputs.iter()) {
-            assert_eq!(map_event_type(input), Some(*expected), "input: {}", input);
+
+        for variant in &all_variants {
+            let (bus_input, expected) = expected_pair(variant);
+            assert_eq!(
+                map_event_type(bus_input),
+                Some(expected),
+                "variant {:?} maps {} -> {}",
+                variant,
+                bus_input,
+                expected
+            );
+            // Also assert the WebhookEvent::Display matches the mapped form
+            // so the wire identifier stays in lockstep with the Rust enum.
+            assert_eq!(variant.to_string(), expected);
         }
     }
 
@@ -333,12 +417,35 @@ mod tests {
         let payload = build_event_payload(&event, "artifact_uploaded");
         let obj = payload.as_object().unwrap();
 
-        assert_eq!(obj.len(), 5);
+        // v1 emits exactly four keys: event, entity_id, actor, timestamp.
+        // The `payload` key is OMITTED (not serialized as null) until E4
+        // wires up the per-event enrichment. Receivers see a missing key,
+        // not a null value, so they can tell v1 apart from a deliberate
+        // v2-null-payload.
+        assert_eq!(obj.len(), 4);
         assert_eq!(payload["event"], "artifact_uploaded");
         assert_eq!(payload["entity_id"], "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(payload["actor"], "alice");
         assert_eq!(payload["timestamp"], "2026-04-08T12:00:00Z");
-        assert!(payload["payload"].is_null());
+        assert!(
+            obj.get("payload").is_none(),
+            "v1 must omit the payload key entirely, not emit null"
+        );
+    }
+
+    #[test]
+    fn test_build_event_payload_omits_payload_key_not_null() {
+        // Explicit fence: serialising-then-parsing must not introduce a
+        // payload key. If a future change writes `"payload": null` instead
+        // of omitting it, this test fails loudly.
+        let event = sample_event("artifact.created");
+        let payload = build_event_payload(&event, "artifact_uploaded");
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !serialized.contains("\"payload\""),
+            "serialized v1 payload must not contain a payload key, got: {}",
+            serialized
+        );
     }
 
     #[test]

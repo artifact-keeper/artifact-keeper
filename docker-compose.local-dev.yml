@@ -184,6 +184,13 @@ services:
       DEPENDENCY_TRACK_URL: http://dependency-track-apiserver:8080
       DEPENDENCY_TRACK_ENABLED: "true"
       ALLOW_HTTP_INTEGRATIONS: "1"
+      # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
+      # The dev placeholder below is "dev-key-not-for-prod-use-in-prod"
+      # base64-encoded, stable across rebuilds so existing rows can decrypt.
+      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-ZGV2LWtleS1ub3QtZm9yLXByb2QtdXNlLWluLXByb2Q=}
+      # Webhooks v2 producer is off by default; enable after rotating
+      # migrated webhook secrets to avoid duplicate delivery from System B.
+      WEBHOOKS_V2_PRODUCER_ENABLED: ${WEBHOOKS_V2_PRODUCER_ENABLED:-false}
       # Forward host proxy settings so the backend can reach external services
       # through a corporate proxy. reqwest honours these natively.
       HTTP_PROXY: ${HTTP_PROXY:-}
