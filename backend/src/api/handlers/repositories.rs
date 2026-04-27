@@ -2114,6 +2114,11 @@ pub async fn add_virtual_member(
     let virtual_repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, virtual_repo.id)?;
     let member_repo = service.get_by_key(&payload.member_key).await?;
+    // Issue #913: also require access on the member repo so a caller with
+    // write scope on the virtual parent cannot add a member they have no
+    // rights to. Tokens with `allowed_repo_ids = None` (admins, full-access
+    // JWT sessions, unrestricted API tokens) bypass this naturally.
+    require_repo_access(&auth, member_repo.id)?;
 
     // Get current max priority if not specified
     let priority = match payload.priority {
@@ -2198,6 +2203,8 @@ pub async fn remove_virtual_member(
     let virtual_repo = service.get_by_key(&key).await?;
     require_repo_access(&auth, virtual_repo.id)?;
     let member_repo = service.get_by_key(&member_key).await?;
+    // Issue #913: also require access on the member repo (see add_virtual_member).
+    require_repo_access(&auth, member_repo.id)?;
 
     if virtual_repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
@@ -2257,6 +2264,8 @@ pub async fn update_virtual_members(
     // Update priorities for each member
     for member in &payload.members {
         let member_repo = service.get_by_key(&member.member_key).await?;
+        // Issue #913: also require access on each member repo (see add_virtual_member).
+        require_repo_access(&auth, member_repo.id)?;
 
         sqlx::query(
             "UPDATE virtual_repo_members SET priority = $1 WHERE virtual_repo_id = $2 AND member_repo_id = $3",
@@ -4022,6 +4031,86 @@ mod tests {
             }
             other => panic!("Expected Authorization error, got: {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #913: virtual member endpoints must check access on BOTH the
+    // virtual parent and each member repo before mutating membership. These
+    // tests model the per-member check the handlers now perform.
+    // -----------------------------------------------------------------------
+
+    /// Simulate the parent + member access check that
+    /// `add_virtual_member`, `remove_virtual_member`, and the per-iteration
+    /// step of `update_virtual_members` perform after resolving the repos.
+    fn check_virtual_member_authz(
+        auth: &AuthExtension,
+        virtual_repo_id: Uuid,
+        member_repo_id: Uuid,
+    ) -> Result<()> {
+        require_repo_access(auth, virtual_repo_id)?;
+        require_repo_access(auth, member_repo_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_virtual_member_authz_access_to_parent_only_is_denied() {
+        // Caller has access to V but not M -> 403.
+        let virtual_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let ext = make_auth_ext(Some(vec![virtual_id]));
+        let result = check_virtual_member_authz(&ext, virtual_id, member_id);
+        assert!(
+            result.is_err(),
+            "caller with access to parent only must be denied"
+        );
+        match result.unwrap_err() {
+            AppError::Authorization(msg) => {
+                assert!(msg.contains("does not have access"))
+            }
+            other => panic!("Expected Authorization error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_virtual_member_authz_access_to_member_only_is_denied() {
+        // Caller has access to M but not V -> 403.
+        let virtual_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let ext = make_auth_ext(Some(vec![member_id]));
+        let result = check_virtual_member_authz(&ext, virtual_id, member_id);
+        assert!(
+            result.is_err(),
+            "caller with access to member only must be denied"
+        );
+    }
+
+    #[test]
+    fn test_virtual_member_authz_access_to_both_is_allowed() {
+        // Caller has access to both V and M -> ok.
+        let virtual_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let ext = make_auth_ext(Some(vec![virtual_id, member_id]));
+        assert!(check_virtual_member_authz(&ext, virtual_id, member_id).is_ok());
+    }
+
+    #[test]
+    fn test_virtual_member_authz_unrestricted_token_bypass() {
+        // Tokens with allowed_repo_ids = None (admins, JWT sessions,
+        // unrestricted API tokens) bypass the per-member check.
+        let virtual_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let ext = make_auth_ext(None);
+        assert!(check_virtual_member_authz(&ext, virtual_id, member_id).is_ok());
+    }
+
+    #[test]
+    fn test_virtual_member_authz_no_access_to_either_is_denied() {
+        // Caller has access to neither V nor M -> 403 (failing on parent first).
+        let virtual_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let ext = make_auth_ext(Some(vec![other]));
+        assert!(check_virtual_member_authz(&ext, virtual_id, member_id).is_err());
     }
 
     // -----------------------------------------------------------------------
