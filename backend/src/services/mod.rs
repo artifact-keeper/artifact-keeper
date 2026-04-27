@@ -68,6 +68,7 @@ pub mod wasm_bindings;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
 pub mod webhook_payloads;
+pub mod webhook_producer;
 
 // Observability & lifecycle
 pub mod analytics_service;
