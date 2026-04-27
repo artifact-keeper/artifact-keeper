@@ -72,6 +72,13 @@ pub enum AppError {
 
     #[error("Bad gateway: {0}")]
     BadGateway(String),
+
+    /// Service is temporarily over capacity. Maps to HTTP 503. Used by the
+    /// proxy service when the upstream-fetch semaphore queue saturates and
+    /// `proxy_queue_timeout_secs` fires before a permit becomes available.
+    /// Clients should back off and retry.
+    #[error("Service overloaded: {0}")]
+    Overloaded(String),
 }
 
 impl AppError {
@@ -98,6 +105,7 @@ impl AppError {
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            Self::Overloaded(_) => (StatusCode::SERVICE_UNAVAILABLE, "OVERLOADED"),
         }
     }
 
@@ -125,7 +133,8 @@ impl AppError {
             | Self::Conflict(msg)
             | Self::Validation(msg)
             | Self::QuotaExceeded(msg)
-            | Self::BadGateway(msg) => msg.clone(),
+            | Self::BadGateway(msg)
+            | Self::Overloaded(msg) => msg.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
