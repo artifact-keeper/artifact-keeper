@@ -13,6 +13,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::webhook_payloads::{self, PayloadTemplate};
+use crate::services::webhook_secret_crypto;
 
 /// Create webhook routes
 pub fn router() -> Router<SharedState> {
@@ -22,6 +23,7 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/enable", post(enable_webhook))
         .route("/:id/disable", post(disable_webhook))
         .route("/:id/test", post(test_webhook))
+        .route("/:id/rotate-secret", post(rotate_webhook_secret))
         .route("/:id/deliveries", get(list_deliveries))
         .route("/:id/deliveries/:delivery_id/redeliver", post(redeliver))
 }
@@ -70,6 +72,9 @@ pub struct CreateWebhookRequest {
     pub name: String,
     pub url: String,
     pub events: Vec<String>,
+    /// Optional caller-supplied secret. When omitted the server generates a
+    /// fresh `whsec_*` secret. Either way the raw value is returned in the
+    /// 201 response body exactly once and is unrecoverable thereafter.
     pub secret: Option<String>,
     pub repository_id: Option<Uuid>,
     #[schema(value_type = Option<Object>)]
@@ -90,8 +95,40 @@ pub struct WebhookResponse {
     #[schema(value_type = Option<Object>)]
     pub headers: Option<serde_json::Value>,
     pub payload_template: PayloadTemplate,
+    /// Short non-reversible identifier for the current signing secret
+    /// (`whsec_...abcd`), suitable for display in operator UIs. The raw
+    /// secret is never returned by GET or LIST.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_digest: Option<String>,
+    /// True while a previous secret is still accepted by the retry path
+    /// during a rotation overlap window.
+    #[serde(default)]
+    pub secret_rotation_active: bool,
     pub last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Response returned exactly once when a webhook is created or its secret
+/// is rotated. The raw `secret` value is not retrievable afterwards.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookSecretCreatedResponse {
+    #[serde(flatten)]
+    pub webhook: WebhookResponse,
+    /// Raw signing secret. Display this to the operator immediately and
+    /// instruct them to record it; the server retains only the encrypted
+    /// form and a short digest.
+    pub secret: String,
+}
+
+/// Response returned by the rotate-secret endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RotateWebhookSecretResponse {
+    pub id: Uuid,
+    /// Raw signing secret produced by this rotation. Shown exactly once.
+    pub secret: String,
+    pub secret_digest: String,
+    /// When the previously active secret stops being accepted.
+    pub previous_secret_expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -126,7 +163,8 @@ pub async fn list_webhooks(
     let webhooks = sqlx::query(
         r#"
         SELECT id, name, url, events, is_enabled, repository_id, headers,
-               payload_template, last_triggered_at, created_at
+               payload_template, secret_digest, secret_previous_expires_at,
+               last_triggered_at, created_at
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
@@ -162,6 +200,8 @@ pub async fn list_webhooks(
         .into_iter()
         .map(|w| {
             let tpl: String = w.get("payload_template");
+            let prev_expires: Option<chrono::DateTime<chrono::Utc>> =
+                w.get("secret_previous_expires_at");
             WebhookResponse {
                 id: w.get("id"),
                 name: w.get("name"),
@@ -171,6 +211,10 @@ pub async fn list_webhooks(
                 repository_id: w.get("repository_id"),
                 headers: w.get("headers"),
                 payload_template: PayloadTemplate::from_str_lossy(&tpl),
+                secret_digest: w.get("secret_digest"),
+                secret_rotation_active: prev_expires
+                    .map(|e| e > chrono::Utc::now())
+                    .unwrap_or(false),
                 last_triggered_at: w.get("last_triggered_at"),
                 created_at: w.get("created_at"),
             }
@@ -180,7 +224,12 @@ pub async fn list_webhooks(
     Ok(Json(WebhookListResponse { items, total }))
 }
 
-/// Create webhook
+/// Create webhook.
+///
+/// Generates a fresh signing secret (or accepts a caller-supplied one),
+/// encrypts it at rest, and returns the raw secret in the response body
+/// **once**. After this call, GET on the webhook returns only
+/// `secret_digest`, never the raw secret.
 #[utoipa::path(
     post,
     path = "",
@@ -188,7 +237,7 @@ pub async fn list_webhooks(
     tag = "webhooks",
     request_body = CreateWebhookRequest,
     responses(
-        (status = 200, description = "Webhook created successfully", body = WebhookResponse),
+        (status = 200, description = "Webhook created. Body includes the raw secret exactly once.", body = WebhookSecretCreatedResponse),
         (status = 422, description = "Validation error"),
         (status = 500, description = "Internal server error")
     ),
@@ -198,7 +247,7 @@ pub async fn create_webhook(
     State(state): State<SharedState>,
     Extension(_auth): Extension<AuthExtension>,
     Json(payload): Json<CreateWebhookRequest>,
-) -> Result<Json<WebhookResponse>> {
+) -> Result<Json<WebhookSecretCreatedResponse>> {
     // Validate URL (SSRF prevention)
     validate_webhook_url(&payload.url)?;
 
@@ -209,37 +258,49 @@ pub async fn create_webhook(
         ));
     }
 
-    // Hash secret if provided
-    let secret_hash = if let Some(ref secret) = payload.secret {
-        Some(crate::services::auth_service::AuthService::hash_password(secret).await?)
-    } else {
-        None
-    };
+    // Use the caller-provided secret if any, otherwise generate one.
+    let raw_secret = payload
+        .secret
+        .clone()
+        .unwrap_or_else(webhook_secret_crypto::generate_secret);
+
+    // Encrypt at rest.
+    let secret_encrypted = webhook_secret_crypto::encrypt_secret(&raw_secret).map_err(|e| {
+        tracing::error!("webhook secret encryption failed: {}", e);
+        AppError::Internal("webhook secret encryption is not configured".to_string())
+    })?;
+    let secret_digest = webhook_secret_crypto::digest_for_display(&raw_secret);
 
     use sqlx::Row;
 
     let template_str = payload.payload_template.to_string();
     let webhook = sqlx::query(
         r#"
-        INSERT INTO webhooks (name, url, events, secret_hash, repository_id, headers, payload_template)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO webhooks
+            (name, url, events, repository_id, headers, payload_template,
+             secret_encrypted, secret_digest)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id, name, url, events, is_enabled, repository_id, headers,
-                  payload_template, last_triggered_at, created_at
+                  payload_template, secret_digest, secret_previous_expires_at,
+                  last_triggered_at, created_at
         "#,
     )
     .bind(&payload.name)
     .bind(&payload.url)
     .bind(&payload.events)
-    .bind(&secret_hash)
     .bind(payload.repository_id)
     .bind(&payload.headers)
     .bind(&template_str)
+    .bind(&secret_encrypted)
+    .bind(&secret_digest)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let tpl: String = webhook.get("payload_template");
-    Ok(Json(WebhookResponse {
+    let prev_expires: Option<chrono::DateTime<chrono::Utc>> =
+        webhook.get("secret_previous_expires_at");
+    let response = WebhookResponse {
         id: webhook.get("id"),
         name: webhook.get("name"),
         url: webhook.get("url"),
@@ -248,8 +309,17 @@ pub async fn create_webhook(
         repository_id: webhook.get("repository_id"),
         headers: webhook.get("headers"),
         payload_template: PayloadTemplate::from_str_lossy(&tpl),
+        secret_digest: webhook.get("secret_digest"),
+        secret_rotation_active: prev_expires
+            .map(|e| e > chrono::Utc::now())
+            .unwrap_or(false),
         last_triggered_at: webhook.get("last_triggered_at"),
         created_at: webhook.get("created_at"),
+    };
+
+    Ok(Json(WebhookSecretCreatedResponse {
+        webhook: response,
+        secret: raw_secret,
     }))
 }
 
@@ -277,7 +347,8 @@ pub async fn get_webhook(
     let webhook = sqlx::query(
         r#"
         SELECT id, name, url, events, is_enabled, repository_id, headers,
-               payload_template, last_triggered_at, created_at
+               payload_template, secret_digest, secret_previous_expires_at,
+               last_triggered_at, created_at
         FROM webhooks
         WHERE id = $1
         "#,
@@ -289,6 +360,8 @@ pub async fn get_webhook(
     .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
 
     let tpl: String = webhook.get("payload_template");
+    let prev_expires: Option<chrono::DateTime<chrono::Utc>> =
+        webhook.get("secret_previous_expires_at");
     Ok(Json(WebhookResponse {
         id: webhook.get("id"),
         name: webhook.get("name"),
@@ -298,6 +371,10 @@ pub async fn get_webhook(
         repository_id: webhook.get("repository_id"),
         headers: webhook.get("headers"),
         payload_template: PayloadTemplate::from_str_lossy(&tpl),
+        secret_digest: webhook.get("secret_digest"),
+        secret_rotation_active: prev_expires
+            .map(|e| e > chrono::Utc::now())
+            .unwrap_or(false),
         last_triggered_at: webhook.get("last_triggered_at"),
         created_at: webhook.get("created_at"),
     }))
@@ -717,6 +794,107 @@ pub async fn redeliver(
     }))
 }
 
+/// Length of the rotation overlap window. Both the previous and the
+/// current secret are accepted by the retry path during this window.
+const SECRET_ROTATION_OVERLAP: chrono::Duration = chrono::Duration::hours(24);
+
+/// Rotate the signing secret for a webhook.
+///
+/// Generates a new raw secret, encrypts it, moves the existing
+/// `secret_encrypted` into `secret_previous_encrypted`, and stamps an
+/// expiry 24 hours in the future. The new raw secret is returned in the
+/// response body **once**. The HMAC signing path (added in a later ticket)
+/// signs deliveries with both secrets while the previous one is within
+/// its expiry window so consumers can rotate without dropped events.
+#[utoipa::path(
+    post,
+    path = "/{id}/rotate-secret",
+    context_path = "/api/v1/webhooks",
+    tag = "webhooks",
+    params(
+        ("id" = Uuid, Path, description = "Webhook ID")
+    ),
+    responses(
+        (status = 200, description = "Secret rotated. Body includes the new raw secret exactly once.", body = RotateWebhookSecretResponse),
+        (status = 404, description = "Webhook not found"),
+        (status = 500, description = "Encryption key not configured")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn rotate_webhook_secret(
+    State(state): State<SharedState>,
+    Extension(_auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RotateWebhookSecretResponse>> {
+    let new_secret = webhook_secret_crypto::generate_secret();
+    let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
+        tracing::error!("webhook secret encryption failed during rotation: {}", e);
+        AppError::Internal("webhook secret encryption is not configured".to_string())
+    })?;
+    let new_digest = webhook_secret_crypto::digest_for_display(&new_secret);
+    let now = chrono::Utc::now();
+    let previous_expires_at = now + SECRET_ROTATION_OVERLAP;
+
+    let updated = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        UPDATE webhooks
+        SET
+            secret_previous_encrypted   = secret_encrypted,
+            secret_previous_expires_at  = CASE
+                WHEN secret_encrypted IS NOT NULL THEN $2
+                ELSE NULL
+            END,
+            secret_encrypted            = $3,
+            secret_digest               = $4,
+            secret_rotation_started_at  = $5,
+            updated_at                  = NOW()
+        WHERE id = $1
+        RETURNING id
+        "#,
+    )
+    .bind(id)
+    .bind(previous_expires_at)
+    .bind(&new_encrypted)
+    .bind(&new_digest)
+    .bind(now)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if updated.is_none() {
+        return Err(AppError::NotFound("Webhook not found".to_string()));
+    }
+
+    Ok(Json(RotateWebhookSecretResponse {
+        id,
+        secret: new_secret,
+        secret_digest: new_digest,
+        previous_secret_expires_at: previous_expires_at,
+    }))
+}
+
+/// Background-task entry point: clear expired previous-secret material so
+/// stale ciphertext does not linger past the rotation overlap window.
+///
+/// Returns the number of rows updated. Safe to call from a scheduler tick.
+pub async fn cleanup_expired_previous_secrets(
+    db: &sqlx::PgPool,
+) -> std::result::Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE webhooks
+        SET secret_previous_encrypted  = NULL,
+            secret_previous_expires_at = NULL
+        WHERE secret_previous_encrypted IS NOT NULL
+          AND secret_previous_expires_at IS NOT NULL
+          AND secret_previous_expires_at <= NOW()
+        "#,
+    )
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Validate a webhook URL to prevent SSRF attacks.
 ///
 /// Blocks URLs pointing to private/internal networks, loopback addresses,
@@ -998,6 +1176,7 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
         enable_webhook,
         disable_webhook,
         test_webhook,
+        rotate_webhook_secret,
         list_deliveries,
         redeliver,
     ),
@@ -1006,6 +1185,8 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
         PayloadTemplate,
         CreateWebhookRequest,
         WebhookResponse,
+        WebhookSecretCreatedResponse,
+        RotateWebhookSecretResponse,
         WebhookListResponse,
         TestWebhookResponse,
         DeliveryResponse,
@@ -1233,6 +1414,8 @@ mod tests {
             repository_id: None,
             headers: None,
             payload_template: PayloadTemplate::Generic,
+            secret_digest: Some("whsec_...abcd".to_string()),
+            secret_rotation_active: false,
             last_triggered_at: None,
             created_at: chrono::Utc::now(),
         };
