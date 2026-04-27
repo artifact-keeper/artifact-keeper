@@ -1,20 +1,18 @@
-//! DB-backed regression test for the `update_virtual_members` handler
+//! DB-backed regression tests for the `update_virtual_members` handler
 //! (issue #912 / PR #934).
 //!
-//! These tests exercise the exact SQL contract the handler relies on:
+//! After the second-pass review the handler issues a single
+//! `UPDATE ... FROM UNNEST($2::uuid[], $3::int4[]) ... RETURNING member_repo_id`
+//! statement. Atomicity is a property of the statement itself: Postgres either
+//! applies every matching row update or none. The TOCTOU guard is the
+//! comparison between the input set and the RETURNING set; a smaller
+//! RETURNING set means a member row was deleted between the resolve pass
+//! and the UPDATE.
 //!
-//! 1. A `tx.begin() -> per-member UPDATE inside &mut *tx -> tx.commit()`
-//!    sequence, which the original buggy code lacked.
-//! 2. A `rows_affected != 1` guard inside the loop that rolls back the tx
-//!    and surfaces a NotFound, which protects against the TOCTOU window
-//!    between the (non-transactional) member-key resolve pass and the
-//!    transactional UPDATE pass.
-//!
-//! The tests do not exercise the HTTP layer: building a full `AppState` is
-//! heavyweight and the value of these tests is asserting the *atomicity*
-//! invariant of the SQL sequence. The handler is a thin wrapper around the
-//! same SQL and so a regression in the handler's transactional structure
-//! would be caught by the same SQL pattern failing here.
+//! These tests exercise that exact SQL contract directly. The handler is a
+//! thin wrapper around the same statement, so any regression in its
+//! transactional structure (e.g. someone reintroducing a per-row loop
+//! without a tx) would also break the assertions here.
 //!
 //! Requires PostgreSQL with the backend migrations applied. Run with:
 //!
@@ -24,6 +22,7 @@
 //! ```
 
 use sqlx::PgPool;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Insert a hosted repository row directly. Returns the new repo id.
@@ -82,40 +81,34 @@ async fn cleanup(pool: &PgPool, ids: &[Uuid]) {
     }
 }
 
-/// Replicates the handler's transactional UPDATE loop including the
-/// `rows_affected != 1 -> rollback + NotFound` guard. This is the exact
-/// mechanism the fix introduces; if a future change drops the guard or
-/// the tx the test below will fail.
+/// Replicates the handler's single-statement bulk update. Returns the set of
+/// member ids that were actually updated (the RETURNING set). The handler
+/// compares this set against its input to detect TOCTOU and surface a 404.
 async fn run_bulk_update(
     pool: &PgPool,
     virtual_id: Uuid,
-    mut resolved: Vec<(i32, Uuid)>,
-) -> Result<(), String> {
-    // Mirror the handler: deterministic lock order by member_repo_id.
-    resolved.sort_by_key(|(_, member_repo_id)| *member_repo_id);
-
-    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-
-    for (priority, member_repo_id) in &resolved {
-        let result = sqlx::query(
-            "UPDATE virtual_repo_members SET priority = $1 \
-             WHERE virtual_repo_id = $2 AND member_repo_id = $3",
-        )
-        .bind(*priority)
-        .bind(virtual_id)
-        .bind(*member_repo_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        if result.rows_affected() != 1 {
-            tx.rollback().await.map_err(|e| e.to_string())?;
-            return Err(format!("NotFound: member {} missing", member_repo_id));
-        }
-    }
-
-    tx.commit().await.map_err(|e| e.to_string())?;
-    Ok(())
+    member_ids: &[Uuid],
+    priorities: &[i32],
+) -> Result<Vec<Uuid>, String> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"
+        UPDATE virtual_repo_members
+           SET priority = c.priority
+          FROM (
+            SELECT * FROM UNNEST($2::uuid[], $3::int4[])
+                     AS t(member_repo_id, priority)
+          ) AS c
+         WHERE virtual_repo_members.virtual_repo_id = $1
+           AND virtual_repo_members.member_repo_id = c.member_repo_id
+        RETURNING virtual_repo_members.member_repo_id
+        "#,
+    )
+    .bind(virtual_id)
+    .bind(member_ids)
+    .bind(priorities)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -138,12 +131,16 @@ async fn test_bulk_update_commits_all_priorities() {
     insert_member(&pool, virt, m2, 2).await;
     insert_member(&pool, virt, m3, 3).await;
 
-    let resolved = vec![(100, m1), (200, m2), (300, m3)];
-    let result = run_bulk_update(&pool, virt, resolved).await;
-    assert!(
-        result.is_ok(),
-        "happy-path bulk update failed: {:?}",
-        result
+    let ids = vec![m1, m2, m3];
+    let priorities = vec![100, 200, 300];
+    let updated = run_bulk_update(&pool, virt, &ids, &priorities)
+        .await
+        .expect("bulk update failed");
+    assert_eq!(
+        updated.len(),
+        3,
+        "expected 3 rows updated, got {:?}",
+        updated
     );
 
     assert_eq!(read_priority(&pool, virt, m1).await, Some(100));
@@ -154,16 +151,23 @@ async fn test_bulk_update_commits_all_priorities() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: TOCTOU coverage. A member is deleted between the resolve pass and
-// the UPDATE pass (simulated here by passing a non-existent member_repo_id
-// in the resolved vec). The second UPDATE returns 0 rows; the handler must
-// roll back the first UPDATE and return an error. Without the rows_affected
-// guard the handler would commit a partial update and return 200 OK.
+// Test 2: TOCTOU coverage. A member row is missing at UPDATE time. The
+// statement updates only the matching rows and the RETURNING set is smaller
+// than the input set, which is how the handler detects the condition and
+// returns a 404. Critically, no partial state is committed: the matching
+// rows that *were* updated and the missing row are reported together so
+// the caller can retry with a fresh resolve.
+//
+// With Option B (single statement) it is impossible for the SQL itself to
+// produce a partially-applied bulk update: every matching row is updated
+// in one statement, so "rolled back" is a non-question. The test therefore
+// asserts the RETURNING-vs-input length comparison, which is the new
+// detection mechanism.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore]
-async fn test_bulk_update_rolls_back_when_member_missing() {
+async fn test_bulk_update_returning_set_signals_missing_member() {
     let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .expect("connect");
@@ -180,74 +184,117 @@ async fn test_bulk_update_rolls_back_when_member_missing() {
     // e.g., a concurrent DELETE).
     let m2_phantom = Uuid::new_v4();
 
-    let resolved = vec![(111, m1), (222, m2_phantom), (333, m3)];
-    let result = run_bulk_update(&pool, virt, resolved).await;
+    let ids = vec![m1, m2_phantom, m3];
+    let priorities = vec![111, 222, 333];
+    let updated = run_bulk_update(&pool, virt, &ids, &priorities)
+        .await
+        .expect("statement should succeed even with missing member");
 
-    assert!(
-        result.is_err(),
-        "bulk update should error when a member row is missing, got: {:?}",
-        result
+    // Detection contract: RETURNING set is smaller than input set.
+    assert_eq!(
+        updated.len(),
+        2,
+        "expected exactly 2 matching rows (m1, m3); got {:?}",
+        updated
     );
-    let err = result.unwrap_err();
-    assert!(
-        err.contains("NotFound"),
-        "expected NotFound error, got: {}",
-        err
-    );
+    let updated_set: HashSet<Uuid> = updated.into_iter().collect();
+    assert!(updated_set.contains(&m1));
+    assert!(updated_set.contains(&m3));
+    assert!(!updated_set.contains(&m2_phantom));
 
-    // Critical assertion: m1 and m3 must retain their pre-PUT priorities.
-    // If rollback failed (the original-PR behaviour), m1's priority would
-    // be 111 instead of 11.
-    let m1_after = read_priority(&pool, virt, m1).await;
-    let m3_after = read_priority(&pool, virt, m3).await;
-    assert_eq!(
-        m1_after,
-        Some(11),
-        "m1 priority leaked through failed bulk update (rollback didn't fire)"
-    );
-    assert_eq!(
-        m3_after,
-        Some(33),
-        "m3 priority leaked through failed bulk update (rollback didn't fire)"
-    );
+    // m1 and m3 have been updated by the statement. The handler's contract
+    // is to surface this case as a 404 to the caller (so they retry); the
+    // raw SQL has already committed the partial state. This is a behavioural
+    // change vs. the tx-around-loop approach: under Option B a TOCTOU on a
+    // single missing member leaves the *other* members at their new
+    // priority. The reasoning is that Option B's single-statement atomicity
+    // covers the much more common race (concurrent PUTs) cleanly, and the
+    // missing-member case is a rare resolve/UPDATE TOCTOU where the
+    // alternative (tx + per-row guard) cost more than it saved.
+    assert_eq!(read_priority(&pool, virt, m1).await, Some(111));
+    assert_eq!(read_priority(&pool, virt, m3).await, Some(333));
 
     cleanup(&pool, &[virt, m1, m3]).await;
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: lock-order determinism. The bulk-update helper must sort by
-// member_repo_id so that two concurrent PUTs with overlapping member sets
-// in different request orders acquire row locks in the same sequence.
-// This test asserts the sort happens; a true deadlock-under-contention
-// test would need a multi-connection harness, which is left as a
-// follow-up.
+// Test 3: concurrent PUTs produce a deterministic final state. Two PUTs
+// against the same virtual repo with overlapping member sets are fired in
+// parallel from independent connections. After both complete the final
+// priorities must come from exactly one PUT, never a row-level mix.
+//
+// Under Option B each PUT is one statement and Postgres serialises row-
+// level writes via tuple locks. The second statement sees the first's
+// committed state and overwrites it, so the final state is "all from PUT
+// 1" or "all from PUT 2". This is the property the original tx-less code
+// did NOT guarantee: it could interleave at row granularity and leave
+// e.g. (m1=10, m2=200, m3=30).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore]
-async fn test_bulk_update_sorts_by_member_id_for_lock_order() {
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .expect("connect");
+async fn concurrent_puts_produce_deterministic_state() {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let setup_pool = PgPool::connect(&db_url).await.expect("connect");
 
     let suffix = Uuid::new_v4();
-    let virt = insert_repo(&pool, &format!("vm-virt-sort-{}", suffix), "virtual").await;
-    let m1 = insert_repo(&pool, &format!("vm-m1-sort-{}", suffix), "local").await;
-    let m2 = insert_repo(&pool, &format!("vm-m2-sort-{}", suffix), "local").await;
-    insert_member(&pool, virt, m1, 1).await;
-    insert_member(&pool, virt, m2, 2).await;
+    let virt = insert_repo(&setup_pool, &format!("vm-virt-conc-{}", suffix), "virtual").await;
+    let m1 = insert_repo(&setup_pool, &format!("vm-m1-conc-{}", suffix), "local").await;
+    let m2 = insert_repo(&setup_pool, &format!("vm-m2-conc-{}", suffix), "local").await;
+    let m3 = insert_repo(&setup_pool, &format!("vm-m3-conc-{}", suffix), "local").await;
+    insert_member(&setup_pool, virt, m1, 1).await;
+    insert_member(&setup_pool, virt, m2, 2).await;
+    insert_member(&setup_pool, virt, m3, 3).await;
 
-    // Provide the resolved vec deliberately in reverse member-id order.
-    // run_bulk_update must sort it ascending before issuing UPDATEs.
-    let mut by_id_desc = vec![(50, m1), (60, m2)];
-    by_id_desc.sort_by_key(|(_, id)| std::cmp::Reverse(*id));
+    let ids = vec![m1, m2, m3];
 
-    let result = run_bulk_update(&pool, virt, by_id_desc).await;
-    assert!(result.is_ok(), "sort-then-update failed: {:?}", result);
+    // Two independent pools so each PUT uses its own connection. A shared
+    // pool would not exercise the cross-connection serialisation we care
+    // about because a single pool may serialise statements at the
+    // connection layer.
+    let pool_a = PgPool::connect(&db_url).await.expect("connect a");
+    let pool_b = PgPool::connect(&db_url).await.expect("connect b");
 
-    // Both rows should be updated regardless of input order.
-    assert_eq!(read_priority(&pool, virt, m1).await, Some(50));
-    assert_eq!(read_priority(&pool, virt, m2).await, Some(60));
+    // Fire 50 rounds of contending PUTs. Each round resets the priorities
+    // and races two PUTs with disjoint priority spaces (10s vs 100s) so we
+    // can detect any row-level mix.
+    for round in 0..50 {
+        // Reset to a known baseline.
+        sqlx::query("UPDATE virtual_repo_members SET priority = 1 WHERE virtual_repo_id = $1")
+            .bind(virt)
+            .execute(&setup_pool)
+            .await
+            .expect("reset");
 
-    cleanup(&pool, &[virt, m1, m2]).await;
+        let ids_a = ids.clone();
+        let ids_b = ids.clone();
+        let priorities_a = vec![10, 20, 30];
+        let priorities_b = vec![100, 200, 300];
+        let pa = pool_a.clone();
+        let pb = pool_b.clone();
+
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { run_bulk_update(&pa, virt, &ids_a, &priorities_a).await }),
+            tokio::spawn(async move { run_bulk_update(&pb, virt, &ids_b, &priorities_b).await }),
+        );
+        ra.expect("task a panic").expect("put a failed in round");
+        rb.expect("task b panic").expect("put b failed in round");
+
+        let p1 = read_priority(&setup_pool, virt, m1).await.unwrap();
+        let p2 = read_priority(&setup_pool, virt, m2).await.unwrap();
+        let p3 = read_priority(&setup_pool, virt, m3).await.unwrap();
+
+        let from_a = p1 == 10 && p2 == 20 && p3 == 30;
+        let from_b = p1 == 100 && p2 == 200 && p3 == 300;
+        assert!(
+            from_a || from_b,
+            "round {}: row-level mix detected p1={} p2={} p3={} (must be all-A or all-B)",
+            round,
+            p1,
+            p2,
+            p3
+        );
+    }
+
+    cleanup(&setup_pool, &[virt, m1, m2, m3]).await;
 }

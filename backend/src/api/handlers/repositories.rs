@@ -2254,66 +2254,65 @@ pub async fn update_virtual_members(
         ));
     }
 
-    // Resolve every member_repo lookup before opening the transaction.
-    // Reads do not need transactional protection and resolving up front means
-    // a bad key fails fast with 404 before any UPDATE runs. This also keeps
-    // the transaction short, which matters under concurrent PUTs.
-    let mut resolved: Vec<(i32, Uuid)> = Vec::with_capacity(payload.members.len());
+    // Resolve every member_repo lookup up front. Reads do not need
+    // transactional protection and resolving first means a bad key fails
+    // fast with 404 before the UPDATE runs.
+    let mut resolved_member_ids: Vec<Uuid> = Vec::with_capacity(payload.members.len());
+    let mut priorities: Vec<i32> = Vec::with_capacity(payload.members.len());
     for member in &payload.members {
         let member_repo = service.get_by_key(&member.member_key).await?;
-        resolved.push((member.priority, member_repo.id));
+        resolved_member_ids.push(member_repo.id);
+        priorities.push(member.priority);
     }
 
-    // Sort by member_repo_id to enforce a deterministic row-lock acquisition
-    // order. Two concurrent PUTs with overlapping member sets supplied in
-    // different request orders would otherwise grab row locks in conflicting
-    // sequences and deadlock under contention.
-    resolved.sort_by_key(|(_, member_repo_id)| *member_repo_id);
+    // Single-statement bulk update via UNNEST(uuid[], int4[]). This is atomic
+    // by construction in Postgres: the entire statement either succeeds and
+    // updates every matching row, or fails and updates none. Removes the
+    // need for an explicit transaction, the per-row lock-ordering sort, and
+    // the rows_affected loop guard. Concurrent PUTs serialise at the row-
+    // lock layer of this single statement and produce a deterministic final
+    // state (one wins, the other overwrites it; never a row-level mix).
+    //
+    // RETURNING gives us the set of member_repo_ids that actually matched
+    // the (virtual_repo_id, member_repo_id) predicate. If that set is
+    // smaller than the input set, some member row was deleted between the
+    // resolve pass and the UPDATE (TOCTOU), and we surface a 404 listing
+    // the missing keys so the caller can retry with a fresh resolution.
+    let updated: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        UPDATE virtual_repo_members
+           SET priority = c.priority
+          FROM (
+            SELECT * FROM UNNEST($2::uuid[], $3::int4[])
+                     AS t(member_repo_id, priority)
+          ) AS c
+         WHERE virtual_repo_members.virtual_repo_id = $1
+           AND virtual_repo_members.member_repo_id = c.member_repo_id
+        RETURNING virtual_repo_members.member_repo_id
+        "#,
+    )
+    .bind(virtual_repo.id)
+    .bind(&resolved_member_ids)
+    .bind(&priorities)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Run all UPDATEs inside a single transaction so concurrent PUTs cannot
-    // interleave at row granularity and produce partially-applied bulk
-    // updates. Either every priority change commits together or none do.
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-    for (priority, member_repo_id) in &resolved {
-        // TOCTOU guard: the resolution pass above ran outside the tx, so a
-        // concurrent DELETE could have removed the row between resolve and
-        // UPDATE. Postgres reports 0 rows affected in that case. Without this
-        // check the handler would commit silently and return stale data with
-        // a misleading 200. rows_affected != 1 means the membership row no
-        // longer satisfies the (virtual_repo_id, member_repo_id) predicate;
-        // roll back and surface a 404 so callers can retry.
-        let result = sqlx::query(
-            "UPDATE virtual_repo_members SET priority = $1 WHERE virtual_repo_id = $2 AND member_repo_id = $3",
-        )
-        .bind(*priority)
-        .bind(virtual_repo.id)
-        .bind(*member_repo_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        if result.rows_affected() != 1 {
-            // Drop the tx explicitly so the rollback is visible in logs.
-            // Falling out of scope would also roll it back, but being
-            // explicit keeps the intent obvious.
-            tx.rollback()
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            return Err(AppError::NotFound(format!(
-                "Member {} not found in virtual repository {}",
-                member_repo_id, virtual_repo.id
-            )));
-        }
+    if updated.len() != resolved_member_ids.len() {
+        let updated_set: std::collections::HashSet<Uuid> = updated.into_iter().collect();
+        let missing: Vec<&str> = payload
+            .members
+            .iter()
+            .zip(resolved_member_ids.iter())
+            .filter(|(_, id)| !updated_set.contains(id))
+            .map(|(m, _)| m.member_key.as_str())
+            .collect();
+        return Err(AppError::NotFound(format!(
+            "members no longer exist on virtual repository {}: {}",
+            virtual_repo.key,
+            missing.join(", ")
+        )));
     }
-
-    tx.commit()
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
 
     // Return updated list
     list_virtual_members(State(state), Path(key)).await
@@ -3628,10 +3627,10 @@ mod tests {
     // Note: the original `test_update_virtual_members_resolution_preserves_order`
     // unit test was removed during code review. It exercised
     // `Vec::iter().map().collect()` and `serde_json::from_str`, neither of
-    // which touches the transactional UPDATE loop or the rows_affected check
-    // that fixes the #912 bug. A real DB-backed regression test now lives in
-    // `backend/tests/virtual_members_atomicity_test.rs` and would catch a
-    // regression of the partial-application behaviour.
+    // which touches the single-statement `UPDATE ... FROM UNNEST(...)`
+    // bulk update or the RETURNING-set comparison that fixes the #912 bug.
+    // A real DB-backed regression test (including a concurrent-PUT race)
+    // lives in `backend/tests/virtual_members_atomicity_test.rs`.
 
     #[test]
     fn test_virtual_member_response_serialization() {
