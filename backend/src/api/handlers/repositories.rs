@@ -3617,6 +3617,63 @@ mod tests {
         assert!(json.contains("\"priority\":1"));
     }
 
+    /// Structural guard for the defensive cycle / self-membership check
+    /// inside `update_virtual_members` (issue #915 second-pass review).
+    ///
+    /// The handler today only updates priorities of existing rows, so it
+    /// cannot insert a new edge and therefore cannot introduce a cycle.
+    /// The defensive check is preserved against a future contract change
+    /// (e.g. upsert semantics). Because no integration harness here can
+    /// observe the no-op behaviour, this test asserts on the *source
+    /// text* of the handler so the protection cannot be silently dropped
+    /// in a refactor without the test failing.
+    ///
+    /// Required substrings are constructed via `format!` so this test's
+    /// own source text does not accidentally satisfy the search.
+    #[test]
+    fn test_update_virtual_members_defensive_check_present() {
+        let source = include_str!("repositories.rs");
+
+        // Locate the `update_virtual_members` handler body.
+        let handler_marker = format!("pub async fn {}{}(", "update_virtual", "_members");
+        let handler_start = source
+            .find(&handler_marker)
+            .expect("update_virtual_members handler must exist");
+        // Slice from the handler signature forward; bound at the next
+        // top-level `pub` item or end of file.
+        let after_sig = &source[handler_start..];
+        let handler_end = after_sig[1..]
+            .find("\npub ")
+            .map(|i| i + 1)
+            .unwrap_or(after_sig.len());
+        let handler_body = &after_sig[..handler_end];
+
+        // The handler's body must still call the cycle helper.
+        let cycle_call = format!("{}_{}_{}", "would", "create", "cycle");
+        assert!(
+            handler_body.contains(&cycle_call),
+            "update_virtual_members must keep its defensive cycle check"
+        );
+
+        // ...and must still reject self-membership before updating.
+        // The exact comparison is `member_repo.id == virtual_repo.id`.
+        let self_check = format!("{}.id == {}.id", "member_repo", "virtual_repo");
+        assert!(
+            handler_body.contains(&self_check),
+            "update_virtual_members must keep its self-membership equality check"
+        );
+
+        // ...and the validation message string must remain.
+        let cannot_be_member_msg = format!(
+            "{} {} {} {} {}",
+            "A virtual repository", "cannot be", "a member", "of", "itself"
+        );
+        assert!(
+            handler_body.contains(&cannot_be_member_msg),
+            "self-membership rejection message must remain unchanged"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // compute_pagination
     // -----------------------------------------------------------------------

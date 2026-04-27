@@ -213,6 +213,21 @@ pub(crate) fn is_duplicate_key_error(error_message: &str) -> bool {
 /// unbounded work in `would_create_cycle_in_graph`.
 pub(crate) const MAX_VIRTUAL_DEPTH: usize = 32;
 
+/// Advisory-lock key used to serialize all mutations of the virtual
+/// membership graph (`add_virtual_member` and friends).
+///
+/// Concurrent `add_virtual_member` calls that race the cycle check would
+/// otherwise be able to bypass it: A reads at T, B reads at T, both pass,
+/// both INSERT, the resulting graph has the cycle the algorithm guarantees
+/// against. Taking this single transaction-scoped advisory lock at the
+/// start of every `add_virtual_member` tx makes the check + INSERT
+/// effectively atomic without forcing SERIALIZABLE on the whole codepath
+/// or trying to row-lock a graph subset.
+///
+/// The constant is arbitrary, just needs to be stable across processes.
+/// Chosen as a 64-bit hash of "artifact_keeper.virtual_repo_members.write".
+pub(crate) const VIRTUAL_MEMBER_GRAPH_LOCK_KEY: i64 = 0x4b56_4d47_5752_5445; // "KVMGWRTE"
+
 /// Pure cycle-detection on a virtual-membership graph.
 ///
 /// Determines whether adding the edge `virtual_id -> candidate_member_id`
@@ -654,7 +669,47 @@ impl RepositoryService {
         member_repo_id: Uuid,
         priority: i32,
     ) -> Result<()> {
-        // Validate virtual repository exists and is virtual type
+        // Reject self-membership unconditionally before opening the
+        // transaction. The cycle check below would also catch this, but
+        // the dedicated error message is more useful at the API boundary
+        // and we can return without paying for the advisory lock.
+        if virtual_repo_id == member_repo_id {
+            return Err(AppError::Validation(
+                "A virtual repository cannot be a member of itself".to_string(),
+            ));
+        }
+
+        // TOCTOU fix (issue #915 second-pass review): wrap the cycle
+        // check + INSERT in one transaction guarded by a transaction-
+        // scoped advisory lock. Without this, two concurrent admins
+        // could each pass the cycle check at T, each INSERT at T+1, and
+        // produce the cycle the algorithm is supposed to prevent
+        // (e.g. A: V1 -> V2, B: V2 -> V1; both checks see no cycle).
+        //
+        // The advisory lock is held for the duration of this tx and
+        // automatically released on commit or rollback. It serializes
+        // *all* `add_virtual_member` calls process-wide and across
+        // application instances backed by the same database. Throughput
+        // impact is negligible because the critical section is a few
+        // small reads and one INSERT, and membership mutation is a
+        // rare administrative action.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(VIRTUAL_MEMBER_GRAPH_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Re-fetch both repositories *inside* the locked tx so we observe
+        // a consistent snapshot of types/formats. A racing UPDATE that
+        // changed `repo_type` would have to wait for our advisory lock if
+        // it also goes through this path; direct admin updates of
+        // `repo_type` are out of scope for membership-graph integrity.
         let virtual_repo = self.get_by_id(virtual_repo_id).await?;
         if virtual_repo.repo_type != RepositoryType::Virtual {
             return Err(AppError::Validation(
@@ -662,19 +717,8 @@ impl RepositoryService {
             ));
         }
 
-        // Reject self-membership unconditionally. The cycle check below
-        // would also catch this, but the dedicated error message is more
-        // useful at the API boundary.
-        if virtual_repo_id == member_repo_id {
-            return Err(AppError::Validation(
-                "A virtual repository cannot be a member of itself".to_string(),
-            ));
-        }
-
-        // Validate member repository exists.
         let member_repo = self.get_by_id(member_repo_id).await?;
 
-        // Validate formats match
         if virtual_repo.format != member_repo.format {
             return Err(AppError::Validation(
                 "Member repository format must match virtual repository format".to_string(),
@@ -683,7 +727,11 @@ impl RepositoryService {
 
         // Cycle check: only meaningful when the candidate is itself
         // virtual. Non-virtual repositories are leaves in the membership
-        // graph and cannot participate in a cycle.
+        // graph and cannot participate in a cycle. Reads use `&self.db`,
+        // not the tx, but the advisory lock guarantees no other
+        // `add_virtual_member` tx can be mutating `virtual_repo_members`
+        // concurrently, so any committed state we read is stable for the
+        // remainder of this tx.
         if member_repo.repo_type == RepositoryType::Virtual
             && self
                 .would_create_cycle(virtual_repo_id, member_repo_id)
@@ -695,19 +743,23 @@ impl RepositoryService {
             )));
         }
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
             VALUES ($1, $2, $3)
             ON CONFLICT (virtual_repo_id, member_repo_id) DO UPDATE SET priority = $3
             "#,
-            virtual_repo_id,
-            member_repo_id,
-            priority
         )
-        .execute(&self.db)
+        .bind(virtual_repo_id)
+        .bind(member_repo_id)
+        .bind(priority)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
     }
@@ -1539,9 +1591,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_cycle_diamond_no_cycle_allowed() {
-        // V1 -> V2, V1 -> V3, V2 -> V4, V3 -> V4. Adding V1 -> V4 again
-        // (or V4 -> V_new) does not create a cycle. Verify that a diamond
-        // shaped DAG is correctly classified as acyclic.
+        // V1 -> V2, V1 -> V3, V2 -> V4, V3 -> V4 (diamond). Two
+        // assertions exercise the algorithm against this shape:
+        //
+        // 1. (v4, v1, graph): proposing V4 -> V1 must be rejected
+        //    because the BFS from V1 reaches V4 via *both* paths
+        //    (v1 -> v2 -> v4 and v1 -> v3 -> v4); the visited-set
+        //    must dedupe v4 reached via v2 and v3 without the BFS
+        //    looping or double-reporting, and ultimately the walk
+        //    reaches v4 == virtual_id, returning true.
+        //
+        // 2. (v_new, v1, graph): proposing V_new -> V1 where V_new
+        //    is not in the graph must be allowed. The BFS from V1
+        //    walks the full diamond (v2, v3, v4) without ever
+        //    reaching v_new, so the result is false. This is the
+        //    canonical "diamond DAG remains acyclic" case and the
+        //    one the original test author intended.
+        //
+        // The previous version of this test queried (v4, v_new, graph)
+        // where v_new had no graph entry, so the BFS terminated
+        // immediately and never traversed the diamond at all. That
+        // gave a false sense of coverage. (Issue #915 second-pass review.)
         let v1 = Uuid::new_v4();
         let v2 = Uuid::new_v4();
         let v3 = Uuid::new_v4();
@@ -1552,10 +1622,27 @@ mod tests {
         graph.insert(v2, vec![v4]);
         graph.insert(v3, vec![v4]);
         graph.insert(v4, vec![]);
-        let result = would_create_cycle_in_graph(v4, v_new, make_graph_lookup(graph))
+
+        // Assertion 1: closing the diamond by adding V4 -> V1 is a cycle.
+        // The visited set must dedupe v4 (reached via both v2 and v3).
+        let result_close = would_create_cycle_in_graph(v4, v1, make_graph_lookup(graph.clone()))
             .await
             .unwrap();
-        assert!(!result, "diamond DAG must remain valid when extended");
+        assert!(
+            result_close,
+            "v4 -> v1 closes the diamond and must be rejected; \
+             also exercises the visited-set dedupe of v4"
+        );
+
+        // Assertion 2: extending the diamond with V_new -> V1 is acyclic.
+        // The BFS traverses v1 -> v2/v3 -> v4 without reaching v_new.
+        let result_extend = would_create_cycle_in_graph(v_new, v1, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(
+            !result_extend,
+            "v_new -> v1 extends the diamond DAG without creating a cycle"
+        );
     }
 
     #[tokio::test]
