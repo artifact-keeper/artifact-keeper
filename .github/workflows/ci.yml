@@ -29,32 +29,18 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: sccache
+  SQLX_OFFLINE: "true"
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # TIER 1: FAST CI (Every Push/PR) - Target: < 5 minutes
   # ════════════════════════════════════════════════════════════════════════════
 
-  lint-rust:
-    name: 🦀 Lint Rust
-    runs-on: ubuntu-latest
+  check-rust:
+    name: 🦀 Check Rust
+    runs-on: ak-ci-runners
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -64,20 +50,9 @@ jobs:
 
   test-backend-unit:
     name: 🧪 Backend Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run unit tests
         env:
@@ -86,7 +61,7 @@ jobs:
 
   coverage:
     name: 📊 Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     services:
       postgres:
         image: postgres:16-alpine
@@ -104,55 +79,234 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Install sqlx-cli
-        uses: taiki-e/install-action@v2
-        with:
-          tool: sqlx-cli
+      # Skip the expensive coverage build on PRs that touch no Rust source.
+      # Dependency bumps (Cargo.toml/Cargo.lock only), workflow edits, and
+      # docs-only changes cannot move coverage numbers, and the Backend Unit
+      # Tests job already validates the build. `rust_changed=true` for push
+      # events preserves the existing behavior on main.
+      - name: Detect Rust source changes
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          if git diff --name-only FETCH_HEAD -- '*.rs' | grep -q .; then
+            echo "rust_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust_changed=false" >> "$GITHUB_OUTPUT"
+            echo "### Coverage: skipped (no Rust source changes in this PR)" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Run database migrations
+        if: steps.detect.outputs.rust_changed == 'true'
         run: sqlx migrate run --source backend/migrations
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
 
       - name: Generate coverage report
+        if: steps.detect.outputs.rust_changed == 'true'
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
         run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
 
+      - name: Coverage summary and gate
+        if: steps.detect.outputs.rust_changed == 'true'
+        run: |
+          # Total project coverage summary
+          echo "### Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cargo llvm-cov --workspace --lib --no-run --summary-only 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # Total coverage floor (never let overall coverage drop below 50%)
+          cargo llvm-cov --workspace --lib --no-run --fail-under-lines 50
+
+      - name: New code coverage gate
+        if: github.event_name == 'pull_request' && steps.detect.outputs.rust_changed == 'true'
+        run: |
+          # Fetch base branch so we can diff against it (checkout is shallow by default)
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }}
+
+          # Check coverage on new/changed lines only (not the entire file).
+          # Uses unified diff to extract exact line numbers that were added or modified,
+          # then cross-references with lcov to measure coverage of those specific lines.
+          CHANGED_FILES=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null || true)
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No .rs files changed, skipping new code coverage check"
+            echo "### New Code Coverage: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Parse the unified diff to find which lines were added/changed in each file,
+          # then cross-reference with lcov.info to compute coverage on those lines only.
+          RESULT=$(python3 -c "
+          import subprocess, re
+
+          # Step 1: Parse unified diff to find added line numbers per file
+          diff = subprocess.run(
+              ['git', 'diff', '-U0', 'FETCH_HEAD', '--', '*.rs'],
+              capture_output=True, text=True
+          ).stdout
+
+          new_lines = {}  # filename -> set of added line numbers
+          current_file = None
+          for line in diff.split('\n'):
+              if line.startswith('+++ b/'):
+                  current_file = line[6:]
+              elif line.startswith('@@') and current_file:
+                  # Parse @@ -old,count +new,count @@ format
+                  m = re.search(r'\+(\d+)(?:,(\d+))?', line)
+                  if m:
+                      start = int(m.group(1))
+                      count = int(m.group(2)) if m.group(2) else 1
+                      if current_file not in new_lines:
+                          new_lines[current_file] = set()
+                      for i in range(start, start + count):
+                          new_lines[current_file].add(i)
+
+          if not new_lines:
+              print('none')
+          else:
+              # Step 2: Parse lcov.info and check coverage only for new lines
+              hit = miss = 0
+              lcov_file = None
+              lcov_match = None
+              for line in open('lcov.info'):
+                  line = line.strip()
+                  if line.startswith('SF:'):
+                      path = line[3:]
+                      lcov_match = None
+                      for f, lines in new_lines.items():
+                          if path.endswith(f):
+                              lcov_match = lines
+                              break
+                  elif line.startswith('DA:') and lcov_match is not None:
+                      parts = line[3:].split(',')
+                      lineno = int(parts[0])
+                      count = int(parts[1])
+                      if lineno in lcov_match:
+                          if count > 0:
+                              hit += 1
+                          else:
+                              miss += 1
+              total = hit + miss
+              if total == 0:
+                  print('none')
+              else:
+                  pct = (hit * 100) // total
+                  print(f'{pct} {hit} {total}')
+          ")
+
+          if [ "$RESULT" = "none" ]; then
+            echo "No instrumented lines in new code"
+            echo "### New Code Coverage: N/A (no instrumented new lines)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          PCT=$(echo "$RESULT" | awk '{print $1}')
+          HIT=$(echo "$RESULT" | awk '{print $2}')
+          TOTAL=$(echo "$RESULT" | awk '{print $3}')
+
+          echo "### New Code Coverage: ${PCT}% (${HIT}/${TOTAL} new lines)" >> $GITHUB_STEP_SUMMARY
+          echo "New code coverage: ${PCT}% (${HIT}/${TOTAL} new lines)"
+
+          # Skip gate for very small changes (< 10 instrumented new lines) since
+          # the percentage is statistically noisy at that scale
+          if [ "$TOTAL" -lt 10 ]; then
+            echo "Too few new lines ($TOTAL) to enforce coverage gate, skipping"
+            echo "Skipped: fewer than 10 instrumented new lines" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          if [ "$PCT" -lt 70 ]; then
+            echo "::error::New code coverage is ${PCT}%, below 70% threshold"
+            echo "Coverage on new/changed lines is below 70%. Add tests for new code." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Setup Node.js for jscpd
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Code duplication gate
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          # Install jscpd (copy-paste detector, same approach as SonarCloud's CPD engine)
+          npm install -g jscpd@4 --silent
+
+          # Get changed .rs files
+          git fetch --no-tags --depth=1 origin ${{ github.base_ref }} 2>/dev/null || true
+          CHANGED_RS=$(git diff --name-only FETCH_HEAD -- '*.rs' 2>/dev/null | grep -v '_test\|tests/' || true)
+
+          if [ -z "$CHANGED_RS" ]; then
+            echo "No .rs source files changed, skipping duplication check"
+            echo "### Code Duplication: N/A (no Rust changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          # Write changed files to a list for jscpd
+          echo "$CHANGED_RS" > /tmp/changed-files.txt
+
+          # Run jscpd on changed files only (min 10 lines, threshold 3%)
+          RESULT=$(jscpd --min-lines 10 --threshold 3 --reporters json \
+            --format rust --output /tmp/jscpd-report \
+            $(echo "$CHANGED_RS" | tr '\n' ' ') 2>&1) || true
+
+          # Parse results
+          if [ -f /tmp/jscpd-report/jscpd-report.json ]; then
+            DUP_PCT=$(python3 -c "
+          import json
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          stats = data.get('statistics', {})
+          total = stats.get('total', {})
+          pct = total.get('percentage', 0)
+          dups = total.get('duplicatedLines', 0)
+          lines = total.get('lines', 0)
+          clones = len(data.get('duplicates', []))
+          print(f'{pct:.1f} {dups} {lines} {clones}')
+          " 2>/dev/null) || DUP_PCT="0.0 0 0 0"
+
+            PCT=$(echo "$DUP_PCT" | awk '{print $1}')
+            DUP_LINES=$(echo "$DUP_PCT" | awk '{print $2}')
+            TOTAL_LINES=$(echo "$DUP_PCT" | awk '{print $3}')
+            CLONES=$(echo "$DUP_PCT" | awk '{print $4}')
+
+            echo "### Code Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)" >> $GITHUB_STEP_SUMMARY
+            echo "Duplication: ${PCT}% (${DUP_LINES}/${TOTAL_LINES} lines, ${CLONES} clones)"
+
+            # Fail if duplication exceeds 3%
+            OVER=$(python3 -c "print('yes' if float('${PCT}') > 3.0 else 'no')")
+            if [ "$OVER" = "yes" ]; then
+              echo "::error::Code duplication is ${PCT}%, exceeding 3% threshold"
+
+              # Show the duplicate blocks
+              python3 -c "
+          import json
+          data = json.load(open('/tmp/jscpd-report/jscpd-report.json'))
+          for d in data.get('duplicates', []):
+              fa = d['firstFile']
+              sa = d['secondFile']
+              print(f\"  {fa['name']}:{fa['startLoc']['line']}-{fa['endLoc']['line']} <-> {sa['name']}:{sa['startLoc']['line']}-{sa['endLoc']['line']}\")
+          " 2>/dev/null || true
+
+              exit 1
+            fi
+          else
+            echo "### Code Duplication: 0% (no duplicates found)" >> $GITHUB_STEP_SUMMARY
+          fi
+
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        if: always() && steps.detect.outputs.rust_changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: lcov-coverage
           path: lcov.info
-
-      - name: SonarCloud Scan
-        if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@299e4b793aaa83bf2aba7c9c14bedbb485688ec4 # v7
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          args: >
-            -Dsonar.projectKey=artifact-keeper_artifact-keeper
-            -Dsonar.organization=artifact-keeper
-            -Dsonar.rust.lcov.reportPaths=lcov.info
 
   # ════════════════════════════════════════════════════════════════════════════
   # TIER 2: INTEGRATION (Main Branch Push Only)
@@ -160,8 +314,8 @@ jobs:
 
   test-backend-integration:
     name: 🔗 Backend Integration Tests
-    runs-on: ubuntu-latest
-    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && github.event_name == 'push'
+    runs-on: ak-ci-runners
+    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     services:
       postgres:
         image: postgres:16-alpine
@@ -179,17 +333,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run integration tests
         env:
@@ -313,11 +456,11 @@ jobs:
 
   detect-changes:
     name: 🔍 Detect Changes
-    runs-on: ubuntu-latest
+    runs-on: ak-ci-runners
     permissions:
       contents: read
       pull-requests: read
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'push'
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       openscap: ${{ steps.filter.outputs.openscap }}
@@ -339,7 +482,7 @@ jobs:
 
   build-backend-image:
     name: 🐳 Build Backend Image
-    runs-on: ubuntu-24.04
+    runs-on: ak-ci-runners
     needs: detect-changes
     if: needs.detect-changes.outputs.backend == 'true'
     steps:
@@ -349,7 +492,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Build backend image
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: ./docker/Dockerfile.backend
@@ -382,7 +525,7 @@ jobs:
           ls -lh /tmp/backend-image.tar.gz
 
       - name: Upload image artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: backend-image
           path: /tmp/backend-image.tar.gz
@@ -390,7 +533,7 @@ jobs:
 
   build-openscap-image:
     name: 🐳 Build OpenSCAP Image
-    runs-on: ubuntu-24.04
+    runs-on: ak-ci-runners
     needs: detect-changes
     if: needs.detect-changes.outputs.openscap == 'true'
     steps:
@@ -400,7 +543,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Build openscap image
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: ./docker/Dockerfile.openscap
@@ -452,8 +595,8 @@ jobs:
 
   ci-complete:
     name: ✅ CI Complete
-    runs-on: ubuntu-latest
-    needs: [lint-rust, test-backend-unit, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    runs-on: ak-ci-runners
+    needs: [check-rust, test-backend-unit, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -464,8 +607,8 @@ jobs:
           tier1_pass=true
 
           # Tier 1 jobs (required)
-          for job in lint-rust test-backend-unit; do
-            result="${{ needs.lint-rust.result }}"
+          for job in check-rust test-backend-unit; do
+            result="${{ needs.check-rust.result }}"
             [ "$job" = "test-backend-unit" ] && result="${{ needs.test-backend-unit.result }}"
             if [[ "$result" == "success" ]]; then
               echo "✅ $job" >> $GITHUB_STEP_SUMMARY
@@ -540,46 +683,31 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
 
   build-windows-dev:
-    name: 🪟 Windows Dev Build
-    runs-on: windows-latest
-    # Only build Windows on main push (not PRs) to save 27+ min on PR checks.
+    name: 🪟 Windows Cross-Build
+    runs-on: ak-ci-runners
+    # Only build Windows on main push (not PRs).
     # The release workflow builds Windows binaries for actual releases.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: x86_64-pc-windows-msvc
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build Windows binary
+      - name: Build Windows binary (cross-compile)
         env:
           SQLX_OFFLINE: true
           CARGO_TERM_COLOR: always
-        run: cargo build --release --target x86_64-pc-windows-msvc --features vendored-openssl
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --target x86_64-pc-windows-gnu --features vendored-openssl
 
       - name: Package binary
-        shell: bash
         run: |
           mkdir -p dist
-          cp target/x86_64-pc-windows-msvc/release/artifact-keeper.exe dist/artifact-keeper-windows-amd64.exe
+          cp target/x86_64-pc-windows-gnu/release/artifact-keeper.exe dist/artifact-keeper-windows-amd64.exe
           cd dist
           sha256sum artifact-keeper-windows-amd64.exe > artifact-keeper-windows-amd64.exe.sha256
           echo "Built: $(ls -lh artifact-keeper-windows-amd64.exe | awk '{print $5}')"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: artifact-keeper-windows-amd64
           path: |
