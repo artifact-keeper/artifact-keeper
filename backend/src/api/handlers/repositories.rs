@@ -4113,6 +4113,57 @@ mod tests {
         assert!(check_virtual_member_authz(&ext, virtual_id, member_id).is_err());
     }
 
+    /// Issue #913 binding test (API Tester finding):
+    ///
+    /// The five tests above use a test-only `check_virtual_member_authz`
+    /// helper that re-implements the two `require_repo_access` calls each
+    /// production handler performs. If a refactor accidentally drops the
+    /// member-repo check from one of the actual handlers, those tests still
+    /// pass because they never touch the production code path.
+    ///
+    /// Invoking the real handlers from a unit test would require a full
+    /// `SharedState` (postgres pool, storage backend, etc.) which the rest
+    /// of this `mod tests` block deliberately avoids. Instead, this test
+    /// reads the handler source as a string and asserts that each of the
+    /// three mutating handlers literally contains
+    /// `require_repo_access(&auth, member_repo.id)` so the wiring cannot
+    /// silently regress. Ugly, but it gives us a single point of failure
+    /// for the API Tester finding without dragging the DB into unit tests.
+    #[test]
+    fn test_virtual_member_handlers_contain_member_repo_access_check() {
+        let source = include_str!("repositories.rs");
+
+        // Locate each handler's body and assert it contains the per-member
+        // access check. Splitting on the `pub async fn <name>(` marker keeps
+        // us from matching only the doc comment or signature.
+        for handler in [
+            "add_virtual_member",
+            "remove_virtual_member",
+            "update_virtual_members",
+        ] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found in repositories.rs", handler));
+            // Bound the search to the next `pub async fn` (or EOF) so we
+            // only inspect this handler's body.
+            let rest = &source[start + marker.len()..];
+            let end = rest
+                .find("\npub async fn ")
+                .or_else(|| rest.find("\npub fn "))
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            assert!(
+                body.contains("require_repo_access(&auth, member_repo.id)"),
+                "handler `{}` is missing `require_repo_access(&auth, member_repo.id)` \
+                 (issue #913). If you intentionally removed it, also remove this test \
+                 and document the new authz model.",
+                handler
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // require_visible
     // -----------------------------------------------------------------------
