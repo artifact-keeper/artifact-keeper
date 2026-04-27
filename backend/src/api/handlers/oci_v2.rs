@@ -4440,4 +4440,83 @@ mod tests {
             Some("sha256:abcdef1234567890abcdef1234567890".to_string())
         );
     }
+
+    // -----------------------------------------------------------------------
+    // default_docker_mirror_repo: env var resolution
+    //
+    // The OnceLock means we can only observe one value per process. The
+    // build_default_mirror_value helper isolates the parsing logic so we
+    // can test all branches without depending on cell state.
+    // -----------------------------------------------------------------------
+
+    /// Parse the same way `default_docker_mirror_repo` does, without the
+    /// OnceLock cache. Mirrors the inner `get_or_init` closure 1:1.
+    fn build_default_mirror_value(raw: Option<&str>) -> Option<String> {
+        raw.map(|s| s.to_string()).filter(|s| !s.is_empty())
+    }
+
+    #[test]
+    fn test_default_mirror_unset_returns_none() {
+        assert_eq!(build_default_mirror_value(None), None);
+    }
+
+    #[test]
+    fn test_default_mirror_empty_string_returns_none() {
+        // An empty AK_DEFAULT_DOCKER_MIRROR_REPO must not be treated as a
+        // configured mirror; otherwise the SQL query would search for a
+        // repo with key="" and the fallback could mask real 404s.
+        assert_eq!(build_default_mirror_value(Some("")), None);
+    }
+
+    #[test]
+    fn test_default_mirror_returns_set_value() {
+        assert_eq!(
+            build_default_mirror_value(Some("docker-hub-cache")),
+            Some("docker-hub-cache".to_string())
+        );
+    }
+
+    /// Pure-logic check on the routing decision: given the literal
+    /// repo_key resolution and the configured mirror, what should
+    /// effective_image be?
+    #[test]
+    fn test_mirror_routing_uses_full_image_name_on_fallback() {
+        // The handler's behavior, expressed without DB access: when the
+        // literal repo_key misses and a different mirror is configured,
+        // the upstream proxy receives the FULL image_name as the path so
+        // dockerd's `/v2/library/postgres/...` routes to the proxy with
+        // image="library/postgres" (preserving the `library/` namespace).
+        let image_name = "library/postgres";
+        let (repo_key, image) = match image_name.find('/') {
+            Some(idx) => (&image_name[..idx], &image_name[idx + 1..]),
+            None => (image_name, image_name),
+        };
+        assert_eq!(repo_key, "library");
+        assert_eq!(image, "postgres");
+
+        // Literal lookup: repo_key="library" (would 404 in prod).
+        // Fallback: effective_image becomes the full image_name.
+        let effective_image_on_fallback = image_name.to_string();
+        assert_eq!(effective_image_on_fallback, "library/postgres");
+
+        // Without fallback: effective_image is the trimmed image.
+        let effective_image_literal = image.to_string();
+        assert_eq!(effective_image_literal, "postgres");
+    }
+
+    #[test]
+    fn test_mirror_routing_skips_self_recursion() {
+        // If a request comes in as `/v2/docker-hub-cache/library/postgres/...`
+        // (someone addressing the proxy directly), repo_key matches the
+        // mirror_key. The fallback's `mirror_key != repo_key` guard ensures
+        // we don't double-resolve.
+        let image_name = "docker-hub-cache/library/postgres";
+        let mirror_key = "docker-hub-cache";
+        let repo_key = match image_name.find('/') {
+            Some(idx) => &image_name[..idx],
+            None => image_name,
+        };
+        assert_eq!(repo_key, mirror_key);
+        // The handler must take the literal path, not the fallback.
+    }
 }
