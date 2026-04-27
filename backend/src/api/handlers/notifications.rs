@@ -4,9 +4,18 @@
 //! subscriptions scoped to a repository. Each subscription specifies a delivery
 //! channel (email or webhook), a set of event types to listen for, and
 //! channel-specific configuration (recipient addresses, webhook URLs, etc.).
+//!
+//! # Deprecation
+//!
+//! These endpoints are deprecated as of v1.1.9 in favour of the dedicated
+//! `/api/v1/webhooks` API (System A). Every response carries RFC 8594
+//! deprecation headers (`Deprecation`, `Sunset`, `Link`) so clients can detect
+//! the migration window programmatically. Removal is tracked under
+//! artifact-keeper#920 (v1.2.0).
 
 use axum::{
     extract::{Path, State},
+    response::Response,
     routing::get,
     Json, Router,
 };
@@ -22,10 +31,33 @@ use crate::error::{AppError, Result};
 use crate::services::repository_service::RepositoryService;
 
 // ---------------------------------------------------------------------------
+// Deprecation header constants (RFC 8594)
+// ---------------------------------------------------------------------------
+
+/// `Deprecation` header value. Per RFC 8594, the value `true` indicates the
+/// resource is deprecated without specifying when the deprecation took effect.
+pub(crate) const DEPRECATION_HEADER_VALUE: &str = "true";
+
+/// `Sunset` header value. The notifications subscription endpoints are
+/// scheduled for removal in v1.2.0 (target: 2026-08-01). Date is fixed at
+/// compile time, not derived at runtime, so the header is stable across
+/// requests and instances.
+pub(crate) const SUNSET_HEADER_VALUE: &str = "Sat, 01 Aug 2026 00:00:00 GMT";
+
+/// `Link` header pointing at the successor API. Clients should migrate to the
+/// `/api/v1/webhooks` endpoints documented at the linked URL.
+pub(crate) const SUCCESSOR_LINK_HEADER_VALUE: &str =
+    "<https://artifactkeeper.com/docs/advanced/webhooks>; rel=\"successor-version\"";
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
-/// Routes nested under /api/v1/repositories/:key/notifications
+/// Routes nested under /api/v1/repositories/:key/notifications.
+///
+/// Every response from these routes carries RFC 8594 deprecation headers
+/// (`Deprecation`, `Sunset`, `Link`) advertising the v1.2.0 sunset window and
+/// the successor API.
 pub fn repo_notifications_router() -> Router<SharedState> {
     Router::new()
         .route(
@@ -36,6 +68,29 @@ pub fn repo_notifications_router() -> Router<SharedState> {
             "/:key/notifications/:subscription_id",
             axum::routing::delete(delete_subscription),
         )
+        .layer(axum::middleware::map_response(deprecation_headers))
+}
+
+/// Inject RFC 8594 deprecation headers on every response.
+///
+/// Applied as a `tower::map_response` layer over the notifications router so
+/// every endpoint (POST/GET/DELETE) and every status code (2xx, 4xx, 5xx)
+/// surfaces the same `Deprecation`, `Sunset`, and `Link` headers.
+async fn deprecation_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    // .parse() on these &'static str values cannot fail because they are
+    // valid header values, but unwrap_or keeps the response on the happy path
+    // even if a future edit introduces an invalid byte.
+    if let Ok(v) = DEPRECATION_HEADER_VALUE.parse() {
+        headers.insert("deprecation", v);
+    }
+    if let Ok(v) = SUNSET_HEADER_VALUE.parse() {
+        headers.insert("sunset", v);
+    }
+    if let Ok(v) = SUCCESSOR_LINK_HEADER_VALUE.parse() {
+        headers.insert("link", v);
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -610,5 +665,109 @@ mod tests {
         let req: CreateNotificationSubscriptionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.channel, "webhook");
         assert_eq!(req.event_types.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deprecation headers (RFC 8594)
+    // -----------------------------------------------------------------------
+
+    use axum::{body::Body, http::Request, routing::get as axum_get, Router};
+    use tower::ServiceExt;
+
+    /// Build a no-DB router that mirrors how the deprecation middleware is
+    /// layered in `repo_notifications_router` so we can assert headers
+    /// without standing up SharedState. Every test handler returns a fixed
+    /// status, then the middleware should overlay the headers regardless.
+    fn deprecation_test_router() -> Router {
+        Router::new()
+            .route("/:key/notifications", axum_get(|| async { "ok-list" }))
+            .route(
+                "/:key/notifications/post",
+                axum::routing::post(|| async { "ok-create" }),
+            )
+            .route(
+                "/:key/notifications/:subscription_id",
+                axum::routing::delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/:key/notifications/error",
+                axum_get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+            )
+            .layer(axum::middleware::map_response(deprecation_headers))
+    }
+
+    async fn fetch(method: &str, uri: &str) -> axum::response::Response {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        deprecation_test_router().oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_deprecation_header_present_on_get() {
+        let resp = fetch("GET", "/myrepo/notifications").await;
+        assert_eq!(resp.headers().get("deprecation").unwrap(), "true");
+    }
+
+    #[tokio::test]
+    async fn test_sunset_header_present_on_get() {
+        let resp = fetch("GET", "/myrepo/notifications").await;
+        assert_eq!(
+            resp.headers().get("sunset").unwrap(),
+            "Sat, 01 Aug 2026 00:00:00 GMT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_link_header_present_on_get() {
+        let resp = fetch("GET", "/myrepo/notifications").await;
+        let link = resp.headers().get("link").unwrap().to_str().unwrap();
+        assert!(link.contains("rel=\"successor-version\""));
+        assert!(link.contains("artifactkeeper.com/docs/advanced/webhooks"));
+    }
+
+    #[tokio::test]
+    async fn test_deprecation_headers_present_on_post() {
+        let resp = fetch("POST", "/myrepo/notifications/post").await;
+        assert_eq!(resp.headers().get("deprecation").unwrap(), "true");
+        assert!(resp.headers().get("sunset").is_some());
+        assert!(resp.headers().get("link").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_deprecation_headers_present_on_delete() {
+        let resp = fetch(
+            "DELETE",
+            "/myrepo/notifications/00000000-0000-0000-0000-000000000000",
+        )
+        .await;
+        assert_eq!(resp.headers().get("deprecation").unwrap(), "true");
+        assert!(resp.headers().get("sunset").is_some());
+        assert!(resp.headers().get("link").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_deprecation_headers_present_on_error_responses() {
+        // Per RFC 8594, deprecation signalling must apply to error responses too
+        // so a client probing a deprecated endpoint can detect deprecation
+        // even if the request fails.
+        let resp = fetch("GET", "/myrepo/notifications/error").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.headers().get("deprecation").unwrap(), "true");
+        assert!(resp.headers().get("sunset").is_some());
+        assert!(resp.headers().get("link").is_some());
+    }
+
+    #[test]
+    fn test_deprecation_constants_are_stable() {
+        // These values are part of the public deprecation contract. Changing
+        // them is a breaking change for clients that pin on the sunset date,
+        // so guard them with a unit test.
+        assert_eq!(DEPRECATION_HEADER_VALUE, "true");
+        assert_eq!(SUNSET_HEADER_VALUE, "Sat, 01 Aug 2026 00:00:00 GMT");
+        assert!(SUCCESSOR_LINK_HEADER_VALUE.starts_with('<'));
+        assert!(SUCCESSOR_LINK_HEADER_VALUE.contains("rel=\"successor-version\""));
     }
 }
