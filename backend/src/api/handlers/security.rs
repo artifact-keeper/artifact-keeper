@@ -610,6 +610,14 @@ async fn list_findings(
     Query(query): Query<ListFindingsQuery>,
 ) -> Result<Json<FindingListResponse>> {
     let svc = ScanResultService::new(state.db.clone());
+
+    // Verify the scan exists. Without this check, an unknown scan_id falls
+    // through the `WHERE scan_result_id = $1` query and returns a 200 with
+    // an empty envelope, contradicting the 404 documented in the OpenAPI
+    // annotation above. Clients can't distinguish "unknown scan" from "real
+    // scan with zero findings" without this pre-check.
+    svc.get_scan(scan_id).await?;
+
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(50).min(200);
     let offset = (page - 1) * per_page;
