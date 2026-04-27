@@ -15,7 +15,9 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
-use crate::services::auth_service::AuthService;
+use crate::services::auth_service::{
+    invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
+};
 use std::sync::atomic::Ordering;
 
 /// Create user routes
@@ -408,6 +410,21 @@ pub async fn update_user(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
+    // When an admin deactivates a user, immediately invalidate every cached
+    // API-token and JWT for that user. Without this, a compromised account
+    // would keep authenticating against any AuthService instance whose
+    // in-memory cache had a fresh hit, for up to API_TOKEN_CACHE_TTL_SECS
+    // (5 min) after the flip. Issue #931.
+    //
+    // We invalidate whenever the request body asks for `is_active=false`,
+    // even on idempotent re-application: an extra eviction is harmless.
+    // We deliberately do NOT invalidate on `is_active=true` re-activation,
+    // since fresh validations will be cached against the now-active row.
+    if matches!(payload.is_active, Some(false)) {
+        invalidate_user_token_cache_entries(user.id);
+        invalidate_user_tokens(user.id);
+    }
+
     state
         .event_bus
         .emit("user.updated", user.id, Some(auth.username.clone()));
@@ -449,6 +466,13 @@ pub async fn delete_user(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("User not found".to_string()));
     }
+
+    // Hard-deleting a user must also evict any cached API-token and JWT
+    // validations for that user, otherwise the cache would keep
+    // authenticating the deleted user for up to API_TOKEN_CACHE_TTL_SECS
+    // (5 min). Issue #931.
+    invalidate_user_token_cache_entries(id);
+    invalidate_user_tokens(id);
 
     state
         .event_bus

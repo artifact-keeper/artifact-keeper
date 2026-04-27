@@ -152,6 +152,46 @@ pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
     false
 }
 
+/// Global record of users whose API-token cache entries have been forcibly
+/// invalidated (e.g. when an admin sets `is_active=false`). The value is the
+/// Unix timestamp of the invalidation so cache entries inserted before that
+/// point are rejected even on cache hit, without waiting for the
+/// `API_TOKEN_CACHE_TTL_SECS` window to elapse. Entries are pruned after
+/// twice the cache TTL since beyond that any stale cache entry has expired
+/// on its own and the `WHERE is_active = true` SQL filter takes over.
+static API_TOKEN_USER_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, Instant>>> = OnceLock::new();
+
+fn api_token_user_invalidation_map() -> &'static RwLock<HashMap<Uuid, Instant>> {
+    API_TOKEN_USER_INVALIDATIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Mark every cached API-token validation belonging to `user_id` as stale.
+///
+/// Called when the user is deactivated (`is_active=false`), hard-deleted, or
+/// otherwise loses the right to authenticate. Subsequent cache hits for any
+/// of that user's API tokens will be rejected immediately, closing the up-to
+/// `API_TOKEN_CACHE_TTL_SECS` window during which the cache would otherwise
+/// continue accepting them. Old entries beyond `2 * API_TOKEN_CACHE_TTL_SECS`
+/// are pruned on each call to keep memory bounded.
+pub fn invalidate_user_token_cache_entries(user_id: Uuid) {
+    if let Ok(mut map) = api_token_user_invalidation_map().write() {
+        map.insert(user_id, Instant::now());
+        let cutoff_secs = API_TOKEN_CACHE_TTL_SECS * 2;
+        map.retain(|_, recorded_at| recorded_at.elapsed().as_secs() < cutoff_secs);
+    }
+}
+
+/// Returns true if a cache entry inserted at `cached_at` should be rejected
+/// because the user's API tokens have been invalidated since it was cached.
+pub(crate) fn is_user_api_tokens_invalidated_after(user_id: Uuid, cached_at: Instant) -> bool {
+    if let Ok(map) = api_token_user_invalidation_map().read() {
+        if let Some(&invalidated_at) = map.get(&user_id) {
+            return cached_at <= invalidated_at;
+        }
+    }
+    false
+}
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
@@ -387,6 +427,17 @@ impl AuthService {
                             return Err(AppError::Authentication("API token expired".to_string()));
                         }
                     }
+                    // Reject if the user has been deactivated (or hard-deleted)
+                    // since this entry was cached. Without this check, a cached
+                    // validation would keep accepting requests for up to
+                    // `API_TOKEN_CACHE_TTL_SECS` (5 min) after `is_active`
+                    // flipped to false, even though the SQL filter
+                    // `WHERE id = $1 AND is_active = true` would now reject.
+                    if is_user_api_tokens_invalidated_after(entry.validation.user.id, *cached_at) {
+                        return Err(AppError::Authentication(
+                            "User account is deactivated".to_string(),
+                        ));
+                    }
                     return Ok(entry.validation.clone());
                 }
             }
@@ -604,6 +655,26 @@ impl AuthService {
         mark_api_token_revoked(token_id);
 
         Ok(())
+    }
+
+    /// Drop every cached API-token validation entry that belongs to `user_id`
+    /// from this `AuthService` instance's per-instance cache.
+    ///
+    /// This is a memory-cleanup helper: the global
+    /// [`invalidate_user_token_cache_entries`] function already rejects stale
+    /// hits across every `AuthService` instance, but this method also frees
+    /// the entries from the long-lived shared instance so they don't sit in
+    /// memory until the TTL elapses.
+    ///
+    /// Returns the number of cache entries removed.
+    pub fn flush_user_token_cache_entries(&self, user_id: Uuid) -> usize {
+        if let Ok(mut cache) = self.token_cache.write() {
+            let before = cache.len();
+            cache.retain(|_, (entry, _)| entry.validation.user.id != user_id);
+            before - cache.len()
+        } else {
+            0
+        }
     }
 
     // =========================================================================
@@ -2068,6 +2139,111 @@ mod tests {
         // and should return false, exercising the OnceLock init path
         let fresh = Uuid::new_v4();
         assert!(!is_token_invalidated(fresh, Utc::now().timestamp()));
+    }
+
+    // -----------------------------------------------------------------------
+    // API-token cache invalidation on user deactivation (issue #931)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_invalidate_user_token_cache_entries_marks_user() {
+        let user_id = Uuid::new_v4();
+        let cached_at = Instant::now();
+        // Sleep so the invalidation timestamp is strictly after `cached_at`.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        invalidate_user_token_cache_entries(user_id);
+        assert!(is_user_api_tokens_invalidated_after(user_id, cached_at));
+    }
+
+    #[test]
+    fn test_user_invalidation_does_not_affect_other_users() {
+        let target = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let cached_at = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        invalidate_user_token_cache_entries(target);
+        assert!(is_user_api_tokens_invalidated_after(target, cached_at));
+        assert!(!is_user_api_tokens_invalidated_after(other, cached_at));
+    }
+
+    #[test]
+    fn test_cache_entry_inserted_after_invalidation_is_kept() {
+        let user_id = Uuid::new_v4();
+        invalidate_user_token_cache_entries(user_id);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // A fresh cache entry inserted AFTER the invalidation timestamp
+        // should not be rejected (the user has been re-validated against the DB).
+        let cached_at = Instant::now();
+        assert!(!is_user_api_tokens_invalidated_after(user_id, cached_at));
+    }
+
+    #[test]
+    fn test_unknown_user_is_not_api_token_invalidated() {
+        let unknown = Uuid::new_v4();
+        assert!(!is_user_api_tokens_invalidated_after(
+            unknown,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn test_flush_user_token_cache_entries_removes_only_target_user() {
+        // Construct two cache entries for different users in a synthetic cache
+        // and verify the flush helper only drops entries matching the user_id.
+        let user_a = Uuid::new_v4();
+        let user_b = Uuid::new_v4();
+
+        fn make_entry(id: Uuid) -> CachedApiTokenEntry {
+            CachedApiTokenEntry {
+                validation: ApiTokenValidation {
+                    user: User {
+                        id,
+                        username: format!("u-{}", id),
+                        email: "x@example.com".to_string(),
+                        password_hash: None,
+                        display_name: None,
+                        auth_provider: AuthProvider::Local,
+                        external_id: None,
+                        is_admin: false,
+                        is_active: true,
+                        is_service_account: false,
+                        must_change_password: false,
+                        totp_secret: None,
+                        totp_enabled: false,
+                        totp_backup_codes: None,
+                        totp_verified_at: None,
+                        last_login_at: None,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    },
+                    scopes: vec![],
+                    allowed_repo_ids: None,
+                },
+                token_id: Uuid::new_v4(),
+                expires_at: None,
+            }
+        }
+
+        let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
+            RwLock::new(HashMap::new());
+        {
+            let mut w = cache.write().unwrap();
+            w.insert("key-a".to_string(), (make_entry(user_a), Instant::now()));
+            w.insert("key-b".to_string(), (make_entry(user_b), Instant::now()));
+        }
+
+        // Apply the same retain logic the AuthService method uses.
+        let removed = {
+            let mut w = cache.write().unwrap();
+            let before = w.len();
+            w.retain(|_, (entry, _)| entry.validation.user.id != user_a);
+            before - w.len()
+        };
+        assert_eq!(removed, 1);
+
+        let r = cache.read().unwrap();
+        assert!(r.get("key-a").is_none(), "user_a entry should be flushed");
+        assert!(r.get("key-b").is_some(), "user_b entry must remain");
     }
 
     #[test]
