@@ -49,6 +49,20 @@ pub fn record_webhook_delivery(event: &str, success: bool) {
     counter!("ak_webhook_deliveries_total", "event" => event.to_string(), "status" => status.to_string()).increment(1);
 }
 
+/// Record an outbound URL that was rejected by SSRF validation, either
+/// at handler entry (`validate_outbound_url`) or on a redirect hop
+/// inside the shared HTTP client. `reason` is `"hostname"` or `"ip"`,
+/// `label` identifies the calling site (e.g. `"Webhook URL"`,
+/// `"Cargo upstream download URL"`, `"http-client redirect"`).
+pub fn record_outbound_url_blocked(reason: &str, label: &str) {
+    counter!(
+        "ak_outbound_url_blocked_total",
+        "reason" => reason.to_string(),
+        "label" => label.to_string()
+    )
+    .increment(1);
+}
+
 /// Update storage gauge metrics from database stats.
 pub fn set_storage_gauge(total_bytes: i64, total_artifacts: i64, total_repos: i64) {
     gauge!("ak_storage_used_bytes").set(total_bytes as f64);
@@ -116,6 +130,12 @@ mod tests {
     fn test_record_webhook_delivery_does_not_panic() {
         record_webhook_delivery("artifact.created", true);
         record_webhook_delivery("artifact.deleted", false);
+    }
+
+    #[test]
+    fn test_record_outbound_url_blocked_does_not_panic() {
+        record_outbound_url_blocked("hostname", "Webhook URL");
+        record_outbound_url_blocked("ip", "http-client redirect");
     }
 
     #[test]
