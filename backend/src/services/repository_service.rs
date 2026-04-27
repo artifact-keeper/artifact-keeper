@@ -724,19 +724,34 @@ impl RepositoryService {
 /// PostgreSQL SQLSTATE for unique constraint violations.
 const PG_UNIQUE_VIOLATION: &str = "23505";
 
+/// Auto-generated PostgreSQL constraint name for
+/// `UNIQUE(virtual_repo_id, member_repo_id)` declared in
+/// `backend/migrations/003_repositories.sql`. This is the only unique
+/// constraint on `virtual_repo_members` whose violation should map to a 409
+/// "already a member" error. If a future migration adds another UNIQUE on
+/// this table (e.g. `(virtual_repo_id, priority)`), violations of that
+/// constraint must NOT be surfaced as "already a member" -- they fall
+/// through to [`AppError::Database`] instead.
+const VIRTUAL_REPO_MEMBERS_PAIR_UNIQUE_CONSTRAINT: &str =
+    "virtual_repo_members_virtual_repo_id_member_repo_id_key";
+
 /// Map an `INSERT` error from `virtual_repo_members` to an [`AppError`].
 ///
-/// Unique constraint violations (`23505`) indicate that the same
-/// `(virtual_repo_id, member_repo_id)` pair was inserted twice. These are
-/// surfaced as [`AppError::Conflict`] so the handler returns HTTP 409 instead
-/// of a generic 500. All other errors are reported as [`AppError::Database`].
+/// Only a unique-constraint violation (`23505`) on the
+/// `(virtual_repo_id, member_repo_id)` pair-uniqueness constraint is mapped
+/// to [`AppError::Conflict`] (HTTP 409). Other 23505 violations (from
+/// constraints added by future migrations) and all other database errors
+/// fall through to [`AppError::Database`] to avoid producing misleading
+/// "already a member" messages.
 fn map_virtual_member_insert_error(
     err: sqlx::Error,
     virtual_key: &str,
     member_key: &str,
 ) -> AppError {
     if let sqlx::Error::Database(db_err) = &err {
-        if db_err.code().as_deref() == Some(PG_UNIQUE_VIOLATION) {
+        if db_err.code().as_deref() == Some(PG_UNIQUE_VIOLATION)
+            && db_err.constraint() == Some(VIRTUAL_REPO_MEMBERS_PAIR_UNIQUE_CONSTRAINT)
+        {
             return AppError::Conflict(format!(
                 "repository '{}' is already a member of '{}'",
                 member_key, virtual_key
@@ -1338,6 +1353,7 @@ mod tests {
     struct MockDbError {
         message: String,
         code: Option<String>,
+        constraint: Option<String>,
         kind: ErrorKind,
     }
 
@@ -1356,6 +1372,10 @@ mod tests {
 
         fn code(&self) -> Option<Cow<'_, str>> {
             self.code.as_deref().map(Cow::Borrowed)
+        }
+
+        fn constraint(&self) -> Option<&str> {
+            self.constraint.as_deref()
         }
 
         fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
@@ -1388,6 +1408,21 @@ mod tests {
             message: "duplicate key value violates unique constraint \"virtual_repo_members_virtual_repo_id_member_repo_id_key\""
                 .to_string(),
             code: Some("23505".to_string()),
+            constraint: Some(
+                VIRTUAL_REPO_MEMBERS_PAIR_UNIQUE_CONSTRAINT.to_string(),
+            ),
+            kind: ErrorKind::UniqueViolation,
+        }))
+    }
+
+    fn make_unique_violation_other_constraint(constraint: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(MockDbError {
+            message: format!(
+                "duplicate key value violates unique constraint \"{}\"",
+                constraint
+            ),
+            code: Some("23505".to_string()),
+            constraint: Some(constraint.to_string()),
             kind: ErrorKind::UniqueViolation,
         }))
     }
@@ -1396,6 +1431,7 @@ mod tests {
         sqlx::Error::Database(Box::new(MockDbError {
             message: "violates foreign key constraint".to_string(),
             code: Some("23503".to_string()),
+            constraint: Some("fk_virtual_repo_members_virtual_repo_id".to_string()),
             kind: ErrorKind::ForeignKeyViolation,
         }))
     }
@@ -1444,12 +1480,49 @@ mod tests {
         let err = sqlx::Error::Database(Box::new(MockDbError {
             message: "some unexpected error".to_string(),
             code: None,
+            constraint: None,
             kind: ErrorKind::Other,
         }));
         let mapped = map_virtual_member_insert_error(err, "v", "m");
         assert!(
             matches!(mapped, AppError::Database(_)),
             "missing code should not be treated as conflict, got {mapped:?}"
+        );
+    }
+
+    /// A 23505 unique-violation on a constraint other than the
+    /// `(virtual_repo_id, member_repo_id)` pair-uniqueness one (for example,
+    /// a hypothetical future `UNIQUE(virtual_repo_id, priority)`) must NOT
+    /// produce a misleading "already a member" 409. It must fall through to
+    /// `AppError::Database` so the underlying cause is logged and surfaced
+    /// as a 500.
+    #[test]
+    fn test_map_virtual_member_insert_error_wrong_unique_constraint_returns_database() {
+        let err = make_unique_violation_other_constraint(
+            "virtual_repo_members_virtual_repo_id_priority_key",
+        );
+        let mapped = map_virtual_member_insert_error(err, "virtual-key", "member-key");
+        assert!(
+            matches!(mapped, AppError::Database(_)),
+            "23505 on a non-pair-unique constraint must not be Conflict, got {mapped:?}"
+        );
+    }
+
+    /// A 23505 with no constraint name attached (defensive: the Postgres
+    /// driver always populates this field, but the trait default returns
+    /// `None`) must also fall through to Database -- we will not guess.
+    #[test]
+    fn test_map_virtual_member_insert_error_unique_violation_without_constraint_returns_database() {
+        let err = sqlx::Error::Database(Box::new(MockDbError {
+            message: "duplicate key".to_string(),
+            code: Some("23505".to_string()),
+            constraint: None,
+            kind: ErrorKind::UniqueViolation,
+        }));
+        let mapped = map_virtual_member_insert_error(err, "v", "m");
+        assert!(
+            matches!(mapped, AppError::Database(_)),
+            "23505 without constraint name must not be Conflict, got {mapped:?}"
         );
     }
 }
