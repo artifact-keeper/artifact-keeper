@@ -64,7 +64,10 @@ jobs:
     runs-on: ak-ci-runners
     services:
       postgres:
-        image: postgres:16-alpine
+        # Use the GHCR mirror maintained by .github/workflows/mirror-images.yml
+        # to avoid Docker Hub anonymous-pull rate limits, which were aborting
+        # the coverage job before tests could compile.
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
@@ -318,7 +321,8 @@ jobs:
     if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     services:
       postgres:
-        image: postgres:16-alpine
+        # Use the GHCR mirror to avoid Docker Hub anonymous-pull rate limits.
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:16-alpine
         env:
           POSTGRES_USER: registry
           POSTGRES_PASSWORD: registry
