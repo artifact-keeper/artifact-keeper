@@ -472,6 +472,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     );
     tracing::info!("Notification dispatcher started");
 
+    // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
+    // into webhook_deliveries. The retry scheduler (every 30s) drives
+    // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
+    artifact_keeper_backend::services::webhook_producer::start_webhook_producer(
+        app_state.event_bus.clone(),
+        app_state.db.clone(),
+    );
+    tracing::info!("Webhook producer started");
+
     app_state
         .setup_required
         .store(setup_required, std::sync::atomic::Ordering::Relaxed);
