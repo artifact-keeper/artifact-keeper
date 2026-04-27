@@ -467,7 +467,7 @@ async fn list_scan_configs(
     responses(
         (status = 200, description = "Scan triggered successfully", body = TriggerScanResponse),
         (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
-        (status = 500, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -476,10 +476,13 @@ async fn trigger_scan(
     Extension(_auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
+    // 503 (not 500) because "scanner not configured" is a normal operational
+    // state on minimal stacks (no Trivy / OpenSCAP service), not a server
+    // bug. 500 alerts on operator dashboards; 503 does not.
     let scanner = state
         .scanner_service
         .as_ref()
-        .ok_or_else(|| AppError::Internal("Scanner service not configured".to_string()))?
+        .ok_or_else(|| AppError::ServiceUnavailable("Scanner service not configured".to_string()))?
         .clone();
 
     if let Some(artifact_id) = body.artifact_id {
