@@ -400,6 +400,13 @@ impl AuthService {
         })
     }
 
+    /// Borrow the underlying database pool. Used by middleware that needs
+    /// to issue queries through the same connection pool the auth service uses
+    /// (e.g. download-ticket fallback in the auth middleware chain).
+    pub fn db(&self) -> &PgPool {
+        &self.db
+    }
+
     pub fn validate_access_token(&self, token: &str) -> Result<Claims> {
         let token_data = self.decode_token(token)?;
 
