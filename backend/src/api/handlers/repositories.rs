@@ -24,6 +24,7 @@ use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
+use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
 use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -491,14 +492,24 @@ pub async fn get_cache_ttl(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let ttl = result
-        .and_then(|(v,)| v.parse::<i64>().ok())
-        .unwrap_or(3600); // default 1 hour
+    let ttl = resolve_cache_ttl(result.map(|(v,)| v));
 
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
     }))
+}
+
+/// Resolve the effective cache TTL from a stored `repository_config` value.
+///
+/// Falls back to [`DEFAULT_CACHE_TTL_SECS`] (24 hours) when no value is stored
+/// or when the stored value cannot be parsed as `i64`. This matches the default
+/// applied by `proxy_service` so `GET /cache-ttl` always reports the value the
+/// proxy will actually use.
+fn resolve_cache_ttl(stored: Option<String>) -> i64 {
+    stored
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
 }
 
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
@@ -4159,14 +4170,46 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // resolve_cache_ttl (issue #911: GET /cache-ttl default must match proxy)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_cache_ttl_falls_back_to_proxy_default_when_unset() {
+        // When no row exists in repository_config, the GET endpoint must
+        // report the same default the proxy actually applies (24h, not 1h).
+        assert_eq!(resolve_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(resolve_cache_ttl(None), 86400);
+    }
+
+    #[test]
+    fn test_resolve_cache_ttl_falls_back_when_value_unparseable() {
+        assert_eq!(
+            resolve_cache_ttl(Some("not-a-number".to_string())),
+            DEFAULT_CACHE_TTL_SECS,
+        );
+    }
+
+    #[test]
+    fn test_resolve_cache_ttl_returns_stored_value() {
+        assert_eq!(resolve_cache_ttl(Some("7200".to_string())), 7200);
+    }
+
+    #[test]
+    fn test_resolve_cache_ttl_returns_stored_zero() {
+        // resolve_cache_ttl is only responsible for parsing; range validation
+        // happens on the SET path via validate_cache_ttl.
+        assert_eq!(resolve_cache_ttl(Some("0".to_string())), 0);
+    }
+
+    // -----------------------------------------------------------------------
     // Cache TTL DTO serialization / deserialization
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_set_cache_ttl_request_deserialization() {
-        let json = r#"{"cache_ttl_seconds": 3600}"#;
+        let json = r#"{"cache_ttl_seconds": 86400}"#;
         let req: SetCacheTtlRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cache_ttl_seconds, 3600);
+        assert_eq!(req.cache_ttl_seconds, 86400);
     }
 
     #[test]
