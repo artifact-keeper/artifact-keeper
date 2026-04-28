@@ -31,6 +31,32 @@ const HTTP_TIMEOUT_SECS: u64 = 60;
 /// (e.g. the deprecated zero-arg `ProxyService::new` constructor).
 const DEFAULT_MAX_CONCURRENT_FETCHES: usize = 20;
 
+/// RAII guard wrapping an `OwnedSemaphorePermit` so the
+/// `ak_proxy_upstream_inflight` gauge is decremented when the permit is
+/// released. Without this, the gauge would only be updated on acquire and
+/// would stay pinned at the high-water mark forever, falsely advertising
+/// saturation while traffic is idle.
+struct FetchPermitGuard {
+    /// `Option` so `Drop` can `take()` the permit and explicitly drop it
+    /// BEFORE reading `available_permits()`. Custom `Drop::drop` runs
+    /// before field drops, so without the explicit `take()` the permit
+    /// would still be held when we sample the semaphore — the gauge
+    /// would report saturation - 1 forever. Counterintuitive but
+    /// matches the documented Rust drop-order semantics.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    sem: Arc<Semaphore>,
+    limit: usize,
+}
+
+impl Drop for FetchPermitGuard {
+    fn drop(&mut self) {
+        // Release the permit FIRST so the gauge sample reflects the
+        // post-release available-permits count, not the pre-release one.
+        drop(self.permit.take());
+        ProxyService::refresh_inflight_gauge_for(&self.sem, self.limit);
+    }
+}
+
 /// Default queue-wait budget per upstream fetch when no explicit value is
 /// supplied. Tuned to be tighter than typical client read timeouts (npm,
 /// cargo, pip) so a saturated proxy returns 503 fast rather than the
@@ -166,14 +192,21 @@ impl ProxyService {
     /// Acquire a permit for an upstream fetch, waiting up to `queue_timeout`.
     ///
     /// Returns `Ok(None)` when stampede protection is disabled (operator set
-    /// the limit to 0). Returns `Ok(Some(permit))` after acquiring a permit;
-    /// the guard automatically releases on drop. Returns
+    /// the limit to 0). Returns `Ok(Some(guard))` after acquiring a permit;
+    /// the guard automatically releases the permit AND decrements the
+    /// `ak_proxy_upstream_inflight` gauge on drop. Returns
     /// `Err(AppError::Overloaded)` when the queue is saturated and the
     /// timeout fires, after emitting `ak_proxy_queue_full_total`.
     ///
+    /// The 503 message returned to the client is deliberately generic;
+    /// the concrete configured limit and timeout are logged server-side
+    /// only so an unauthenticated attacker probing for capacity numbers
+    /// gets nothing useful out of the response body. The `Retry-After`
+    /// header (set in `IntoResponse`) carries the actionable hint.
+    ///
     /// Emits `ak_proxy_queue_wait_seconds` for every acquire attempt
     /// (success or timeout) so operators can dashboard p50/p95 wait time.
-    async fn acquire_fetch_permit(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    async fn acquire_fetch_permit(&self) -> Result<Option<FetchPermitGuard>> {
         let Some(sem) = &self.upstream_fetch_sem else {
             return Ok(None);
         };
@@ -184,11 +217,12 @@ impl ProxyService {
 
         match result {
             Ok(Ok(permit)) => {
-                let inflight = self
-                    .fetch_concurrency_limit
-                    .saturating_sub(sem.available_permits());
-                crate::services::metrics_service::set_proxy_upstream_inflight(inflight as f64);
-                Ok(Some(permit))
+                self.refresh_inflight_gauge();
+                Ok(Some(FetchPermitGuard {
+                    permit: Some(permit),
+                    sem: Arc::clone(sem),
+                    limit: self.fetch_concurrency_limit,
+                }))
             }
             Ok(Err(_)) => {
                 // The semaphore is owned by this ProxyService instance and
@@ -207,12 +241,32 @@ impl ProxyService {
                     timeout_secs = self.queue_timeout.as_secs(),
                     "proxy upstream-fetch queue full, returning 503 to client"
                 );
-                Err(AppError::Overloaded(format!(
-                    "upstream-fetch queue full (limit: {} concurrent fetches, queue timeout: {}s); retry after backoff",
-                    self.fetch_concurrency_limit,
-                    self.queue_timeout.as_secs()
-                )))
+                // Generic public message: do NOT include limit or timeout
+                // numbers. An unauthenticated client can otherwise binary-
+                // search the limit by ramping concurrency until 503 fires,
+                // learning the exact PROXY_MAX_CONCURRENT_FETCHES per pod.
+                // The Retry-After header carries the actionable hint.
+                Err(AppError::Overloaded {
+                    message: "upstream-fetch queue is saturated; retry after backoff".to_string(),
+                    retry_after_secs: self.queue_timeout.as_secs().max(1),
+                })
             }
+        }
+    }
+
+    /// Recompute and publish the `ak_proxy_upstream_inflight` gauge from the
+    /// semaphore's current available-permits count. Called both on permit
+    /// acquire (in `acquire_fetch_permit`) and on permit release (via
+    /// `FetchPermitGuard::drop`) so the gauge tracks both edges and never
+    /// stays pinned at a stale high-water mark while traffic is idle.
+    fn refresh_inflight_gauge_for(sem: &Semaphore, limit: usize) {
+        let inflight = limit.saturating_sub(sem.available_permits());
+        crate::services::metrics_service::set_proxy_upstream_inflight(inflight as f64);
+    }
+
+    fn refresh_inflight_gauge(&self) {
+        if let Some(sem) = &self.upstream_fetch_sem {
+            Self::refresh_inflight_gauge_for(sem, self.fetch_concurrency_limit);
         }
     }
 
@@ -2251,14 +2305,32 @@ mod tests {
 
         let result = svc.acquire_fetch_permit().await;
         match result {
-            Err(AppError::Overloaded(msg)) => {
+            Err(AppError::Overloaded {
+                message,
+                retry_after_secs,
+            }) => {
                 assert!(
-                    msg.contains("queue full"),
-                    "expected 'queue full' in message, got: {msg}"
+                    message.contains("saturated"),
+                    "expected 'saturated' in user message, got: {message}"
+                );
+                // Public message must NOT leak capacity tunables (see
+                // comment on acquire_fetch_permit). Asserting absence
+                // catches a regression where someone reintroduces
+                // limit/timeout into the response body.
+                assert!(
+                    !message.contains("limit:"),
+                    "user message must not leak configured limit, got: {message}"
                 );
                 assert!(
-                    msg.contains("limit: 1"),
-                    "expected configured limit in message, got: {msg}"
+                    !message.contains("timeout"),
+                    "user message must not leak configured timeout, got: {message}"
+                );
+                // Retry-After must be at least 1 second (we max(1) the
+                // queue_timeout). Caller's queue_timeout was 500ms which
+                // floor()s to 0; the max(1) guard turns it into 1.
+                assert!(
+                    retry_after_secs >= 1,
+                    "retry_after_secs must be >= 1, got: {retry_after_secs}"
                 );
             }
             other => panic!("expected AppError::Overloaded, got {:?}", other.map(|_| ())),
@@ -2329,14 +2401,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_overloaded_error_maps_to_503_service_unavailable() {
-        // Documents the AppError::Overloaded → 503 contract. The proxy 503
-        // is the load-bearing client signal: if this drifts to 500 or
-        // 502, clients will retry too aggressively or stop retrying
-        // entirely. Worth a unit test rather than relying on the E2E gate.
-        let err = AppError::Overloaded("queue full".to_string());
+    async fn test_overloaded_error_maps_to_503_with_retry_after() {
+        // Documents the AppError::Overloaded → 503 + Retry-After contract.
+        // The 503 is the load-bearing client signal; the Retry-After header
+        // is what stops well-behaved clients (cargo, npm, pip retry
+        // middleware, kubelet) from retry-storming the moment they see
+        // 503 and re-saturating the queue.
+        let err = AppError::Overloaded {
+            message: "saturated".to_string(),
+            retry_after_secs: 7,
+        };
         let resp = axum::response::IntoResponse::into_response(err);
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = resp
+            .headers()
+            .get("Retry-After")
+            .expect("Retry-After header must be present on 503 Overloaded")
+            .to_str()
+            .expect("Retry-After value must be valid ASCII");
+        assert_eq!(retry_after, "7");
     }
 
     #[tokio::test]
