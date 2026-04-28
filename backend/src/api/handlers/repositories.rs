@@ -24,6 +24,7 @@ use crate::formats::maven::MavenHandler;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
+use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
 use crate::services::repository_service::{
     CreateRepositoryRequest as ServiceCreateRepoReq, RepoVisibility, RepositoryService,
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
@@ -491,14 +492,24 @@ pub async fn get_cache_ttl(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let ttl = result
-        .and_then(|(v,)| v.parse::<i64>().ok())
-        .unwrap_or(3600); // default 1 hour
+    let ttl = resolve_cache_ttl(result.map(|(v,)| v));
 
     Ok(Json(CacheTtlResponse {
         repository_key: key,
         cache_ttl_seconds: ttl,
     }))
+}
+
+/// Resolve the effective cache TTL from a stored `repository_config` value.
+///
+/// Falls back to [`DEFAULT_CACHE_TTL_SECS`] when no value is stored or when the
+/// stored value cannot be parsed as `i64`. This matches the default applied by
+/// `proxy_service` so `GET /cache-ttl` always reports the value the proxy will
+/// actually use.
+fn resolve_cache_ttl(stored: Option<String>) -> i64 {
+    stored
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_SECS)
 }
 
 fn parse_format(s: &str) -> Result<RepositoryFormat> {
@@ -4160,14 +4171,95 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // resolve_cache_ttl (issue #911: GET /cache-ttl default must match proxy)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_cache_ttl_falls_back_to_proxy_default_when_unset() {
+        // When no row exists in repository_config, the GET endpoint must
+        // report the same default the proxy actually applies (24h, not 1h).
+        assert_eq!(resolve_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(resolve_cache_ttl(None), 86400);
+    }
+
+    #[test]
+    fn test_resolve_cache_ttl_falls_back_when_value_unparseable() {
+        assert_eq!(
+            resolve_cache_ttl(Some("not-a-number".to_string())),
+            DEFAULT_CACHE_TTL_SECS,
+        );
+    }
+
+    #[test]
+    fn test_resolve_cache_ttl_returns_stored_value() {
+        assert_eq!(resolve_cache_ttl(Some("7200".to_string())), 7200);
+    }
+
+    #[test]
+    fn test_resolve_cache_ttl_returns_stored_zero() {
+        // resolve_cache_ttl is only responsible for parsing; range validation
+        // happens on the SET path via validate_cache_ttl.
+        assert_eq!(resolve_cache_ttl(Some("0".to_string())), 0);
+    }
+
+    /// Structural guard for issue #911. The unit tests above only cover the
+    /// `resolve_cache_ttl` helper. They will still pass if a future change
+    /// reverts the `get_cache_ttl` handler call site to a hardcoded literal
+    /// like the old 1-hour default, which is exactly the regression we are
+    /// trying to prevent. Asserting on the source text of this file at
+    /// compile time is ugly but pins the call site without requiring a
+    /// Postgres fixture.
+    ///
+    /// In-process handler tests in this crate would require a live PgPool
+    /// (no `#[sqlx::test]` pattern is used in this file), so we use a
+    /// source-grep test as the lightweight regression contract instead.
+    ///
+    /// The forbidden substrings are constructed at runtime so this test's
+    /// own body does not contain them and trip the check on itself.
+    #[test]
+    fn test_get_cache_ttl_handler_uses_resolve_helper_not_hardcoded_literal() {
+        let src = include_str!("repositories.rs");
+
+        // Build forbidden patterns at runtime so they do not appear as
+        // literal substrings in this source file.
+        let unwrap_prefix = ["unwrap", "_or"].concat(); // "unwrap_or"
+        let bad_old_default = format!("{}({})", unwrap_prefix, 3600);
+        let bad_inline_default = format!("{}({})", unwrap_prefix, 86400);
+
+        assert!(
+            !src.contains(&bad_old_default),
+            "regression of issue #911: the old 1-hour fallback literal must \
+             not reappear in this file; the get_cache_ttl handler must \
+             delegate to resolve_cache_ttl(...) so the default stays aligned \
+             with proxy_service::DEFAULT_CACHE_TTL_SECS",
+        );
+        assert!(
+            !src.contains(&bad_inline_default),
+            "do not hardcode the cache TTL default literal; call \
+             resolve_cache_ttl(...) which references DEFAULT_CACHE_TTL_SECS",
+        );
+
+        // Anchor: the handler body must actually call the helper.
+        // Spelled in three pieces so this assertion's own text does not
+        // satisfy the search.
+        let helper_call = format!("{}{}{}", "resolve_cache_ttl(result.map(", "|(v,)| v", "))",);
+        assert!(
+            src.contains(&helper_call),
+            "get_cache_ttl handler must call the resolve_cache_ttl helper to \
+             derive the effective TTL; do not inline the fallback in the \
+             handler",
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Cache TTL DTO serialization / deserialization
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_set_cache_ttl_request_deserialization() {
-        let json = r#"{"cache_ttl_seconds": 3600}"#;
+        let json = r#"{"cache_ttl_seconds": 86400}"#;
         let req: SetCacheTtlRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cache_ttl_seconds, 3600);
+        assert_eq!(req.cache_ttl_seconds, 86400);
     }
 
     #[test]
