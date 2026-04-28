@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **API-token cache invalidation on user deactivation** (#931) -- when an admin deactivates or deletes a user (`PATCH /api/v1/users/{id}`, `DELETE /api/v1/users/{id}`), updates a service account (`PATCH/DELETE /api/v1/service-accounts/{id}`), or runs a federated SSO offboarding sync (`AuthService::deactivate_missing_users`), every cached API-token validation belonging to that user or service account is now rejected immediately rather than continuing to authenticate for up to 5 minutes (the previous `API_TOKEN_CACHE_TTL_SECS` window). Caveat: the invalidation map is per-process. In multi-replica deployments (Helm `replicas > 1`) only the replica that handled the admin action evicts immediately; other replicas still reject the cached entry within the same 5-minute window via the existing `WHERE is_active = true` SQL filter, but cache hits on those replicas can still authenticate during that window. A v1.2.0 follow-up will move the signal into the database or a Redis pub-sub channel so it is observed by every replica.
+
 ## [1.2.0] - 2026-04-24
+
+## [1.1.6] - 2026-04-20
+
+### Sponsors
+
+Thank you to our backers for supporting ongoing development:
+
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper)
+
+### Fixed
+
+- **PyPI: simple index now normalizes package names per PEP 503** (#798) -- packages with underscores, dots, or mixed case are now normalized to lowercase hyphens in the simple index, and lookups are case-insensitive.
+- **npm: version-specific metadata endpoint** (#799) -- `GET /npm/{repo}/{package}/{version}` now returns the specific version object extracted from the packument, supporting both regular and scoped packages.
+- **Go, Terraform, Swift: return 404 for nonexistent resources** (#800) -- version listings and release lookups for modules/packages that don't exist now return 404 instead of an empty 200. Empty repositories still work correctly.
+- **Conda native: .conda package format key corrected** (#801) -- `derive_format_key()` was producing `"condanative"` instead of `"conda_native"` for multi-word format variants, breaking format handler registration. Also affects `wasm_oci` and `helm_oci`.
+- **HuggingFace: long model name validation** (#802) -- model names over 255 characters, revisions over 255 characters, or paths over 2036 characters now return 400 with a descriptive error instead of a 500 database constraint violation.
+- **Conan: revision count no longer inflated** (#803) -- uploading multiple files to the same recipe revision (conanfile.py, conanmanifest.txt, conan_export.tgz) now correctly counts as one revision, not three. The revisions query uses GROUP BY on the revision hash.
+
+## [1.1.5] - 2026-04-19
 
 ### Sponsors
 
