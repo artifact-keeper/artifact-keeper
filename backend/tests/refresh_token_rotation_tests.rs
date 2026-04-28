@@ -28,46 +28,9 @@ async fn connect_db() -> PgPool {
 
 fn make_test_config() -> Arc<Config> {
     Arc::new(Config {
-        database_url: "postgresql://unused".to_string(),
-        bind_address: "0.0.0.0:8080".to_string(),
-        log_level: "info".to_string(),
-        storage_backend: "filesystem".to_string(),
-        storage_path: "/tmp/test".to_string(),
-        s3_bucket: None,
-        gcs_bucket: None,
-        s3_region: None,
-        s3_endpoint: None,
         jwt_secret: "test-secret-key-for-refresh-rotation-integration-tests-must-be-long"
             .to_string(),
-        jwt_expiration_secs: 86400,
-        jwt_access_token_expiry_minutes: 30,
-        jwt_refresh_token_expiry_days: 7,
-        oidc_issuer: None,
-        oidc_client_id: None,
-        oidc_client_secret: None,
-        ldap_url: None,
-        ldap_base_dn: None,
-        trivy_url: None,
-        openscap_url: None,
-        openscap_profile: "standard".to_string(),
-        meilisearch_url: None,
-        meilisearch_api_key: None,
-        scan_workspace_path: "/tmp".to_string(),
-        demo_mode: false,
-        peer_instance_name: "test".to_string(),
-        peer_public_endpoint: "http://localhost:8080".to_string(),
-        peer_api_key: "test-key".to_string(),
-        dependency_track_url: None,
-        otel_exporter_otlp_endpoint: None,
-        otel_service_name: "test".to_string(),
-        gc_schedule: "0 0 * * * *".to_string(),
-        lifecycle_check_interval_secs: 60,
-        max_upload_size_bytes: 10_737_418_240,
-        allow_local_admin_login: false,
-        proxy_max_concurrent_fetches: 20,
-        proxy_max_artifact_size_bytes: 2_147_483_648,
-        proxy_queue_timeout_secs: 30,
-        metrics_port: None,
+        ..Config::default()
     })
 }
 
@@ -274,6 +237,176 @@ async fn test_gc_used_refresh_jtis_removes_old_rows() {
             .await
             .expect("check fresh jti");
     assert!(exists_fresh.0, "fresh jti must be preserved");
+
+    cleanup_test_user(&pool, user_id).await;
+}
+
+/// Fires N concurrent `refresh_tokens` calls with the same valid refresh
+/// token and asserts exactly one succeeds. This exercises the load-bearing
+/// claim of the design (issue #929): the atomic
+/// `INSERT ... ON CONFLICT DO NOTHING` against `used_refresh_jtis` must
+/// serialize concurrent redemptions race-free, with the unique row
+/// constraint on `jti` acting as the single point of mutual exclusion.
+#[tokio::test]
+#[ignore] // requires PostgreSQL
+async fn test_refresh_token_concurrent_redemption_only_one_succeeds() {
+    let pool = connect_db().await;
+    let (user_id, username, password) = create_test_user(&pool).await;
+    let auth = Arc::new(AuthService::new(pool.clone(), make_test_config()));
+
+    let (_user, pair1) = auth
+        .authenticate(&username, &password)
+        .await
+        .expect("login");
+
+    // Spawn N concurrent refresh attempts with the same token.
+    const N: usize = 10;
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let auth = auth.clone();
+        let token = pair1.refresh_token.clone();
+        handles.push(tokio::spawn(
+            async move { auth.refresh_tokens(&token).await },
+        ));
+    }
+
+    let mut successes = 0usize;
+    let mut failures = 0usize;
+    for h in handles {
+        match h.await.expect("task panicked") {
+            Ok(_) => successes += 1,
+            Err(_) => failures += 1,
+        }
+    }
+
+    assert_eq!(
+        successes, 1,
+        "exactly one concurrent refresh must succeed, got {}",
+        successes
+    );
+    assert_eq!(
+        failures,
+        N - 1,
+        "remaining {} attempts must be rejected as replays",
+        N - 1
+    );
+
+    // Sanity check: only one jti should have landed for this user.
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM used_refresh_jtis WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count used_refresh_jtis");
+    assert_eq!(
+        count.0, 1,
+        "exactly one jti row should be persisted regardless of concurrency"
+    );
+
+    cleanup_test_user(&pool, user_id).await;
+}
+
+/// Mints a legacy-style refresh token (no `jti` claim) directly with
+/// `jsonwebtoken::encode`, using the same secret two distinct AuthService
+/// instances share, then verifies that the second instance rejects the
+/// token as a replay even though its in-process state is empty. This
+/// proves the legacy guard now survives restarts and is shared across
+/// replicas (issue #929 review HIGH-2).
+#[tokio::test]
+#[ignore] // requires PostgreSQL
+async fn test_legacy_refresh_token_replay_rejected_across_auth_instances() {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde::Serialize;
+
+    let pool = connect_db().await;
+    let (user_id, _username, _password) = create_test_user(&pool).await;
+    let cfg = make_test_config();
+
+    // Mint a legacy refresh token: no `jti` field at all (mirrors pre-#929
+    // tokens issued by older versions). We construct a minimal claims
+    // struct so the field is omitted entirely from the encoded JWT, not
+    // serialized as `null`.
+    #[derive(Serialize)]
+    struct LegacyClaims {
+        sub: Uuid,
+        username: String,
+        email: String,
+        is_admin: bool,
+        iat: i64,
+        exp: i64,
+        token_type: String,
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let exp = now + 3600;
+    let legacy = LegacyClaims {
+        sub: user_id,
+        username: "legacy-user".to_string(),
+        email: "legacy@example.test".to_string(),
+        is_admin: false,
+        iat: now,
+        exp,
+        token_type: "refresh".to_string(),
+    };
+
+    let legacy_token = encode(
+        &Header::default(),
+        &legacy,
+        &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+    )
+    .expect("encode legacy refresh token");
+
+    // Two distinct AuthService instances backed by the same DB simulate
+    // either a process restart or two replicas behind a load balancer.
+    let auth_a = AuthService::new(pool.clone(), cfg.clone());
+    let auth_b = AuthService::new(pool.clone(), cfg.clone());
+
+    // First instance redeems successfully.
+    let first = auth_a.refresh_tokens(&legacy_token).await;
+    assert!(
+        first.is_ok(),
+        "first redemption of legacy token must succeed: {:?}",
+        first.err()
+    );
+
+    // Second instance, which has never seen the token before in process
+    // memory, must still reject it as a replay because the DB blocklist
+    // is shared.
+    let second = auth_b.refresh_tokens(&legacy_token).await;
+    assert!(
+        second.is_err(),
+        "legacy token must be rejected by a fresh AuthService instance \
+         (proves the guard survives restarts and is shared across replicas)"
+    );
+
+    cleanup_test_user(&pool, user_id).await;
+}
+
+/// Verifies that `blocklist_refresh_token` (used by the logout handler)
+/// renders an outstanding refresh token unusable.
+#[tokio::test]
+#[ignore] // requires PostgreSQL
+async fn test_logout_blocklist_renders_refresh_token_unusable() {
+    let pool = connect_db().await;
+    let (user_id, username, password) = create_test_user(&pool).await;
+    let auth = AuthService::new(pool.clone(), make_test_config());
+
+    let (_user, pair) = auth
+        .authenticate(&username, &password)
+        .await
+        .expect("login");
+
+    // Logout: blocklist the refresh token without rotating.
+    auth.blocklist_refresh_token(&pair.refresh_token)
+        .await
+        .expect("blocklist refresh token");
+
+    // Subsequent attempt to refresh with the now-blocklisted token must fail.
+    let post_logout = auth.refresh_tokens(&pair.refresh_token).await;
+    assert!(
+        post_logout.is_err(),
+        "blocklisted refresh token must be rejected"
+    );
 
     cleanup_test_user(&pool, user_id).await;
 }

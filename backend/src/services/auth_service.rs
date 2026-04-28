@@ -270,41 +270,29 @@ pub(crate) fn is_user_api_tokens_invalidated_after(user_id: Uuid, cached_at: Ins
     false
 }
 
-/// In-memory guard for refresh tokens minted before issue #929 (no jti).
-/// Keyed by (user_id, iat) which uniquely identifies a legacy token within
-/// a single second; collisions are acceptable because they would also collide
-/// in the JWT itself. Entries are reaped opportunistically on each insert.
-static LEGACY_REFRESH_USED: OnceLock<RwLock<HashMap<(Uuid, i64), i64>>> = OnceLock::new();
+/// Namespace UUID for synthesizing deterministic jti values for legacy
+/// (pre-#929) refresh tokens that did not carry a jti claim. We use the
+/// well-known `Uuid::NAMESPACE_OID` as the v5 namespace so that the same
+/// `(user_id, iat)` pair always hashes to the same UUID, regardless of which
+/// replica or process is handling the request. This lets the legacy
+/// single-use guard share the `used_refresh_jtis` table with the new path:
+/// once a legacy token is consumed, the same `INSERT ... ON CONFLICT DO
+/// NOTHING` semantics reject parallel and post-restart replays. The choice
+/// of `NAMESPACE_OID` is arbitrary but stable; we only require that the
+/// namespace not collide with naturally-generated v4 jti UUIDs (v5 collisions
+/// with v4 are cryptographically improbable).
+const LEGACY_JTI_NAMESPACE: Uuid = Uuid::NAMESPACE_OID;
 
-fn legacy_refresh_used_map() -> &'static RwLock<HashMap<(Uuid, i64), i64>> {
-    LEGACY_REFRESH_USED.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Atomically record a legacy (pre-#929) refresh token as used. Returns true
-/// if this call claimed the token, false if it had already been claimed.
-pub(crate) fn claim_legacy_refresh(user_id: Uuid, issued_at: i64) -> bool {
-    let now = Utc::now().timestamp();
-    let cutoff = now - INVALIDATION_RETENTION_SECS;
-    if let Ok(mut map) = legacy_refresh_used_map().write() {
-        map.retain(|_, ts| *ts > cutoff);
-        if map.contains_key(&(user_id, issued_at)) {
-            return false;
-        }
-        map.insert((user_id, issued_at), now);
-        true
-    } else {
-        // If the lock is poisoned, fail closed: treat as already used.
-        false
-    }
-}
-
-/// Test-only helper to clear the legacy-refresh in-memory guard so individual
-/// tests do not interfere with each other.
-#[cfg(test)]
-pub(crate) fn reset_legacy_refresh_used() {
-    if let Ok(mut map) = legacy_refresh_used_map().write() {
-        map.clear();
-    }
+/// Synthesize a deterministic jti for a legacy (pre-#929) refresh token.
+/// Two requests carrying the same legacy token (same `user_id`, same `iat`)
+/// will hash to the same UUID, so the atomic INSERT into
+/// `used_refresh_jtis` rejects the second attempt regardless of which
+/// replica or process handled the first.
+fn legacy_token_jti(user_id: Uuid, issued_at: i64) -> Uuid {
+    let mut bytes = [0u8; 24];
+    bytes[..16].copy_from_slice(user_id.as_bytes());
+    bytes[16..].copy_from_slice(&issued_at.to_be_bytes());
+    Uuid::new_v5(&LEGACY_JTI_NAMESPACE, &bytes)
 }
 
 /// Authentication service
@@ -474,10 +462,12 @@ impl AuthService {
     /// to refresh with the same token is rejected as a replay (issue #929).
     ///
     /// Tokens minted before #929 do not carry a jti. They are still accepted,
-    /// but only once: the first successful refresh issues a jti-bearing pair
-    /// and forces all clients onto the rotation scheme. To still defend
-    /// against parallel replays of legacy tokens, we rate-limit through the
-    /// in-memory `LEGACY_REFRESH_USED` set keyed by (user_id, iat).
+    /// but only once: we synthesize a deterministic UUIDv5 from
+    /// `(user_id, iat)` (`legacy_token_jti`) and INSERT it into the same
+    /// `used_refresh_jtis` table. The atomic conflict path therefore covers
+    /// both new and legacy tokens, and the guard survives process restarts
+    /// and is shared across replicas. After the first successful refresh
+    /// the caller receives a jti-bearing pair and is on the new path.
     pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<(User, TokenPair)> {
         let token_data = self.decode_token(refresh_token)?;
 
@@ -491,43 +481,46 @@ impl AuthService {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        // Single-use rotation: if the token carries a jti, ensure it has not
-        // already been redeemed. The atomic INSERT below acts as the
-        // claim-the-jti step; if it returns 0 rows, another caller already
-        // claimed it, which means this request is a replay.
-        if let Some(jti) = token_data.claims.jti {
-            let inserted = sqlx::query!(
-                r#"
+        // Single-use rotation: claim the jti via an atomic INSERT. If the
+        // token does not carry one (legacy pre-#929 token), synthesize a
+        // deterministic UUIDv5 from (user_id, iat) so the same INSERT path
+        // covers both cases and the guard is shared across replicas /
+        // survives process restarts.
+        let jti = token_data
+            .claims
+            .jti
+            .unwrap_or_else(|| legacy_token_jti(token_data.claims.sub, token_data.claims.iat));
+
+        let inserted = sqlx::query!(
+            r#"
                 INSERT INTO used_refresh_jtis (jti, user_id)
                 VALUES ($1, $2)
                 ON CONFLICT (jti) DO NOTHING
                 "#,
-                jti,
-                token_data.claims.sub
-            )
-            .execute(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            jti,
+            token_data.claims.sub
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-            if inserted.rows_affected() == 0 {
-                // Replay detected. Invalidate the user's existing access
-                // tokens issued at-or-before this refresh so a leaked pair
-                // is fully neutralized rather than letting the attacker keep
-                // using a still-valid access token until natural expiry.
-                invalidate_user_tokens(token_data.claims.sub);
-                return Err(AppError::Authentication(
-                    "Refresh token has already been used".to_string(),
-                ));
-            }
-        } else {
-            // Legacy token (pre-#929): no jti to record. Accept once via an
-            // in-memory guard keyed by (user_id, iat). After the first use
-            // the caller receives a jti-bearing pair and is on the new path.
-            if !claim_legacy_refresh(token_data.claims.sub, token_data.claims.iat) {
-                return Err(AppError::Authentication(
-                    "Refresh token has already been used".to_string(),
-                ));
-            }
+        if inserted.rows_affected() == 0 {
+            // Replay detected. Invalidate the user's existing access
+            // tokens issued at-or-before this refresh so a leaked pair
+            // is fully neutralized rather than letting the attacker keep
+            // using a still-valid access token until natural expiry.
+            //
+            // Note (multi-replica): `invalidate_user_tokens` records the
+            // event in process-local memory. In multi-replica deployments
+            // each replica observes its own invalidation timestamp, so an
+            // access token may remain valid on a replica that did not see
+            // the replay until the natural expiry. Promoting this signal
+            // to a DB-backed table or a NOTIFY/LISTEN channel is tracked
+            // for v1.2.0 follow-up.
+            invalidate_user_tokens(token_data.claims.sub);
+            return Err(AppError::Authentication(
+                "Refresh token has already been used".to_string(),
+            ));
         }
 
         // Fetch fresh user data
@@ -567,6 +560,45 @@ impl AuthService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(result.rows_affected())
+    }
+
+    /// Blocklist a refresh token by inserting its jti into `used_refresh_jtis`.
+    /// Used by the logout handler so that a captured refresh token cannot be
+    /// redeemed after the user has logged out, even though the JWT itself
+    /// remains within its `exp` window.
+    ///
+    /// Tokens without a jti (legacy pre-#929) are blocklisted using the same
+    /// deterministic UUIDv5 derivation as `refresh_tokens`.
+    ///
+    /// Returns Ok regardless of whether the token was already blocklisted:
+    /// idempotency is desirable here because logout is fire-and-forget.
+    /// Returns Err only on JWT decode failures or database errors.
+    pub async fn blocklist_refresh_token(&self, refresh_token: &str) -> Result<()> {
+        let token_data = self.decode_token(refresh_token)?;
+
+        if token_data.claims.token_type != "refresh" {
+            return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+
+        let jti = token_data
+            .claims
+            .jti
+            .unwrap_or_else(|| legacy_token_jti(token_data.claims.sub, token_data.claims.iat));
+
+        sqlx::query!(
+            r#"
+                INSERT INTO used_refresh_jtis (jti, user_id)
+                VALUES ($1, $2)
+                ON CONFLICT (jti) DO NOTHING
+                "#,
+            jti,
+            token_data.claims.sub
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
     }
 
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
@@ -1509,45 +1541,8 @@ mod tests {
 
     fn make_test_config() -> Arc<Config> {
         Arc::new(Config {
-            database_url: "postgresql://unused".to_string(),
-            bind_address: "0.0.0.0:8080".to_string(),
-            log_level: "info".to_string(),
-            storage_backend: "filesystem".to_string(),
-            storage_path: "/tmp/test".to_string(),
-            s3_bucket: None,
-            gcs_bucket: None,
-            s3_region: None,
-            s3_endpoint: None,
             jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
-            jwt_expiration_secs: 86400,
-            jwt_access_token_expiry_minutes: 30,
-            jwt_refresh_token_expiry_days: 7,
-            oidc_issuer: None,
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            ldap_url: None,
-            ldap_base_dn: None,
-            trivy_url: None,
-            openscap_url: None,
-            openscap_profile: "standard".to_string(),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            scan_workspace_path: "/tmp".to_string(),
-            demo_mode: false,
-            peer_instance_name: "test".to_string(),
-            peer_public_endpoint: "http://localhost:8080".to_string(),
-            peer_api_key: "test-key".to_string(),
-            dependency_track_url: None,
-            otel_exporter_otlp_endpoint: None,
-            otel_service_name: "test".to_string(),
-            gc_schedule: "0 0 * * * *".to_string(),
-            lifecycle_check_interval_secs: 60,
-            max_upload_size_bytes: 10_737_418_240,
-            allow_local_admin_login: false,
-            proxy_max_concurrent_fetches: 20,
-            proxy_max_artifact_size_bytes: 2_147_483_648,
-            proxy_queue_timeout_secs: 30,
-            metrics_port: None,
+            ..Config::default()
         })
     }
 
@@ -2650,49 +2645,58 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Refresh-token rotation: legacy in-memory guard (#929)
+    // Refresh-token rotation: legacy-token deterministic jti derivation (#929)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_claim_legacy_refresh_first_use_succeeds() {
-        reset_legacy_refresh_used();
+    fn test_legacy_token_jti_is_deterministic() {
+        // The same (user_id, iat) must always produce the same UUID, so that
+        // any replica or any post-restart process sees the same jti and the
+        // shared `used_refresh_jtis` table catches the replay.
         let user = Uuid::new_v4();
-        let iat = Utc::now().timestamp();
-        assert!(claim_legacy_refresh(user, iat), "first claim must succeed");
-    }
-
-    #[test]
-    fn test_claim_legacy_refresh_replay_rejected() {
-        reset_legacy_refresh_used();
-        let user = Uuid::new_v4();
-        let iat = Utc::now().timestamp();
-        assert!(claim_legacy_refresh(user, iat));
-        assert!(
-            !claim_legacy_refresh(user, iat),
-            "second claim with same (user, iat) must be rejected"
+        let iat: i64 = 1_700_000_000;
+        let a = legacy_token_jti(user, iat);
+        let b = legacy_token_jti(user, iat);
+        assert_eq!(
+            a, b,
+            "legacy_token_jti must be deterministic for stable claim-the-jti semantics"
         );
     }
 
     #[test]
-    fn test_claim_legacy_refresh_distinct_iats_independent() {
-        reset_legacy_refresh_used();
+    fn test_legacy_token_jti_distinct_iats_differ() {
         let user = Uuid::new_v4();
-        let iat = Utc::now().timestamp();
-        assert!(claim_legacy_refresh(user, iat));
-        // A different iat (e.g. a freshly-issued token) must not be blocked
-        // by an earlier token's claim.
-        assert!(claim_legacy_refresh(user, iat + 1));
+        let a = legacy_token_jti(user, 1_700_000_000);
+        let b = legacy_token_jti(user, 1_700_000_001);
+        assert_ne!(
+            a, b,
+            "different iats for the same user must produce different jtis"
+        );
     }
 
     #[test]
-    fn test_claim_legacy_refresh_distinct_users_independent() {
-        reset_legacy_refresh_used();
-        let iat = Utc::now().timestamp();
+    fn test_legacy_token_jti_distinct_users_differ() {
         let user_a = Uuid::new_v4();
         let user_b = Uuid::new_v4();
-        assert!(claim_legacy_refresh(user_a, iat));
-        // A different user's claim at the same iat must not collide.
-        assert!(claim_legacy_refresh(user_b, iat));
+        let iat: i64 = 1_700_000_000;
+        let a = legacy_token_jti(user_a, iat);
+        let b = legacy_token_jti(user_b, iat);
+        assert_ne!(
+            a, b,
+            "different users at the same iat must produce different jtis"
+        );
+    }
+
+    #[test]
+    fn test_legacy_token_jti_is_v5() {
+        // Sanity check that we are emitting a name-based UUID (version 5),
+        // not a v4 random UUID. v5 has the high nibble of byte 6 set to 5.
+        let jti = legacy_token_jti(Uuid::new_v4(), 1_700_000_000);
+        assert_eq!(
+            jti.get_version_num(),
+            5,
+            "legacy jti must be a v5 (name-based) UUID"
+        );
     }
 
     // -----------------------------------------------------------------------

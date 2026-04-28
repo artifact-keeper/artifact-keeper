@@ -322,8 +322,39 @@ pub fn spawn_all(
         });
     }
 
+    // Refresh-token jti blocklist GC (every hour). Reaps rows older than the
+    // refresh-token TTL; without this the `used_refresh_jtis` table would
+    // grow unbounded since every refresh appends one row (issue #929).
+    {
+        let db = db.clone();
+        let config_clone = config.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(180)).await;
+            let auth = crate::services::auth_service::AuthService::new(
+                db,
+                std::sync::Arc::new(config_clone),
+            );
+            let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
+
+            loop {
+                ticker.tick().await;
+                tracing::debug!("Reaping expired refresh-token jti rows");
+
+                match auth.gc_used_refresh_jtis().await {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!("Refresh-token jti GC: reaped {} expired rows", removed);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Refresh-token jti GC failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup"
+        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, refresh-jti GC"
     );
 }
 

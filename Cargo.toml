@@ -65,7 +65,7 @@ anyhow = "1.0"
 dotenvy = "0.15"
 
 # UUID
-uuid = { version = "1.7", features = ["v4", "serde"] }
+uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
