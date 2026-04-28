@@ -4996,4 +4996,59 @@ mod tests {
             handler_call,
         );
     }
+
+    /// Ordering regression test (#917 / PR #946 review): inside the
+    /// `set_cache_ttl` handler body, the type-check (`is_cache_ttl_configurable`)
+    /// MUST run before the range check (`validate_cache_ttl`). If the order is
+    /// swapped, a Local repo with a bad TTL value would surface "must be
+    /// between 1 and 2592000" instead of the intended "remote (proxy)" type
+    /// error, masking the rejection contract this PR adds. Both call markers
+    /// are built via format! at runtime so this test body itself does not
+    /// satisfy the search.
+    #[test]
+    fn set_cache_ttl_type_check_runs_before_range_check() {
+        let source = include_str!("repositories.rs");
+
+        // Isolate the set_cache_ttl function body so we don't accidentally
+        // pick up the validate_cache_ttl definition (which sits earlier in
+        // the file) or unrelated handlers.
+        let signature = format!("pub async fn {}(", "set_cache_ttl");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("could not locate `{}` in repositories.rs", signature));
+
+        // The next handler immediately after set_cache_ttl is get_cache_ttl;
+        // bound the search there so we only inspect set_cache_ttl's body.
+        let next_signature = format!("pub async fn {}(", "get_cache_ttl");
+        let end = source[start..]
+            .find(&next_signature)
+            .map(|offset| start + offset)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        let type_check_call = format!("{}(&repo.repo_type)", "is_cache_ttl_configurable");
+        let range_check_call = format!("{}(payload.cache_ttl_seconds)", "validate_cache_ttl");
+
+        let type_idx = body.find(&type_check_call).unwrap_or_else(|| {
+            panic!(
+                "set_cache_ttl must call `{}`; not found in handler body (see #917)",
+                type_check_call,
+            )
+        });
+        let range_idx = body.find(&range_check_call).unwrap_or_else(|| {
+            panic!(
+                "set_cache_ttl must call `{}`; not found in handler body (see #917)",
+                range_check_call,
+            )
+        });
+
+        assert!(
+            type_idx < range_idx,
+            "type check `{}` must run BEFORE range check `{}` in set_cache_ttl, otherwise a Local repo with a bad TTL surfaces the range error and masks the type-rejection contract (#917). type_idx={}, range_idx={}",
+            type_check_call,
+            range_check_call,
+            type_idx,
+            range_idx,
+        );
+    }
 }
