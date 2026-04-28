@@ -22,7 +22,7 @@ use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::storage_service::StorageService;
 
 /// Default cache TTL in seconds (24 hours)
-const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
+pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
 
 /// HTTP client timeout in seconds
 const HTTP_TIMEOUT_SECS: u64 = 60;
