@@ -51,11 +51,41 @@ async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 // Path helpers
 // ---------------------------------------------------------------------------
 
+/// Escape SQL LIKE metacharacters in a user-supplied literal so it can be
+/// safely concatenated into a LIKE pattern.
+///
+/// The returned string is intended to be used with an `ESCAPE '\'` clause.
+/// Three characters are escaped: the escape character `\` itself (must come
+/// first so we do not double-escape escapes we just inserted), the
+/// zero-or-more wildcard `%`, and the single-character wildcard `_`.
+///
+/// Without this, user-controlled segments in artifact paths could inject LIKE
+/// wildcards and cause queries to match unrelated artifact rows in the same
+/// repository (wrong artifact served, information disclosure).
+fn escape_like_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Given a `-SNAPSHOT` artifact path, build a SQL LIKE pattern that matches
 /// the corresponding timestamp-resolved filename stored in the database.
 ///
 /// Example: `com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar`
 ///       -> `com/example/lib/1.0-SNAPSHOT/lib-1.0-%.jar`
+///
+/// User-supplied LIKE metacharacters (`%`, `_`, `\`) in the path are escaped
+/// so they match literally; only the `%` introduced by this function in place
+/// of `-SNAPSHOT` is treated as a wildcard. Callers MUST pair the returned
+/// pattern with an `ESCAPE '\'` clause in the SQL query.
 ///
 /// Returns `None` if the path does not contain a `-SNAPSHOT` filename segment.
 fn snapshot_like_pattern(path: &str) -> Option<String> {
@@ -71,19 +101,34 @@ fn snapshot_like_pattern(path: &str) -> Option<String> {
         return None;
     }
 
-    // Replace `-SNAPSHOT` in the filename with `-%` for the LIKE pattern.
-    // The filename may be e.g. "lib-1.0-SNAPSHOT.jar" or "lib-1.0-SNAPSHOT-sources.jar".
-    // We want to match   "lib-1.0-20260304.095300-1.jar" / "...-sources.jar".
+    // The base version is taken from the request directory and is itself
+    // user-controlled, so it must be LIKE-escaped before being interpolated.
+    // The `-SNAPSHOT` suffix and the `-%` we introduce ourselves are trusted
+    // literals (the `%` is the one and only intentional wildcard).
     let base_version = version_dir.strip_suffix("-SNAPSHOT").unwrap();
     let snapshot_token = format!("{}-SNAPSHOT", base_version);
-    let timestamp_wildcard = format!("{}-%", base_version);
 
     if !filename.contains(&snapshot_token) {
         return None;
     }
 
-    let resolved_filename = filename.replace(&snapshot_token, &timestamp_wildcard);
-    let dir = parts[..parts.len() - 1].join("/");
+    // Build the escaped pieces of the resulting pattern. We split on the
+    // (un-escaped) snapshot_token first, escape each surrounding fragment of
+    // user input, then join with the trusted `-%` wildcard substitute.
+    let escaped_base_version = escape_like_literal(base_version);
+    let escaped_filename_segments: Vec<String> = filename
+        .split(&snapshot_token)
+        .map(escape_like_literal)
+        .collect();
+    let timestamp_wildcard_escaped = format!("{}-%", escaped_base_version);
+    let resolved_filename = escaped_filename_segments.join(&timestamp_wildcard_escaped);
+
+    // Every directory segment is also user-controlled and must be escaped.
+    let dir = parts[..parts.len() - 1]
+        .iter()
+        .map(|seg| escape_like_literal(seg))
+        .collect::<Vec<_>>()
+        .join("/");
     Some(format!("{}/{}", dir, resolved_filename))
 }
 
@@ -100,13 +145,18 @@ async fn resolve_snapshot_artifact(
     // Use runtime sqlx::query (not the query! macro) to avoid needing an
     // offline cache entry. The LIKE pattern matches timestamped filenames
     // and we pick the latest one by created_at.
+    //
+    // `pattern` is built by `snapshot_like_pattern`, which escapes any LIKE
+    // metacharacters (`%`, `_`, `\`) coming from user input so only the
+    // intentional `%` in place of `-SNAPSHOT` acts as a wildcard. The
+    // `ESCAPE '\'` clause makes that contract explicit to PostgreSQL.
     let row = sqlx::query(
         r#"
         SELECT id, storage_key, checksum_sha256, path
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE $2
+          AND path LIKE $2 ESCAPE '\'
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -142,8 +192,18 @@ async fn collect_snapshot_entries(
     version: &str,
 ) -> Vec<SnapshotEntry> {
     // Build the directory path: com/example/my-lib/1.0-SNAPSHOT/
-    let group_path = group_id.replace('.', "/");
-    let dir_prefix = format!("{}/{}/{}/", group_path, artifact_id, version);
+    // group_id, artifact_id and version are all derived from the user's
+    // request path, so each segment must be LIKE-escaped before we append the
+    // trailing `%` directory wildcard. Without escaping, an attacker could
+    // inject `%` or `_` (e.g., a `version` of `1.0-SNAPSHOT_evil`) to enumerate
+    // unrelated artifacts in the same repository.
+    let group_path = escape_like_literal(&group_id.replace('.', "/"));
+    let dir_prefix = format!(
+        "{}/{}/{}/",
+        group_path,
+        escape_like_literal(artifact_id),
+        escape_like_literal(version)
+    );
     let like_pattern = format!("{}%", dir_prefix);
 
     // Fetch every artifact under that version directory. We do NOT restrict the
@@ -155,7 +215,7 @@ async fn collect_snapshot_entries(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE $2
+          AND path LIKE $2 ESCAPE '\'
         "#,
     )
     .bind(repo_id)
@@ -1475,7 +1535,9 @@ async fn upload(
     // This groups POM, JAR, sources, javadoc, etc. under a single record
     // so the UI shows one package per GAV instead of separate entries.
     let gav_existing: Option<(uuid::Uuid, String, String, Option<serde_json::Value>)> = {
-        let gav_pattern = format!("{}%", gav_dir);
+        // gav_dir comes from the user-supplied request path; escape LIKE
+        // metacharacters so the trailing `%` is the only wildcard.
+        let gav_pattern = format!("{}%", escape_like_literal(gav_dir));
         let row = sqlx::query(
             r#"
             SELECT a.id, a.path, a.storage_key, am.metadata
@@ -1483,7 +1545,7 @@ async fn upload(
             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
             WHERE a.repository_id = $1
               AND a.is_deleted = false
-              AND a.path LIKE $2
+              AND a.path LIKE $2 ESCAPE '\'
               AND a.name = $3
               AND a.version = $4
             ORDER BY a.created_at ASC
@@ -2152,6 +2214,71 @@ mod tests {
                 "org/apache/commons/commons-lang3/3.12.0-SNAPSHOT/commons-lang3-3.12.0-%.jar"
                     .to_string()
             )
+        );
+    }
+
+    /// Regression: user-supplied `%` and `_` characters in the request path
+    /// must NOT be passed through as SQL LIKE wildcards. An attacker crafting
+    /// a request like `com/x/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT%.jar` could
+    /// otherwise match arbitrary timestamped artifacts whose filenames have
+    /// any content after the (legitimate) wildcard segment, instead of only
+    /// the exact `.jar` extension. With a `repository_id` constraint the
+    /// blast radius is bounded to a single repo, but it still serves the
+    /// wrong artifact and discloses the existence of unrelated rows.
+    ///
+    /// Expected behavior: literal `%` / `_` in user input must be escaped so
+    /// the resulting LIKE pattern only contains intentional wildcards. The
+    /// returned pattern must be paired with an `ESCAPE '\'` clause in the SQL.
+    #[test]
+    fn test_snapshot_like_pattern_escapes_user_wildcard_percent() {
+        // Attacker appends a literal `%` so the LIKE matches any suffix.
+        let result = snapshot_like_pattern("com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT%.jar");
+        // The single intentional wildcard introduced by the helper (replacing
+        // `-SNAPSHOT` with `-%`) is allowed; any `%` originating from user
+        // input must be escaped with a backslash so it matches a literal `%`.
+        assert_eq!(
+            result,
+            Some("com/example/lib/1.0-SNAPSHOT/lib-1.0-%\\%.jar".to_string()),
+            "user-supplied `%` must be escaped, not passed through as a wildcard"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_escapes_user_wildcard_underscore() {
+        // `_` is a single-character LIKE wildcard; user input must not be
+        // able to introduce one. Filename keeps the legitimate `-SNAPSHOT`
+        // token but adds a `_` that an attacker controls.
+        let result = snapshot_like_pattern("com/example/lib/1.0-SNAPSHOT/lib_-1.0-SNAPSHOT.jar");
+        assert_eq!(
+            result,
+            Some("com/example/lib/1.0-SNAPSHOT/lib\\_-1.0-%.jar".to_string()),
+            "user-supplied `_` must be escaped, not passed through as a wildcard"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_escapes_user_backslash() {
+        // The escape character itself must also be escaped to avoid breaking
+        // the ESCAPE '\' contract.
+        let result =
+            snapshot_like_pattern("com/example/lib/1.0-SNAPSHOT/lib\\path-1.0-SNAPSHOT.jar");
+        assert_eq!(
+            result,
+            Some("com/example/lib/1.0-SNAPSHOT/lib\\\\path-1.0-%.jar".to_string()),
+            "user-supplied `\\` must be escaped to preserve ESCAPE '\\' semantics"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_escapes_wildcards_in_directory() {
+        // Wildcards in any user-controlled segment (not just the filename)
+        // must also be escaped. The version directory must still end with
+        // `-SNAPSHOT` to trigger the helper.
+        let result = snapshot_like_pattern("com/example/lib%/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar");
+        assert_eq!(
+            result,
+            Some("com/example/lib\\%/1.0-SNAPSHOT/lib-1.0-%.jar".to_string()),
+            "user-supplied wildcards in directory segments must also be escaped"
         );
     }
 
