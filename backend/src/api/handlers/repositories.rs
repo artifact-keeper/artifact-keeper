@@ -2134,6 +2134,7 @@ pub async fn list_virtual_members(
         (status = 200, description = "Member added", body = VirtualMemberResponse),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository or member not found"),
+        (status = 409, description = "Member already exists in virtual repository"),
     )
 )]
 pub async fn add_virtual_member(

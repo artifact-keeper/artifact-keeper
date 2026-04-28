@@ -608,7 +608,6 @@ impl RepositoryService {
             r#"
             INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
             VALUES ($1, $2, $3)
-            ON CONFLICT (virtual_repo_id, member_repo_id) DO UPDATE SET priority = $3
             "#,
             virtual_repo_id,
             member_repo_id,
@@ -616,7 +615,9 @@ impl RepositoryService {
         )
         .execute(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| {
+            map_virtual_member_insert_error(e, virtual_repo.key.as_str(), member_repo.key.as_str())
+        })?;
 
         Ok(())
     }
@@ -718,6 +719,46 @@ impl RepositoryService {
             created_at: repo.created_at.timestamp(),
         }
     }
+}
+
+/// PostgreSQL SQLSTATE for unique constraint violations.
+const PG_UNIQUE_VIOLATION: &str = "23505";
+
+/// Auto-generated PostgreSQL constraint name for
+/// `UNIQUE(virtual_repo_id, member_repo_id)` declared in
+/// `backend/migrations/003_repositories.sql`. This is the only unique
+/// constraint on `virtual_repo_members` whose violation should map to a 409
+/// "already a member" error. If a future migration adds another UNIQUE on
+/// this table (e.g. `(virtual_repo_id, priority)`), violations of that
+/// constraint must NOT be surfaced as "already a member" -- they fall
+/// through to [`AppError::Database`] instead.
+const VIRTUAL_REPO_MEMBERS_PAIR_UNIQUE_CONSTRAINT: &str =
+    "virtual_repo_members_virtual_repo_id_member_repo_id_key";
+
+/// Map an `INSERT` error from `virtual_repo_members` to an [`AppError`].
+///
+/// Only a unique-constraint violation (`23505`) on the
+/// `(virtual_repo_id, member_repo_id)` pair-uniqueness constraint is mapped
+/// to [`AppError::Conflict`] (HTTP 409). Other 23505 violations (from
+/// constraints added by future migrations) and all other database errors
+/// fall through to [`AppError::Database`] to avoid producing misleading
+/// "already a member" messages.
+fn map_virtual_member_insert_error(
+    err: sqlx::Error,
+    virtual_key: &str,
+    member_key: &str,
+) -> AppError {
+    if let sqlx::Error::Database(db_err) = &err {
+        if db_err.code().as_deref() == Some(PG_UNIQUE_VIOLATION)
+            && db_err.constraint() == Some(VIRTUAL_REPO_MEMBERS_PAIR_UNIQUE_CONSTRAINT)
+        {
+            return AppError::Conflict(format!(
+                "repository '{}' is already a member of '{}'",
+                member_key, virtual_key
+            ));
+        }
+    }
+    AppError::Database(err.to_string())
 }
 
 #[cfg(test)]
@@ -1293,6 +1334,195 @@ mod tests {
         assert_ne!(
             RepoVisibility::User(uid),
             RepoVisibility::User(Uuid::new_v4())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // map_virtual_member_insert_error tests
+    // -----------------------------------------------------------------------
+
+    use sqlx::error::{DatabaseError, ErrorKind};
+    use std::borrow::Cow;
+    use std::error::Error as StdError;
+    use std::fmt;
+
+    /// Minimal in-memory `DatabaseError` impl for unit-testing the error
+    /// mapping helper. Lets us simulate a Postgres unique-violation without a
+    /// live database connection.
+    #[derive(Debug)]
+    struct MockDbError {
+        message: String,
+        code: Option<String>,
+        constraint: Option<String>,
+        kind: ErrorKind,
+    }
+
+    impl fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl StdError for MockDbError {}
+
+    impl DatabaseError for MockDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.as_deref().map(Cow::Borrowed)
+        }
+
+        fn constraint(&self) -> Option<&str> {
+            self.constraint.as_deref()
+        }
+
+        fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> ErrorKind {
+            // ErrorKind is non_exhaustive and lacks Copy/Clone, so re-construct it
+            // by matching on the stored variant.
+            match self.kind {
+                ErrorKind::UniqueViolation => ErrorKind::UniqueViolation,
+                ErrorKind::ForeignKeyViolation => ErrorKind::ForeignKeyViolation,
+                ErrorKind::NotNullViolation => ErrorKind::NotNullViolation,
+                ErrorKind::CheckViolation => ErrorKind::CheckViolation,
+                _ => ErrorKind::Other,
+            }
+        }
+    }
+
+    fn make_unique_violation() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(MockDbError {
+            message: "duplicate key value violates unique constraint \"virtual_repo_members_virtual_repo_id_member_repo_id_key\""
+                .to_string(),
+            code: Some("23505".to_string()),
+            constraint: Some(
+                VIRTUAL_REPO_MEMBERS_PAIR_UNIQUE_CONSTRAINT.to_string(),
+            ),
+            kind: ErrorKind::UniqueViolation,
+        }))
+    }
+
+    fn make_unique_violation_other_constraint(constraint: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(MockDbError {
+            message: format!(
+                "duplicate key value violates unique constraint \"{}\"",
+                constraint
+            ),
+            code: Some("23505".to_string()),
+            constraint: Some(constraint.to_string()),
+            kind: ErrorKind::UniqueViolation,
+        }))
+    }
+
+    fn make_foreign_key_violation() -> sqlx::Error {
+        sqlx::Error::Database(Box::new(MockDbError {
+            message: "violates foreign key constraint".to_string(),
+            code: Some("23503".to_string()),
+            constraint: Some("fk_virtual_repo_members_virtual_repo_id".to_string()),
+            kind: ErrorKind::ForeignKeyViolation,
+        }))
+    }
+
+    #[test]
+    fn test_map_virtual_member_insert_error_unique_violation_returns_conflict() {
+        let err = make_unique_violation();
+        let mapped = map_virtual_member_insert_error(err, "virtual-key", "member-key");
+        match mapped {
+            AppError::Conflict(msg) => {
+                assert!(
+                    msg.contains("member-key"),
+                    "message should include member key: {msg}"
+                );
+                assert!(
+                    msg.contains("virtual-key"),
+                    "message should include virtual key: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_virtual_member_insert_error_other_db_error_returns_database() {
+        let err = make_foreign_key_violation();
+        let mapped = map_virtual_member_insert_error(err, "virtual-key", "member-key");
+        assert!(
+            matches!(mapped, AppError::Database(_)),
+            "non-23505 errors should map to Database, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn test_map_virtual_member_insert_error_pool_closed_returns_database() {
+        let err = sqlx::Error::PoolClosed;
+        let mapped = map_virtual_member_insert_error(err, "virtual-key", "member-key");
+        assert!(
+            matches!(mapped, AppError::Database(_)),
+            "non-database sqlx errors should map to Database, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn test_map_virtual_member_insert_error_db_error_without_code_returns_database() {
+        let err = sqlx::Error::Database(Box::new(MockDbError {
+            message: "some unexpected error".to_string(),
+            code: None,
+            constraint: None,
+            kind: ErrorKind::Other,
+        }));
+        let mapped = map_virtual_member_insert_error(err, "v", "m");
+        assert!(
+            matches!(mapped, AppError::Database(_)),
+            "missing code should not be treated as conflict, got {mapped:?}"
+        );
+    }
+
+    /// A 23505 unique-violation on a constraint other than the
+    /// `(virtual_repo_id, member_repo_id)` pair-uniqueness one (for example,
+    /// a hypothetical future `UNIQUE(virtual_repo_id, priority)`) must NOT
+    /// produce a misleading "already a member" 409. It must fall through to
+    /// `AppError::Database` so the underlying cause is logged and surfaced
+    /// as a 500.
+    #[test]
+    fn test_map_virtual_member_insert_error_wrong_unique_constraint_returns_database() {
+        let err = make_unique_violation_other_constraint(
+            "virtual_repo_members_virtual_repo_id_priority_key",
+        );
+        let mapped = map_virtual_member_insert_error(err, "virtual-key", "member-key");
+        assert!(
+            matches!(mapped, AppError::Database(_)),
+            "23505 on a non-pair-unique constraint must not be Conflict, got {mapped:?}"
+        );
+    }
+
+    /// A 23505 with no constraint name attached (defensive: the Postgres
+    /// driver always populates this field, but the trait default returns
+    /// `None`) must also fall through to Database -- we will not guess.
+    #[test]
+    fn test_map_virtual_member_insert_error_unique_violation_without_constraint_returns_database() {
+        let err = sqlx::Error::Database(Box::new(MockDbError {
+            message: "duplicate key".to_string(),
+            code: Some("23505".to_string()),
+            constraint: None,
+            kind: ErrorKind::UniqueViolation,
+        }));
+        let mapped = map_virtual_member_insert_error(err, "v", "m");
+        assert!(
+            matches!(mapped, AppError::Database(_)),
+            "23505 without constraint name must not be Conflict, got {mapped:?}"
         );
     }
 }
