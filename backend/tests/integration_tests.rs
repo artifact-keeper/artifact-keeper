@@ -1373,4 +1373,37 @@ mod tests {
             "Private repo packages should not appear in anonymous listing"
         );
     }
+
+    // ============= Security: list_findings =============
+
+    /// Regression test for #914: GET /api/v1/security/scans/{unknown}/findings
+    /// must return 404, not a 200 with an empty envelope. Without the
+    /// existence check in `list_findings`, the SQL `WHERE scan_result_id = $1`
+    /// returned zero rows and the handler responded 200 with `{items:[],
+    /// total:0}` -- contradicting the OpenAPI annotation that documents 404
+    /// for "Scan not found" and forcing clients to assume any zero-finding
+    /// response could be either an unknown scan or a clean scan.
+    #[tokio::test]
+    #[ignore = "requires running HTTP server"]
+    async fn test_list_findings_unknown_scan_returns_404() {
+        let server = get_server().await;
+        let client = Client::new();
+        let unknown_scan_id = "00000000-0000-0000-0000-000000000000";
+
+        let resp = client
+            .get(format!(
+                "{}/api/v1/security/scans/{}/findings",
+                server.base_url, unknown_scan_id
+            ))
+            .header("Authorization", format!("Bearer {}", server.access_token))
+            .send()
+            .await
+            .expect("list_findings request failed");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "unknown scan_id must return 404 (was 200 before #914 fix)"
+        );
+    }
 }
