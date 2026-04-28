@@ -185,9 +185,12 @@ services:
       DEPENDENCY_TRACK_ENABLED: "true"
       ALLOW_HTTP_INTEGRATIONS: "1"
       # Webhooks v2 signing-secret encryption key. 32 bytes, base64 encoded.
-      # The dev placeholder below is "dev-key-not-for-prod-use-in-prod"
-      # base64-encoded, stable across rebuilds so existing rows can decrypt.
-      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-ZGV2LWtleS1ub3QtZm9yLXByb2QtdXNlLWluLXByb2Q=}
+      # Generate once for your local stack with: openssl rand -base64 32,
+      # then export AK_WEBHOOK_SECRET_KEY before docker compose up. The
+      # placeholder below is intentionally invalid base64 so the backend
+      # ensure_configured check fails fast with a clear error rather than
+      # silently running with a shared dev key.
+      AK_WEBHOOK_SECRET_KEY: ${AK_WEBHOOK_SECRET_KEY:-REPLACE_ME_WITH_OUTPUT_OF_openssl_rand_base64_32}
       # Webhooks v2 producer is off by default; enable after rotating
       # migrated webhook secrets to avoid duplicate delivery from System B.
       WEBHOOKS_V2_PRODUCER_ENABLED: ${WEBHOOKS_V2_PRODUCER_ENABLED:-false}

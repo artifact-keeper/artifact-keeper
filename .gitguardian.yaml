@@ -45,13 +45,6 @@ secret:
       match: "test-api-key"
     - name: "Test webhook secret in unit tests"
       match: "my-secret-key"
-    # AK_WEBHOOK_SECRET_KEY dev fixture in docker-compose / .env.local-dev.
-    # Decodes to literal "dev-key-not-for-prod-use-in-prod" — self-labeled,
-    # 32 bytes, used only for local docker compose up. Production must
-    # provision via the IaC chart (artifact-keeper-iac, tracked in
-    # artifact-keeper#950).
-    - name: "AK_WEBHOOK_SECRET_KEY local-dev placeholder"
-      match: "ZGV2LWtleS1ub3QtZm9yLXByb2QtdXNlLWluLXByb2Q="
 
     # GCS test service account
     - name: "Test GCS service account email"
