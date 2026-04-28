@@ -43,10 +43,37 @@ pub fn record_security_scan(scanner: &str, success: bool, duration_secs: f64) {
         .record(duration_secs);
 }
 
+/// Record a scanner backend health-check failure. Distinct from
+/// `record_security_scan` so dashboards can separate "Trivy was down" from
+/// "scan ran and failed mid-execution". `reason` is "unreachable" (network
+/// error / timeout) or "unhealthy" (non-2xx response).
+pub fn record_scanner_health_check_failure(scanner: &str, reason: &str) {
+    counter!(
+        "ak_scanner_health_check_failures_total",
+        "scanner" => scanner.to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
 /// Record a webhook delivery event.
 pub fn record_webhook_delivery(event: &str, success: bool) {
     let status = if success { "success" } else { "failure" };
     counter!("ak_webhook_deliveries_total", "event" => event.to_string(), "status" => status.to_string()).increment(1);
+}
+
+/// Record an outbound URL that was rejected by SSRF validation, either
+/// at handler entry (`validate_outbound_url`) or on a redirect hop
+/// inside the shared HTTP client. `reason` is `"hostname"` or `"ip"`,
+/// `label` identifies the calling site (e.g. `"Webhook URL"`,
+/// `"Cargo upstream download URL"`, `"http-client redirect"`).
+pub fn record_outbound_url_blocked(reason: &str, label: &str) {
+    counter!(
+        "ak_outbound_url_blocked_total",
+        "reason" => reason.to_string(),
+        "label" => label.to_string()
+    )
+    .increment(1);
 }
 
 /// Update storage gauge metrics from database stats.
@@ -113,9 +140,21 @@ mod tests {
     }
 
     #[test]
+    fn test_record_scanner_health_check_failure_does_not_panic() {
+        record_scanner_health_check_failure("trivy", "unreachable");
+        record_scanner_health_check_failure("trivy", "unhealthy");
+    }
+
+    #[test]
     fn test_record_webhook_delivery_does_not_panic() {
         record_webhook_delivery("artifact.created", true);
         record_webhook_delivery("artifact.deleted", false);
+    }
+
+    #[test]
+    fn test_record_outbound_url_blocked_does_not_panic() {
+        record_outbound_url_blocked("hostname", "Webhook URL");
+        record_outbound_url_blocked("ip", "http-client redirect");
     }
 
     #[test]

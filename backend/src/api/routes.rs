@@ -28,6 +28,11 @@ pub fn create_router(state: SharedState) -> Router {
         state.db.clone(),
         Arc::new(state.config.clone()),
     ));
+    // Register this long-lived AuthService's token cache with the global
+    // invalidation registry so user deactivations (issue #931) flush its
+    // cached API-token validations immediately rather than waiting for the
+    // 5-minute TTL.
+    vis_auth_service.register_for_global_flush();
     let vis_state = RepoVisibilityState {
         auth_service: vis_auth_service,
         db: state.db.clone(),
@@ -145,6 +150,9 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.db.clone(),
         Arc::new(state.config.clone()),
     ));
+    // Register the middleware AuthService's token cache for global flush
+    // on user deactivation (issue #931).
+    auth_service.register_for_global_flush();
 
     let upload_limit = state.config.max_upload_size_bytes;
 
