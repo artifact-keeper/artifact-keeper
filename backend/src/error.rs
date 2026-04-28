@@ -72,6 +72,14 @@ pub enum AppError {
 
     #[error("Bad gateway: {0}")]
     BadGateway(String),
+
+    /// A required dependency or feature is not configured / not enabled on
+    /// this deployment. Distinct from `Internal` (which is "the server
+    /// failed unexpectedly") because operators alert on 500s but not on
+    /// 503s, and clients can distinguish "feature off" from "server bug"
+    /// by status code alone.
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
 
 impl AppError {
@@ -98,6 +106,7 @@ impl AppError {
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
+            Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
         }
     }
 
@@ -125,7 +134,8 @@ impl AppError {
             | Self::Conflict(msg)
             | Self::Validation(msg)
             | Self::QuotaExceeded(msg)
-            | Self::BadGateway(msg) => msg.clone(),
+            | Self::BadGateway(msg)
+            | Self::ServiceUnavailable(msg) => msg.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -240,6 +250,16 @@ mod tests {
         assert_eq!(err.user_message(), "storage limit reached");
     }
 
+    #[test]
+    fn test_service_unavailable_passes_through() {
+        let err = AppError::ServiceUnavailable("Scanner service not configured".into());
+        assert_eq!(err.user_message(), "Scanner service not configured");
+        assert_eq!(
+            err.to_string(),
+            "Service unavailable: Scanner service not configured"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // HTTP status codes
     // -----------------------------------------------------------------------
@@ -281,6 +301,14 @@ mod tests {
         assert_eq!(
             AppError::BadGateway("x".into()).status_and_code().1,
             "BAD_GATEWAY"
+        );
+        assert_eq!(
+            AppError::ServiceUnavailable("x".into()).status_and_code().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            AppError::ServiceUnavailable("x".into()).status_and_code().1,
+            "SERVICE_UNAVAILABLE"
         );
     }
 
