@@ -363,6 +363,16 @@ pub async fn auth_middleware(
         }
     }
 
+    // Note on the ambiguous message: "Invalid or expired download ticket"
+    // intentionally does not distinguish between
+    //   (a) ticket not found,
+    //   (b) ticket expired,
+    //   (c) bound-path mismatch,
+    //   (d) write method on a read-only ticket.
+    // Leaking which case it is would help an attacker who has a partial
+    // ticket value (or who is probing path bindings) narrow down the cause.
+    // High-entropy tickets and a 30-second TTL make ambiguity cheap. Do not
+    // "fix" this by giving a more specific message.
     let message = if !had_header_credentials && ticket_parts.is_some() {
         "Invalid or expired download ticket"
     } else {
@@ -550,6 +560,18 @@ async fn try_resolve_ticket_auth(
         // Ticket has been consumed by validate_download_ticket; treat the
         // mismatch as an authentication failure so the client cannot reuse
         // the same ticket against a different path.
+        //
+        // Trade-off: a mistyped path by a legitimate client will burn the
+        // ticket and the client must mint a new one. We accept this cost
+        // because single-use is the security invariant we cannot weaken
+        // without breaking the threat model (a stolen ticket adversary
+        // would simply replay against the right path).
+        //
+        // The cleaner alternative is `SELECT then DELETE WHERE ... RETURNING`
+        // inside a transaction so wrong-path attempts do not consume. That
+        // is a follow-up change; not in this PR because the existing
+        // single-statement DELETE-RETURNING is the only thing that gives
+        // us atomic single-use under concurrent retry.
         return None;
     }
 
@@ -586,6 +608,22 @@ async fn try_resolve_ticket_auth(
     // [`DownloadTicketAuth`] marker extension so write-gating middleware
     // can recognise the request as ticket-authenticated.
     ext.is_admin = false;
+
+    // Scope hardening: `AuthExtension::has_scope` returns `true` for any
+    // non-API-token auth (the JWT-session shortcut at the top of the impl).
+    // No handler today calls `has_scope("admin")` for elevation, but a
+    // future one could, and a ticket-authenticated request would silently
+    // pass that check. Pretend the ticket is an API token with an empty
+    // scope set so any explicit scope check defaults to deny.
+    //
+    // This intentionally does not modify `is_service_account` or
+    // `must_change_password`: a ticket inherits the minter's identity for
+    // those flags so downstream handlers see the same view they would for
+    // any other auth method. Accepting the inherited identity is the
+    // design — the ticket is proof that a session with those flags
+    // intentionally minted a download URL.
+    ext.is_api_token = true;
+    ext.scopes = Some(vec![]);
     Some(ext)
 }
 
@@ -1770,5 +1808,62 @@ mod tests {
             bound,
             "/api/v1/repositories/foo/secret"
         ));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_trailing_slash_mismatch() {
+        // Trailing-slash equivalence is NOT honoured by the consumer.
+        // The minter is responsible for binding the exact form the client
+        // request will use; mint-time normalization strips the trailing
+        // slash, so this case is the "client added a trailing slash"
+        // failure mode, not the "minter forgot to strip it" mode.
+        let bound = Some("/api/v1/repositories/foo");
+        assert!(!ticket_path_allowed(bound, "/api/v1/repositories/foo/"));
+
+        // Mirror in the other direction.
+        let bound = Some("/api/v1/repositories/foo/");
+        assert!(!ticket_path_allowed(bound, "/api/v1/repositories/foo"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_case_difference() {
+        // Format handlers that case-fold (PyPI/NuGet/Go) lowercase before
+        // dispatching; the consumer compares to the raw `request.uri().path()`
+        // BEFORE that handler-side normalization happens, so the mint-time
+        // validator must lowercase. If a minter bypassed validation, this
+        // is the failure mode they would see at consume time.
+        let bound = Some("/pypi/myrepo/Django");
+        assert!(!ticket_path_allowed(bound, "/pypi/myrepo/django"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_encoded_slash() {
+        // axum/hyper exposes the raw path; `%2F` is not equivalent to `/`.
+        // A ticket bound to `/foo/bar` must not match `/foo%2Fbar`.
+        let bound = Some("/foo/bar");
+        assert!(!ticket_path_allowed(bound, "/foo%2Fbar"));
+        assert!(!ticket_path_allowed(bound, "/foo%2fbar"));
+
+        let bound = Some("/foo%2Fbar");
+        assert!(!ticket_path_allowed(bound, "/foo/bar"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_double_encoded() {
+        // `%252F` is `%2F` after one decode, `/` after two. The consumer
+        // compares raw bytes, so neither form matches `/`.
+        let bound = Some("/foo/bar");
+        assert!(!ticket_path_allowed(bound, "/foo%252Fbar"));
+        assert!(!ticket_path_allowed(bound, "/foo%252fbar"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_only_exact_byte_equality() {
+        // No transformation, no canonicalization, no Unicode-folding.
+        // A ticket bound with combining characters must not match a
+        // pre-composed equivalent.
+        let bound = Some("/foo/cafe\u{0301}"); // "café" decomposed
+        assert!(ticket_path_allowed(bound, "/foo/cafe\u{0301}"));
+        assert!(!ticket_path_allowed(bound, "/foo/caf\u{00E9}")); // "café" precomposed
     }
 }
