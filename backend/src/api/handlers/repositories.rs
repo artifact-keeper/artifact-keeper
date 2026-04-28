@@ -390,6 +390,19 @@ fn validate_cache_ttl(secs: i64) -> bool {
     (1..=2_592_000).contains(&secs)
 }
 
+/// Reject `cache_ttl` writes against repositories whose proxy code path will
+/// never read the value back. Only Remote (proxy) repositories consume the
+/// `cache_ttl_secs` row written by `set_cache_ttl`; writing it for Local,
+/// Virtual or Staging repos produces dead state with no consumer.
+fn is_cache_ttl_configurable(repo_type: &RepositoryType) -> Result<()> {
+    if repo_type != &RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "cache_ttl is only configurable on remote (proxy) repositories".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetCacheTtlRequest {
     pub cache_ttl_seconds: i64,
@@ -428,15 +441,22 @@ pub async fn set_cache_ttl(
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
 
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_access(&auth, repo.id)?;
+
+    // Reject writes on non-remote repos before any further validation: the
+    // value would never be read back by the proxy code path (see #917).
+    // The explicit `repo.repo_type != RepositoryType::Remote` comparison
+    // inside `is_cache_ttl_configurable` is what the structural regression
+    // test below greps for.
+    is_cache_ttl_configurable(&repo.repo_type)?;
+
     if !validate_cache_ttl(payload.cache_ttl_seconds) {
         return Err(AppError::Validation(
             "cache_ttl_seconds must be between 1 and 2592000 (30 days)".to_string(),
         ));
     }
-
-    let service = RepositoryService::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
-    require_repo_access(&auth, repo.id)?;
 
     // Upsert into repository_config table
     sqlx::query(
@@ -473,6 +493,10 @@ pub async fn set_cache_ttl(
         (status = 404, description = "Repository not found"),
     )
 )]
+// Note: GET stays permissive for any repo_type even though writes are
+// restricted to Remote repositories (see `set_cache_ttl`). Existing UI
+// probes call this endpoint for every repo type and expect a 200 with the
+// default TTL; tightening the read path would break them.
 pub async fn get_cache_ttl(
     State(state): State<SharedState>,
     Path(key): Path<String>,
@@ -5007,5 +5031,117 @@ mod tests {
         // untouched. We never silently flip an existing public repo to
         // private on unrelated updates.
         assert_eq!(coerce_is_public_for_update(None, false), (None, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_cache_ttl_configurable (#917)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_ttl_configurable_for_remote() {
+        assert!(is_cache_ttl_configurable(&RepositoryType::Remote).is_ok());
+    }
+
+    #[test]
+    fn cache_ttl_rejected_for_local() {
+        let err = is_cache_ttl_configurable(&RepositoryType::Local).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("remote (proxy)")),
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cache_ttl_rejected_for_virtual() {
+        let err = is_cache_ttl_configurable(&RepositoryType::Virtual).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn cache_ttl_rejected_for_staging() {
+        let err = is_cache_ttl_configurable(&RepositoryType::Staging).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    /// Structural test guarding against accidental regressions: the
+    /// `set_cache_ttl` handler MUST call `is_cache_ttl_configurable` so a
+    /// `cache_ttl_secs` row is never written for Local, Virtual or Staging
+    /// repositories (issue #917). The expected substrings are built at
+    /// runtime from format! so this test body itself does not satisfy the
+    /// search.
+    #[test]
+    fn set_cache_ttl_contains_remote_only_guard() {
+        let source = include_str!("repositories.rs");
+
+        // 1. The helper itself must compare against Remote.
+        let helper_check = format!("repo_type {} &RepositoryType::Remote", "!=");
+        assert!(
+            source.contains(&helper_check),
+            "is_cache_ttl_configurable must compare against RepositoryType::Remote; missing `{}` (see #917)",
+            helper_check,
+        );
+
+        // 2. The handler must invoke the helper on the loaded repo.
+        let handler_call = format!("is_cache_ttl_configurable({}repo.repo_type)", "&");
+        assert!(
+            source.contains(&handler_call),
+            "set_cache_ttl must call `{}` to reject non-Remote repos (see #917)",
+            handler_call,
+        );
+    }
+
+    /// Ordering regression test (#917 / PR #946 review): inside the
+    /// `set_cache_ttl` handler body, the type-check (`is_cache_ttl_configurable`)
+    /// MUST run before the range check (`validate_cache_ttl`). If the order is
+    /// swapped, a Local repo with a bad TTL value would surface "must be
+    /// between 1 and 2592000" instead of the intended "remote (proxy)" type
+    /// error, masking the rejection contract this PR adds. Both call markers
+    /// are built via format! at runtime so this test body itself does not
+    /// satisfy the search.
+    #[test]
+    fn set_cache_ttl_type_check_runs_before_range_check() {
+        let source = include_str!("repositories.rs");
+
+        // Isolate the set_cache_ttl function body so we don't accidentally
+        // pick up the validate_cache_ttl definition (which sits earlier in
+        // the file) or unrelated handlers.
+        let signature = format!("pub async fn {}(", "set_cache_ttl");
+        let start = source
+            .find(&signature)
+            .unwrap_or_else(|| panic!("could not locate `{}` in repositories.rs", signature));
+
+        // The next handler immediately after set_cache_ttl is get_cache_ttl;
+        // bound the search there so we only inspect set_cache_ttl's body.
+        let next_signature = format!("pub async fn {}(", "get_cache_ttl");
+        let end = source[start..]
+            .find(&next_signature)
+            .map(|offset| start + offset)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        let type_check_call = format!("{}(&repo.repo_type)", "is_cache_ttl_configurable");
+        let range_check_call = format!("{}(payload.cache_ttl_seconds)", "validate_cache_ttl");
+
+        let type_idx = body.find(&type_check_call).unwrap_or_else(|| {
+            panic!(
+                "set_cache_ttl must call `{}`; not found in handler body (see #917)",
+                type_check_call,
+            )
+        });
+        let range_idx = body.find(&range_check_call).unwrap_or_else(|| {
+            panic!(
+                "set_cache_ttl must call `{}`; not found in handler body (see #917)",
+                range_check_call,
+            )
+        });
+
+        assert!(
+            type_idx < range_idx,
+            "type check `{}` must run BEFORE range check `{}` in set_cache_ttl, otherwise a Local repo with a bad TTL surfaces the range error and masks the type-rejection contract (#917). type_idx={}, range_idx={}",
+            type_check_call,
+            range_check_call,
+            type_idx,
+            range_idx,
+        );
     }
 }
