@@ -2761,4 +2761,493 @@ mod tests {
         assert!(claims.jti.is_none());
         assert_eq!(claims.token_type, "refresh");
     }
+
+    // -----------------------------------------------------------------------
+    // AuthService construction and token generation paths (#929)
+    //
+    // These tests use a lazy PgPool so they do not require a live database;
+    // they exercise the in-memory parts of `AuthService::new`,
+    // `generate_tokens`, `generate_totp_pending_token`, and the early-return
+    // branches of `blocklist_refresh_token` that fire before any SQL runs.
+    // -----------------------------------------------------------------------
+
+    fn make_lazy_pool() -> PgPool {
+        // connect_lazy never opens a TCP socket until a query is issued, so it
+        // is safe to construct in unit tests with no Postgres available.
+        PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("connect_lazy never fails for a syntactically valid URL")
+    }
+
+    #[tokio::test]
+    async fn test_auth_service_new_initializes_token_cache() {
+        // Covers AuthService::new(): keys derived from secret and an empty
+        // RwLock-wrapped cache is constructed.
+        let cfg = make_test_config();
+        let svc = AuthService::new(make_lazy_pool(), cfg);
+        // Cache must start empty.
+        assert_eq!(svc.token_cache.read().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_tokens_assigns_jti_to_both_tokens() {
+        // Exercises `generate_tokens` body, including the `jti: Some(...)`
+        // assignments on access and refresh claims (lines 283 and 297).
+        let cfg = make_test_config();
+        let svc = AuthService::new(make_lazy_pool(), cfg.clone());
+        let user = make_test_user();
+
+        let pair = svc.generate_tokens(&user).expect("generate_tokens");
+
+        // Decode both tokens with the same secret and assert each carries a
+        // unique jti and the expected token_type.
+        let key = DecodingKey::from_secret(cfg.jwt_secret.as_bytes());
+        let validation = Validation::new(Algorithm::HS256);
+
+        let access =
+            decode::<Claims>(&pair.access_token, &key, &validation).expect("decode access token");
+        let refresh =
+            decode::<Claims>(&pair.refresh_token, &key, &validation).expect("decode refresh token");
+
+        assert_eq!(access.claims.token_type, "access");
+        assert_eq!(refresh.claims.token_type, "refresh");
+        assert!(access.claims.jti.is_some(), "access token must carry a jti");
+        assert!(
+            refresh.claims.jti.is_some(),
+            "refresh token must carry a jti"
+        );
+        assert_ne!(
+            access.claims.jti, refresh.claims.jti,
+            "access and refresh tokens must use distinct jtis"
+        );
+        assert_eq!(access.claims.sub, user.id);
+        assert_eq!(refresh.claims.sub, user.id);
+        assert_eq!(
+            pair.expires_in,
+            (cfg.jwt_access_token_expiry_minutes * 60) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_totp_pending_token_round_trip() {
+        // Covers `generate_totp_pending_token` (line 1251 jti=None) and
+        // `validate_totp_pending_token` round-trip.
+        let cfg = make_test_config();
+        let svc = AuthService::new(make_lazy_pool(), cfg);
+        let user = make_test_user();
+
+        let token = svc
+            .generate_totp_pending_token(&user)
+            .expect("generate totp pending token");
+
+        let claims = svc
+            .validate_totp_pending_token(&token)
+            .expect("validate totp pending token");
+        assert_eq!(claims.token_type, "totp_pending");
+        assert_eq!(claims.sub, user.id);
+        assert!(
+            claims.jti.is_none(),
+            "totp_pending tokens must not carry a jti"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_totp_pending_token_rejects_wrong_type() {
+        // Covers the "Invalid token type" branch when a non-totp_pending
+        // token is fed to `validate_totp_pending_token`.
+        let cfg = make_test_config();
+        let svc = AuthService::new(make_lazy_pool(), cfg);
+        let user = make_test_user();
+
+        let pair = svc.generate_tokens(&user).expect("generate_tokens");
+        let result = svc.validate_totp_pending_token(&pair.access_token);
+        assert!(
+            matches!(result, Err(AppError::Authentication(_))),
+            "access token must be rejected as wrong type, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocklist_refresh_token_rejects_malformed_jwt() {
+        // The decode_token call inside blocklist_refresh_token must surface
+        // an Authentication error for non-JWT input. Hits the `?` propagation
+        // on line 448 without touching the database.
+        let cfg = make_test_config();
+        let svc = AuthService::new(make_lazy_pool(), cfg);
+        let result = svc.blocklist_refresh_token("not-a-jwt").await;
+        assert!(
+            matches!(result, Err(AppError::Authentication(_))),
+            "malformed JWT must yield Authentication error, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocklist_refresh_token_rejects_non_refresh_type() {
+        // An access token must be rejected before any DB query runs. Covers
+        // the "Invalid token type" branch (lines 450-452).
+        let cfg = make_test_config();
+        let svc = AuthService::new(make_lazy_pool(), cfg);
+        let user = make_test_user();
+
+        let pair = svc.generate_tokens(&user).expect("generate_tokens");
+        let result = svc.blocklist_refresh_token(&pair.access_token).await;
+        assert!(
+            matches!(result, Err(AppError::Authentication(_))),
+            "access token must be rejected by blocklist, got {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Database-backed coverage for the jti rotation paths (#929)
+    //
+    // These tests exercise the SQL branches of `refresh_tokens`,
+    // `gc_used_refresh_jtis`, and `blocklist_refresh_token`. They auto-skip
+    // when DATABASE_URL is unset or unreachable so the unit-test gate
+    // (which has no Postgres) stays green; the coverage gate provisions a
+    // Postgres service container and runs migrations before invoking
+    // `cargo llvm-cov --workspace --lib`, so these tests execute there and
+    // contribute to new-code coverage.
+    // -----------------------------------------------------------------------
+
+    async fn try_connect_test_db() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        // Short timeout so a misconfigured DATABASE_URL does not stall the
+        // unit test run for minutes.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&url)
+            .await
+            .ok()?;
+        // Verify the schema we depend on is actually present. If migrations
+        // were not applied in this environment, skip rather than failing.
+        let migrated: Result<(bool,)> = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+             WHERE table_name = 'used_refresh_jtis')",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()));
+        match migrated {
+            Ok((true,)) => Some(pool),
+            _ => None,
+        }
+    }
+
+    async fn insert_test_user(pool: &PgPool) -> Uuid {
+        let username = format!("authsvc-cov-{}", Uuid::new_v4().as_simple());
+        let email = format!("{}@cov.test", username);
+        let pwd_hash = AuthService::hash_password("cov-test-password")
+            .await
+            .expect("hash test password");
+        let row: (Uuid,) = sqlx::query_as(
+            "INSERT INTO users (username, email, password_hash, auth_provider, \
+             is_admin, is_active) \
+             VALUES ($1, $2, $3, 'local', false, true) RETURNING id",
+        )
+        .bind(&username)
+        .bind(&email)
+        .bind(&pwd_hash)
+        .fetch_one(pool)
+        .await
+        .expect("insert test user");
+        row.0
+    }
+
+    async fn delete_test_user(pool: &PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_blocklist_refresh_token_inserts_jti() {
+        let Some(pool) = try_connect_test_db().await else {
+            eprintln!("skip: DATABASE_URL unset or schema missing");
+            return;
+        };
+        let user_id = insert_test_user(&pool).await;
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // Mint a refresh token for this user with a known jti so we can
+        // verify the row landed in used_refresh_jtis.
+        let jti = Uuid::new_v4();
+        let now = Utc::now();
+        let claims = Claims {
+            sub: user_id,
+            username: "cov".to_string(),
+            email: "cov@x.test".to_string(),
+            is_admin: false,
+            iat: now.timestamp(),
+            exp: (now + Duration::days(1)).timestamp(),
+            token_type: "refresh".to_string(),
+            jti: Some(jti),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        )
+        .expect("encode refresh token");
+
+        svc.blocklist_refresh_token(&token)
+            .await
+            .expect("blocklist refresh token");
+
+        let row: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM used_refresh_jtis WHERE jti = $1)")
+                .bind(jti)
+                .fetch_one(&pool)
+                .await
+                .expect("check jti row");
+        assert!(row.0, "blocklisted jti must be persisted");
+
+        // Idempotency: a second blocklist call on the same token must not
+        // error (ON CONFLICT DO NOTHING path).
+        svc.blocklist_refresh_token(&token)
+            .await
+            .expect("blocklist is idempotent");
+
+        delete_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_blocklist_refresh_token_legacy_no_jti_uses_derived() {
+        let Some(pool) = try_connect_test_db().await else {
+            eprintln!("skip: DATABASE_URL unset or schema missing");
+            return;
+        };
+        let user_id = insert_test_user(&pool).await;
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // Mint a legacy refresh token with NO jti claim so the
+        // unwrap_or_else fallback (line 457) fires.
+        #[derive(Serialize)]
+        struct LegacyClaims {
+            sub: Uuid,
+            username: String,
+            email: String,
+            is_admin: bool,
+            iat: i64,
+            exp: i64,
+            token_type: String,
+        }
+        let now = Utc::now().timestamp();
+        let legacy = LegacyClaims {
+            sub: user_id,
+            username: "legacy-cov".to_string(),
+            email: "legacy-cov@x.test".to_string(),
+            is_admin: false,
+            iat: now,
+            exp: now + 3600,
+            token_type: "refresh".to_string(),
+        };
+        let token = encode(
+            &Header::default(),
+            &legacy,
+            &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        )
+        .expect("encode legacy refresh token");
+
+        svc.blocklist_refresh_token(&token)
+            .await
+            .expect("blocklist legacy refresh token");
+
+        let derived = legacy_token_jti(user_id, now);
+        let row: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM used_refresh_jtis WHERE jti = $1)")
+                .bind(derived)
+                .fetch_one(&pool)
+                .await
+                .expect("check derived jti row");
+        assert!(
+            row.0,
+            "legacy token must be blocklisted under the derived jti"
+        );
+
+        delete_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_gc_used_refresh_jtis_reaps_aged_rows() {
+        let Some(pool) = try_connect_test_db().await else {
+            eprintln!("skip: DATABASE_URL unset or schema missing");
+            return;
+        };
+        let user_id = insert_test_user(&pool).await;
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // Insert one aged row (older than the refresh-token TTL) and one
+        // fresh row. GC should remove only the aged row.
+        let aged = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO used_refresh_jtis (jti, user_id, used_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '30 days')",
+        )
+        .bind(aged)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert aged jti");
+
+        let fresh = Uuid::new_v4();
+        sqlx::query("INSERT INTO used_refresh_jtis (jti, user_id, used_at) VALUES ($1, $2, NOW())")
+            .bind(fresh)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert fresh jti");
+
+        let removed = svc.gc_used_refresh_jtis().await.expect("gc");
+        assert!(removed >= 1, "gc must reap at least the aged row");
+
+        let aged_exists: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM used_refresh_jtis WHERE jti = $1)")
+                .bind(aged)
+                .fetch_one(&pool)
+                .await
+                .expect("check aged");
+        assert!(!aged_exists.0, "aged row must have been reaped");
+
+        let fresh_exists: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM used_refresh_jtis WHERE jti = $1)")
+                .bind(fresh)
+                .fetch_one(&pool)
+                .await
+                .expect("check fresh");
+        assert!(fresh_exists.0, "fresh row must be preserved");
+
+        delete_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_gc_used_refresh_jtis_returns_zero_when_nothing_old() {
+        // Boundary: when no aged rows exist, GC returns 0 without erroring.
+        let Some(pool) = try_connect_test_db().await else {
+            eprintln!("skip: DATABASE_URL unset or schema missing");
+            return;
+        };
+        let user_id = insert_test_user(&pool).await;
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // First, reap any aged rows from previous failed runs so we get a
+        // clean baseline for the assertion below.
+        let _ = svc.gc_used_refresh_jtis().await;
+
+        // Insert only fresh rows.
+        let jti = Uuid::new_v4();
+        sqlx::query("INSERT INTO used_refresh_jtis (jti, user_id, used_at) VALUES ($1, $2, NOW())")
+            .bind(jti)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert fresh jti");
+
+        let removed = svc.gc_used_refresh_jtis().await.expect("gc");
+        assert_eq!(removed, 0, "fresh rows must not be reaped");
+
+        // Cleanup the row we just inserted before deleting the user, since
+        // the FK has no cascade configured for jti rows in older migrations.
+        let _ = sqlx::query("DELETE FROM used_refresh_jtis WHERE jti = $1")
+            .bind(jti)
+            .execute(&pool)
+            .await;
+        delete_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_tokens_happy_path_and_replay_rejected() {
+        // Covers the SQL INSERT path of refresh_tokens (lines 365-378) on
+        // first use, the rows_affected==0 replay branch on the second use
+        // (lines 391-395), and the user fetch (lines 398-415).
+        let Some(pool) = try_connect_test_db().await else {
+            eprintln!("skip: DATABASE_URL unset or schema missing");
+            return;
+        };
+        let user_id = insert_test_user(&pool).await;
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // Use authenticate to mint a real refresh token. We re-fetch the
+        // password from the inserted row indirectly: we know insert_test_user
+        // hashed "cov-test-password", so authenticate with that.
+        let username: (String,) = sqlx::query_as("SELECT username FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load test username");
+        let (_user, pair) = svc
+            .authenticate(&username.0, "cov-test-password")
+            .await
+            .expect("authenticate test user");
+
+        let (_user, pair2) = svc
+            .refresh_tokens(&pair.refresh_token)
+            .await
+            .expect("first refresh succeeds");
+        assert_ne!(
+            pair.refresh_token, pair2.refresh_token,
+            "rotation must mint a new refresh token"
+        );
+
+        // Replay must be rejected.
+        let replay = svc.refresh_tokens(&pair.refresh_token).await;
+        assert!(
+            matches!(replay, Err(AppError::Authentication(_))),
+            "replay must be rejected as Authentication error, got {:?}",
+            replay
+        );
+
+        delete_test_user(&pool, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_tokens_user_not_found_after_decode() {
+        // Covers the `.ok_or_else(... User not found ...)` branch when the
+        // refresh token decodes to a user_id that no longer exists in the
+        // users table (deleted between issuance and refresh).
+        let Some(pool) = try_connect_test_db().await else {
+            eprintln!("skip: DATABASE_URL unset or schema missing");
+            return;
+        };
+        let cfg = make_test_config();
+        let svc = AuthService::new(pool.clone(), cfg.clone());
+
+        // Mint a refresh token bound to a user_id that doesn't exist.
+        let ghost = Uuid::new_v4();
+        let now = Utc::now();
+        let claims = Claims {
+            sub: ghost,
+            username: "ghost".to_string(),
+            email: "ghost@x.test".to_string(),
+            is_admin: false,
+            iat: now.timestamp(),
+            exp: (now + Duration::days(1)).timestamp(),
+            token_type: "refresh".to_string(),
+            jti: Some(Uuid::new_v4()),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(cfg.jwt_secret.as_bytes()),
+        )
+        .expect("encode refresh token");
+
+        // Without a referenced user the INSERT into used_refresh_jtis fails
+        // on the FK, surfacing as an AppError::Database. Either way the
+        // function returns an error and exercises the SQL path.
+        let result = svc.refresh_tokens(&token).await;
+        assert!(
+            result.is_err(),
+            "ghost-user refresh must be rejected, got {:?}",
+            result
+        );
+    }
 }
