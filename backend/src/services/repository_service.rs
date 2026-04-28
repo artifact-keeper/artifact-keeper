@@ -1731,6 +1731,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_cycle_lookup_error_propagates() {
+        // The lookup closure is the only fallible step in the BFS. If it
+        // returns Err, the helper must surface the error rather than
+        // returning a stale Ok(false). Covers the `?`-operator's Err arm
+        // on the `virtual_members(node).await?` call so the failure path
+        // is exercised by unit tests rather than relying on DB-backed
+        // integration runs.
+        let v_target = Uuid::new_v4();
+        let candidate = Uuid::new_v4();
+        let lookup = |_node: Uuid| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<Uuid>>>>,
+        > {
+            Box::pin(async {
+                Err(AppError::Database(
+                    "simulated pool-closed lookup failure".to_string(),
+                )) as Result<Vec<Uuid>>
+            })
+        };
+        let result = would_create_cycle_in_graph(v_target, candidate, lookup).await;
+        assert!(
+            matches!(result, Err(AppError::Database(_))),
+            "lookup error must propagate, got {result:?}"
+        );
+    }
+
     // Compile-time sanity check on the depth bound: small enough to
     // terminate fast, large enough to allow legitimate nesting. Encoded
     // as a `const _` so clippy does not flag it as a constant assertion.
