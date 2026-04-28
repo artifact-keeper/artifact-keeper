@@ -467,7 +467,7 @@ async fn list_scan_configs(
     responses(
         (status = 200, description = "Scan triggered successfully", body = TriggerScanResponse),
         (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
-        (status = 500, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
+        (status = 503, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -476,10 +476,13 @@ async fn trigger_scan(
     Extension(_auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
+    // 503 (not 500) because "scanner not configured" is a normal operational
+    // state on minimal stacks (no Trivy / OpenSCAP service), not a server
+    // bug. 500 alerts on operator dashboards; 503 does not.
     let scanner = state
         .scanner_service
         .as_ref()
-        .ok_or_else(|| AppError::Internal("Scanner service not configured".to_string()))?
+        .ok_or_else(|| AppError::ServiceUnavailable("Scanner service not configured".to_string()))?
         .clone();
 
     if let Some(artifact_id) = body.artifact_id {
@@ -1434,6 +1437,73 @@ mod tests {
         let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.artifact_id, None);
         assert_eq!(req.repository_id, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Structural guard for issue #918: trigger_scan must return 503
+    // (ServiceUnavailable), not 500 (Internal), when scanner_service is None.
+    // -----------------------------------------------------------------------
+    //
+    // The error.rs unit tests added with this fix only verify that the
+    // ServiceUnavailable variant maps to a 503 status code. They do NOT
+    // verify that the trigger_scan handler actually emits that variant.
+    // A regression that reverted the handler call site to AppError::Internal
+    // (the original bug) would still pass every other test in this crate.
+    //
+    // Constructing a SharedState with scanner_service: None would require a
+    // live Postgres pool (no #[sqlx::test] pattern is used in this file),
+    // so we use a source-grep test as the lightweight regression contract.
+    //
+    // The forbidden substrings are constructed at runtime via format!() so
+    // this test's own body does not contain them and trip the check on itself.
+    #[test]
+    fn test_trigger_scan_handler_uses_service_unavailable_for_missing_scanner() {
+        let src = include_str!("security.rs");
+
+        // Slice out just the trigger_scan function body so we are asserting on
+        // the bug-fix call site, not on (e.g.) a doc comment elsewhere in the
+        // file that happens to mention "Internal".
+        let fn_marker = "async fn trigger_scan(";
+        let fn_start = src
+            .find(fn_marker)
+            .expect("trigger_scan function must exist");
+        // The next handler in this file is `list_scans`. Bound the slice on
+        // that to avoid scanning the rest of the module.
+        let next_fn_marker = "async fn list_scans(";
+        let fn_end_rel = src[fn_start..]
+            .find(next_fn_marker)
+            .expect("list_scans must follow trigger_scan in this file");
+        let body = &src[fn_start..fn_start + fn_end_rel];
+
+        // Build the forbidden pattern at runtime so this assertion's own
+        // text does not satisfy the search.
+        let internal_variant = format!("AppError::{}(", "Internal");
+        let bad_call = format!(
+            "{}\"Scanner service not configured\"",
+            internal_variant.as_str()
+        );
+        assert!(
+            !body.contains(&bad_call),
+            "regression of issue #918: trigger_scan must NOT return \
+             AppError::Internal for the scanner-not-configured case; that \
+             maps to HTTP 500 and triggers operator alerts. Use \
+             AppError::ServiceUnavailable so it maps to HTTP 503 instead.",
+        );
+
+        // Anchor: the handler must affirmatively use the ServiceUnavailable
+        // variant. Spelled in two pieces so this assertion's own text does
+        // not satisfy the search trivially.
+        let good_variant = format!("AppError::{}(", "ServiceUnavailable");
+        let good_call = format!(
+            "{}\"Scanner service not configured\"",
+            good_variant.as_str()
+        );
+        assert!(
+            body.contains(&good_call),
+            "trigger_scan must return AppError::ServiceUnavailable(\"Scanner \
+             service not configured\") when state.scanner_service is None, \
+             so the response is HTTP 503 (not 500).",
+        );
     }
 
     #[test]
