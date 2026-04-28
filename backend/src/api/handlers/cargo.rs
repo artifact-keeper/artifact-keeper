@@ -2789,4 +2789,24 @@ mod tests {
             "legitimate external URL should be accepted"
         );
     }
+
+    /// Smoke test that the cargo `dl` field flows through
+    /// `validate_outbound_url`. The detailed coverage of each bypass
+    /// class lives in `api::validation::tests`; this test pins the
+    /// integration: a malicious upstream `config.json` returning a
+    /// crafted `dl` cannot reach AWS IMDS via the cargo download path.
+    /// One realistic case is sufficient — duplicating the full bypass
+    /// matrix here would shadow the validator's own tests.
+    #[test]
+    fn test_build_download_url_rejects_ipv6_ssrf_bypass() {
+        use crate::api::validation::validate_outbound_url;
+        let dl = "http://[::ffff:169.254.169.254]";
+        let url = build_download_url(dl, "evil", "1.0.0");
+        let err = validate_outbound_url(&url, "Cargo upstream download URL")
+            .expect_err("IPv4-mapped AWS IMDS via dl must be rejected");
+        assert!(
+            err.to_string().contains("private/internal network"),
+            "expected SSRF rejection reason in error message, got: {err}"
+        );
+    }
 }

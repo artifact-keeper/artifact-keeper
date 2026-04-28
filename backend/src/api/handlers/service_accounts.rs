@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::auth_service::AuthService;
+use crate::services::auth_service::{
+    invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
+};
 use crate::services::service_account_service::{ServiceAccountService, ServiceAccountSummary};
 use crate::services::token_service::TokenService;
 
@@ -360,6 +362,16 @@ pub async fn update_service_account(
 ) -> Result<Json<ServiceAccountResponse>> {
     require_admin(&auth)?;
 
+    // Pre-mark the cache invalidation BEFORE the SQL UPDATE so any concurrent
+    // request that might still hit the cache during the update is rejected.
+    // Service accounts are precisely the principal type that runs hot in the
+    // API-token cache (cargo/npm/maven CI bots), so the 5-minute window is
+    // most relevant for them. Issue #931.
+    if matches!(payload.is_active, Some(false)) {
+        invalidate_user_token_cache_entries(id);
+        invalidate_user_tokens(id);
+    }
+
     let svc = ServiceAccountService::new(state.db.clone());
     let user = svc
         .update(id, payload.display_name.as_deref(), payload.is_active)
@@ -400,6 +412,13 @@ pub async fn delete_service_account(
     Path(id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode> {
     require_admin(&auth)?;
+
+    // Pre-mark the cache invalidation BEFORE the SQL DELETE. Hard-deleting a
+    // service account must also evict cached API-token validations for that
+    // account, otherwise the cache would keep authenticating the deleted
+    // service account for up to API_TOKEN_CACHE_TTL_SECS (5 min). Issue #931.
+    invalidate_user_token_cache_entries(id);
+    invalidate_user_tokens(id);
 
     let svc = ServiceAccountService::new(state.db.clone());
     svc.delete(id).await?;
