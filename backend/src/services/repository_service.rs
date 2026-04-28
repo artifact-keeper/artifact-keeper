@@ -206,6 +206,85 @@ pub(crate) fn is_duplicate_key_error(error_message: &str) -> bool {
     error_message.contains("duplicate key")
 }
 
+/// Maximum depth the virtual-membership graph walk will descend before
+/// giving up. A registry that legitimately needs more than 32 layers of
+/// virtual nesting has bigger problems; the bound exists so a corrupted
+/// graph (e.g. cycles already persisted in the database) cannot cause
+/// unbounded work in `would_create_cycle_in_graph`.
+pub(crate) const MAX_VIRTUAL_DEPTH: usize = 32;
+
+/// Advisory-lock key used to serialize all mutations of the virtual
+/// membership graph (`add_virtual_member` and friends).
+///
+/// Concurrent `add_virtual_member` calls that race the cycle check would
+/// otherwise be able to bypass it: A reads at T, B reads at T, both pass,
+/// both INSERT, the resulting graph has the cycle the algorithm guarantees
+/// against. Taking this single transaction-scoped advisory lock at the
+/// start of every `add_virtual_member` tx makes the check + INSERT
+/// effectively atomic without forcing SERIALIZABLE on the whole codepath
+/// or trying to row-lock a graph subset.
+///
+/// The constant is arbitrary, just needs to be stable across processes.
+/// Chosen as a 64-bit hash of "artifact_keeper.virtual_repo_members.write".
+pub(crate) const VIRTUAL_MEMBER_GRAPH_LOCK_KEY: i64 = 0x4b56_4d47_5752_5445; // "KVMGWRTE"
+
+/// Pure cycle-detection on a virtual-membership graph.
+///
+/// Determines whether adding the edge `virtual_id -> candidate_member_id`
+/// would close a cycle in the directed graph defined by
+/// `virtual_repo_members`. The walk only considers edges whose source is a
+/// virtual repository (non-virtual leaves cannot extend the path), so the
+/// `virtual_members` lookup must already restrict its result to virtual
+/// member ids.
+///
+/// Returns `Ok(true)` if the proposed edge would create a cycle (including
+/// the trivial self-loop `virtual_id == candidate_member_id`), `Ok(false)`
+/// if it is safe. Returns `Err(_)` only if the underlying lookup errors.
+///
+/// The walk is breadth-first and bounded by [`MAX_VIRTUAL_DEPTH`]; if the
+/// bound is reached without resolving the question, the function
+/// conservatively returns `Ok(true)` to refuse the insert. This matches
+/// the safety contract the issue calls for: when in doubt, refuse.
+pub(crate) async fn would_create_cycle_in_graph<F, Fut>(
+    virtual_id: Uuid,
+    candidate_member_id: Uuid,
+    mut virtual_members: F,
+) -> Result<bool>
+where
+    F: FnMut(Uuid) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Uuid>>>,
+{
+    // Self-membership: a virtual repository cannot contain itself.
+    if virtual_id == candidate_member_id {
+        return Ok(true);
+    }
+
+    // BFS from the candidate. If we ever reach `virtual_id`, the proposed
+    // edge would close the cycle `virtual_id -> candidate -> ... -> virtual_id`.
+    let mut visited = std::collections::HashSet::new();
+    let mut frontier: std::collections::VecDeque<(Uuid, usize)> = std::collections::VecDeque::new();
+    frontier.push_back((candidate_member_id, 0));
+    visited.insert(candidate_member_id);
+
+    while let Some((node, depth)) = frontier.pop_front() {
+        if depth >= MAX_VIRTUAL_DEPTH {
+            // Refuse rather than risk unbounded work on a corrupted graph.
+            return Ok(true);
+        }
+        let children = virtual_members(node).await?;
+        for child in children {
+            if child == virtual_id {
+                return Ok(true);
+            }
+            if visited.insert(child) {
+                frontier.push_back((child, depth + 1));
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// Repository service
 pub struct RepositoryService {
     db: PgPool,
@@ -574,14 +653,63 @@ impl RepositoryService {
         Ok(())
     }
 
-    /// Add a member repository to a virtual repository
+    /// Add a member repository to a virtual repository.
+    ///
+    /// Rejects:
+    /// - self-membership (a virtual repository cannot contain itself)
+    /// - any addition that would close a cycle in the membership graph
+    /// - mismatched formats between the virtual repository and the member
+    /// - members whose graph descent would exceed [`MAX_VIRTUAL_DEPTH`]
+    ///
+    /// Cycle detection runs only when the candidate member is itself a
+    /// virtual repository (non-virtual leaves cannot extend a cycle).
     pub async fn add_virtual_member(
         &self,
         virtual_repo_id: Uuid,
         member_repo_id: Uuid,
         priority: i32,
     ) -> Result<()> {
-        // Validate virtual repository exists and is virtual type
+        // Reject self-membership unconditionally before opening the
+        // transaction. The cycle check below would also catch this, but
+        // the dedicated error message is more useful at the API boundary
+        // and we can return without paying for the advisory lock.
+        if virtual_repo_id == member_repo_id {
+            return Err(AppError::Validation(
+                "A virtual repository cannot be a member of itself".to_string(),
+            ));
+        }
+
+        // TOCTOU fix (issue #915 second-pass review): wrap the cycle
+        // check + INSERT in one transaction guarded by a transaction-
+        // scoped advisory lock. Without this, two concurrent admins
+        // could each pass the cycle check at T, each INSERT at T+1, and
+        // produce the cycle the algorithm is supposed to prevent
+        // (e.g. A: V1 -> V2, B: V2 -> V1; both checks see no cycle).
+        //
+        // The advisory lock is held for the duration of this tx and
+        // automatically released on commit or rollback. It serializes
+        // *all* `add_virtual_member` calls process-wide and across
+        // application instances backed by the same database. Throughput
+        // impact is negligible because the critical section is a few
+        // small reads and one INSERT, and membership mutation is a
+        // rare administrative action.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(VIRTUAL_MEMBER_GRAPH_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Re-fetch both repositories *inside* the locked tx so we observe
+        // a consistent snapshot of types/formats. A racing UPDATE that
+        // changed `repo_type` would have to wait for our advisory lock if
+        // it also goes through this path; direct admin updates of
+        // `repo_type` are out of scope for membership-graph integrity.
         let virtual_repo = self.get_by_id(virtual_repo_id).await?;
         if virtual_repo.repo_type != RepositoryType::Virtual {
             return Err(AppError::Validation(
@@ -589,37 +717,102 @@ impl RepositoryService {
             ));
         }
 
-        // Validate member repository exists and is not virtual
         let member_repo = self.get_by_id(member_repo_id).await?;
-        if member_repo.repo_type == RepositoryType::Virtual {
-            return Err(AppError::Validation(
-                "Cannot add virtual repository as member".to_string(),
-            ));
-        }
 
-        // Validate formats match
         if virtual_repo.format != member_repo.format {
             return Err(AppError::Validation(
                 "Member repository format must match virtual repository format".to_string(),
             ));
         }
 
-        sqlx::query!(
+        // Cycle check: only meaningful when the candidate is itself
+        // virtual. Non-virtual repositories are leaves in the membership
+        // graph and cannot participate in a cycle. Reads use `&self.db`,
+        // not the tx, but the advisory lock guarantees no other
+        // `add_virtual_member` tx can be mutating `virtual_repo_members`
+        // concurrently, so any committed state we read is stable for the
+        // remainder of this tx.
+        if member_repo.repo_type == RepositoryType::Virtual
+            && self
+                .would_create_cycle(virtual_repo_id, member_repo_id)
+                .await?
+        {
+            return Err(AppError::Validation(format!(
+                "Adding repository {} as a member of virtual repository {} would create a cycle",
+                member_repo.key, virtual_repo.key
+            )));
+        }
+
+        sqlx::query(
             r#"
             INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority)
             VALUES ($1, $2, $3)
             "#,
-            virtual_repo_id,
-            member_repo_id,
-            priority
         )
-        .execute(&self.db)
+        .bind(virtual_repo_id)
+        .bind(member_repo_id)
+        .bind(priority)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             map_virtual_member_insert_error(e, virtual_repo.key.as_str(), member_repo.key.as_str())
         })?;
 
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         Ok(())
+    }
+
+    /// Return true if inserting the edge
+    /// `virtual_id -> candidate_member_id` into `virtual_repo_members`
+    /// would create a cycle (including a trivial self-loop).
+    ///
+    /// Walks the existing membership graph starting from
+    /// `candidate_member_id` and following only edges whose source is
+    /// itself a virtual repository. The walk is bounded by
+    /// [`MAX_VIRTUAL_DEPTH`] as a defensive limit; on overflow this
+    /// conservatively returns `Ok(true)` so the caller refuses the
+    /// insert.
+    ///
+    /// Worst-case cost is O(V + E) over the virtual-only subgraph
+    /// reachable from the candidate.
+    pub async fn would_create_cycle(
+        &self,
+        virtual_id: Uuid,
+        candidate_member_id: Uuid,
+    ) -> Result<bool> {
+        would_create_cycle_in_graph(virtual_id, candidate_member_id, |node| {
+            self.virtual_member_children(node)
+        })
+        .await
+    }
+
+    /// Return the ids of every member of `repo_id` whose own type is
+    /// `virtual`. Non-virtual members are filtered out because they
+    /// cannot extend a path in the cycle search.
+    ///
+    /// Uses the dynamic query API (not the macro) so the cycle-detection
+    /// path does not depend on an updated offline SQLx cache; the schema
+    /// of `repositories.repo_type` is static enough that the JOIN is
+    /// trivially correct.
+    async fn virtual_member_children(&self, repo_id: Uuid) -> Result<Vec<Uuid>> {
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT vrm.member_repo_id
+            FROM virtual_repo_members vrm
+            INNER JOIN repositories r ON r.id = vrm.member_repo_id
+            WHERE vrm.virtual_repo_id = $1
+              AND r.repo_type = 'virtual'
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Remove a member from a virtual repository
@@ -1336,6 +1529,241 @@ mod tests {
             RepoVisibility::User(Uuid::new_v4())
         );
     }
+
+    // -----------------------------------------------------------------------
+    // would_create_cycle_in_graph (issue #915)
+    //
+    // Tests use an in-memory adjacency map so the algorithm can be exercised
+    // without a database. The map intentionally contains only virtual ->
+    // virtual edges, mirroring what `virtual_member_children` returns from
+    // PostgreSQL.
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashMap;
+
+    /// Helper: build an async lookup closure from a static graph.
+    fn make_graph_lookup(
+        graph: HashMap<Uuid, Vec<Uuid>>,
+    ) -> impl FnMut(Uuid) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Uuid>>>>>
+    {
+        move |node: Uuid| {
+            let children = graph.get(&node).cloned().unwrap_or_default();
+            Box::pin(async move { Ok(children) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Uuid>>>>>
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cycle_self_membership_rejected() {
+        // V trying to add itself as a member is the trivial self-loop.
+        let v = Uuid::new_v4();
+        let graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        let result = would_create_cycle_in_graph(v, v, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(result, "self-membership must be detected as a cycle");
+    }
+
+    #[tokio::test]
+    async fn test_cycle_direct_two_node_cycle_rejected() {
+        // V1 already contains V2. Adding V1 as a member of V2 closes
+        // V1 -> V2 -> V1.
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let mut graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        graph.insert(v1, vec![v2]);
+        // Insert V2 as a key with no children so the lookup terminates cleanly.
+        graph.insert(v2, vec![]);
+        let result = would_create_cycle_in_graph(v2, v1, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(result, "V2 -> V1 must be rejected when V1 -> V2 exists");
+    }
+
+    #[tokio::test]
+    async fn test_cycle_indirect_three_node_cycle_rejected() {
+        // V1 -> V2 -> V3, then trying V3 -> V1 closes a 3-node cycle.
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let v3 = Uuid::new_v4();
+        let mut graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        graph.insert(v1, vec![v2]);
+        graph.insert(v2, vec![v3]);
+        graph.insert(v3, vec![]);
+        let result = would_create_cycle_in_graph(v3, v1, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(result, "V3 -> V1 must close the V1 -> V2 -> V3 chain");
+    }
+
+    #[tokio::test]
+    async fn test_cycle_independent_virtuals_allowed() {
+        // V1 and V2 are unrelated, both empty. Adding V2 to V1 is safe.
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let mut graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        graph.insert(v1, vec![]);
+        graph.insert(v2, vec![]);
+        let result = would_create_cycle_in_graph(v1, v2, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "independent virtuals must not be flagged as cyclic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_local_only_subgraph_allowed() {
+        // The candidate has no virtual children at all (its children would
+        // be local repos, which `virtual_member_children` filters out).
+        // The lookup therefore returns an empty list.
+        let v1 = Uuid::new_v4();
+        let candidate = Uuid::new_v4();
+        let graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        let result = would_create_cycle_in_graph(v1, candidate, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "candidate with only non-virtual descendants must be safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_diamond_no_cycle_allowed() {
+        // V1 -> V2, V1 -> V3, V2 -> V4, V3 -> V4 (diamond). Two
+        // assertions exercise the algorithm against this shape:
+        //
+        // 1. (v4, v1, graph): proposing V4 -> V1 must be rejected
+        //    because the BFS from V1 reaches V4 via *both* paths
+        //    (v1 -> v2 -> v4 and v1 -> v3 -> v4); the visited-set
+        //    must dedupe v4 reached via v2 and v3 without the BFS
+        //    looping or double-reporting, and ultimately the walk
+        //    reaches v4 == virtual_id, returning true.
+        //
+        // 2. (v_new, v1, graph): proposing V_new -> V1 where V_new
+        //    is not in the graph must be allowed. The BFS from V1
+        //    walks the full diamond (v2, v3, v4) without ever
+        //    reaching v_new, so the result is false. This is the
+        //    canonical "diamond DAG remains acyclic" case and the
+        //    one the original test author intended.
+        //
+        // The previous version of this test queried (v4, v_new, graph)
+        // where v_new had no graph entry, so the BFS terminated
+        // immediately and never traversed the diamond at all. That
+        // gave a false sense of coverage. (Issue #915 second-pass review.)
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let v3 = Uuid::new_v4();
+        let v4 = Uuid::new_v4();
+        let v_new = Uuid::new_v4();
+        let mut graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        graph.insert(v1, vec![v2, v3]);
+        graph.insert(v2, vec![v4]);
+        graph.insert(v3, vec![v4]);
+        graph.insert(v4, vec![]);
+
+        // Assertion 1: closing the diamond by adding V4 -> V1 is a cycle.
+        // The visited set must dedupe v4 (reached via both v2 and v3).
+        let result_close = would_create_cycle_in_graph(v4, v1, make_graph_lookup(graph.clone()))
+            .await
+            .unwrap();
+        assert!(
+            result_close,
+            "v4 -> v1 closes the diamond and must be rejected; \
+             also exercises the visited-set dedupe of v4"
+        );
+
+        // Assertion 2: extending the diamond with V_new -> V1 is acyclic.
+        // The BFS traverses v1 -> v2/v3 -> v4 without reaching v_new.
+        let result_extend = would_create_cycle_in_graph(v_new, v1, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(
+            !result_extend,
+            "v_new -> v1 extends the diamond DAG without creating a cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_visited_set_prevents_revisit() {
+        // V1 -> V2, V2 -> V3, V3 -> V2 (a cycle that does NOT include V1).
+        // Trying to add V1 -> V2 again must terminate (visited set) and
+        // return false because the existing cycle does not touch V1.
+        let v1 = Uuid::new_v4();
+        let v2 = Uuid::new_v4();
+        let v3 = Uuid::new_v4();
+        let mut graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        graph.insert(v1, vec![v2]);
+        graph.insert(v2, vec![v3]);
+        graph.insert(v3, vec![v2]);
+        let result = would_create_cycle_in_graph(v1, v2, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "pre-existing cycle not touching v1 must not falsely reject"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_depth_bound_refuses_pathological_chain() {
+        // Build a linear chain v0 -> v1 -> ... -> v(N) where N exceeds
+        // MAX_VIRTUAL_DEPTH. The walk must short-circuit and refuse.
+        let nodes: Vec<Uuid> = (0..(MAX_VIRTUAL_DEPTH + 5))
+            .map(|_| Uuid::new_v4())
+            .collect();
+        let mut graph: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for window in nodes.windows(2) {
+            graph.insert(window[0], vec![window[1]]);
+        }
+        graph.insert(*nodes.last().unwrap(), vec![]);
+
+        let head = nodes[0];
+        let new_root = Uuid::new_v4();
+        let result = would_create_cycle_in_graph(new_root, head, make_graph_lookup(graph))
+            .await
+            .unwrap();
+        assert!(
+            result,
+            "walks deeper than MAX_VIRTUAL_DEPTH must be refused defensively"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_lookup_error_propagates() {
+        // The lookup closure is the only fallible step in the BFS. If it
+        // returns Err, the helper must surface the error rather than
+        // returning a stale Ok(false). Covers the `?`-operator's Err arm
+        // on the `virtual_members(node).await?` call so the failure path
+        // is exercised by unit tests rather than relying on DB-backed
+        // integration runs.
+        let v_target = Uuid::new_v4();
+        let candidate = Uuid::new_v4();
+        let lookup = |_node: Uuid| -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<Uuid>>>>,
+        > {
+            Box::pin(async {
+                Err(AppError::Database(
+                    "simulated pool-closed lookup failure".to_string(),
+                )) as Result<Vec<Uuid>>
+            })
+        };
+        let result = would_create_cycle_in_graph(v_target, candidate, lookup).await;
+        assert!(
+            matches!(result, Err(AppError::Database(_))),
+            "lookup error must propagate, got {result:?}"
+        );
+    }
+
+    // Compile-time sanity check on the depth bound: small enough to
+    // terminate fast, large enough to allow legitimate nesting. Encoded
+    // as a `const _` so clippy does not flag it as a constant assertion.
+    const _: () = {
+        assert!(MAX_VIRTUAL_DEPTH >= 8);
+        assert!(MAX_VIRTUAL_DEPTH <= 128);
+    };
 
     // -----------------------------------------------------------------------
     // map_virtual_member_insert_error tests
