@@ -1053,6 +1053,10 @@ async fn start_migration(
         concurrency: config.concurrent_transfers.max(1) as usize,
         throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
         dry_run: config.dry_run,
+        // Honor the user's `verify_checksums` preference from MigrationConfig
+        // so the documented API flag actually disables verification
+        // (issue #856).
+        verify_checksums: config.verify_checksums,
         ..Default::default()
     };
 
@@ -1181,6 +1185,10 @@ async fn resume_migration(
         concurrency: config.concurrent_transfers.max(1) as usize,
         throttle_delay_ms: config.throttle_delay_ms.max(0) as u64,
         dry_run: config.dry_run,
+        // Honor the user's `verify_checksums` preference from MigrationConfig
+        // so the documented API flag actually disables verification
+        // (issue #856).
+        verify_checksums: config.verify_checksums,
         ..Default::default()
     };
 
