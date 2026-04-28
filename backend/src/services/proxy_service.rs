@@ -192,9 +192,13 @@ impl ProxyService {
             }
             Ok(Err(_)) => {
                 // The semaphore is owned by this ProxyService instance and
-                // is never explicitly closed. Reaching this branch implies a
-                // logic error elsewhere, not a runtime condition.
-                unreachable!("upstream_fetch_sem is never closed")
+                // is never explicitly closed, so reaching this branch implies
+                // a logic error elsewhere. Return an error rather than
+                // panicking so a never-expected condition cannot bring down
+                // the proxy hot path.
+                Err(AppError::Internal(
+                    "upstream fetch semaphore unexpectedly closed".to_string(),
+                ))
             }
             Err(_) => {
                 crate::services::metrics_service::record_proxy_queue_full();
@@ -2348,5 +2352,46 @@ mod tests {
             Duration::from_secs(DEFAULT_QUEUE_TIMEOUT_SECS)
         );
         assert!(svc.upstream_fetch_sem.is_some());
+    }
+
+    /// Structural guard: assert that `fetch_from_upstream` actually invokes
+    /// the permit acquisition. Every behavioural test in this module calls
+    /// `acquire_fetch_permit` directly, so deleting the `let _permit = ...`
+    /// line from `fetch_from_upstream` would silently disable stampede
+    /// protection on the hot path while leaving every other test green.
+    ///
+    /// The forbidden-revert needle is built via `format!` from disjoint
+    /// fragments so this test body itself does not contain a literal copy
+    /// that would satisfy the substring check.
+    #[test]
+    fn test_fetch_from_upstream_invokes_acquire_fetch_permit() {
+        const SOURCE: &str = include_str!("proxy_service.rs");
+
+        let fn_marker = format!(
+            "async fn {}{}",
+            "fetch_from_upstream", "(&self, url: &str, repo_id: Uuid)"
+        );
+        let body_start = SOURCE.find(&fn_marker).unwrap_or_else(|| {
+            panic!(
+                "could not locate `fetch_from_upstream` definition; \
+                 has its signature changed? Update this structural test."
+            )
+        });
+
+        // Extract a window from the function definition through the next
+        // 8 KB so the search stops well inside the function body but well
+        // before any unrelated trailing methods.
+        let end = (body_start + 8 * 1024).min(SOURCE.len());
+        let window = &SOURCE[body_start..end];
+
+        let needle = format!("{}{}", "acquire_fetch_", "permit");
+        assert!(
+            window.contains(&needle),
+            "`fetch_from_upstream` no longer calls `{}`. This is the chokepoint \
+             that bounds upstream fetch concurrency (#872); removing it silently \
+             disables stampede protection. Re-add the permit acquisition or \
+             update this structural test if the chokepoint moved.",
+            needle
+        );
     }
 }
