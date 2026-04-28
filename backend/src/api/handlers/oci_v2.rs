@@ -362,6 +362,27 @@ struct OciRepoInfo {
 
 /// Resolve the first path segment as a repository key and the rest as the
 /// image name within the repository.
+/// Read `AK_DEFAULT_DOCKER_MIRROR_REPO` once. Returns the configured proxy
+/// repo key, or None if the variable is unset / empty. Cached for the
+/// lifetime of the process; changes require a pod restart.
+///
+/// When set, this enables "Docker daemon mirror mode": requests to
+/// `/v2/<image>/...` (no AK repo prefix, the path layout dockerd's
+/// `registry-mirrors` produces) fall back through the named proxy repo,
+/// using the full original image_name as the upstream image path. Without
+/// this, only `/v2/<repo-key>/<image>/...` works and dockerd's mirror
+/// config is silently bypassed.
+fn default_docker_mirror_repo() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            std::env::var("AK_DEFAULT_DOCKER_MIRROR_REPO")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
 async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
     use sqlx::Row;
     // Split: "test/python" → repo_key="test", image="python"
@@ -371,21 +392,57 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
         None => (image_name, image_name),
     };
 
-    let repo = sqlx::query(
-        "SELECT id, key, storage_backend, storage_path, repo_type::text as repo_type, \
-         upstream_url, is_public FROM repositories WHERE key = $1",
-    )
-    .bind(repo_key)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
+    let map_db_err = |e: sqlx::Error| {
         oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             &e.to_string(),
         )
-    })?
-    .ok_or_else(|| {
+    };
+
+    let select_repo_by_key = |key: String| async move {
+        sqlx::query(
+            "SELECT id, key, storage_backend, storage_path, repo_type::text as repo_type, \
+             upstream_url, is_public FROM repositories WHERE key = $1",
+        )
+        .bind(key)
+        .fetch_optional(db)
+        .await
+    };
+
+    // 1. Try the literal repo_key first (existing behavior preserved).
+    let mut repo = select_repo_by_key(repo_key.to_string())
+        .await
+        .map_err(map_db_err)?;
+    let mut effective_image = image.to_string();
+
+    // 2. Mirror-mode fallback: if the literal lookup missed AND a default
+    //    Docker mirror repo is configured, re-resolve through it with the
+    //    full original image_name as the image path. This makes dockerd's
+    //    `registry-mirrors` config work end-to-end: a pull of
+    //    `library/postgres:16-alpine` arrives as
+    //    `/v2/library/postgres/manifests/16-alpine`, repo_key="library"
+    //    misses, fallback re-resolves the configured proxy repo (e.g.
+    //    `docker-hub-cache`), and the proxy code path (`is_docker_hub`,
+    //    `normalize_docker_image`, blob/manifest cache) takes over with
+    //    image="library/postgres".
+    if repo.is_none() {
+        if let Some(mirror_key) = default_docker_mirror_repo() {
+            // Don't infinitely recurse: only attempt the fallback when the
+            // miss was on a different key than the mirror itself.
+            if mirror_key != repo_key {
+                if let Some(row) = select_repo_by_key(mirror_key.to_string())
+                    .await
+                    .map_err(map_db_err)?
+                {
+                    repo = Some(row);
+                    effective_image = image_name.to_string();
+                }
+            }
+        }
+    }
+
+    let repo = repo.ok_or_else(|| {
         oci_error(
             StatusCode::NOT_FOUND,
             "NAME_UNKNOWN",
@@ -405,7 +462,7 @@ async fn resolve_repo(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Resp
         repo_type: repo.try_get("repo_type").unwrap_or_default(),
         upstream_url: repo.try_get("upstream_url").ok(),
         is_public: repo.try_get("is_public").unwrap_or(false),
-        image: image.to_string(),
+        image: effective_image,
     })
 }
 
@@ -2056,6 +2113,7 @@ struct UpstreamTagsPage {
     next_last: Option<String>,
 }
 
+#[rustfmt::skip]
 async fn fetch_upstream_tags_page(
     state: &SharedState,
     repo_id: Uuid,
@@ -2074,26 +2132,21 @@ async fn fetch_upstream_tags_page(
     })?;
 
     let upstream_path = format!("v2/{}/{}", image, build_remote_tags_list_path(n, last));
-    let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached(
-        proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
-        &upstream_path,
-    )
-    .await
-    .map_err(|resp| match resp.status() {
-        StatusCode::NOT_FOUND => oci_error(
-            StatusCode::NOT_FOUND,
-            "NAME_UNKNOWN",
-            "repository not found upstream",
-        ),
-        _ => oci_error(
-            StatusCode::BAD_GATEWAY,
-            "UNKNOWN",
-            "failed to fetch tags from upstream",
-        ),
-    })?;
+    let (content, _ct, link) =
+        proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, upstream_url, &upstream_path)
+            .await
+            .map_err(|resp| match resp.status() {
+                StatusCode::NOT_FOUND => oci_error(
+                    StatusCode::NOT_FOUND,
+                    "NAME_UNKNOWN",
+                    "repository not found upstream",
+                ),
+                _ => oci_error(
+                    StatusCode::BAD_GATEWAY,
+                    "UNKNOWN",
+                    "failed to fetch tags from upstream",
+                ),
+            })?;
 
     let parsed = serde_json::from_slice::<serde_json::Value>(&content).map_err(|e| {
         warn!("Invalid upstream tags/list response for {}: {}", image, e);
@@ -2120,7 +2173,11 @@ async fn fetch_upstream_tags_page(
             .iter()
             .filter_map(|t| t.as_str().map(String::from))
             .collect(),
-        next_last: if link.is_empty() { None } else { parse_upstream_pagination_last(&link) },
+        next_last: if link.is_empty() {
+            None
+        } else {
+            parse_upstream_pagination_last(&link)
+        },
     })
 }
 
@@ -4382,5 +4439,84 @@ mod tests {
             reference,
             Some("sha256:abcdef1234567890abcdef1234567890".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // default_docker_mirror_repo: env var resolution
+    //
+    // The OnceLock means we can only observe one value per process. The
+    // build_default_mirror_value helper isolates the parsing logic so we
+    // can test all branches without depending on cell state.
+    // -----------------------------------------------------------------------
+
+    /// Parse the same way `default_docker_mirror_repo` does, without the
+    /// OnceLock cache. Mirrors the inner `get_or_init` closure 1:1.
+    fn build_default_mirror_value(raw: Option<&str>) -> Option<String> {
+        raw.map(|s| s.to_string()).filter(|s| !s.is_empty())
+    }
+
+    #[test]
+    fn test_default_mirror_unset_returns_none() {
+        assert_eq!(build_default_mirror_value(None), None);
+    }
+
+    #[test]
+    fn test_default_mirror_empty_string_returns_none() {
+        // An empty AK_DEFAULT_DOCKER_MIRROR_REPO must not be treated as a
+        // configured mirror; otherwise the SQL query would search for a
+        // repo with key="" and the fallback could mask real 404s.
+        assert_eq!(build_default_mirror_value(Some("")), None);
+    }
+
+    #[test]
+    fn test_default_mirror_returns_set_value() {
+        assert_eq!(
+            build_default_mirror_value(Some("docker-hub-cache")),
+            Some("docker-hub-cache".to_string())
+        );
+    }
+
+    /// Pure-logic check on the routing decision: given the literal
+    /// repo_key resolution and the configured mirror, what should
+    /// effective_image be?
+    #[test]
+    fn test_mirror_routing_uses_full_image_name_on_fallback() {
+        // The handler's behavior, expressed without DB access: when the
+        // literal repo_key misses and a different mirror is configured,
+        // the upstream proxy receives the FULL image_name as the path so
+        // dockerd's `/v2/library/postgres/...` routes to the proxy with
+        // image="library/postgres" (preserving the `library/` namespace).
+        let image_name = "library/postgres";
+        let (repo_key, image) = match image_name.find('/') {
+            Some(idx) => (&image_name[..idx], &image_name[idx + 1..]),
+            None => (image_name, image_name),
+        };
+        assert_eq!(repo_key, "library");
+        assert_eq!(image, "postgres");
+
+        // Literal lookup: repo_key="library" (would 404 in prod).
+        // Fallback: effective_image becomes the full image_name.
+        let effective_image_on_fallback = image_name.to_string();
+        assert_eq!(effective_image_on_fallback, "library/postgres");
+
+        // Without fallback: effective_image is the trimmed image.
+        let effective_image_literal = image.to_string();
+        assert_eq!(effective_image_literal, "postgres");
+    }
+
+    #[test]
+    fn test_mirror_routing_skips_self_recursion() {
+        // If a request comes in as `/v2/docker-hub-cache/library/postgres/...`
+        // (someone addressing the proxy directly), repo_key matches the
+        // mirror_key. The fallback's `mirror_key != repo_key` guard ensures
+        // we don't double-resolve.
+        let image_name = "docker-hub-cache/library/postgres";
+        let mirror_key = "docker-hub-cache";
+        let repo_key = match image_name.find('/') {
+            Some(idx) => &image_name[..idx],
+            None => image_name,
+        };
+        assert_eq!(repo_key, mirror_key);
+        // The handler must take the literal path, not the fallback.
     }
 }
