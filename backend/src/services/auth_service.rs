@@ -3,7 +3,7 @@
 //! Handles user authentication, JWT token management, and password hashing.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Instant;
 
 use bcrypt::{hash, verify, DEFAULT_COST};
@@ -159,13 +159,37 @@ pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
 /// `API_TOKEN_CACHE_TTL_SECS` window to elapse. Entries are pruned after
 /// twice the cache TTL since beyond that any stale cache entry has expired
 /// on its own and the `WHERE is_active = true` SQL filter takes over.
+///
+/// **Replica scope:** this map is per-process. In multi-replica deployments
+/// (Helm chart `replicas > 1`), a deactivation processed by replica A is not
+/// visible to replicas B..N, so cache hits on those replicas continue
+/// authorising the user for up to `API_TOKEN_CACHE_TTL_SECS` (5 min). A
+/// follow-up in v1.2.0 will move the invalidation signal into the database
+/// (or a Redis pub-sub channel) so it is observed by every replica.
 static API_TOKEN_USER_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, Instant>>> = OnceLock::new();
 
 fn api_token_user_invalidation_map() -> &'static RwLock<HashMap<Uuid, Instant>> {
     API_TOKEN_USER_INVALIDATIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Mark every cached API-token validation belonging to `user_id` as stale.
+/// Type alias for an entry in the per-instance API-token cache map.
+type TokenCacheMap = RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>>;
+
+/// Registry of long-lived `AuthService` token caches that should be flushed
+/// when a user is invalidated. Each entry is a `Weak` reference so dropped
+/// services don't pin memory; dead weaks are pruned during invalidation.
+///
+/// Ad-hoc per-request `AuthService` instances do NOT register here: their
+/// cache is empty, dropped at the end of the request, and thus has nothing
+/// to flush.
+static AUTH_TOKEN_CACHE_REGISTRY: OnceLock<RwLock<Vec<Weak<TokenCacheMap>>>> = OnceLock::new();
+
+fn auth_token_cache_registry() -> &'static RwLock<Vec<Weak<TokenCacheMap>>> {
+    AUTH_TOKEN_CACHE_REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Mark every cached API-token validation belonging to `user_id` as stale and
+/// also flush matching entries from every registered long-lived cache.
 ///
 /// Called when the user is deactivated (`is_active=false`), hard-deleted, or
 /// otherwise loses the right to authenticate. Subsequent cache hits for any
@@ -173,11 +197,56 @@ fn api_token_user_invalidation_map() -> &'static RwLock<HashMap<Uuid, Instant>> 
 /// `API_TOKEN_CACHE_TTL_SECS` window during which the cache would otherwise
 /// continue accepting them. Old entries beyond `2 * API_TOKEN_CACHE_TTL_SECS`
 /// are pruned on each call to keep memory bounded.
+///
+/// **Call ordering (LOW-5 TOCTOU mitigation):** invoke this BEFORE the SQL
+/// `UPDATE users SET is_active=false` (or `DELETE`). Pre-marking is
+/// fail-secure: if the SQL fails the worst case is a small false-positive
+/// on cache rejection (forcing one extra DB re-validation), while the
+/// timestamp guarantees that any cache entry already in flight is rejected
+/// by the time the SQL commits.
+///
+/// **Replica scope:** this function is per-process. See the docstring on
+/// [`API_TOKEN_USER_INVALIDATIONS`] for the multi-replica caveat.
 pub fn invalidate_user_token_cache_entries(user_id: Uuid) {
+    // 1) Record the invalidation timestamp BEFORE any SQL has committed.
     if let Ok(mut map) = api_token_user_invalidation_map().write() {
         map.insert(user_id, Instant::now());
+        // Note: the heavy retain-prune still runs here on insert as a safety
+        // net, but the periodic scheduler task in scheduler_service.rs is
+        // the primary pruner and runs even when deactivations are infrequent.
         let cutoff_secs = API_TOKEN_CACHE_TTL_SECS * 2;
         map.retain(|_, recorded_at| recorded_at.elapsed().as_secs() < cutoff_secs);
+    }
+
+    // 2) Walk the registry of long-lived AuthService caches and drop matching
+    // entries from each. We also prune dead Weaks while we're here.
+    if let Ok(mut registry) = auth_token_cache_registry().write() {
+        registry.retain(|weak| {
+            if let Some(cache_arc) = weak.upgrade() {
+                if let Ok(mut cache) = cache_arc.write() {
+                    cache.retain(|_, (entry, _)| entry.validation.user.id != user_id);
+                }
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// Periodic prune of `API_TOKEN_USER_INVALIDATIONS` entries older than
+/// `2 * API_TOKEN_CACHE_TTL_SECS`. Called by the background scheduler so
+/// memory stays bounded even when deactivations are infrequent (the
+/// retain-on-insert path inside `invalidate_user_token_cache_entries` only
+/// fires on writes).
+pub fn prune_stale_user_token_invalidations() -> usize {
+    if let Ok(mut map) = api_token_user_invalidation_map().write() {
+        let before = map.len();
+        let cutoff_secs = API_TOKEN_CACHE_TTL_SECS * 2;
+        map.retain(|_, recorded_at| recorded_at.elapsed().as_secs() < cutoff_secs);
+        before - map.len()
+    } else {
+        0
     }
 }
 
@@ -201,7 +270,12 @@ pub struct AuthService {
     /// In-memory cache of recently validated API tokens.  Avoids repeating the
     /// expensive bcrypt verification on every request (cargo sends credentials
     /// on every index and download request).
-    token_cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>>,
+    ///
+    /// Wrapped in `Arc` so long-lived instances can be registered with the
+    /// global cache registry (see [`AuthService::register_for_global_flush`])
+    /// and have entries flushed by [`invalidate_user_token_cache_entries`]
+    /// without holding a strong reference to the whole `AuthService`.
+    token_cache: Arc<TokenCacheMap>,
 }
 
 impl AuthService {
@@ -213,7 +287,22 @@ impl AuthService {
             config,
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
-            token_cache: RwLock::new(HashMap::new()),
+            token_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register this `AuthService`'s token cache with the global registry so
+    /// that [`invalidate_user_token_cache_entries`] can flush matching entries
+    /// from it directly. Call this on every long-lived `AuthService` instance
+    /// (typically the ones created in `routes.rs` for the auth middleware and
+    /// the repo-visibility middleware). Ad-hoc per-request instances should
+    /// NOT register: they are dropped at the end of the request, the global
+    /// invalidation timestamp is sufficient to reject any cache hit they might
+    /// produce, and registering them would only churn the registry's `Weak`
+    /// vector.
+    pub fn register_for_global_flush(&self) {
+        if let Ok(mut registry) = auth_token_cache_registry().write() {
+            registry.push(Arc::downgrade(&self.token_cache));
         }
     }
 
@@ -1077,7 +1166,15 @@ impl AuthService {
         // 1. Are from the specified provider
         // 2. Have an external_id that is NOT in the active list
         // 3. Are currently active
-        let result = sqlx::query!(
+        //
+        // Federated SSO sync is the offboarding reaper: when an upstream
+        // account is removed (LDAP/SAML/OIDC), this method flips
+        // `is_active=false` locally. We MUST invalidate the API-token cache
+        // for each deactivated user, otherwise a compromised credential
+        // would still authenticate against the cache for up to
+        // `API_TOKEN_CACHE_TTL_SECS` (5 min) after the upstream removal.
+        // Issue #931.
+        let deactivated_ids: Vec<Uuid> = sqlx::query_scalar!(
             r#"
             UPDATE users
             SET is_active = false, updated_at = NOW()
@@ -1085,15 +1182,21 @@ impl AuthService {
               AND is_active = true
               AND external_id IS NOT NULL
               AND external_id != ALL($2)
+            RETURNING id
             "#,
             provider as AuthProvider,
             active_external_ids
         )
-        .execute(&self.db)
+        .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(result.rows_affected())
+        for user_id in &deactivated_ids {
+            invalidate_user_token_cache_entries(*user_id);
+            invalidate_user_tokens(*user_id);
+        }
+
+        Ok(deactivated_ids.len() as u64)
     }
 
     /// Reactivate a previously deactivated federated user.
@@ -2244,6 +2347,153 @@ mod tests {
         let r = cache.read().unwrap();
         assert!(r.get("key-a").is_none(), "user_a entry should be flushed");
         assert!(r.get("key-b").is_some(), "user_b entry must remain");
+    }
+
+    #[test]
+    fn test_reactivation_then_redeactivation_invalidates_again() {
+        // Regression test for LOW-1: false -> true -> false sequence must
+        // re-mark the invalidation timestamp on the second deactivation, so
+        // any cache entry inserted during the brief active window is
+        // rejected by the cache-hit check.
+        let user_id = Uuid::new_v4();
+
+        // First deactivation.
+        invalidate_user_token_cache_entries(user_id);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Re-activation: NO invalidation by the handler. A fresh cache entry
+        // would be admitted by the cache-hit check (cached_at > invalidated_at).
+        let cached_during_active_window = Instant::now();
+        assert!(
+            !is_user_api_tokens_invalidated_after(user_id, cached_during_active_window),
+            "fresh entry cached after first deactivation must pass while user is reactivated"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Second deactivation must overwrite the timestamp so the entry
+        // cached during the active window is now rejected.
+        invalidate_user_token_cache_entries(user_id);
+        assert!(
+            is_user_api_tokens_invalidated_after(user_id, cached_during_active_window),
+            "entry cached before second deactivation must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_register_for_global_flush_drops_matching_cache_entries() {
+        // LOW-6: invalidate_user_token_cache_entries must also flush matching
+        // entries from any registered long-lived AuthService cache, not just
+        // mark them stale via the global timestamp map.
+        //
+        // We construct a standalone Arc<TokenCacheMap> and register a Weak
+        // pointer to it directly with the global registry. This exercises
+        // the same code path that AuthService::register_for_global_flush
+        // uses, without needing a Tokio context for sqlx pool construction.
+
+        fn make_entry(id: Uuid) -> CachedApiTokenEntry {
+            CachedApiTokenEntry {
+                validation: ApiTokenValidation {
+                    user: User {
+                        id,
+                        username: format!("u-{}", id),
+                        email: "x@test.local".to_string(),
+                        password_hash: None,
+                        display_name: None,
+                        auth_provider: AuthProvider::Local,
+                        external_id: None,
+                        is_admin: false,
+                        is_active: true,
+                        is_service_account: false,
+                        must_change_password: false,
+                        totp_secret: None,
+                        totp_enabled: false,
+                        totp_backup_codes: None,
+                        totp_verified_at: None,
+                        last_login_at: None,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    },
+                    scopes: vec![],
+                    allowed_repo_ids: None,
+                },
+                token_id: Uuid::new_v4(),
+                expires_at: None,
+            }
+        }
+
+        let user_a = Uuid::new_v4();
+        let user_b = Uuid::new_v4();
+
+        let cache: Arc<TokenCacheMap> = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut w = cache.write().unwrap();
+            w.insert(
+                format!("key-a-{}", user_a),
+                (make_entry(user_a), Instant::now()),
+            );
+            w.insert(
+                format!("key-b-{}", user_b),
+                (make_entry(user_b), Instant::now()),
+            );
+        }
+
+        // Register the cache with the global registry, mirroring what
+        // AuthService::register_for_global_flush does internally.
+        if let Ok(mut registry) = auth_token_cache_registry().write() {
+            registry.push(Arc::downgrade(&cache));
+        }
+
+        // Invalidating user_a should flush key-a from the registered cache
+        // and leave key-b untouched.
+        invalidate_user_token_cache_entries(user_a);
+        let r = cache.read().unwrap();
+        assert!(
+            r.get(&format!("key-a-{}", user_a)).is_none(),
+            "registered cache must drop matching entry"
+        );
+        assert!(
+            r.get(&format!("key-b-{}", user_b)).is_some(),
+            "unrelated entry must survive"
+        );
+    }
+
+    #[test]
+    fn test_dropped_cache_weak_is_pruned_from_registry() {
+        // The registry holds Weak<TokenCacheMap>. When the underlying Arc
+        // is dropped, the next call to invalidate_user_token_cache_entries
+        // should prune the dead Weak so the registry doesn't grow unbounded.
+        let registry_size_before = auth_token_cache_registry().read().unwrap().len();
+
+        // Register a cache, then drop its Arc.
+        {
+            let cache: Arc<TokenCacheMap> = Arc::new(RwLock::new(HashMap::new()));
+            if let Ok(mut registry) = auth_token_cache_registry().write() {
+                registry.push(Arc::downgrade(&cache));
+            }
+            // cache goes out of scope here.
+        }
+
+        // Trigger the prune path.
+        invalidate_user_token_cache_entries(Uuid::new_v4());
+
+        let registry_size_after = auth_token_cache_registry().read().unwrap().len();
+        assert!(
+            registry_size_after <= registry_size_before,
+            "registry should not grow after dropped Arc and one invalidation: \
+             before={}, after={}",
+            registry_size_before,
+            registry_size_after
+        );
+    }
+
+    #[test]
+    fn test_prune_stale_user_token_invalidations_handles_empty_map() {
+        // The periodic prune helper should always succeed with no entries.
+        let dropped = prune_stale_user_token_invalidations();
+        // We can't predict the global state across tests, but the helper
+        // must not panic and must return a number.
+        let _ = dropped;
     }
 
     #[test]

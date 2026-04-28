@@ -75,6 +75,30 @@ pub fn spawn_all(
         });
     }
 
+    // API-token cache invalidation map prune (every hour).
+    //
+    // The invalidation map records when each user's API-token cache entries
+    // were marked stale. Entries older than 2 * API_TOKEN_CACHE_TTL_SECS
+    // (10 min) are no longer needed because any cache entry they would
+    // reject has itself expired. Pruning during invalidate_user_token_cache_entries
+    // covers the high-churn case; this periodic task keeps memory bounded
+    // when deactivations are infrequent. Issue #931.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
+
+        loop {
+            ticker.tick().await;
+            let dropped = crate::services::auth_service::prune_stale_user_token_invalidations();
+            if dropped > 0 {
+                tracing::debug!(
+                    "Pruned {} stale API-token cache invalidation entries",
+                    dropped
+                );
+            }
+        }
+    });
+
     // Health monitoring (every 60 seconds)
     {
         let db = db.clone();

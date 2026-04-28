@@ -381,6 +381,26 @@ pub async fn update_user(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateUserRequest>,
 ) -> Result<Json<AdminUserResponse>> {
+    // When an admin deactivates a user, immediately invalidate every cached
+    // API-token and JWT for that user. Without this, a compromised account
+    // would keep authenticating against any AuthService instance whose
+    // in-memory cache had a fresh hit, for up to API_TOKEN_CACHE_TTL_SECS
+    // (5 min) after the flip. Issue #931.
+    //
+    // Pre-mark the invalidation BEFORE the SQL UPDATE so a concurrent
+    // request that hits the cache during the UPDATE is rejected. Pre-marking
+    // is fail-secure: if the SQL fails we just force one extra DB
+    // re-validation, but never serve a stale cache entry.
+    //
+    // We invalidate whenever the request body asks for `is_active=false`,
+    // even on idempotent re-application: an extra eviction is harmless.
+    // We deliberately do NOT invalidate on `is_active=true` re-activation,
+    // since fresh validations will be cached against the now-active row.
+    if matches!(payload.is_active, Some(false)) {
+        invalidate_user_token_cache_entries(id);
+        invalidate_user_tokens(id);
+    }
+
     let user = sqlx::query_as!(
         User,
         r#"
@@ -409,21 +429,6 @@ pub async fn update_user(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
-
-    // When an admin deactivates a user, immediately invalidate every cached
-    // API-token and JWT for that user. Without this, a compromised account
-    // would keep authenticating against any AuthService instance whose
-    // in-memory cache had a fresh hit, for up to API_TOKEN_CACHE_TTL_SECS
-    // (5 min) after the flip. Issue #931.
-    //
-    // We invalidate whenever the request body asks for `is_active=false`,
-    // even on idempotent re-application: an extra eviction is harmless.
-    // We deliberately do NOT invalidate on `is_active=true` re-activation,
-    // since fresh validations will be cached against the now-active row.
-    if matches!(payload.is_active, Some(false)) {
-        invalidate_user_token_cache_entries(user.id);
-        invalidate_user_tokens(user.id);
-    }
 
     state
         .event_bus
@@ -458,6 +463,15 @@ pub async fn delete_user(
         return Err(AppError::Validation("Cannot delete yourself".to_string()));
     }
 
+    // Pre-mark the invalidation BEFORE the SQL DELETE. Hard-deleting a user
+    // must evict any cached API-token and JWT validations for that user;
+    // otherwise the cache would keep authenticating the deleted user for up
+    // to API_TOKEN_CACHE_TTL_SECS (5 min). Pre-marking is fail-secure: if
+    // the DELETE returns 404 we've spent one extra DB re-validation on a
+    // user that doesn't exist, never serving a stale cache entry. Issue #931.
+    invalidate_user_token_cache_entries(id);
+    invalidate_user_tokens(id);
+
     let result = sqlx::query!("DELETE FROM users WHERE id = $1", id)
         .execute(&state.db)
         .await
@@ -466,13 +480,6 @@ pub async fn delete_user(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("User not found".to_string()));
     }
-
-    // Hard-deleting a user must also evict any cached API-token and JWT
-    // validations for that user, otherwise the cache would keep
-    // authenticating the deleted user for up to API_TOKEN_CACHE_TTL_SECS
-    // (5 min). Issue #931.
-    invalidate_user_token_cache_entries(id);
-    invalidate_user_tokens(id);
 
     state
         .event_bus
