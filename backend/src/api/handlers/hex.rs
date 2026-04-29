@@ -167,9 +167,24 @@ async fn package_info(
     }
 
     if repo.repo_type == RepositoryType::Virtual {
-        // Check all member DBs first (covers local and cached remote packages).
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-        for member in &members {
+        // Non-Remote members are authoritative for their package names; check
+        // them first regardless of priority configuration.
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote)
+        {
+            if let Some(response) =
+                fetch_package_info_from_repo(&state.db, member.id, &repo_key, &name).await?
+            {
+                return Ok(response);
+            }
+        }
+        // No non-Remote member has this package; fall back to Remote caches.
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+        {
             if let Some(response) =
                 fetch_package_info_from_repo(&state.db, member.id, &repo_key, &name).await?
             {
@@ -269,9 +284,38 @@ async fn download_tarball(
                 let db = state.db.clone();
                 let upstream_path = format!("tarballs/{}", filename);
                 let filename_clone = filename.to_string();
+
+                // Disable the remote upstream proxy if any non-Remote member
+                // owns this package name, preventing name-shadowing attacks.
+                let pkg_name = package_name_from_tarball_filename(filename);
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let local_owns_name = if let Some(ref n) = pkg_name {
+                    let mut found = false;
+                    for m in members
+                        .iter()
+                        .filter(|m| m.repo_type != RepositoryType::Remote)
+                    {
+                        if fetch_package_info_from_repo(&state.db, m.id, &repo_key, n)
+                            .await?
+                            .is_some()
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                } else {
+                    false
+                };
+                let effective_proxy = if local_owns_name {
+                    None
+                } else {
+                    state.proxy_service.as_deref()
+                };
+
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
-                    state.proxy_service.as_deref(),
+                    effective_proxy,
                     repo.id,
                     &upstream_path,
                     |member_id, location| {
@@ -709,6 +753,23 @@ async fn list_versions(
 // ---------------------------------------------------------------------------
 // Virtual repo merging helpers
 // ---------------------------------------------------------------------------
+
+/// Extract the package name from a hex tarball filename (`{name}-{version}.tar`).
+/// Returns `None` if the filename doesn't match the expected pattern.
+/// Hex versions always start with an ASCII digit, so the split point is the
+/// first `-` whose following character is a digit.
+fn package_name_from_tarball_filename(filename: &str) -> Option<String> {
+    let without_ext = filename.strip_suffix(".tar")?;
+    for (i, _) in without_ext.match_indices('-') {
+        if without_ext
+            .get(i + 1..)
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            return Some(without_ext[..i].to_string());
+        }
+    }
+    None
+}
 
 /// Query distinct package names from all virtual member repos (including remote caches).
 async fn query_local_member_names(
@@ -1447,6 +1508,58 @@ mod tests {
         let version = "2.10.0";
         let url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
         assert_eq!(url, "/hex/hex-virtual/tarballs/cowboy-2.10.0.tar");
+    }
+
+    // -----------------------------------------------------------------------
+    // package_name_from_tarball_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_package_name_from_tarball_simple() {
+        assert_eq!(
+            package_name_from_tarball_filename("cowboy-2.10.0.tar"),
+            Some("cowboy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_hyphenated_name() {
+        assert_eq!(
+            package_name_from_tarball_filename("plug-cowboy-2.7.0.tar"),
+            Some("plug-cowboy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_underscore_name() {
+        assert_eq!(
+            package_name_from_tarball_filename("ex_doc-0.30.0.tar"),
+            Some("ex_doc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_prerelease_version() {
+        // Version has pre-release suffix; name split is still at first -digit.
+        assert_eq!(
+            package_name_from_tarball_filename("cowboy-2.0.0-rc.1.tar"),
+            Some("cowboy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_no_extension() {
+        assert_eq!(package_name_from_tarball_filename("cowboy-2.10.0"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_no_version_separator() {
+        assert_eq!(package_name_from_tarball_filename("cowboy.tar"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_empty() {
+        assert_eq!(package_name_from_tarball_filename(""), None);
     }
 
     // -----------------------------------------------------------------------
