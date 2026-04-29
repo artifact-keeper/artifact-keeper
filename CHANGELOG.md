@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Auth: download-ticket consumer middleware** (#930) -- the `?ticket=<v>` query parameter minted by `POST /api/v1/auth/ticket` is now accepted as a fallback authenticator on read routes (`auth_middleware`, `optional_auth_middleware`, and `repo_visibility_middleware`). Tickets are single-use, expire after 30 seconds, are restricted to GET/HEAD methods, and only authenticate the request whose URL path matches the ticket's bound `resource_path`. Useful for browser anchor-tag downloads and `EventSource` SSE streams where `Authorization` headers cannot be set.
+
 ### Fixed
 
 - **`POST /v2/token` now accepts OAuth2 password-grant credentials in the form body** (#894). Docker's distribution token endpoint flow uses `Content-Type: application/x-www-form-urlencoded` with `grant_type=password&username=...&password=...&service=...&scope=...` in the request body, but the handler previously read credentials only from the HTTP Basic Auth header and returned the anonymous token when the body carried the credentials. Result: `docker push` to a private repository failed with `unauthorized` because the OCI client received an anonymous token despite valid credentials. The handler now extracts username and password from the form body when no Basic Auth header is present, accepts `application/x-www-form-urlencoded` (with optional charset suffix), validates `grant_type=password` when supplied, and falls through to the existing Bearer / anonymous flow on any malformed input. No protocol regression: existing Basic Auth and Bearer-refresh paths are unchanged.
