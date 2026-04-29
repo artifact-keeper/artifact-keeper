@@ -100,13 +100,12 @@ async fn fetch_package_info_from_repo(
     let releases: Vec<serde_json::Value> = artifacts
         .iter()
         .map(|a| {
-            let version = a.version.clone().unwrap_or_default();
-            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
-            serde_json::json!({
-                "version": version,
-                "url": tarball_url,
-                "checksum": a.checksum_sha256,
-            })
+            release_entry_json(
+                repo_key,
+                name,
+                &a.version.clone().unwrap_or_default(),
+                &a.checksum_sha256,
+            )
         })
         .collect();
 
@@ -120,17 +119,12 @@ async fn fetch_package_info_from_repo(
     .unwrap_or(Some(0))
     .unwrap_or(0);
 
-    let json = serde_json::json!({
-        "name": name,
-        "releases": releases,
-        "downloads": download_count,
-    });
-
+    let body = package_info_body(name, &releases, download_count);
     Ok(Some(
         Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&json).unwrap()))
+            .body(Body::from(body))
             .unwrap(),
     ))
 }
@@ -753,6 +747,31 @@ async fn list_versions(
 // ---------------------------------------------------------------------------
 // Virtual repo merging helpers
 // ---------------------------------------------------------------------------
+
+/// Build a single release entry for the `/packages/{name}` JSON response.
+fn release_entry_json(
+    repo_key: &str,
+    name: &str,
+    version: &str,
+    checksum: &str,
+) -> serde_json::Value {
+    let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
+    serde_json::json!({
+        "version": version,
+        "url": tarball_url,
+        "checksum": checksum,
+    })
+}
+
+/// Serialize the `/packages/{name}` response body to a JSON string.
+fn package_info_body(name: &str, releases: &[serde_json::Value], download_count: i64) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "name": name,
+        "releases": releases,
+        "downloads": download_count,
+    }))
+    .unwrap()
+}
 
 /// Extract the package name from a hex tarball filename (`{name}-{version}.tar`).
 /// Returns `None` if the filename doesn't match the expected pattern.
@@ -1560,6 +1579,192 @@ mod tests {
     #[test]
     fn test_package_name_from_tarball_empty() {
         assert_eq!(package_name_from_tarball_filename(""), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_zero_version() {
+        assert_eq!(
+            package_name_from_tarball_filename("pkg-0.1.0.tar"),
+            Some("pkg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_multi_hyphen_name() {
+        assert_eq!(
+            package_name_from_tarball_filename("a-b-c-1.0.0.tar"),
+            Some("a-b-c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_name_with_digits() {
+        assert_eq!(
+            package_name_from_tarball_filename("pkg123-1.0.0.tar"),
+            Some("pkg123".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // release_entry_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_release_entry_url_format() {
+        let entry = release_entry_json("myrepo", "cowboy", "2.10.0", "");
+        assert_eq!(entry["url"], "/hex/myrepo/tarballs/cowboy-2.10.0.tar");
+    }
+
+    #[test]
+    fn test_release_entry_url_uses_repo_key() {
+        let a = release_entry_json("repo-a", "pkg", "1.0.0", "");
+        let b = release_entry_json("repo-b", "pkg", "1.0.0", "");
+        assert!(a["url"].as_str().unwrap().contains("repo-a"));
+        assert!(b["url"].as_str().unwrap().contains("repo-b"));
+    }
+
+    #[test]
+    fn test_release_entry_version_field() {
+        let entry = release_entry_json("r", "pkg", "3.2.1", "");
+        assert_eq!(entry["version"], "3.2.1");
+    }
+
+    #[test]
+    fn test_release_entry_checksum_field() {
+        let entry = release_entry_json("r", "pkg", "1.0.0", "abc123");
+        assert_eq!(entry["checksum"], "abc123");
+    }
+
+    #[test]
+    fn test_release_entry_empty_checksum() {
+        let entry = release_entry_json("r", "pkg", "1.0.0", "");
+        assert_eq!(entry["checksum"], "");
+    }
+
+    #[test]
+    fn test_release_entry_has_version_url_checksum() {
+        let entry = release_entry_json("r", "pkg", "1.0.0", "");
+        assert!(entry.get("version").is_some());
+        assert!(entry.get("url").is_some());
+        assert!(entry.get("checksum").is_some());
+    }
+
+    #[test]
+    fn test_release_entry_url_contains_name_and_version() {
+        let entry = release_entry_json("repo", "phoenix", "1.7.0", "");
+        let url = entry["url"].as_str().unwrap();
+        assert!(url.contains("phoenix"));
+        assert!(url.contains("1.7.0"));
+    }
+
+    #[test]
+    fn test_release_entry_hyphenated_name() {
+        let entry = release_entry_json("repo", "plug-cowboy", "2.7.0", "");
+        assert_eq!(entry["url"], "/hex/repo/tarballs/plug-cowboy-2.7.0.tar");
+    }
+
+    #[test]
+    fn test_release_entry_url_has_tarballs_segment() {
+        let entry = release_entry_json("repo", "pkg", "1.0.0", "");
+        assert!(entry["url"].as_str().unwrap().contains("/tarballs/"));
+    }
+
+    #[test]
+    fn test_release_entry_url_ends_with_tar() {
+        let entry = release_entry_json("repo", "pkg", "1.0.0", "");
+        assert!(entry["url"].as_str().unwrap().ends_with(".tar"));
+    }
+
+    #[test]
+    fn test_release_entry_sha256_checksum() {
+        let checksum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let entry = release_entry_json("repo", "pkg", "1.0.0", checksum);
+        assert_eq!(entry["checksum"].as_str().unwrap(), checksum);
+    }
+
+    // -----------------------------------------------------------------------
+    // package_info_body
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_package_info_body_is_valid_json() {
+        let body = package_info_body("cowboy", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.is_object());
+    }
+
+    #[test]
+    fn test_package_info_body_name_field() {
+        let body = package_info_body("phoenix", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["name"], "phoenix");
+    }
+
+    #[test]
+    fn test_package_info_body_downloads_field() {
+        let body = package_info_body("pkg", &[], 42);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["downloads"], 42);
+    }
+
+    #[test]
+    fn test_package_info_body_zero_downloads() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["downloads"], 0);
+    }
+
+    #[test]
+    fn test_package_info_body_empty_releases() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["releases"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_package_info_body_with_releases() {
+        let releases = vec![
+            serde_json::json!({"version": "1.0.0", "url": "/hex/r/tarballs/pkg-1.0.0.tar", "checksum": null}),
+            serde_json::json!({"version": "2.0.0", "url": "/hex/r/tarballs/pkg-2.0.0.tar", "checksum": null}),
+        ];
+        let body = package_info_body("pkg", &releases, 5);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["releases"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_package_info_body_has_name_releases_downloads() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.get("name").is_some());
+        assert!(parsed.get("releases").is_some());
+        assert!(parsed.get("downloads").is_some());
+    }
+
+    #[test]
+    fn test_package_info_body_large_download_count() {
+        let body = package_info_body("pkg", &[], 1_000_000);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["downloads"], 1_000_000);
+    }
+
+    #[test]
+    fn test_package_info_body_releases_content_preserved() {
+        let releases = vec![release_entry_json("repo", "pkg", "1.0.0", "abc")];
+        let body = package_info_body("pkg", &releases, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let first = &parsed["releases"][0];
+        assert_eq!(first["version"], "1.0.0");
+        assert_eq!(first["checksum"], "abc");
+    }
+
+    #[test]
+    fn test_package_info_body_name_matches_input() {
+        for name in &["phoenix", "ecto", "plug_cowboy", "ex-doc"] {
+            let body = package_info_body(name, &[], 0);
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["name"].as_str().unwrap(), *name);
+        }
     }
 
     // -----------------------------------------------------------------------
