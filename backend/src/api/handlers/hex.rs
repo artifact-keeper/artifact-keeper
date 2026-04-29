@@ -58,12 +58,17 @@ async fn resolve_hex_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 // GET /hex/{repo_key}/packages/{name} -- Package info (JSON with releases)
 // ---------------------------------------------------------------------------
 
-async fn package_info(
-    State(state): State<SharedState>,
-    Path((repo_key, name)): Path<(String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_hex_repo(&state.db, &repo_key).await?;
-
+/// Query a repository's DB for a package and return a JSON response, or
+/// `None` if the package is not present. The tarball URLs in the response
+/// use `repo_key` so that downloads always route through the same repo
+/// endpoint (important for virtual repos: tarballs go through the virtual
+/// repo, which in turn routes to the correct member).
+async fn fetch_package_info_from_repo(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    name: &str,
+) -> Result<Option<Response>, Response> {
     let artifacts = sqlx::query!(
         r#"
         SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -75,10 +80,10 @@ async fn package_info(
           AND LOWER(a.name) = LOWER($2)
         ORDER BY a.created_at DESC
         "#,
-        repo.id,
+        repo_id,
         name
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .map_err(|e| {
         (
@@ -89,51 +94,7 @@ async fn package_info(
     })?;
 
     if artifacts.is_empty() {
-        // Remote: fetch package metadata from the upstream hex registry.
-        if repo.repo_type == RepositoryType::Remote {
-            if let (Some(ref upstream_url), Some(ref proxy)) =
-                (&repo.upstream_url, &state.proxy_service)
-            {
-                let upstream_path = format!("packages/{}", name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &upstream_path,
-                )
-                .await?;
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/json".to_string()),
-                    )
-                    .body(Body::from(content))
-                    .unwrap());
-            }
-        }
-
-        // Virtual: iterate members in priority order, proxy from first remote that has it.
-        if repo.repo_type == RepositoryType::Virtual {
-            let upstream_path = format!("packages/{}", name);
-            return proxy_helpers::resolve_virtual_metadata(
-                &state.db,
-                state.proxy_service.as_deref(),
-                repo.id,
-                &upstream_path,
-                |content, _member_key| async move {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(content))
-                        .unwrap())
-                },
-            )
-            .await;
-        }
-
-        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        return Ok(None);
     }
 
     let releases: Vec<serde_json::Value> = artifacts
@@ -141,7 +102,6 @@ async fn package_info(
         .map(|a| {
             let version = a.version.clone().unwrap_or_default();
             let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
-
             serde_json::json!({
                 "version": version,
                 "url": tarball_url,
@@ -150,13 +110,12 @@ async fn package_info(
         })
         .collect();
 
-    // Get download count across all versions
     let artifact_ids: Vec<uuid::Uuid> = artifacts.iter().map(|a| a.id).collect();
     let download_count: i64 = sqlx::query_scalar!(
         "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = ANY($1)",
         &artifact_ids
     )
-    .fetch_one(&state.db)
+    .fetch_one(db)
     .await
     .unwrap_or(Some(0))
     .unwrap_or(0);
@@ -167,11 +126,79 @@ async fn package_info(
         "downloads": download_count,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&json).unwrap()))
+            .unwrap(),
+    ))
+}
+
+async fn package_info(
+    State(state): State<SharedState>,
+    Path((repo_key, name)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_hex_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(response) =
+            fetch_package_info_from_repo(&state.db, repo.id, &repo_key, &name).await?
+        {
+            return Ok(response);
+        }
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let upstream_path = format!("packages/{}", name);
+            let (content, content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path)
+                    .await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/json".to_string()),
+                )
+                .body(Body::from(content))
+                .unwrap());
+        }
+        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        // Check all member DBs first (covers local and cached remote packages).
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if let Some(response) =
+                fetch_package_info_from_repo(&state.db, member.id, &repo_key, &name).await?
+            {
+                return Ok(response);
+            }
+        }
+        // Not in any member DB: try upstream proxy for uncached remote members.
+        let upstream_path = format!("packages/{}", name);
+        return proxy_helpers::resolve_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &upstream_path,
+            |content, _member_key| async move {
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(content))
+                    .unwrap())
+            },
+        )
+        .await;
+    }
+
+    // Local/Hosted
+    match fetch_package_info_from_repo(&state.db, repo.id, &repo_key, &name).await? {
+        Some(response) => Ok(response),
+        None => Err((StatusCode::NOT_FOUND, "Package not found").into_response()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,16 +710,13 @@ async fn list_versions(
 // Virtual repo merging helpers
 // ---------------------------------------------------------------------------
 
-/// Query distinct package names from all local (non-remote) virtual members.
+/// Query distinct package names from all virtual member repos (including remote caches).
 async fn query_local_member_names(
     db: &PgPool,
     members: &[Repository],
 ) -> Result<Vec<String>, Response> {
     let mut all_names = Vec::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let names = sqlx::query_scalar!(
             r#"
         SELECT DISTINCT name
@@ -717,7 +741,7 @@ async fn query_local_member_names(
     Ok(all_names)
 }
 
-/// Query name/version pairs from all local (non-remote) virtual members,
+/// Query name/version pairs from all virtual member repos (including remote caches),
 /// grouped by package name.
 async fn query_local_member_versions(
     db: &PgPool,
@@ -726,9 +750,6 @@ async fn query_local_member_versions(
     let mut packages: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let artifacts = sqlx::query!(
             r#"
         SELECT name, version
@@ -1404,7 +1425,7 @@ mod tests {
 
     #[test]
     fn test_virtual_repo_eligible_for_member_iteration() {
-        // Virtual repos resolve through their members, not their own upstream_url.
+        // Virtual repos check member DBs first, then fall to upstream proxy.
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
             key: String::new(),
@@ -1414,6 +1435,18 @@ mod tests {
             upstream_url: None,
         };
         assert_eq!(repo.repo_type, "virtual");
+    }
+
+    #[test]
+    fn test_package_info_tarball_url_uses_repo_key() {
+        // For virtual repos the tarball URL must use the virtual repo key
+        // (not the member key) so downloads are routed back through the
+        // virtual endpoint and then dispatched to the correct member.
+        let repo_key = "hex-virtual";
+        let name = "cowboy";
+        let version = "2.10.0";
+        let url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
+        assert_eq!(url, "/hex/hex-virtual/tarballs/cowboy-2.10.0.tar");
     }
 
     // -----------------------------------------------------------------------
