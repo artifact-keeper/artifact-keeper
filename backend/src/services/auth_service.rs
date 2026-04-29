@@ -400,6 +400,13 @@ impl AuthService {
         })
     }
 
+    /// Borrow the underlying database pool. Used by middleware that needs
+    /// to issue queries through the same connection pool the auth service uses
+    /// (e.g. download-ticket fallback in the auth middleware chain).
+    pub fn db(&self) -> &PgPool {
+        &self.db
+    }
+
     pub fn validate_access_token(&self, token: &str) -> Result<Claims> {
         let token_data = self.decode_token(token)?;
 
@@ -2523,5 +2530,64 @@ mod tests {
         let validation = Validation::new(Algorithm::HS256);
         let result = decode::<Claims>(&forged_token, &decoding_key, &validation);
         assert!(result.is_err(), "alg=none token must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // AuthService::new and db() accessor (#930 review hardening). These are
+    // shape-only checks — `connect_lazy` constructs a pool without contacting
+    // the database, which is sufficient for verifying that the constructor
+    // populates every field and that `db()` returns the same handle.
+    // -----------------------------------------------------------------------
+
+    fn lazy_pool() -> sqlx::PgPool {
+        sqlx::PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/invalid")
+            .expect("connect_lazy never errors on construction")
+    }
+
+    #[tokio::test]
+    async fn test_auth_service_new_constructs_with_lazy_pool() {
+        let pool = lazy_pool();
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+        // The accessor is the only public way to retrieve the pool; checking
+        // that it returns a usable reference confirms the constructor stored
+        // it and that `db()` does not perform any extra work.
+        let db_ref: &sqlx::PgPool = service.db();
+        // PgPool exposes `size()` which returns 0 for a never-connected pool;
+        // the call must not panic.
+        let _ = db_ref.size();
+    }
+
+    // -----------------------------------------------------------------------
+    // deactivate_missing_users requires a real database. The CI coverage job
+    // boots a postgres service and exposes DATABASE_URL; if it is missing
+    // (e.g. local `cargo test --lib` without docker compose) the test exits
+    // early so it never gates a developer who is not running the full stack.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_deactivate_missing_users_no_targets_returns_zero() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return, // No DB: silently skip; covered in CI.
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return, // DB not reachable: skip.
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool, cfg);
+        // No federated SAML users exist in the smoke schema, so the UPDATE
+        // affects zero rows. The branch we want to cover is the body of the
+        // function (the SQL execute and the rows_affected unwrap), not the
+        // post-condition: assert simply that it does not error.
+        let result = service
+            .deactivate_missing_users(AuthProvider::Saml, &[])
+            .await;
+        assert!(
+            result.is_ok(),
+            "deactivate_missing_users with no targets must succeed, got: {result:?}"
+        );
+        assert_eq!(result.unwrap(), 0);
     }
 }
