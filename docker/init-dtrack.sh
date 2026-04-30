@@ -10,7 +10,7 @@ DT_URL="${DEPENDENCY_TRACK_URL:-http://dependency-track-apiserver:8080}"
 DT_ADMIN_USER="admin"
 DT_DEFAULT_PASS="admin"
 DT_NEW_PASS="${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}"
-API_KEY_FILE="/shared/dtrack-api-key"
+API_KEY_FILE="${DTRACK_API_KEY_FILE:-/shared/dtrack-api-key}"
 BOOTSTRAP_MARKER="/shared/.dtrack-bootstrapped"
 
 echo "[dtrack-init] Waiting for Dependency-Track at $DT_URL ..."
