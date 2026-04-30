@@ -227,9 +227,10 @@ pub async fn login(
 )]
 pub async fn logout(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     auth: Option<Extension<AuthExtension>>,
 ) -> Result<Response> {
-    if let Some(Extension(auth)) = auth {
+    if let Some(Extension(ref auth)) = auth {
         audit_auth(
             &state,
             AuditAction::Logout,
@@ -237,6 +238,21 @@ pub async fn logout(
             serde_json::json!({}),
         )
         .await;
+    }
+
+    // Blocklist the outstanding refresh token, if one was presented via
+    // cookie, so that a network attacker who captured it earlier cannot
+    // redeem it after the user has logged out. We deliberately ignore
+    // decode failures (an absent or malformed cookie just means we have
+    // nothing to revoke) so the logout flow stays best-effort.
+    if let Some(refresh_token_str) = extract_cookie(&headers, "ak_refresh_token") {
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        if let Err(e) = auth_service
+            .blocklist_refresh_token(refresh_token_str)
+            .await
+        {
+            tracing::debug!("Logout refresh-token blocklist skipped: {}", e);
+        }
     }
 
     let mut response = ().into_response();

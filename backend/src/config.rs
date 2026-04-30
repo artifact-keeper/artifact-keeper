@@ -314,6 +314,58 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    /// Default configuration suitable for tests. Production code should always
+    /// build `Config` via `Config::from_env()`; the values here intentionally
+    /// reference offline placeholders (e.g. `postgresql://unused`) and do not
+    /// connect to anything by themselves. Tests use this with the
+    /// `..Default::default()` struct-update syntax so adding a field does not
+    /// mechanically break every hand-built test config.
+    fn default() -> Self {
+        Self {
+            database_url: "postgresql://unused".to_string(),
+            bind_address: "0.0.0.0:8080".to_string(),
+            log_level: "info".to_string(),
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/test".to_string(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret-key-for-unit-tests-must-be-at-least-32-bytes".to_string(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "standard".to_string(),
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/tmp".to_string(),
+            demo_mode: false,
+            peer_instance_name: "test".to_string(),
+            peer_public_endpoint: "http://localhost:8080".to_string(),
+            peer_api_key: "test-key".to_string(),
+            dependency_track_url: None,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "test".to_string(),
+            gc_schedule: "0 0 * * * *".to_string(),
+            lifecycle_check_interval_secs: 60,
+            max_upload_size_bytes: 10_737_418_240,
+            allow_local_admin_login: false,
+            proxy_max_concurrent_fetches: 20,
+            proxy_max_artifact_size_bytes: 2_147_483_648,
+            proxy_queue_timeout_secs: 30,
+            metrics_port: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
