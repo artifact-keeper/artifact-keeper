@@ -94,7 +94,7 @@ flowchart TD
         direction LR
         PG[(PostgreSQL)]
         FS["Storage<br/>FS / S3"]
-        MS["Meilisearch"]
+        MS["OpenSearch"]
         SC["Trivy / Grype / OpenSCAP"]
     end
 
