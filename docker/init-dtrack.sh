@@ -62,16 +62,35 @@ fi
 
 echo "[dtrack-init] Authenticated successfully"
 
-# Extract the Automation team's API key using jq
-API_KEY=$(curl -sf "$DT_URL/api/v1/team" \
-  -H "Authorization: Bearer $TOKEN" | \
+# Get or create an Automation team API key. Newer Dependency-Track versions do
+# not always expose existing key material, so create one when none is visible.
+TEAMS_JSON=$(curl -sf "$DT_URL/api/v1/team" \
+  -H "Authorization: Bearer $TOKEN")
+
+API_KEY=$(echo "$TEAMS_JSON" | \
   jq -r '.[] | select(.name == "Automation") | .apiKeys[0].key // empty')
 
 if [ -z "$API_KEY" ]; then
-  echo "[dtrack-init] ERROR: Could not find Automation team API key" >&2
+  AUTOMATION_TEAM_UUID=$(echo "$TEAMS_JSON" | \
+    jq -r '.[] | select(.name == "Automation") | .uuid // empty')
+
+  if [ -z "$AUTOMATION_TEAM_UUID" ]; then
+    echo "[dtrack-init] ERROR: Could not find Automation team" >&2
+    echo "[dtrack-init] Available teams:"
+    echo "$TEAMS_JSON" | jq -r '.[].name' 2>/dev/null || true
+    exit 1
+  fi
+
+  echo "[dtrack-init] Creating Automation team API key..."
+  API_KEY=$(curl -sf -X PUT "$DT_URL/api/v1/team/$AUTOMATION_TEAM_UUID/key" \
+    -H "Authorization: Bearer $TOKEN" | \
+    jq -r '.key // empty')
+fi
+
+if [ -z "$API_KEY" ]; then
+  echo "[dtrack-init] ERROR: Could not provision Automation team API key" >&2
   echo "[dtrack-init] Available teams:"
-  curl -sf "$DT_URL/api/v1/team" \
-    -H "Authorization: Bearer $TOKEN" | jq -r '.[].name' 2>/dev/null || true
+  echo "$TEAMS_JSON" | jq -r '.[].name' 2>/dev/null || true
   exit 1
 fi
 
