@@ -62,7 +62,12 @@ async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 /// Without this, user-controlled segments in artifact paths could inject LIKE
 /// wildcards and cause queries to match unrelated artifact rows in the same
 /// repository (wrong artifact served, information disclosure).
-fn escape_like_literal(s: &str) -> String {
+///
+/// Visibility is `pub` (not `pub(crate)`) so that the
+/// `tests/security_regression_tests.rs` integration test can reach this
+/// helper from outside the crate to verify GHSA-7f39-724h-cccm and
+/// GHSA-cxcr-cmqm-6rrw remain fixed.
+pub fn escape_like_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -88,7 +93,11 @@ fn escape_like_literal(s: &str) -> String {
 /// pattern with an `ESCAPE '\'` clause in the SQL query.
 ///
 /// Returns `None` if the path does not contain a `-SNAPSHOT` filename segment.
-fn snapshot_like_pattern(path: &str) -> Option<String> {
+///
+/// Visibility is `pub` (not `pub(crate)`) so the
+/// `tests/security_regression_tests.rs` integration test can verify the
+/// composed wildcard-escape behavior from outside the crate.
+pub fn snapshot_like_pattern(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     if parts.len() < 2 {
         return None;
