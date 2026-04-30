@@ -2507,49 +2507,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_test_config_for_middleware() -> std::sync::Arc<crate::config::Config> {
-        // Mirrors the helper in the auth_service tests module. Keep the JWT
-        // secret long enough to satisfy any future minimum-length check.
-        std::sync::Arc::new(crate::config::Config {
-            database_url: "postgresql://unused".to_string(),
-            bind_address: "0.0.0.0:8080".to_string(),
-            log_level: "info".to_string(),
-            storage_backend: "filesystem".to_string(),
-            storage_path: "/tmp/test".to_string(),
-            s3_bucket: None,
-            gcs_bucket: None,
-            s3_region: None,
-            s3_endpoint: None,
-            jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
-            jwt_expiration_secs: 86400,
-            jwt_access_token_expiry_minutes: 30,
-            jwt_refresh_token_expiry_days: 7,
-            oidc_issuer: None,
-            oidc_client_id: None,
-            oidc_client_secret: None,
-            ldap_url: None,
-            ldap_base_dn: None,
-            trivy_url: None,
-            openscap_url: None,
-            openscap_profile: "standard".to_string(),
-            meilisearch_url: None,
-            meilisearch_api_key: None,
-            scan_workspace_path: "/tmp".to_string(),
-            demo_mode: false,
-            peer_instance_name: "test".to_string(),
-            peer_public_endpoint: "http://localhost:8080".to_string(),
-            peer_api_key: "test-key".to_string(),
-            dependency_track_url: None,
-            otel_exporter_otlp_endpoint: None,
-            otel_service_name: "test".to_string(),
-            gc_schedule: "0 0 * * * *".to_string(),
-            lifecycle_check_interval_secs: 60,
-            max_upload_size_bytes: 10_737_418_240,
-            allow_local_admin_login: false,
-            proxy_max_concurrent_fetches: 20,
-            proxy_max_artifact_size_bytes: 2_147_483_648,
-            proxy_queue_timeout_secs: 30,
-            metrics_port: None,
-        })
+        // Use Config::default() so the helper survives field additions on main
+        // (the cherry-pick from release/1.1.x originally hard-coded an older
+        // field set). The default jwt_secret is long enough for any future
+        // minimum-length check, and these tests only exercise auth-shape
+        // behaviour, not configuration-dependent paths.
+        std::sync::Arc::new(crate::config::Config::default())
     }
 
     fn make_test_auth_service() -> Arc<AuthService> {
@@ -2824,10 +2787,17 @@ mod tests {
                 .unwrap()
                 .insert(key, (entry, std::time::Instant::now()));
         }
+        // PermissionService is constructed against the lazy pool: tests that
+        // exercise repo_visibility_middleware never hit a permission-check
+        // path that requires a live DB, so the empty-cache lazy state is fine.
+        let permission_service = std::sync::Arc::new(
+            crate::services::permission_service::PermissionService::new(pool.clone()),
+        );
         RepoVisibilityState {
             auth_service,
             db: pool,
             repo_cache: cache,
+            permission_service,
         }
     }
 
