@@ -1682,6 +1682,26 @@ mod tests {
         assert_eq!(entry["checksum"].as_str().unwrap(), checksum);
     }
 
+    #[test]
+    fn test_release_entry_url_starts_with_slash() {
+        let entry = release_entry_json("repo", "pkg", "1.0.0", "");
+        assert!(entry["url"].as_str().unwrap().starts_with('/'));
+    }
+
+    #[test]
+    fn test_release_entry_prerelease_version_in_url() {
+        let entry = release_entry_json("repo", "cowboy", "2.0.0-rc.1", "");
+        assert_eq!(entry["url"], "/hex/repo/tarballs/cowboy-2.0.0-rc.1.tar");
+    }
+
+    #[test]
+    fn test_release_entry_version_matches_url() {
+        let version = "3.14.159";
+        let entry = release_entry_json("r", "pkg", version, "");
+        assert!(entry["url"].as_str().unwrap().contains(version));
+        assert_eq!(entry["version"].as_str().unwrap(), version);
+    }
+
     // -----------------------------------------------------------------------
     // package_info_body
     // -----------------------------------------------------------------------
@@ -1765,6 +1785,49 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(parsed["name"].as_str().unwrap(), *name);
         }
+    }
+
+    #[test]
+    fn test_package_info_body_releases_field_is_array() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["releases"].is_array());
+    }
+
+    #[test]
+    fn test_package_info_body_downloads_is_number() {
+        let body = package_info_body("pkg", &[], 7);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["downloads"].is_number());
+    }
+
+    #[test]
+    fn test_package_info_body_name_is_string() {
+        let body = package_info_body("cowboy", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["name"].is_string());
+    }
+
+    #[test]
+    fn test_package_info_body_release_url_routed_through_repo() {
+        let releases = vec![release_entry_json("hex-virtual", "cowboy", "2.10.0", "")];
+        let body = package_info_body("cowboy", &releases, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let url = parsed["releases"][0]["url"].as_str().unwrap();
+        assert!(url.contains("hex-virtual"));
+        assert!(!url.contains("hex-remote"));
+    }
+
+    #[test]
+    fn test_package_info_body_multiple_releases_all_present() {
+        let releases: Vec<serde_json::Value> = ["1.0.0", "1.1.0", "2.0.0"]
+            .iter()
+            .map(|v| release_entry_json("r", "pkg", v, ""))
+            .collect();
+        let body = package_info_body("pkg", &releases, 3);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["releases"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["downloads"], 3);
     }
 
     // -----------------------------------------------------------------------
