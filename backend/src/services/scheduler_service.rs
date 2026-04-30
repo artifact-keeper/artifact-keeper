@@ -353,8 +353,38 @@ pub fn spawn_all(
         });
     }
 
+    // Download-ticket cleanup (every 10 minutes).
+    //
+    // Tickets self-expire on use via `expires_at > NOW()` in
+    // `validate_download_ticket`, so this is hygiene rather than correctness.
+    // 30-second TTL plus high churn means rows accumulate quickly under load
+    // even though each row is small. A 10-minute cadence keeps the table from
+    // unbounded growth without spamming the database.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let mut ticker = interval(Duration::from_secs(600)); // 10 minutes
+
+            loop {
+                ticker.tick().await;
+                tracing::debug!("Cleaning up expired download tickets");
+
+                match crate::services::auth_config_service::AuthConfigService::cleanup_expired_download_tickets(&db).await {
+                    Ok(count) if count > 0 => {
+                        tracing::debug!("Cleaned up {} expired download tickets", count);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Download ticket cleanup failed: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     tracing::info!(
-        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, refresh-jti GC"
+        "Background schedulers started: metrics, health monitor, lifecycle, backup schedules, sync policies, webhook retries, curation sync, upload cleanup, download ticket cleanup, refresh-jti GC"
     );
 }
 

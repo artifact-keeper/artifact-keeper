@@ -6,6 +6,7 @@
 //! - Progress tracking
 //! - Checkpoint saving for resumability
 
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -311,10 +312,16 @@ impl MigrationWorker {
 
                 let source_path = build_source_path(repo_key, &artifact_path);
                 let size = artifact.size.unwrap_or(0);
-                let checksum = artifact
-                    .sha256
-                    .clone()
-                    .or_else(|| artifact.actual_sha1.clone());
+                // Keep sha256 and sha1 separate so verification can compare
+                // each digest against the corresponding locally computed
+                // value. Picking a single "checksum" field and computing
+                // only sha256 locally would cause a false mismatch whenever
+                // the source advertises only sha1 (issue #856).
+                let expected_sha256 = artifact.sha256.clone();
+                let expected_sha1 = artifact.actual_sha1.clone();
+                // Prefer sha256 for bookkeeping/dedup since that is what
+                // Artifact Keeper uses internally.
+                let item_checksum = expected_sha256.clone().or_else(|| expected_sha1.clone());
 
                 // Skip if already completed (resume support)
                 if self.is_item_already_completed(job_id, &source_path).await? {
@@ -329,7 +336,7 @@ impl MigrationWorker {
                         MigrationItemType::Artifact,
                         &source_path,
                         size,
-                        checksum.as_deref(),
+                        item_checksum.as_deref(),
                     )
                     .await?;
 
@@ -340,7 +347,10 @@ impl MigrationWorker {
                     &artifact_path,
                     &source_path,
                     size,
-                    &checksum,
+                    ExpectedChecksums {
+                        sha256: expected_sha256,
+                        sha1: expected_sha1,
+                    },
                     conflict_resolution,
                     include_metadata,
                     completed,
@@ -423,7 +433,7 @@ impl MigrationWorker {
         artifact_path: &str,
         source_path: &str,
         size: i64,
-        checksum: &Option<String>,
+        expected: ExpectedChecksums,
         conflict_resolution: ConflictResolution,
         include_metadata: bool,
         completed: &mut i32,
@@ -431,8 +441,13 @@ impl MigrationWorker {
         skipped: &mut i32,
         transferred: &mut i64,
     ) -> Result<(), MigrationError> {
+        // Prefer sha256 for duplicate detection since that is what Artifact
+        // Keeper stores internally. Fall back to sha1 when the source only
+        // provides that (common for older Nexus artifacts).
+        let dedup_checksum = expected.sha256.clone().or_else(|| expected.sha1.clone());
+
         let should_skip = self
-            .check_artifact_duplicate(source_path, checksum.as_deref(), conflict_resolution)
+            .check_artifact_duplicate(source_path, dedup_checksum.as_deref(), conflict_resolution)
             .await?;
 
         if should_skip {
@@ -451,7 +466,7 @@ impl MigrationWorker {
                 self.finalize_transfer(
                     item_id,
                     &transfer_result,
-                    checksum,
+                    &expected,
                     size,
                     completed,
                     failed,
@@ -476,22 +491,14 @@ impl MigrationWorker {
         &self,
         item_id: Uuid,
         transfer_result: &TransferResult,
-        expected_checksum: &Option<String>,
+        expected: &ExpectedChecksums,
         size: i64,
         completed: &mut i32,
         failed: &mut i32,
         transferred: &mut i64,
     ) -> Result<(), MigrationError> {
-        if !self.verify_transfer_checksum(expected_checksum, &transfer_result.calculated_checksum) {
-            self.migration_service
-                .fail_item(
-                    item_id,
-                    &format!(
-                        "Checksum mismatch: expected {:?}, got {:?}",
-                        expected_checksum, transfer_result.calculated_checksum
-                    ),
-                )
-                .await?;
+        if let Some(mismatch) = self.verify_transfer_checksums(expected, transfer_result) {
+            self.migration_service.fail_item(item_id, &mismatch).await?;
             *failed += 1;
             return Ok(());
         }
@@ -508,10 +515,27 @@ impl MigrationWorker {
         Ok(())
     }
 
-    /// Verify a transfer's checksum against the expected value.
-    /// Returns true if verification passes or is not applicable.
-    fn verify_transfer_checksum(&self, expected: &Option<String>, actual: &Option<String>) -> bool {
-        verify_checksums_match(self.config.verify_checksums, expected, actual)
+    /// Verify a transfer's checksums against the expected values.
+    ///
+    /// Compares each advertised digest (sha256 and sha1) against the
+    /// locally computed digest of the same algorithm. A previous version
+    /// of this check compared the single "best" expected digest against a
+    /// locally computed sha256, which produced a guaranteed false positive
+    /// whenever the source only advertised sha1 (issue #856).
+    ///
+    /// Returns `None` when verification passes or is not applicable, and
+    /// `Some(error_message)` when a mismatch is detected.
+    fn verify_transfer_checksums(
+        &self,
+        expected: &ExpectedChecksums,
+        actual: &TransferResult,
+    ) -> Option<String> {
+        verify_expected_checksums(
+            self.config.verify_checksums,
+            expected,
+            actual.calculated_sha256.as_deref(),
+            actual.calculated_sha1.as_deref(),
+        )
     }
 
     /// Send a progress update through the channel, if one is configured
@@ -619,10 +643,11 @@ impl MigrationWorker {
         let artifact_data = client.download_artifact(repo_key, artifact_path).await?;
         let content_size = artifact_data.len();
 
-        // Calculate checksum
-        let mut hasher = Sha256::new();
-        hasher.update(&artifact_data);
-        let checksum = hex::encode(hasher.finalize());
+        // Calculate both sha256 and sha1. Computing both lets the
+        // verification step compare the source's advertised digest against
+        // the matching locally computed value regardless of which algorithm
+        // the source uses (issue #856).
+        let (sha256_hex, sha1_hex) = compute_dual_checksums(&artifact_data);
 
         // Get metadata if requested
         let metadata = if include_metadata {
@@ -635,7 +660,7 @@ impl MigrationWorker {
         };
 
         // Upload to Artifact Keeper storage using CAS key
-        let storage_key = ArtifactService::storage_key_from_checksum(&checksum);
+        let storage_key = ArtifactService::storage_key_from_checksum(&sha256_hex);
 
         if !self.config.dry_run {
             // Check if content already exists (deduplication)
@@ -668,7 +693,7 @@ impl MigrationWorker {
                 .bind(&path_str)
                 .bind(name)
                 .bind(content_size as i64)
-                .bind(&checksum)
+                .bind(&sha256_hex)
                 .bind(&storage_key)
                 .execute(&self.db)
                 .await?;
@@ -680,13 +705,16 @@ impl MigrationWorker {
         tracing::debug!(
             path = %artifact_path,
             size = content_size,
-            checksum = %checksum,
+            sha256 = %sha256_hex,
+            sha1 = %sha1_hex,
             "Artifact transferred"
         );
 
         Ok(TransferResult {
             target_path,
-            calculated_checksum: Some(checksum),
+            calculated_checksum: Some(sha256_hex.clone()),
+            calculated_sha256: Some(sha256_hex),
+            calculated_sha1: Some(sha1_hex),
             metadata,
         })
     }
@@ -1109,12 +1137,117 @@ impl MigrationWorker {
     }
 }
 
-/// Result of a successful artifact transfer
+/// Result of a successful artifact transfer.
+///
+/// Carries both locally computed digests so the caller can compare against
+/// whichever algorithm the source advertised (issue #856).
 #[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
 struct TransferResult {
     target_path: String,
+    /// Legacy alias for `calculated_sha256`, retained so existing callers
+    /// that inspect `calculated_checksum` continue to see the sha256 value.
     calculated_checksum: Option<String>,
+    calculated_sha256: Option<String>,
+    calculated_sha1: Option<String>,
     metadata: Option<std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// Digests that the source registry declared for an artifact.
+///
+/// Both fields are optional because sources vary in what they report.
+/// Nexus, for example, always returns `sha1` for Maven artifacts but may
+/// omit `sha256` for older ones. Keeping them separate lets the worker
+/// compare each advertised digest against the matching locally computed
+/// value instead of guessing which algorithm to verify against (issue
+/// #856).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExpectedChecksums {
+    pub sha256: Option<String>,
+    pub sha1: Option<String>,
+}
+
+impl ExpectedChecksums {
+    /// Returns true when at least one digest was declared.
+    #[allow(dead_code)]
+    pub fn has_any(&self) -> bool {
+        self.sha256.is_some() || self.sha1.is_some()
+    }
+}
+
+/// Compute both sha256 and sha1 hex digests over the same payload in a
+/// single pass over the bytes. Returns `(sha256_hex, sha1_hex)`.
+pub(crate) fn compute_dual_checksums(data: &[u8]) -> (String, String) {
+    let mut sha256 = Sha256::new();
+    sha256.update(data);
+    let sha256_hex = hex::encode(sha256.finalize());
+
+    let mut sha1 = Sha1::new();
+    sha1.update(data);
+    let sha1_hex = hex::encode(sha1.finalize());
+
+    (sha256_hex, sha1_hex)
+}
+
+/// Compare each advertised digest against the matching locally computed
+/// digest. Returns `None` when verification passes (all advertised digests
+/// match, or verification is disabled, or no digests were advertised) and
+/// `Some(error_message)` when any advertised digest disagrees with the
+/// locally computed value of the same algorithm.
+///
+/// Comparison is hex and case-insensitive. A missing local digest for an
+/// algorithm the source advertised is treated as a verification failure
+/// rather than a pass, so we never silently accept an unverified artifact
+/// when the user has verification enabled.
+pub(crate) fn verify_expected_checksums(
+    verify_enabled: bool,
+    expected: &ExpectedChecksums,
+    actual_sha256: Option<&str>,
+    actual_sha1: Option<&str>,
+) -> Option<String> {
+    if !verify_enabled {
+        return None;
+    }
+
+    if let Some(exp_sha256) = expected.sha256.as_deref() {
+        let exp_norm = exp_sha256.to_ascii_lowercase();
+        match actual_sha256 {
+            Some(actual) if actual.eq_ignore_ascii_case(&exp_norm) => {}
+            Some(actual) => {
+                return Some(format!(
+                    "Checksum mismatch (sha256): expected {}, got {}",
+                    exp_norm, actual
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "Checksum mismatch (sha256): expected {}, got none",
+                    exp_norm
+                ));
+            }
+        }
+    }
+
+    if let Some(exp_sha1) = expected.sha1.as_deref() {
+        let exp_norm = exp_sha1.to_ascii_lowercase();
+        match actual_sha1 {
+            Some(actual) if actual.eq_ignore_ascii_case(&exp_norm) => {}
+            Some(actual) => {
+                return Some(format!(
+                    "Checksum mismatch (sha1): expected {}, got {}",
+                    exp_norm, actual
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "Checksum mismatch (sha1): expected {}, got none",
+                    exp_norm
+                ));
+            }
+        }
+    }
+
+    None
 }
 
 /// Determine the final job status based on completed and failed counts.
@@ -1132,8 +1265,14 @@ pub(crate) fn determine_final_status(
 }
 
 /// Check whether an expected checksum matches an actual checksum.
+///
 /// Returns true (pass) when verification is disabled, when either value
-/// is missing, or when both values are present and equal.
+/// is missing, or when both values are present and equal. This is a thin
+/// legacy wrapper retained so callers and tests outside the worker can
+/// still perform a single-digest comparison; the worker itself now uses
+/// [`verify_expected_checksums`] to compare each advertised digest against
+/// the locally computed value of the same algorithm (issue #856).
+#[allow(dead_code)]
 pub(crate) fn verify_checksums_match(
     verify_enabled: bool,
     expected: &Option<String>,
@@ -1143,7 +1282,7 @@ pub(crate) fn verify_checksums_match(
         return true;
     }
     match (expected, actual) {
-        (Some(exp), Some(act)) => exp == act,
+        (Some(exp), Some(act)) => exp.eq_ignore_ascii_case(act),
         _ => true,
     }
 }
@@ -1499,6 +1638,8 @@ mod tests {
         let result = TransferResult {
             target_path: "libs-release/com/example/lib.jar".to_string(),
             calculated_checksum: Some("abc123def456".to_string()),
+            calculated_sha256: Some("abc123def456".to_string()),
+            calculated_sha1: Some("abc1".to_string()),
             metadata: Some(std::collections::HashMap::from([(
                 "key".to_string(),
                 vec!["value1".to_string(), "value2".to_string()],
@@ -1506,6 +1647,8 @@ mod tests {
         };
         assert_eq!(result.target_path, "libs-release/com/example/lib.jar");
         assert!(result.calculated_checksum.is_some());
+        assert!(result.calculated_sha256.is_some());
+        assert!(result.calculated_sha1.is_some());
         assert!(result.metadata.is_some());
     }
 
@@ -1513,10 +1656,11 @@ mod tests {
     fn test_transfer_result_no_metadata() {
         let result = TransferResult {
             target_path: "repo/file.bin".to_string(),
-            calculated_checksum: None,
-            metadata: None,
+            ..TransferResult::default()
         };
         assert!(result.calculated_checksum.is_none());
+        assert!(result.calculated_sha256.is_none());
+        assert!(result.calculated_sha1.is_none());
         assert!(result.metadata.is_none());
     }
 
@@ -1657,10 +1801,14 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_checksums_match_case_sensitive() {
+    fn test_verify_checksums_match_case_insensitive() {
+        // Updated behavior (issue #856): some registries return digests in
+        // uppercase hex, so the single-digest helper now performs a
+        // case-insensitive comparison to stay in sync with
+        // `verify_expected_checksums`.
         let expected = Some("ABC123".to_string());
         let actual = Some("abc123".to_string());
-        assert!(!verify_checksums_match(true, &expected, &actual));
+        assert!(verify_checksums_match(true, &expected, &actual));
     }
 
     // -----------------------------------------------------------------------
@@ -1826,6 +1974,8 @@ mod tests {
         let result = TransferResult {
             target_path: "repo/artifact.jar".to_string(),
             calculated_checksum: Some("deadbeef".to_string()),
+            calculated_sha256: Some("deadbeef".to_string()),
+            calculated_sha1: None,
             metadata: Some(metadata),
         };
 
@@ -1839,8 +1989,8 @@ mod tests {
     fn test_transfer_result_empty_metadata() {
         let result = TransferResult {
             target_path: "repo/file.bin".to_string(),
-            calculated_checksum: None,
             metadata: Some(std::collections::HashMap::new()),
+            ..TransferResult::default()
         };
         assert!(result.metadata.as_ref().unwrap().is_empty());
     }
@@ -1951,5 +2101,213 @@ mod tests {
             ..WorkerConfig::default()
         };
         assert_eq!(config.batch_size, i64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_dual_checksums (issue #856)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_dual_checksums_empty_payload() {
+        // Known reference values for the empty string.
+        let (sha256, sha1) = compute_dual_checksums(b"");
+        assert_eq!(
+            sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(sha1, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    #[test]
+    fn test_compute_dual_checksums_known_payload() {
+        // Known reference values for the ASCII string "abc".
+        let (sha256, sha1) = compute_dual_checksums(b"abc");
+        assert_eq!(
+            sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(sha1, "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn test_compute_dual_checksums_digest_lengths() {
+        // Guard against algorithm swaps: sha256 hex is 64 chars, sha1 is 40.
+        let (sha256, sha1) = compute_dual_checksums(b"the quick brown fox");
+        assert_eq!(sha256.len(), 64);
+        assert_eq!(sha1.len(), 40);
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_expected_checksums (issue #856)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_verify_expected_checksums_disabled_skips_everything() {
+        // When verification is disabled the function must never report a
+        // mismatch, even if the advertised and computed digests differ.
+        let expected = ExpectedChecksums {
+            sha256: Some("deadbeef".into()),
+            sha1: Some("feedface".into()),
+        };
+        assert!(verify_expected_checksums(false, &expected, Some("00"), Some("00")).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_no_expected_values() {
+        // With nothing advertised there's nothing to verify against.
+        let expected = ExpectedChecksums::default();
+        assert!(verify_expected_checksums(true, &expected, Some("abc"), Some("def")).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha256_match() {
+        let (sha256, sha1) = compute_dual_checksums(b"hello world");
+        let expected = ExpectedChecksums {
+            sha256: Some(sha256.clone()),
+            sha1: None,
+        };
+        assert!(verify_expected_checksums(true, &expected, Some(&sha256), Some(&sha1)).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha1_only_match() {
+        // Regression test for issue #856: when the source (e.g. Nexus) only
+        // advertises sha1, verification must compare sha1 to sha1. Before
+        // the fix the worker always computed sha256 locally and compared it
+        // against the advertised sha1, guaranteeing a false mismatch.
+        let (_sha256, sha1) = compute_dual_checksums(b"hello world");
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some(sha1.clone()),
+        };
+        let result = verify_expected_checksums(
+            true,
+            &expected,
+            Some("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            Some(&sha1),
+        );
+        assert!(
+            result.is_none(),
+            "sha1-only match should pass, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha1_only_mismatch_reports_sha1_not_sha256() {
+        // The reporter's log showed "expected <sha1>, got <sha256>". After
+        // the fix, a genuine sha1 mismatch must report algorithms that
+        // actually disagreed, and sha256 must never be compared against an
+        // advertised sha1.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some("0692b094dbd155ac5885d8369b32d4cb8dadf74d".into()),
+        };
+        let (actual_sha256, actual_sha1) = compute_dual_checksums(b"corrupted");
+        let result =
+            verify_expected_checksums(true, &expected, Some(&actual_sha256), Some(&actual_sha1));
+        let message = result.expect("expected a mismatch");
+        assert!(
+            message.contains("sha1"),
+            "expected sha1 mismatch message, got: {}",
+            message
+        );
+        assert!(
+            !message.contains("sha256"),
+            "sha1-only expectation should not mention sha256, got: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_both_advertised_both_match() {
+        let (sha256, sha1) = compute_dual_checksums(b"payload");
+        let expected = ExpectedChecksums {
+            sha256: Some(sha256.clone()),
+            sha1: Some(sha1.clone()),
+        };
+        assert!(verify_expected_checksums(true, &expected, Some(&sha256), Some(&sha1)).is_none());
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_sha256_mismatch_reported_first() {
+        // When both digests are advertised and sha256 is the one that
+        // disagrees, the reported error must call out sha256.
+        let expected = ExpectedChecksums {
+            sha256: Some("00".into()),
+            sha1: Some("11".into()),
+        };
+        let result = verify_expected_checksums(true, &expected, Some("ff"), Some("22"));
+        let msg = result.expect("mismatch");
+        assert!(msg.contains("sha256"), "{}", msg);
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_case_insensitive() {
+        // Nexus and Artifactory have both been observed emitting digests in
+        // uppercase hex on older releases. Comparison must ignore case.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709".into()),
+        };
+        let result = verify_expected_checksums(
+            true,
+            &expected,
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        );
+        assert!(
+            result.is_none(),
+            "case-insensitive match failed: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_expected_checksums_missing_local_digest_is_mismatch() {
+        // If the source advertises a sha1 but for some reason the worker
+        // has no local sha1, fail loudly instead of silently passing.
+        let expected = ExpectedChecksums {
+            sha256: None,
+            sha1: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".into()),
+        };
+        let result = verify_expected_checksums(true, &expected, Some("abcd"), None);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_expected_checksums_has_any() {
+        assert!(!ExpectedChecksums::default().has_any());
+        assert!(ExpectedChecksums {
+            sha256: Some("x".into()),
+            sha1: None,
+        }
+        .has_any());
+        assert!(ExpectedChecksums {
+            sha256: None,
+            sha1: Some("y".into()),
+        }
+        .has_any());
+    }
+
+    // -----------------------------------------------------------------------
+    // WorkerConfig.verify_checksums default (issue #856 plumbing)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_worker_config_default_verifies_checksums() {
+        // Verification must be enabled by default so existing users do not
+        // silently accept corrupted artifacts after an upgrade.
+        let config = WorkerConfig::default();
+        assert!(config.verify_checksums);
+    }
+
+    #[test]
+    fn test_worker_config_verify_checksums_can_be_disabled() {
+        let config = WorkerConfig {
+            verify_checksums: false,
+            ..WorkerConfig::default()
+        };
+        assert!(!config.verify_checksums);
     }
 }

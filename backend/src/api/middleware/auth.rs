@@ -48,6 +48,17 @@ pub struct AuthExtension {
     pub allowed_repo_ids: Option<Vec<Uuid>>,
 }
 
+/// Marker request extension inserted alongside [`AuthExtension`] when the
+/// caller authenticated via a single-use download ticket (`?ticket=`).
+///
+/// This is a separate extension rather than a field on `AuthExtension` so
+/// the existing 80+ test fixtures and call sites that build `AuthExtension`
+/// literals do not need to be updated. Middleware that needs to refuse
+/// ticket-authenticated requests (writes, admin) checks for the presence
+/// of this extension instead.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadTicketAuth;
+
 impl AuthExtension {
     /// Check whether this auth context has a required scope.
     /// JWT sessions (non-API-token auth) always pass since they have no scope
@@ -301,62 +312,73 @@ pub async fn auth_middleware(
     // Extract token from request headers
     let extracted = extract_token(&request);
 
-    match extracted {
-        ExtractedToken::Bearer(token) => {
-            // Try JWT token first for Bearer scheme
-            match auth_service.validate_access_token(token) {
-                Ok(claims) => {
-                    request.extensions_mut().insert(AuthExtension::from(claims));
-                    next.run(request).await
-                }
-                Err(_) => {
-                    // Fall back to API token
-                    match validate_api_token_with_scopes(&auth_service, token).await {
-                        Ok(auth_ext) => {
-                            request.extensions_mut().insert(auth_ext);
-                            next.run(request).await
-                        }
-                        Err(_) => {
-                            (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response()
-                        }
-                    }
-                }
-            }
-        }
+    // Track whether the request even attempted header-based auth, so the
+    // 401 message stays informative when only a ?ticket= was supplied.
+    let had_header_credentials = !matches!(extracted, ExtractedToken::None);
+
+    let header_result: Result<AuthExtension, &'static str> = match extracted {
+        ExtractedToken::Bearer(token) => match auth_service.validate_access_token(token) {
+            Ok(claims) => Ok(AuthExtension::from(claims)),
+            Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
+                Ok(ext) => Ok(ext),
+                Err(_) => Err("Invalid or expired token"),
+            },
+        },
         ExtractedToken::ApiKey(token) => {
-            // ApiKey scheme is always an API token
             match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(auth_ext) => {
-                    request.extensions_mut().insert(auth_ext);
-                    next.run(request).await
-                }
-                Err(_) => {
-                    (StatusCode::UNAUTHORIZED, "Invalid or expired API token").into_response()
-                }
+                Ok(ext) => Ok(ext),
+                Err(_) => Err("Invalid or expired API token"),
             }
         }
-        ExtractedToken::Basic(encoded) => {
-            let Some((username, password)) = decode_basic_credentials(encoded) else {
-                return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials")
-                    .into_response();
-            };
-            match auth_service.authenticate(&username, &password).await {
-                Ok((user, _token_pair)) => {
-                    request.extensions_mut().insert(AuthExtension::from(user));
-                    next.run(request).await
+        ExtractedToken::Basic(encoded) => match decode_basic_credentials(encoded) {
+            None => Err("Invalid Basic auth credentials"),
+            Some((username, password)) => {
+                match auth_service.authenticate(&username, &password).await {
+                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
+                    Err(_) => Err("Invalid credentials"),
                 }
-                Err(_) => (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response(),
             }
+        },
+        ExtractedToken::None => Err("Missing authorization header"),
+        ExtractedToken::Invalid => Err("Invalid authorization header format"),
+    };
+
+    let header_error = match header_result {
+        Ok(ext) => {
+            request.extensions_mut().insert(ext);
+            return next.run(request).await;
         }
-        ExtractedToken::None => {
-            (StatusCode::UNAUTHORIZED, "Missing authorization header").into_response()
+        Err(msg) => msg,
+    };
+
+    // Header-based auth failed. Fall back to a `?ticket=` download ticket
+    // if present in the query string. Tickets only authenticate read methods
+    // and only for the path the ticket was minted against.
+    let ticket_parts = extract_ticket_request_parts(&request);
+    if let Some(parts) = ticket_parts.as_ref() {
+        if let Some(ext) = try_resolve_ticket_for_parts(auth_service.db(), parts).await {
+            request.extensions_mut().insert(ext);
+            request.extensions_mut().insert(DownloadTicketAuth);
+            return next.run(request).await;
         }
-        ExtractedToken::Invalid => (
-            StatusCode::UNAUTHORIZED,
-            "Invalid authorization header format",
-        )
-            .into_response(),
     }
+
+    // Note on the ambiguous message: "Invalid or expired download ticket"
+    // intentionally does not distinguish between
+    //   (a) ticket not found,
+    //   (b) ticket expired,
+    //   (c) bound-path mismatch,
+    //   (d) write method on a read-only ticket.
+    // Leaking which case it is would help an attacker who has a partial
+    // ticket value (or who is probing path bindings) narrow down the cause.
+    // High-entropy tickets and a 30-second TTL make ambiguity cheap. Do not
+    // "fix" this by giving a more specific message.
+    let message = if !had_header_credentials && ticket_parts.is_some() {
+        "Invalid or expired download ticket"
+    } else {
+        header_error
+    };
+    (StatusCode::UNAUTHORIZED, message).into_response()
 }
 
 /// Validate an API token and create an AuthExtension with scopes and repo restrictions.
@@ -428,6 +450,218 @@ async fn try_resolve_auth(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Download ticket auth (?ticket= query param)
+// ---------------------------------------------------------------------------
+
+/// Extract the value of a `ticket` query parameter from a URI's query string.
+///
+/// Returns `None` when no query string is present, no `ticket` key exists, or
+/// the value is empty. Repeated `ticket=` keys take the first occurrence.
+/// Performs simple percent-decoding of `+` -> space and `%XX` byte escapes; the
+/// ticket itself is hex (no special characters), but query-decoding keeps
+/// behaviour consistent with HTTP clients that always encode.
+pub(crate) fn extract_ticket_from_query(query: Option<&str>) -> Option<String> {
+    let q = query?;
+    for pair in q.split('&') {
+        let mut it = pair.splitn(2, '=');
+        let key = it.next()?;
+        if key != "ticket" {
+            continue;
+        }
+        let raw = it.next().unwrap_or("");
+        if raw.is_empty() {
+            return None;
+        }
+        // Minimal percent-decoding sufficient for hex tickets.
+        let mut out = String::with_capacity(raw.len());
+        let bytes = raw.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'+' {
+                out.push(' ');
+                i += 1;
+            } else if b == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push(((h * 16 + l) as u8) as char);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b as char);
+                        i += 1;
+                    }
+                }
+            } else {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// HTTP methods that download tickets are allowed to authenticate.
+///
+/// Tickets are minted for downloads/streams only. Any write operation
+/// (POST, PUT, PATCH, DELETE) authenticated by a ticket must be rejected
+/// even when the underlying user has write permission, because the ticket
+/// embeds no scope information and the calling client may be a browser
+/// `<a href>` or `EventSource` that the user did not consent to use for
+/// mutations.
+fn ticket_method_allowed(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD)
+}
+
+/// Decide whether a ticket bound to `bound_path` may authenticate a request
+/// for `request_path`.
+///
+/// A ticket with `bound_path = None` authenticates any read path the minting
+/// user can reach (legacy behaviour). A ticket with `bound_path = Some(p)`
+/// authenticates only requests whose URL path equals `p`. We compare by exact
+/// match to keep the policy auditable; callers that want a directory-prefix
+/// must mint one ticket per resource.
+fn ticket_path_allowed(bound_path: Option<&str>, request_path: &str) -> bool {
+    match bound_path {
+        None => true,
+        Some(p) => p == request_path,
+    }
+}
+
+/// Resolve a download ticket to an [`AuthExtension`] without consuming it.
+///
+/// Wraps [`AuthConfigService::validate_download_ticket`], which atomically
+/// deletes the ticket on success (single-use enforcement) and rejects expired
+/// tickets via `expires_at > NOW()`. After the ticket is consumed, the
+/// owning user is loaded so the resulting extension carries the same identity
+/// downstream handlers see for any other auth method.
+async fn try_resolve_ticket_auth(
+    db: &sqlx::PgPool,
+    ticket: &str,
+    method: &Method,
+    request_path: &str,
+) -> Option<AuthExtension> {
+    if !ticket_method_allowed(method) {
+        return None;
+    }
+
+    let (user_id, _purpose, resource_path) =
+        crate::services::auth_config_service::AuthConfigService::validate_download_ticket(
+            db, ticket,
+        )
+        .await
+        .ok()?;
+
+    if !ticket_path_allowed(resource_path.as_deref(), request_path) {
+        // Ticket has been consumed by validate_download_ticket; treat the
+        // mismatch as an authentication failure so the client cannot reuse
+        // the same ticket against a different path.
+        //
+        // Trade-off: a mistyped path by a legitimate client will burn the
+        // ticket and the client must mint a new one. We accept this cost
+        // because single-use is the security invariant we cannot weaken
+        // without breaking the threat model (a stolen ticket adversary
+        // would simply replay against the right path).
+        //
+        // The cleaner alternative is `SELECT then DELETE WHERE ... RETURNING`
+        // inside a transaction so wrong-path attempts do not consume. That
+        // is a follow-up change; not in this PR because the existing
+        // single-statement DELETE-RETURNING is the only thing that gives
+        // us atomic single-use under concurrent retry.
+        return None;
+    }
+
+    // Load the owning user. We block deactivated users so a revoked account
+    // cannot keep downloading via outstanding tickets, but we honour service
+    // accounts and not-yet-rotated passwords because the ticket itself is
+    // the proof of intent: the JWT session that minted it had whatever
+    // rights the user had at mint time.
+    //
+    // Uses `sqlx::query_as::<_, User>` rather than the `query_as!` macro so
+    // adding the ticket-consumer middleware does not require regenerating
+    // the offline SQLx query cache.
+    let user: User = sqlx::query_as::<_, User>(
+        r#"
+        SELECT
+            id, username, email, password_hash, display_name,
+            auth_provider, external_id, is_admin, is_active,
+            is_service_account, must_change_password,
+            totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+            last_login_at, created_at, updated_at
+        FROM users
+        WHERE id = $1 AND is_active = true
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .ok()??;
+
+    let mut ext = AuthExtension::from(user);
+    // Tickets are read-only. Drop admin elevation so a ticket minted by an
+    // admin cannot be replayed against admin-only routes that happen to
+    // accept tickets in their middleware chain. Callers also insert the
+    // [`DownloadTicketAuth`] marker extension so write-gating middleware
+    // can recognise the request as ticket-authenticated.
+    ext.is_admin = false;
+
+    // Scope hardening: `AuthExtension::has_scope` returns `true` for any
+    // non-API-token auth (the JWT-session shortcut at the top of the impl).
+    // No handler today calls `has_scope("admin")` for elevation, but a
+    // future one could, and a ticket-authenticated request would silently
+    // pass that check. Pretend the ticket is an API token with an empty
+    // scope set so any explicit scope check defaults to deny.
+    //
+    // This intentionally does not modify `is_service_account` or
+    // `must_change_password`: a ticket inherits the minter's identity for
+    // those flags so downstream handlers see the same view they would for
+    // any other auth method. Accepting the inherited identity is the
+    // design — the ticket is proof that a session with those flags
+    // intentionally minted a download URL.
+    ext.is_api_token = true;
+    ext.scopes = Some(vec![]);
+    Some(ext)
+}
+
+/// Snapshot of the request fields needed to authenticate a download ticket.
+///
+/// Cloned out of the [`Request`] before the async ticket-validation work
+/// runs, so the resulting future does not borrow the request. Without this,
+/// callers would hold a borrow across `.await` and the middleware future
+/// would not be `Send`, which `axum::middleware::from_fn_with_state` requires.
+struct TicketRequestParts {
+    ticket: String,
+    method: Method,
+    path: String,
+}
+
+fn extract_ticket_request_parts(request: &Request) -> Option<TicketRequestParts> {
+    let ticket = extract_ticket_from_query(request.uri().query())?;
+    Some(TicketRequestParts {
+        ticket,
+        method: request.method().clone(),
+        path: request.uri().path().to_string(),
+    })
+}
+
+/// Try to authenticate via a `?ticket=` query param when no header credentials
+/// are present (or all of them have failed).
+///
+/// Returns `Some(ext)` when the ticket is valid, the request method is a
+/// read, and the bound path matches. Returns `None` otherwise. The ticket
+/// is consumed (single-use) on the validation attempt regardless of whether
+/// the request is ultimately allowed.
+async fn try_resolve_ticket_for_parts(
+    db: &sqlx::PgPool,
+    parts: &TicketRequestParts,
+) -> Option<AuthExtension> {
+    try_resolve_ticket_auth(db, &parts.ticket, &parts.method, &parts.path).await
+}
+
 /// Optional authentication middleware - allows unauthenticated requests
 ///
 /// Supports the same authentication schemes as auth_middleware but
@@ -438,9 +672,25 @@ pub async fn optional_auth_middleware(
     next: Next,
 ) -> Response {
     let extracted = extract_token(&request);
-    let auth_ext = try_resolve_auth(&auth_service, extracted).await;
+    let mut auth_ext = try_resolve_auth(&auth_service, extracted).await;
+
+    // If header-based auth produced no identity, fall back to a `?ticket=`
+    // query param. Optional-auth routes are typically reads, so a ticket can
+    // legitimately stand in for headers (e.g. browser <a href> downloads).
+    let mut authed_via_ticket = false;
+    if auth_ext.is_none() {
+        if let Some(parts) = extract_ticket_request_parts(&request) {
+            if let Some(ext) = try_resolve_ticket_for_parts(auth_service.db(), &parts).await {
+                auth_ext = Some(ext);
+                authed_via_ticket = true;
+            }
+        }
+    }
 
     request.extensions_mut().insert(auth_ext);
+    if authed_via_ticket {
+        request.extensions_mut().insert(DownloadTicketAuth);
+    }
     next.run(request).await
 }
 
@@ -672,16 +922,39 @@ pub async fn repo_visibility_middleware(
 
     // Perform optional auth (shared with optional_auth_middleware).
     let extracted = extract_token(&request);
-    let auth_ext = try_resolve_auth(&vis_state.auth_service, extracted).await;
+    let mut auth_ext = try_resolve_auth(&vis_state.auth_service, extracted).await;
+
+    // Fall back to a `?ticket=` query param when no header credentials were
+    // supplied or accepted. Tickets are read-only and bound to a path; the
+    // helper itself rejects non-read methods, and the `is_write` check below
+    // also covers the case where a ticket somehow leaked into a write request.
+    let mut authed_via_ticket = false;
+    if auth_ext.is_none() {
+        if let Some(parts) = extract_ticket_request_parts(&request) {
+            if let Some(ext) = try_resolve_ticket_for_parts(&vis_state.db, &parts).await {
+                auth_ext = Some(ext);
+                authed_via_ticket = true;
+            }
+        }
+    }
 
     // Insert auth extension for downstream handlers.
     request.extensions_mut().insert(auth_ext.clone());
+    if authed_via_ticket {
+        request.extensions_mut().insert(DownloadTicketAuth);
+    }
 
     // #508: Write operations (PUT, POST, PATCH, DELETE) always require
     // authentication, even on public repositories. Without this, unauthenticated
     // upload requests to public repos fall through to the handler which returns
     // 404 (misleading) instead of 401.
-    if is_write && auth_ext.is_none() {
+    //
+    // Tickets must never authorize writes even if the bound path happens to
+    // be writable: a ticket is effectively a single-use download URL, not a
+    // capability token. Treat ticket-authenticated requests as anonymous for
+    // the purpose of write gating.
+    let has_write_auth = auth_ext.is_some() && !authed_via_ticket;
+    if is_write && !has_write_auth {
         return unauthorized_response();
     }
 
@@ -1433,5 +1706,842 @@ mod tests {
             allowed_repo_ids: None,
         };
         assert!(ext.require_admin().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Download ticket helpers (#930)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_ticket_from_query_simple() {
+        let q = Some("ticket=abc123");
+        assert_eq!(extract_ticket_from_query(q), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_among_other_params() {
+        let q = Some("foo=bar&ticket=xyz&baz=qux");
+        assert_eq!(extract_ticket_from_query(q), Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_first_occurrence_wins() {
+        let q = Some("ticket=first&ticket=second");
+        assert_eq!(extract_ticket_from_query(q), Some("first".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_missing() {
+        let q = Some("foo=bar&baz=qux");
+        assert_eq!(extract_ticket_from_query(q), None);
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_no_query_string() {
+        assert_eq!(extract_ticket_from_query(None), None);
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_empty_value() {
+        let q = Some("ticket=");
+        // Empty ticket value is treated as missing.
+        assert_eq!(extract_ticket_from_query(q), None);
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_percent_encoded() {
+        // Tickets are hex so the percent-decoding path normally never fires,
+        // but exercise it for robustness.
+        let q = Some("ticket=ab%2Bcd");
+        assert_eq!(extract_ticket_from_query(q), Some("ab+cd".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ticket_substring_match_rejected() {
+        // A param named `myticket` must not be picked up.
+        let q = Some("myticket=nope");
+        assert_eq!(extract_ticket_from_query(q), None);
+    }
+
+    #[test]
+    fn test_ticket_method_allowed_get_head() {
+        assert!(ticket_method_allowed(&Method::GET));
+        assert!(ticket_method_allowed(&Method::HEAD));
+    }
+
+    #[test]
+    fn test_ticket_method_allowed_rejects_writes() {
+        assert!(!ticket_method_allowed(&Method::POST));
+        assert!(!ticket_method_allowed(&Method::PUT));
+        assert!(!ticket_method_allowed(&Method::PATCH));
+        assert!(!ticket_method_allowed(&Method::DELETE));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_unbound_ticket_allows_anything() {
+        assert!(ticket_path_allowed(None, "/api/v1/repositories/foo"));
+        assert!(ticket_path_allowed(None, "/totally/different"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_exact_match() {
+        let bound = Some("/api/v1/repositories/foo/blob.tar.gz");
+        assert!(ticket_path_allowed(
+            bound,
+            "/api/v1/repositories/foo/blob.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_mismatch() {
+        let bound = Some("/api/v1/repositories/foo/blob.tar.gz");
+        assert!(!ticket_path_allowed(
+            bound,
+            "/api/v1/repositories/bar/blob.tar.gz"
+        ));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_prefix() {
+        // Path-prefix match is intentionally not allowed: a ticket bound
+        // to `/repo/foo` must not authenticate `/repo/foo/secret`.
+        let bound = Some("/api/v1/repositories/foo");
+        assert!(!ticket_path_allowed(
+            bound,
+            "/api/v1/repositories/foo/secret"
+        ));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_trailing_slash_mismatch() {
+        // Trailing-slash equivalence is NOT honoured by the consumer.
+        // The minter is responsible for binding the exact form the client
+        // request will use; mint-time normalization strips the trailing
+        // slash, so this case is the "client added a trailing slash"
+        // failure mode, not the "minter forgot to strip it" mode.
+        let bound = Some("/api/v1/repositories/foo");
+        assert!(!ticket_path_allowed(bound, "/api/v1/repositories/foo/"));
+
+        // Mirror in the other direction.
+        let bound = Some("/api/v1/repositories/foo/");
+        assert!(!ticket_path_allowed(bound, "/api/v1/repositories/foo"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_case_difference() {
+        // Format handlers that case-fold (PyPI/NuGet/Go) lowercase before
+        // dispatching; the consumer compares to the raw `request.uri().path()`
+        // BEFORE that handler-side normalization happens, so the mint-time
+        // validator must lowercase. If a minter bypassed validation, this
+        // is the failure mode they would see at consume time.
+        let bound = Some("/pypi/myrepo/Django");
+        assert!(!ticket_path_allowed(bound, "/pypi/myrepo/django"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_encoded_slash() {
+        // axum/hyper exposes the raw path; `%2F` is not equivalent to `/`.
+        // A ticket bound to `/foo/bar` must not match `/foo%2Fbar`.
+        let bound = Some("/foo/bar");
+        assert!(!ticket_path_allowed(bound, "/foo%2Fbar"));
+        assert!(!ticket_path_allowed(bound, "/foo%2fbar"));
+
+        let bound = Some("/foo%2Fbar");
+        assert!(!ticket_path_allowed(bound, "/foo/bar"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_rejects_double_encoded() {
+        // `%252F` is `%2F` after one decode, `/` after two. The consumer
+        // compares raw bytes, so neither form matches `/`.
+        let bound = Some("/foo/bar");
+        assert!(!ticket_path_allowed(bound, "/foo%252Fbar"));
+        assert!(!ticket_path_allowed(bound, "/foo%252fbar"));
+    }
+
+    #[test]
+    fn test_ticket_path_allowed_only_exact_byte_equality() {
+        // No transformation, no canonicalization, no Unicode-folding.
+        // A ticket bound with combining characters must not match a
+        // pre-composed equivalent.
+        let bound = Some("/foo/cafe\u{0301}"); // "café" decomposed
+        assert!(ticket_path_allowed(bound, "/foo/cafe\u{0301}"));
+        assert!(!ticket_path_allowed(bound, "/foo/caf\u{00E9}")); // "café" precomposed
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional ticket-method coverage (#930): the existing block already
+    // covers GET/HEAD/POST/PUT/PATCH/DELETE; OPTIONS/CONNECT/TRACE round out
+    // the negative half so the matcher is exercised across every variant the
+    // client side might emit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ticket_method_allowed_rejects_options() {
+        assert!(!ticket_method_allowed(&Method::OPTIONS));
+    }
+
+    #[test]
+    fn test_ticket_method_allowed_rejects_connect() {
+        assert!(!ticket_method_allowed(&Method::CONNECT));
+    }
+
+    #[test]
+    fn test_ticket_method_allowed_rejects_trace() {
+        assert!(!ticket_method_allowed(&Method::TRACE));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_ticket_from_query: additional malformed-input edge cases.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_ticket_from_query_pair_without_equals_is_skipped() {
+        // A bare segment like `ticket` without `=` must not be treated as a
+        // ticket; the splitn(2, '=') yields key="ticket" and the value lookup
+        // unwrap_or("") produces an empty raw string which is rejected.
+        let q = Some("ticket&other=1");
+        assert_eq!(extract_ticket_from_query(q), None);
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_repeated_amp_collapses_empty_pairs() {
+        // Empty segments between `&` are skipped (their key is "" and never
+        // matches "ticket"); a real `ticket=` later in the query still wins.
+        let q = Some("&&&ticket=hello&&");
+        assert_eq!(extract_ticket_from_query(q), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_invalid_percent_falls_back_to_literal() {
+        // `%ZZ` is not valid hex, so the bytes are emitted verbatim instead of
+        // panicking. This keeps the helper robust against client encoding bugs
+        // without trying to be cleverer than necessary.
+        let q = Some("ticket=ab%ZZcd");
+        let got = extract_ticket_from_query(q).unwrap();
+        // The first `%` and the following two characters fall through one byte
+        // at a time, so the literal `%ZZ` survives in the output.
+        assert!(got.contains("%ZZcd"));
+        assert!(got.starts_with("ab"));
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_truncated_percent() {
+        // A `%` without two trailing chars is also passed through literally.
+        let q = Some("ticket=ab%");
+        assert_eq!(extract_ticket_from_query(q), Some("ab%".to_string()));
+    }
+
+    #[test]
+    fn test_extract_ticket_from_query_case_sensitive_key() {
+        // The key match is case-sensitive (`ticket`, not `Ticket`). Clients
+        // that uppercase the key get None, not a silent fallthrough.
+        assert_eq!(extract_ticket_from_query(Some("Ticket=abc")), None);
+        assert_eq!(extract_ticket_from_query(Some("TICKET=abc")), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_ticket_request_parts: cloned-out request shape used by the
+    // middleware to keep the auth future Send across `.await`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_ticket_request_parts_present() {
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/auth/me?ticket=abcd")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let parts = extract_ticket_request_parts(&req).expect("ticket parts");
+        assert_eq!(parts.ticket, "abcd");
+        assert_eq!(parts.method, Method::GET);
+        assert_eq!(parts.path, "/api/v1/auth/me");
+    }
+
+    #[test]
+    fn test_extract_ticket_request_parts_missing_ticket() {
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/auth/me?foo=bar")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(extract_ticket_request_parts(&req).is_none());
+    }
+
+    #[test]
+    fn test_extract_ticket_request_parts_no_query_string() {
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/auth/me")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(extract_ticket_request_parts(&req).is_none());
+    }
+
+    #[test]
+    fn test_extract_ticket_request_parts_preserves_method_for_writes() {
+        // Even though writes will be rejected later, this helper has no
+        // policy of its own; the snapshot must reflect the actual method.
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/something?ticket=t")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let parts = extract_ticket_request_parts(&req).expect("parts");
+        assert_eq!(parts.method, Method::POST);
+    }
+
+    // -----------------------------------------------------------------------
+    // DownloadTicketAuth marker extension construction. Trivial Copy/Clone/
+    // Debug shape — proves the type can be inserted into a request extensions
+    // map and pulled back out, which is how the consumer middleware signals
+    // "this request was authenticated by a single-use download ticket" to
+    // downstream write-gating code.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_download_ticket_auth_marker_copy_semantics() {
+        let m1 = DownloadTicketAuth;
+        let m2 = m1; // Copy
+        let _m3 = m1; // Still usable.
+                      // Debug formatter exists.
+        let dbg = format!("{:?}", m2);
+        assert!(dbg.contains("DownloadTicketAuth"));
+    }
+
+    #[test]
+    fn test_download_ticket_auth_marker_round_trips_through_extensions() {
+        let mut req = axum::http::Request::builder()
+            .uri("/x")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(DownloadTicketAuth);
+        assert!(req.extensions().get::<DownloadTicketAuth>().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // try_resolve_ticket_auth direct entry-point coverage.
+    //
+    // The middleware that wraps this function is tested via integration tests
+    // in `backend/tests/download_ticket_tests.rs`, but those are gated on a
+    // running HTTP server and so do not contribute to lib coverage. Calling
+    // the helper directly with a `connect_lazy` pool exercises the early
+    // method-rejection branch and the validate-fails-no-such-ticket branch
+    // which together form the bulk of the consumer middleware's logic.
+    // -----------------------------------------------------------------------
+
+    fn lazy_pool() -> sqlx::PgPool {
+        // `connect_lazy_with` defers the actual TCP/handshake attempt until
+        // the first query. The 1-second acquire timeout keeps tests fast: if
+        // a path we did not intend to exercise reaches the pool, it errors
+        // out in a second instead of stalling on the default 30s timeout.
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_ticket_auth_rejects_post() {
+        // Write methods short-circuit before any DB query, so we do not need
+        // a working pool to exercise this branch.
+        let pool = lazy_pool();
+        let got = try_resolve_ticket_auth(&pool, "anyticket", &Method::POST, "/x").await;
+        assert!(got.is_none(), "POST must not be authenticated by ticket");
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_ticket_auth_rejects_put() {
+        let pool = lazy_pool();
+        let got = try_resolve_ticket_auth(&pool, "t", &Method::PUT, "/x").await;
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_ticket_auth_rejects_delete() {
+        let pool = lazy_pool();
+        let got = try_resolve_ticket_auth(&pool, "t", &Method::DELETE, "/x").await;
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_ticket_auth_rejects_patch() {
+        let pool = lazy_pool();
+        let got = try_resolve_ticket_auth(&pool, "t", &Method::PATCH, "/x").await;
+        assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_ticket_auth_db_unreachable_returns_none() {
+        // GET passes the method check, runs validate_download_ticket against
+        // the lazy pool, and the unreachable DB makes that call error out.
+        // The `.ok()??` chain converts the error into None, which is what the
+        // middleware needs in order to fall through to a 401.
+        let pool = lazy_pool();
+        let got = try_resolve_ticket_auth(&pool, "no-such-ticket", &Method::GET, "/x").await;
+        assert!(got.is_none(), "DB error must surface as None, not a panic");
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_ticket_for_parts_db_unreachable_returns_none() {
+        // Same shape as above, exercised through the parts-bundle wrapper that
+        // the middleware actually calls. Asserts that the wrapper does not add
+        // any extra fallibility on top of try_resolve_ticket_auth itself.
+        let pool = lazy_pool();
+        let parts = TicketRequestParts {
+            ticket: "no-such".to_string(),
+            method: Method::GET,
+            path: "/x".to_string(),
+        };
+        assert!(try_resolve_ticket_for_parts(&pool, &parts).await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // auth_middleware end-to-end shape via tower::ServiceExt::oneshot.
+    //
+    // These tests instantiate a real Router with the middleware applied, then
+    // drive it through tower's `oneshot`. The downstream handler is a tiny
+    // probe so we can assert that the middleware short-circuited (returned
+    // 401 without touching the handler) or fell through (returned 200).
+    // -----------------------------------------------------------------------
+
+    fn make_test_config_for_middleware() -> std::sync::Arc<crate::config::Config> {
+        // Mirrors the helper in the auth_service tests module. Keep the JWT
+        // secret long enough to satisfy any future minimum-length check.
+        std::sync::Arc::new(crate::config::Config {
+            database_url: "postgresql://unused".to_string(),
+            bind_address: "0.0.0.0:8080".to_string(),
+            log_level: "info".to_string(),
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/test".to_string(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
+            jwt_expiration_secs: 86400,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "standard".to_string(),
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/tmp".to_string(),
+            demo_mode: false,
+            peer_instance_name: "test".to_string(),
+            peer_public_endpoint: "http://localhost:8080".to_string(),
+            peer_api_key: "test-key".to_string(),
+            dependency_track_url: None,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "test".to_string(),
+            gc_schedule: "0 0 * * * *".to_string(),
+            lifecycle_check_interval_secs: 60,
+            max_upload_size_bytes: 10_737_418_240,
+            allow_local_admin_login: false,
+            proxy_max_concurrent_fetches: 20,
+            proxy_max_artifact_size_bytes: 2_147_483_648,
+            proxy_queue_timeout_secs: 30,
+            metrics_port: None,
+        })
+    }
+
+    fn make_test_auth_service() -> Arc<AuthService> {
+        // The lazy pool means AuthService construction is free; queries that
+        // actually reach the DB will error out, which is what we want when
+        // exercising "auth fails, fall through" branches.
+        let pool = lazy_pool();
+        Arc::new(AuthService::new(pool, make_test_config_for_middleware()))
+    }
+
+    async fn run_through_auth_middleware(
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+
+        let auth_service = make_test_auth_service();
+        let app: Router = Router::new()
+            .route(
+                "/probe",
+                any(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .route("/api/v1/auth/me", any(|| async { (StatusCode::OK, "me") }))
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                auth_middleware,
+            ));
+        app.oneshot(request).await.unwrap()
+    }
+
+    async fn run_through_optional_auth(
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+
+        let auth_service = make_test_auth_service();
+        let app: Router = Router::new()
+            .route("/probe", any(|| async { (StatusCode::OK, "ok") }))
+            .layer(middleware::from_fn_with_state(
+                auth_service,
+                optional_auth_middleware,
+            ));
+        app.oneshot(request).await.unwrap()
+    }
+
+    fn empty_get(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_rejects_missing_credentials() {
+        let resp = run_through_auth_middleware(empty_get("/probe")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Missing authorization header"),
+            "expected missing-header message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_rejects_invalid_auth_header_format() {
+        // A scheme that is neither Bearer/ApiKey/Basic falls into the
+        // ExtractedToken::Invalid branch and produces the format error.
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", "Garbage tokenvalue")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_auth_middleware(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Invalid authorization header format"),
+            "expected invalid-format message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_rejects_bearer_with_unverifiable_token() {
+        // The Bearer branch first tries JWT decode (fails), then API token
+        // validation (fails because the lazy pool is unreachable). Both fall
+        // through to the "Invalid or expired token" 401.
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", "Bearer not-a-real-jwt")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_auth_middleware(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Invalid or expired token"),
+            "expected expired-token message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_rejects_apikey_scheme_with_bad_token() {
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", "ApiKey deadbeef")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_auth_middleware(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Invalid or expired API token"),
+            "expected ApiKey-failed message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_rejects_basic_with_invalid_b64() {
+        // `decode_basic_credentials` returns None for non-base64 input. The
+        // resulting branch is the `None` arm at lines 333-335.
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", "Basic !!!not-base64!!!")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_auth_middleware(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Invalid Basic auth credentials"),
+            "expected basic-credentials message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_rejects_basic_with_unauthenticatable_user() {
+        // Valid base64 with `user:pass` shape, but the lazy pool means
+        // `authenticate` errors out, so the branch returns "Invalid credentials".
+        let creds = base64::engine::general_purpose::STANDARD.encode("alice:wrong");
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", format!("Basic {}", creds))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_auth_middleware(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Invalid credentials"),
+            "expected invalid-credentials message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_no_header_with_ticket_query_uses_ticket_message() {
+        // No header credentials at all, but a `?ticket=` query is present.
+        // The middleware tries the ticket fallback (DB unreachable -> None)
+        // and produces the ambiguous "Invalid or expired download ticket"
+        // message rather than the generic header-missing one.
+        let resp = run_through_auth_middleware(empty_get("/probe?ticket=xyz")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Invalid or expired download ticket"),
+            "expected ticket-failure message, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_header_present_with_ticket_keeps_header_message() {
+        // When header credentials are present (and fail), even an additional
+        // `?ticket=` query must NOT switch the response to the ticket-specific
+        // message: otherwise an attacker could discover whether their bearer
+        // token landed in the JWT or API-token bucket. Keep the header-error.
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe?ticket=xyz")
+            .header("Authorization", "Bearer not-a-real-jwt")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_auth_middleware(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("Invalid or expired token"),
+            "expected token-failure message (not ticket message), got: {text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // optional_auth_middleware: must always pass through to the handler with
+    // Option<AuthExtension> in extensions, even when auth fails.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_optional_auth_middleware_passes_through_without_credentials() {
+        let resp = run_through_optional_auth(empty_get("/probe")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_optional_auth_middleware_passes_through_with_bad_bearer() {
+        // Bad Bearer + ?ticket= query: both fail (lazy pool). Middleware must
+        // still pass through to the handler with `None` auth extension.
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe?ticket=xyz")
+            .header("Authorization", "Bearer not-a-real-jwt")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_optional_auth(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_optional_auth_middleware_passes_through_with_invalid_header() {
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .header("Authorization", "GarbageScheme x")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_optional_auth(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // repo_visibility_middleware exercised with a pre-populated repo cache so
+    // we can drive both branches (public vs private, write vs read) without
+    // ever hitting the unreachable lazy DB pool.
+    // -----------------------------------------------------------------------
+
+    fn make_vis_state(cached: Option<(String, CachedRepo)>) -> RepoVisibilityState {
+        let auth_service = make_test_auth_service();
+        let pool = lazy_pool();
+        let cache: RepoCache =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        if let Some((key, entry)) = cached {
+            cache
+                .write()
+                .unwrap()
+                .insert(key, (entry, std::time::Instant::now()));
+        }
+        RepoVisibilityState {
+            auth_service,
+            db: pool,
+            repo_cache: cache,
+        }
+    }
+
+    fn make_cached_repo(is_public: bool) -> CachedRepo {
+        CachedRepo {
+            id: Uuid::new_v4(),
+            format: "pypi".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+            storage_path: "/tmp".to_string(),
+            storage_backend: "filesystem".to_string(),
+            is_public,
+            index_upstream_url: None,
+        }
+    }
+
+    async fn run_through_visibility(
+        state: RepoVisibilityState,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Response<axum::body::Body> {
+        use axum::{middleware, routing::any, Router};
+        use tower::ServiceExt;
+
+        let app: Router = Router::new()
+            // Use a single permissive fallback so the test does not need to
+            // mirror every possible route shape — the middleware runs first
+            // and decides whether to call the handler.
+            .fallback(any(|| async { (StatusCode::OK, "handler-reached") }))
+            .layer(middleware::from_fn_with_state(
+                state,
+                repo_visibility_middleware,
+            ));
+        app.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_pass_through_when_no_repo_key() {
+        // A path with no repo segment short-circuits at the empty-key check,
+        // before the cache is touched. Hitting `/` for example.
+        let state = make_vis_state(None);
+        let resp = run_through_visibility(state, empty_get("/")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_read_no_auth_passes() {
+        // Public repo + GET + no auth header: must pass through to the handler.
+        let key = "myrepo";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached)));
+        let resp = run_through_visibility(state, empty_get("/pypi/myrepo/simple/")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_private_read_no_auth_returns_401() {
+        let key = "private";
+        let cached = make_cached_repo(/* is_public */ false);
+        let state = make_vis_state(Some((key.to_string(), cached)));
+        let resp = run_through_visibility(state, empty_get("/pypi/private/simple/")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_write_no_auth_returns_401() {
+        // Even on a public repo, writes must require auth (#508). With a
+        // ticket-only fallback the ticket is also rejected because writes
+        // strip the auth ext via `has_write_auth = ext.is_some() && !ticket`.
+        let key = "myrepo";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached)));
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/pypi/myrepo/upload")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_public_read_with_ticket_query_falls_through() {
+        // The ticket fallback hits the unreachable lazy DB pool and returns
+        // None. The repo is public, so read access still succeeds — the
+        // ticket-resolution attempt must not block legitimate anonymous reads.
+        let key = "myrepo";
+        let cached = make_cached_repo(/* is_public */ true);
+        let state = make_vis_state(Some((key.to_string(), cached)));
+        let resp =
+            run_through_visibility(state, empty_get("/pypi/myrepo/simple/?ticket=anything")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_repo_visibility_private_write_with_ticket_query_returns_401() {
+        // Even if a ticket somehow validated, ticket-authenticated writes are
+        // refused. With the lazy pool the ticket trivially fails to resolve
+        // and the request is still anonymous, so the same 401 applies.
+        let key = "private";
+        let cached = make_cached_repo(/* is_public */ false);
+        let state = make_vis_state(Some((key.to_string(), cached)));
+        let req = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/pypi/private/upload?ticket=abc")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

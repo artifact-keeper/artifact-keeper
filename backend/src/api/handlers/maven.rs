@@ -51,11 +51,41 @@ async fn resolve_maven_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
 // Path helpers
 // ---------------------------------------------------------------------------
 
+/// Escape SQL LIKE metacharacters in a user-supplied literal so it can be
+/// safely concatenated into a LIKE pattern.
+///
+/// The returned string is intended to be used with an `ESCAPE '\'` clause.
+/// Three characters are escaped: the escape character `\` itself (must come
+/// first so we do not double-escape escapes we just inserted), the
+/// zero-or-more wildcard `%`, and the single-character wildcard `_`.
+///
+/// Without this, user-controlled segments in artifact paths could inject LIKE
+/// wildcards and cause queries to match unrelated artifact rows in the same
+/// repository (wrong artifact served, information disclosure).
+fn escape_like_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Given a `-SNAPSHOT` artifact path, build a SQL LIKE pattern that matches
 /// the corresponding timestamp-resolved filename stored in the database.
 ///
 /// Example: `com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar`
 ///       -> `com/example/lib/1.0-SNAPSHOT/lib-1.0-%.jar`
+///
+/// User-supplied LIKE metacharacters (`%`, `_`, `\`) in the path are escaped
+/// so they match literally; only the `%` introduced by this function in place
+/// of `-SNAPSHOT` is treated as a wildcard. Callers MUST pair the returned
+/// pattern with an `ESCAPE '\'` clause in the SQL query.
 ///
 /// Returns `None` if the path does not contain a `-SNAPSHOT` filename segment.
 fn snapshot_like_pattern(path: &str) -> Option<String> {
@@ -71,19 +101,34 @@ fn snapshot_like_pattern(path: &str) -> Option<String> {
         return None;
     }
 
-    // Replace `-SNAPSHOT` in the filename with `-%` for the LIKE pattern.
-    // The filename may be e.g. "lib-1.0-SNAPSHOT.jar" or "lib-1.0-SNAPSHOT-sources.jar".
-    // We want to match   "lib-1.0-20260304.095300-1.jar" / "...-sources.jar".
+    // The base version is taken from the request directory and is itself
+    // user-controlled, so it must be LIKE-escaped before being interpolated.
+    // The `-SNAPSHOT` suffix and the `-%` we introduce ourselves are trusted
+    // literals (the `%` is the one and only intentional wildcard).
     let base_version = version_dir.strip_suffix("-SNAPSHOT").unwrap();
     let snapshot_token = format!("{}-SNAPSHOT", base_version);
-    let timestamp_wildcard = format!("{}-%", base_version);
 
     if !filename.contains(&snapshot_token) {
         return None;
     }
 
-    let resolved_filename = filename.replace(&snapshot_token, &timestamp_wildcard);
-    let dir = parts[..parts.len() - 1].join("/");
+    // Build the escaped pieces of the resulting pattern. We split on the
+    // (un-escaped) snapshot_token first, escape each surrounding fragment of
+    // user input, then join with the trusted `-%` wildcard substitute.
+    let escaped_base_version = escape_like_literal(base_version);
+    let escaped_filename_segments: Vec<String> = filename
+        .split(&snapshot_token)
+        .map(escape_like_literal)
+        .collect();
+    let timestamp_wildcard_escaped = format!("{}-%", escaped_base_version);
+    let resolved_filename = escaped_filename_segments.join(&timestamp_wildcard_escaped);
+
+    // Every directory segment is also user-controlled and must be escaped.
+    let dir = parts[..parts.len() - 1]
+        .iter()
+        .map(|seg| escape_like_literal(seg))
+        .collect::<Vec<_>>()
+        .join("/");
     Some(format!("{}/{}", dir, resolved_filename))
 }
 
@@ -100,13 +145,18 @@ async fn resolve_snapshot_artifact(
     // Use runtime sqlx::query (not the query! macro) to avoid needing an
     // offline cache entry. The LIKE pattern matches timestamped filenames
     // and we pick the latest one by created_at.
+    //
+    // `pattern` is built by `snapshot_like_pattern`, which escapes any LIKE
+    // metacharacters (`%`, `_`, `\`) coming from user input so only the
+    // intentional `%` in place of `-SNAPSHOT` acts as a wildcard. The
+    // `ESCAPE '\'` clause makes that contract explicit to PostgreSQL.
     let row = sqlx::query(
         r#"
         SELECT id, storage_key, checksum_sha256, path
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE $2
+          AND path LIKE $2 ESCAPE '\'
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -131,6 +181,79 @@ struct ResolvedSnapshot {
     path: String,
 }
 
+/// Collect all stored timestamped SNAPSHOT files in a specific version directory
+/// for a given member repository. Returns the parsed `SnapshotEntry`s ready to
+/// feed into [`generate_snapshot_metadata_xml`].
+async fn collect_snapshot_entries(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> Vec<SnapshotEntry> {
+    // Build the directory path: com/example/my-lib/1.0-SNAPSHOT/
+    // group_id, artifact_id and version are all derived from the user's
+    // request path, so each segment must be LIKE-escaped before we append the
+    // trailing `%` directory wildcard. Without escaping, an attacker could
+    // inject `%` or `_` (e.g., a `version` of `1.0-SNAPSHOT_evil`) to enumerate
+    // unrelated artifacts in the same repository.
+    let group_path = escape_like_literal(&group_id.replace('.', "/"));
+    let dir_prefix = format!(
+        "{}/{}/{}/",
+        group_path,
+        escape_like_literal(artifact_id),
+        escape_like_literal(version)
+    );
+    let like_pattern = format!("{}%", dir_prefix);
+
+    // Fetch every artifact under that version directory. We do NOT restrict the
+    // filename to timestamp-bearing forms here; the extractor below ignores any
+    // filenames that don't match the expected pattern.
+    let rows = match sqlx::query(
+        r#"
+        SELECT path
+        FROM artifacts
+        WHERE repository_id = $1
+          AND is_deleted = false
+          AND path LIKE $2 ESCAPE '\'
+        "#,
+    )
+    .bind(repo_id)
+    .bind(&like_pattern)
+    .fetch_all(db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    use sqlx::Row;
+    let base_version = match version.strip_suffix("-SNAPSHOT") {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+
+    let mut entries: Vec<SnapshotEntry> = Vec::new();
+    for row in rows {
+        let path: String = row.get("path");
+        // Only files directly inside the version directory contribute.
+        let filename = match path.rsplit('/').next() {
+            Some(f) => f,
+            None => continue,
+        };
+        if let Some(info) = extract_snapshot_info_from_filename(filename, artifact_id, base_version)
+        {
+            entries.push(SnapshotEntry {
+                classifier: info.classifier,
+                extension: info.extension,
+                timestamp: info.timestamp,
+                build_number: info.build_number,
+            });
+        }
+    }
+    entries
+}
+
 fn checksum_suffix(ct: ChecksumType) -> &'static str {
     match ct {
         ChecksumType::Md5 => "md5",
@@ -138,6 +261,36 @@ fn checksum_suffix(ct: ChecksumType) -> &'static str {
         ChecksumType::Sha256 => "sha256",
         ChecksumType::Sha512 => "sha512",
     }
+}
+
+/// Maven-specific fallback for [`proxy_helpers::local_fetch_by_path`] that
+/// resolves a `-SNAPSHOT` filename alias to the latest timestamped artifact.
+///
+/// Returns the same shape as `local_fetch_by_path` so it can be dropped into
+/// the `resolve_virtual_download` callback.
+async fn maven_local_fetch_snapshot(
+    db: &PgPool,
+    state: &SharedState,
+    repo_id: uuid::Uuid,
+    location: &crate::storage::StorageLocation,
+    path: &str,
+) -> Result<(Bytes, Option<String>), Response> {
+    if !path.contains("-SNAPSHOT") {
+        return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
+    }
+
+    let resolved = resolve_snapshot_artifact(db, repo_id, path)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
+
+    let storage = state.storage_for_repo_or_500(location)?;
+    let content = storage
+        .get(&resolved.storage_key)
+        .await
+        .map_err(map_storage_err)?;
+
+    let ct = content_type_for_path(path).to_string();
+    Ok((content, Some(ct)))
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +329,303 @@ fn parse_metadata_path(path: &str) -> Option<(String, String)> {
 /// Artifact IDs practically never start with a digit.
 fn looks_like_maven_version(s: &str) -> bool {
     s.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Parse a SNAPSHOT version-level metadata path and return (groupId, artifactId, version).
+///
+/// Example: `com/example/my-lib/1.0-SNAPSHOT/maven-metadata.xml`
+///       -> `Some(("com.example", "my-lib", "1.0-SNAPSHOT"))`
+///
+/// Returns `None` for non-SNAPSHOT version paths and for artifact-level metadata paths.
+fn parse_snapshot_metadata_path(path: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    // Minimum: groupSegment/artifactId/version/maven-metadata.xml
+    if parts.len() < 4 {
+        return None;
+    }
+    if parts[parts.len() - 1] != "maven-metadata.xml" {
+        return None;
+    }
+    let version = parts[parts.len() - 2];
+    if !version.ends_with("-SNAPSHOT") {
+        return None;
+    }
+    let artifact_id = parts[parts.len() - 3].to_string();
+    let group_id = parts[..parts.len() - 3].join(".");
+    Some((group_id, artifact_id, version.to_string()))
+}
+
+/// Information extracted from a timestamped SNAPSHOT filename.
+///
+/// Example: filename `mylib-1.0-20260101.120000-3-sources.jar`
+///   with base version `1.0` ->
+/// `SnapshotFileInfo { timestamp: "20260101.120000", build_number: 3,
+///                     classifier: Some("sources"), extension: "jar" }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFileInfo {
+    timestamp: String,
+    build_number: u32,
+    classifier: Option<String>,
+    extension: String,
+}
+
+/// Parse a timestamped SNAPSHOT filename to extract its snapshot components.
+///
+/// The expected form is `{artifactId}-{baseVersion}-{YYYYMMDD.HHMMSS}-{N}[-{classifier}].{extension}`.
+/// Returns `None` if the filename does not match this pattern.
+fn extract_snapshot_info_from_filename(
+    filename: &str,
+    artifact_id: &str,
+    base_version: &str,
+) -> Option<SnapshotFileInfo> {
+    // Strip the extension (handle common compound extensions like tar.gz).
+    let (stem, extension) = if let Some(stem) = filename.strip_suffix(".tar.gz") {
+        (stem, "tar.gz".to_string())
+    } else {
+        let dot = filename.rfind('.')?;
+        (&filename[..dot], filename[dot + 1..].to_string())
+    };
+
+    // Strip the `{artifactId}-{baseVersion}-` prefix.
+    let prefix = format!("{}-{}-", artifact_id, base_version);
+    let rest = stem.strip_prefix(&prefix)?;
+
+    // Now rest is `{YYYYMMDD.HHMMSS}-{N}` or `{YYYYMMDD.HHMMSS}-{N}-{classifier}`.
+    // Find the timestamp segment: must contain exactly one '.' and be 15 chars (8.6).
+    let mut segments = rest.splitn(3, '-');
+    let ts = segments.next()?;
+    let build_str = segments.next()?;
+    let classifier = segments.next().map(|s| s.to_string());
+
+    // Validate the timestamp looks like YYYYMMDD.HHMMSS.
+    if ts.len() != 15 || ts.as_bytes().get(8) != Some(&b'.') {
+        return None;
+    }
+    if !ts.bytes().enumerate().all(|(i, b)| {
+        if i == 8 {
+            b == b'.'
+        } else {
+            b.is_ascii_digit()
+        }
+    }) {
+        return None;
+    }
+
+    let build_number: u32 = build_str.parse().ok()?;
+
+    Some(SnapshotFileInfo {
+        timestamp: ts.to_string(),
+        build_number,
+        classifier,
+        extension,
+    })
+}
+
+/// A resolved snapshot file descriptor used when building snapshot metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotEntry {
+    /// Classifier, if any (e.g. "sources", "javadoc").
+    classifier: Option<String>,
+    /// Extension without the leading dot (e.g. "jar", "pom", "tar.gz").
+    extension: String,
+    /// Timestamp string in `YYYYMMDD.HHMMSS` form.
+    timestamp: String,
+    /// Build number for the snapshot.
+    build_number: u32,
+}
+
+/// Build the `value` field for a snapshotVersion entry: `{baseVersion}-{timestamp}-{N}`.
+fn snapshot_version_value(base_version: &str, entry: &SnapshotEntry) -> String {
+    format!(
+        "{}-{}-{}",
+        base_version, entry.timestamp, entry.build_number
+    )
+}
+
+/// Parse `<snapshotVersion>` elements out of a SNAPSHOT maven-metadata.xml.
+///
+/// The parser is intentionally lightweight (string-splitting) to match the
+/// style of [`parse_metadata_versions`] elsewhere in the code base.
+fn parse_snapshot_versions_xml(xml: &str) -> Vec<SnapshotEntry> {
+    let mut out = Vec::new();
+    let snapshot_versions_block = match xml
+        .split("<snapshotVersions>")
+        .nth(1)
+        .and_then(|s| s.split("</snapshotVersions>").next())
+    {
+        Some(block) => block,
+        None => return out,
+    };
+
+    for segment in snapshot_versions_block.split("<snapshotVersion>").skip(1) {
+        let item = match segment.split("</snapshotVersion>").next() {
+            Some(i) => i,
+            None => continue,
+        };
+        let extension = item
+            .split("<extension>")
+            .nth(1)
+            .and_then(|s| s.split("</extension>").next())
+            .map(|s| s.trim().to_string());
+        let value = item
+            .split("<value>")
+            .nth(1)
+            .and_then(|s| s.split("</value>").next())
+            .map(|s| s.trim().to_string());
+        let classifier = item
+            .split("<classifier>")
+            .nth(1)
+            .and_then(|s| s.split("</classifier>").next())
+            .map(|s| s.trim().to_string());
+
+        let (Some(ext), Some(val)) = (extension, value) else {
+            continue;
+        };
+
+        // Value is `{baseVersion}-{timestamp}-{buildNumber}`. The timestamp is
+        // a 15-char `YYYYMMDD.HHMMSS` segment. The base version itself may
+        // contain dots (`1.0`, `1.2.3`), so we must scan for a timestamp-
+        // shaped segment bounded by `-` on both sides rather than anchoring
+        // on the first `.`.
+        let bytes = val.as_bytes();
+        let mut parsed: Option<(String, u32)> = None;
+        for ts_start in 0..val.len().saturating_sub(15) {
+            // Must be preceded by `-` (timestamp follows the base version).
+            if ts_start == 0 || bytes[ts_start - 1] != b'-' {
+                continue;
+            }
+            let ts_end = ts_start + 15;
+            if ts_end >= val.len() {
+                break;
+            }
+            // Must be YYYYMMDD.HHMMSS then `-`.
+            if bytes[ts_end] != b'-' {
+                continue;
+            }
+            let ts = &val[ts_start..ts_end];
+            let shape_ok = ts.bytes().enumerate().all(|(i, b)| {
+                if i == 8 {
+                    b == b'.'
+                } else {
+                    b.is_ascii_digit()
+                }
+            });
+            if !shape_ok {
+                continue;
+            }
+            let Ok(build_number) = val[ts_end + 1..].parse::<u32>() else {
+                continue;
+            };
+            parsed = Some((ts.to_string(), build_number));
+            break;
+        }
+        let Some((timestamp, build_number)) = parsed else {
+            continue;
+        };
+
+        out.push(SnapshotEntry {
+            classifier,
+            extension: ext,
+            timestamp,
+            build_number,
+        });
+    }
+    out
+}
+
+/// Generate `maven-metadata.xml` for a SNAPSHOT version folder.
+///
+/// `version` is the `-SNAPSHOT` alias (e.g. `1.0-SNAPSHOT`). `entries` is the set
+/// of (classifier, extension, timestamp, buildNumber) triples found for this folder
+/// across one or more member repos. Only the latest timestamp/buildNumber wins
+/// inside the top-level `<snapshot>` block; all entries are listed under
+/// `<snapshotVersions>`.
+fn generate_snapshot_metadata_xml(
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+    entries: &[SnapshotEntry],
+) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let base_version = version.strip_suffix("-SNAPSHOT")?;
+
+    // Pick the latest (timestamp, buildNumber) for the top-level snapshot block.
+    // Ordering is lexicographic on timestamp then numeric on build_number.
+    let latest = entries
+        .iter()
+        .max_by(|a, b| {
+            a.timestamp
+                .cmp(&b.timestamp)
+                .then(a.build_number.cmp(&b.build_number))
+        })
+        .unwrap();
+
+    // Deduplicate entries: keep the latest (timestamp, buildNumber) per
+    // (classifier, extension) key. Same logical file may appear in multiple
+    // member repos; the most recent wins.
+    let mut dedup: std::collections::BTreeMap<(Option<String>, String), SnapshotEntry> =
+        std::collections::BTreeMap::new();
+    for e in entries {
+        let key = (e.classifier.clone(), e.extension.clone());
+        dedup
+            .entry(key)
+            .and_modify(|existing| {
+                if (e.timestamp.as_str(), e.build_number)
+                    > (existing.timestamp.as_str(), existing.build_number)
+                {
+                    *existing = e.clone();
+                }
+            })
+            .or_insert_with(|| e.clone());
+    }
+
+    let last_updated = latest.timestamp.replace('.', "");
+
+    let mut snapshot_versions = String::new();
+    for entry in dedup.values() {
+        let value = snapshot_version_value(base_version, entry);
+        let classifier_line = match &entry.classifier {
+            Some(c) => format!("        <classifier>{}</classifier>\n", c),
+            None => String::new(),
+        };
+        let updated = entry.timestamp.replace('.', "");
+        snapshot_versions.push_str(&format!(
+            "      <snapshotVersion>\n\
+{classifier_line}        <extension>{ext}</extension>\n        <value>{value}</value>\n        <updated>{updated}</updated>\n      </snapshotVersion>\n",
+            ext = entry.extension,
+            value = value,
+            updated = updated,
+            classifier_line = classifier_line,
+        ));
+    }
+
+    Some(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>{group_id}</groupId>
+  <artifactId>{artifact_id}</artifactId>
+  <version>{version}</version>
+  <versioning>
+    <snapshot>
+      <timestamp>{timestamp}</timestamp>
+      <buildNumber>{build_number}</buildNumber>
+    </snapshot>
+    <lastUpdated>{last_updated}</lastUpdated>
+    <snapshotVersions>
+{snapshot_versions}    </snapshotVersions>
+  </versioning>
+</metadata>
+"#,
+        group_id = group_id,
+        artifact_id = artifact_id,
+        version = version,
+        timestamp = latest.timestamp,
+        build_number = latest.build_number,
+        last_updated = last_updated,
+        snapshot_versions = snapshot_versions,
+    ))
 }
 
 /// Check if a path is a checksum request. Returns the base path and checksum type.
@@ -381,6 +831,77 @@ async fn download(
                         .header(CONTENT_LENGTH, xml.len().to_string())
                         .body(Body::from(xml))
                         .unwrap());
+                }
+            }
+
+            // Virtual repo: SNAPSHOT version-level metadata (#839).
+            // parse_metadata_path returns None for `g/a/v-SNAPSHOT/maven-metadata.xml`
+            // paths, so we handle those separately here. For each member, try the
+            // stored metadata file first, then generate from member artifacts, then
+            // proxy from upstream for remote members.
+            if let Some((group_id, artifact_id, version)) = parse_snapshot_metadata_path(&path) {
+                let mut all_entries: Vec<SnapshotEntry> = Vec::new();
+
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                for member in &members {
+                    // First try the member's stored maven-metadata.xml directly.
+                    // This captures uploads that deployed a precomputed metadata file.
+                    let member_storage_key = format!("maven/{}", path);
+                    if let Ok(member_storage) = state.storage_for_repo(&member.storage_location()) {
+                        if let Ok(content) = member_storage.get(&member_storage_key).await {
+                            if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                all_entries.extend(parse_snapshot_versions_xml(xml_str));
+                            }
+                        }
+                    }
+
+                    // Collect entries directly from the member's artifact rows.
+                    let entries = collect_snapshot_entries(
+                        &state.db,
+                        member.id,
+                        &group_id,
+                        &artifact_id,
+                        &version,
+                    )
+                    .await;
+                    all_entries.extend(entries);
+
+                    // For remote members, also try proxying the upstream metadata.
+                    if member.repo_type == RepositoryType::Remote {
+                        if let (Some(upstream_url), Some(ref proxy)) =
+                            (member.upstream_url.as_deref(), &state.proxy_service)
+                        {
+                            if let Ok((content, _)) = proxy_helpers::proxy_fetch(
+                                proxy,
+                                member.id,
+                                &member.key,
+                                upstream_url,
+                                &path,
+                            )
+                            .await
+                            {
+                                if let Ok(xml_str) = std::str::from_utf8(&content) {
+                                    all_entries.extend(parse_snapshot_versions_xml(xml_str));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !all_entries.is_empty() {
+                    if let Some(xml) = generate_snapshot_metadata_xml(
+                        &group_id,
+                        &artifact_id,
+                        &version,
+                        &all_entries,
+                    ) {
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "text/xml")
+                            .header(CONTENT_LENGTH, xml.len().to_string())
+                            .body(Body::from(xml))
+                            .unwrap());
+                    }
                 }
             }
         }
@@ -627,7 +1148,26 @@ async fn serve_artifact(
                         let state = state.clone();
                         let artifact_path = artifact_path.clone();
                         async move {
-                            proxy_helpers::local_fetch_by_path(
+                            // Fast path: strict path match (covers release artifacts
+                            // and SNAPSHOT files deployed under their `-SNAPSHOT` alias).
+                            if let Ok(result) = proxy_helpers::local_fetch_by_path(
+                                &db,
+                                &state,
+                                member_id,
+                                &location,
+                                &artifact_path,
+                            )
+                            .await
+                            {
+                                return Ok(result);
+                            }
+
+                            // Fallback: SNAPSHOT alias resolution (#839).
+                            // Maven deploys store SNAPSHOTs under timestamped filenames
+                            // (`foo-1.0-20260101.120000-1.jar`). The client still asks
+                            // for the `-SNAPSHOT` filename, so map that alias to the
+                            // latest timestamped file before giving up.
+                            maven_local_fetch_snapshot(
                                 &db,
                                 &state,
                                 member_id,
@@ -995,7 +1535,9 @@ async fn upload(
     // This groups POM, JAR, sources, javadoc, etc. under a single record
     // so the UI shows one package per GAV instead of separate entries.
     let gav_existing: Option<(uuid::Uuid, String, String, Option<serde_json::Value>)> = {
-        let gav_pattern = format!("{}%", gav_dir);
+        // gav_dir comes from the user-supplied request path; escape LIKE
+        // metacharacters so the trailing `%` is the only wildcard.
+        let gav_pattern = format!("{}%", escape_like_literal(gav_dir));
         let row = sqlx::query(
             r#"
             SELECT a.id, a.path, a.storage_key, am.metadata
@@ -1003,7 +1545,7 @@ async fn upload(
             LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
             WHERE a.repository_id = $1
               AND a.is_deleted = false
-              AND a.path LIKE $2
+              AND a.path LIKE $2 ESCAPE '\'
               AND a.name = $3
               AND a.version = $4
             ORDER BY a.created_at ASC
@@ -1675,6 +2217,71 @@ mod tests {
         );
     }
 
+    /// Regression: user-supplied `%` and `_` characters in the request path
+    /// must NOT be passed through as SQL LIKE wildcards. An attacker crafting
+    /// a request like `com/x/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT%.jar` could
+    /// otherwise match arbitrary timestamped artifacts whose filenames have
+    /// any content after the (legitimate) wildcard segment, instead of only
+    /// the exact `.jar` extension. With a `repository_id` constraint the
+    /// blast radius is bounded to a single repo, but it still serves the
+    /// wrong artifact and discloses the existence of unrelated rows.
+    ///
+    /// Expected behavior: literal `%` / `_` in user input must be escaped so
+    /// the resulting LIKE pattern only contains intentional wildcards. The
+    /// returned pattern must be paired with an `ESCAPE '\'` clause in the SQL.
+    #[test]
+    fn test_snapshot_like_pattern_escapes_user_wildcard_percent() {
+        // Attacker appends a literal `%` so the LIKE matches any suffix.
+        let result = snapshot_like_pattern("com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT%.jar");
+        // The single intentional wildcard introduced by the helper (replacing
+        // `-SNAPSHOT` with `-%`) is allowed; any `%` originating from user
+        // input must be escaped with a backslash so it matches a literal `%`.
+        assert_eq!(
+            result,
+            Some("com/example/lib/1.0-SNAPSHOT/lib-1.0-%\\%.jar".to_string()),
+            "user-supplied `%` must be escaped, not passed through as a wildcard"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_escapes_user_wildcard_underscore() {
+        // `_` is a single-character LIKE wildcard; user input must not be
+        // able to introduce one. Filename keeps the legitimate `-SNAPSHOT`
+        // token but adds a `_` that an attacker controls.
+        let result = snapshot_like_pattern("com/example/lib/1.0-SNAPSHOT/lib_-1.0-SNAPSHOT.jar");
+        assert_eq!(
+            result,
+            Some("com/example/lib/1.0-SNAPSHOT/lib\\_-1.0-%.jar".to_string()),
+            "user-supplied `_` must be escaped, not passed through as a wildcard"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_escapes_user_backslash() {
+        // The escape character itself must also be escaped to avoid breaking
+        // the ESCAPE '\' contract.
+        let result =
+            snapshot_like_pattern("com/example/lib/1.0-SNAPSHOT/lib\\path-1.0-SNAPSHOT.jar");
+        assert_eq!(
+            result,
+            Some("com/example/lib/1.0-SNAPSHOT/lib\\\\path-1.0-%.jar".to_string()),
+            "user-supplied `\\` must be escaped to preserve ESCAPE '\\' semantics"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_like_pattern_escapes_wildcards_in_directory() {
+        // Wildcards in any user-controlled segment (not just the filename)
+        // must also be escaped. The version directory must still end with
+        // `-SNAPSHOT` to trigger the helper.
+        let result = snapshot_like_pattern("com/example/lib%/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar");
+        assert_eq!(
+            result,
+            Some("com/example/lib\\%/1.0-SNAPSHOT/lib-1.0-%.jar".to_string()),
+            "user-supplied wildcards in directory segments must also be escaped"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // checksum_suffix
     // -----------------------------------------------------------------------
@@ -1893,5 +2500,325 @@ mod tests {
             let reconstructed = format!("{}.{}", base, checksum_suffix(ct));
             assert_eq!(reconstructed, path);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_snapshot_metadata_path (#839)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_snapshot_metadata_path_basic() {
+        let result =
+            parse_snapshot_metadata_path("com/example/my-lib/1.0-SNAPSHOT/maven-metadata.xml");
+        assert_eq!(
+            result,
+            Some((
+                "com.example".to_string(),
+                "my-lib".to_string(),
+                "1.0-SNAPSHOT".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_snapshot_metadata_path_deep_group() {
+        let result =
+            parse_snapshot_metadata_path("com/test/artifacthub/0.0.1-SNAPSHOT/maven-metadata.xml");
+        assert_eq!(
+            result,
+            Some((
+                "com.test".to_string(),
+                "artifacthub".to_string(),
+                "0.0.1-SNAPSHOT".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_snapshot_metadata_path_leading_slash() {
+        let result =
+            parse_snapshot_metadata_path("/com/example/lib/2.0-SNAPSHOT/maven-metadata.xml");
+        assert_eq!(
+            result,
+            Some((
+                "com.example".to_string(),
+                "lib".to_string(),
+                "2.0-SNAPSHOT".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_snapshot_metadata_path_release_returns_none() {
+        let result = parse_snapshot_metadata_path("com/example/lib/1.0.0/maven-metadata.xml");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_snapshot_metadata_path_artifact_level_returns_none() {
+        // Artifact-level metadata is handled by parse_metadata_path instead.
+        let result = parse_snapshot_metadata_path("com/example/lib/maven-metadata.xml");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_snapshot_metadata_path_not_metadata_returns_none() {
+        let result =
+            parse_snapshot_metadata_path("com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar");
+        assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_snapshot_info_from_filename (#839)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_snapshot_info_primary_jar() {
+        let info =
+            extract_snapshot_info_from_filename("mylib-1.0-20260101.120000-3.jar", "mylib", "1.0")
+                .unwrap();
+        assert_eq!(info.timestamp, "20260101.120000");
+        assert_eq!(info.build_number, 3);
+        assert_eq!(info.classifier, None);
+        assert_eq!(info.extension, "jar");
+    }
+
+    #[test]
+    fn test_extract_snapshot_info_with_classifier() {
+        let info = extract_snapshot_info_from_filename(
+            "mylib-1.0-20260101.120000-3-sources.jar",
+            "mylib",
+            "1.0",
+        )
+        .unwrap();
+        assert_eq!(info.classifier, Some("sources".to_string()));
+        assert_eq!(info.extension, "jar");
+        assert_eq!(info.build_number, 3);
+    }
+
+    #[test]
+    fn test_extract_snapshot_info_pom() {
+        let info = extract_snapshot_info_from_filename(
+            "artifacthub-0.0.1-20260415.091234-7.pom",
+            "artifacthub",
+            "0.0.1",
+        )
+        .unwrap();
+        assert_eq!(info.extension, "pom");
+        assert_eq!(info.timestamp, "20260415.091234");
+        assert_eq!(info.build_number, 7);
+    }
+
+    #[test]
+    fn test_extract_snapshot_info_tar_gz() {
+        let info = extract_snapshot_info_from_filename(
+            "bundle-1.0-20260101.120000-1.tar.gz",
+            "bundle",
+            "1.0",
+        )
+        .unwrap();
+        assert_eq!(info.extension, "tar.gz");
+    }
+
+    #[test]
+    fn test_extract_snapshot_info_wrong_artifact_returns_none() {
+        let result =
+            extract_snapshot_info_from_filename("other-1.0-20260101.120000-3.jar", "mylib", "1.0");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_snapshot_info_non_timestamped_returns_none() {
+        // Deployed under the SNAPSHOT alias (no timestamp) - not our pattern.
+        let result = extract_snapshot_info_from_filename("mylib-1.0-SNAPSHOT.jar", "mylib", "1.0");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_snapshot_info_bad_timestamp_returns_none() {
+        // Garbage where the timestamp should be.
+        let result =
+            extract_snapshot_info_from_filename("mylib-1.0-notatimestamp-3.jar", "mylib", "1.0");
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // snapshot_version_value
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_snapshot_version_value_basic() {
+        let entry = SnapshotEntry {
+            classifier: None,
+            extension: "jar".into(),
+            timestamp: "20260101.120000".into(),
+            build_number: 3,
+        };
+        assert_eq!(
+            snapshot_version_value("1.0", &entry),
+            "1.0-20260101.120000-3"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_snapshot_metadata_xml (#839)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_snapshot_metadata_xml_single_entry() {
+        let entries = vec![SnapshotEntry {
+            classifier: None,
+            extension: "jar".into(),
+            timestamp: "20260101.120000".into(),
+            build_number: 1,
+        }];
+        let xml = generate_snapshot_metadata_xml("com.example", "mylib", "1.0-SNAPSHOT", &entries)
+            .unwrap();
+        assert!(xml.contains("<groupId>com.example</groupId>"));
+        assert!(xml.contains("<artifactId>mylib</artifactId>"));
+        assert!(xml.contains("<version>1.0-SNAPSHOT</version>"));
+        assert!(xml.contains("<timestamp>20260101.120000</timestamp>"));
+        assert!(xml.contains("<buildNumber>1</buildNumber>"));
+        assert!(xml.contains("<value>1.0-20260101.120000-1</value>"));
+        assert!(xml.contains("<extension>jar</extension>"));
+        assert!(xml.contains("<lastUpdated>20260101120000</lastUpdated>"));
+    }
+
+    #[test]
+    fn test_generate_snapshot_metadata_xml_empty_returns_none() {
+        let xml = generate_snapshot_metadata_xml("com.example", "lib", "1.0-SNAPSHOT", &[]);
+        assert!(xml.is_none());
+    }
+
+    #[test]
+    fn test_generate_snapshot_metadata_xml_non_snapshot_returns_none() {
+        let entries = vec![SnapshotEntry {
+            classifier: None,
+            extension: "jar".into(),
+            timestamp: "20260101.120000".into(),
+            build_number: 1,
+        }];
+        // version must end with -SNAPSHOT
+        let xml = generate_snapshot_metadata_xml("com.example", "lib", "1.0", &entries);
+        assert!(xml.is_none());
+    }
+
+    #[test]
+    fn test_generate_snapshot_metadata_xml_picks_latest_timestamp() {
+        let entries = vec![
+            SnapshotEntry {
+                classifier: None,
+                extension: "jar".into(),
+                timestamp: "20260101.120000".into(),
+                build_number: 1,
+            },
+            SnapshotEntry {
+                classifier: None,
+                extension: "jar".into(),
+                timestamp: "20260201.120000".into(),
+                build_number: 2,
+            },
+        ];
+        let xml = generate_snapshot_metadata_xml("com.example", "mylib", "1.0-SNAPSHOT", &entries)
+            .unwrap();
+        // Top-level snapshot should reflect the later one (20260201 > 20260101).
+        assert!(xml.contains("<timestamp>20260201.120000</timestamp>"));
+        assert!(xml.contains("<buildNumber>2</buildNumber>"));
+    }
+
+    #[test]
+    fn test_generate_snapshot_metadata_xml_with_classifier() {
+        let entries = vec![
+            SnapshotEntry {
+                classifier: None,
+                extension: "jar".into(),
+                timestamp: "20260101.120000".into(),
+                build_number: 1,
+            },
+            SnapshotEntry {
+                classifier: Some("sources".into()),
+                extension: "jar".into(),
+                timestamp: "20260101.120000".into(),
+                build_number: 1,
+            },
+        ];
+        let xml = generate_snapshot_metadata_xml("com.example", "mylib", "1.0-SNAPSHOT", &entries)
+            .unwrap();
+        assert!(xml.contains("<classifier>sources</classifier>"));
+        // Both entries should appear in snapshotVersions.
+        let occurrences = xml.matches("<snapshotVersion>").count();
+        assert_eq!(occurrences, 2);
+    }
+
+    #[test]
+    fn test_generate_snapshot_metadata_xml_dedupes_by_key() {
+        // Two entries for the same (classifier=None, extension=jar) key; the
+        // later timestamp should win and only one snapshotVersion entry emitted.
+        let entries = vec![
+            SnapshotEntry {
+                classifier: None,
+                extension: "jar".into(),
+                timestamp: "20260101.120000".into(),
+                build_number: 1,
+            },
+            SnapshotEntry {
+                classifier: None,
+                extension: "jar".into(),
+                timestamp: "20260201.120000".into(),
+                build_number: 2,
+            },
+        ];
+        let xml = generate_snapshot_metadata_xml("com.example", "mylib", "1.0-SNAPSHOT", &entries)
+            .unwrap();
+        let occurrences = xml.matches("<snapshotVersion>").count();
+        assert_eq!(occurrences, 1);
+        assert!(xml.contains("<value>1.0-20260201.120000-2</value>"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_snapshot_versions_xml (#839)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_snapshot_versions_xml_roundtrip() {
+        // Generate XML from a known set of entries, then parse it back. The
+        // parsed entries must contain every (classifier, extension, timestamp,
+        // buildNumber) from the input.
+        let entries = vec![
+            SnapshotEntry {
+                classifier: None,
+                extension: "jar".into(),
+                timestamp: "20260101.120000".into(),
+                build_number: 1,
+            },
+            SnapshotEntry {
+                classifier: Some("sources".into()),
+                extension: "jar".into(),
+                timestamp: "20260101.120000".into(),
+                build_number: 1,
+            },
+        ];
+        let xml = generate_snapshot_metadata_xml("com.example", "mylib", "1.0-SNAPSHOT", &entries)
+            .unwrap();
+        let parsed = parse_snapshot_versions_xml(&xml);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().any(|e| e.classifier.is_none()
+            && e.extension == "jar"
+            && e.build_number == 1
+            && e.timestamp == "20260101.120000"));
+        assert!(parsed
+            .iter()
+            .any(|e| e.classifier.as_deref() == Some("sources")
+                && e.extension == "jar"
+                && e.build_number == 1
+                && e.timestamp == "20260101.120000"));
+    }
+
+    #[test]
+    fn test_parse_snapshot_versions_xml_no_snapshot_block() {
+        // Metadata without a <snapshotVersions> block yields an empty list.
+        let xml = r#"<metadata><groupId>g</groupId><artifactId>a</artifactId></metadata>"#;
+        let parsed = parse_snapshot_versions_xml(xml);
+        assert!(parsed.is_empty());
     }
 }
