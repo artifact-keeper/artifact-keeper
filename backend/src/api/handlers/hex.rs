@@ -58,12 +58,17 @@ async fn resolve_hex_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
 // GET /hex/{repo_key}/packages/{name} -- Package info (JSON with releases)
 // ---------------------------------------------------------------------------
 
-async fn package_info(
-    State(state): State<SharedState>,
-    Path((repo_key, name)): Path<(String, String)>,
-) -> Result<Response, Response> {
-    let repo = resolve_hex_repo(&state.db, &repo_key).await?;
-
+/// Query a repository's DB for a package and return a JSON response, or
+/// `None` if the package is not present. The tarball URLs in the response
+/// use `repo_key` so that downloads always route through the same repo
+/// endpoint (important for virtual repos: tarballs go through the virtual
+/// repo, which in turn routes to the correct member).
+async fn fetch_package_info_from_repo(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    name: &str,
+) -> Result<Option<Response>, Response> {
     let artifacts = sqlx::query!(
         r#"
         SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -75,10 +80,10 @@ async fn package_info(
           AND LOWER(a.name) = LOWER($2)
         ORDER BY a.created_at DESC
         "#,
-        repo.id,
+        repo_id,
         name
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await
     .map_err(|e| {
         (
@@ -89,89 +94,120 @@ async fn package_info(
     })?;
 
     if artifacts.is_empty() {
-        // Remote: fetch package metadata from the upstream hex registry.
-        if repo.repo_type == RepositoryType::Remote {
-            if let (Some(ref upstream_url), Some(ref proxy)) =
-                (&repo.upstream_url, &state.proxy_service)
-            {
-                let upstream_path = format!("packages/{}", name);
-                let (content, content_type) = proxy_helpers::proxy_fetch(
-                    proxy,
-                    repo.id,
-                    &repo_key,
-                    upstream_url,
-                    &upstream_path,
-                )
-                .await?;
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/json".to_string()),
-                    )
-                    .body(Body::from(content))
-                    .unwrap());
-            }
-        }
-
-        // Virtual: iterate members in priority order, proxy from first remote that has it.
-        if repo.repo_type == RepositoryType::Virtual {
-            let upstream_path = format!("packages/{}", name);
-            return proxy_helpers::resolve_virtual_metadata(
-                &state.db,
-                state.proxy_service.as_deref(),
-                repo.id,
-                &upstream_path,
-                |content, _member_key| async move {
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CONTENT_TYPE, "application/json")
-                        .body(Body::from(content))
-                        .unwrap())
-                },
-            )
-            .await;
-        }
-
-        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+        return Ok(None);
     }
 
     let releases: Vec<serde_json::Value> = artifacts
         .iter()
         .map(|a| {
-            let version = a.version.clone().unwrap_or_default();
-            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
-
-            serde_json::json!({
-                "version": version,
-                "url": tarball_url,
-                "checksum": a.checksum_sha256,
-            })
+            release_entry_json(
+                repo_key,
+                name,
+                &a.version.clone().unwrap_or_default(),
+                &a.checksum_sha256,
+            )
         })
         .collect();
 
-    // Get download count across all versions
     let artifact_ids: Vec<uuid::Uuid> = artifacts.iter().map(|a| a.id).collect();
     let download_count: i64 = sqlx::query_scalar!(
         "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = ANY($1)",
         &artifact_ids
     )
-    .fetch_one(&state.db)
+    .fetch_one(db)
     .await
     .unwrap_or(Some(0))
     .unwrap_or(0);
 
-    let json = serde_json::json!({
-        "name": name,
-        "releases": releases,
-        "downloads": download_count,
-    });
+    let body = package_info_body(name, &releases, download_count);
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap(),
+    ))
+}
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+async fn package_info(
+    State(state): State<SharedState>,
+    Path((repo_key, name)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    let repo = resolve_hex_repo(&state.db, &repo_key).await?;
+
+    if repo.repo_type == RepositoryType::Remote {
+        if let Some(response) =
+            fetch_package_info_from_repo(&state.db, repo.id, &repo_key, &name).await?
+        {
+            return Ok(response);
+        }
+        if let (Some(ref upstream_url), Some(ref proxy)) =
+            (&repo.upstream_url, &state.proxy_service)
+        {
+            let upstream_path = format!("packages/{}", name);
+            let (content, content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path)
+                    .await?;
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/json".to_string()),
+                )
+                .body(Body::from(content))
+                .unwrap());
+        }
+        return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        // Non-Remote members are authoritative for their package names; check
+        // them first regardless of priority configuration.
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote)
+        {
+            if let Some(response) =
+                fetch_package_info_from_repo(&state.db, member.id, &repo_key, &name).await?
+            {
+                return Ok(response);
+            }
+        }
+        // No non-Remote member has this package; fall back to Remote caches.
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+        {
+            if let Some(response) =
+                fetch_package_info_from_repo(&state.db, member.id, &repo_key, &name).await?
+            {
+                return Ok(response);
+            }
+        }
+        // Not in any member DB: try upstream proxy for uncached remote members.
+        let upstream_path = format!("packages/{}", name);
+        return proxy_helpers::resolve_virtual_metadata(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &upstream_path,
+            |content, _member_key| async move {
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(content))
+                    .unwrap())
+            },
+        )
+        .await;
+    }
+
+    // Local/Hosted
+    match fetch_package_info_from_repo(&state.db, repo.id, &repo_key, &name).await? {
+        Some(response) => Ok(response),
+        None => Err((StatusCode::NOT_FOUND, "Package not found").into_response()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +278,38 @@ async fn download_tarball(
                 let db = state.db.clone();
                 let upstream_path = format!("tarballs/{}", filename);
                 let filename_clone = filename.to_string();
+
+                // Disable the remote upstream proxy if any non-Remote member
+                // owns this package name, preventing name-shadowing attacks.
+                let pkg_name = package_name_from_tarball_filename(filename);
+                let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+                let local_owns_name = if let Some(ref n) = pkg_name {
+                    let mut found = false;
+                    for m in members
+                        .iter()
+                        .filter(|m| m.repo_type != RepositoryType::Remote)
+                    {
+                        if fetch_package_info_from_repo(&state.db, m.id, &repo_key, n)
+                            .await?
+                            .is_some()
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                } else {
+                    false
+                };
+                let effective_proxy = if local_owns_name {
+                    None
+                } else {
+                    state.proxy_service.as_deref()
+                };
+
                 let (content, content_type) = proxy_helpers::resolve_virtual_download(
                     &state.db,
-                    state.proxy_service.as_deref(),
+                    effective_proxy,
                     repo.id,
                     &upstream_path,
                     |member_id, location| {
@@ -683,16 +748,55 @@ async fn list_versions(
 // Virtual repo merging helpers
 // ---------------------------------------------------------------------------
 
-/// Query distinct package names from all local (non-remote) virtual members.
+/// Build a single release entry for the `/packages/{name}` JSON response.
+fn release_entry_json(
+    repo_key: &str,
+    name: &str,
+    version: &str,
+    checksum: &str,
+) -> serde_json::Value {
+    let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
+    serde_json::json!({
+        "version": version,
+        "url": tarball_url,
+        "checksum": checksum,
+    })
+}
+
+/// Serialize the `/packages/{name}` response body to a JSON string.
+fn package_info_body(name: &str, releases: &[serde_json::Value], download_count: i64) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "name": name,
+        "releases": releases,
+        "downloads": download_count,
+    }))
+    .unwrap()
+}
+
+/// Extract the package name from a hex tarball filename (`{name}-{version}.tar`).
+/// Returns `None` if the filename doesn't match the expected pattern.
+/// Hex versions always start with an ASCII digit, so the split point is the
+/// first `-` whose following character is a digit.
+fn package_name_from_tarball_filename(filename: &str) -> Option<String> {
+    let without_ext = filename.strip_suffix(".tar")?;
+    for (i, _) in without_ext.match_indices('-') {
+        if without_ext
+            .get(i + 1..)
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            return Some(without_ext[..i].to_string());
+        }
+    }
+    None
+}
+
+/// Query distinct package names from all virtual member repos (including remote caches).
 async fn query_local_member_names(
     db: &PgPool,
     members: &[Repository],
 ) -> Result<Vec<String>, Response> {
     let mut all_names = Vec::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let names = sqlx::query_scalar!(
             r#"
         SELECT DISTINCT name
@@ -717,7 +821,7 @@ async fn query_local_member_names(
     Ok(all_names)
 }
 
-/// Query name/version pairs from all local (non-remote) virtual members,
+/// Query name/version pairs from all virtual member repos (including remote caches),
 /// grouped by package name.
 async fn query_local_member_versions(
     db: &PgPool,
@@ -726,9 +830,6 @@ async fn query_local_member_versions(
     let mut packages: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let artifacts = sqlx::query!(
             r#"
         SELECT name, version
@@ -1404,7 +1505,7 @@ mod tests {
 
     #[test]
     fn test_virtual_repo_eligible_for_member_iteration() {
-        // Virtual repos resolve through their members, not their own upstream_url.
+        // Virtual repos check member DBs first, then fall to upstream proxy.
         let repo = RepoInfo {
             id: uuid::Uuid::new_v4(),
             key: String::new(),
@@ -1414,6 +1515,319 @@ mod tests {
             upstream_url: None,
         };
         assert_eq!(repo.repo_type, "virtual");
+    }
+
+    #[test]
+    fn test_package_info_tarball_url_uses_repo_key() {
+        // For virtual repos the tarball URL must use the virtual repo key
+        // (not the member key) so downloads are routed back through the
+        // virtual endpoint and then dispatched to the correct member.
+        let repo_key = "hex-virtual";
+        let name = "cowboy";
+        let version = "2.10.0";
+        let url = format!("/hex/{}/tarballs/{}-{}.tar", repo_key, name, version);
+        assert_eq!(url, "/hex/hex-virtual/tarballs/cowboy-2.10.0.tar");
+    }
+
+    // -----------------------------------------------------------------------
+    // package_name_from_tarball_filename
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_package_name_from_tarball_simple() {
+        assert_eq!(
+            package_name_from_tarball_filename("cowboy-2.10.0.tar"),
+            Some("cowboy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_hyphenated_name() {
+        assert_eq!(
+            package_name_from_tarball_filename("plug-cowboy-2.7.0.tar"),
+            Some("plug-cowboy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_underscore_name() {
+        assert_eq!(
+            package_name_from_tarball_filename("ex_doc-0.30.0.tar"),
+            Some("ex_doc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_prerelease_version() {
+        // Version has pre-release suffix; name split is still at first -digit.
+        assert_eq!(
+            package_name_from_tarball_filename("cowboy-2.0.0-rc.1.tar"),
+            Some("cowboy".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_no_extension() {
+        assert_eq!(package_name_from_tarball_filename("cowboy-2.10.0"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_no_version_separator() {
+        assert_eq!(package_name_from_tarball_filename("cowboy.tar"), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_empty() {
+        assert_eq!(package_name_from_tarball_filename(""), None);
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_zero_version() {
+        assert_eq!(
+            package_name_from_tarball_filename("pkg-0.1.0.tar"),
+            Some("pkg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_multi_hyphen_name() {
+        assert_eq!(
+            package_name_from_tarball_filename("a-b-c-1.0.0.tar"),
+            Some("a-b-c".to_string())
+        );
+    }
+
+    #[test]
+    fn test_package_name_from_tarball_name_with_digits() {
+        assert_eq!(
+            package_name_from_tarball_filename("pkg123-1.0.0.tar"),
+            Some("pkg123".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // release_entry_json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_release_entry_url_format() {
+        let entry = release_entry_json("myrepo", "cowboy", "2.10.0", "");
+        assert_eq!(entry["url"], "/hex/myrepo/tarballs/cowboy-2.10.0.tar");
+    }
+
+    #[test]
+    fn test_release_entry_url_uses_repo_key() {
+        let a = release_entry_json("repo-a", "pkg", "1.0.0", "");
+        let b = release_entry_json("repo-b", "pkg", "1.0.0", "");
+        assert!(a["url"].as_str().unwrap().contains("repo-a"));
+        assert!(b["url"].as_str().unwrap().contains("repo-b"));
+    }
+
+    #[test]
+    fn test_release_entry_version_field() {
+        let entry = release_entry_json("r", "pkg", "3.2.1", "");
+        assert_eq!(entry["version"], "3.2.1");
+    }
+
+    #[test]
+    fn test_release_entry_checksum_field() {
+        let entry = release_entry_json("r", "pkg", "1.0.0", "abc123");
+        assert_eq!(entry["checksum"], "abc123");
+    }
+
+    #[test]
+    fn test_release_entry_empty_checksum() {
+        let entry = release_entry_json("r", "pkg", "1.0.0", "");
+        assert_eq!(entry["checksum"], "");
+    }
+
+    #[test]
+    fn test_release_entry_has_version_url_checksum() {
+        let entry = release_entry_json("r", "pkg", "1.0.0", "");
+        assert!(entry.get("version").is_some());
+        assert!(entry.get("url").is_some());
+        assert!(entry.get("checksum").is_some());
+    }
+
+    #[test]
+    fn test_release_entry_url_contains_name_and_version() {
+        let entry = release_entry_json("repo", "phoenix", "1.7.0", "");
+        let url = entry["url"].as_str().unwrap();
+        assert!(url.contains("phoenix"));
+        assert!(url.contains("1.7.0"));
+    }
+
+    #[test]
+    fn test_release_entry_hyphenated_name() {
+        let entry = release_entry_json("repo", "plug-cowboy", "2.7.0", "");
+        assert_eq!(entry["url"], "/hex/repo/tarballs/plug-cowboy-2.7.0.tar");
+    }
+
+    #[test]
+    fn test_release_entry_url_has_tarballs_segment() {
+        let entry = release_entry_json("repo", "pkg", "1.0.0", "");
+        assert!(entry["url"].as_str().unwrap().contains("/tarballs/"));
+    }
+
+    #[test]
+    fn test_release_entry_url_ends_with_tar() {
+        let entry = release_entry_json("repo", "pkg", "1.0.0", "");
+        assert!(entry["url"].as_str().unwrap().ends_with(".tar"));
+    }
+
+    #[test]
+    fn test_release_entry_sha256_checksum() {
+        let checksum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let entry = release_entry_json("repo", "pkg", "1.0.0", checksum);
+        assert_eq!(entry["checksum"].as_str().unwrap(), checksum);
+    }
+
+    #[test]
+    fn test_release_entry_url_starts_with_slash() {
+        let entry = release_entry_json("repo", "pkg", "1.0.0", "");
+        assert!(entry["url"].as_str().unwrap().starts_with('/'));
+    }
+
+    #[test]
+    fn test_release_entry_prerelease_version_in_url() {
+        let entry = release_entry_json("repo", "cowboy", "2.0.0-rc.1", "");
+        assert_eq!(entry["url"], "/hex/repo/tarballs/cowboy-2.0.0-rc.1.tar");
+    }
+
+    #[test]
+    fn test_release_entry_version_matches_url() {
+        let version = "3.14.159";
+        let entry = release_entry_json("r", "pkg", version, "");
+        assert!(entry["url"].as_str().unwrap().contains(version));
+        assert_eq!(entry["version"].as_str().unwrap(), version);
+    }
+
+    // -----------------------------------------------------------------------
+    // package_info_body
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_package_info_body_is_valid_json() {
+        let body = package_info_body("cowboy", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.is_object());
+    }
+
+    #[test]
+    fn test_package_info_body_name_field() {
+        let body = package_info_body("phoenix", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["name"], "phoenix");
+    }
+
+    #[test]
+    fn test_package_info_body_downloads_field() {
+        let body = package_info_body("pkg", &[], 42);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["downloads"], 42);
+    }
+
+    #[test]
+    fn test_package_info_body_zero_downloads() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["downloads"], 0);
+    }
+
+    #[test]
+    fn test_package_info_body_empty_releases() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["releases"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_package_info_body_with_releases() {
+        let releases = vec![
+            serde_json::json!({"version": "1.0.0", "url": "/hex/r/tarballs/pkg-1.0.0.tar", "checksum": null}),
+            serde_json::json!({"version": "2.0.0", "url": "/hex/r/tarballs/pkg-2.0.0.tar", "checksum": null}),
+        ];
+        let body = package_info_body("pkg", &releases, 5);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["releases"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_package_info_body_has_name_releases_downloads() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.get("name").is_some());
+        assert!(parsed.get("releases").is_some());
+        assert!(parsed.get("downloads").is_some());
+    }
+
+    #[test]
+    fn test_package_info_body_large_download_count() {
+        let body = package_info_body("pkg", &[], 1_000_000);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["downloads"], 1_000_000);
+    }
+
+    #[test]
+    fn test_package_info_body_releases_content_preserved() {
+        let releases = vec![release_entry_json("repo", "pkg", "1.0.0", "abc")];
+        let body = package_info_body("pkg", &releases, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let first = &parsed["releases"][0];
+        assert_eq!(first["version"], "1.0.0");
+        assert_eq!(first["checksum"], "abc");
+    }
+
+    #[test]
+    fn test_package_info_body_name_matches_input() {
+        for name in &["phoenix", "ecto", "plug_cowboy", "ex-doc"] {
+            let body = package_info_body(name, &[], 0);
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["name"].as_str().unwrap(), *name);
+        }
+    }
+
+    #[test]
+    fn test_package_info_body_releases_field_is_array() {
+        let body = package_info_body("pkg", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["releases"].is_array());
+    }
+
+    #[test]
+    fn test_package_info_body_downloads_is_number() {
+        let body = package_info_body("pkg", &[], 7);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["downloads"].is_number());
+    }
+
+    #[test]
+    fn test_package_info_body_name_is_string() {
+        let body = package_info_body("cowboy", &[], 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["name"].is_string());
+    }
+
+    #[test]
+    fn test_package_info_body_release_url_routed_through_repo() {
+        let releases = vec![release_entry_json("hex-virtual", "cowboy", "2.10.0", "")];
+        let body = package_info_body("cowboy", &releases, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let url = parsed["releases"][0]["url"].as_str().unwrap();
+        assert!(url.contains("hex-virtual"));
+        assert!(!url.contains("hex-remote"));
+    }
+
+    #[test]
+    fn test_package_info_body_multiple_releases_all_present() {
+        let releases: Vec<serde_json::Value> = ["1.0.0", "1.1.0", "2.0.0"]
+            .iter()
+            .map(|v| release_entry_json("r", "pkg", v, ""))
+            .collect();
+        let body = package_info_body("pkg", &releases, 3);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["releases"].as_array().unwrap().len(), 3);
+        assert_eq!(parsed["downloads"], 3);
     }
 
     // -----------------------------------------------------------------------
