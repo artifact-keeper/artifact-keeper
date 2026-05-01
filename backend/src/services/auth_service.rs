@@ -3092,6 +3092,13 @@ mod tests {
 
         // Insert one aged row (older than the refresh-token TTL) and one
         // fresh row. GC should remove only the aged row.
+        //
+        // NOTE: production GC (`DELETE FROM used_refresh_jtis WHERE used_at < $1`)
+        // is intentionally global, so when this suite runs in parallel against a
+        // shared Postgres (e.g. `cargo llvm-cov --workspace --lib`), other tests'
+        // rows are visible to our `removed` count. We therefore assert outcomes
+        // by inspecting only THIS test's specific jti rows rather than the
+        // global `removed` count. The production path is still exercised end-to-end.
         let aged = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO used_refresh_jtis (jti, user_id, used_at) \
@@ -3111,8 +3118,7 @@ mod tests {
             .await
             .expect("insert fresh jti");
 
-        let removed = svc.gc_used_refresh_jtis().await.expect("gc");
-        assert!(removed >= 1, "gc must reap at least the aged row");
+        svc.gc_used_refresh_jtis().await.expect("gc");
 
         let aged_exists: (bool,) =
             sqlx::query_as("SELECT EXISTS(SELECT 1 FROM used_refresh_jtis WHERE jti = $1)")
@@ -3135,7 +3141,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_used_refresh_jtis_returns_zero_when_nothing_old() {
-        // Boundary: when no aged rows exist, GC returns 0 without erroring.
+        // Boundary: when no aged rows exist for THIS test's user, GC must
+        // leave that user's fresh row intact and return Ok without erroring.
+        //
+        // NOTE: production GC is global, so we cannot assert `removed == 0`
+        // when other tests run concurrently against the same database. Instead
+        // we scope the post-condition to this test's user_id and verify that
+        // the fresh row we inserted survives. This still proves "fresh rows
+        // are not reaped" — the assertion this test was designed to make.
         let Some(pool) = try_connect_test_db().await else {
             eprintln!("skip: DATABASE_URL unset or schema missing");
             return;
@@ -3143,10 +3156,6 @@ mod tests {
         let user_id = insert_test_user(&pool).await;
         let cfg = make_test_config();
         let svc = AuthService::new(pool.clone(), cfg.clone());
-
-        // First, reap any aged rows from previous failed runs so we get a
-        // clean baseline for the assertion below.
-        let _ = svc.gc_used_refresh_jtis().await;
 
         // Insert only fresh rows.
         let jti = Uuid::new_v4();
@@ -3157,8 +3166,21 @@ mod tests {
             .await
             .expect("insert fresh jti");
 
-        let removed = svc.gc_used_refresh_jtis().await.expect("gc");
-        assert_eq!(removed, 0, "fresh rows must not be reaped");
+        svc.gc_used_refresh_jtis().await.expect("gc");
+
+        // The fresh row for THIS test's user must still be present after GC.
+        let fresh_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM used_refresh_jtis WHERE user_id = $1 AND jti = $2",
+        )
+        .bind(user_id)
+        .bind(jti)
+        .fetch_one(&pool)
+        .await
+        .expect("count fresh");
+        assert_eq!(
+            fresh_count.0, 1,
+            "fresh row for this user must not be reaped"
+        );
 
         // Cleanup the row we just inserted before deleting the user, since
         // the FK has no cascade configured for jti rows in older migrations.
