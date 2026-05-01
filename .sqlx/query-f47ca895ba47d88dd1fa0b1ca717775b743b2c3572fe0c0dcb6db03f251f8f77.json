@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at\n            FROM scan_results\n            WHERE checksum_sha256 = $1\n              AND scan_type = $2\n              AND status = 'completed'\n              AND completed_at > NOW() - ($3 || ' days')::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at\n            FROM scan_results\n            WHERE checksum_sha256 = $1\n              AND scan_type = $2\n              AND status = 'completed'\n              AND legacy_unverified = false\n              AND completed_at > NOW() - ($3 || ' days')::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -110,5 +110,5 @@
       false
     ]
   },
-  "hash": "0dfed086da2ddd03aba0a562a49eb899f1e29a72612b55cf5e6385c23f83aba2"
+  "hash": "f47ca895ba47d88dd1fa0b1ca717775b743b2c3572fe0c0dcb6db03f251f8f77"
 }

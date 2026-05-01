@@ -408,11 +408,17 @@ impl PromotionPolicyService {
             findings_count: i32,
         }
 
+        // legacy_unverified = false excludes silent-success rows from
+        // v1.1.0-v1.1.8 (#994); without this filter the promotion gate
+        // would read findings_count=0 from a deceptive completed row and
+        // promote artifacts that were never actually scanned.
         let scan: Option<ScanRow> = sqlx::query_as(
             r#"
             SELECT critical_count, high_count, medium_count, low_count, findings_count
             FROM scan_results
-            WHERE artifact_id = $1 AND status = 'completed'
+            WHERE artifact_id = $1
+              AND status = 'completed'
+              AND legacy_unverified = false
             ORDER BY created_at DESC
             LIMIT 1
             "#,

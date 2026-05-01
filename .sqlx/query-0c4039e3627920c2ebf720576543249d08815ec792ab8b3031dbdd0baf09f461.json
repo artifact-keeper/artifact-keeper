@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT MAX(completed_at) as \"last_scan_at\"\n            FROM scan_results\n            WHERE repository_id = $1\n              AND status = 'completed'\n              AND legacy_unverified = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_scan_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0c4039e3627920c2ebf720576543249d08815ec792ab8b3031dbdd0baf09f461"
+}

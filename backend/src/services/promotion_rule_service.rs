@@ -462,11 +462,17 @@ impl PromotionRuleService {
     // -----------------------------------------------------------------------
 
     async fn get_latest_scan(&self, artifact_id: Uuid) -> Result<Option<ScanCountsRow>> {
+        // legacy_unverified = false excludes silent-success rows from
+        // v1.1.0-v1.1.8 (#994). Without this filter promotion rules would
+        // read 0/0/0/0 counts from a deceptive completed row and promote
+        // artifacts that were never actually scanned.
         let row: Option<ScanCountsRow> = sqlx::query_as::<_, ScanCountsRow>(
             r#"
             SELECT critical_count, high_count, medium_count, low_count
             FROM scan_results
-            WHERE artifact_id = $1 AND status = 'completed'
+            WHERE artifact_id = $1
+              AND status = 'completed'
+              AND legacy_unverified = false
             ORDER BY created_at DESC
             LIMIT 1
             "#,
