@@ -121,6 +121,10 @@ impl ScanResultService {
         scan_type: &str,
         ttl_days: i32,
     ) -> Result<Option<ScanResult>> {
+        // legacy_unverified = false excludes silent-success rows from
+        // v1.1.0-v1.1.8 (#994). Reusing a legacy row would propagate its
+        // deceptive completed status to a fresh artifact, defeating the
+        // gating fix.
         let result = sqlx::query_as!(
             ScanResult,
             r#"
@@ -131,6 +135,7 @@ impl ScanResultService {
             WHERE checksum_sha256 = $1
               AND scan_type = $2
               AND status = 'completed'
+              AND legacy_unverified = false
               AND completed_at > NOW() - ($3 || ' days')::interval
             ORDER BY completed_at DESC
             LIMIT 1
@@ -516,11 +521,16 @@ impl ScanResultService {
 
         let (score, grade) = compute_security_score(critical, high, medium, low);
 
+        // legacy_unverified = false excludes silent-success rows from
+        // v1.1.0-v1.1.8 (#994). Reporting last_scan_at from those rows
+        // would falsely indicate a repo was recently scanned.
         let last_scan_at = sqlx::query_scalar!(
             r#"
             SELECT MAX(completed_at) as "last_scan_at"
             FROM scan_results
-            WHERE repository_id = $1 AND status = 'completed'
+            WHERE repository_id = $1
+              AND status = 'completed'
+              AND legacy_unverified = false
             "#,
             repository_id,
         )

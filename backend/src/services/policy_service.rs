@@ -64,11 +64,16 @@ impl PolicyService {
             low_count: i32,
         }
 
+        // legacy_unverified = false excludes the silent-success rows from
+        // v1.1.0-v1.1.8 (#994) flagged by migration 075. Treating those as
+        // "scan completed clean" auto-promoted unscanned artifacts; under
+        // block_unscanned the artifact must be treated as never scanned.
         let latest_scan: Option<ScanRow> = sqlx::query_as(
             r#"
             SELECT status, findings_count, critical_count, high_count, medium_count, low_count
             FROM scan_results
             WHERE artifact_id = $1
+              AND legacy_unverified = false
             ORDER BY created_at DESC
             LIMIT 1
             "#,

@@ -781,7 +781,11 @@ async fn extract_dependencies_for_artifact(
     db: &sqlx::PgPool,
     artifact_id: Uuid,
 ) -> Result<Vec<DependencyInfo>> {
-    // Try to get findings from the latest scan
+    // Try to get findings from the latest scan.
+    // sr.legacy_unverified = false excludes silent-success rows from
+    // v1.1.0-v1.1.8 (#994); they have no findings but joining through them
+    // is still wrong on principle and avoids reading from a row that the
+    // policy/promotion gates already disregard.
     let findings: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
         SELECT DISTINCT
@@ -791,6 +795,7 @@ async fn extract_dependencies_for_artifact(
         FROM scan_findings sf
         JOIN scan_results sr ON sf.scan_result_id = sr.id
         WHERE sr.artifact_id = $1
+          AND sr.legacy_unverified = false
         ORDER BY name
         LIMIT 1000
         "#,
