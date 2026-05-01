@@ -546,6 +546,9 @@ pub async fn local_fetch_by_name_version(
 
 /// Generic local artifact fetch by path suffix (LIKE match).
 /// Used for handlers like npm that query by filename suffix.
+///
+/// `path_suffix` is treated as a literal: `%` and `_` are escaped before
+/// matching, so callers must pass raw user input, not a pre-escaped value.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
@@ -553,13 +556,14 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
+    let path_suffix_escaped = super::escape_like_literal(path_suffix);
     let artifact = sqlx::query!(
         r#"SELECT storage_key, content_type
         FROM artifacts
-        WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false
+        WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\' AND is_deleted = false
         LIMIT 1"#,
         repo_id,
-        path_suffix
+        path_suffix_escaped
     )
     .fetch_optional(db)
     .await

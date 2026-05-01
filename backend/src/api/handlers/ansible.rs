@@ -384,6 +384,9 @@ async fn download_collection(
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
 
     let filename = file_path.trim_start_matches('/');
+    // Escape `%` and `_` so user-supplied filename is matched as a literal,
+    // not a LIKE wildcard. See `crate::api::handlers::escape_like_literal`.
+    let filename_escaped = super::escape_like_literal(filename);
 
     let artifact = sqlx::query!(
         r#"
@@ -391,11 +394,11 @@ async fn download_collection(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,
-        filename
+        filename_escaped
     )
     .fetch_optional(&state.db)
     .await

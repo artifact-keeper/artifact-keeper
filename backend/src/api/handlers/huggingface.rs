@@ -570,7 +570,14 @@ async fn list_files(
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
-    let path_prefix = format!("{}/{}/", model_id, revision);
+    // Escape `%` and `_` in user-supplied path components so they're matched
+    // as literals in the LIKE prefix below, not wildcards. See
+    // `crate::api::handlers::escape_like_literal`.
+    let path_prefix = format!(
+        "{}/{}/",
+        super::escape_like_literal(&model_id),
+        super::escape_like_literal(&revision),
+    );
 
     let artifacts = sqlx::query!(
         r#"
@@ -578,7 +585,7 @@ async fn list_files(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE $2 || '%'
+          AND path LIKE $2 || '%' ESCAPE '\'
         ORDER BY path
         "#,
         repo.id,

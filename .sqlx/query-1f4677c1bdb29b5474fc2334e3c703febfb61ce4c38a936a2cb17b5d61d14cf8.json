@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT storage_key, content_type\n        FROM artifacts\n        WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false\n        LIMIT 1",
+  "query": "SELECT storage_key, content_type\n        FROM artifacts\n        WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\\' AND is_deleted = false\n        LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -25,5 +25,5 @@
       false
     ]
   },
-  "hash": "f04bd7b8dbcfbb666112f431bdeecb6f9b411e6dea56d76db13c0a8b336faabc"
+  "hash": "1f4677c1bdb29b5474fc2334e3c703febfb61ce4c38a936a2cb17b5d61d14cf8"
 }

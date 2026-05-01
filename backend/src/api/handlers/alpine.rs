@@ -114,7 +114,15 @@ async fn list_alpine_artifacts(
     repository: &str,
     arch: &str,
 ) -> Result<Vec<AlpineArtifact>, Response> {
-    let path_prefix = format!("{}/{}/{}/", branch, repository, arch);
+    // Escape `%` and `_` in user-supplied path components so they're matched
+    // as literals in the LIKE prefix below, not wildcards. See
+    // `crate::api::handlers::escape_like_literal`.
+    let path_prefix = format!(
+        "{}/{}/{}/",
+        super::escape_like_literal(branch),
+        super::escape_like_literal(repository),
+        super::escape_like_literal(arch),
+    );
     let rows = sqlx::query!(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -123,7 +131,7 @@ async fn list_alpine_artifacts(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.path LIKE $2 || '%'
+          AND a.path LIKE $2 || '%' ESCAPE '\'
         ORDER BY a.name, a.created_at DESC
         "#,
         repo_id,

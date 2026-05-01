@@ -185,6 +185,9 @@ async fn download_tarball(
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
 
     let filename = tarball_file.trim_start_matches('/');
+    // Escape `%` and `_` so user-supplied filename is matched as a literal,
+    // not a LIKE wildcard. See `crate::api::handlers::escape_like_literal`.
+    let filename_escaped = super::escape_like_literal(filename);
 
     // Find artifact by matching the path ending
     let artifact = sqlx::query!(
@@ -193,11 +196,11 @@ async fn download_tarball(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,
-        filename
+        filename_escaped
     )
     .fetch_optional(&state.db)
     .await
