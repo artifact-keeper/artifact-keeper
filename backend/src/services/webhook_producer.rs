@@ -176,8 +176,8 @@ pub fn start_webhook_producer(
 /// `artifact.*` events: their `entity_id` is the user/build/artifact UUID
 /// respectively, not the owning repository. For those events, the
 /// `repository_id = $2` arm of the WHERE clause never matches, so only
-/// global-scoped webhooks (repository_id IS NULL) fire. The same flaw
-/// exists in `notification_dispatcher.rs::dispatch_event`.
+/// global-scoped webhooks (repository_id IS NULL) fire. This matches the
+/// design that lands on main as #948.
 ///
 /// FIXME(#948): Thread an explicit `repository_id: Option<Uuid>` through
 /// `DomainEvent` so this scoping is correct for non-repo events. Until
