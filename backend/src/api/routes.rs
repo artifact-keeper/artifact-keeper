@@ -380,15 +380,27 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 admin_middleware,
             )),
         )
-        // Webhook routes with auth middleware
+        // Webhook routes split between read-only (any authenticated user) and
+        // mutating handlers (admin only). Webhook subscriptions can receive
+        // cross-tenant event metadata (e.g. repository.created, user.created on
+        // global webhooks where repository_id = NULL), so create/delete/enable/
+        // disable/test/redeliver are gated to admin only until per-tenant
+        // scoping lands (#948). Each sub-router applies its own auth layer
+        // before being merged under /webhooks.
         .nest(
             "/webhooks",
             handlers::webhooks::router()
-                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
                     auth_middleware,
-                )),
+                ))
+                .merge(
+                    handlers::webhooks::admin_router().layer(middleware::from_fn_with_state(
+                        auth_service.clone(),
+                        admin_middleware,
+                    )),
+                )
+                .layer(DefaultBodyLimit::max(1024 * 1024)), // 1 MB
         )
         // Domain event stream (SSE) with auth middleware
         .nest(
