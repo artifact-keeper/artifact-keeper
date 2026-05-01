@@ -18,6 +18,27 @@ pub async fn cleanup_soft_deleted_artifact(
     .await;
 }
 
+/// Escape SQL `LIKE` wildcards (`%`, `_`) and the escape character (`\`) in
+/// user-supplied input that will be concatenated into a `LIKE` pattern.
+///
+/// Use together with an `ESCAPE '\'` clause on the SQL side. Without this
+/// helper, a user-supplied path component containing `%` or `_` would act
+/// as a wildcard rather than a literal — leaking other artifact paths inside
+/// the same repository (info disclosure / wrong-artifact serving).
+pub fn escape_like_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub mod error_helpers;
 
 pub mod admin;
@@ -97,3 +118,48 @@ pub mod users;
 pub mod vscode;
 pub mod wasm_proxy;
 pub mod webhooks;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // escape_like_literal — SQL LIKE wildcard escape for user-supplied input
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_escape_like_literal_passes_safe_chars_through() {
+        assert_eq!(escape_like_literal("foo-1.0.0.tgz"), "foo-1.0.0.tgz");
+        assert_eq!(escape_like_literal(""), "");
+        assert_eq!(escape_like_literal("@types/mdurl"), "@types/mdurl");
+    }
+
+    #[test]
+    fn test_escape_like_literal_escapes_percent() {
+        // SECURITY: a `%` from user input must not act as a LIKE wildcard.
+        assert_eq!(escape_like_literal("%"), r"\%");
+        assert_eq!(escape_like_literal("%.gem"), r"\%.gem");
+        assert_eq!(escape_like_literal("foo%bar%baz"), r"foo\%bar\%baz");
+    }
+
+    #[test]
+    fn test_escape_like_literal_escapes_underscore() {
+        // SECURITY: a `_` from user input must not act as a LIKE single-char wildcard.
+        assert_eq!(escape_like_literal("_"), r"\_");
+        assert_eq!(escape_like_literal("foo_bar"), r"foo\_bar");
+    }
+
+    #[test]
+    fn test_escape_like_literal_escapes_backslash() {
+        // SECURITY: a `\` must be escaped so it doesn't itself act as the LIKE
+        // escape character (we use `ESCAPE '\'` on the SQL side).
+        assert_eq!(escape_like_literal(r"\"), r"\\");
+        assert_eq!(escape_like_literal(r"foo\bar"), r"foo\\bar");
+    }
+
+    #[test]
+    fn test_escape_like_literal_combined_payload() {
+        // Adversarial filename mixing all special chars.
+        assert_eq!(escape_like_literal(r"%_\evil"), r"\%\_\\evil");
+    }
+}
