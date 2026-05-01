@@ -65,7 +65,7 @@ impl ImageScanner {
     }
 
     /// Check if this artifact is an OCI/Docker image manifest.
-    fn is_container_image(artifact: &Artifact) -> bool {
+    pub(crate) fn is_container_image(artifact: &Artifact) -> bool {
         let ct = &artifact.content_type;
         ct.contains("vnd.oci.image")
             || ct.contains("vnd.docker.distribution")
@@ -280,13 +280,20 @@ impl Scanner for ImageScanner {
         "image"
     }
 
+    fn is_applicable(&self, artifact: &Artifact, _metadata: Option<&ArtifactMetadata>) -> bool {
+        Self::is_container_image(artifact)
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         _content: &Bytes,
     ) -> Result<Vec<RawFinding>> {
-        // Only scan OCI/Docker image manifests
+        // Defense in depth: the orchestrator already gates on `is_applicable`
+        // (issue #994), but tests and direct callers may invoke `scan()`
+        // without the orchestrator. Keep the early-return so non-applicable
+        // artifacts never reach the Trivy network path.
         if !Self::is_container_image(artifact) {
             return Ok(vec![]);
         }

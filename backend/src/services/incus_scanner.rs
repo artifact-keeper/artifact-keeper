@@ -242,12 +242,17 @@ impl Scanner for IncusScanner {
         "incus"
     }
 
+    fn is_applicable(&self, artifact: &Artifact, _metadata: Option<&ArtifactMetadata>) -> bool {
+        Self::is_applicable(artifact)
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<Vec<RawFinding>> {
+        // Defense in depth: see comment in image_scanner.rs scan() (issue #994).
         if !Self::is_applicable(artifact) {
             return Ok(vec![]);
         }

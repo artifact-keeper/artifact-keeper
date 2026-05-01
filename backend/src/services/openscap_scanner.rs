@@ -73,7 +73,7 @@ impl OpenScapScanner {
 
     /// Returns true if this scanner applies to the given artifact.
     /// OpenSCAP is relevant for container images, RPMs, and DEBs.
-    fn is_applicable(artifact: &Artifact) -> bool {
+    pub(crate) fn is_applicable(artifact: &Artifact) -> bool {
         let ct = artifact.content_type.to_lowercase();
         let name_lower = artifact.name.to_lowercase();
         let path_lower = artifact.path.to_lowercase();
@@ -183,12 +183,17 @@ impl Scanner for OpenScapScanner {
         "openscap"
     }
 
+    fn is_applicable(&self, artifact: &Artifact, _metadata: Option<&ArtifactMetadata>) -> bool {
+        Self::is_applicable(artifact)
+    }
+
     async fn scan(
         &self,
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<Vec<RawFinding>> {
+        // Defense in depth: see comment in image_scanner.rs scan() (issue #994).
         if !Self::is_applicable(artifact) {
             return Ok(vec![]);
         }

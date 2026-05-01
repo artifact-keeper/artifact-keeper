@@ -281,6 +281,23 @@ pub trait Scanner: Send + Sync {
     /// The scan_type value stored in scan_results.
     fn scan_type(&self) -> &str;
 
+    /// Whether this scanner applies to the given artifact.
+    ///
+    /// The orchestrator calls this BEFORE creating a `scan_results` row so
+    /// non-applicable scanners do not produce deceptive zero-finding
+    /// `completed` rows in the DB. Returning `false` here is semantically
+    /// distinct from `scan() -> Ok(vec![])`: the former means "this scanner
+    /// did not run", the latter means "this scanner ran and found nothing."
+    /// Conflating them produces silent-success regressions where receivers
+    /// using a scan record as a security gate pass artifacts that were
+    /// never actually scanned (issue #994).
+    ///
+    /// Default returns `true` so scanners that always apply (e.g. the
+    /// dependency / advisory scanner) do not need to override.
+    fn is_applicable(&self, _artifact: &Artifact, _metadata: Option<&ArtifactMetadata>) -> bool {
+        true
+    }
+
     /// Run the scan against artifact content and metadata.
     async fn scan(
         &self,
@@ -1210,6 +1227,22 @@ impl ScannerService {
         const DEDUP_TTL_DAYS: i32 = 30;
 
         for scanner in &self.scanners {
+            // Skip scanners that do not apply to this artifact. We do this
+            // BEFORE creating a scan_results row so the DB does not record a
+            // `completed` scan with `findings_count=0` for a scanner that
+            // never actually inspected the artifact. Recording such rows
+            // makes it look like the artifact was scanned and cleared, which
+            // is exactly the silent-success class that broke the
+            // release-gate `test-scan-completes` check (issue #994).
+            if !scanner.is_applicable(&artifact, metadata.as_ref()) {
+                info!(
+                    "Skipping scanner {} for artifact {}: not applicable to this artifact format",
+                    scanner.name(),
+                    artifact_id,
+                );
+                continue;
+            }
+
             // Check for reusable scan results (same hash + scan type within TTL)
             if let Ok(Some(source_scan)) = self
                 .scan_result_service
@@ -5540,5 +5573,121 @@ mod tests {
         extract_tar_gz_safe(&archive, tmp.path()).unwrap();
         // Should succeed with no files created
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #994: Scanner::is_applicable trait gating
+    //
+    // Before #994 the orchestrator created a `scan_results` row for every
+    // registered scanner regardless of whether the scanner could actually
+    // inspect the artifact. Non-applicable scanners returned `Ok(vec![])`,
+    // which the orchestrator treated as a successful zero-finding scan and
+    // marked `status='completed'`. Receivers that used the row as a security
+    // gate then waved through artifacts that had never actually been
+    // scanned. The fix added `Scanner::is_applicable` and gates row
+    // creation on it. These tests pin the trait contract.
+    // -----------------------------------------------------------------------
+
+    use crate::services::image_scanner::ImageScanner;
+    use crate::services::incus_scanner::IncusScanner;
+    use crate::services::openscap_scanner::OpenScapScanner;
+    use crate::services::trivy_fs_scanner::TrivyFsScanner;
+
+    /// A npm tarball (lodash 4.17.4 is the canonical fixture: known CVEs)
+    /// must NOT be applicable to scanners that target other artifact shapes.
+    /// The previous behaviour was to silently return `Ok(vec![])` from
+    /// `scan()`, which the orchestrator recorded as a clean scan.
+    #[test]
+    fn test_npm_tarball_is_not_applicable_to_image_or_incus_or_openscap_scanners() {
+        let lodash = test_helpers::make_test_artifact(
+            "lodash-4.17.4.tgz",
+            "application/octet-stream",
+            "npm/lodash/-/lodash-4.17.4.tgz",
+        );
+
+        let image_scanner = ImageScanner::new("http://trivy:4954".to_string());
+        let trivy_fs = TrivyFsScanner::new("http://trivy:4954".to_string(), "/tmp".to_string());
+        let incus = IncusScanner::new("http://trivy:4954".to_string(), "/tmp".to_string());
+        let openscap = OpenScapScanner::new(
+            "http://openscap:8091".to_string(),
+            "x".to_string(),
+            "/tmp".to_string(),
+        );
+
+        // Image / Incus / OpenSCAP do not apply to an npm tarball: they
+        // would have produced silent-success rows pre-#994.
+        assert!(
+            !Scanner::is_applicable(&image_scanner, &lodash, None),
+            "ImageScanner must not claim to apply to an npm tarball — \
+             pre-#994 it returned Ok(vec![]) and the orchestrator stored a \
+             completed zero-finding row, indistinguishable from a clean scan"
+        );
+        assert!(
+            !Scanner::is_applicable(&incus, &lodash, None),
+            "IncusScanner must not claim to apply to an npm tarball"
+        );
+        assert!(
+            !Scanner::is_applicable(&openscap, &lodash, None),
+            "OpenScapScanner must not claim to apply to an npm tarball"
+        );
+
+        // TrivyFsScanner *is* the right scanner for an npm tarball — the
+        // gate must not over-correct and skip the scanner that can find the
+        // CVEs.
+        assert!(
+            Scanner::is_applicable(&trivy_fs, &lodash, None),
+            "TrivyFsScanner must apply to an npm tarball — over-correcting \
+             would skip the scanner that surfaces the lodash CVEs"
+        );
+    }
+
+    /// An OCI image manifest must be applicable to ImageScanner (and
+    /// OpenSCAP, which targets containers + RPM/DEB) but NOT to TrivyFs or
+    /// Incus. Pins the inverse of the npm-tarball case.
+    #[test]
+    fn test_oci_manifest_is_applicable_to_image_scanner_only() {
+        let manifest = test_helpers::make_test_artifact(
+            "manifest",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/myapp/manifests/latest",
+        );
+
+        let image_scanner = ImageScanner::new("http://trivy:4954".to_string());
+        let trivy_fs = TrivyFsScanner::new("http://trivy:4954".to_string(), "/tmp".to_string());
+        let incus = IncusScanner::new("http://trivy:4954".to_string(), "/tmp".to_string());
+
+        assert!(Scanner::is_applicable(&image_scanner, &manifest, None));
+        assert!(
+            !Scanner::is_applicable(&trivy_fs, &manifest, None),
+            "TrivyFsScanner must yield to ImageScanner on OCI manifests"
+        );
+        assert!(!Scanner::is_applicable(&incus, &manifest, None));
+    }
+
+    /// The default `is_applicable` impl returns true. Scanners that always
+    /// run (the dependency / advisory scanner) rely on this default.
+    #[test]
+    fn test_default_is_applicable_is_true() {
+        struct AlwaysApply;
+        #[async_trait::async_trait]
+        impl Scanner for AlwaysApply {
+            fn name(&self) -> &str {
+                "always"
+            }
+            fn scan_type(&self) -> &str {
+                "always"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<Vec<RawFinding>> {
+                Ok(vec![])
+            }
+        }
+        let s = AlwaysApply;
+        let a = test_helpers::make_test_artifact("x", "text/plain", "x");
+        assert!(s.is_applicable(&a, None));
     }
 }
