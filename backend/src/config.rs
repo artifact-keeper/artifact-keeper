@@ -145,6 +145,16 @@ pub struct Config {
     /// **Security note:** ensure this port is not reachable from untrusted
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
+
+    /// Comma-separated list of usernames exempt from auth/API rate limiting.
+    /// Useful for shared CI/admin accounts in test environments where bcrypt
+    /// verification on every burst request can saturate the spawn_blocking
+    /// pool and surface as 401/429 flakes. Set via `RATE_LIMIT_EXEMPT_USERNAMES`.
+    pub rate_limit_exempt_usernames: Vec<String>,
+
+    /// When true, principals authenticated as service accounts bypass the
+    /// in-process rate limiter. Set via `RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS`.
+    pub rate_limit_exempt_service_accounts: bool,
 }
 
 redacted_debug!(Config {
@@ -187,6 +197,8 @@ redacted_debug!(Config {
     show proxy_max_artifact_size_bytes,
     show proxy_queue_timeout_secs,
     show metrics_port,
+    show rate_limit_exempt_usernames,
+    show rate_limit_exempt_service_accounts,
 });
 
 impl Config {
@@ -276,6 +288,19 @@ impl Config {
                 },
                 Err(_) => None,
             },
+            rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            rate_limit_exempt_service_accounts: matches!(
+                env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
+                Ok("true" | "1")
+            ),
         };
 
         config.validate_jwt_secret()?;
@@ -362,6 +387,8 @@ impl Default for Config {
             proxy_max_artifact_size_bytes: 2_147_483_648,
             proxy_queue_timeout_secs: 30,
             metrics_port: None,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
         }
     }
 }
@@ -1183,5 +1210,133 @@ mod tests {
         } else {
             env::remove_var("PROXY_MAX_CONCURRENT_FETCHES");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // RATE_LIMIT_EXEMPT_USERNAMES + RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS parsing
+    // -----------------------------------------------------------------------
+
+    fn with_rate_limit_env<F>(usernames: Option<&str>, service_accounts: Option<&str>, f: F)
+    where
+        F: FnOnce(&Config),
+    {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let saved_db = env::var("DATABASE_URL").ok();
+        let saved_jwt = env::var("JWT_SECRET").ok();
+        let saved_users = env::var("RATE_LIMIT_EXEMPT_USERNAMES").ok();
+        let saved_sa = env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").ok();
+
+        env::set_var("DATABASE_URL", "postgresql://localhost/test");
+        env::set_var(
+            "JWT_SECRET",
+            "ratelimit-exempt-test-secret-must-be-32-bytes",
+        );
+        match usernames {
+            Some(v) => env::set_var("RATE_LIMIT_EXEMPT_USERNAMES", v),
+            None => env::remove_var("RATE_LIMIT_EXEMPT_USERNAMES"),
+        }
+        match service_accounts {
+            Some(v) => env::set_var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS", v),
+            None => env::remove_var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS"),
+        }
+
+        let cfg = Config::from_env().expect("from_env must succeed with required vars set");
+        f(&cfg);
+
+        // Restore.
+        match saved_db {
+            Some(v) => env::set_var("DATABASE_URL", v),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match saved_jwt {
+            Some(v) => env::set_var("JWT_SECRET", v),
+            None => env::remove_var("JWT_SECRET"),
+        }
+        match saved_users {
+            Some(v) => env::set_var("RATE_LIMIT_EXEMPT_USERNAMES", v),
+            None => env::remove_var("RATE_LIMIT_EXEMPT_USERNAMES"),
+        }
+        match saved_sa {
+            Some(v) => env::set_var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS", v),
+            None => env::remove_var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS"),
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_usernames_unset_yields_empty_vec() {
+        with_rate_limit_env(None, None, |cfg| {
+            assert!(cfg.rate_limit_exempt_usernames.is_empty());
+            assert!(!cfg.rate_limit_exempt_service_accounts);
+        });
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_usernames_single() {
+        with_rate_limit_env(Some("admin"), None, |cfg| {
+            assert_eq!(cfg.rate_limit_exempt_usernames, vec!["admin".to_string()]);
+        });
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_usernames_multi() {
+        with_rate_limit_env(Some("admin,deploy-bot,ci-bot"), None, |cfg| {
+            assert_eq!(
+                cfg.rate_limit_exempt_usernames,
+                vec![
+                    "admin".to_string(),
+                    "deploy-bot".to_string(),
+                    "ci-bot".to_string(),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_usernames_trims_whitespace_and_drops_empty() {
+        with_rate_limit_env(Some("  admin , , deploy-bot ,"), None, |cfg| {
+            assert_eq!(
+                cfg.rate_limit_exempt_usernames,
+                vec!["admin".to_string(), "deploy-bot".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_usernames_empty_string_yields_empty_vec() {
+        with_rate_limit_env(Some(""), None, |cfg| {
+            assert!(cfg.rate_limit_exempt_usernames.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_service_accounts_true_strings() {
+        for raw in ["true", "1"] {
+            with_rate_limit_env(None, Some(raw), |cfg| {
+                assert!(
+                    cfg.rate_limit_exempt_service_accounts,
+                    "value {raw:?} should be parsed as true"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_service_accounts_falsy_strings() {
+        for raw in ["false", "0", "yes", "no", "True", "TRUE", "", "anything"] {
+            with_rate_limit_env(None, Some(raw), |cfg| {
+                assert!(
+                    !cfg.rate_limit_exempt_service_accounts,
+                    "value {raw:?} should NOT be parsed as true (only \"true\"/\"1\" qualify)"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_exempt_both_set_simultaneously() {
+        with_rate_limit_env(Some("ci-bot"), Some("true"), |cfg| {
+            assert_eq!(cfg.rate_limit_exempt_usernames, vec!["ci-bot".to_string()]);
+            assert!(cfg.rate_limit_exempt_service_accounts);
+        });
     }
 }
