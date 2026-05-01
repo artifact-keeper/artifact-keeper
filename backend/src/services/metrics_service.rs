@@ -62,6 +62,28 @@ pub fn record_webhook_delivery(event: &str, success: bool) {
     counter!("ak_webhook_deliveries_total", "event" => event.to_string(), "status" => status.to_string()).increment(1);
 }
 
+/// Record that the webhook producer enqueued a `webhook_deliveries` row for the
+/// given event. Counts one increment per matched webhook, so a single
+/// EventBus event with N matching subscribers produces N enqueued samples.
+pub fn record_webhook_delivery_enqueued(event: &str) {
+    counter!(
+        "ak_webhook_delivery_enqueued_total",
+        "event" => event.to_string()
+    )
+    .increment(1);
+}
+
+/// Record that the webhook producer failed to enqueue a `webhook_deliveries`
+/// row. `reason` is a coarse classifier (e.g. `"db_error"`).
+pub fn record_webhook_delivery_enqueue_failed(event: &str, reason: &str) {
+    counter!(
+        "ak_webhook_delivery_enqueue_failed_total",
+        "event" => event.to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
 /// Record an outbound URL that was rejected by SSRF validation, either
 /// at handler entry (`validate_outbound_url`) or on a redirect hop
 /// inside the shared HTTP client. `reason` is `"hostname"` or `"ip"`,

@@ -71,3 +71,4 @@ pub mod lifecycle_service;
 pub mod metrics_service;
 pub mod scheduler_service;
 pub mod sync_worker;
+pub mod webhook_producer;

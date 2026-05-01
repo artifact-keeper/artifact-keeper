@@ -393,6 +393,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
     let grpc_db_pool = db_pool.clone();
+    // Keep handles for the webhook producer (spawned after the shutdown token
+    // is constructed below) before the sync worker consumes db_pool and before
+    // the router takes ownership of `state`.
+    let webhook_producer_db_pool = db_pool.clone();
+    let webhook_producer_event_bus = state.event_bus.clone();
 
     // Spawn background sync worker for peer replication
     artifact_keeper_backend::services::sync_worker::spawn_sync_worker(db_pool).await;
@@ -518,6 +523,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             token
         }
     };
+
+    // Spawn the webhook producer: subscribes to the EventBus and writes a row
+    // into `webhook_deliveries` for every webhook whose events array matches.
+    // The retry scheduler in `process_webhook_retries` picks rows up on its
+    // 30-second tick and performs the actual HTTP POST. Before this producer
+    // existed, no code path inserted into `webhook_deliveries`, so webhook
+    // delivery was effectively dead code (#909).
+    artifact_keeper_backend::services::webhook_producer::start_webhook_producer(
+        webhook_producer_event_bus,
+        webhook_producer_db_pool,
+        shutdown_token.clone(),
+    );
+    tracing::info!("Webhook producer started");
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
