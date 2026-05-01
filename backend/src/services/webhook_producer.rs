@@ -523,4 +523,397 @@ mod tests {
             assert_eq!(map_event_type(ev), None, "{} should be unmapped", ev);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Integration tests for enqueue_for_event and start_webhook_producer.
+    //
+    // These tests exercise the database-bound paths that pure unit tests
+    // cannot reach: the webhook lookup query, the INSERT into
+    // webhook_deliveries, the broadcast subscription loop, and the global
+    // vs scoped match logic. They run as part of `cargo test --workspace
+    // --lib` (which is what the coverage gate uses) and skip silently if
+    // no database is available, so local runs without Postgres still pass.
+    //
+    // CI provides DATABASE_URL with a fully migrated schema. Locally:
+    //   DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" \
+    //     cargo test --workspace --lib webhook_producer::tests::integration
+    // -----------------------------------------------------------------------
+    mod integration {
+        use super::*;
+        use sqlx::PgPool;
+        use std::sync::OnceLock;
+        use std::time::Duration;
+        use tokio::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        /// Serialize integration tests against the shared Postgres instance.
+        ///
+        /// `cargo test` runs tests in parallel by default. These tests insert
+        /// webhooks that subscribe to the same event types and then call
+        /// `enqueue_for_event`, which scans ALL enabled webhooks for a given
+        /// event. Without serialization, test A's webhook is found by test B's
+        /// enqueue call (and vice versa), so each test sees deliveries for
+        /// rows it never set up. Holding this mutex keeps each test's window
+        /// of "my webhooks exist in the table" disjoint from the others'.
+        fn serial_lock() -> &'static Mutex<()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+        }
+
+        /// Try to connect to the test database. Returns `None` if DATABASE_URL
+        /// is unset or the connection fails, which is the signal to skip the
+        /// test (so `cargo test --lib` without Postgres still passes).
+        async fn maybe_pool() -> Option<PgPool> {
+            let url = std::env::var("DATABASE_URL").ok()?;
+            match PgPool::connect(&url).await {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    eprintln!(
+                        "webhook_producer integration test: skipping, cannot connect to \
+                         DATABASE_URL ({}): {}",
+                        url, e
+                    );
+                    None
+                }
+            }
+        }
+
+        /// Insert a webhook subscription. Returns the new webhook id.
+        async fn insert_webhook(
+            pool: &PgPool,
+            name: &str,
+            events: &[&str],
+            repo_id: Option<Uuid>,
+            is_enabled: bool,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            let events_owned: Vec<String> = events.iter().map(|s| s.to_string()).collect();
+            sqlx::query(
+                r#"
+                INSERT INTO webhooks
+                    (id, name, url, events, is_enabled, repository_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                "#,
+            )
+            .bind(id)
+            .bind(name)
+            .bind("https://example.invalid/hook")
+            .bind(&events_owned)
+            .bind(is_enabled)
+            .bind(repo_id)
+            .execute(pool)
+            .await
+            .expect("insert webhook");
+            id
+        }
+
+        /// Insert a minimal `local` repository row so a webhook can scope to
+        /// it. Returns the repo id.
+        async fn insert_repo(pool: &PgPool, key_suffix: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            let key = format!("ak992-{}-{}", key_suffix, &id.to_string()[..8]);
+            sqlx::query(
+                r#"
+                INSERT INTO repositories
+                    (id, key, name, format, repo_type, storage_path, is_public)
+                VALUES ($1, $2, $2, 'generic', 'local', $3, false)
+                "#,
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(format!("/tmp/ak992-test/{}", key))
+            .execute(pool)
+            .await
+            .expect("insert repository");
+            id
+        }
+
+        async fn delivery_count_for(pool: &PgPool, webhook_id: Uuid) -> i64 {
+            let row: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_id = $1")
+                    .bind(webhook_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count deliveries");
+            row.0
+        }
+
+        /// Best-effort cleanup. Run at the end of each test so reruns of the
+        /// same test against the same DB don't accumulate cruft.
+        async fn cleanup_webhooks(pool: &PgPool, ids: &[Uuid]) {
+            for id in ids {
+                let _ = sqlx::query("DELETE FROM webhook_deliveries WHERE webhook_id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+                let _ = sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+
+        async fn cleanup_repos(pool: &PgPool, ids: &[Uuid]) {
+            for id in ids {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await;
+            }
+        }
+
+        /// Wipe any leftover ak992 fixtures from a previous failed run so a
+        /// rerun against the same database starts clean. Operates only on
+        /// rows we ourselves create (name prefix `ak992-`, repo key prefix
+        /// `ak992-`), never on real production data.
+        async fn purge_leftovers(pool: &PgPool) {
+            let _ = sqlx::query(
+                "DELETE FROM webhook_deliveries WHERE webhook_id IN \
+                 (SELECT id FROM webhooks WHERE name LIKE 'ak992-%')",
+            )
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM webhooks WHERE name LIKE 'ak992-%'")
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE key LIKE 'ak992-%'")
+                .execute(pool)
+                .await;
+        }
+
+        /// Test 1: a published event lands as a `webhook_deliveries` row for a
+        /// matching, enabled, global subscription. End-to-end through
+        /// `start_webhook_producer` so the broadcast loop is exercised too.
+        #[tokio::test]
+        async fn end_to_end_event_produces_delivery_row() {
+            let Some(pool) = maybe_pool().await else {
+                return;
+            };
+            let _guard = serial_lock().lock().await;
+            purge_leftovers(&pool).await;
+
+            let webhook_id = insert_webhook(
+                &pool,
+                "ak992-end-to-end",
+                &["repository_created"],
+                None,
+                true,
+            )
+            .await;
+
+            let bus = std::sync::Arc::new(crate::services::event_bus::EventBus::new(16));
+            let token = CancellationToken::new();
+            start_webhook_producer(bus.clone(), pool.clone(), token.clone());
+
+            // Tiny sleep so the spawned task is parked on rx.recv() before we
+            // publish. Without this the broadcast send can race the spawn.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let entity = Uuid::new_v4().to_string();
+            bus.publish(DomainEvent {
+                event_type: "repository.created".into(),
+                entity_id: entity.clone(),
+                actor: Some("admin".into()),
+                timestamp: "2026-04-28T12:00:00Z".into(),
+            });
+
+            // Settling delay for the producer to dequeue + INSERT. Not a
+            // load-bearing assertion; we re-check below if needed.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            let count = delivery_count_for(&pool, webhook_id).await;
+            assert_eq!(
+                count, 1,
+                "expected exactly one delivery row, found {}",
+                count
+            );
+
+            let row: (String, serde_json::Value) = sqlx::query_as(
+                "SELECT event, payload FROM webhook_deliveries WHERE webhook_id = $1 LIMIT 1",
+            )
+            .bind(webhook_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch delivery row");
+            assert_eq!(row.0, "repository_created", "event column mismatch");
+            assert_eq!(
+                row.1.get("entity_id").and_then(|v| v.as_str()),
+                Some(entity.as_str()),
+                "payload entity_id must round-trip"
+            );
+            assert_eq!(
+                row.1.get("actor").and_then(|v| v.as_str()),
+                Some("admin"),
+                "payload actor must round-trip"
+            );
+
+            token.cancel();
+            cleanup_webhooks(&pool, &[webhook_id]).await;
+        }
+
+        /// Test 2: global webhook (`repository_id IS NULL`) matches every
+        /// event; scoped webhook (`repository_id = X`) only matches events
+        /// whose `entity_id` parses to `X`. Calls `enqueue_for_event` directly
+        /// so timing isn't a factor.
+        #[tokio::test]
+        async fn global_and_scoped_webhook_routing() {
+            let Some(pool) = maybe_pool().await else {
+                return;
+            };
+            let _guard = serial_lock().lock().await;
+            purge_leftovers(&pool).await;
+
+            let scoped_repo_id = insert_repo(&pool, "scoped").await;
+            let other_repo_id = insert_repo(&pool, "other").await;
+
+            let global_id =
+                insert_webhook(&pool, "ak992-global", &["repository_created"], None, true).await;
+            let scoped_id = insert_webhook(
+                &pool,
+                "ak992-scoped",
+                &["repository_created"],
+                Some(scoped_repo_id),
+                true,
+            )
+            .await;
+
+            // Event 1: targets the scoped repo. Both webhooks must fire.
+            let event_for_scoped = DomainEvent {
+                event_type: "repository.created".into(),
+                entity_id: scoped_repo_id.to_string(),
+                actor: Some("admin".into()),
+                timestamp: "2026-04-28T12:00:00Z".into(),
+            };
+            enqueue_for_event(&pool, &event_for_scoped)
+                .await
+                .expect("enqueue scoped event");
+
+            assert_eq!(
+                delivery_count_for(&pool, global_id).await,
+                1,
+                "global webhook must receive delivery for scoped repo event"
+            );
+            assert_eq!(
+                delivery_count_for(&pool, scoped_id).await,
+                1,
+                "scoped webhook must receive delivery for its own repo event"
+            );
+
+            // Event 2: targets a different repo. Only the global webhook
+            // gets a new row; the scoped webhook stays at 1.
+            let event_for_other = DomainEvent {
+                event_type: "repository.created".into(),
+                entity_id: other_repo_id.to_string(),
+                actor: Some("admin".into()),
+                timestamp: "2026-04-28T12:01:00Z".into(),
+            };
+            enqueue_for_event(&pool, &event_for_other)
+                .await
+                .expect("enqueue other event");
+
+            assert_eq!(
+                delivery_count_for(&pool, global_id).await,
+                2,
+                "global webhook must receive a second delivery for the other repo"
+            );
+            assert_eq!(
+                delivery_count_for(&pool, scoped_id).await,
+                1,
+                "scoped webhook must NOT fire for a different repo's event"
+            );
+
+            cleanup_webhooks(&pool, &[global_id, scoped_id]).await;
+            cleanup_repos(&pool, &[scoped_repo_id, other_repo_id]).await;
+        }
+
+        /// Test 3: a disabled subscription must not produce delivery rows
+        /// even when its event filter and scope would otherwise match.
+        #[tokio::test]
+        async fn disabled_subscription_does_not_fire() {
+            let Some(pool) = maybe_pool().await else {
+                return;
+            };
+            let _guard = serial_lock().lock().await;
+            purge_leftovers(&pool).await;
+
+            let webhook_id = insert_webhook(
+                &pool,
+                "ak992-disabled",
+                &["repository_created"],
+                None,
+                false,
+            )
+            .await;
+
+            let event = DomainEvent {
+                event_type: "repository.created".into(),
+                entity_id: Uuid::new_v4().to_string(),
+                actor: None,
+                timestamp: "2026-04-28T12:00:00Z".into(),
+            };
+            enqueue_for_event(&pool, &event)
+                .await
+                .expect("enqueue must not error even when there are no matching webhooks");
+
+            assert_eq!(
+                delivery_count_for(&pool, webhook_id).await,
+                0,
+                "disabled webhook must not receive a delivery"
+            );
+
+            cleanup_webhooks(&pool, &[webhook_id]).await;
+        }
+
+        /// Test 4: an event type with no `WebhookEvent` mapping is silently
+        /// skipped. No rows are inserted, no error is returned.
+        #[tokio::test]
+        async fn unmapped_event_type_is_silently_skipped() {
+            let Some(pool) = maybe_pool().await else {
+                return;
+            };
+            let _guard = serial_lock().lock().await;
+            purge_leftovers(&pool).await;
+
+            // A webhook that subscribes to every known event. Even so, an
+            // unmapped event type must produce zero rows because the producer
+            // exits early in `map_event_type`.
+            let webhook_id = insert_webhook(
+                &pool,
+                "ak992-unmapped",
+                &[
+                    "artifact_uploaded",
+                    "artifact_deleted",
+                    "repository_created",
+                    "repository_deleted",
+                    "user_created",
+                    "user_deleted",
+                    "build_started",
+                    "build_completed",
+                    "build_failed",
+                ],
+                None,
+                true,
+            )
+            .await;
+
+            let event = DomainEvent {
+                event_type: "completely_unknown_event".into(),
+                entity_id: Uuid::new_v4().to_string(),
+                actor: None,
+                timestamp: "2026-04-28T12:00:00Z".into(),
+            };
+            enqueue_for_event(&pool, &event)
+                .await
+                .expect("unmapped event must not error");
+
+            assert_eq!(
+                delivery_count_for(&pool, webhook_id).await,
+                0,
+                "unmapped event type must produce zero delivery rows"
+            );
+
+            cleanup_webhooks(&pool, &[webhook_id]).await;
+        }
+    }
 }
