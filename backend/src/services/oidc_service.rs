@@ -760,6 +760,8 @@ mod tests {
             proxy_max_artifact_size_bytes: 2_147_483_648,
             proxy_queue_timeout_secs: 30,
             metrics_port: None,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
         };
 
         let oidc_config = OidcConfig::from_config(&config);
@@ -810,6 +812,8 @@ mod tests {
             proxy_max_artifact_size_bytes: 2_147_483_648,
             proxy_queue_timeout_secs: 30,
             metrics_port: None,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
         }
     }
 

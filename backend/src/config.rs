@@ -145,6 +145,16 @@ pub struct Config {
     /// **Security note:** ensure this port is not reachable from untrusted
     /// networks (e.g. restrict via firewall or Kubernetes NetworkPolicy).
     pub metrics_port: Option<u16>,
+
+    /// Comma-separated list of usernames exempt from auth/API rate limiting.
+    /// Useful for shared CI/admin accounts in test environments where bcrypt
+    /// verification on every burst request can saturate the spawn_blocking
+    /// pool and surface as 401/429 flakes. Set via `RATE_LIMIT_EXEMPT_USERNAMES`.
+    pub rate_limit_exempt_usernames: Vec<String>,
+
+    /// When true, principals authenticated as service accounts bypass the
+    /// in-process rate limiter. Set via `RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS`.
+    pub rate_limit_exempt_service_accounts: bool,
 }
 
 redacted_debug!(Config {
@@ -187,6 +197,8 @@ redacted_debug!(Config {
     show proxy_max_artifact_size_bytes,
     show proxy_queue_timeout_secs,
     show metrics_port,
+    show rate_limit_exempt_usernames,
+    show rate_limit_exempt_service_accounts,
 });
 
 impl Config {
@@ -276,6 +288,19 @@ impl Config {
                 },
                 Err(_) => None,
             },
+            rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            rate_limit_exempt_service_accounts: matches!(
+                env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
+                Ok("true" | "1")
+            ),
         };
 
         config.validate_jwt_secret()?;
@@ -362,6 +387,8 @@ impl Default for Config {
             proxy_max_artifact_size_bytes: 2_147_483_648,
             proxy_queue_timeout_secs: 30,
             metrics_port: None,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
         }
     }
 }

@@ -10,7 +10,9 @@ use super::middleware::auth::{
     RepoVisibilityState,
 };
 use super::middleware::demo::demo_guard;
-use super::middleware::rate_limit::{rate_limit_middleware, RateLimiter};
+use super::middleware::rate_limit::{
+    rate_limit_middleware, RateLimitExemptions, RateLimitState, RateLimiter,
+};
 use super::middleware::setup::setup_guard;
 use super::middleware::tracing::correlation_id_middleware;
 use super::SharedState;
@@ -176,6 +178,23 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     let auth_rate_limiter = Arc::new(RateLimiter::new(auth_rate_limit, rate_limit_window));
     let api_rate_limiter = Arc::new(RateLimiter::new(api_rate_limit, rate_limit_window));
 
+    // Build the exemption set from Config (RATE_LIMIT_EXEMPT_USERNAMES /
+    // RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS). Backported from #697 so shared
+    // CI/test admin accounts can bypass the in-process limiter.
+    let exemptions = Arc::new(RateLimitExemptions::new(
+        state.config.rate_limit_exempt_usernames.clone(),
+        state.config.rate_limit_exempt_service_accounts,
+    ));
+
+    let auth_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&auth_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+    };
+    let api_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&api_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+    };
+
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
     {
@@ -198,7 +217,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         .nest(
             "/auth",
             handlers::auth::public_router().layer(middleware::from_fn_with_state(
-                auth_rate_limiter,
+                auth_rate_limit_state,
                 rate_limit_middleware,
             )),
         )
@@ -516,7 +535,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         )
         // General API rate limiting (100 req/min per IP/user)
         .layer(middleware::from_fn_with_state(
-            api_rate_limiter,
+            api_rate_limit_state,
             rate_limit_middleware,
         ))
 }
