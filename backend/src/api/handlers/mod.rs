@@ -219,7 +219,10 @@ mod tests {
 
     #[test]
     fn test_escape_path_prefix_two_components() {
-        assert_eq!(escape_path_prefix(&["bert-base", "main"]), "bert-base/main/");
+        assert_eq!(
+            escape_path_prefix(&["bert-base", "main"]),
+            "bert-base/main/"
+        );
     }
 
     #[test]
