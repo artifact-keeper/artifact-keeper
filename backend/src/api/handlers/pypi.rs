@@ -562,9 +562,6 @@ async fn serve_file(
     project: &str,
     filename: &str,
 ) -> Result<Response, Response> {
-    // Escape `%` and `_` so user-supplied filename is matched as a literal,
-    // not a LIKE wildcard. See `crate::api::handlers::escape_like_literal`.
-    let filename_escaped = super::escape_like_literal(filename);
     // Find artifact by filename (last path segment matches)
     let artifact = sqlx::query!(
         r#"
@@ -576,7 +573,7 @@ async fn serve_file(
         LIMIT 1
         "#,
         repo.id,
-        filename_escaped
+        super::escape_filename_for_like(filename)
     )
     .fetch_optional(&state.db)
     .await
@@ -857,9 +854,6 @@ async fn serve_metadata(
     location: &crate::storage::StorageLocation,
     filename: &str,
 ) -> Result<Response, Response> {
-    // Escape `%` and `_` so user-supplied filename is matched as a literal,
-    // not a LIKE wildcard. See `crate::api::handlers::escape_like_literal`.
-    let filename_escaped = super::escape_like_literal(filename);
     // Find the artifact
     let artifact = sqlx::query!(
         r#"
@@ -871,7 +865,7 @@ async fn serve_metadata(
         LIMIT 1
         "#,
         repo_id,
-        filename_escaped
+        super::escape_filename_for_like(filename)
     )
     .fetch_optional(db)
     .await

@@ -744,9 +744,6 @@ async fn download_provider(
 ) -> Result<Response, Response> {
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     let provider_name = format!("{}/{}", namespace, type_name);
-    // Escape `%` and `_` in the platform tag so user-supplied os/arch (and
-    // the literal `_` separator) are matched as literals in the LIKE pattern
-    // below, not wildcards. See `crate::api::handlers::escape_like_literal`.
     let platform_path = super::escape_like_literal(&format!("{}_{}", os, arch));
 
     let artifact = sqlx::query!(

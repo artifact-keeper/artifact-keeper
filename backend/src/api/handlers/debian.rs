@@ -148,10 +148,6 @@ async fn fetch_package_entries(
     component: &str,
     arch: &str,
 ) -> Result<Vec<PackageEntry>, Response> {
-    // Escape `%` and `_` in user-supplied component so it's matched as a
-    // literal in the LIKE pattern below, not a wildcard. See
-    // `crate::api::handlers::escape_like_literal`.
-    let component_escaped = super::escape_like_literal(component);
     let artifacts = sqlx::query!(
         r#"
         SELECT a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -164,7 +160,7 @@ async fn fetch_package_entries(
         ORDER BY a.name, a.created_at DESC
         "#,
         repo_id,
-        component_escaped
+        super::escape_like_literal(component)
     )
     .fetch_all(db)
     .await

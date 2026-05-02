@@ -198,9 +198,6 @@ async fn download_package(
     Path((repo_key, filename)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
-    // Escape `%` and `_` so user-supplied filename is matched as a literal,
-    // not a LIKE wildcard. See `crate::api::handlers::escape_like_literal`.
-    let filename_escaped = super::escape_like_literal(&filename);
 
     let artifact = sqlx::query!(
         r#"
@@ -212,7 +209,7 @@ async fn download_package(
         LIMIT 1
         "#,
         repo.id,
-        filename_escaped
+        super::escape_filename_for_like(&filename)
     )
     .fetch_optional(&state.db)
     .await

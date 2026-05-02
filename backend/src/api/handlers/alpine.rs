@@ -114,15 +114,7 @@ async fn list_alpine_artifacts(
     repository: &str,
     arch: &str,
 ) -> Result<Vec<AlpineArtifact>, Response> {
-    // Escape `%` and `_` in user-supplied path components so they're matched
-    // as literals in the LIKE prefix below, not wildcards. See
-    // `crate::api::handlers::escape_like_literal`.
-    let path_prefix = format!(
-        "{}/{}/{}/",
-        super::escape_like_literal(branch),
-        super::escape_like_literal(repository),
-        super::escape_like_literal(arch),
-    );
+    let path_prefix = super::escape_path_prefix(&[branch, repository, arch]);
     let rows = sqlx::query!(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
