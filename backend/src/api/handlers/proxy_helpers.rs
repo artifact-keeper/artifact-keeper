@@ -554,9 +554,8 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
+    let path = sqlx::query_scalar!(
+        r#"SELECT path FROM artifacts
         WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\' AND is_deleted = false
         LIMIT 1"#,
         repo_id,
@@ -567,13 +566,7 @@ pub async fn local_fetch_by_path_suffix(
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
-
-    Ok((content, Some(artifact.content_type)))
+    local_fetch_by_path(db, state, repo_id, location, &path).await
 }
 
 /// Build a minimal `Repository` model for proxy operations.
