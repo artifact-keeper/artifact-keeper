@@ -546,7 +546,7 @@ pub async fn local_fetch_by_name_version(
 
 /// Generic local artifact fetch by path suffix (LIKE match).
 /// Used for handlers like npm that query by filename suffix. `path_suffix`
-/// is escaped internally — callers pass raw user input, not pre-escaped.
+/// is escaped internally; callers pass raw user input, not pre-escaped.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
