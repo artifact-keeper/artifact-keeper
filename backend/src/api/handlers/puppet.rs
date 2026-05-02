@@ -348,11 +348,11 @@ async fn download_module(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2 ESCAPE '\'
+          AND path LIKE '%/' || $2
         LIMIT 1
         "#,
         repo.id,
-        super::escape_filename_for_like(&file_path)
+        filename
     )
     .fetch_optional(&state.db)
     .await

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,\n               am.metadata as \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND a.path LIKE 'pool/' || $2 || '/%' ESCAPE '\\'\n        ORDER BY a.name, a.created_at DESC\n        ",
+  "query": "\n        SELECT a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,\n               am.metadata as \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND a.path LIKE 'pool/' || $2 || '/%'\n        ORDER BY a.name, a.created_at DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -49,5 +49,5 @@
       false
     ]
   },
-  "hash": "76183ce8e14ec95db4977422fec25053bd6c12c7d92303015ac6c86e2f8012dc"
+  "hash": "46cf3c33aea06e7123ab21951906e5b78b4ab257e2d836b9c6c46a0a2ee7c957"
 }
