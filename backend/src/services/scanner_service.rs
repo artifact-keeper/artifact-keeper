@@ -1237,11 +1237,99 @@ impl ScannerService {
         self.dependency_track = Some(dt);
     }
 
+    /// Synchronously create one placeholder `running` scan_result row per
+    /// configured scanner for the given artifact, returning the row IDs.
+    ///
+    /// This is the synchronous half of the trigger-scan path: it commits real
+    /// rows to the database before the caller spawns the actual scan worker.
+    /// Returns `(scan_type, scan_result_id)` pairs that the caller can pass to
+    /// [`scan_artifact_with_prepared`] (and surface in the API response so
+    /// clients can pin polling to specific scan IDs without racing concurrent
+    /// scans on the same artifact).
+    ///
+    /// Returns `Ok(vec![])` when scanning is disabled for the artifact's
+    /// repository and `force` is false (matching `scan_artifact_with_options`).
+    /// Returns `Ok(vec![])` when the artifact is missing or soft-deleted, so
+    /// the caller can decide whether to surface a 404 separately.
+    pub async fn prepare_artifact_scan(
+        &self,
+        artifact_id: Uuid,
+        force: bool,
+    ) -> Result<Vec<(String, Uuid)>> {
+        let artifact = sqlx::query!(
+            r#"
+            SELECT repository_id, checksum_sha256
+            FROM artifacts
+            WHERE id = $1 AND is_deleted = false
+            "#,
+            artifact_id,
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let Some(artifact) = artifact else {
+            return Ok(vec![]);
+        };
+
+        if !force
+            && !self
+                .scan_config_service
+                .is_scan_enabled(artifact.repository_id)
+                .await?
+        {
+            return Ok(vec![]);
+        }
+
+        let mut prepared = Vec::with_capacity(self.scanners.len());
+        for scanner in &self.scanners {
+            let row = self
+                .scan_result_service
+                .create_scan_result_with_checksum(
+                    artifact_id,
+                    artifact.repository_id,
+                    scanner.scan_type(),
+                    Some(&artifact.checksum_sha256),
+                )
+                .await?;
+            prepared.push((scanner.scan_type().to_string(), row.id));
+        }
+
+        Ok(prepared)
+    }
+
+    /// Scan a single artifact using pre-allocated scan_result row IDs.
+    ///
+    /// Companion to [`prepare_artifact_scan`]: when the caller has already
+    /// committed placeholder rows (so it could surface their IDs in the
+    /// trigger response), this variant reuses those IDs instead of inserting
+    /// new ones. Falls back to creating a row on the fly if a scanner has no
+    /// matching prepared ID (e.g. scanner set changed between prepare and
+    /// execute).
+    pub async fn scan_artifact_with_prepared(
+        &self,
+        artifact_id: Uuid,
+        prepared: HashMap<String, Uuid>,
+        force: bool,
+    ) -> Result<()> {
+        self.scan_artifact_inner(artifact_id, force, Some(prepared))
+            .await
+    }
+
     /// Scan a single artifact: run all applicable scanners, persist results,
     /// recalculate the repository security score.
     /// Scan a single artifact. When `force` is true, skip the repo scan-enabled check
     /// (used for on-demand scans triggered manually by an admin).
     pub async fn scan_artifact_with_options(&self, artifact_id: Uuid, force: bool) -> Result<()> {
+        self.scan_artifact_inner(artifact_id, force, None).await
+    }
+
+    async fn scan_artifact_inner(
+        &self,
+        artifact_id: Uuid,
+        force: bool,
+        prepared: Option<HashMap<String, Uuid>>,
+    ) -> Result<()> {
         // Fetch artifact and content
         let artifact = sqlx::query_as!(
             Artifact,
@@ -1297,8 +1385,14 @@ impl ScannerService {
 
         let checksum = &artifact.checksum_sha256;
         const DEDUP_TTL_DAYS: i32 = 30;
+        let mut prepared = prepared.unwrap_or_default();
 
         for scanner in &self.scanners {
+            // Take any pre-allocated row id committed by the trigger handler.
+            // The id was already returned to the client in TriggerScanResponse,
+            // so we must keep the same row alive (UPDATE rather than INSERT).
+            let prepared_id = prepared.remove(scanner.scan_type());
+
             // Check for reusable scan results (same hash + scan type within TTL)
             if let Ok(Some(source_scan)) = self
                 .scan_result_service
@@ -1307,17 +1401,22 @@ impl ScannerService {
             {
                 // Skip if the source scan is for the same artifact (already scanned)
                 if source_scan.artifact_id != artifact_id {
-                    match self
-                        .scan_result_service
-                        .copy_scan_results(
-                            source_scan.id,
-                            artifact_id,
-                            artifact.repository_id,
-                            scanner.scan_type(),
-                            checksum,
-                        )
-                        .await
-                    {
+                    let copied = if let Some(target_id) = prepared_id {
+                        self.scan_result_service
+                            .convert_to_reused(target_id, source_scan.id, artifact_id)
+                            .await
+                    } else {
+                        self.scan_result_service
+                            .copy_scan_results(
+                                source_scan.id,
+                                artifact_id,
+                                artifact.repository_id,
+                                scanner.scan_type(),
+                                checksum,
+                            )
+                            .await
+                    };
+                    match copied {
                         Ok(reused) => {
                             info!(
                                 "Reusing scan results from {} for artifact {} (scanner={}, hash={}..)",
@@ -1341,15 +1440,20 @@ impl ScannerService {
                 }
             }
 
-            let scan_result = self
-                .scan_result_service
-                .create_scan_result_with_checksum(
-                    artifact_id,
-                    artifact.repository_id,
-                    scanner.scan_type(),
-                    Some(checksum),
-                )
-                .await?;
+            // Either reuse path failed or no reusable scan: run a fresh scan.
+            // If we still have a prepared id, reuse it; otherwise create a row.
+            let scan_result = if let Some(target_id) = prepared_id {
+                self.scan_result_service.get_scan(target_id).await?
+            } else {
+                self.scan_result_service
+                    .create_scan_result_with_checksum(
+                        artifact_id,
+                        artifact.repository_id,
+                        scanner.scan_type(),
+                        Some(checksum),
+                    )
+                    .await?
+            };
 
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {
                 Ok(findings) => {

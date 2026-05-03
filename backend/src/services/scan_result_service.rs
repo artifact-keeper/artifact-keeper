@@ -99,7 +99,8 @@ impl ScanResultService {
             VALUES ($1, $2, $3, 'running', NOW(), $4)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                      scanner_version, error_message, started_at, completed_at, created_at
+                      scanner_version, error_message, started_at, completed_at, created_at,
+                      is_reused, source_scan_id
             "#,
             artifact_id,
             repository_id,
@@ -126,7 +127,8 @@ impl ScanResultService {
             r#"
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                   scanner_version, error_message, started_at, completed_at, created_at
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
             FROM scan_results
             WHERE checksum_sha256 = $1
               AND scan_type = $2
@@ -171,7 +173,8 @@ impl ScanResultService {
             VALUES ($1, $2, $3, 'completed', NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, true)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                      scanner_version, error_message, started_at, completed_at, created_at
+                      scanner_version, error_message, started_at, completed_at, created_at,
+                      is_reused, source_scan_id
             "#,
             artifact_id,
             repository_id,
@@ -212,6 +215,81 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(new_scan)
+    }
+
+    /// Convert a pre-allocated `running` scan_result row into a reused row
+    /// whose counts and findings are copied from `source_scan_id`.
+    ///
+    /// Used by the trigger-scan path when scan_result rows are created
+    /// synchronously (so their IDs can be returned in the trigger response)
+    /// before the dedup decision is made. UPDATEs the target row in place
+    /// rather than INSERTing a new one, so the IDs already returned to the
+    /// client remain valid.
+    pub async fn convert_to_reused(
+        &self,
+        target_scan_id: Uuid,
+        source_scan_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<ScanResult> {
+        // Pull source counts so we can copy them onto the target.
+        let source = self.get_scan(source_scan_id).await?;
+
+        let updated = sqlx::query_as!(
+            ScanResult,
+            r#"
+            UPDATE scan_results
+            SET status = 'completed',
+                completed_at = NOW(),
+                findings_count = $2,
+                critical_count = $3,
+                high_count = $4,
+                medium_count = $5,
+                low_count = $6,
+                info_count = $7,
+                is_reused = true,
+                source_scan_id = $8
+            WHERE id = $1
+            RETURNING id, artifact_id, repository_id, scan_type, status,
+                      findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                      scanner_version, error_message, started_at, completed_at, created_at,
+                      is_reused, source_scan_id
+            "#,
+            target_scan_id,
+            source.findings_count,
+            source.critical_count,
+            source.high_count,
+            source.medium_count,
+            source.low_count,
+            source.info_count,
+            source_scan_id,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Copy findings from the source scan into the target scan id.
+        sqlx::query!(
+            r#"
+            INSERT INTO scan_findings (
+                scan_result_id, artifact_id, severity, title, description,
+                cve_id, affected_component, affected_version, fixed_version,
+                source, source_url
+            )
+            SELECT $1, $2, severity, title, description,
+                   cve_id, affected_component, affected_version, fixed_version,
+                   source, source_url
+            FROM scan_findings
+            WHERE scan_result_id = $3
+            "#,
+            target_scan_id,
+            artifact_id,
+            source_scan_id,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(updated)
     }
 
     /// Mark a scan as completed with severity counts.
@@ -274,7 +352,8 @@ impl ScanResultService {
             r#"
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                   scanner_version, error_message, started_at, completed_at, created_at
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
             FROM scan_results
             WHERE id = $1
             "#,
@@ -300,7 +379,8 @@ impl ScanResultService {
             r#"
             SELECT id, artifact_id, repository_id, scan_type, status,
                    findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                   scanner_version, error_message, started_at, completed_at, created_at
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
             FROM scan_results
             WHERE ($1::uuid IS NULL OR repository_id = $1)
               AND ($2::uuid IS NULL OR artifact_id = $2)
@@ -812,12 +892,16 @@ mod tests {
             started_at: Some(chrono::Utc::now()),
             completed_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            is_reused: false,
+            source_scan_id: None,
         };
         assert_eq!(result.scan_type, "dependency");
         assert_eq!(result.status, "completed");
         assert_eq!(result.findings_count, 10);
         assert_eq!(result.critical_count, 1);
         assert!(result.error_message.is_none());
+        assert!(!result.is_reused);
+        assert!(result.source_scan_id.is_none());
     }
 
     #[test]
@@ -839,11 +923,15 @@ mod tests {
             started_at: None,
             completed_at: None,
             created_at: chrono::Utc::now(),
+            is_reused: false,
+            source_scan_id: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["scan_type"], "image");
         assert_eq!(json["status"], "running");
         assert_eq!(json["findings_count"], 0);
+        assert_eq!(json["is_reused"], false);
+        assert!(json["source_scan_id"].is_null());
     }
 
     #[test]
@@ -865,9 +953,41 @@ mod tests {
             started_at: Some(chrono::Utc::now()),
             completed_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            is_reused: false,
+            source_scan_id: None,
         };
         assert_eq!(result.status, "failed");
         assert_eq!(result.error_message.as_deref(), Some("Scanner timed out"));
+    }
+
+    #[test]
+    fn test_scan_result_reused_marks_source() {
+        let source_id = Uuid::new_v4();
+        let result = ScanResult {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            scan_type: "trivy".to_string(),
+            status: "completed".to_string(),
+            findings_count: 5,
+            critical_count: 0,
+            high_count: 1,
+            medium_count: 2,
+            low_count: 2,
+            info_count: 0,
+            scanner_version: None,
+            error_message: None,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            is_reused: true,
+            source_scan_id: Some(source_id),
+        };
+        assert!(result.is_reused);
+        assert_eq!(result.source_scan_id, Some(source_id));
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["is_reused"], true);
+        assert_eq!(json["source_scan_id"], source_id.to_string());
     }
 
     // =======================================================================
