@@ -425,6 +425,9 @@ async fn download_package(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
     let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path);
+    // Escape `%` and `_` so user-supplied filename is matched as a literal,
+    // not a LIKE wildcard. See `crate::api::handlers::escape_filename_for_like`.
+    let filename_escaped = super::escape_filename_for_like(filename);
 
     let artifact = sqlx::query!(
         r#"
@@ -432,11 +435,11 @@ async fn download_package(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,
-        filename
+        filename_escaped
     )
     .fetch_optional(&state.db)
     .await

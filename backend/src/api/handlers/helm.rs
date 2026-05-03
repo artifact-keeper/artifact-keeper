@@ -223,6 +223,9 @@ async fn download_chart(
     Path((repo_key, filename)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
+    // Escape `%` and `_` so user-supplied filename is matched as a literal,
+    // not a LIKE wildcard. See `crate::api::handlers::escape_filename_for_like`.
+    let filename_escaped = super::escape_filename_for_like(&filename);
 
     // Find artifact by filename pattern
     let artifact = sqlx::query!(
@@ -231,11 +234,11 @@ async fn download_chart(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,
-        filename
+        filename_escaped
     )
     .fetch_optional(&state.db)
     .await

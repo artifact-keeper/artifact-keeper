@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, path, name, size_bytes, checksum_sha256, storage_key\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path LIKE $2\n        LIMIT 1\n        ",
+  "query": "\n        SELECT id, path, name, size_bytes, checksum_sha256, storage_key\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path LIKE '%/' || $2 ESCAPE '\\'\n        LIMIT 1\n        ",
   "describe": {
     "columns": [
       {
@@ -49,5 +49,5 @@
       false
     ]
   },
-  "hash": "94bf14be7e71718fd184a4d1ada7143e388b2ebb5a06b9440113adf2814227f4"
+  "hash": "dbce4f53f1bfeeab3230d00c8a400bb8fc7b7df69df6b6a416ef1d30fd663103"
 }
