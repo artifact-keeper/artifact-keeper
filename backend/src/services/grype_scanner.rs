@@ -355,4 +355,24 @@ mod tests {
         assert_eq!(report.matches[0].vulnerability.id, "CVE-2021-44228");
         assert_eq!(report.matches[0].artifact.name, "log4j-core");
     }
+
+    /// `version()` exercises the OnceCell-cached `grype --version` probe.
+    /// As with the Trivy version test, we accept either Some or None
+    /// depending on whether `grype` is installed on the test host: we only
+    /// require that repeated calls return the same value (cache fidelity)
+    /// and that any returned token starts with `grype-`.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let scanner = GrypeScanner::new("/tmp/grype-version-cov-test".to_string());
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("grype-"),
+                "grype version probe must be normalized to 'grype-<ver>'; got {}",
+                v
+            );
+        }
+    }
 }

@@ -2181,6 +2181,111 @@ mod tests {
         assert_eq!(s.version().await, None);
     }
 
+    /// Exercise the success path of `capture_cli_version_with_timeout`:
+    /// spawn succeeded, exit status was zero, stdout had a non-empty first
+    /// line. `/bin/echo` is part of POSIX baseline and always produces this
+    /// shape, so we use it as a stand-in for a healthy `--version` probe.
+    /// Verifies the trim + first-line slicing logic that the per-scanner
+    /// `version()` impls rely on. Skipped on hosts without `/bin/echo`.
+    #[tokio::test]
+    async fn test_capture_cli_version_success_returns_first_line() {
+        if !std::path::Path::new("/bin/echo").exists() {
+            eprintln!("skipping: /bin/echo not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/echo",
+            &["Version: 0.62.1"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, Some("Version: 0.62.1".to_string()));
+    }
+
+    /// Multi-line stdout: only the first line should be returned, with
+    /// trailing whitespace trimmed. `printf` is more portable than
+    /// `echo -e` for embedding `\n`; we shell out via `/bin/sh -c`.
+    #[tokio::test]
+    async fn test_capture_cli_version_success_multi_line_takes_first() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "printf 'grype 0.83.0\\nDB updated 2025-04-01\\n'"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, Some("grype 0.83.0".to_string()));
+    }
+
+    /// A binary that exits non-zero must yield None even if it printed
+    /// something on stdout. `/usr/bin/false` is POSIX-standard and always
+    /// exits 1 with empty stdout; combining shell redirection lets us
+    /// assert the exit-status branch independent of empty-stdout.
+    #[tokio::test]
+    async fn test_capture_cli_version_non_success_status_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        // Print a fake version to stdout, then exit non-zero. We must still
+        // observe None so callers do not record output from a crashed probe.
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "echo 'trivy 0.0.0'; exit 7"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, None);
+    }
+
+    /// A binary that exits zero with empty stdout (e.g. `/bin/true`) must
+    /// yield None. This exercises the `lines().next()?` early-return.
+    #[tokio::test]
+    async fn test_capture_cli_version_empty_stdout_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result =
+            capture_cli_version_with_timeout("/bin/sh", &["-c", "exit 0"], Duration::from_secs(2))
+                .await;
+        assert_eq!(result, None);
+    }
+
+    /// A binary whose first stdout line is whitespace-only must yield None,
+    /// not `Some("")`. This exercises the `if line.is_empty()` branch after
+    /// trimming.
+    #[tokio::test]
+    async fn test_capture_cli_version_whitespace_only_stdout_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "printf '   \\n'"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, None);
+    }
+
+    /// `capture_cli_version` (the non-timeout-parameterized wrapper) must
+    /// also propagate success. Exercise it once with `/bin/echo` so the
+    /// public wrapper line is covered alongside the inner helper.
+    #[tokio::test]
+    async fn test_capture_cli_version_wrapper_success_path() {
+        if !std::path::Path::new("/bin/echo").exists() {
+            eprintln!("skipping: /bin/echo not present on this host");
+            return;
+        }
+        let result = capture_cli_version("/bin/echo", &["trivy 0.62.1"]).await;
+        assert_eq!(result, Some("trivy 0.62.1".to_string()));
+    }
+
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
     // -----------------------------------------------------------------------

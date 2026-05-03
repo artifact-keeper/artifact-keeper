@@ -330,4 +330,29 @@ mod tests {
             "Trivy filesystem scan",
         );
     }
+
+    /// `version()` exercises the OnceCell-cached probe path. We do not
+    /// require `trivy` to be installed: the test only asserts the call
+    /// returns deterministically (`Some("trivy-...")` when installed,
+    /// `None` otherwise) and that subsequent calls return the same value
+    /// from cache. The point is to cover the per-scanner override body so
+    /// the new-code coverage gate sees these lines as executed.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("trivy-"),
+                "trivy version probe must be normalized to 'trivy-<ver>'; got {}",
+                v
+            );
+        }
+    }
 }

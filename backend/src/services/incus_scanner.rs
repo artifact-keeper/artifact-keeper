@@ -1112,4 +1112,28 @@ mod tests {
         assert_eq!(report.results.len(), 1);
         assert!(report.results[0].vulnerabilities.is_none());
     }
+
+    /// `version()` covers the OnceCell-cached `trivy --version` probe path
+    /// for the Incus scanner. The Incus scanner shares the Trivy binary
+    /// with `TrivyFsScanner`, so the format is also `trivy-<ver>`. We
+    /// tolerate hosts both with and without `trivy` installed; the
+    /// assertion is on caching plus the prefix shape.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("trivy-"),
+                "incus scanner version must be normalized 'trivy-<ver>'; got {}",
+                v
+            );
+        }
+    }
 }

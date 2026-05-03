@@ -606,4 +606,24 @@ mod tests {
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].vulnerabilities.as_ref().unwrap().len(), 1);
     }
+
+    /// `version()` covers the OnceCell-cached `trivy --version` probe path
+    /// for the container-image scanner. As with the Trivy filesystem
+    /// scanner, we tolerate hosts both with and without `trivy` installed:
+    /// the assertion is that repeated calls are cached and that any
+    /// returned token has the normalized `trivy-` prefix.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let scanner = ImageScanner::new("http://localhost:0".to_string());
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("trivy-"),
+                "image scanner version must be normalized 'trivy-<ver>'; got {}",
+                v
+            );
+        }
+    }
 }

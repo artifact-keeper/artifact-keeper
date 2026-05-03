@@ -402,4 +402,145 @@ mod tests {
         let result = scanner.scan(&artifact, None, &content).await;
         assert_scan_failed(&result, "OpenSCAP scan");
     }
+
+    /// `probe_version` returns `Some("openscap-<ver>")` when the wrapper's
+    /// `/health` endpoint responds 200 with a `version` field shaped like
+    /// the real `oscap --version` first line. This is the happy path the
+    /// orchestrator relies on for `scan_results.scanner_version`.
+    #[tokio::test]
+    async fn test_probe_version_success() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/health"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"version": "OpenSCAP command line tool (oscap) 1.4.0"}),
+            ))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            server.uri(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let v = scanner.version().await;
+        assert_eq!(v, Some("openscap-1.4.0".to_string()));
+
+        // Second call must hit the cache, not the server. Wiremock would
+        // accept additional calls silently, so we instead assert the value
+        // is stable across two awaits. The cache populated above must not
+        // be re-run.
+        let v2 = scanner.version().await;
+        assert_eq!(v, v2);
+    }
+
+    /// `probe_version` returns `None` when the wrapper responds with a
+    /// non-2xx status (e.g. 503 during sidecar startup). The scan must
+    /// still proceed; the version field is metadata, not load-bearing.
+    #[tokio::test]
+    async fn test_probe_version_non_success_status_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/health"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            server.uri(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the response body cannot be
+    /// parsed as the expected JSON shape. Defensive: a misconfigured
+    /// reverse proxy might return HTML.
+    #[tokio::test]
+    async fn test_probe_version_malformed_body_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/health"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string("<html>not json</html>")
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            server.uri(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the JSON is well-formed but the
+    /// `version` field is absent or null. The wrapper's health response
+    /// schema explicitly defaults this field to None.
+    #[tokio::test]
+    async fn test_probe_version_missing_field_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/health"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            server.uri(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the version field is present
+    /// but contains only whitespace. The token extraction
+    /// (`split_whitespace().last()`) yields nothing, so the function
+    /// short-circuits to None instead of producing `openscap-`.
+    #[tokio::test]
+    async fn test_probe_version_whitespace_only_field_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/health"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"version": "   "})),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            server.uri(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the URL is unreachable
+    /// (connection refused). This exercises the `.send().await.ok()?`
+    /// short-circuit. Together with the success/error/missing tests above,
+    /// every branch of `probe_version` is covered without requiring a real
+    /// OpenSCAP wrapper sidecar.
+    #[tokio::test]
+    async fn test_probe_version_unreachable_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            // Port 0 is reserved and yields connection refused.
+            "http://127.0.0.1:0".to_string(),
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        assert_eq!(scanner.version().await, None);
+    }
 }
