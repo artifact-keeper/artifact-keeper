@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE scan_results\n            SET status = 'completed',\n                completed_at = NOW(),\n                findings_count = $2,\n                critical_count = $3,\n                high_count = $4,\n                medium_count = $5,\n                low_count = $6,\n                info_count = $7,\n                is_reused = true,\n                source_scan_id = $8\n            WHERE id = $1\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id\n            ",
+  "query": "\n            UPDATE scan_results\n            SET status = 'completed',\n                completed_at = NOW(),\n                findings_count = $2,\n                critical_count = $3,\n                high_count = $4,\n                medium_count = $5,\n                low_count = $6,\n                info_count = $7,\n                is_reused = true,\n                source_scan_id = $8\n            WHERE id = $1 AND status = 'running'\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id\n            ",
   "describe": {
     "columns": [
       {
@@ -127,5 +127,5 @@
       true
     ]
   },
-  "hash": "8b61556680db91d2fb166eaa1692fceb2b21e1305959d4347ae22bf181c79a6a"
+  "hash": "3b3e1b7ed2e3250739ac2677fdd31c93367f129f95db8f8be22d4dc2baad2d91"
 }

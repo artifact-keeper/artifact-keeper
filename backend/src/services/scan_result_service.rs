@@ -225,6 +225,14 @@ impl ScanResultService {
     /// before the dedup decision is made. UPDATEs the target row in place
     /// rather than INSERTing a new one, so the IDs already returned to the
     /// client remain valid.
+    ///
+    /// Behavior:
+    /// - The UPDATE is guarded by `status = 'running'` so a re-run on an
+    ///   already-converted row is a no-op (returns the existing row without
+    ///   inserting duplicate findings).
+    /// - The UPDATE and the findings INSERT run in a single transaction so a
+    ///   findings-INSERT failure does not leave the parent row marked
+    ///   `is_reused = true` with zero finding rows.
     pub async fn convert_to_reused(
         &self,
         target_scan_id: Uuid,
@@ -234,6 +242,15 @@ impl ScanResultService {
         // Pull source counts so we can copy them onto the target.
         let source = self.get_scan(source_scan_id).await?;
 
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Status guard: only convert a row that is still 'running'. If another
+        // caller already converted this row, the UPDATE matches zero rows and
+        // we treat it as a no-op (idempotent).
         let updated = sqlx::query_as!(
             ScanResult,
             r#"
@@ -248,7 +265,7 @@ impl ScanResultService {
                 info_count = $7,
                 is_reused = true,
                 source_scan_id = $8
-            WHERE id = $1
+            WHERE id = $1 AND status = 'running'
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
@@ -263,11 +280,26 @@ impl ScanResultService {
             source.info_count,
             source_scan_id,
         )
-        .fetch_one(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Copy findings from the source scan into the target scan id.
+        let updated = match updated {
+            Some(row) => row,
+            None => {
+                // Already converted (or in a non-running terminal state). Roll
+                // back the (no-op) transaction and return the current row
+                // without inserting duplicate findings.
+                tx.rollback()
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                return self.get_scan(target_scan_id).await;
+            }
+        };
+
+        // Copy findings from the source scan into the target scan id. This
+        // runs inside the same transaction so a failure here rolls back the
+        // status/counts UPDATE above.
         sqlx::query!(
             r#"
             INSERT INTO scan_findings (
@@ -285,9 +317,13 @@ impl ScanResultService {
             artifact_id,
             source_scan_id,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(updated)
     }
