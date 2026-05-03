@@ -545,7 +545,8 @@ pub async fn local_fetch_by_name_version(
 }
 
 /// Generic local artifact fetch by path suffix (LIKE match).
-/// Used for handlers like npm that query by filename suffix.
+/// Used for handlers like npm that query by filename suffix. `path_suffix`
+/// is escaped internally; callers pass raw user input, not pre-escaped.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
@@ -553,26 +554,19 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query!(
-        r#"SELECT storage_key, content_type
-        FROM artifacts
-        WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false
+    let path = sqlx::query_scalar!(
+        r#"SELECT path FROM artifacts
+        WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\' AND is_deleted = false
         LIMIT 1"#,
         repo_id,
-        path_suffix
+        super::escape_like_literal(path_suffix)
     )
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
-
-    Ok((content, Some(artifact.content_type)))
+    local_fetch_by_path(db, state, repo_id, location, &path).await
 }
 
 /// Build a minimal `Repository` model for proxy operations.

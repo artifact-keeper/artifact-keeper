@@ -39,6 +39,25 @@ pub fn escape_like_literal(s: &str) -> String {
     out
 }
 
+/// Escape a user-supplied filename from a URL path segment for safe
+/// `LIKE '%/' || $n ESCAPE '\'` suffix matching. Strips a single leading
+/// slash (URL extractors often hand us one) and escapes `%`, `_`, `\`.
+pub fn escape_filename_for_like(file_path: &str) -> String {
+    escape_like_literal(file_path.trim_start_matches('/'))
+}
+
+/// Build a `/`-joined path prefix from user-supplied components, escaping
+/// each component for safe `LIKE $n || '%' ESCAPE '\'` prefix matching.
+/// A trailing `/` is appended. Empty input produces an empty string.
+pub fn escape_path_prefix(components: &[&str]) -> String {
+    let mut out = String::new();
+    for c in components {
+        out.push_str(&escape_like_literal(c));
+        out.push('/');
+    }
+    out
+}
+
 pub mod error_helpers;
 
 pub mod admin;
@@ -161,5 +180,73 @@ mod tests {
     fn test_escape_like_literal_combined_payload() {
         // Adversarial filename mixing all special chars.
         assert_eq!(escape_like_literal(r"%_\evil"), r"\%\_\\evil");
+    }
+
+    // -----------------------------------------------------------------------
+    // escape_filename_for_like — strip leading slash + escape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_escape_filename_strips_leading_slash() {
+        assert_eq!(escape_filename_for_like("/foo.tgz"), "foo.tgz");
+        assert_eq!(escape_filename_for_like("//foo.tgz"), "foo.tgz");
+        assert_eq!(escape_filename_for_like("foo.tgz"), "foo.tgz");
+        assert_eq!(escape_filename_for_like(""), "");
+    }
+
+    #[test]
+    fn test_escape_filename_escapes_wildcards() {
+        // SECURITY: a `%` or `_` in a download URL filename must not
+        // broaden the LIKE match to other artifacts in the repository.
+        assert_eq!(escape_filename_for_like("/%.whl"), r"\%.whl");
+        assert_eq!(escape_filename_for_like("foo_bar.gem"), r"foo\_bar.gem");
+        assert_eq!(escape_filename_for_like(r"/%_\evil"), r"\%\_\\evil");
+    }
+
+    #[test]
+    fn test_escape_filename_preserves_internal_slashes() {
+        // `/` is not a LIKE special char — internal path separators in
+        // a filename are matched literally.
+        assert_eq!(
+            escape_filename_for_like("/v3/files/foo-1.0.0.tar.gz"),
+            "v3/files/foo-1.0.0.tar.gz"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // escape_path_prefix — multi-component path prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_escape_path_prefix_two_components() {
+        assert_eq!(
+            escape_path_prefix(&["bert-base", "main"]),
+            "bert-base/main/"
+        );
+    }
+
+    #[test]
+    fn test_escape_path_prefix_three_components() {
+        // SECURITY: alpine paths use `branch/repository/arch/` from URL —
+        // `_` in `x86_64` must be escaped so it's matched literally.
+        assert_eq!(
+            escape_path_prefix(&["v3.18", "main", "x86_64"]),
+            r"v3.18/main/x86\_64/"
+        );
+    }
+
+    #[test]
+    fn test_escape_path_prefix_escapes_each_component() {
+        // SECURITY: every component is escaped independently before the
+        // separator is emitted, so a `/` in user input would be a literal
+        // (which is fine — `/` isn't a LIKE wildcard) but `%` and `_`
+        // become escaped in place.
+        assert_eq!(escape_path_prefix(&["%", "_evil"]), r"\%/\_evil/");
+    }
+
+    #[test]
+    fn test_escape_path_prefix_empty_inputs() {
+        assert_eq!(escape_path_prefix(&[]), "");
+        assert_eq!(escape_path_prefix(&[""]), "/");
     }
 }
