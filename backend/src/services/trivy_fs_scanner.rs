@@ -128,7 +128,7 @@ impl Scanner for TrivyFsScanner {
 
     /// Probe `trivy --version` once and cache the parsed version string.
     /// Returns `None` if the binary is missing or its output cannot be
-    /// parsed — `scan_results.scanner_version` is nullable for that case.
+    /// parsed; `scan_results.scanner_version` is nullable for that case.
     async fn version(&self) -> Option<String> {
         self.cached_version
             .get_or_init(|| async {

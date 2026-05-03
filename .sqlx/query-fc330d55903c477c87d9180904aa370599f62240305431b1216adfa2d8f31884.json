@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_results (\n                artifact_id, repository_id, scan_type, status, started_at, completed_at,\n                findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                checksum_sha256, source_scan_id, is_reused\n            )\n            VALUES ($1, $2, $3, 'completed', NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, true)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at\n            ",
+  "query": "\n            INSERT INTO scan_results (\n                artifact_id, repository_id, scan_type, status, started_at, completed_at,\n                findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                scanner_version, checksum_sha256, source_scan_id, is_reused\n            )\n            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at\n            ",
   "describe": {
     "columns": [
       {
@@ -89,12 +89,15 @@
         "Uuid",
         "Uuid",
         "Varchar",
+        "Timestamptz",
+        "Timestamptz",
         "Int4",
         "Int4",
         "Int4",
         "Int4",
         "Int4",
         "Int4",
+        "Varchar",
         "Bpchar",
         "Uuid"
       ]
@@ -118,5 +121,5 @@
       false
     ]
   },
-  "hash": "9eda77bacfe0c44ef3bd3b11e12282926e648ca1253b652f9f7b84ea9b8891f2"
+  "hash": "fc330d55903c477c87d9180904aa370599f62240305431b1216adfa2d8f31884"
 }

@@ -381,19 +381,48 @@ pub trait Scanner: Send + Sync {
     }
 }
 
+/// Maximum wall-clock time we will wait for a scanner CLI's `--version`
+/// subcommand to return. A hung version probe is serialized through
+/// `OnceCell::get_or_init`, so any single hang would head-of-line block
+/// every concurrent scan (including the post-failure probe in `fail_scan`).
+/// Five seconds is generous for a `--version` flag that should print and
+/// exit immediately on any healthy binary, but tight enough that a stuck
+/// binary cannot stall the scan pipeline.
+const CAPTURE_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Run an external CLI's `--version` subcommand and return its first stdout
-/// line, trimmed. Returns `None` when the binary is missing or fails. Used
-/// by `Scanner::version()` implementations to capture the binary version
-/// string for the `scan_results.scanner_version` column.
+/// line, trimmed. Returns `None` when the binary is missing, fails, or
+/// hangs past `CAPTURE_CLI_VERSION_TIMEOUT`. Used by `Scanner::version()`
+/// implementations to capture the binary version string for the
+/// `scan_results.scanner_version` column.
 ///
 /// `args` is the arg vector passed to the binary (typically `["--version"]`
 /// or `["version"]` depending on the tool's CLI conventions).
 pub(crate) async fn capture_cli_version(binary: &str, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new(binary)
-        .args(args)
-        .output()
-        .await
-        .ok()?;
+    capture_cli_version_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
+}
+
+/// Inner implementation of [`capture_cli_version`] parameterized on the
+/// timeout so tests can exercise the elapsed-timeout branch in milliseconds
+/// rather than the full production five-second wait.
+pub(crate) async fn capture_cli_version_with_timeout(
+    binary: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let fut = tokio::process::Command::new(binary).args(args).output();
+    let output = match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => return None, // spawn / IO error
+        Err(_) => {
+            warn!(
+                binary = binary,
+                timeout_ms = timeout.as_millis() as u64,
+                "scanner version probe timed out; recording NULL scanner_version"
+            );
+            return None;
+        }
+    };
     if !output.status.success() {
         return None;
     }
@@ -426,7 +455,7 @@ pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
 
 /// Parse a `grype --version` first stdout line into a `grype-X.Y.Z` token.
 /// Grype's `--version` (single dash-dash flag) emits a single line like
-/// `grype 0.83.0` — we normalize to `grype-<version>` for consistency with
+/// `grype 0.83.0`, which we normalize to `grype-<version>` for consistency with
 /// `format_trivy_version`. Also tolerates a `Version:` prefix as a
 /// defensive shape (some packagings of `grype version` emit that).
 pub(crate) fn format_grype_version(raw: &str) -> Option<String> {
@@ -1453,7 +1482,7 @@ impl ScannerService {
 
                     // Probe scanner binary version after a successful scan so
                     // the persisted provenance matches the binary that just
-                    // ran. None on probe failure is acceptable — the field is
+                    // ran. None on probe failure is acceptable: the field is
                     // nullable and the silent-success migration (075) treats
                     // NULL as "legacy / unknown" rather than as a hard error.
                     let scanner_version = scanner.version().await;
@@ -2095,6 +2124,33 @@ mod tests {
         let result =
             capture_cli_version("definitely-not-a-real-binary-issue-902", &["--version"]).await;
         assert_eq!(result, None);
+    }
+
+    /// A scanner CLI that hangs (does not print and exit) must not park the
+    /// version probe forever. Without the timeout, `OnceCell::get_or_init`
+    /// would serialize every concurrent caller behind the hung future, and
+    /// because `fail_scan` is awaited AFTER `scanner.version().await`, even
+    /// FAILED scans would never persist their failure row. Run `sleep` with
+    /// a 30s argument and a 50ms test-only timeout: we should observe the
+    /// elapsed branch, return None, and complete in well under a second.
+    /// Skipped on hosts without `/bin/sleep` (effectively never on Linux/macOS).
+    #[tokio::test]
+    async fn test_capture_cli_version_hung_binary_times_out() {
+        if !std::path::Path::new("/bin/sleep").exists() {
+            eprintln!("skipping: /bin/sleep not present on this host");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let result =
+            capture_cli_version_with_timeout("/bin/sleep", &["30"], Duration::from_millis(50))
+                .await;
+        let elapsed = started.elapsed();
+        assert_eq!(result, None, "timeout branch must return None");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout did not fire promptly; elapsed was {:?}",
+            elapsed
+        );
     }
 
     /// Default `Scanner::version()` returns None so existing scanners

@@ -159,16 +159,27 @@ impl ScanResultService {
         // Get source scan counts
         let source = self.get_scan(source_scan_id).await?;
 
-        // Create new scan result marked as reused
+        // Create new scan result marked as reused.
+        //
+        // Provenance fields propagate from the source scan so the dedup-copy
+        // row honors the PR #1006 invariant ("every newly-completed scan has
+        // scanner_version set going forward") and so migration 075's
+        // `IS NULL` legacy criterion stays accurate. `started_at` and
+        // `completed_at` are copied from the source for honest measurement:
+        // the reused row reflects when the original scan actually executed,
+        // which is more useful than NOW()/NOW() (the latter would suggest
+        // an instantaneous scan that never really happened). The dedup
+        // event itself is recoverable from `created_at`, which Postgres
+        // sets at INSERT time, plus `is_reused` and `source_scan_id`.
         let new_scan = sqlx::query_as!(
             ScanResult,
             r#"
             INSERT INTO scan_results (
                 artifact_id, repository_id, scan_type, status, started_at, completed_at,
                 findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                checksum_sha256, source_scan_id, is_reused
+                scanner_version, checksum_sha256, source_scan_id, is_reused
             )
-            VALUES ($1, $2, $3, 'completed', NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, true)
+            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at
@@ -176,12 +187,15 @@ impl ScanResultService {
             artifact_id,
             repository_id,
             scan_type,
+            source.started_at,
+            source.completed_at,
             source.findings_count,
             source.critical_count,
             source.high_count,
             source.medium_count,
             source.low_count,
             source.info_count,
+            source.scanner_version,
             checksum_sha256,
             source_scan_id,
         )

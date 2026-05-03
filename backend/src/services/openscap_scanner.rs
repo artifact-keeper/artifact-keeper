@@ -88,7 +88,7 @@ impl OpenScapScanner {
 
     /// Probe the OpenSCAP wrapper's `/health` endpoint to capture the
     /// running `oscap` binary version. Returns `None` on any error so the
-    /// scan still completes — the version is metadata, not a scan result.
+    /// scan still completes; the version is metadata, not a scan result.
     async fn probe_version(&self) -> Option<String> {
         let url = format!("{}/health", self.openscap_url);
         let resp = self
