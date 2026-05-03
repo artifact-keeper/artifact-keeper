@@ -789,6 +789,85 @@ jobs:
           done
         continue-on-error: true
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # VERIFY-PUBLISHED: fail fast if a tag-triggered run did not actually
+  # publish the expected semver tags on ghcr.io.
+  #
+  # Background: issue #905 was filed because operators believed semver tags
+  # (1.1.7, 1.1.8) were missing on ghcr.io. The reproduction used
+  # `gh api .../packages/.../versions` without `--paginate`; that endpoint
+  # returns at most 30 versions per page sorted by recency, and the page is
+  # dominated by sha-prefixed dev/branch tags, so semver tags get pushed off
+  # the visible window. The tags were in fact present.
+  #
+  # To make the publish contract self-evident, this job probes the registry
+  # the same way consumers do (a HEAD on the manifest endpoint) and fails
+  # the workflow if any expected semver tag is missing for the current ref.
+  # That way we catch the real failure mode (a push that silently no-op'd)
+  # in the publish workflow itself, not days later via a broken helm install.
+  # ════════════════════════════════════════════════════════════════════════════
+  verify-published:
+    name: Verify Published Tags
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    needs: [merge-backend, merge-openscap, merge-backend-alpine]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Probe ghcr.io manifests for expected semver tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKEND_IMAGE: ${{ env.BACKEND_IMAGE }}
+          OPENSCAP_IMAGE: ${{ env.OPENSCAP_IMAGE }}
+        run: |
+          set -u
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Verifying ghcr.io semver tags for version: ${VERSION}"
+
+          MANIFEST_ACCEPT='-H Accept:application/vnd.oci.image.index.v1+json -H Accept:application/vnd.docker.distribution.manifest.list.v2+json -H Accept:application/vnd.docker.distribution.manifest.v2+json'
+
+          probe_ghcr() {
+            local name="$1"; local tag="$2"
+            local token
+            token=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${name}:pull" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              | jq -r '.token // empty')
+            [ -n "${token}" ] || return 1
+            # shellcheck disable=SC2086
+            curl -sfL --proto =https -o /dev/null \
+              -H "Authorization: Bearer ${token}" \
+              ${MANIFEST_ACCEPT} \
+              "https://ghcr.io/v2/${name}/manifests/${tag}"
+          }
+
+          # Tags this workflow promises to publish on a tag push. Mirror the
+          # metadata-action `tags:` blocks above. Alpine variant gets the
+          # `-alpine` suffix from the metadata-action `flavor` setting.
+          EXPECTED=(
+            "${BACKEND_IMAGE}:${VERSION}"
+            "${BACKEND_IMAGE}:${VERSION}-alpine"
+            "${OPENSCAP_IMAGE}:${VERSION}"
+          )
+
+          missing=()
+          for entry in "${EXPECTED[@]}"; do
+            name="${entry%:*}"
+            tag="${entry#*:}"
+            if probe_ghcr "${name}" "${tag}"; then
+              echo "  ok  ghcr.io/${name}:${tag}"
+            else
+              echo "::error::ghcr.io/${name}:${tag} is missing"
+              missing+=("ghcr.io/${name}:${tag}")
+            fi
+          done
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Tag-triggered publish completed but some expected semver tags are not present on ghcr.io. Inspect the merge-* jobs for silent imagetools failures."
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "All expected ghcr.io semver tags present for ${VERSION}."
+
   summary:
     name: Publish Summary
     runs-on: ubuntu-latest
