@@ -391,11 +391,11 @@ async fn download_collection(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,
-        filename
+        super::escape_filename_for_like(&file_path)
     )
     .fetch_optional(&state.db)
     .await

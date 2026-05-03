@@ -649,7 +649,8 @@ pub async fn local_fetch_by_name_version(
 }
 
 /// Generic local artifact fetch by path suffix (LIKE match).
-/// Used for handlers like npm that query by filename suffix.
+/// Used for handlers like npm that query by filename suffix. `path_suffix`
+/// is escaped internally; callers pass raw user input, not pre-escaped.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
@@ -657,28 +658,19 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false \
+    let path: String = sqlx::query_scalar(
+        "SELECT path FROM artifacts \
+         WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
     )
     .bind(repo_id)
-    .bind(path_suffix)
+    .bind(super::escape_like_literal(path_suffix))
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
-
-    Ok((content, Some(artifact.content_type)))
+    local_fetch_by_path(db, state, repo_id, location, &path).await
 }
 
 /// Look up a local artifact by path and return a presigned redirect if the

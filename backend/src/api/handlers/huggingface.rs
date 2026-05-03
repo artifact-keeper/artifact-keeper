@@ -575,7 +575,7 @@ async fn list_files(
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
-    let path_prefix = format!("{}/{}/", model_id, revision);
+    let path_prefix = super::escape_path_prefix(&[&model_id, &revision]);
 
     let artifacts = sqlx::query!(
         r#"
@@ -583,7 +583,7 @@ async fn list_files(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE $2 || '%'
+          AND path LIKE $2 || '%' ESCAPE '\'
         ORDER BY path
         "#,
         repo.id,
