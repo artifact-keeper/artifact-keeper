@@ -13,6 +13,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
@@ -20,7 +21,10 @@ use crate::formats::incus::{IncusFileType, IncusHandler};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
-use crate::services::scanner_service::{convert_trivy_findings, fail_scan, ScanWorkspace, Scanner};
+use crate::services::scanner_service::{
+    capture_cli_version, convert_trivy_findings, fail_scan, format_trivy_version, ScanWorkspace,
+    Scanner,
+};
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
 async fn write_temp_file(path: &Path, content: &Bytes, label: &str) -> Result<()> {
@@ -93,6 +97,10 @@ async fn run_trivy_scan(
 pub struct IncusScanner {
     trivy_url: String,
     scan_workspace: String,
+    /// Lazily-probed version string from `trivy --version`, e.g.
+    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
+    /// not pay an extra subprocess for the version probe.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl IncusScanner {
@@ -100,6 +108,7 @@ impl IncusScanner {
         Self {
             trivy_url,
             scan_workspace,
+            cached_version: OnceCell::new(),
         }
     }
 
@@ -240,6 +249,20 @@ impl Scanner for IncusScanner {
 
     fn scan_type(&self) -> &str {
         "incus"
+    }
+
+    /// Probe `trivy --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed. The Incus scanner shells out to the same `trivy` binary as
+    /// `TrivyFsScanner`, so the format is also `trivy-<version>`.
+    async fn version(&self) -> Option<String> {
+        self.cached_version
+            .get_or_init(|| async {
+                let raw = capture_cli_version("trivy", &["--version"]).await?;
+                format_trivy_version(&raw)
+            })
+            .await
+            .clone()
     }
 
     async fn scan(

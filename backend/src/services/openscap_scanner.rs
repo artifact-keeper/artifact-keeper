@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
@@ -18,6 +19,15 @@ use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
     fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
 };
+
+/// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
+/// Used by `Scanner::version()` to capture the running `oscap` binary
+/// version for `scan_results.scanner_version`.
+#[derive(Debug, Deserialize)]
+struct OpenScapHealth {
+    #[serde(default)]
+    version: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // OpenSCAP wrapper JSON response structures
@@ -54,6 +64,10 @@ pub struct OpenScapScanner {
     openscap_url: String,
     profile: String,
     scan_workspace: String,
+    /// Lazily-probed version string from the wrapper sidecar's `/health`
+    /// endpoint, e.g. `openscap-1.4.0`. Cached for the scanner's lifetime
+    /// so we do not GET `/health` on every scan.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl OpenScapScanner {
@@ -68,6 +82,34 @@ impl OpenScapScanner {
             openscap_url,
             profile,
             scan_workspace,
+            cached_version: OnceCell::new(),
+        }
+    }
+
+    /// Probe the OpenSCAP wrapper's `/health` endpoint to capture the
+    /// running `oscap` binary version. Returns `None` on any error so the
+    /// scan still completes — the version is metadata, not a scan result.
+    async fn probe_version(&self) -> Option<String> {
+        let url = format!("{}/health", self.openscap_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let health: OpenScapHealth = resp.json().await.ok()?;
+        let raw = health.version?;
+        // `oscap --version` first line is e.g. `OpenSCAP command line tool
+        // (oscap) 1.4.0`. Capture just the version token for compactness.
+        let token = raw.split_whitespace().last()?.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(format!("openscap-{}", token))
         }
     }
 
@@ -181,6 +223,16 @@ impl Scanner for OpenScapScanner {
 
     fn scan_type(&self) -> &str {
         "openscap"
+    }
+
+    /// Probe the wrapper sidecar's `/health` endpoint once and cache the
+    /// `oscap` version string. Returns `None` if the wrapper is unreachable
+    /// or its response cannot be parsed.
+    async fn version(&self) -> Option<String> {
+        self.cached_version
+            .get_or_init(|| async { self.probe_version().await })
+            .await
+            .clone()
     }
 
     async fn scan(

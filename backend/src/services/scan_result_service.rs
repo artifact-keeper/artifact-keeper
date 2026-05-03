@@ -214,7 +214,15 @@ impl ScanResultService {
         Ok(new_scan)
     }
 
-    /// Mark a scan as completed with severity counts.
+    /// Mark a scan as completed with severity counts and provenance.
+    ///
+    /// `scanner_version` is the binary version that produced the report
+    /// (e.g. `trivy-0.62.1`). `started_at` is the wall-clock timestamp of
+    /// when the scanner subprocess was kicked off (captured by the
+    /// orchestrator just before invoking `Scanner::scan`). Both fields are
+    /// persisted so consumers (E2E tests, operators) can verify a scan
+    /// actually ran and reproduce its result against the same scanner
+    /// version. See issue #902.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
@@ -225,13 +233,17 @@ impl ScanResultService {
         medium: i32,
         low: i32,
         info: i32,
+        scanner_version: Option<&str>,
+        started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
             UPDATE scan_results
             SET status = 'completed', findings_count = $2,
                 critical_count = $3, high_count = $4, medium_count = $5,
-                low_count = $6, info_count = $7, completed_at = NOW()
+                low_count = $6, info_count = $7, completed_at = NOW(),
+                scanner_version = COALESCE($8, scanner_version),
+                started_at = $9
             WHERE id = $1
             "#,
             scan_id,
@@ -241,6 +253,8 @@ impl ScanResultService {
             medium,
             low,
             info,
+            scanner_version,
+            started_at,
         )
         .execute(&self.db)
         .await
@@ -249,16 +263,30 @@ impl ScanResultService {
         Ok(())
     }
 
-    /// Mark a scan as failed with an error message.
-    pub async fn fail_scan(&self, scan_id: Uuid, error: &str) -> Result<()> {
+    /// Mark a scan as failed with an error message and (when known) the
+    /// scanner binary version + start timestamp. `scanner_version` is
+    /// `None` when the scanner crashed before its version could be
+    /// captured (e.g. binary missing); `started_at` is always set to when
+    /// the orchestrator kicked off the scan attempt.
+    pub async fn fail_scan(
+        &self,
+        scan_id: Uuid,
+        error: &str,
+        scanner_version: Option<&str>,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
         sqlx::query!(
             r#"
             UPDATE scan_results
-            SET status = 'failed', error_message = $2, completed_at = NOW()
+            SET status = 'failed', error_message = $2, completed_at = NOW(),
+                scanner_version = COALESCE($3, scanner_version),
+                started_at = $4
             WHERE id = $1
             "#,
             scan_id,
             error,
+            scanner_version,
+            started_at,
         )
         .execute(&self.db)
         .await

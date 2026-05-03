@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::Scanner;
+use crate::services::scanner_service::{capture_cli_version, format_trivy_version, Scanner};
 
 // Trivy JSON report structures
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,10 @@ pub struct TrivyVulnerability {
 pub struct ImageScanner {
     trivy_url: String,
     http: reqwest::Client,
+    /// Lazily-probed version string from `trivy --version`, e.g.
+    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
+    /// not pay an extra subprocess for the version probe.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl ImageScanner {
@@ -61,6 +66,7 @@ impl ImageScanner {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            cached_version: OnceCell::new(),
         }
     }
 
@@ -278,6 +284,19 @@ impl Scanner for ImageScanner {
 
     fn scan_type(&self) -> &str {
         "image"
+    }
+
+    /// Probe `trivy --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed.
+    async fn version(&self) -> Option<String> {
+        self.cached_version
+            .get_or_init(|| async {
+                let raw = capture_cli_version("trivy", &["--version"]).await?;
+                format_trivy_version(&raw)
+            })
+            .await
+            .clone()
     }
 
     async fn scan(

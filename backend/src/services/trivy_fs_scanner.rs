@@ -6,18 +6,26 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::Path;
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
-use crate::services::scanner_service::{convert_trivy_findings, fail_scan, ScanWorkspace, Scanner};
+use crate::services::scanner_service::{
+    capture_cli_version, convert_trivy_findings, fail_scan, format_trivy_version, ScanWorkspace,
+    Scanner,
+};
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
 pub struct TrivyFsScanner {
     trivy_url: String,
     scan_workspace: String,
+    /// Lazily-probed version string from `trivy --version`, e.g.
+    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
+    /// not pay an extra subprocess for the version probe.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl TrivyFsScanner {
@@ -25,6 +33,7 @@ impl TrivyFsScanner {
         Self {
             trivy_url,
             scan_workspace,
+            cached_version: OnceCell::new(),
         }
     }
 
@@ -115,6 +124,19 @@ impl Scanner for TrivyFsScanner {
 
     fn scan_type(&self) -> &str {
         "filesystem"
+    }
+
+    /// Probe `trivy --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed — `scan_results.scanner_version` is nullable for that case.
+    async fn version(&self) -> Option<String> {
+        self.cached_version
+            .get_or_init(|| async {
+                let raw = capture_cli_version("trivy", &["--version"]).await?;
+                format_trivy_version(&raw)
+            })
+            .await
+            .clone()
     }
 
     async fn scan(

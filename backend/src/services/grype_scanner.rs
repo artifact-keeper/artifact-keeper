@@ -7,12 +7,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
 use std::path::Path;
+use tokio::sync::OnceCell;
 use tracing::info;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{fail_scan, ScanWorkspace, Scanner};
+use crate::services::scanner_service::{
+    capture_cli_version, fail_scan, format_grype_version, ScanWorkspace, Scanner,
+};
 
 // ---------------------------------------------------------------------------
 // Grype JSON output structures
@@ -66,11 +69,18 @@ pub struct GrypeArtifact {
 /// Grype-based vulnerability scanner for packages and archives.
 pub struct GrypeScanner {
     scan_workspace: String,
+    /// Lazily-probed version string from `grype --version`, e.g.
+    /// `grype-0.83.0`. Cached for the scanner's lifetime so each scan does
+    /// not pay an extra subprocess for the version probe.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl GrypeScanner {
     pub fn new(scan_workspace: String) -> Self {
-        Self { scan_workspace }
+        Self {
+            scan_workspace,
+            cached_version: OnceCell::new(),
+        }
     }
 
     /// Run grype against the workspace directory.
@@ -142,6 +152,19 @@ impl Scanner for GrypeScanner {
 
     fn scan_type(&self) -> &str {
         "grype"
+    }
+
+    /// Probe `grype --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed.
+    async fn version(&self) -> Option<String> {
+        self.cached_version
+            .get_or_init(|| async {
+                let raw = capture_cli_version("grype", &["--version"]).await?;
+                format_grype_version(&raw)
+            })
+            .await
+            .clone()
     }
 
     async fn scan(

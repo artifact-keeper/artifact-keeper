@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE scan_results\n            SET status = 'failed', error_message = $2, completed_at = NOW(),\n                scanner_version = COALESCE($3, scanner_version),\n                started_at = $4\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "382d64fd08e40e64db4224ce3e9d4c094464f36a2300e13ac7a348e98f530194"
+}
