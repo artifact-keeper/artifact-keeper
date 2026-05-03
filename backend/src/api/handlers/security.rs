@@ -513,8 +513,8 @@ async fn trigger_scan(
         // fire-and-forget (tokio::spawn) but uses these pre-committed IDs
         // instead of inserting new rows. See artifact-keeper#906.
         let prepared = scanner.prepare_artifact_scan(artifact_id, true).await?;
-        let scan_result_ids: Vec<Uuid> = prepared.iter().map(|(_, id)| *id).collect();
-        let prepared_map: std::collections::HashMap<String, Uuid> = prepared.into_iter().collect();
+        let scan_result_ids = crate::services::scanner_service::extract_scan_result_ids(&prepared);
+        let prepared_map = crate::services::scanner_service::prepared_pairs_to_map(prepared);
 
         let scanner_for_spawn = scanner.clone();
         tokio::spawn(async move {
@@ -526,7 +526,7 @@ async fn trigger_scan(
             }
         });
         return Ok(Json(TriggerScanResponse {
-            message: format!("Scan queued for artifact {}", artifact_id),
+            message: crate::services::scanner_service::build_artifact_scan_message(artifact_id),
             artifacts_queued: 1,
             scan_result_ids,
         }));
@@ -557,9 +557,9 @@ async fn trigger_scan(
     // worker. Clients that need scan_result_ids must trigger artifact-level
     // scans (one per artifact_id) instead.
     Ok(Json(TriggerScanResponse {
-        message: format!(
-            "Repository scan queued for {} ({} artifacts)",
-            repository_id, count
+        message: crate::services::scanner_service::build_repository_scan_message(
+            repository_id,
+            count,
         ),
         artifacts_queued: count as u32,
         scan_result_ids: Vec::new(),

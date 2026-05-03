@@ -120,6 +120,91 @@ pub(crate) fn build_dependency_info_from_findings(
         .collect()
 }
 
+/// Extract just the scan_result IDs from the `(scan_type, id)` pairs returned
+/// by [`ScannerService::prepare_artifact_scan`].
+///
+/// Used by the trigger-scan handler to build `TriggerScanResponse.scan_result_ids`
+/// without consuming the underlying vector (the same pairs are also collected
+/// into a HashMap and handed to the spawned worker).
+pub(crate) fn extract_scan_result_ids(prepared: &[(String, Uuid)]) -> Vec<Uuid> {
+    prepared.iter().map(|(_, id)| *id).collect()
+}
+
+/// Convert the `(scan_type, id)` pairs returned by
+/// [`ScannerService::prepare_artifact_scan`] into the HashMap shape consumed by
+/// [`ScannerService::scan_artifact_with_prepared`].
+///
+/// Pulled out as a free function so the trigger-scan handler can build the map
+/// without owning a HashMap import, and so the conversion is unit-testable
+/// without spinning up a database.
+pub(crate) fn prepared_pairs_to_map(prepared: Vec<(String, Uuid)>) -> HashMap<String, Uuid> {
+    prepared.into_iter().collect()
+}
+
+/// Outcome of consulting the prepared-id map for one scanner inside
+/// `scan_artifact_inner`'s loop. The DB-bound caller does the actual
+/// row lookup or insert; this enum encodes the *decision* in a way that
+/// is unit-testable without a database.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PreparedScanAction {
+    /// A pre-allocated row id was popped from the map. The caller should
+    /// reuse this row (UPDATE in the dedup path, GET in the fresh-scan
+    /// path) instead of inserting a new one.
+    Reuse(Uuid),
+    /// No matching prepared id (either because the trigger handler didn't
+    /// pre-allocate, or the scanner set changed between prepare and
+    /// execute). Caller falls back to inserting a fresh row.
+    InsertFresh,
+}
+
+/// Resolve the prepared-id outcome for a single scanner without touching
+/// the database. The caller invokes `prepared.remove(scan_type)` and
+/// hands the result here.
+pub(crate) fn resolve_prepared_action(prepared_id: Option<Uuid>) -> PreparedScanAction {
+    match prepared_id {
+        Some(id) => PreparedScanAction::Reuse(id),
+        None => PreparedScanAction::InsertFresh,
+    }
+}
+
+/// Truncate a hex checksum string to its first 8 characters (or fewer if
+/// the input is shorter) for use in human-readable log messages.
+///
+/// Lifted out of the inline `&checksum[..8.min(checksum.len())]` slice in
+/// the reuse-path log line so it is unit-testable and so a future change
+/// (longer prefix, sha-prefix scheme, etc.) is a single edit.
+pub(crate) fn checksum_log_prefix(checksum: &str) -> &str {
+    &checksum[..8.min(checksum.len())]
+}
+
+/// Decide whether a reusable scan match should be skipped because it points at
+/// the same artifact we are currently scanning.
+///
+/// `find_reusable_scan` returns the most recent completed scan for a given
+/// `(checksum, scan_type)` pair. When the matched scan's `artifact_id` equals
+/// the current artifact's id, copying would be a no-op (we are reusing our
+/// own previous scan). The caller skips the reuse path in that case and runs
+/// a fresh scan instead.
+pub(crate) fn should_skip_reuse_for_same_artifact(
+    source_artifact_id: Uuid,
+    current_artifact_id: Uuid,
+) -> bool {
+    source_artifact_id == current_artifact_id
+}
+
+/// Build the user-facing message for an artifact-level trigger response.
+pub(crate) fn build_artifact_scan_message(artifact_id: Uuid) -> String {
+    format!("Scan queued for artifact {}", artifact_id)
+}
+
+/// Build the user-facing message for a repository-level trigger response.
+pub(crate) fn build_repository_scan_message(repository_id: Uuid, artifact_count: i64) -> String {
+    format!(
+        "Repository scan queued for {} ({} artifacts)",
+        repository_id, artifact_count
+    )
+}
+
 /// Shared scan workspace utilities for scanners that need to write artifact
 /// content to disk, optionally extract archives, and clean up after scanning.
 pub(crate) struct ScanWorkspace;
@@ -1391,7 +1476,7 @@ impl ScannerService {
             // Take any pre-allocated row id committed by the trigger handler.
             // The id was already returned to the client in TriggerScanResponse,
             // so we must keep the same row alive (UPDATE rather than INSERT).
-            let prepared_id = prepared.remove(scanner.scan_type());
+            let prepared_action = resolve_prepared_action(prepared.remove(scanner.scan_type()));
 
             // Check for reusable scan results (same hash + scan type within TTL)
             if let Ok(Some(source_scan)) = self
@@ -1400,21 +1485,24 @@ impl ScannerService {
                 .await
             {
                 // Skip if the source scan is for the same artifact (already scanned)
-                if source_scan.artifact_id != artifact_id {
-                    let copied = if let Some(target_id) = prepared_id {
-                        self.scan_result_service
-                            .convert_to_reused(target_id, source_scan.id, artifact_id)
-                            .await
-                    } else {
-                        self.scan_result_service
-                            .copy_scan_results(
-                                source_scan.id,
-                                artifact_id,
-                                artifact.repository_id,
-                                scanner.scan_type(),
-                                checksum,
-                            )
-                            .await
+                if !should_skip_reuse_for_same_artifact(source_scan.artifact_id, artifact_id) {
+                    let copied = match prepared_action {
+                        PreparedScanAction::Reuse(target_id) => {
+                            self.scan_result_service
+                                .convert_to_reused(target_id, source_scan.id, artifact_id)
+                                .await
+                        }
+                        PreparedScanAction::InsertFresh => {
+                            self.scan_result_service
+                                .copy_scan_results(
+                                    source_scan.id,
+                                    artifact_id,
+                                    artifact.repository_id,
+                                    scanner.scan_type(),
+                                    checksum,
+                                )
+                                .await
+                        }
                     };
                     match copied {
                         Ok(reused) => {
@@ -1423,7 +1511,7 @@ impl ScannerService {
                                 source_scan.id,
                                 artifact_id,
                                 scanner.name(),
-                                &checksum[..8.min(checksum.len())],
+                                checksum_log_prefix(checksum),
                             );
                             // Update quarantine status based on copied findings
                             self.update_quarantine_status(artifact_id, reused.findings_count)
@@ -1442,17 +1530,20 @@ impl ScannerService {
 
             // Either reuse path failed or no reusable scan: run a fresh scan.
             // If we still have a prepared id, reuse it; otherwise create a row.
-            let scan_result = if let Some(target_id) = prepared_id {
-                self.scan_result_service.get_scan(target_id).await?
-            } else {
-                self.scan_result_service
-                    .create_scan_result_with_checksum(
-                        artifact_id,
-                        artifact.repository_id,
-                        scanner.scan_type(),
-                        Some(checksum),
-                    )
-                    .await?
+            let scan_result = match prepared_action {
+                PreparedScanAction::Reuse(target_id) => {
+                    self.scan_result_service.get_scan(target_id).await?
+                }
+                PreparedScanAction::InsertFresh => {
+                    self.scan_result_service
+                        .create_scan_result_with_checksum(
+                            artifact_id,
+                            artifact.repository_id,
+                            scanner.scan_type(),
+                            Some(checksum),
+                        )
+                        .await?
+                }
             };
 
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {
@@ -6281,5 +6372,194 @@ mod tests {
         assert_eq!(deps[0].name, "zzz");
         assert_eq!(deps[1].name, "aaa");
         assert_eq!(deps[2].name, "mmm");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure helpers introduced for the trigger-scan / pre-allocated-row path.
+    // These are unit-tested here so the new lines they contain are exercised
+    // by `cargo llvm-cov --lib` (the integration-tier DB tests for the same
+    // path live in `backend/tests/scan_convert_to_reused_tests.rs`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_scan_result_ids_empty() {
+        let prepared: Vec<(String, Uuid)> = vec![];
+        let ids = extract_scan_result_ids(&prepared);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_scan_result_ids_single_scanner() {
+        let id = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id)];
+        let ids = extract_scan_result_ids(&prepared);
+        assert_eq!(ids, vec![id]);
+    }
+
+    #[test]
+    fn test_extract_scan_result_ids_preserves_order() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let prepared = vec![
+            ("trivy".to_string(), id1),
+            ("grype".to_string(), id2),
+            ("image".to_string(), id3),
+        ];
+        let ids = extract_scan_result_ids(&prepared);
+        assert_eq!(ids, vec![id1, id2, id3]);
+    }
+
+    #[test]
+    fn test_extract_scan_result_ids_does_not_consume_input() {
+        // Caller relies on still having the pairs after this call so it can
+        // also build the HashMap. Asserting on the post-call state of the
+        // Vec is the cheapest way to pin that contract.
+        let id = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id)];
+        let _ids = extract_scan_result_ids(&prepared);
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].0, "trivy");
+    }
+
+    #[test]
+    fn test_prepared_pairs_to_map_empty() {
+        let map = prepared_pairs_to_map(vec![]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_prepared_pairs_to_map_round_trip() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id1), ("grype".to_string(), id2)];
+        let map = prepared_pairs_to_map(prepared);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("trivy"), Some(&id1));
+        assert_eq!(map.get("grype"), Some(&id2));
+    }
+
+    #[test]
+    fn test_prepared_pairs_to_map_duplicate_scan_type_last_wins() {
+        // HashMap collect semantics: later entries overwrite earlier ones.
+        // This documents the behavior so a future change to a more strict
+        // collector (e.g. detecting duplicates) is an explicit decision.
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id1), ("trivy".to_string(), id2)];
+        let map = prepared_pairs_to_map(prepared);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("trivy"), Some(&id2));
+    }
+
+    #[test]
+    fn test_should_skip_reuse_for_same_artifact_true() {
+        let id = Uuid::new_v4();
+        assert!(should_skip_reuse_for_same_artifact(id, id));
+    }
+
+    #[test]
+    fn test_should_skip_reuse_for_same_artifact_false() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(!should_skip_reuse_for_same_artifact(a, b));
+    }
+
+    #[test]
+    fn test_should_skip_reuse_for_same_artifact_nil_vs_real() {
+        let nil = Uuid::nil();
+        let real = Uuid::new_v4();
+        assert!(!should_skip_reuse_for_same_artifact(nil, real));
+        assert!(should_skip_reuse_for_same_artifact(nil, nil));
+    }
+
+    #[test]
+    fn test_build_artifact_scan_message_includes_id() {
+        let id = Uuid::new_v4();
+        let msg = build_artifact_scan_message(id);
+        assert!(msg.contains(&id.to_string()));
+        assert!(msg.starts_with("Scan queued for artifact "));
+    }
+
+    #[test]
+    fn test_build_artifact_scan_message_nil_uuid() {
+        let msg = build_artifact_scan_message(Uuid::nil());
+        assert_eq!(
+            msg,
+            "Scan queued for artifact 00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn test_build_repository_scan_message_includes_count_and_id() {
+        let repo = Uuid::new_v4();
+        let msg = build_repository_scan_message(repo, 42);
+        assert!(msg.contains(&repo.to_string()));
+        assert!(msg.contains("42 artifacts"));
+        assert!(msg.starts_with("Repository scan queued for "));
+    }
+
+    #[test]
+    fn test_build_repository_scan_message_zero_artifacts() {
+        let repo = Uuid::nil();
+        let msg = build_repository_scan_message(repo, 0);
+        assert!(msg.contains("0 artifacts"));
+    }
+
+    #[test]
+    fn test_build_repository_scan_message_large_count() {
+        let repo = Uuid::new_v4();
+        let msg = build_repository_scan_message(repo, 1_000_000);
+        assert!(msg.contains("1000000 artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_prepared_action / checksum_log_prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_prepared_action_some_returns_reuse() {
+        let id = Uuid::new_v4();
+        let action = resolve_prepared_action(Some(id));
+        assert_eq!(action, PreparedScanAction::Reuse(id));
+    }
+
+    #[test]
+    fn test_resolve_prepared_action_none_returns_insert_fresh() {
+        let action = resolve_prepared_action(None);
+        assert_eq!(action, PreparedScanAction::InsertFresh);
+    }
+
+    #[test]
+    fn test_resolve_prepared_action_distinct_ids_are_distinct() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        assert_ne!(
+            resolve_prepared_action(Some(id1)),
+            resolve_prepared_action(Some(id2))
+        );
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_long_checksum_truncates_to_8() {
+        let cs = "abcdef0123456789abcdef0123456789";
+        assert_eq!(checksum_log_prefix(cs), "abcdef01");
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_short_checksum_returns_whole_string() {
+        let cs = "abc";
+        assert_eq!(checksum_log_prefix(cs), "abc");
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_empty_returns_empty() {
+        assert_eq!(checksum_log_prefix(""), "");
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_exactly_eight_chars() {
+        let cs = "12345678";
+        assert_eq!(checksum_log_prefix(cs), "12345678");
     }
 }
