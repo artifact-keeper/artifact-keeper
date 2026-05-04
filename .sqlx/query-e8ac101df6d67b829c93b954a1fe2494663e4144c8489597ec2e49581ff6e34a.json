@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH latest_scans AS (\n                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id\n                FROM scan_results sr\n                JOIN artifacts a ON a.id = sr.artifact_id\n                WHERE a.repository_id = $1\n                  AND NOT a.is_deleted\n                  AND sr.status = 'completed'\n                  AND sr.legacy_unverified = false\n                ORDER BY sr.artifact_id, sr.scan_type,\n                         sr.completed_at DESC NULLS LAST, sr.created_at DESC\n            )\n            SELECT\n                COUNT(*) FILTER (WHERE severity = 'critical' AND NOT is_acknowledged) as \"critical!\",\n                COUNT(*) FILTER (WHERE severity = 'high' AND NOT is_acknowledged) as \"high!\",\n                COUNT(*) FILTER (WHERE severity = 'medium' AND NOT is_acknowledged) as \"medium!\",\n                COUNT(*) FILTER (WHERE severity = 'low' AND NOT is_acknowledged) as \"low!\",\n                COUNT(*) FILTER (WHERE is_acknowledged) as \"acknowledged!\",\n                COUNT(*) as \"total!\"\n            FROM scan_findings\n            WHERE scan_result_id IN (SELECT id FROM latest_scans)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "critical!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "high!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "medium!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "low!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "acknowledged!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "total!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "e8ac101df6d67b829c93b954a1fe2494663e4144c8489597ec2e49581ff6e34a"
+}
