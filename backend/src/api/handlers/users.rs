@@ -1693,19 +1693,26 @@ mod tests {
 // inside the test module so this regression test fails to compile on any
 // branch where the fix has been reverted.
 // ---------------------------------------------------------------------------
+/// Shared fixtures, stub handlers, and request helpers used by the two
+/// route-middleware regression test modules below
+/// (`password_route_middleware_tests` for #1010 and `me_route_regression_tests`
+/// for #1008).
+///
+/// Each module owns its own `build_users_test_app` because the router shape
+/// under test is the load-bearing detail. Everything that does NOT differ
+/// between the two — Postgres lazy pool, JWT-signing config, user fixture,
+/// admin-side stub handlers, request builders, response readers — lives here
+/// to avoid copy/paste drift.
 #[cfg(test)]
-mod password_route_middleware_tests {
-    use crate::api::middleware::auth::{admin_middleware, auth_middleware, AuthExtension};
+mod route_test_support {
+    use crate::api::middleware::auth::AuthExtension;
     use crate::config::Config;
     use crate::models::user::{AuthProvider, User};
-    use crate::services::auth_service::AuthService;
     use axum::{
         body::Body,
         extract::{Extension, Path},
         http::{Request, StatusCode},
-        middleware,
-        response::IntoResponse,
-        routing::{get, post},
+        response::{IntoResponse, Response},
         Router,
     };
     use chrono::Utc;
@@ -1714,37 +1721,36 @@ mod password_route_middleware_tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    // ---- fixtures ---------------------------------------------------------
-
-    fn lazy_pool() -> PgPool {
-        // No socket is opened until a query runs, so this is safe in unit
-        // tests without a live Postgres instance. Stub handlers below never
-        // touch the pool, so no query is ever issued.
+    /// No socket is opened until a query runs, so this is safe in unit tests
+    /// without a live Postgres instance. The stub handlers below never touch
+    /// the pool, so no query is ever issued.
+    pub(super) fn lazy_pool() -> PgPool {
         PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
             .expect("connect_lazy never fails for a syntactically valid URL")
     }
 
-    fn make_test_config() -> Arc<Config> {
+    /// JWT-signing config keyed by a per-test-module secret, so a token minted
+    /// in one module cannot accidentally validate in another.
+    pub(super) fn make_test_config(jwt_secret: &str) -> Arc<Config> {
         Arc::new(Config {
-            jwt_secret: "regression-test-secret-key-for-issue-1010-unit-test".to_string(),
+            jwt_secret: jwt_secret.to_string(),
             ..Config::default()
         })
     }
 
-    fn make_user(is_admin: bool) -> User {
+    /// Minimal `User` fixture — only the fields touched by `AuthService`'s
+    /// token generation and the stub handlers' assertions matter.
+    pub(super) fn make_user(is_admin: bool) -> User {
         let now = Utc::now();
+        let (username, email) = if is_admin {
+            ("admin_user", "admin@example.com")
+        } else {
+            ("regular_user", "regular@example.com")
+        };
         User {
             id: Uuid::new_v4(),
-            username: if is_admin {
-                "admin_user".to_string()
-            } else {
-                "regular_user".to_string()
-            },
-            email: if is_admin {
-                "admin@example.com".to_string()
-            } else {
-                "regular@example.com".to_string()
-            },
+            username: username.to_string(),
+            email: email.to_string(),
             password_hash: None,
             auth_provider: AuthProvider::Local,
             external_id: None,
@@ -1765,21 +1771,17 @@ mod password_route_middleware_tests {
 
     // ---- stub handlers ----------------------------------------------------
     //
-    // These stand in for `change_password` and `list_users`/`get_user` in
-    // the test router. They preserve the contract that matters for the
-    // regression: the change_password stub mirrors the real handler's
-    // ownership check (`auth.user_id == path id` OR `auth.is_admin`); the
-    // admin-only stubs simply assert that the request reached them (the
-    // admin gate is upstream of the handler).
+    // Stand in for the production `change_password`, `list_users`, and
+    // `get_user` handlers in the test routers. They preserve only the
+    // contracts that matter for the regressions: the change_password stub
+    // mirrors the real handler's ownership check (`auth.user_id == path id`
+    // OR `auth.is_admin`); the admin-only stubs simply assert that the
+    // request reached them (the admin gate is upstream of the handler).
 
-    async fn stub_change_password(
+    pub(super) async fn stub_change_password(
         Extension(auth): Extension<AuthExtension>,
         Path(id): Path<Uuid>,
     ) -> impl IntoResponse {
-        // Same ownership rule the production handler enforces: a non-admin
-        // can only change their own password. The middleware composition is
-        // what determines whether we even reach this handler — that is the
-        // bug under test.
         if auth.user_id != id && !auth.is_admin {
             return (
                 StatusCode::FORBIDDEN,
@@ -1790,16 +1792,83 @@ mod password_route_middleware_tests {
         (StatusCode::OK, "password-changed").into_response()
     }
 
-    async fn stub_list_users(Extension(_auth): Extension<AuthExtension>) -> impl IntoResponse {
+    pub(super) async fn stub_list_users(
+        Extension(_auth): Extension<AuthExtension>,
+    ) -> impl IntoResponse {
         (StatusCode::OK, "user-list").into_response()
     }
 
-    async fn stub_get_user(
+    pub(super) async fn stub_get_user(
         Extension(_auth): Extension<AuthExtension>,
         Path(_id): Path<Uuid>,
     ) -> impl IntoResponse {
         (StatusCode::OK, "user-detail").into_response()
     }
+
+    // ---- request helpers --------------------------------------------------
+
+    /// GET request with a Bearer token and an empty body.
+    pub(super) fn bearer_get(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// POST `<uri>` with a Bearer token and a minimal valid JSON body. The
+    /// body content does not matter for the routing/middleware regressions —
+    /// the stub handlers ignore it.
+    pub(super) fn password_change_request(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"new_password":"NewSecurePass123!"}"#))
+            .unwrap()
+    }
+
+    pub(super) async fn body_text(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Run a request through the app and return `(status, body_text)`.
+    /// Every regression test below makes both assertions, so this collapses
+    /// the boilerplate.
+    pub(super) async fn send(app: Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = body_text(resp).await;
+        (status, body)
+    }
+}
+
+#[cfg(test)]
+mod password_route_middleware_tests {
+    use super::route_test_support::{
+        bearer_get, lazy_pool, make_test_config, make_user, password_change_request, send,
+        stub_change_password, stub_get_user, stub_list_users,
+    };
+    use crate::api::middleware::auth::{admin_middleware, auth_middleware};
+    use crate::models::user::User;
+    use crate::services::auth_service::AuthService;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        routing::{get, post},
+        Router,
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const JWT_SECRET: &str = "regression-test-secret-key-for-issue-1010-unit-test";
 
     // ---- router builder ---------------------------------------------------
 
@@ -1841,51 +1910,11 @@ mod password_route_middleware_tests {
         Router::new().nest("/users", self_service.merge(admin_only))
     }
 
-    /// POST `/users/:id/password` request with a Bearer token and a
-    /// minimal valid JSON body. The body content does not matter for the
-    /// middleware/routing regression — the stub handler ignores it.
-    fn password_change_request(uri: &str, token: &str) -> Request<Body> {
-        Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"new_password":"NewSecurePass123!"}"#))
-            .unwrap()
-    }
-
-    /// GET request with a Bearer token and an empty body.
-    fn bearer_get(uri: &str, token: &str) -> Request<Body> {
-        Request::builder()
-            .method("GET")
-            .uri(uri)
-            .header("Authorization", format!("Bearer {}", token))
-            .body(Body::empty())
-            .unwrap()
-    }
-
-    async fn body_text(resp: axum::response::Response) -> String {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
-    }
-
-    /// Run a request through the app and return `(status, body_text)` —
-    /// every regression test below makes both assertions, so this collapses
-    /// the boilerplate.
-    async fn send(app: Router, req: Request<Body>) -> (StatusCode, String) {
-        let resp = app.oneshot(req).await.unwrap();
-        let status = resp.status();
-        let body = body_text(resp).await;
-        (status, body)
-    }
-
     /// Build the `/users` test app and mint a JWT for a fresh user with the
     /// requested admin flag. Returns `(app, user, access_token)`. Most
     /// regression tests need exactly this triple.
     fn setup_with_user(is_admin: bool) -> (Router, User, String) {
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config(JWT_SECRET)));
         let user = make_user(is_admin);
         let tokens = auth_service
             .generate_tokens(&user)
@@ -1997,7 +2026,7 @@ mod password_route_middleware_tests {
         // The self-service route still requires authentication — `auth_middleware`
         // (not anonymous) — so a missing Authorization header must be rejected
         // at the middleware with 401 before the handler is reached.
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config(JWT_SECRET)));
         let app = build_users_test_app(auth_service);
 
         let req = Request::builder()
@@ -2045,88 +2074,40 @@ mod me_route_regression_tests {
     //! Compile-time anchors to `super::self_service_router` and
     //! `super::router` ensure this test fails to compile if the route split
     //! is reverted.
+    use super::route_test_support::{
+        bearer_get, lazy_pool, make_test_config, make_user, password_change_request, send,
+        stub_change_password, stub_get_user, stub_list_users,
+    };
     use crate::api::middleware::auth::{admin_middleware, auth_middleware, AuthExtension};
-    use crate::config::Config;
-    use crate::models::user::{AuthProvider, User};
+    use crate::models::user::User;
     use crate::services::auth_service::AuthService;
     use axum::{
         body::Body,
-        extract::{Extension, Path},
+        extract::Extension,
         http::{Request, StatusCode},
         middleware,
         response::IntoResponse,
         routing::{get, post},
         Router,
     };
-    use chrono::Utc;
-    use sqlx::PgPool;
     use std::sync::Arc;
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    // ---- fixtures ---------------------------------------------------------
+    const JWT_SECRET: &str = "regression-test-secret-key-for-issue-1008-me-routes";
 
-    fn lazy_pool() -> PgPool {
-        // No socket is opened until a query runs, so this is safe in unit
-        // tests without a live Postgres instance. Stub handlers below never
-        // touch the pool, so no query is ever issued.
-        PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
-            .expect("connect_lazy never fails for a syntactically valid URL")
-    }
-
-    fn make_test_config() -> Arc<Config> {
-        Arc::new(Config {
-            jwt_secret: "regression-test-secret-key-for-issue-1008-me-routes".to_string(),
-            ..Config::default()
-        })
-    }
-
-    fn make_user(is_admin: bool) -> User {
-        let now = Utc::now();
-        User {
-            id: Uuid::new_v4(),
-            username: if is_admin {
-                "admin_user".to_string()
-            } else {
-                "regular_user".to_string()
-            },
-            email: if is_admin {
-                "admin@example.com".to_string()
-            } else {
-                "regular@example.com".to_string()
-            },
-            password_hash: None,
-            auth_provider: AuthProvider::Local,
-            external_id: None,
-            display_name: None,
-            is_active: true,
-            is_admin,
-            is_service_account: false,
-            must_change_password: false,
-            totp_secret: None,
-            totp_enabled: false,
-            totp_backup_codes: None,
-            totp_verified_at: None,
-            last_login_at: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    // ---- stub handlers ----------------------------------------------------
+    // ---- module-specific stub handlers -----------------------------------
     //
-    // Stand in for the real `get_user`, `change_password`, and `list_users`
-    // handlers in the test router. They preserve only the contracts that
-    // matter for the regression: `/me`-aliased handlers must read the user
-    // id from the `AuthExtension` (NOT from a path parameter — the bug under
-    // test was a `Uuid` parse failure on the literal `me`); the admin-only
-    // stubs simply assert that the request reached them, since the admin
-    // gate is upstream of the handler.
+    // These two stubs only make sense for the `/me` aliases — they resolve
+    // the user identity from the `AuthExtension` instead of a path parameter,
+    // which is exactly the contract the production handlers enforce. The
+    // admin-side stubs (`stub_get_user`, `stub_list_users`) and the
+    // `/:id/password` stub (`stub_change_password`) live in
+    // [`super::route_test_support`] because they are shared with the
+    // password-route module.
 
     async fn stub_get_current_user(Extension(auth): Extension<AuthExtension>) -> impl IntoResponse {
-        // Mirrors the production `get_current_user` contract: resolve the
-        // user identity from the JWT/auth context, never from `:id`. If
-        // routing wrongly sent us through `/:id` with `id == "me"`, axum
+        // If routing wrongly sent us through `/:id` with `id == "me"`, axum
         // would have rejected the request at the `Path<Uuid>` extractor
         // before we ever got here.
         (
@@ -2139,42 +2120,14 @@ mod me_route_regression_tests {
     async fn stub_change_my_password(
         Extension(auth): Extension<AuthExtension>,
     ) -> impl IntoResponse {
-        // Mirrors the production `change_my_password` contract: the user id
-        // comes from the auth extension, so this handler being reachable
-        // (rather than 403'd by `admin_middleware`) is the regression.
+        // The user id comes from the auth extension, so this handler being
+        // reachable (rather than 403'd by `admin_middleware`) is the
+        // regression.
         (
             StatusCode::OK,
             format!("me-password-changed:{}", auth.user_id),
         )
             .into_response()
-    }
-
-    async fn stub_change_password(
-        Extension(auth): Extension<AuthExtension>,
-        Path(id): Path<Uuid>,
-    ) -> impl IntoResponse {
-        // Same ownership rule the production handler enforces: a non-admin
-        // can only change their own password. Used by the `/:id/password`
-        // route inside the self-service router.
-        if auth.user_id != id && !auth.is_admin {
-            return (
-                StatusCode::FORBIDDEN,
-                "Cannot change other users' passwords",
-            )
-                .into_response();
-        }
-        (StatusCode::OK, "password-changed").into_response()
-    }
-
-    async fn stub_list_users(Extension(_auth): Extension<AuthExtension>) -> impl IntoResponse {
-        (StatusCode::OK, "user-list").into_response()
-    }
-
-    async fn stub_get_user(
-        Extension(_auth): Extension<AuthExtension>,
-        Path(_id): Path<Uuid>,
-    ) -> impl IntoResponse {
-        (StatusCode::OK, "user-detail").into_response()
     }
 
     // ---- router builder ---------------------------------------------------
@@ -2226,45 +2179,10 @@ mod me_route_regression_tests {
         Router::new().nest("/users", self_service.merge(admin_only))
     }
 
-    // ---- request helpers --------------------------------------------------
-
-    fn bearer_get(uri: &str, token: &str) -> Request<Body> {
-        Request::builder()
-            .method("GET")
-            .uri(uri)
-            .header("Authorization", format!("Bearer {}", token))
-            .body(Body::empty())
-            .unwrap()
-    }
-
-    fn password_change_request(uri: &str, token: &str) -> Request<Body> {
-        Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"new_password":"NewSecurePass123!"}"#))
-            .unwrap()
-    }
-
-    async fn body_text(resp: axum::response::Response) -> String {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
-    }
-
-    async fn send(app: Router, req: Request<Body>) -> (StatusCode, String) {
-        let resp = app.oneshot(req).await.unwrap();
-        let status = resp.status();
-        let body = body_text(resp).await;
-        (status, body)
-    }
-
     /// Build the `/users` test app and mint a real JWT for a fresh user
     /// with the requested admin flag. Returns `(app, user, access_token)`.
     fn setup_with_user(is_admin: bool) -> (Router, User, String) {
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config(JWT_SECRET)));
         let user = make_user(is_admin);
         let tokens = auth_service
             .generate_tokens(&user)
@@ -2416,7 +2334,7 @@ mod me_route_regression_tests {
         // The self-service router is gated by `auth_middleware`, not
         // anonymous: `/me` must still 401 without a Bearer token, the same
         // way `/:id/password` does.
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config(JWT_SECRET)));
         let app = build_users_test_app(auth_service);
 
         let req = Request::builder()
