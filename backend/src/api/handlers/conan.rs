@@ -228,16 +228,58 @@ fn content_type_for_conan_file(path: &str) -> &'static str {
     }
 }
 
+/// Maximum byte length for any single Conan reference path segment
+/// (`name`, `version`, `user`, `channel`, `revision`, `package_id`,
+/// `pkg_revision`, `file_path`). This matches the typical filesystem
+/// `NAME_MAX` limit (255) and keeps storage-backend operations from
+/// surfacing low-level filesystem errors as 5xx responses.
+const CONAN_MAX_SEGMENT_LEN: usize = 255;
+
+/// Validate the byte length of every user-supplied Conan path segment.
+///
+/// Returns a 414 (URI Too Long) plain-text error response when any segment
+/// exceeds [`CONAN_MAX_SEGMENT_LEN`]. The first offending segment is named
+/// in the response body so abuse / fuzzing payloads do not look like server
+/// faults in monitoring (issue #990).
+#[allow(clippy::result_large_err)]
+fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
+    for (label, value) in segments {
+        if value.len() > CONAN_MAX_SEGMENT_LEN {
+            return Err((
+                StatusCode::URI_TOO_LONG,
+                format!(
+                    "Conan path segment '{}' exceeds {} bytes (got {})",
+                    label,
+                    CONAN_MAX_SEGMENT_LEN,
+                    value.len()
+                ),
+            )
+                .into_response());
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // GET /conan/{repo_key}/v2/ping
 // ---------------------------------------------------------------------------
 
-async fn ping() -> Response {
-    Response::builder()
+/// Ping / capability probe.
+///
+/// Validates the repository exists before returning the static capability
+/// banner so Conan clients can distinguish a configured-but-broken remote
+/// from a typo (issue #990). Returns 404 when the repository does not
+/// exist or is not Conan-format.
+async fn ping(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let _repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header("X-Conan-Server-Capabilities", "revisions")
         .body(Body::empty())
-        .unwrap()
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +729,7 @@ async fn recipe_file_download(
 
 async fn recipe_file_upload(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    auth: Option<Extension<Option<AuthExtension>>>,
     Path((repo_key, name, version, user, channel, revision, file_path)): Path<(
         String,
         String,
@@ -699,8 +741,29 @@ async fn recipe_file_upload(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conan")?.user_id;
+    // Reject path segments that exceed the filesystem NAME_MAX before any
+    // DB, auth, or storage-backend call, so deeply-nested or fuzzing-style
+    // payloads surface as a 414 instead of a low-level 500 (issue #990).
+    // Path-shape is independent of authn/authz so it is safe (and useful for
+    // monitoring) to fail it first.
+    validate_conan_segments(&[
+        ("name", &name),
+        ("version", &version),
+        ("user", &user),
+        ("channel", &channel),
+        ("revision", &revision),
+        ("file_path", &file_path),
+    ])?;
+
+    // Validate the repo BEFORE checking auth, so an upload to a non-existent
+    // repo returns 404 instead of 500 (issue #990). The repo-visibility
+    // middleware skips the auth-extension insertion when the repo key is
+    // unknown, so a strict `Extension<Option<AuthExtension>>` extractor
+    // would surface a 500 here. Accepting the extension as `Option<...>`
+    // lets us run the resolve-then-auth-then-validate sequence cleanly.
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    let auth_ext = auth.and_then(|Extension(a)| a);
+    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path =
@@ -1192,7 +1255,7 @@ async fn package_file_download(
 #[allow(clippy::type_complexity)]
 async fn package_file_upload(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    auth: Option<Extension<Option<AuthExtension>>>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision, file_path)): Path<(
         String,
         String,
@@ -1206,8 +1269,25 @@ async fn package_file_upload(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conan")?.user_id;
+    // Reject excessively long path segments up front (before any DB, auth,
+    // or storage-backend call) so the storage backend and DB never see paths
+    // that would surface as opaque 5xx errors (issue #990).
+    validate_conan_segments(&[
+        ("name", &name),
+        ("version", &version),
+        ("user", &user),
+        ("channel", &channel),
+        ("revision", &revision),
+        ("package_id", &package_id),
+        ("pkg_revision", &pkg_revision),
+        ("file_path", &file_path),
+    ])?;
+
+    // Resolve repo BEFORE auth so unknown repo keys surface as 404, not 500.
+    // See `recipe_file_upload` for the full rationale (issue #990).
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    let auth_ext = auth.and_then(|Extension(a)| a);
+    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path = package_artifact_path(
@@ -1920,5 +2000,65 @@ mod tests {
             "boost", "1.80", "myuser", "stable", "r1", "pid", "prev", "file",
         );
         assert!(path.contains("/myuser/stable/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_conan_segments — issue #990 long-path guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_conan_segments_accepts_normal_segments() {
+        let segments = [
+            ("name", "zlib"),
+            ("version", "1.3.1"),
+            ("user", "_"),
+            ("channel", "_"),
+            ("revision", "deadbeefcafebabedeadbeefcafebabe"),
+            ("file_path", "conanfile.py"),
+        ];
+        assert!(validate_conan_segments(&segments).is_ok());
+    }
+
+    #[test]
+    fn test_validate_conan_segments_accepts_segment_at_max() {
+        let max_segment: String = "a".repeat(CONAN_MAX_SEGMENT_LEN);
+        let segments = [("name", max_segment.as_str())];
+        assert!(
+            validate_conan_segments(&segments).is_ok(),
+            "exactly {} bytes must be accepted",
+            CONAN_MAX_SEGMENT_LEN
+        );
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_name() {
+        // Mirrors test-conan-errors.sh #15: a 300-char package name.
+        let long_name: String = "a".repeat(300);
+        let segments = [
+            ("name", long_name.as_str()),
+            ("version", "1.0.0"),
+            ("user", "_"),
+            ("channel", "_"),
+            ("revision", "rev"),
+            ("file_path", "conanfile.py"),
+        ];
+        let resp = validate_conan_segments(&segments).expect_err("must reject 300-char name");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_version() {
+        let long_version: String = "1.".repeat(200); // 400 chars
+        let segments = [("name", "zlib"), ("version", long_version.as_str())];
+        let resp = validate_conan_segments(&segments).expect_err("must reject 400-char version");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_file_path() {
+        let long_path: String = "x".repeat(CONAN_MAX_SEGMENT_LEN + 1);
+        let segments = [("file_path", long_path.as_str())];
+        let resp = validate_conan_segments(&segments).expect_err("must reject overlong file_path");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
     }
 }
