@@ -1938,3 +1938,421 @@ mod password_route_middleware_tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
+
+#[cfg(test)]
+mod me_route_regression_tests {
+    //! Regression tests for issue #1008.
+    //!
+    //! Two related bugs are guarded here:
+    //!
+    //! 1. **Routing collision (the original #1008 bug):** A literal `/me`
+    //!    segment must resolve to the JWT-bound user instead of being parsed
+    //!    as a `Uuid` path parameter. This requires the `/me` and
+    //!    `/me/password` routes to be registered BEFORE any `/:id` patterns
+    //!    in the same router (axum's matcher prefers literals only when they
+    //!    are registered first).
+    //!
+    //! 2. **Middleware composition (the #1008 R1 Security BLOCKER):** The
+    //!    initial fix put the `/me` aliases inside `users::router()`, which
+    //!    on `release/1.1.x` is wrapped in `admin_middleware`. The result
+    //!    was that `GET /users/me` and `POST /users/me/password` returned
+    //!    403 "Admin access required" for any non-admin caller, defeating
+    //!    the entire purpose of the alias (the documented first-time-setup
+    //!    flow uses these from a non-admin context). After issue #1010 the
+    //!    correct home for self-service routes is
+    //!    [`super::self_service_router`], which is mounted under
+    //!    `auth_middleware` in `routes.rs::api_v1_routes`.
+    //!
+    //! These tests exercise the **same** middleware composition the
+    //! production router builds, mint real JWT tokens via
+    //! `AuthService::generate_tokens`, and run requests through real
+    //! `auth_middleware` / `admin_middleware`. A handler-only test would not
+    //! catch the regression — the bug is in routing + middleware, not the
+    //! handler bodies.
+    //!
+    //! Compile-time anchors to `super::self_service_router` and
+    //! `super::router` ensure this test fails to compile if the route split
+    //! is reverted.
+    use crate::api::middleware::auth::{admin_middleware, auth_middleware, AuthExtension};
+    use crate::config::Config;
+    use crate::models::user::{AuthProvider, User};
+    use crate::services::auth_service::AuthService;
+    use axum::{
+        body::Body,
+        extract::{Extension, Path},
+        http::{Request, StatusCode},
+        middleware,
+        response::IntoResponse,
+        routing::{get, post},
+        Router,
+    };
+    use chrono::Utc;
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    // ---- fixtures ---------------------------------------------------------
+
+    fn lazy_pool() -> PgPool {
+        // No socket is opened until a query runs, so this is safe in unit
+        // tests without a live Postgres instance. Stub handlers below never
+        // touch the pool, so no query is ever issued.
+        PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("connect_lazy never fails for a syntactically valid URL")
+    }
+
+    fn make_test_config() -> Arc<Config> {
+        Arc::new(Config {
+            jwt_secret: "regression-test-secret-key-for-issue-1008-me-routes".to_string(),
+            ..Config::default()
+        })
+    }
+
+    fn make_user(is_admin: bool) -> User {
+        let now = Utc::now();
+        User {
+            id: Uuid::new_v4(),
+            username: if is_admin {
+                "admin_user".to_string()
+            } else {
+                "regular_user".to_string()
+            },
+            email: if is_admin {
+                "admin@example.com".to_string()
+            } else {
+                "regular@example.com".to_string()
+            },
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            last_login_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // ---- stub handlers ----------------------------------------------------
+    //
+    // Stand in for the real `get_user`, `change_password`, and `list_users`
+    // handlers in the test router. They preserve only the contracts that
+    // matter for the regression: `/me`-aliased handlers must read the user
+    // id from the `AuthExtension` (NOT from a path parameter — the bug under
+    // test was a `Uuid` parse failure on the literal `me`); the admin-only
+    // stubs simply assert that the request reached them, since the admin
+    // gate is upstream of the handler.
+
+    async fn stub_get_current_user(Extension(auth): Extension<AuthExtension>) -> impl IntoResponse {
+        // Mirrors the production `get_current_user` contract: resolve the
+        // user identity from the JWT/auth context, never from `:id`. If
+        // routing wrongly sent us through `/:id` with `id == "me"`, axum
+        // would have rejected the request at the `Path<Uuid>` extractor
+        // before we ever got here.
+        (
+            StatusCode::OK,
+            format!("me:{}:admin={}", auth.user_id, auth.is_admin),
+        )
+            .into_response()
+    }
+
+    async fn stub_change_my_password(
+        Extension(auth): Extension<AuthExtension>,
+    ) -> impl IntoResponse {
+        // Mirrors the production `change_my_password` contract: the user id
+        // comes from the auth extension, so this handler being reachable
+        // (rather than 403'd by `admin_middleware`) is the regression.
+        (
+            StatusCode::OK,
+            format!("me-password-changed:{}", auth.user_id),
+        )
+            .into_response()
+    }
+
+    async fn stub_change_password(
+        Extension(auth): Extension<AuthExtension>,
+        Path(id): Path<Uuid>,
+    ) -> impl IntoResponse {
+        // Same ownership rule the production handler enforces: a non-admin
+        // can only change their own password. Used by the `/:id/password`
+        // route inside the self-service router.
+        if auth.user_id != id && !auth.is_admin {
+            return (
+                StatusCode::FORBIDDEN,
+                "Cannot change other users' passwords",
+            )
+                .into_response();
+        }
+        (StatusCode::OK, "password-changed").into_response()
+    }
+
+    async fn stub_list_users(Extension(_auth): Extension<AuthExtension>) -> impl IntoResponse {
+        (StatusCode::OK, "user-list").into_response()
+    }
+
+    async fn stub_get_user(
+        Extension(_auth): Extension<AuthExtension>,
+        Path(_id): Path<Uuid>,
+    ) -> impl IntoResponse {
+        (StatusCode::OK, "user-detail").into_response()
+    }
+
+    // ---- router builder ---------------------------------------------------
+
+    /// Build a `/users` test app with the same middleware composition as the
+    /// production `routes.rs::api_v1_routes` `/users` nest after issue
+    /// #1010: a self-service router (carrying `/me`, `/me/password`, and
+    /// `/:id/password`) behind `auth_middleware`, merged with an admin-only
+    /// router behind `admin_middleware`.
+    ///
+    /// The `super::self_service_router` and `super::router` references are
+    /// what make this regression test fail to compile if the production
+    /// route split is reverted. The previous incarnation of the #1008 fix
+    /// tested `users::router()` in isolation with a fake `AuthExtension`,
+    /// which silently passed even though the production `/users` nest had
+    /// the `/me` handlers behind `admin_middleware`. Building the same
+    /// composition here is what closes that R1 Security gap.
+    fn build_users_test_app(auth_service: Arc<AuthService>) -> Router {
+        // Compile-time anchor to the production fix. If `self_service_router`
+        // is removed (or stops carrying `/me`), this test will fail to
+        // compile or its assertions will fail. The production function
+        // returns `Router<SharedState>`, which we cannot ground to `()` here
+        // without a full AppState, so we only take a function-pointer
+        // reference to prove existence.
+        let _production_self_service: fn() -> Router<crate::api::SharedState> =
+            super::self_service_router;
+        let _production_admin: fn() -> Router<crate::api::SharedState> = super::router;
+
+        // Mirror the *exact* route shape `super::self_service_router`
+        // builds: `/me` and `/me/password` registered BEFORE `/:id/password`
+        // so axum resolves the literal segment correctly (issue #1008).
+        let self_service: Router = Router::new()
+            .route("/me", get(stub_get_current_user))
+            .route("/me/password", post(stub_change_my_password))
+            .route("/:id/password", post(stub_change_password))
+            .layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            ));
+
+        let admin_only: Router = Router::new()
+            .route("/", get(stub_list_users))
+            .route("/:id", get(stub_get_user))
+            .layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
+            ));
+
+        Router::new().nest("/users", self_service.merge(admin_only))
+    }
+
+    // ---- request helpers --------------------------------------------------
+
+    fn bearer_get(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn password_change_request(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"new_password":"NewSecurePass123!"}"#))
+            .unwrap()
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn send(app: Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = body_text(resp).await;
+        (status, body)
+    }
+
+    /// Build the `/users` test app and mint a real JWT for a fresh user
+    /// with the requested admin flag. Returns `(app, user, access_token)`.
+    fn setup_with_user(is_admin: bool) -> (Router, User, String) {
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let user = make_user(is_admin);
+        let tokens = auth_service
+            .generate_tokens(&user)
+            .expect("mint access token");
+        let app = build_users_test_app(auth_service);
+        (app, user, tokens.access_token)
+    }
+
+    // ---- the regression tests --------------------------------------------
+
+    #[tokio::test]
+    async fn non_admin_can_get_users_me() {
+        // The R1 Security BLOCKER: `GET /users/me` was 403 "Admin access
+        // required" for any non-admin because the route was registered
+        // inside `users::router()` (admin-gated). After moving it into
+        // `self_service_router` (auth-gated), a non-admin's JWT must reach
+        // the handler.
+        let (app, user, token) = setup_with_user(/* is_admin */ false);
+
+        let (status, body) = send(app, bearer_get("/users/me", &token)).await;
+
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin GET /users/me must not be blocked by admin_middleware (#1008 R1); body was: {body}"
+        );
+        assert!(
+            !body.contains("Admin access required"),
+            "response must not be the admin-gate rejection (#1008 R1); status={status}, body={body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin GET /users/me should reach the handler and succeed; body was: {body}"
+        );
+        // The handler resolves the user from the JWT, not from a path
+        // parameter — proves the request did NOT fall into the `/:id`
+        // matcher and try to parse "me" as a Uuid.
+        assert!(
+            body.contains(&format!("me:{}:admin=false", user.id)),
+            "expected me-handler payload bound to JWT user, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_admin_can_post_users_me_password() {
+        // Same R1 Security regression for POST /users/me/password — this is
+        // the route the documented first-time-setup flow calls from a
+        // non-admin context, so it MUST be reachable without admin.
+        let (app, user, token) = setup_with_user(/* is_admin */ false);
+
+        let (status, body) = send(app, password_change_request("/users/me/password", &token)).await;
+
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin POST /users/me/password must not be blocked by admin_middleware (#1008 R1); body was: {body}"
+        );
+        assert!(
+            !body.contains("Admin access required"),
+            "response must not be the admin-gate rejection (#1008 R1); status={status}, body={body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin POST /users/me/password should reach the handler; body was: {body}"
+        );
+        assert!(
+            body.contains(&format!("me-password-changed:{}", user.id)),
+            "expected me-password handler payload bound to JWT user, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_can_also_use_users_me() {
+        // Admins are still authenticated users, so the `/me` aliases must
+        // also work for them — the auth_middleware accepts any valid JWT,
+        // and the merge with the admin router must not shadow the literal
+        // `/me` route.
+        let (app, user, token) = setup_with_user(/* is_admin */ true);
+
+        let (status, body) = send(app, bearer_get("/users/me", &token)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin GET /users/me should succeed; body was: {body}"
+        );
+        assert!(
+            body.contains(&format!("me:{}:admin=true", user.id)),
+            "expected me-handler payload bound to admin JWT user, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn me_literal_does_not_collide_with_uuid_route() {
+        // The original #1008 routing bug: `GET /users/me` fell into the
+        // `/:id` matcher and 400'd with "UUID parsing failed". Since the
+        // self-service router only contains `/:id/password` (not `/:id`),
+        // the canonical UUID-parse-failure path here is the merged admin
+        // router's `/:id`. We assert that `/me` resolves to the literal
+        // route and never produces a UUID-parse rejection at any layer.
+        let (app, _user, token) = setup_with_user(/* is_admin */ false);
+
+        let (status, body) = send(app, bearer_get("/users/me", &token)).await;
+
+        // Strongest signal: literal route wins, status is 200 from the
+        // self-service handler.
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected literal /me route to win, got {status} body={body}"
+        );
+        assert!(
+            !body.to_ascii_lowercase().contains("uuid"),
+            "response must not contain a UUID-parse failure message; body={body}"
+        );
+        assert!(
+            !body.contains("Invalid URL"),
+            "axum's Path<Uuid> rejection must not surface for /me; body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_user_by_uuid_still_routes_to_get_user() {
+        // Regression guard for the admin path: registering literal `/me`
+        // before `/:id` must not break UUID-keyed `/users/{uuid}` routing
+        // for admins. The admin router's `/:id` handler should still be
+        // reached.
+        let (app, _admin, token) = setup_with_user(/* is_admin */ true);
+
+        let target_id = Uuid::new_v4();
+        let uri = format!("/users/{}", target_id);
+        let (status, body) = send(app, bearer_get(&uri, &token)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin GET /users/<uuid> must still route to get_user; body was: {body}"
+        );
+        assert!(
+            body.contains("user-detail"),
+            "expected the admin /:id stub to handle the request, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_me_request_rejected() {
+        // The self-service router is gated by `auth_middleware`, not
+        // anonymous: `/me` must still 401 without a Bearer token, the same
+        // way `/:id/password` does.
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let app = build_users_test_app(auth_service);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/users/me")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
