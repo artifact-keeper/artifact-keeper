@@ -23,9 +23,8 @@ use artifact_keeper_backend::models::security::{RawFinding, Severity};
 use artifact_keeper_backend::services::scan_result_service::ScanResultService;
 
 async fn connect_db() -> PgPool {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://postgres:postgres@localhost:5432/artifact_registry".into()
-    });
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/artifact_registry".into());
     PgPool::connect(&url)
         .await
         .expect("failed to connect to test database")
@@ -137,17 +136,9 @@ async fn create_scans_with_findings(
                 Severity::Info => {}
             }
         }
-        svc.complete_scan(
-            scan.id,
-            findings_per_scan as i32,
-            crit,
-            high,
-            med,
-            low,
-            0,
-        )
-        .await
-        .expect("complete scan");
+        svc.complete_scan(scan.id, findings_per_scan as i32, crit, high, med, low, 0)
+            .await
+            .expect("complete scan");
 
         // Stagger completed_at so DISTINCT ON ordering is deterministic.
         // The most recently inserted scan is the "latest of record".
@@ -219,13 +210,12 @@ async fn rescan_does_not_inflate_finding_counts() {
     // scan_findings table actually contains SCANS * FINDINGS_PER_SCAN rows
     // (150) for this artifact. Without that, asserting 15 below would
     // tautologically pass on broken code.
-    let raw_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_findings WHERE artifact_id = $1",
-    )
-    .bind(artifact_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count raw findings");
+    let raw_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE artifact_id = $1")
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count raw findings");
     assert_eq!(
         raw_count,
         (SCANS * FINDINGS_PER_SCAN) as i64,
