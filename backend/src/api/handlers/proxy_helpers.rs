@@ -225,16 +225,17 @@ pub async fn proxy_fetch_or_redirect(
     let cache_key = proxy_cache_storage_key(repo_key, path);
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     let presigned_enabled = state.config.presigned_downloads_enabled;
+    let storage_location = StorageLocation {
+        backend: state.config.storage_backend.clone(),
+        path: state.config.storage_path.clone(),
+    };
 
     // Fast path (#1018): if presigned downloads are enabled and the proxy
     // cache is already fresh, redirect to the signed URL without ever
     // pulling the cached body into the backend's memory. The freshness
     // probe is metadata-only (HEAD-equivalent on cloud backends).
     if presigned_enabled && proxy_service.is_cache_fresh(repo_key, path).await {
-        if let Ok(storage) = state.storage_for_repo(&StorageLocation {
-            backend: state.config.storage_backend.clone(),
-            path: state.config.storage_path.clone(),
-        }) {
+        if let Ok(storage) = state.storage_for_repo(&storage_location) {
             if let Some(redirect) = try_proxy_cache_redirect(
                 storage.as_ref(),
                 &cache_key,
@@ -258,10 +259,7 @@ pub async fn proxy_fetch_or_redirect(
     // If presigned is configured, prefer redirecting to the just-populated
     // cache entry over streaming the buffered content back to the client.
     if presigned_enabled {
-        if let Ok(storage) = state.storage_for_repo(&StorageLocation {
-            backend: state.config.storage_backend.clone(),
-            path: state.config.storage_path.clone(),
-        }) {
+        if let Ok(storage) = state.storage_for_repo(&storage_location) {
             if let Some(redirect) =
                 try_presigned_redirect(storage.as_ref(), &cache_key, true, expiry).await
             {
