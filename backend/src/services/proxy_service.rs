@@ -119,6 +119,56 @@ impl ProxyService {
         self.get_cached_artifact(&cache_key, &metadata_key).await
     }
 
+    /// Metadata-only freshness check for a proxy-cached artifact.
+    ///
+    /// Loads only the cache metadata sidecar (small JSON) and verifies that
+    /// the underlying content object exists in the storage backend. Does
+    /// NOT download the cached body, which is the whole point of a
+    /// metadata-only probe before issuing a presigned redirect (#1018).
+    ///
+    /// Returns `true` only when both:
+    ///   * the metadata exists and has not expired, and
+    ///   * the content object exists in the backing storage.
+    ///
+    /// # Integrity / SHA-256 self-heal divergence (fast vs. slow path)
+    ///
+    /// The slow path (`get_cached_artifact`) recomputes the SHA-256 of the
+    /// cached body and, on mismatch, returns `None` so the caller re-fetches
+    /// from upstream and overwrites the cache entry — i.e. the cache
+    /// self-heals on the next read.
+    ///
+    /// The fast path that this probe gates (presigned redirect to the
+    /// cached object) does **not** download the body and therefore cannot
+    /// recompute the SHA-256. It trusts the storage backend's own
+    /// integrity guarantees (S3/GCS/Azure object checksums, ETags,
+    /// versioning, etc.). Concretely:
+    ///
+    ///   * a SHA-mismatched cache entry served via a presigned URL will
+    ///     **not** be detected or healed until either (a) the next slow-path
+    ///     access of the same key, or (b) the cache TTL expires and the
+    ///     entry is refreshed from upstream;
+    ///   * this matches existing presign+redirect semantics elsewhere in
+    ///     the codebase — presigned URLs have always trusted the storage
+    ///     backend, the proxy cache is no different.
+    ///
+    /// ETag-based revalidation on the fast path is a deliberate follow-up
+    /// (not implemented here) so the #1018 fix stays scoped to "do not
+    /// buffer the body".
+    pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
+        let cache_key = Self::cache_storage_key(repo_key, path);
+        let metadata_key = Self::cache_metadata_key(repo_key, path);
+
+        let Ok(Some(metadata)) = self.load_cache_metadata(&metadata_key).await else {
+            return false;
+        };
+        if Utc::now() > metadata.expires_at {
+            return false;
+        }
+        // exists() is a HEAD-equivalent on cloud backends and does not pull
+        // the object body into memory.
+        matches!(self.storage.exists(&cache_key).await, Ok(true))
+    }
+
     /// Fetch artifact from upstream, but use `cache_path` instead of
     /// `fetch_path` when reading and writing the proxy cache.
     ///
@@ -335,7 +385,14 @@ impl ProxyService {
     /// Uses a `__content__` leaf file to avoid file/directory collisions
     /// when one path is a prefix of another (e.g., npm metadata at `is-odd`
     /// vs tarball at `is-odd/-/is-odd-3.0.1.tgz`).
-    fn cache_storage_key(repo_key: &str, path: &str) -> String {
+    ///
+    /// Visible to the rest of the crate so that the proxy fast-path in
+    /// `api::handlers::proxy_helpers::proxy_fetch_or_redirect` can sign
+    /// presigned URLs against the *exact* same key the freshness probe
+    /// in `is_cache_fresh` checks. Keeping a single source of truth for
+    /// the key formula prevents the freshness check and the presign
+    /// target from drifting out of sync (#1018).
+    pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> String {
         format!(
             "proxy-cache/{}/{}/__content__",
             repo_key,
@@ -2015,5 +2072,193 @@ mod tests {
         assert_eq!(capped, 3600);
         let effective = capped.saturating_mul(9) / 10;
         assert_eq!(effective, 3240);
+    }
+
+    // =======================================================================
+    // is_cache_fresh tests (#1018 R3-2)
+    // =======================================================================
+    //
+    // Direct unit coverage for the metadata-only freshness probe used by the
+    // proxy fast path. The probe is the gate that decides whether the
+    // presigned-redirect short-circuit fires, so any silent regression here
+    // (e.g. the probe always returning true, or accidentally downloading the
+    // body) re-introduces the buffered-download bug behind a different code
+    // path. These tests fix the contract:
+    //   * missing metadata sidecar         -> false
+    //   * expired metadata                 -> false
+    //   * valid metadata, content missing  -> false
+    //   * valid metadata, content present  -> true
+    //
+    // and crucially never invoke `storage.get(...)` on the cached body.
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Programmable storage backend for `is_cache_fresh` tests.
+    ///
+    /// Lets each test wire up just enough behavior:
+    ///   * `metadata` is the JSON bytes returned by `get(metadata_key)`,
+    ///     or `None` to simulate a missing sidecar (`AppError::NotFound`).
+    ///   * `content_exists` is what `exists(content_key)` returns.
+    ///   * `get_calls` records every `get(...)` call so tests can assert
+    ///     the body was never downloaded.
+    struct CacheFreshMock {
+        metadata: Option<Bytes>,
+        content_exists: bool,
+        get_calls: AtomicUsize,
+    }
+
+    impl CacheFreshMock {
+        fn new(metadata: Option<Bytes>, content_exists: bool) -> Self {
+            Self {
+                metadata,
+                content_exists,
+                get_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for CacheFreshMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.get_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if key.ends_with("__cache_meta__.json") {
+                match &self.metadata {
+                    Some(b) => Ok(b.clone()),
+                    None => Err(AppError::NotFound(key.to_string())),
+                }
+            } else {
+                // Body access on the fast path is forbidden — return
+                // NotFound so accidental hits surface as test failures
+                // rather than fake successes.
+                Err(AppError::NotFound(key.to_string()))
+            }
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            if key.ends_with("__content__") {
+                Ok(self.content_exists)
+            } else {
+                // Metadata sidecar exists iff metadata bytes are present.
+                Ok(self.metadata.is_some())
+            }
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Build a `ProxyService` whose storage is the supplied mock. The DB
+    /// pool is a lazy connection that is never dialed because
+    /// `is_cache_fresh` does not touch the database.
+    fn build_proxy_service_with_storage(
+        storage: Arc<dyn crate::services::storage_service::StorageBackend>,
+    ) -> ProxyService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not fail");
+        ProxyService::new(pool, Arc::new(StorageService::new(storage)))
+    }
+
+    fn fresh_metadata_bytes() -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 42,
+            checksum_sha256: "a".repeat(64),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    fn expired_metadata_bytes() -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at: Utc::now() - chrono::Duration::hours(2),
+            upstream_etag: None,
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            content_type: None,
+            size_bytes: 0,
+            checksum_sha256: String::new(),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_metadata_sidecar_missing() {
+        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "missing metadata sidecar must yield is_cache_fresh = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_metadata_expired() {
+        let mock = Arc::new(CacheFreshMock::new(Some(expired_metadata_bytes()), true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "expired metadata (expires_at < now) must yield is_cache_fresh = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_content_missing() {
+        // Metadata is valid and unexpired, but the underlying content
+        // object has been evicted (e.g. lifecycle policy). The freshness
+        // probe must catch this so the fast path does not sign a URL
+        // pointing at a 404.
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(fresh_metadata_bytes()),
+            /* content_exists = */ false,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "valid metadata with missing content object must yield is_cache_fresh = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_true_when_metadata_valid_and_content_exists() {
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(fresh_metadata_bytes()),
+            /* content_exists = */ true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "valid metadata + existing content must yield is_cache_fresh = true"
+        );
+        // Belt-and-suspenders: the probe must never download the body.
+        // It is only allowed to call `get` on the metadata sidecar.
+        assert_eq!(
+            mock.get_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "is_cache_fresh must read metadata exactly once and never the body"
+        );
     }
 }

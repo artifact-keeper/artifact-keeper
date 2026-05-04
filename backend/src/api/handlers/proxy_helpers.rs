@@ -222,20 +222,44 @@ pub async fn proxy_fetch_or_redirect(
     upstream_url: &str,
     path: &str,
 ) -> Result<Response, Response> {
+    let cache_key = ProxyService::cache_storage_key(repo_key, path);
+    let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+    let presigned_enabled = state.config.presigned_downloads_enabled;
+    let storage_location = StorageLocation {
+        backend: state.config.storage_backend.clone(),
+        path: state.config.storage_path.clone(),
+    };
+
+    // Fast path (#1018): if presigned downloads are enabled and the proxy
+    // cache is already fresh, redirect to the signed URL without ever
+    // pulling the cached body into the backend's memory. The freshness
+    // probe is metadata-only (HEAD-equivalent on cloud backends).
+    if presigned_enabled && proxy_service.is_cache_fresh(repo_key, path).await {
+        if let Ok(storage) = state.storage_for_repo(&storage_location) {
+            if let Some(redirect) = try_proxy_cache_redirect(
+                storage.as_ref(),
+                &cache_key,
+                presigned_enabled,
+                expiry,
+                /* cache_is_fresh = */ true,
+            )
+            .await
+            {
+                return Ok(redirect);
+            }
+        }
+    }
+
+    // Slow path: cache miss / expired / presigned disabled. The fetch
+    // populates the proxy cache so a subsequent presigned redirect on the
+    // *next* request can take the fast path above.
     let (content, content_type) =
         proxy_fetch(proxy_service, repo_id, repo_key, upstream_url, path).await?;
 
-    // If presigned downloads are enabled, try to redirect to the cached copy.
-    // The proxy cache stores content under a well-known key derived from
-    // the repo key and path.
-    if state.config.presigned_downloads_enabled {
-        let cache_key = proxy_cache_storage_key(repo_key, path);
-        let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
-
-        if let Ok(storage) = state.storage_for_repo(&StorageLocation {
-            backend: state.config.storage_backend.clone(),
-            path: state.config.storage_path.clone(),
-        }) {
+    // If presigned is configured, prefer redirecting to the just-populated
+    // cache entry over streaming the buffered content back to the client.
+    if presigned_enabled {
+        if let Ok(storage) = state.storage_for_repo(&storage_location) {
             if let Some(redirect) =
                 try_presigned_redirect(storage.as_ref(), &cache_key, true, expiry).await
             {
@@ -253,16 +277,31 @@ pub async fn proxy_fetch_or_redirect(
         .unwrap())
 }
 
-/// Derive the proxy cache storage key for a given repo key and artifact path.
+/// Try to short-circuit a proxy-cache hit into a presigned redirect, without
+/// downloading the cached content into memory.
 ///
-/// Matches the key pattern used by `ProxyService::cache_storage_key`, so
-/// presigned redirects point to the correct cached object.
-fn proxy_cache_storage_key(repo_key: &str, path: &str) -> String {
-    format!(
-        "proxy-cache/{}/{}/__content__",
-        repo_key,
-        path.trim_start_matches('/').trim_end_matches('/')
-    )
+/// Returns `Some(Response)` when *all* of:
+///   * `presigned_enabled` is true,
+///   * `cache_is_fresh` is true (caller has already done a metadata-only
+///     freshness check that does not download the object body), and
+///   * `try_presigned_redirect` succeeds in producing a signed URL.
+///
+/// Otherwise returns `None` so the caller falls through to the buffered
+/// fetch + cache + serve path.
+///
+/// Extracted from `proxy_fetch_or_redirect` so the redirect short-circuit can
+/// be exercised in unit tests with recording mock storage backends.
+pub(crate) async fn try_proxy_cache_redirect<S: crate::storage::StorageBackend + ?Sized>(
+    storage: &S,
+    cache_key: &str,
+    presigned_enabled: bool,
+    expiry: Duration,
+    cache_is_fresh: bool,
+) -> Option<Response> {
+    if !presigned_enabled || !cache_is_fresh {
+        return None;
+    }
+    try_presigned_redirect(storage, cache_key, true, expiry).await
 }
 
 /// Check whether an artifact is present in the proxy cache under `path`
@@ -1668,48 +1707,171 @@ mod tests {
         assert!(super::reject_write_if_not_hosted("virtual").is_err());
     }
 
-    // ── proxy_cache_storage_key tests ──────────────────────────────────
+    // ── try_proxy_cache_redirect tests ─────────────────────────────────
+    // Regression coverage for #1018: when the proxy cache is fresh and
+    // presigned downloads are enabled, the helper must return a presigned
+    // redirect *without* calling `storage.get(...)`. The previous
+    // implementation downloaded the full cached body before deciding to
+    // redirect, defeating the memory-pressure guarantee that presigned URLs
+    // are meant to provide.
 
-    #[test]
-    fn test_proxy_cache_storage_key_basic() {
-        let key = super::proxy_cache_storage_key("npm-remote", "lodash/-/lodash-4.17.21.tgz");
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// Recording mock storage backend that counts every method call so tests
+    /// can assert which I/O paths fired (in particular: was the full object
+    /// `get(...)` called).
+    struct RecordingStorage {
+        get_calls: StdArc<AtomicUsize>,
+        presigned_calls: StdArc<AtomicUsize>,
+        supports: bool,
+    }
+
+    impl RecordingStorage {
+        fn new(supports: bool) -> Self {
+            Self {
+                get_calls: StdArc::new(AtomicUsize::new(0)),
+                presigned_calls: StdArc::new(AtomicUsize::new(0)),
+                supports,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for RecordingStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::from_static(b"full-body"))
+        }
+        async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+            Ok(true)
+        }
+        async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+        fn supports_redirect(&self) -> bool {
+            self.supports
+        }
+        async fn get_presigned_url(
+            &self,
+            key: &str,
+            expires_in: std::time::Duration,
+        ) -> crate::error::Result<Option<crate::storage::PresignedUrl>> {
+            self.presigned_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(crate::storage::PresignedUrl {
+                url: format!("https://signed.example.com/{}", key),
+                expires_in,
+                source: crate::storage::PresignedUrlSource::S3,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_proxy_cache_redirect_skips_get_on_fresh_cache_hit() {
+        // Bug #1018: a fresh cache hit with presigned enabled must NOT
+        // download the full body. The helper should only invoke the
+        // presigned URL machinery.
+        let storage = RecordingStorage::new(true);
+        let result = super::try_proxy_cache_redirect(
+            &storage,
+            "proxy-cache/repo/pkg/__content__",
+            /* presigned_enabled = */ true,
+            std::time::Duration::from_secs(300),
+            /* cache_is_fresh = */ true,
+        )
+        .await;
+
+        assert!(
+            result.is_some(),
+            "fresh cache + presigned enabled must yield a redirect"
+        );
         assert_eq!(
-            key,
-            "proxy-cache/npm-remote/lodash/-/lodash-4.17.21.tgz/__content__"
+            storage.get_calls.load(Ordering::SeqCst),
+            0,
+            "full body must NOT be downloaded when redirecting via presigned URL"
+        );
+        assert_eq!(
+            storage.presigned_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one presigned URL request expected"
+        );
+
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FOUND);
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("location header")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.contains("signed.example.com"),
+            "redirect should point at the signed URL, got {}",
+            location
         );
     }
 
-    #[test]
-    fn test_proxy_cache_storage_key_strips_leading_slash() {
-        let key = super::proxy_cache_storage_key("maven-central", "/com/example/lib-1.0.jar");
-        assert_eq!(
-            key,
-            "proxy-cache/maven-central/com/example/lib-1.0.jar/__content__"
+    #[tokio::test]
+    async fn test_try_proxy_cache_redirect_returns_none_when_presigned_disabled() {
+        let storage = RecordingStorage::new(true);
+        let result = super::try_proxy_cache_redirect(
+            &storage,
+            "proxy-cache/repo/pkg/__content__",
+            /* presigned_enabled = */ false,
+            std::time::Duration::from_secs(300),
+            /* cache_is_fresh = */ true,
+        )
+        .await;
+
+        assert!(result.is_none(), "disabled presigned must short-circuit");
+        assert_eq!(storage.get_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.presigned_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_try_proxy_cache_redirect_returns_none_when_cache_not_fresh() {
+        // Cache miss / expired: caller must do the upstream fetch + populate
+        // cache path, so the helper should not produce a redirect.
+        let storage = RecordingStorage::new(true);
+        let result = super::try_proxy_cache_redirect(
+            &storage,
+            "proxy-cache/repo/pkg/__content__",
+            /* presigned_enabled = */ true,
+            std::time::Duration::from_secs(300),
+            /* cache_is_fresh = */ false,
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "stale/missing cache must fall through to the buffered fetch path"
         );
+        assert_eq!(storage.get_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.presigned_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn test_proxy_cache_storage_key_strips_trailing_slash() {
-        let key = super::proxy_cache_storage_key("pypi-proxy", "packages/simple/requests/");
-        assert_eq!(
-            key,
-            "proxy-cache/pypi-proxy/packages/simple/requests/__content__"
+    #[tokio::test]
+    async fn test_try_proxy_cache_redirect_returns_none_when_backend_no_redirect_support() {
+        // Filesystem / RBAC-locked backends: redirect is not possible, so
+        // the helper must yield None and let the caller stream content.
+        let storage = RecordingStorage::new(false);
+        let result = super::try_proxy_cache_redirect(
+            &storage,
+            "proxy-cache/repo/pkg/__content__",
+            /* presigned_enabled = */ true,
+            std::time::Duration::from_secs(300),
+            /* cache_is_fresh = */ true,
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "backend without redirect support must yield None"
         );
-    }
-
-    #[test]
-    fn test_proxy_cache_storage_key_no_slashes() {
-        let key = super::proxy_cache_storage_key("npm-remote", "express");
-        assert_eq!(key, "proxy-cache/npm-remote/express/__content__");
-    }
-
-    #[test]
-    fn test_proxy_cache_storage_key_matches_proxy_service_format() {
-        // Verifies the key format matches ProxyService::cache_storage_key
-        // so presigned redirects point to the correct cached objects.
-        let key = super::proxy_cache_storage_key("test-repo", "path/to/artifact");
-        assert!(key.starts_with("proxy-cache/"));
-        assert!(key.ends_with("/__content__"));
+        assert_eq!(storage.get_calls.load(Ordering::SeqCst), 0);
     }
 
     // ── classify_remote_or_virtual tests ───────────────────────────────
