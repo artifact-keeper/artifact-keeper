@@ -1769,13 +1769,26 @@ mod password_route_middleware_tests {
         Router::new().nest("/users", self_service.merge(admin_only))
     }
 
-    fn bearer_request(method: &str, uri: &str, token: &str) -> Request<Body> {
+    /// POST `/users/:id/password` request with a Bearer token and a
+    /// minimal valid JSON body. The body content does not matter for the
+    /// middleware/routing regression — the stub handler ignores it.
+    fn password_change_request(uri: &str, token: &str) -> Request<Body> {
         Request::builder()
-            .method(method)
+            .method("POST")
             .uri(uri)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .body(Body::from(r#"{"new_password":"NewSecurePass123!"}"#))
+            .unwrap()
+    }
+
+    /// GET request with a Bearer token and an empty body.
+    fn bearer_get(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
             .unwrap()
     }
 
@@ -1786,6 +1799,29 @@ mod password_route_middleware_tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// Run a request through the app and return `(status, body_text)` —
+    /// every regression test below makes both assertions, so this collapses
+    /// the boilerplate.
+    async fn send(app: Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = body_text(resp).await;
+        (status, body)
+    }
+
+    /// Build the `/users` test app and mint a JWT for a fresh user with the
+    /// requested admin flag. Returns `(app, user, access_token)`. Most
+    /// regression tests need exactly this triple.
+    fn setup_with_user(is_admin: bool) -> (Router, User, String) {
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let user = make_user(is_admin);
+        let tokens = auth_service
+            .generate_tokens(&user)
+            .expect("mint access token");
+        let app = build_users_test_app(auth_service);
+        (app, user, tokens.access_token)
+    }
+
     // ---- the regression tests --------------------------------------------
 
     #[tokio::test]
@@ -1793,20 +1829,10 @@ mod password_route_middleware_tests {
         // The original bug: this exact request returned 403 "Admin access
         // required" because `POST /users/:id/password` lived under
         // `admin_middleware`. After the fix it must reach the handler.
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
-        let user = make_user(/* is_admin */ false);
-        let tokens = auth_service
-            .generate_tokens(&user)
-            .expect("mint access token");
-        let app = build_users_test_app(auth_service);
+        let (app, user, token) = setup_with_user(/* is_admin */ false);
 
         let uri = format!("/users/{}/password", user.id);
-        let resp = app
-            .oneshot(bearer_request("POST", &uri, &tokens.access_token))
-            .await
-            .unwrap();
-        let status = resp.status();
-        let body = body_text(resp).await;
+        let (status, body) = send(app, password_change_request(&uri, &token)).await;
 
         assert_ne!(
             status,
@@ -1830,21 +1856,11 @@ mod password_route_middleware_tests {
         // Ownership guard preserved: even though the route is reachable
         // without admin, the handler still rejects cross-user password
         // changes from non-admins.
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
-        let attacker = make_user(/* is_admin */ false);
+        let (app, _attacker, token) = setup_with_user(/* is_admin */ false);
         let victim_id = Uuid::new_v4();
-        let tokens = auth_service
-            .generate_tokens(&attacker)
-            .expect("mint access token");
-        let app = build_users_test_app(auth_service);
 
         let uri = format!("/users/{}/password", victim_id);
-        let resp = app
-            .oneshot(bearer_request("POST", &uri, &tokens.access_token))
-            .await
-            .unwrap();
-        let status = resp.status();
-        let body = body_text(resp).await;
+        let (status, body) = send(app, password_change_request(&uri, &token)).await;
 
         assert_eq!(
             status,
@@ -1861,21 +1877,11 @@ mod password_route_middleware_tests {
     async fn test_admin_can_change_any_users_password() {
         // Regression guard for the admin path: the fix must not have
         // accidentally locked admins out of resetting other users.
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
-        let admin = make_user(/* is_admin */ true);
+        let (app, _admin, token) = setup_with_user(/* is_admin */ true);
         let target_id = Uuid::new_v4();
-        let tokens = auth_service
-            .generate_tokens(&admin)
-            .expect("mint access token");
-        let app = build_users_test_app(auth_service);
 
         let uri = format!("/users/{}/password", target_id);
-        let resp = app
-            .oneshot(bearer_request("POST", &uri, &tokens.access_token))
-            .await
-            .unwrap();
-        let status = resp.status();
-        let body = body_text(resp).await;
+        let (status, body) = send(app, password_change_request(&uri, &token)).await;
 
         assert_eq!(
             status,
@@ -1889,23 +1895,10 @@ mod password_route_middleware_tests {
     async fn test_non_admin_still_blocked_from_admin_only_user_routes() {
         // Regression guard for the admin gate: list/get/etc. must still be
         // admin-only after the fix splits out the password route.
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
-        let user = make_user(/* is_admin */ false);
-        let tokens = auth_service
-            .generate_tokens(&user)
-            .expect("mint access token");
-        let app = build_users_test_app(auth_service);
+        let (app, _user, token) = setup_with_user(/* is_admin */ false);
 
         // GET /users (list) must be admin-only.
-        let req_list = Request::builder()
-            .method("GET")
-            .uri("/users")
-            .header("Authorization", format!("Bearer {}", tokens.access_token))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req_list).await.unwrap();
-        let status = resp.status();
-        let body = body_text(resp).await;
+        let (status, body) = send(app.clone(), bearer_get("/users", &token)).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
@@ -1917,15 +1910,8 @@ mod password_route_middleware_tests {
         );
 
         // GET /users/:id (detail) must also still be admin-only.
-        let req_detail = Request::builder()
-            .method("GET")
-            .uri(format!("/users/{}", Uuid::new_v4()))
-            .header("Authorization", format!("Bearer {}", tokens.access_token))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req_detail).await.unwrap();
-        let status = resp.status();
-        let body = body_text(resp).await;
+        let detail_uri = format!("/users/{}", Uuid::new_v4());
+        let (status, body) = send(app, bearer_get(&detail_uri, &token)).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,

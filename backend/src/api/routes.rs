@@ -277,10 +277,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                     auth_service.clone(),
                     auth_middleware,
                 ))
-                .merge(handlers::users::router().layer(middleware::from_fn_with_state(
-                    auth_service.clone(),
-                    admin_middleware,
-                )))
+                .merge(
+                    handlers::users::router().layer(middleware::from_fn_with_state(
+                        auth_service.clone(),
+                        admin_middleware,
+                    )),
+                )
                 .layer(DefaultBodyLimit::max(1024 * 1024)), // 1 MB
         )
         // Profile routes (authenticated user context) with auth middleware
