@@ -110,10 +110,19 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Set version from tag
+        # Force bash on every runner. GitHub-hosted Windows runners ship
+        # git-bash; without this line PowerShell tries to parse bash
+        # parameter expansion and fails.
+        shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           echo "Setting workspace version to ${VERSION}"
-          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          # Portable sed -i: BSD sed (macOS) requires an extension argument,
+          # GNU sed (Linux) accepts it. Using `.bak` then deleting the file
+          # works on both. Without this, macOS reports
+          # `sed: 1: "Cargo.toml": invalid command code C`.
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
           head -5 Cargo.toml
 
       - name: Build
