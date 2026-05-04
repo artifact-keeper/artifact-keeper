@@ -222,7 +222,7 @@ pub async fn proxy_fetch_or_redirect(
     upstream_url: &str,
     path: &str,
 ) -> Result<Response, Response> {
-    let cache_key = proxy_cache_storage_key(repo_key, path);
+    let cache_key = ProxyService::cache_storage_key(repo_key, path);
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     let presigned_enabled = state.config.presigned_downloads_enabled;
     let storage_location = StorageLocation {
@@ -275,18 +275,6 @@ pub async fn proxy_fetch_or_redirect(
         .header("content-length", content.len().to_string())
         .body(axum::body::Body::from(content))
         .unwrap())
-}
-
-/// Derive the proxy cache storage key for a given repo key and artifact path.
-///
-/// Matches the key pattern used by `ProxyService::cache_storage_key`, so
-/// presigned redirects point to the correct cached object.
-fn proxy_cache_storage_key(repo_key: &str, path: &str) -> String {
-    format!(
-        "proxy-cache/{}/{}/__content__",
-        repo_key,
-        path.trim_start_matches('/').trim_end_matches('/')
-    )
 }
 
 /// Try to short-circuit a proxy-cache hit into a presigned redirect, without
@@ -1717,50 +1705,6 @@ mod tests {
     #[test]
     fn test_reject_write_virtual_rejected() {
         assert!(super::reject_write_if_not_hosted("virtual").is_err());
-    }
-
-    // ── proxy_cache_storage_key tests ──────────────────────────────────
-
-    #[test]
-    fn test_proxy_cache_storage_key_basic() {
-        let key = super::proxy_cache_storage_key("npm-remote", "lodash/-/lodash-4.17.21.tgz");
-        assert_eq!(
-            key,
-            "proxy-cache/npm-remote/lodash/-/lodash-4.17.21.tgz/__content__"
-        );
-    }
-
-    #[test]
-    fn test_proxy_cache_storage_key_strips_leading_slash() {
-        let key = super::proxy_cache_storage_key("maven-central", "/com/example/lib-1.0.jar");
-        assert_eq!(
-            key,
-            "proxy-cache/maven-central/com/example/lib-1.0.jar/__content__"
-        );
-    }
-
-    #[test]
-    fn test_proxy_cache_storage_key_strips_trailing_slash() {
-        let key = super::proxy_cache_storage_key("pypi-proxy", "packages/simple/requests/");
-        assert_eq!(
-            key,
-            "proxy-cache/pypi-proxy/packages/simple/requests/__content__"
-        );
-    }
-
-    #[test]
-    fn test_proxy_cache_storage_key_no_slashes() {
-        let key = super::proxy_cache_storage_key("npm-remote", "express");
-        assert_eq!(key, "proxy-cache/npm-remote/express/__content__");
-    }
-
-    #[test]
-    fn test_proxy_cache_storage_key_matches_proxy_service_format() {
-        // Verifies the key format matches ProxyService::cache_storage_key
-        // so presigned redirects point to the correct cached objects.
-        let key = super::proxy_cache_storage_key("test-repo", "path/to/artifact");
-        assert!(key.starts_with("proxy-cache/"));
-        assert!(key.ends_with("/__content__"));
     }
 
     // ── try_proxy_cache_redirect tests ─────────────────────────────────
