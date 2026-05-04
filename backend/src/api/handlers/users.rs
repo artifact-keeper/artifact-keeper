@@ -46,8 +46,78 @@ pub fn router() -> Router<SharedState> {
 /// requires the current password for self-service changes. This router is
 /// mounted at the same `/users` prefix as [`router`] but with the standard
 /// `auth_middleware` instead of `admin_middleware` (issue #1010).
+///
+/// The `/me` and `/me/password` aliases (issue #1008) also live here so that
+/// any authenticated user — including a non-admin in the forced
+/// must_change_password flow — can read their own profile and change their
+/// own password without tripping `admin_middleware`. The literal `/me` and
+/// `/me/password` routes MUST be registered before `/:id/password` so axum's
+/// matcher resolves them as literals instead of trying to parse `me` as a
+/// `Uuid` path parameter.
 pub fn self_service_router() -> Router<SharedState> {
-    Router::new().route("/:id/password", post(change_password))
+    Router::new()
+        // The literal `/me` aliases must be registered BEFORE `/:id` so that
+        // requests like `GET /users/me` resolve to the JWT-bound user instead
+        // of being parsed as a UUID path parameter (issue #1008).
+        .route("/me", get(get_current_user))
+        .route("/me/password", post(change_my_password))
+        .route("/:id/password", post(change_password))
+}
+
+/// Get the currently-authenticated user.
+///
+/// Resolves the user UUID from the JWT/API-token auth context and returns the
+/// same payload as `GET /users/{id}`. Added for issue #1008 so that
+/// `GET /api/v1/users/me` no longer fails with a UUID parse error. Mounted
+/// under [`self_service_router`] so it is reachable by any authenticated user
+/// (issue #1008 R1 Security: must NOT be gated by `admin_middleware`).
+#[utoipa::path(
+    get,
+    path = "/me",
+    context_path = "/api/v1/users",
+    tag = "users",
+    responses(
+        (status = 200, description = "Current user details", body = AdminUserResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "User not found"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_current_user(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<AdminUserResponse>> {
+    get_user(State(state), Path(auth.user_id)).await
+}
+
+/// Change the currently-authenticated user's password.
+///
+/// Convenience alias for `POST /users/{id}/password` that resolves the user
+/// UUID from the auth context. Used by the first-time setup flow documented
+/// in `admin.password` (issue #1008). Mounted under [`self_service_router`]
+/// so a non-admin in the forced must_change_password flow can complete it
+/// without tripping `admin_middleware` (issue #1008 R1 Security).
+#[utoipa::path(
+    post,
+    path = "/me/password",
+    context_path = "/api/v1/users",
+    tag = "users",
+    request_body = ChangePasswordRequest,
+    responses(
+        (status = 200, description = "Password changed successfully"),
+        (status = 401, description = "Current password is incorrect"),
+        (status = 404, description = "User not found"),
+        (status = 422, description = "Validation error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn change_my_password(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> Result<()> {
+    let user_id = auth.user_id;
+    change_password(State(state), Extension(auth), Path(user_id), Json(payload)).await
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -1003,6 +1073,7 @@ pub async fn reset_password(
         list_users,
         create_user,
         get_user,
+        get_current_user,
         update_user,
         delete_user,
         get_user_roles,
@@ -1012,6 +1083,7 @@ pub async fn reset_password(
         create_api_token,
         revoke_api_token,
         change_password,
+        change_my_password,
         reset_password,
     ),
     components(schemas(
