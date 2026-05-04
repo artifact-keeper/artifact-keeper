@@ -195,7 +195,21 @@ impl MigrationWorker {
         //
         // `list_repositories` returns `ArtifactoryError`; the `?` converts via
         // `MigrationError::from(ArtifactoryError)` on the existing `#[from]` impl.
-        let source_repos = client.list_repositories().await?;
+        // NOTE: total_failed below is incremented per *repo* during
+        // provisioning (missing-from-source, unsupported config, conflict,
+        // create_repository failure). A skipped repo with N artifacts
+        // contributes 1 to failed, not N. determine_final_status only
+        // checks failed > 0 && completed == 0, so the final job status is
+        // still correct, but the operator-facing failed count understates
+        // impact. Per-artifact accounting would require listing the
+        // source repo's artifacts before deciding to skip — deferred.
+        let source_repos = client.list_repositories().await.map_err(|e| {
+            tracing::error!(
+                job_id = %job_id, error = %e,
+                "Failed to list source repositories; aborting provisioning pre-pass",
+            );
+            e
+        })?;
         let plan = resolve_repos_for_provisioning(&repos, &source_repos);
         for missing_key in &plan.missing {
             tracing::error!(
@@ -234,12 +248,25 @@ impl MigrationWorker {
                             "Destination repository already exists with matching type+format; reusing",
                         );
                     }
-                    _ => {
+                    Some(other) => {
                         tracing::error!(
                             job_id = %job_id, repo = %migration_config.target_key,
-                            conflict = ?conflict.conflict_type,
+                            conflict = ?other,
                             message = %conflict.message,
                             "Destination repository conflict; skipping artifact transfer for this repo",
+                        );
+                        total_failed += 1;
+                        continue;
+                    }
+                    None => {
+                        // has_conflict=true with conflict_type=None is a
+                        // contract violation in check_repository_conflict.
+                        // Treat it as a conflict (don't silently route
+                        // through the "other" arm) so the bug surfaces.
+                        tracing::error!(
+                            job_id = %job_id, repo = %migration_config.target_key,
+                            message = %conflict.message,
+                            "has_conflict=true but conflict_type=None; treating as conflict",
                         );
                         total_failed += 1;
                         continue;
