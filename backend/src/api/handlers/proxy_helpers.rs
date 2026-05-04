@@ -726,6 +726,553 @@ pub async fn local_fetch_or_redirect(
         .unwrap())
 }
 
+// ---------------------------------------------------------------------------
+// Shared remote/virtual download fallback
+// ---------------------------------------------------------------------------
+
+/// Strategy for resolving the artifact within a virtual repository's members.
+/// Mirrors the two `local_fetch_*` shapes used by format handlers when the
+/// canonical local lookup misses.
+pub enum VirtualLookup<'a> {
+    /// Look up artifacts by trailing path suffix (LIKE `%/<filename>`).
+    /// Used for handlers keyed by filename (helm, ansible, puppet, cran, hex,
+    /// rubygems, rpm). The suffix is escaped internally.
+    PathSuffix(&'a str),
+    /// Look up artifacts by exact stored path. Used for handlers keyed by
+    /// model_id/revision/filename (huggingface).
+    ExactPath(&'a str),
+}
+
+/// Options controlling response shape from [`try_remote_or_virtual_download`].
+pub struct DownloadResponseOpts<'a> {
+    /// Upstream path requested from a Remote repo and/or used as the proxy
+    /// cache key for Virtual members.
+    pub upstream_path: &'a str,
+    /// How to look up the artifact inside virtual member repositories.
+    pub virtual_lookup: VirtualLookup<'a>,
+    /// Default `Content-Type` if the proxied content type is missing.
+    pub default_content_type: &'a str,
+    /// Filename to include in the `Content-Disposition: attachment` header.
+    /// `None` omits the header.
+    pub content_disposition_filename: Option<&'a str>,
+}
+
+/// Try the proxy and virtual fallbacks for a download miss.
+///
+/// Returns `Ok(Some(response))` if the artifact was served from upstream
+/// (Remote) or a virtual member (Virtual), `Ok(None)` if the repo is hosted
+/// (the caller should propagate its own NOT_FOUND), or `Err(response)` if
+/// upstream fetch failed.
+///
+/// This consolidates the "miss path" of every format-handler download:
+/// Remote → `proxy_fetch` + serve, Virtual → `resolve_virtual_download` +
+/// serve. Each handler's only remaining variation is the upstream URL prefix,
+/// the content type defaults, and whether to include a filename in the
+/// `Content-Disposition` header.
+pub async fn try_remote_or_virtual_download(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    opts: DownloadResponseOpts<'_>,
+) -> Result<Option<Response>, Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        let Some(upstream_url) = repo.upstream_url.as_deref() else {
+            return Ok(None);
+        };
+        let Some(proxy) = state.proxy_service.as_deref() else {
+            return Ok(None);
+        };
+
+        let (content, content_type) =
+            proxy_fetch(proxy, repo.id, &repo.key, upstream_url, opts.upstream_path).await?;
+        return Ok(Some(build_download_response(
+            content,
+            content_type,
+            opts.default_content_type,
+            opts.content_disposition_filename,
+        )));
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        let db = state.db.clone();
+        let (content, content_type) = match opts.virtual_lookup {
+            VirtualLookup::PathSuffix(suffix) => {
+                let suffix = suffix.to_string();
+                let state_arc = state.clone();
+                resolve_virtual_download(
+                    &state.db,
+                    state.proxy_service.as_deref(),
+                    repo.id,
+                    opts.upstream_path,
+                    move |member_id, location| {
+                        let db = db.clone();
+                        let state = state_arc.clone();
+                        let suffix = suffix.clone();
+                        async move {
+                            local_fetch_by_path_suffix(&db, &state, member_id, &location, &suffix)
+                                .await
+                        }
+                    },
+                )
+                .await?
+            }
+            VirtualLookup::ExactPath(path) => {
+                let path = path.to_string();
+                let state_arc = state.clone();
+                resolve_virtual_download(
+                    &state.db,
+                    state.proxy_service.as_deref(),
+                    repo.id,
+                    opts.upstream_path,
+                    move |member_id, location| {
+                        let db = db.clone();
+                        let state = state_arc.clone();
+                        let path = path.clone();
+                        async move {
+                            local_fetch_by_path(&db, &state, member_id, &location, &path).await
+                        }
+                    },
+                )
+                .await?
+            }
+        };
+        return Ok(Some(build_download_response(
+            content,
+            content_type,
+            opts.default_content_type,
+            opts.content_disposition_filename,
+        )));
+    }
+
+    Ok(None)
+}
+
+/// Artifact row exposing the columns most metadata endpoints need:
+/// id, version, size, checksum, and the raw `artifact_metadata.metadata`
+/// JSON. Returned by [`find_artifact_by_name_lowercase`] and
+/// [`list_artifacts_by_name_lowercase`].
+pub struct ArtifactWithMetadata {
+    pub id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub checksum_sha256: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Look up an artifact by case-insensitive name AND exact version.
+/// Returns `Ok(None)` on miss.
+#[allow(clippy::result_large_err)]
+pub async fn find_artifact_by_name_version(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+    version: &str,
+) -> Result<Option<ArtifactWithMetadata>, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+           AND a.version = $3 \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(row.map(|r| ArtifactWithMetadata {
+        id: r.try_get("id").unwrap_or_default(),
+        name: r.try_get("name").unwrap_or_default(),
+        version: r.try_get("version").ok(),
+        size_bytes: r.try_get("size_bytes").ok(),
+        checksum_sha256: r.try_get("checksum_sha256").ok(),
+        metadata: r.try_get("metadata").ok(),
+    }))
+}
+
+/// Look up the most recent artifact whose name matches `name`
+/// case-insensitively in `repository_id`. Returns `Ok(None)` on miss.
+///
+/// Replaces the duplicated `LEFT JOIN artifact_metadata ... WHERE
+/// LOWER(name) = LOWER($2) ORDER BY created_at DESC LIMIT 1` query that
+/// every metadata endpoint otherwise repeats verbatim.
+#[allow(clippy::result_large_err)]
+pub async fn find_artifact_by_name_lowercase(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+) -> Result<Option<ArtifactWithMetadata>, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+         ORDER BY a.created_at DESC \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(row.map(|r| ArtifactWithMetadata {
+        id: r.try_get("id").unwrap_or_default(),
+        name: r.try_get("name").unwrap_or_default(),
+        version: r.try_get("version").ok(),
+        size_bytes: r.try_get("size_bytes").ok(),
+        checksum_sha256: r.try_get("checksum_sha256").ok(),
+        metadata: r.try_get("metadata").ok(),
+    }))
+}
+
+/// List every non-deleted artifact whose name matches `name`
+/// case-insensitively in `repository_id`, newest first.
+///
+/// Companion to [`find_artifact_by_name_lowercase`] for endpoints that
+/// need the full version history (e.g. RubyGems versions, Puppet release
+/// list, Hex package versions).
+#[allow(clippy::result_large_err)]
+pub async fn list_artifacts_by_name_lowercase(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+) -> Result<Vec<ArtifactWithMetadata>, Response> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+         ORDER BY a.created_at DESC",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_all(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ArtifactWithMetadata {
+            id: r.try_get("id").unwrap_or_default(),
+            name: r.try_get("name").unwrap_or_default(),
+            version: r.try_get("version").ok(),
+            size_bytes: r.try_get("size_bytes").ok(),
+            checksum_sha256: r.try_get("checksum_sha256").ok(),
+            metadata: r.try_get("metadata").ok(),
+        })
+        .collect())
+}
+
+/// Lightweight artifact row returned by [`find_local_by_filename_suffix`].
+/// Captures only the fields the format download handlers actually need
+/// (id + storage_key) so the helper can stay format-agnostic.
+pub struct LocalArtifactHit {
+    pub id: Uuid,
+    pub storage_key: String,
+}
+
+/// Look up a single artifact by trailing filename match within a repository.
+///
+/// Runs `SELECT ... WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\'`
+/// against `repository_id`, escaping `path_suffix` against `%` / `_` / `\`.
+/// Returns `Ok(Some(hit))` on match, `Ok(None)` on miss, or `Err(response)`
+/// on database failure.
+///
+/// Replaces the duplicated `sqlx::query! r#"... LIKE '%/' || $2 ESCAPE '\'
+/// LIMIT 1 "#` boilerplate that every filename-keyed format download handler
+/// otherwise repeats.
+#[allow(clippy::result_large_err)]
+pub async fn find_local_by_filename_suffix(
+    db: &PgPool,
+    repository_id: Uuid,
+    path_suffix: &str,
+) -> Result<Option<LocalArtifactHit>, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT id, storage_key FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND path LIKE '%/' || $2 ESCAPE '\\' \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(super::escape_like_literal(path_suffix))
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(row.map(|r| LocalArtifactHit {
+        id: r.try_get("id").unwrap_or_default(),
+        storage_key: r.try_get("storage_key").unwrap_or_default(),
+    }))
+}
+
+/// Parse a two-field multipart upload (`file` + a named JSON metadata field).
+///
+/// Used by Ansible (collection upload) and Puppet (module publish), which
+/// both ship a tarball alongside a JSON descriptor of the package. Returns
+/// `(tarball_bytes, metadata_json)` or a 400 response describing the parse
+/// failure.
+///
+/// `json_field_names` lists the form-field names to accept for the JSON
+/// payload (Ansible accepts both `collection` and `metadata`; Puppet uses
+/// `module`). The first matching field wins. Unknown fields are ignored.
+pub async fn parse_multipart_file_with_json(
+    mut multipart: axum::extract::Multipart,
+    json_field_names: &[&str],
+) -> Result<(Bytes, Option<serde_json::Value>), Response> {
+    let mut tarball: Option<Bytes> = None;
+    let mut json_value: Option<serde_json::Value> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name == "file" {
+            tarball = Some(field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read file: {}", e),
+                )
+                    .into_response()
+            })?);
+        } else if json_field_names.iter().any(|n| *n == field_name) {
+            let data = field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read metadata JSON: {}", e),
+                )
+                    .into_response()
+            })?;
+            json_value = Some(serde_json::from_slice(&data).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid metadata JSON: {}", e),
+                )
+                    .into_response()
+            })?);
+        }
+    }
+
+    let tarball =
+        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
+
+    if tarball.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
+    }
+
+    Ok((tarball, json_value))
+}
+
+/// Resolve the storage backend for a repository and write `body` to
+/// `storage_key`. Maps storage failures to a 500 "Storage error" response.
+///
+/// Replaces the duplicated "let storage = state.storage_for_repo(...) ;
+/// storage.put(...).await.map_err(...)" block that every multipart upload
+/// handler otherwise repeats.
+#[allow(clippy::result_large_err)]
+pub async fn put_artifact_bytes(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    storage_key: &str,
+    body: Bytes,
+) -> Result<(), Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    storage
+        .put(storage_key, body)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+    Ok(())
+}
+
+/// Borrowed handle to the columns required to insert a new artifact row.
+/// The lifetime ties the supplied string slices to the surrounding scope so
+/// the helper can avoid extra allocations.
+pub struct NewArtifact<'a> {
+    pub repository_id: Uuid,
+    pub path: &'a str,
+    pub name: &'a str,
+    pub version: &'a str,
+    pub size_bytes: i64,
+    pub checksum_sha256: &'a str,
+    pub content_type: &'a str,
+    pub storage_key: &'a str,
+    pub uploaded_by: Uuid,
+}
+
+/// Insert a row into `artifacts` and return the new id.
+///
+/// Replaces the duplicated nine-column INSERT macro that every multipart
+/// upload handler otherwise repeats verbatim. Errors map to a 500
+/// "Database error" response.
+#[allow(clippy::result_large_err)]
+pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO artifacts ( \
+             repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, uploaded_by \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         RETURNING id",
+    )
+    .bind(art.repository_id)
+    .bind(art.path)
+    .bind(art.name)
+    .bind(art.version)
+    .bind(art.size_bytes)
+    .bind(art.checksum_sha256)
+    .bind(art.content_type)
+    .bind(art.storage_key)
+    .bind(art.uploaded_by)
+    .fetch_one(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+    Ok(id)
+}
+
+/// Reject if `(repository_id, path)` already exists, otherwise sweep any
+/// soft-deleted row at that path so a subsequent INSERT can proceed.
+///
+/// `conflict_message` is the human-readable error returned on a 409
+/// (e.g. "Module version already exists").
+#[allow(clippy::result_large_err)]
+pub async fn ensure_unique_artifact_path(
+    db: &PgPool,
+    repo_id: Uuid,
+    artifact_path: &str,
+    conflict_message: &str,
+) -> Result<(), Response> {
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    if existing.is_some() {
+        return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
+    }
+
+    super::cleanup_soft_deleted_artifact(db, repo_id, artifact_path).await;
+    Ok(())
+}
+
+/// Upsert format-specific metadata for a freshly-uploaded artifact and bump
+/// the owning repository's `updated_at` timestamp. Best-effort: errors are
+/// swallowed because the artifact row itself has already been committed.
+///
+/// Replaces the duplicated tail of every multipart upload handler:
+/// "INSERT INTO artifact_metadata ... ON CONFLICT" + "UPDATE repositories
+/// SET updated_at = NOW()".
+pub async fn record_artifact_metadata(
+    db: &PgPool,
+    artifact_id: Uuid,
+    repo_id: Uuid,
+    format: &str,
+    metadata: &serde_json::Value,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $3",
+    )
+    .bind(artifact_id)
+    .bind(format)
+    .bind(metadata)
+    .execute(db)
+    .await;
+
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo_id)
+        .execute(db)
+        .await;
+}
+
+/// Serve an artifact from local storage with quarantine + statistics.
+///
+/// Performs the standard hit-path tail used by every format download handler:
+/// quarantine check, storage load, download-statistics insert, and a 200
+/// response with the supplied content type and optional `Content-Disposition`.
+/// `artifact_id` is the row id for quarantine + statistics; `storage_key` is
+/// the raw key handed to the storage backend.
+pub async fn serve_local_artifact(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    artifact_id: Uuid,
+    storage_key: &str,
+    content_type: &str,
+    content_disposition_filename: Option<&str>,
+) -> Result<Response, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
+        .await
+        .map_err(|e| e.into_response())?;
+
+    let content = storage
+        .get(storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+
+    let _ = sqlx::query(
+        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+    )
+    .bind(artifact_id)
+    .execute(&state.db)
+    .await;
+
+    Ok(build_download_response(
+        content,
+        Some(content_type.to_string()),
+        content_type,
+        content_disposition_filename,
+    ))
+}
+
+/// Build a 200 OK download response from proxied content.
+fn build_download_response(
+    content: Bytes,
+    content_type: Option<String>,
+    default_content_type: &str,
+    filename: Option<&str>,
+) -> Response {
+    let ct = content_type.unwrap_or_else(|| default_content_type.to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", ct)
+        .header("Content-Length", content.len().to_string());
+    if let Some(fname) = filename {
+        builder = builder.header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", fname),
+        );
+    }
+    builder.body(axum::body::Body::from(content)).unwrap()
+}
+
 /// Build a minimal `Repository` model for proxy operations.
 fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repository {
     Repository {

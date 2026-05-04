@@ -46,6 +46,32 @@ pub fn escape_filename_for_like(file_path: &str) -> String {
     escape_like_literal(file_path.trim_start_matches('/'))
 }
 
+/// Build a 200 OK `application/json` response from a serde JSON value.
+/// Centralizes the boilerplate every metadata endpoint otherwise repeats:
+/// `Response::builder().status(OK).header(CONTENT_TYPE, "application/json")
+/// .body(serde_json::to_string(&json).unwrap()).unwrap()`.
+pub fn json_response(value: &serde_json::Value) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(value).unwrap(),
+    )
+        .into_response()
+}
+
+/// Map a database error to a 500 plain-text "Database error: {e}" response.
+/// Centralizes the boilerplate that every format handler otherwise repeats
+/// after `sqlx::query!(...).fetch_*().await.map_err(...)` calls.
+pub fn db_err(e: impl std::fmt::Display) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Database error: {}", e),
+    )
+        .into_response()
+}
+
 /// Build a `/`-joined path prefix from user-supplied components, escaping
 /// each component for safe `LIKE $n || '%' ESCAPE '\'` prefix matching.
 /// A trailing `/` is appended. Empty input produces an empty string.

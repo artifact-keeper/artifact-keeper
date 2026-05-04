@@ -139,13 +139,7 @@ async fn list_rpm_artifacts(
     )
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     Ok(rows
         .into_iter()
@@ -425,102 +419,44 @@ async fn download_package(
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
 
     let filename = pkg_path.rsplit('/').next().unwrap_or(&pkg_path);
-    // Escape `%` and `_` so user-supplied filename is matched as a literal,
-    // not a LIKE wildcard. See `crate::api::handlers::escape_filename_for_like`.
-    let filename_escaped = super::escape_filename_for_like(filename);
 
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, size_bytes, checksum_sha256, storage_key
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path LIKE '%/' || $2 ESCAPE '\'
-        LIMIT 1
-        "#,
-        repo.id,
-        filename_escaped
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
-
-    let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let upstream_path = format!("packages/{}", pkg_path);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
-            }
-
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
+    let hit =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+            Some(a) => a,
+            None => {
                 let upstream_path = format!("packages/{}", pkg_path);
-                let filename_clone = filename.to_string();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let suffix = filename_clone.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_path_suffix(
-                                &db, &state, member_id, &location, &suffix,
-                            )
-                            .await
-                        }
+                let (default_ct, cd_filename) = if repo.repo_type == RepositoryType::Virtual {
+                    ("application/x-rpm", Some(filename))
+                } else {
+                    ("application/octet-stream", None)
+                };
+                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                    &state,
+                    &repo,
+                    proxy_helpers::DownloadResponseOpts {
+                        upstream_path: &upstream_path,
+                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                        default_content_type: default_ct,
+                        content_disposition_filename: cd_filename,
                     },
                 )
-                .await?;
-
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/x-rpm".to_string()),
-                    )
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", filename),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                .await?
+                {
+                    return Ok(resp);
+                }
+                return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
             }
+        };
 
-            return Err(not_found);
-        }
-    };
+    // RPM hit-path needs the SHA256 to emit X-Checksum-SHA256, so re-query
+    // to pick up the checksum field that the lightweight helper omits.
+    let artifact = sqlx::query!(
+        "SELECT id, size_bytes, checksum_sha256, storage_key FROM artifacts WHERE id = $1",
+        hit.id
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(super::db_err)?;
 
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -652,75 +588,35 @@ async fn store_rpm(
     let full_version = format!("{}-{}", pkg_version, release);
     let artifact_path = format!("packages/{}", filename);
 
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
         repo.id,
-        artifact_path
+        &artifact_path,
+        "Package already exists",
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Store the file
     let storage_key = format!("rpm/{}/{}", repo.id, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, content.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    proxy_helpers::put_artifact_bytes(state, repo, &storage_key, content.clone()).await?;
 
     let size_bytes = content.len() as i64;
 
     // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        pkg_name,
-        full_version,
-        size_bytes,
-        computed_sha256,
-        "application/x-rpm",
-        storage_key,
-        user_id,
+    let artifact_id = proxy_helpers::insert_artifact(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &artifact_path,
+            name: &pkg_name,
+            version: &full_version,
+            size_bytes,
+            checksum_sha256: &computed_sha256,
+            content_type: "application/x-rpm",
+            storage_key: &storage_key,
+            uploaded_by: user_id,
+        },
     )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
     // Store RPM-specific metadata
     let rpm_metadata = serde_json::json!({
@@ -731,25 +627,8 @@ async fn store_rpm(
         "filename": filename,
     });
 
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'rpm', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        rpm_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "rpm", &rpm_metadata)
+        .await;
 
     info!(
         "RPM upload: {}-{}-{}.{}.rpm to repo {}",

@@ -11,7 +11,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -80,13 +80,7 @@ async fn package_info(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     if artifacts.is_empty() {
         // Remote: fetch package metadata from the upstream hex registry.
@@ -167,11 +161,7 @@ async fn package_info(
         "downloads": download_count,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -186,135 +176,44 @@ async fn download_tarball(
 
     let filename = tarball_file.trim_start_matches('/');
 
-    // Find artifact by matching the path ending
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, name, version, size_bytes, checksum_sha256, storage_key
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path LIKE '%/' || $2 ESCAPE '\'
-        LIMIT 1
-        "#,
-        repo.id,
-        super::escape_filename_for_like(&tarball_file)
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Tarball not found").into_response());
-
-    let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let upstream_path = format!("tarballs/{}", filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
-            }
-
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
+    let artifact =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+            Some(a) => a,
+            None => {
                 let upstream_path = format!("tarballs/{}", filename);
-                let filename_clone = filename.to_string();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let suffix = filename_clone.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_path_suffix(
-                                &db, &state, member_id, &location, &suffix,
-                            )
-                            .await
-                        }
+                // Remote: no Content-Disposition; Virtual: include filename.
+                let cd_filename = if repo.repo_type == RepositoryType::Virtual {
+                    Some(filename)
+                } else {
+                    None
+                };
+                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                    &state,
+                    &repo,
+                    proxy_helpers::DownloadResponseOpts {
+                        upstream_path: &upstream_path,
+                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                        default_content_type: "application/octet-stream",
+                        content_disposition_filename: cd_filename,
                     },
                 )
-                .await?;
-
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", filename),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                .await?
+                {
+                    return Ok(resp);
+                }
+                return Err((StatusCode::NOT_FOUND, "Tarball not found").into_response());
             }
+        };
 
-            return Err(not_found);
-        }
-    };
-
-    // Read from storage
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
-        .await
-        .map_err(|e| e.into_response())?;
-
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
+    proxy_helpers::serve_local_artifact(
+        &state,
+        &repo,
+        artifact.id,
+        &artifact.storage_key,
+        "application/octet-stream",
+        Some(filename),
     )
-    .execute(&state.db)
-    .await;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -378,40 +277,16 @@ async fn publish_package(
 
     let artifact_path = format!("{}/{}/{}", pkg_name, pkg_version, filename);
 
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
         repo.id,
-        artifact_path
+        &artifact_path,
+        "Package version already exists",
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package version already exists").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Store the file
     let storage_key = format!("hex/{}/{}/{}", pkg_name, pkg_version, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let hex_metadata = serde_json::json!({
         "format": "hex",
@@ -423,55 +298,25 @@ async fn publish_package(
     let size_bytes = body.len() as i64;
 
     // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        pkg_name,
-        pkg_version,
-        size_bytes,
-        computed_sha256,
-        "application/octet-stream",
-        storage_key,
-        user_id,
+    let artifact_id = proxy_helpers::insert_artifact(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &artifact_path,
+            name: &pkg_name,
+            version: &pkg_version,
+            size_bytes,
+            checksum_sha256: &computed_sha256,
+            content_type: "application/octet-stream",
+            storage_key: &storage_key,
+            uploaded_by: user_id,
+        },
     )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
     // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'hex', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        hex_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "hex", &hex_metadata)
+        .await;
 
     info!(
         "Hex publish: {} {} ({}) to repo {}",
@@ -513,13 +358,7 @@ async fn list_names(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     // Remote with no local artifacts: proxy the names list from upstream.
     // hex.pm's /names endpoint returns a signed protobuf payload; pass it through as-is.
@@ -569,11 +408,7 @@ async fn list_names(
 
     let json = serde_json::json!(names);
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -598,13 +433,7 @@ async fn list_versions(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     // Group versions by package name
     let mut packages: std::collections::BTreeMap<String, Vec<String>> =

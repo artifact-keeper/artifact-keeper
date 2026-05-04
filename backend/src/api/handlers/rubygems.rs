@@ -77,31 +77,8 @@ async fn gem_info(
     // Strip .json suffix if present
     let gem_name = name.strip_suffix(".json").unwrap_or(&name);
 
-    // Find the latest version of this gem
-    let artifact = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND LOWER(a.name) = LOWER($2)
-        ORDER BY a.created_at DESC
-        LIMIT 1
-        "#,
-        repo.id,
-        gem_name
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    let artifact =
+        proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, gem_name).await?;
 
     if let Some(artifact) = artifact {
         // Get download count
@@ -137,11 +114,7 @@ async fn gem_info(
             "version_downloads": download_count,
         });
 
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap());
+        return Ok(super::json_response(&json));
     }
 
     // Virtual repo: try remote members in priority order
@@ -177,29 +150,8 @@ async fn gem_versions(
 
     let gem_name = name.strip_suffix(".json").unwrap_or(&name);
 
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND LOWER(a.name) = LOWER($2)
-        ORDER BY a.created_at DESC
-        "#,
-        repo.id,
-        gem_name
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    let artifacts =
+        proxy_helpers::list_artifacts_by_name_lowercase(&state.db, repo.id, gem_name).await?;
 
     if artifacts.is_empty() {
         return Err((StatusCode::NOT_FOUND, "Gem not found").into_response());
@@ -249,137 +201,46 @@ async fn download_gem(
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
 
     let filename = gem_file.trim_start_matches('/');
-    // Escape `%` and `_` so user-supplied filename is matched as a literal,
-    // not a LIKE wildcard. See `crate::api::handlers::escape_like_literal`.
-    let filename_escaped = super::escape_like_literal(filename);
 
-    // Find artifact by matching the path ending
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, name, version, size_bytes, checksum_sha256, storage_key
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path LIKE '%/' || $2 ESCAPE '\'
-        LIMIT 1
-        "#,
-        repo.id,
-        filename_escaped
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Gem file not found").into_response());
-
-    let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let upstream_path = format!("gems/{}", filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
-            }
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
-                let fname = filename.to_string();
+    let artifact =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+            Some(a) => a,
+            None => {
                 let upstream_path = format!("gems/{}", filename);
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let fname = fname.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_path_suffix(
-                                &db, &state, member_id, &location, &fname,
-                            )
-                            .await
-                        }
+                // Remote: no Content-Disposition; Virtual: include filename.
+                // Mirrors the prior behavior so clients see the same headers.
+                let cd_filename = if repo.repo_type == RepositoryType::Virtual {
+                    Some(filename)
+                } else {
+                    None
+                };
+                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                    &state,
+                    &repo,
+                    proxy_helpers::DownloadResponseOpts {
+                        upstream_path: &upstream_path,
+                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                        default_content_type: "application/octet-stream",
+                        content_disposition_filename: cd_filename,
                     },
                 )
-                .await?;
-
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", filename),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                .await?
+                {
+                    return Ok(resp);
+                }
+                return Err((StatusCode::NOT_FOUND, "Gem file not found").into_response());
             }
-            return Err(not_found);
-        }
-    };
+        };
 
-    // Read from storage
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
-        .await
-        .map_err(|e| e.into_response())?;
-
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
+    proxy_helpers::serve_local_artifact(
+        &state,
+        &repo,
+        artifact.id,
+        &artifact.storage_key,
+        "application/octet-stream",
+        Some(filename),
     )
-    .execute(&state.db)
-    .await;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -428,40 +289,16 @@ async fn push_gem(
     // Artifact path
     let artifact_path = format!("{}/{}/{}", gem_name, gem_version, filename);
 
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
         repo.id,
-        artifact_path
+        &artifact_path,
+        "Gem version already exists",
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Gem version already exists").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Store the file
     let storage_key = format!("rubygems/{}/{}/{}", gem_name, gem_version, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     // Build metadata JSON
     let gem_metadata = serde_json::json!({
@@ -472,54 +309,30 @@ async fn push_gem(
     let size_bytes = body.len() as i64;
 
     // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        gem_name,
-        gem_version.to_string(),
-        size_bytes,
-        computed_sha256,
-        "application/octet-stream",
-        storage_key,
-        user_id,
+    let gem_version_str = gem_version.to_string();
+    let artifact_id = proxy_helpers::insert_artifact(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &artifact_path,
+            name: gem_name,
+            version: &gem_version_str,
+            size_bytes,
+            checksum_sha256: &computed_sha256,
+            content_type: "application/octet-stream",
+            storage_key: &storage_key,
+            uploaded_by: user_id,
+        },
     )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'rubygems', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
+    proxy_helpers::record_artifact_metadata(
+        &state.db,
         artifact_id,
-        gem_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
         repo.id,
+        "rubygems",
+        &gem_metadata,
     )
-    .execute(&state.db)
     .await;
 
     info!(

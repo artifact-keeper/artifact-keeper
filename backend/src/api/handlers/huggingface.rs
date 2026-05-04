@@ -11,7 +11,7 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,7 +25,6 @@ use tracing::info;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
-use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -81,6 +80,28 @@ async fn resolve_huggingface_repo(db: &PgPool, repo_key: &str) -> Result<RepoInf
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["huggingface"], "a Hugging Face").await
 }
 
+/// Extract a filename from request headers.
+///
+/// Prefers the `X-Filename` header; falls back to `Content-Disposition`
+/// (parsing the `filename=` parameter, stripping surrounding quotes); if
+/// neither is present, returns `"uploaded_file"`.
+fn filename_from_headers(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-filename")
+        .or(headers.get("content-disposition"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            if v.contains("filename=") {
+                v.split("filename=")
+                    .nth(1)
+                    .map(|f| f.trim_matches('"').to_string())
+            } else {
+                Some(v.to_string())
+            }
+        })
+        .unwrap_or_else(|| "uploaded_file".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // GET /huggingface/{repo_key}/api/models — List models
 // ---------------------------------------------------------------------------
@@ -105,13 +126,7 @@ async fn list_models(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     let models: Vec<serde_json::Value> = artifacts
         .iter()
@@ -151,31 +166,9 @@ async fn model_info(
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
-    let artifact = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND LOWER(a.name) = LOWER($2)
-        ORDER BY a.created_at DESC
-        LIMIT 1
-        "#,
-        repo.id,
-        model_id
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Model not found").into_response())?;
+    let artifact = proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &model_id)
+        .await?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Model not found").into_response())?;
 
     let siblings = sqlx::query!(
         r#"
@@ -191,13 +184,7 @@ async fn model_info(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     let files: Vec<serde_json::Value> = siblings
         .iter()
@@ -226,11 +213,7 @@ async fn model_info(
         "siblings": files,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -260,113 +243,40 @@ async fn download_file(
     )
     .fetch_optional(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .map_err(super::db_err)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "File not found").into_response());
 
     let artifact = match artifact {
         Ok(a) => a,
         Err(not_found) => {
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let upstream_path = format!("{}/resolve/{}/{}", model_id, revision, filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
-            }
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
-                let upstream_path = format!("{}/resolve/{}/{}", model_id, revision, filename);
-                let vpath = artifact_path.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let vpath = vpath.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_path(
-                                &db, &state, member_id, &location, &vpath,
-                            )
-                            .await
-                        }
-                    },
-                )
-                .await?;
-
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+            let upstream_path = format!("{}/resolve/{}/{}", model_id, revision, filename);
+            if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                &state,
+                &repo,
+                proxy_helpers::DownloadResponseOpts {
+                    upstream_path: &upstream_path,
+                    virtual_lookup: proxy_helpers::VirtualLookup::ExactPath(&artifact_path),
+                    default_content_type: "application/octet-stream",
+                    content_disposition_filename: None,
+                },
+            )
+            .await?
+            {
+                return Ok(resp);
             }
             return Err(not_found);
         }
     };
 
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
-        .await
-        .map_err(|e| e.into_response())?;
-
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
+    proxy_helpers::serve_local_artifact(
+        &state,
+        &repo,
+        artifact.id,
+        &artifact.storage_key,
+        "application/octet-stream",
+        Some(filename),
     )
-    .execute(&state.db)
-    .await;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -414,22 +324,8 @@ async fn upload_file(
             .into_response());
     }
 
-    // Extract filename from Content-Disposition header or default
-    let filename = headers
-        .get("x-filename")
-        .or(headers.get("content-disposition"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            // Try to extract filename from Content-Disposition
-            if v.contains("filename=") {
-                v.split("filename=")
-                    .nth(1)
-                    .map(|f| f.trim_matches('"').to_string())
-            } else {
-                Some(v.to_string())
-            }
-        })
-        .unwrap_or_else(|| "uploaded_file".to_string());
+    // Extract filename from X-Filename or Content-Disposition header.
+    let filename = filename_from_headers(&headers);
 
     let artifact_path = format!("{}/{}/{}", model_id, revision, filename);
 
@@ -452,40 +348,16 @@ async fn upload_file(
     hasher.update(&body);
     let computed_sha256 = format!("{:x}", hasher.finalize());
 
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
         repo.id,
-        artifact_path
+        &artifact_path,
+        "File already exists at this path",
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "File already exists at this path").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Store the file
     let storage_key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let size_bytes = body.len() as i64;
 
@@ -496,54 +368,30 @@ async fn upload_file(
     });
 
     // Insert artifact record
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        model_id,
-        revision,
-        size_bytes,
-        computed_sha256,
-        "application/octet-stream",
-        storage_key,
-        user_id,
+    let artifact_id = proxy_helpers::insert_artifact(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &artifact_path,
+            name: &model_id,
+            version: &revision,
+            size_bytes,
+            checksum_sha256: &computed_sha256,
+            content_type: "application/octet-stream",
+            storage_key: &storage_key,
+            uploaded_by: user_id,
+        },
     )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
     // Store metadata
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'huggingface', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
+    proxy_helpers::record_artifact_metadata(
+        &state.db,
         artifact_id,
-        metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    // Update repository timestamp
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
         repo.id,
+        "huggingface",
+        &metadata,
     )
-    .execute(&state.db)
     .await;
 
     info!(
@@ -591,13 +439,7 @@ async fn list_files(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     let files: Vec<serde_json::Value> = artifacts
         .iter()
@@ -640,21 +482,7 @@ mod tests {
     fn test_filename_from_x_filename_header() {
         let mut headers = HeaderMap::new();
         headers.insert("x-filename", HeaderValue::from_static("model.bin"));
-        let filename = headers
-            .get("x-filename")
-            .or(headers.get("content-disposition"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                if v.contains("filename=") {
-                    v.split("filename=")
-                        .nth(1)
-                        .map(|f| f.trim_matches('"').to_string())
-                } else {
-                    Some(v.to_string())
-                }
-            })
-            .unwrap_or_else(|| "uploaded_file".to_string());
-        assert_eq!(filename, "model.bin");
+        assert_eq!(filename_from_headers(&headers), "model.bin");
     }
 
     #[test]
@@ -664,41 +492,13 @@ mod tests {
             "content-disposition",
             HeaderValue::from_static("attachment; filename=\"weights.safetensors\""),
         );
-        let filename = headers
-            .get("x-filename")
-            .or(headers.get("content-disposition"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                if v.contains("filename=") {
-                    v.split("filename=")
-                        .nth(1)
-                        .map(|f| f.trim_matches('"').to_string())
-                } else {
-                    Some(v.to_string())
-                }
-            })
-            .unwrap_or_else(|| "uploaded_file".to_string());
-        assert_eq!(filename, "weights.safetensors");
+        assert_eq!(filename_from_headers(&headers), "weights.safetensors");
     }
 
     #[test]
     fn test_filename_default() {
         let headers = HeaderMap::new();
-        let filename = headers
-            .get("x-filename")
-            .or(headers.get("content-disposition"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                if v.contains("filename=") {
-                    v.split("filename=")
-                        .nth(1)
-                        .map(|f| f.trim_matches('"').to_string())
-                } else {
-                    Some(v.to_string())
-                }
-            })
-            .unwrap_or_else(|| "uploaded_file".to_string());
-        assert_eq!(filename, "uploaded_file");
+        assert_eq!(filename_from_headers(&headers), "uploaded_file");
     }
 
     // -----------------------------------------------------------------------
