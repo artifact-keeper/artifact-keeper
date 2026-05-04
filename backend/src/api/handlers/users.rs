@@ -20,7 +20,14 @@ use crate::services::auth_service::{
 };
 use std::sync::atomic::Ordering;
 
-/// Create user routes
+/// Create user routes that require admin privileges.
+///
+/// The `change_password` route is intentionally NOT included here — see
+/// [`self_service_router`]. A non-admin must be able to change their OWN
+/// password (issue #1010), and the `change_password` handler enforces
+/// ownership (`auth.user_id == path id`) plus the current-password check
+/// itself. Mounting it behind `admin_middleware` would lock non-admins out
+/// of the forced-password-reset flow on first login.
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
@@ -29,8 +36,18 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/roles/:role_id", delete(revoke_role))
         .route("/:id/tokens", get(list_user_tokens).post(create_api_token))
         .route("/:id/tokens/:token_id", delete(revoke_api_token))
-        .route("/:id/password", post(change_password))
         .route("/:id/password/reset", post(reset_password))
+}
+
+/// User routes that only require an authenticated caller (not admin).
+///
+/// The `change_password` handler performs its own ownership check: it only
+/// allows the call when `auth.user_id == path id` OR `auth.is_admin`, and
+/// requires the current password for self-service changes. This router is
+/// mounted at the same `/users` prefix as [`router`] but with the standard
+/// `auth_middleware` instead of `admin_middleware` (issue #1010).
+pub fn self_service_router() -> Router<SharedState> {
+    Router::new().route("/:id/password", post(change_password))
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
