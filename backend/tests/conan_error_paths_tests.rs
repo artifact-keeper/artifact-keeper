@@ -85,6 +85,12 @@ fn basic_auth_header(username: &str, password: &str) -> String {
     format!("Basic {}", encoded)
 }
 
+async fn connect_pool() -> PgPool {
+    PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap()
+}
+
 async fn create_test_user(pool: &PgPool, username: &str, password: &str) -> Uuid {
     let id = Uuid::new_v4();
     let hash = bcrypt::hash(password, 4).expect("bcrypt hash failed");
@@ -171,9 +177,7 @@ fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
 #[tokio::test]
 #[ignore]
 async fn test_990_upload_to_nonexistent_repo_returns_404() {
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
+    let pool = connect_pool().await;
     let username = format!("conan-err-u-{}", &Uuid::new_v4().to_string()[..8]);
     let user_id = create_test_user(&pool, &username, "errpass").await;
     let storage_path = std::env::temp_dir().join("conan-err-bogus-upload");
@@ -217,9 +221,7 @@ async fn test_990_upload_to_nonexistent_repo_returns_404() {
 #[tokio::test]
 #[ignore]
 async fn test_990_ping_on_nonexistent_repo_returns_404() {
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
+    let pool = connect_pool().await;
     let storage_path = std::env::temp_dir().join("conan-err-bogus-ping");
     std::fs::create_dir_all(&storage_path).ok();
     let state = build_state(pool.clone(), storage_path.to_str().unwrap());
@@ -252,9 +254,7 @@ async fn test_990_ping_on_nonexistent_repo_returns_404() {
 #[tokio::test]
 #[ignore]
 async fn test_990_ping_on_existing_repo_returns_200() {
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
+    let pool = connect_pool().await;
     let user_id = create_test_user(
         &pool,
         &format!("conan-ping-u-{}", &Uuid::new_v4().to_string()[..8]),
@@ -301,9 +301,7 @@ async fn test_990_ping_on_existing_repo_returns_200() {
 #[tokio::test]
 #[ignore]
 async fn test_990_long_path_segment_returns_4xx() {
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
+    let pool = connect_pool().await;
     let username = format!("conan-long-u-{}", &Uuid::new_v4().to_string()[..8]);
     let user_id = create_test_user(&pool, &username, "longpass").await;
     let (repo_id, key, storage_path) = create_conan_repo(&pool, "conan-long-test").await;

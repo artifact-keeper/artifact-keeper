@@ -260,6 +260,17 @@ fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
     Ok(())
 }
 
+/// Flatten the optional auth extension that the upload handlers receive.
+///
+/// Upload handlers accept `Option<Extension<Option<AuthExtension>>>` so that
+/// requests routed to a non-existent repo (where the repo-visibility
+/// middleware skips inserting the extension) still reach the handler — the
+/// handler can then return 404 instead of a 500. See `recipe_file_upload`
+/// for the full rationale (issue #990).
+fn flatten_auth_extension(auth: Option<Extension<Option<AuthExtension>>>) -> Option<AuthExtension> {
+    auth.and_then(|Extension(a)| a)
+}
+
 // ---------------------------------------------------------------------------
 // GET /conan/{repo_key}/v2/ping
 // ---------------------------------------------------------------------------
@@ -756,14 +767,10 @@ async fn recipe_file_upload(
     ])?;
 
     // Validate the repo BEFORE checking auth, so an upload to a non-existent
-    // repo returns 404 instead of 500 (issue #990). The repo-visibility
-    // middleware skips the auth-extension insertion when the repo key is
-    // unknown, so a strict `Extension<Option<AuthExtension>>` extractor
-    // would surface a 500 here. Accepting the extension as `Option<...>`
-    // lets us run the resolve-then-auth-then-validate sequence cleanly.
+    // repo returns 404 instead of 500 (issue #990). See
+    // `flatten_auth_extension` for why the extension is optional here.
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
-    let auth_ext = auth.and_then(|Extension(a)| a);
-    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
+    let user_id = require_auth_basic(flatten_auth_extension(auth), "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path =
@@ -1286,8 +1293,7 @@ async fn package_file_upload(
     // Resolve repo BEFORE auth so unknown repo keys surface as 404, not 500.
     // See `recipe_file_upload` for the full rationale (issue #990).
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
-    let auth_ext = auth.and_then(|Extension(a)| a);
-    let user_id = require_auth_basic(auth_ext, "conan")?.user_id;
+    let user_id = require_auth_basic(flatten_auth_extension(auth), "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path = package_artifact_path(
