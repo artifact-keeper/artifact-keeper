@@ -22,8 +22,7 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
-    capture_cli_version, convert_trivy_findings, fail_scan, format_trivy_version, ScanWorkspace,
-    Scanner,
+    cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
 };
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
@@ -256,13 +255,7 @@ impl Scanner for IncusScanner {
     /// parsed. The Incus scanner shells out to the same `trivy` binary as
     /// `TrivyFsScanner`, so the format is also `trivy-<version>`.
     async fn version(&self) -> Option<String> {
-        self.cached_version
-            .get_or_init(|| async {
-                let raw = capture_cli_version("trivy", &["--version"]).await?;
-                format_trivy_version(&raw)
-            })
-            .await
-            .clone()
+        cached_trivy_cli_version(&self.cached_version).await
     }
 
     async fn scan(

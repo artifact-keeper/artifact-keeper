@@ -435,6 +435,37 @@ pub(crate) async fn capture_cli_version_with_timeout(
     }
 }
 
+/// Resolve a scanner's lazily-cached version string, probing once via
+/// `probe` and caching the result in `cell` for the scanner's lifetime.
+///
+/// Concrete `Scanner::version()` impls share this OnceCell + clone pattern;
+/// extracting it here keeps the per-scanner override to a single line and
+/// avoids near-identical method bodies across `trivy_fs_scanner`,
+/// `image_scanner`, `incus_scanner`, `grype_scanner`, and `openscap_scanner`.
+pub(crate) async fn cached_cli_version<F, Fut>(
+    cell: &tokio::sync::OnceCell<Option<String>>,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    cell.get_or_init(probe).await.clone()
+}
+
+/// Convenience wrapper around [`cached_cli_version`] for scanners that probe
+/// the Trivy CLI. Returns `Some("trivy-<ver>")` once the CLI has been
+/// probed, or `None` when the binary is missing or its output is unparseable.
+pub(crate) async fn cached_trivy_cli_version(
+    cell: &tokio::sync::OnceCell<Option<String>>,
+) -> Option<String> {
+    cached_cli_version(cell, || async {
+        let raw = capture_cli_version("trivy", &["--version"]).await?;
+        format_trivy_version(&raw)
+    })
+    .await
+}
+
 /// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token.
 /// Trivy emits `Version: 0.62.1` (or `Version: 0.62.1\n...`). We normalize
 /// to `trivy-<version>` to make the field self-describing in the DB.

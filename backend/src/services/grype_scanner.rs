@@ -14,7 +14,8 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    capture_cli_version, fail_scan, format_grype_version, ScanWorkspace, Scanner,
+    cached_cli_version, capture_cli_version, fail_scan, format_grype_version, ScanWorkspace,
+    Scanner,
 };
 
 // ---------------------------------------------------------------------------
@@ -158,13 +159,11 @@ impl Scanner for GrypeScanner {
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed.
     async fn version(&self) -> Option<String> {
-        self.cached_version
-            .get_or_init(|| async {
-                let raw = capture_cli_version("grype", &["--version"]).await?;
-                format_grype_version(&raw)
-            })
-            .await
-            .clone()
+        cached_cli_version(&self.cached_version, || async {
+            let raw = capture_cli_version("grype", &["--version"]).await?;
+            format_grype_version(&raw)
+        })
+        .await
     }
 
     async fn scan(

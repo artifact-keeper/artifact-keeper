@@ -7,7 +7,7 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{capture_cli_version, format_trivy_version, Scanner};
+use crate::services::scanner_service::{cached_trivy_cli_version, Scanner};
 
 // Trivy JSON report structures
 #[derive(Debug, Deserialize)]
@@ -290,13 +290,7 @@ impl Scanner for ImageScanner {
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed.
     async fn version(&self) -> Option<String> {
-        self.cached_version
-            .get_or_init(|| async {
-                let raw = capture_cli_version("trivy", &["--version"]).await?;
-                format_trivy_version(&raw)
-            })
-            .await
-            .clone()
+        cached_trivy_cli_version(&self.cached_version).await
     }
 
     async fn scan(

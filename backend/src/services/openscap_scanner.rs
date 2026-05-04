@@ -17,7 +17,7 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
+    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
 };
 
 /// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
@@ -229,10 +229,10 @@ impl Scanner for OpenScapScanner {
     /// `oscap` version string. Returns `None` if the wrapper is unreachable
     /// or its response cannot be parsed.
     async fn version(&self) -> Option<String> {
-        self.cached_version
-            .get_or_init(|| async { self.probe_version().await })
-            .await
-            .clone()
+        cached_cli_version(&self.cached_version, || async {
+            self.probe_version().await
+        })
+        .await
     }
 
     async fn scan(
@@ -403,6 +403,32 @@ mod tests {
         assert_scan_failed(&result, "OpenSCAP scan");
     }
 
+    /// Build an `OpenScapScanner` pointing at `url`, using a fresh tempdir
+    /// for the scan workspace. The returned `_dir` guard must be kept
+    /// in scope for the test's lifetime so the directory is not dropped.
+    fn make_probe_scanner(url: String) -> (OpenScapScanner, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            url,
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        (scanner, dir)
+    }
+
+    /// Mount a `GET /health` mock on `server` that responds with `template`,
+    /// matching the openscap wrapper sidecar's healthcheck route.
+    async fn mount_health_mock(
+        server: &wiremock::MockServer,
+        template: wiremock::ResponseTemplate,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/health"))
+            .respond_with(template)
+            .mount(server)
+            .await;
+    }
+
     /// `probe_version` returns `Some("openscap-<ver>")` when the wrapper's
     /// `/health` endpoint responds 200 with a `version` field shaped like
     /// the real `oscap --version` first line. This is the happy path the
@@ -410,20 +436,15 @@ mod tests {
     #[tokio::test]
     async fn test_probe_version_success() {
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/health"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"version": "OpenSCAP command line tool (oscap) 1.4.0"}),
-            ))
-            .mount(&server)
-            .await;
+            ),
+        )
+        .await;
 
-        let dir = tempfile::tempdir().unwrap();
-        let scanner = OpenScapScanner::new(
-            server.uri(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
+        let (scanner, _dir) = make_probe_scanner(server.uri());
         let v = scanner.version().await;
         assert_eq!(v, Some("openscap-1.4.0".to_string()));
 
@@ -441,18 +462,9 @@ mod tests {
     #[tokio::test]
     async fn test_probe_version_non_success_status_returns_none() {
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/health"))
-            .respond_with(wiremock::ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
+        mount_health_mock(&server, wiremock::ResponseTemplate::new(503)).await;
 
-        let dir = tempfile::tempdir().unwrap();
-        let scanner = OpenScapScanner::new(
-            server.uri(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
+        let (scanner, _dir) = make_probe_scanner(server.uri());
         assert_eq!(scanner.version().await, None);
     }
 
@@ -462,22 +474,15 @@ mod tests {
     #[tokio::test]
     async fn test_probe_version_malformed_body_returns_none() {
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/health"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_string("<html>not json</html>")
-                    .insert_header("content-type", "text/html"),
-            )
-            .mount(&server)
-            .await;
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("<html>not json</html>")
+                .insert_header("content-type", "text/html"),
+        )
+        .await;
 
-        let dir = tempfile::tempdir().unwrap();
-        let scanner = OpenScapScanner::new(
-            server.uri(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
+        let (scanner, _dir) = make_probe_scanner(server.uri());
         assert_eq!(scanner.version().await, None);
     }
 
@@ -487,18 +492,13 @@ mod tests {
     #[tokio::test]
     async fn test_probe_version_missing_field_returns_none() {
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/health"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-            .mount(&server)
-            .await;
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+        )
+        .await;
 
-        let dir = tempfile::tempdir().unwrap();
-        let scanner = OpenScapScanner::new(
-            server.uri(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
+        let (scanner, _dir) = make_probe_scanner(server.uri());
         assert_eq!(scanner.version().await, None);
     }
 
@@ -509,21 +509,14 @@ mod tests {
     #[tokio::test]
     async fn test_probe_version_whitespace_only_field_returns_none() {
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/health"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"version": "   "})),
-            )
-            .mount(&server)
-            .await;
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"version": "   "})),
+        )
+        .await;
 
-        let dir = tempfile::tempdir().unwrap();
-        let scanner = OpenScapScanner::new(
-            server.uri(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
+        let (scanner, _dir) = make_probe_scanner(server.uri());
         assert_eq!(scanner.version().await, None);
     }
 
@@ -534,13 +527,8 @@ mod tests {
     /// OpenSCAP wrapper sidecar.
     #[tokio::test]
     async fn test_probe_version_unreachable_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let scanner = OpenScapScanner::new(
-            // Port 0 is reserved and yields connection refused.
-            "http://127.0.0.1:0".to_string(),
-            "standard".to_string(),
-            dir.path().to_string_lossy().to_string(),
-        );
+        // Port 0 is reserved and yields connection refused.
+        let (scanner, _dir) = make_probe_scanner("http://127.0.0.1:0".to_string());
         assert_eq!(scanner.version().await, None);
     }
 }
