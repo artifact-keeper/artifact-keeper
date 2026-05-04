@@ -111,6 +111,9 @@ services:
         condition: service_healthy
       dependency-track-apiserver:
         condition: service_healthy
+    environment:
+      DEPENDENCY_TRACK_URL: ${DEPENDENCY_TRACK_URL:-http://dependency-track-apiserver:8080}
+      DEPENDENCY_TRACK_ADMIN_PASSWORD: ${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}
     volumes:
       - ./docker/init-dtrack.sh:/init-dtrack.sh:ro,z
       - shared_config:/shared
