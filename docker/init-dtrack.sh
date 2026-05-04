@@ -21,8 +21,19 @@ DT_URL="${DEPENDENCY_TRACK_URL:-http://dependency-track-apiserver:8080}"
 DT_ADMIN_USER="admin"
 DT_DEFAULT_PASS="admin"
 DT_NEW_PASS="${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}"
+DT_TEAM_NAME="Automation"
 API_KEY_FILE="/shared/dtrack-api-key"
 BOOTSTRAP_MARKER="/shared/.dtrack-bootstrapped"
+
+# Login against /api/v1/user/login. DT returns a bare JWT string body on
+# success and a body containing "FORCE_PASSWORD_CHANGE" when the default
+# password has not yet been rotated. The caller decides which response is
+# acceptable; we just echo the body.
+dt_login() {
+  curl -sf -X POST "$DT_URL/api/v1/user/login" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=${DT_ADMIN_USER}&password=$1" 2>/dev/null || true
+}
 
 echo "[dtrack-init] Waiting for Dependency-Track at $DT_URL ..."
 for i in $(seq 1 60); do
@@ -46,9 +57,7 @@ if [ -f "$API_KEY_FILE" ] && [ -s "$API_KEY_FILE" ]; then
 fi
 
 # Try login with the new password first (already changed in a previous partial run)
-TOKEN=$(curl -sf -X POST "$DT_URL/api/v1/user/login" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=${DT_ADMIN_USER}&password=${DT_NEW_PASS}" 2>/dev/null || true)
+TOKEN=$(dt_login "$DT_NEW_PASS")
 
 if [ -z "$TOKEN" ] || echo "$TOKEN" | grep -qi "FORCE_PASSWORD_CHANGE"; then
   # First boot: change the default admin password
@@ -63,9 +72,7 @@ if [ -z "$TOKEN" ] || echo "$TOKEN" | grep -qi "FORCE_PASSWORD_CHANGE"; then
   fi
 
   # Login with new password
-  TOKEN=$(curl -sf -X POST "$DT_URL/api/v1/user/login" \
-    -H "Content-Type: application/x-www-form-urlencoded" \
-    -d "username=${DT_ADMIN_USER}&password=${DT_NEW_PASS}" 2>/dev/null || true)
+  TOKEN=$(dt_login "$DT_NEW_PASS")
 fi
 
 if [ -z "$TOKEN" ]; then
@@ -85,24 +92,25 @@ if [ -z "$TEAM_JSON" ]; then
   exit 1
 fi
 
-TEAM_UUID=$(echo "$TEAM_JSON" | jq -r '.[] | select(.name == "Automation") | .uuid // empty')
+TEAM_UUID=$(echo "$TEAM_JSON" | jq -r --arg name "$DT_TEAM_NAME" \
+  '.[] | select(.name == $name) | .uuid // empty')
 
 if [ -z "$TEAM_UUID" ]; then
-  echo "[dtrack-init] ERROR: Could not find Automation team" >&2
+  echo "[dtrack-init] ERROR: Could not find $DT_TEAM_NAME team" >&2
   echo "[dtrack-init] Available teams:" >&2
-  echo "$TEAM_JSON" | jq -r '.[].name' >&2 2>/dev/null || true
+  echo "$TEAM_JSON" | jq -r '.[].name' 2>/dev/null >&2 || true
   exit 1
 fi
-echo "[dtrack-init] Found Automation team: $TEAM_UUID"
+echo "[dtrack-init] Found $DT_TEAM_NAME team: $TEAM_UUID"
 
 # Rotate: delete every pre-existing key on the Automation team. Each helm
 # upgrade that reaches this branch (i.e. shared volume is empty) starts
 # fresh, preventing key accumulation. DELETE returns 204 on success;
 # missing/already-gone keys are ignored.
-EXISTING_PUBLIC_IDS=$(echo "$TEAM_JSON" | \
-  jq -r '.[] | select(.name == "Automation") | .apiKeys[]?.publicId // empty')
+EXISTING_PUBLIC_IDS=$(echo "$TEAM_JSON" | jq -r --arg name "$DT_TEAM_NAME" \
+  '.[] | select(.name == $name) | .apiKeys[]?.publicId // empty')
 if [ -n "$EXISTING_PUBLIC_IDS" ]; then
-  echo "[dtrack-init] Rotating existing Automation API keys..."
+  echo "[dtrack-init] Rotating existing $DT_TEAM_NAME API keys..."
   echo "$EXISTING_PUBLIC_IDS" | while IFS= read -r PUBLIC_ID; do
     [ -z "$PUBLIC_ID" ] && continue
     DEL_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -117,7 +125,7 @@ fi
 
 # Create a fresh API key. DT 4.x returns the unmasked secret in the
 # response body of this single call — there is no other way to retrieve it.
-echo "[dtrack-init] Generating new Automation API key..."
+echo "[dtrack-init] Generating new $DT_TEAM_NAME API key..."
 KEY_RESP=$(curl -sf -X POST "$DT_URL/api/v1/team/$TEAM_UUID/key" \
   -H "Authorization: Bearer $TOKEN" || true)
 
