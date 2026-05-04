@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::models::migration::{MigrationItemType, MigrationJobStatus};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::artifactory_client::ArtifactoryClient;
-use crate::services::migration_service::{MigrationError, MigrationService};
+use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
 use crate::services::source_registry::SourceRegistry;
 use crate::storage::StorageBackend;
 
@@ -179,8 +179,110 @@ impl MigrationWorker {
         let mut total_skipped = 0i32;
         let mut total_transferred = 0i64;
 
-        // Process each repository
+        // Provision destination repositories before transferring artifacts.
+        //
+        // Without this step, `transfer_artifact` looks up the destination
+        // repository row inside an `if let Some(...) = repo_id` and silently
+        // skips the `INSERT INTO artifacts` when the lookup misses. The job
+        // then reports "completed" with bytes in CAS but no addressable
+        // entries in the registry — silent data loss.
+        //
+        // We fetch the source-side repository list once, then for each repo
+        // requested by the job ensure a destination row exists with the same
+        // key. Conflicts (existing repo with same key but different type or
+        // format) are logged and the source repo is skipped so the rest of
+        // the job can still make progress.
+        // `list_repositories` returns `ArtifactoryError`; the `?` converts via
+        // `MigrationError::from(ArtifactoryError)` on the existing `#[from]` impl.
+        let source_repos = client.list_repositories().await?;
+        let mut repos_to_process: Vec<&String> = Vec::with_capacity(repos.len());
         for repo_key in &repos {
+            let source_repo = match source_repos.iter().find(|r| r.key == *repo_key) {
+                Some(r) => r,
+                None => {
+                    tracing::error!(
+                        job_id = %job_id, repo = %repo_key,
+                        "Source repository not found in source registry; skipping",
+                    );
+                    total_failed += 1;
+                    continue;
+                }
+            };
+
+            let migration_config =
+                match MigrationService::prepare_repository_migration(source_repo, None) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            job_id = %job_id, repo = %repo_key, error = %e,
+                            "Failed to prepare repository migration config; skipping",
+                        );
+                        total_failed += 1;
+                        continue;
+                    }
+                };
+
+            // Skip if a repo with the same key already exists with a
+            // compatible type+format; recreate would be ambiguous and
+            // potentially destructive. Surface incompatible matches as an
+            // error so the operator can resolve manually.
+            let conflict = self
+                .migration_service
+                .check_repository_conflict(
+                    &migration_config.target_key,
+                    migration_config.repo_type,
+                    &migration_config.package_type,
+                )
+                .await?;
+            if conflict.has_conflict {
+                match conflict.conflict_type {
+                    Some(ConflictType::SameKey) => {
+                        tracing::info!(
+                            job_id = %job_id, repo = %repo_key,
+                            "Destination repository already exists with matching type+format; reusing",
+                        );
+                    }
+                    _ => {
+                        tracing::error!(
+                            job_id = %job_id, repo = %repo_key,
+                            conflict = ?conflict.conflict_type,
+                            message = %conflict.message,
+                            "Destination repository conflict; skipping artifact transfer for this repo",
+                        );
+                        total_failed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                match self
+                    .migration_service
+                    .create_repository(&migration_config)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            job_id = %job_id, repo = %repo_key,
+                            format = %migration_config.package_type,
+                            repo_type = ?migration_config.repo_type,
+                            "Provisioned destination repository",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            job_id = %job_id, repo = %repo_key, error = %e,
+                            "Failed to create destination repository; skipping",
+                        );
+                        total_failed += 1;
+                        continue;
+                    }
+                }
+            }
+
+            repos_to_process.push(repo_key);
+        }
+
+        // Process each repository
+        for repo_key in repos_to_process {
             // Check for pause/cancel
             if self.cancel_token.is_cancelled() {
                 tracing::info!(job_id = %job_id, "Migration cancelled by user");
