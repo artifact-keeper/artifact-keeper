@@ -228,16 +228,69 @@ fn content_type_for_conan_file(path: &str) -> &'static str {
     }
 }
 
+/// Maximum byte length for any single Conan reference path segment
+/// (`name`, `version`, `user`, `channel`, `revision`, `package_id`,
+/// `pkg_revision`, `file_path`). This matches the typical filesystem
+/// `NAME_MAX` limit (255) and keeps storage-backend operations from
+/// surfacing low-level filesystem errors as 5xx responses.
+const CONAN_MAX_SEGMENT_LEN: usize = 255;
+
+/// Validate the byte length of every user-supplied Conan path segment.
+///
+/// Returns a 414 (URI Too Long) plain-text error response when any segment
+/// exceeds [`CONAN_MAX_SEGMENT_LEN`]. The first offending segment is named
+/// in the response body so abuse / fuzzing payloads do not look like server
+/// faults in monitoring (issue #990).
+#[allow(clippy::result_large_err)]
+fn validate_conan_segments(segments: &[(&str, &str)]) -> Result<(), Response> {
+    for (label, value) in segments {
+        if value.len() > CONAN_MAX_SEGMENT_LEN {
+            return Err((
+                StatusCode::URI_TOO_LONG,
+                format!(
+                    "Conan path segment '{}' exceeds {} bytes (got {})",
+                    label,
+                    CONAN_MAX_SEGMENT_LEN,
+                    value.len()
+                ),
+            )
+                .into_response());
+        }
+    }
+    Ok(())
+}
+
+/// Flatten the optional auth extension that the upload handlers receive.
+///
+/// Upload handlers accept `Option<Extension<Option<AuthExtension>>>` so that
+/// requests routed to a non-existent repo (where the repo-visibility
+/// middleware skips inserting the extension) still reach the handler — the
+/// handler can then return 404 instead of a 500. See `recipe_file_upload`
+/// for the full rationale (issue #990).
+fn flatten_auth_extension(auth: Option<Extension<Option<AuthExtension>>>) -> Option<AuthExtension> {
+    auth.and_then(|Extension(a)| a)
+}
+
 // ---------------------------------------------------------------------------
 // GET /conan/{repo_key}/v2/ping
 // ---------------------------------------------------------------------------
 
-async fn ping() -> Response {
-    Response::builder()
+/// Ping / capability probe.
+///
+/// Validates the repository exists before returning the static capability
+/// banner so Conan clients can distinguish a configured-but-broken remote
+/// from a typo (issue #990). Returns 404 when the repository does not
+/// exist or is not Conan-format.
+async fn ping(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    let _repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header("X-Conan-Server-Capabilities", "revisions")
         .body(Body::empty())
-        .unwrap()
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +740,7 @@ async fn recipe_file_download(
 
 async fn recipe_file_upload(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    auth: Option<Extension<Option<AuthExtension>>>,
     Path((repo_key, name, version, user, channel, revision, file_path)): Path<(
         String,
         String,
@@ -699,8 +752,25 @@ async fn recipe_file_upload(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conan")?.user_id;
+    // Reject path segments that exceed the filesystem NAME_MAX before any
+    // DB, auth, or storage-backend call, so deeply-nested or fuzzing-style
+    // payloads surface as a 414 instead of a low-level 500 (issue #990).
+    // Path-shape is independent of authn/authz so it is safe (and useful for
+    // monitoring) to fail it first.
+    validate_conan_segments(&[
+        ("name", &name),
+        ("version", &version),
+        ("user", &user),
+        ("channel", &channel),
+        ("revision", &revision),
+        ("file_path", &file_path),
+    ])?;
+
+    // Validate the repo BEFORE checking auth, so an upload to a non-existent
+    // repo returns 404 instead of 500 (issue #990). See
+    // `flatten_auth_extension` for why the extension is optional here.
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    let user_id = require_auth_basic(flatten_auth_extension(auth), "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path =
@@ -1192,7 +1262,7 @@ async fn package_file_download(
 #[allow(clippy::type_complexity)]
 async fn package_file_upload(
     State(state): State<SharedState>,
-    Extension(auth): Extension<Option<AuthExtension>>,
+    auth: Option<Extension<Option<AuthExtension>>>,
     Path((repo_key, name, version, user, channel, revision, package_id, pkg_revision, file_path)): Path<(
         String,
         String,
@@ -1206,8 +1276,24 @@ async fn package_file_upload(
     )>,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic(auth, "conan")?.user_id;
+    // Reject excessively long path segments up front (before any DB, auth,
+    // or storage-backend call) so the storage backend and DB never see paths
+    // that would surface as opaque 5xx errors (issue #990).
+    validate_conan_segments(&[
+        ("name", &name),
+        ("version", &version),
+        ("user", &user),
+        ("channel", &channel),
+        ("revision", &revision),
+        ("package_id", &package_id),
+        ("pkg_revision", &pkg_revision),
+        ("file_path", &file_path),
+    ])?;
+
+    // Resolve repo BEFORE auth so unknown repo keys surface as 404, not 500.
+    // See `recipe_file_upload` for the full rationale (issue #990).
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
+    let user_id = require_auth_basic(flatten_auth_extension(auth), "conan")?.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
     let artifact_path = package_artifact_path(
@@ -1920,5 +2006,271 @@ mod tests {
             "boost", "1.80", "myuser", "stable", "r1", "pid", "prev", "file",
         );
         assert!(path.contains("/myuser/stable/"));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_conan_segments — issue #990 long-path guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_conan_segments_accepts_normal_segments() {
+        let segments = [
+            ("name", "zlib"),
+            ("version", "1.3.1"),
+            ("user", "_"),
+            ("channel", "_"),
+            ("revision", "deadbeefcafebabedeadbeefcafebabe"),
+            ("file_path", "conanfile.py"),
+        ];
+        assert!(validate_conan_segments(&segments).is_ok());
+    }
+
+    #[test]
+    fn test_validate_conan_segments_accepts_segment_at_max() {
+        let max_segment: String = "a".repeat(CONAN_MAX_SEGMENT_LEN);
+        let segments = [("name", max_segment.as_str())];
+        assert!(
+            validate_conan_segments(&segments).is_ok(),
+            "exactly {} bytes must be accepted",
+            CONAN_MAX_SEGMENT_LEN
+        );
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_name() {
+        // Mirrors test-conan-errors.sh #15: a 300-char package name.
+        let long_name: String = "a".repeat(300);
+        let segments = [
+            ("name", long_name.as_str()),
+            ("version", "1.0.0"),
+            ("user", "_"),
+            ("channel", "_"),
+            ("revision", "rev"),
+            ("file_path", "conanfile.py"),
+        ];
+        let resp = validate_conan_segments(&segments).expect_err("must reject 300-char name");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_version() {
+        let long_version: String = "1.".repeat(200); // 400 chars
+        let segments = [("name", "zlib"), ("version", long_version.as_str())];
+        let resp = validate_conan_segments(&segments).expect_err("must reject 400-char version");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    #[test]
+    fn test_validate_conan_segments_rejects_overlong_file_path() {
+        let long_path: String = "x".repeat(CONAN_MAX_SEGMENT_LEN + 1);
+        let segments = [("file_path", long_path.as_str())];
+        let resp = validate_conan_segments(&segments).expect_err("must reject overlong file_path");
+        assert_eq!(resp.status(), StatusCode::URI_TOO_LONG);
+    }
+
+    // -----------------------------------------------------------------------
+    // flatten_auth_extension — issue #990 Option-extension flattening
+    // -----------------------------------------------------------------------
+
+    fn make_auth_ext() -> AuthExtension {
+        AuthExtension {
+            user_id: uuid::Uuid::nil(),
+            username: "tester".into(),
+            email: "tester@test.local".into(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_flatten_auth_extension_none_outer() {
+        // No Extension at all — repo-visibility middleware did not run because
+        // the repo does not exist. Must flatten to None so the upload handler
+        // can return a 4xx (issue #990).
+        assert!(flatten_auth_extension(None).is_none());
+    }
+
+    #[test]
+    fn test_flatten_auth_extension_some_outer_none_inner() {
+        // Extension was inserted but the request was unauthenticated.
+        let inner: Option<AuthExtension> = None;
+        assert!(flatten_auth_extension(Some(Extension(inner))).is_none());
+    }
+
+    #[test]
+    fn test_flatten_auth_extension_some_outer_some_inner() {
+        // Extension was inserted with an authenticated user.
+        let ext = make_auth_ext();
+        let username = ext.username.clone();
+        let flat = flatten_auth_extension(Some(Extension(Some(ext))))
+            .expect("Some(Extension(Some(_))) must flatten to Some");
+        assert_eq!(flat.username, username);
+    }
+
+    // -----------------------------------------------------------------------
+    // ping / *_file_upload — exercise non-DB code paths through the router so
+    // that the new lines (validate-segments call sites, signature lines,
+    // auth-flattening) are covered in --lib coverage runs (issue #990).
+    //
+    // These tests use `PgPool::connect_lazy` (the same pattern used by
+    // events.rs / users.rs / auth_service.rs unit tests) so no PostgreSQL is
+    // required. Requests that hit a DB query short-circuit with a 5xx, but
+    // requests that fail the path-segment guard return 414 *before* any DB
+    // call — exactly the shape we want to verify.
+    // -----------------------------------------------------------------------
+
+    fn unit_test_state() -> SharedState {
+        use crate::api::AppState;
+        use crate::config::Config;
+        use crate::storage::filesystem::FilesystemStorage;
+        use std::sync::Arc;
+
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("connect_lazy never fails for a syntactically valid URL");
+        let storage: Arc<dyn crate::storage::StorageBackend> =
+            Arc::new(FilesystemStorage::new("/tmp/conan-unit-test"));
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let config = Config {
+            database_url: String::new(),
+            bind_address: "127.0.0.1:0".into(),
+            log_level: "error".into(),
+            storage_backend: "filesystem".into(),
+            storage_path: "/tmp/conan-unit-test".into(),
+            s3_bucket: None,
+            gcs_bucket: None,
+            s3_region: None,
+            s3_endpoint: None,
+            jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            jwt_expiration_secs: 3600,
+            jwt_access_token_expiry_minutes: 30,
+            jwt_refresh_token_expiry_days: 7,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            oidc_client_secret: None,
+            ldap_url: None,
+            ldap_base_dn: None,
+            trivy_url: None,
+            openscap_url: None,
+            openscap_profile: "standard".into(),
+            meilisearch_url: None,
+            meilisearch_api_key: None,
+            scan_workspace_path: "/tmp/scan".into(),
+            demo_mode: false,
+            peer_instance_name: "test".into(),
+            peer_public_endpoint: "http://localhost:8080".into(),
+            peer_api_key: "test-key".into(),
+            dependency_track_url: None,
+            otel_exporter_otlp_endpoint: None,
+            otel_service_name: "test".into(),
+            gc_schedule: "0 0 * * * *".into(),
+            lifecycle_check_interval_secs: 60,
+            allow_local_admin_login: false,
+            max_upload_size_bytes: 10_737_418_240,
+            proxy_max_concurrent_fetches: 20,
+            proxy_max_artifact_size_bytes: 2_147_483_648,
+            proxy_queue_timeout_secs: 30,
+            metrics_port: None,
+            rate_limit_exempt_usernames: Vec::new(),
+            rate_limit_exempt_service_accounts: false,
+        };
+        Arc::new(AppState::new(config, pool, storage, registry))
+    }
+
+    #[tokio::test]
+    async fn test_recipe_file_upload_returns_414_for_overlong_segment() {
+        // PUT with a 300-char `name` segment must surface as a 4xx (414)
+        // before any DB call. This exercises the validate_conan_segments
+        // call site in `recipe_file_upload` (issue #990 sub-test #15).
+        use tower::ServiceExt;
+
+        let state = unit_test_state();
+        let app = router().with_state(state);
+
+        let long_name: String = "a".repeat(300);
+        let uri = format!(
+            "/some-repo/v2/conans/{}/1.0.0/_/_/revisions/rev/files/conanfile.py",
+            long_name
+        );
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .body(Body::from("dummy".as_bytes().to_vec()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::URI_TOO_LONG,
+            "300-char recipe path segment must return 414 before any DB call"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_package_file_upload_returns_414_for_overlong_segment() {
+        // PUT to the package-file route with a 300-char `package_id` must
+        // also short-circuit with a 414. Exercises the validate_conan_segments
+        // call site in `package_file_upload` (issue #990).
+        use tower::ServiceExt;
+
+        let state = unit_test_state();
+        let app = router().with_state(state);
+
+        let long_pkg_id: String = "p".repeat(300);
+        let uri = format!(
+            "/some-repo/v2/conans/zlib/1.3.1/_/_/revisions/rev/packages/{}/revisions/prev/files/conanfile.py",
+            long_pkg_id
+        );
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .body(Body::from("dummy".as_bytes().to_vec()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::URI_TOO_LONG,
+            "300-char package path segment must return 414 before any DB call"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ping_handler_propagates_repo_resolution_error() {
+        // GET /v2/ping must call `resolve_conan_repo` before returning the
+        // capability banner (issue #990 sub-test #12). With a lazy pool that
+        // cannot connect to PostgreSQL, the resolve call fails and the
+        // handler must propagate that as a 5xx — NOT a 200. This exercises
+        // the handler signature, the `?` propagation, and proves the
+        // capability banner is gated on repo resolution.
+        use tower::ServiceExt;
+
+        let state = unit_test_state();
+        let app = router().with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/some-repo/v2/ping")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // The exact status depends on how `map_db_err` shapes the response,
+        // but the contract that issue #990 requires is: ping does NOT return
+        // 200 when the repo cannot be resolved.
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "ping must not return 200 when repo resolution fails"
+        );
+        assert!(
+            resp.headers().get("X-Conan-Server-Capabilities").is_none(),
+            "capability banner must be gated on successful repo resolution"
+        );
     }
 }
