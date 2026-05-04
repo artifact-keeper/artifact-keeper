@@ -490,10 +490,26 @@ impl ScanResultService {
 
     /// Recalculate and materialize the security score for a repository.
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
-        // Count non-acknowledged findings by severity across all completed scans
-        // for this repository's artifacts.
+        // Count non-acknowledged findings by severity, but only from the
+        // LATEST completed scan per (artifact_id, scan_type) within the
+        // repository (#962). Without this restriction, rescanning the same
+        // artifact N times multiplied the repo's finding counts by N because
+        // every scan_results row owns its own set of scan_findings rows.
+        // legacy_unverified rows are excluded for the same reason as
+        // elsewhere (#994 / migration 075).
         let counts = sqlx::query!(
             r#"
+            WITH latest_scans AS (
+                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+                FROM scan_results sr
+                JOIN artifacts a ON a.id = sr.artifact_id
+                WHERE a.repository_id = $1
+                  AND NOT a.is_deleted
+                  AND sr.status = 'completed'
+                  AND sr.legacy_unverified = false
+                ORDER BY sr.artifact_id, sr.scan_type,
+                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
+            )
             SELECT
                 COUNT(*) FILTER (WHERE severity = 'critical' AND NOT is_acknowledged) as "critical!",
                 COUNT(*) FILTER (WHERE severity = 'high' AND NOT is_acknowledged) as "high!",
@@ -502,9 +518,7 @@ impl ScanResultService {
                 COUNT(*) FILTER (WHERE is_acknowledged) as "acknowledged!",
                 COUNT(*) as "total!"
             FROM scan_findings
-            WHERE artifact_id IN (
-                SELECT id FROM artifacts WHERE repository_id = $1 AND NOT is_deleted
-            )
+            WHERE scan_result_id IN (SELECT id FROM latest_scans)
             "#,
             repository_id,
         )
@@ -619,15 +633,38 @@ impl ScanResultService {
     }
 
     /// Get aggregate dashboard summary across all repositories.
+    ///
+    /// Finding counts are computed against the LATEST completed scan per
+    /// (artifact_id, scan_type), not the entire scan_results history (#962).
+    /// Without this filter, rescanning the same artifact 10 times would
+    /// inflate the dashboard's vulnerability count 10x because each rescan
+    /// inserts a fresh set of scan_findings rows. legacy_unverified rows
+    /// (#994 / migration 075) are excluded from the "latest scan" selection
+    /// for the same reason as elsewhere: they are silent-success rows that
+    /// must not be treated as authoritative.
     pub async fn get_dashboard_summary(&self) -> Result<DashboardSummary> {
         let summary = sqlx::query!(
             r#"
+            WITH latest_scans AS (
+                SELECT DISTINCT ON (artifact_id, scan_type) id
+                FROM scan_results
+                WHERE status = 'completed'
+                  AND legacy_unverified = false
+                ORDER BY artifact_id, scan_type,
+                         completed_at DESC NULLS LAST, created_at DESC
+            )
             SELECT
                 (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true) as "repos_with_scanning!",
                 (SELECT COUNT(*) FROM scan_results) as "total_scans!",
-                (SELECT COUNT(*) FROM scan_findings WHERE NOT is_acknowledged) as "total_findings!",
-                (SELECT COUNT(*) FROM scan_findings WHERE severity = 'critical' AND NOT is_acknowledged) as "critical_findings!",
-                (SELECT COUNT(*) FROM scan_findings WHERE severity = 'high' AND NOT is_acknowledged) as "high_findings!",
+                (SELECT COUNT(*) FROM scan_findings sf
+                  WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
+                    AND NOT sf.is_acknowledged) as "total_findings!",
+                (SELECT COUNT(*) FROM scan_findings sf
+                  WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
+                    AND sf.severity = 'critical' AND NOT sf.is_acknowledged) as "critical_findings!",
+                (SELECT COUNT(*) FROM scan_findings sf
+                  WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
+                    AND sf.severity = 'high' AND NOT sf.is_acknowledged) as "high_findings!",
                 (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A') as "repos_grade_a!",
                 (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F') as "repos_grade_f!"
             "#,

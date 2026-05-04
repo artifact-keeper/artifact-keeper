@@ -1,0 +1,56 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH latest_scans AS (\n                SELECT DISTINCT ON (artifact_id, scan_type) id\n                FROM scan_results\n                WHERE status = 'completed'\n                  AND legacy_unverified = false\n                ORDER BY artifact_id, scan_type,\n                         completed_at DESC NULLS LAST, created_at DESC\n            )\n            SELECT\n                (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true) as \"repos_with_scanning!\",\n                (SELECT COUNT(*) FROM scan_results) as \"total_scans!\",\n                (SELECT COUNT(*) FROM scan_findings sf\n                  WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)\n                    AND NOT sf.is_acknowledged) as \"total_findings!\",\n                (SELECT COUNT(*) FROM scan_findings sf\n                  WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)\n                    AND sf.severity = 'critical' AND NOT sf.is_acknowledged) as \"critical_findings!\",\n                (SELECT COUNT(*) FROM scan_findings sf\n                  WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)\n                    AND sf.severity = 'high' AND NOT sf.is_acknowledged) as \"high_findings!\",\n                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A') as \"repos_grade_a!\",\n                (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F') as \"repos_grade_f!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repos_with_scanning!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_scans!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_findings!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "critical_findings!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "high_findings!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "repos_grade_a!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "repos_grade_f!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "f38bd26bc4cd4e4c853fd397a0d86aa7b855c8d75880043c5fed45d4a4121885"
+}
