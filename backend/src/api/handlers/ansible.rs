@@ -583,4 +583,109 @@ mod tests {
         assert_eq!(metadata["version"], "1.0.0");
         assert_eq!(metadata["filename"], "testns-testcoll-1.0.0.tar.gz");
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    //
+    // No-op without DATABASE_URL; the CI coverage job seeds Postgres so
+    // these run there and instrument the refactored helper-call sites.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_ansible_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/download/missing-pkg-1.0.tar.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_download_serves_local_artifact() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "ansible/community-general-1.0.0.tar.gz",
+            "community-general/1.0.0/community-general-1.0.0.tar.gz",
+            "community-general",
+            "1.0.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"fake-tar"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/download/community-general-1.0.0.tar.gz",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"fake-tar");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_collection_info_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/v3/collections/none/missing/", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_upload_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_upload_remote_repo_405() {
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
 }

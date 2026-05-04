@@ -672,4 +672,112 @@ mod tests {
         );
         assert!(key.len() <= 2048);
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_huggingface_resolve_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/missing-model/resolve/main/missing.bin",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_resolve_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "huggingface/bert-base/main/config.json",
+            "bert-base/main/config.json",
+            "bert-base",
+            "main",
+            "application/json",
+            bytes::Bytes::from_static(b"{\"x\":1}"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/bert-base/resolve/main/config.json",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"{\"x\":1}");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_model_info_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) =
+            tdh::send(app, tdh::get(format!("/{}/api/models/missing", f.repo_key))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_upload_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/models/m/upload/main", f.repo_key))
+            .header("x-filename", "file.bin")
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_huggingface_upload_succeeds_for_local() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/models/my-model/upload/main", f.repo_key))
+            .header("x-filename", "weights.bin")
+            .body(axum::body::Body::from(vec![0u8; 16]))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CREATED,
+            "got {}",
+            status
+        );
+        f.teardown().await;
+    }
 }

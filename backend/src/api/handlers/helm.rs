@@ -533,4 +533,99 @@ mod tests {
             Some("https://charts.helm.sh/stable")
         );
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_helm_chart_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/missing-1.0.0.tgz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_helm_chart_download_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "helm/mychart/0.1.0/mychart-0.1.0.tgz",
+            "mychart/0.1.0/mychart-0.1.0.tgz",
+            "mychart",
+            "0.1.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"helm-chart"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/charts/mychart-0.1.0.tgz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"helm-chart");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_helm_upload_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::post(
+            format!("/{}/api/charts", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_helm_upload_remote_405() {
+        let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/api/charts", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_helm_index_yaml_empty_repo() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+        assert_eq!(status, StatusCode::OK);
+        f.teardown().await;
+    }
 }

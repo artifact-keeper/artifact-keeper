@@ -580,4 +580,267 @@ mod tests {
         assert_eq!(metadata["version"], "1.3.0");
         assert_eq!(metadata["is_binary"], false);
     }
+
+    // -----------------------------------------------------------------------
+    // write_dcf_record — DCF text formatter shared by source + binary index
+    // builders. Pure function, no DB or storage dependencies.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_dcf_record_no_depends() {
+        let mut out = String::new();
+        write_dcf_record(&mut out, "ggplot2", "3.4.0", None);
+        assert_eq!(out, "Package: ggplot2\nVersion: 3.4.0\n\n");
+    }
+
+    #[test]
+    fn test_write_dcf_record_with_depends() {
+        let mut out = String::new();
+        let meta = serde_json::json!({"depends": "R (>= 3.5.0)"});
+        write_dcf_record(&mut out, "dplyr", "1.1.0", Some(&meta));
+        assert_eq!(
+            out,
+            "Package: dplyr\nVersion: 1.1.0\nDepends: R (>= 3.5.0)\n\n"
+        );
+    }
+
+    #[test]
+    fn test_write_dcf_record_metadata_without_depends_field() {
+        let mut out = String::new();
+        let meta = serde_json::json!({"is_binary": false});
+        write_dcf_record(&mut out, "tidyr", "1.3.0", Some(&meta));
+        // `depends` missing → no `Depends:` line.
+        assert_eq!(out, "Package: tidyr\nVersion: 1.3.0\n\n");
+    }
+
+    #[test]
+    fn test_write_dcf_record_depends_must_be_string() {
+        let mut out = String::new();
+        // `depends` present but not a string → no `Depends:` line.
+        let meta = serde_json::json!({"depends": ["R", "tidyr"]});
+        write_dcf_record(&mut out, "x", "0.1", Some(&meta));
+        assert_eq!(out, "Package: x\nVersion: 0.1\n\n");
+    }
+
+    #[test]
+    fn test_write_dcf_record_appends_to_existing() {
+        let mut out = String::from("Package: prior\nVersion: 0.1\n\n");
+        write_dcf_record(&mut out, "next", "0.2", None);
+        assert!(out.starts_with("Package: prior\n"));
+        assert!(out.ends_with("Package: next\nVersion: 0.2\n\n"));
+    }
+
+    #[test]
+    fn test_write_dcf_record_blank_line_terminator() {
+        let mut out = String::new();
+        write_dcf_record(&mut out, "p", "1.0", None);
+        // Records are separated by a blank line for DCF parsers.
+        assert!(out.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_write_dcf_record_empty_version() {
+        let mut out = String::new();
+        write_dcf_record(&mut out, "noversion", "", None);
+        assert_eq!(out, "Package: noversion\nVersion: \n\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for download_package, upload_package, and
+    // build_source_index. Use the shared `test_db_helpers::Fixture` so this
+    // file does not duplicate the per-test scaffolding.
+    //
+    // No-op without DATABASE_URL; the CI coverage job seeds Postgres so
+    // these run there and instrument the refactored helper-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_cran_download_404_when_artifact_missing_local() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/missing_1.0.0.tar.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_download_serves_local_artifact_when_present() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/dplyr/1.1.0/dplyr_1.1.0.tar.gz",
+            "dplyr/1.1.0/dplyr_1.1.0.tar.gz",
+            "dplyr",
+            "1.1.0",
+            "application/x-gzip",
+            Bytes::from_static(b"fake-r-pkg"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/dplyr_1.1.0.tar.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"fake-r-pkg");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_rejects_unauthenticated() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::put(
+            format!("/{}/src/contrib/foo_1.0.tar.gz", f.repo_key),
+            Bytes::from_static(b"data"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_rejects_remote_repo() {
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/src/contrib/foo_1.0.tar.gz", f.repo_key),
+            Bytes::from_static(b"pkg"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_rejects_empty_body() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/src/contrib/foo_1.0.tar.gz", f.repo_key),
+            Bytes::new(),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_succeeds_for_hosted() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let body: Vec<u8> = vec![0u8; 32];
+        let req = tdh::put(
+            format!("/{}/src/contrib/dplyr_1.1.0.tar.gz", f.repo_key),
+            Bytes::from(body),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_conflict_returns_409() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app1 = f.router_with_auth(super::router());
+        let body1: Vec<u8> = vec![1u8; 16];
+        let req1 = tdh::put(
+            format!("/{}/src/contrib/dup_1.0.tar.gz", f.repo_key),
+            Bytes::from(body1),
+        );
+        assert_eq!(tdh::send(app1, req1).await.0, StatusCode::OK);
+
+        let app2 = f.router_with_auth(super::router());
+        let body2: Vec<u8> = vec![1u8; 16];
+        let req2 = tdh::put(
+            format!("/{}/src/contrib/dup_1.0.tar.gz", f.repo_key),
+            Bytes::from(body2),
+        );
+        let (status, _) = tdh::send(app2, req2).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_package_index_empty_repo() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_package_index_with_seeded_artifact() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let id = crate::api::handlers::proxy_helpers::insert_artifact(
+            &f.pool,
+            crate::api::handlers::proxy_helpers::NewArtifact {
+                repository_id: f.repo_id,
+                path: "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz",
+                name: "ggplot2",
+                version: "3.4.0",
+                size_bytes: 50,
+                checksum_sha256: "y",
+                content_type: "application/x-gzip",
+                storage_key: "cran/ggplot2/3.4.0/ggplot2_3.4.0.tar.gz",
+                uploaded_by: f.user_id,
+            },
+        )
+        .await
+        .expect("insert");
+        let meta = serde_json::json!({"depends": "R (>= 3.5.0)"});
+        crate::api::handlers::proxy_helpers::record_artifact_metadata(
+            &f.pool, id, f.repo_id, "cran", &meta,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Package: ggplot2"));
+        assert!(text.contains("Version: 3.4.0"));
+        assert!(text.contains("Depends: R (>= 3.5.0)"));
+        f.teardown().await;
+    }
 }

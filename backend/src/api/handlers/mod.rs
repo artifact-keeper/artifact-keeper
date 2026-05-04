@@ -86,6 +86,9 @@ pub fn escape_path_prefix(components: &[&str]) -> String {
 
 pub mod error_helpers;
 
+#[cfg(test)]
+pub(crate) mod test_db_helpers;
+
 pub mod admin;
 pub mod alpine;
 pub mod analytics;
@@ -279,5 +282,98 @@ mod tests {
     fn test_escape_path_prefix_empty_inputs() {
         assert_eq!(escape_path_prefix(&[]), "");
         assert_eq!(escape_path_prefix(&[""]), "/");
+    }
+
+    // -----------------------------------------------------------------------
+    // db_err — sqlx error → 500 plain-text response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_db_err_returns_500() {
+        let resp = db_err("connection refused");
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_db_err_accepts_string() {
+        let resp = db_err(String::from("query failed"));
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_db_err_accepts_anyhow_like_error() {
+        // Anything that implements Display works.
+        let err = std::io::Error::other("io failure");
+        let resp = db_err(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_db_err_body_includes_label_and_message() {
+        let resp = db_err("disk full");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.starts_with("Database error: "));
+        assert!(text.contains("disk full"));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_response — serde_json::Value → 200 JSON response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_response_status_ok() {
+        let v = serde_json::json!({"hello": "world"});
+        let resp = json_response(&v);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn test_json_response_sets_content_type_application_json() {
+        let v = serde_json::json!({"x": 1});
+        let resp = json_response(&v);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_response_body_serializes_value() {
+        let v = serde_json::json!({"name": "foo", "version": "1.0.0"});
+        let resp = json_response(&v);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["name"], "foo");
+        assert_eq!(parsed["version"], "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_json_response_array_value() {
+        let v = serde_json::json!([1, 2, 3]);
+        let resp = json_response(&v);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed[0], 1);
+        assert_eq!(parsed[1], 2);
+        assert_eq!(parsed[2], 3);
+    }
+
+    #[tokio::test]
+    async fn test_json_response_null_value() {
+        let v = serde_json::Value::Null;
+        let resp = json_response(&v);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, "null".as_bytes());
     }
 }

@@ -568,4 +568,106 @@ mod tests {
         assert_eq!(metadata["owner"], "puppetlabs");
         assert_eq!(metadata["module_name"], "stdlib");
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_puppet_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "puppet").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/v3/files/missing-mod-1.0.0.tar.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_puppet_download_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "puppet").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "puppet/puppetlabs-stdlib-9.0.0.tar.gz",
+            "puppetlabs-stdlib/9.0.0/puppetlabs-stdlib-9.0.0.tar.gz",
+            "puppetlabs-stdlib",
+            "9.0.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"puppet-tar"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/v3/files/puppetlabs-stdlib-9.0.0.tar.gz",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"puppet-tar");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_puppet_module_info_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "puppet").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/v3/modules/none-missing", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_puppet_publish_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "puppet").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::post(
+            format!("/{}/v3/releases", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_puppet_publish_to_remote_405() {
+        let Some(f) = tdh::Fixture::setup("remote", "puppet").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/v3/releases", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
 }

@@ -1562,4 +1562,121 @@ mod tests {
         assert!(xml.contains("<name>curl</name>"));
         assert!(xml.contains("ver=\"7.88.1\""));
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_rpm_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/packages/missing-1.0-1.x86_64.rpm", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_download_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rpm/curl/7.88.1/curl-7.88.1-1.x86_64.rpm",
+            "curl/7.88.1/curl-7.88.1-1.x86_64.rpm",
+            "curl",
+            "7.88.1",
+            "application/x-rpm",
+            bytes::Bytes::from_static(b"rpm-bytes"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/packages/curl-7.88.1-1.x86_64.rpm", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"rpm-bytes");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_upload_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::put(
+            format!("/{}/packages/foo-1.0-1.x86_64.rpm", f.repo_key),
+            bytes::Bytes::from_static(b"data"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_upload_remote_405() {
+        let Some(f) = tdh::Fixture::setup("remote", "rpm").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/packages/foo-1.0-1.x86_64.rpm", f.repo_key),
+            bytes::Bytes::from_static(b"data"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_upload_succeeds_for_local() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let body: Vec<u8> = vec![0u8; 32];
+        let req = tdh::put(
+            format!("/{}/packages/curl-8.0.1-1.x86_64.rpm", f.repo_key),
+            bytes::Bytes::from(body),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CREATED,
+            "got {}",
+            status
+        );
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rpm_upload_invalid_filename_400() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/packages/notarpm.txt", f.repo_key),
+            bytes::Bytes::from_static(b"data"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        f.teardown().await;
+    }
 }

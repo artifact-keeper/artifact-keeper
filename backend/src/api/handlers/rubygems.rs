@@ -889,4 +889,87 @@ mod tests {
         assert_eq!(parsed[0][1], "7.0.0");
         assert_eq!(parsed[0][2], "ruby");
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_rubygems_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/gems/missing-1.0.0.gem", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rubygems_download_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "rubygems/rails/7.0.0/rails-7.0.0.gem",
+            "rails/7.0.0/rails-7.0.0.gem",
+            "rails",
+            "7.0.0",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"gem-data"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/gems/rails-7.0.0.gem", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"gem-data");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rubygems_gem_info_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/v1/gems/missing", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rubygems_push_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/v1/gems", f.repo_key))
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
 }

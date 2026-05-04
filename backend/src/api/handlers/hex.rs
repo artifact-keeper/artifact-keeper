@@ -1448,4 +1448,84 @@ mod tests {
         assert_eq!(result[1]["name"], "jason");
         assert_eq!(result[2]["name"], "zlib");
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_hex_tarball_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/missing-1.0.0.tar", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_hex_tarball_download_serves_local() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "hex/jason/1.4.1/jason-1.4.1.tar",
+            "jason/1.4.1/jason-1.4.1.tar",
+            "jason",
+            "1.4.1",
+            "application/octet-stream",
+            bytes::Bytes::from_static(b"hex-tar"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/tarballs/jason-1.4.1.tar", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"hex-tar");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_hex_package_info_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) =
+            tdh::send(app, tdh::get(format!("/{}/packages/missing", f.repo_key))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_hex_publish_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "hex").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/publish", f.repo_key))
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
 }
