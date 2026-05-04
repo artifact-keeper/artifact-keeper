@@ -17,7 +17,8 @@
 #   Docker Hub:         artifactkeeper/{backend,web,openscap}
 #
 # To use Docker Hub instead, replace image references below. For example:
-#   ghcr.io/artifact-keeper/artifact-keeper-backend:latest  ->  artifactkeeper/backend:latest
+#   ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
+#     -> artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
 #
 # Pin a specific release by setting ARTIFACT_KEEPER_VERSION in a .env file
 # alongside this compose file (e.g. ARTIFACT_KEEPER_VERSION=1.1.0). Omit the
@@ -103,6 +104,7 @@ services:
   # Changes the default Dependency-Track password and extracts an API key so
   # the backend can submit SBOMs automatically. Writes the key to a shared
   # volume that the backend reads at startup.
+  # Docker Hub alternative: artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
   dtrack-init:
     image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
     container_name: artifact-keeper-dtrack-init
@@ -122,6 +124,7 @@ services:
   # ---------------------------------------------------------------------------
   # The core Artifact Keeper service. Handles all API requests, package format
   # protocols, storage, and integrations with scanners.
+  # Docker Hub alternative: artifactkeeper/backend:${ARTIFACT_KEEPER_VERSION:-latest}
   #
   # Key environment variables to review for your deployment:
   #   JWT_SECRET        - MUST be changed for production (use a random 32+ char string)
@@ -132,7 +135,7 @@ services:
   # For S3-compatible object storage, set S3_BUCKET, S3_REGION, S3_ACCESS_KEY,
   # S3_SECRET_KEY, and STORAGE_BACKEND=s3. See .env.example for all options.
   backend:
-    image: ghcr.io/artifact-keeper/artifact-keeper-backend:latest  # or artifactkeeper/backend:latest
+    image: ghcr.io/artifact-keeper/artifact-keeper-backend:${ARTIFACT_KEEPER_VERSION:-latest}
     container_name: artifact-keeper-backend
     depends_on:
       postgres:
