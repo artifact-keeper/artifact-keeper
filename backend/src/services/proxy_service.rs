@@ -119,6 +119,31 @@ impl ProxyService {
         self.get_cached_artifact(&cache_key, &metadata_key).await
     }
 
+    /// Metadata-only freshness check for a proxy-cached artifact.
+    ///
+    /// Loads only the cache metadata sidecar (small JSON) and verifies that
+    /// the underlying content object exists in the storage backend. Does
+    /// NOT download the cached body, which is the whole point of a
+    /// metadata-only probe before issuing a presigned redirect (#1018).
+    ///
+    /// Returns `true` only when both:
+    ///   * the metadata exists and has not expired, and
+    ///   * the content object exists in the backing storage.
+    pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
+        let cache_key = Self::cache_storage_key(repo_key, path);
+        let metadata_key = Self::cache_metadata_key(repo_key, path);
+
+        let Ok(Some(metadata)) = self.load_cache_metadata(&metadata_key).await else {
+            return false;
+        };
+        if Utc::now() > metadata.expires_at {
+            return false;
+        }
+        // exists() is a HEAD-equivalent on cloud backends and does not pull
+        // the object body into memory.
+        matches!(self.storage.exists(&cache_key).await, Ok(true))
+    }
+
     /// Fetch artifact from upstream, but use `cache_path` instead of
     /// `fetch_path` when reading and writing the proxy cache.
     ///
