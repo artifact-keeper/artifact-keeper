@@ -137,8 +137,13 @@ fi
 API_KEY=$(echo "$KEY_RESP" | jq -r '.key // empty')
 
 if [ -z "$API_KEY" ]; then
+  # Do NOT log $KEY_RESP — if the schema ever moves .key (e.g. to .data.key)
+  # the unmasked secret is in that body and would leak to log aggregation.
+  # Log only structural diagnostics.
   echo "[dtrack-init] ERROR: Could not extract .key from create-key response" >&2
-  echo "[dtrack-init] Response was: $KEY_RESP" >&2
+  echo "[dtrack-init] Response length: ${#KEY_RESP} bytes" >&2
+  RESP_KEYS=$(echo "$KEY_RESP" | jq -r 'keys // []' 2>/dev/null || echo '<not-json>')
+  echo "[dtrack-init] Response top-level keys: $RESP_KEYS" >&2
   exit 1
 fi
 

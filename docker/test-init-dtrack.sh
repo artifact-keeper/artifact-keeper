@@ -58,7 +58,13 @@ EXISTING_PUBLIC_ID = "abc123"
 
 # Track which key public_ids currently exist on the team. Starts with the
 # pre-provisioned masked one; deletes remove it; create-key adds new ones.
-state = {"keys": [{"publicId": EXISTING_PUBLIC_ID, "maskedKey": MASKED_KEY}]}
+# post_key_count tracks how many times POST /key was hit so the test can
+# prove the rotation path actually fired across multiple init runs.
+state = {
+    "keys": [{"publicId": EXISTING_PUBLIC_ID, "maskedKey": MASKED_KEY}],
+    "post_key_count": 0,
+}
+KEY_LOG = os.environ["KEY_LOG"]
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a, **k):
@@ -99,11 +105,18 @@ class H(BaseHTTPRequestHandler):
                               ctype="text/plain")
         if self.path == f"/api/v1/team/{TEAM_UUID}/key":
             # DT 4.x: POST returns the unmasked key once.
-            new = {"publicId": "newpub42",
-                   "maskedKey": "odt_********KEY42",
-                   "key": EXPECTED_KEY}
+            # Each POST mints a unique key so the test can verify rotation
+            # actually produced a different value on subsequent runs.
+            state["post_key_count"] += 1
+            n = state["post_key_count"]
+            unmasked = f"{EXPECTED_KEY}_run{n}"
+            new = {"publicId": f"newpub{n}",
+                   "maskedKey": f"odt_********KEY{n}",
+                   "key": unmasked}
             state["keys"].append({"publicId": new["publicId"],
                                   "maskedKey": new["maskedKey"]})
+            with open(KEY_LOG, "a") as f:
+                f.write(unmasked + "\n")
             return self._send(201, json.dumps(new).encode())
         if self.path == "/api/v1/configProperty":
             return self._send(200)
@@ -122,7 +135,9 @@ port = int(sys.argv[1])
 HTTPServer(("127.0.0.1", port), H).serve_forever()
 PYEOF
 
-EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" \
+KEY_LOG="$WORK_DIR/keys.log"
+: > "$KEY_LOG"
+EXPECTED_KEY="$EXPECTED_KEY" MASKED_KEY="$MASKED_KEY" KEY_LOG="$KEY_LOG" \
   python3 "$WORK_DIR/mock_dtrack.py" "$MOCK_PORT" >"$WORK_DIR/mock.log" 2>&1 &
 MOCK_PID=$!
 
@@ -165,19 +180,41 @@ fail() {
 # Assertion 2: API key file exists and is non-empty
 [ -s "$KEY_FILE" ] || fail "$KEY_FILE missing or empty"
 
-# Assertion 3: contents are the unmasked key (not the masked one).
-GOT="$(tr -d '\n' < "$KEY_FILE")"
-[ "$GOT" = "$EXPECTED_KEY" ] || \
-  fail "API key file contents '$GOT' != expected '$EXPECTED_KEY'"
+# Assertion 3: contents are the unmasked key from the first POST /key call
+# (not the masked one). The mock mints "<EXPECTED_KEY>_run<N>" per POST.
+FIRST_KEY="$(tr -d '\n' < "$KEY_FILE")"
+EXPECTED_FIRST="${EXPECTED_KEY}_run1"
+[ "$FIRST_KEY" = "$EXPECTED_FIRST" ] || \
+  fail "API key file contents '$FIRST_KEY' != expected '$EXPECTED_FIRST'"
 
-# Assertion 4: Idempotence — re-running the script must not error and must
-# leave a usable key file in place. (Existing-file short-circuit is fine.)
+# Assertion 4a: Idempotence (warm start) — re-running with the marker
+# present must short-circuit cleanly without re-hitting POST /key.
 set +e
 DEPENDENCY_TRACK_URL="$MOCK_URL" \
   "$SANDBOXED" > "$WORK_DIR/init2.out" 2> "$WORK_DIR/init2.err"
 INIT_RC2=$?
 set -e
-[ "$INIT_RC2" -eq 0 ] || fail "second run exited $INIT_RC2 (expected 0)"
-[ -s "$KEY_FILE" ]    || fail "$KEY_FILE missing after second run"
+[ "$INIT_RC2" -eq 0 ] || fail "warm second run exited $INIT_RC2 (expected 0)"
+[ -s "$KEY_FILE" ]    || fail "$KEY_FILE missing after warm second run"
+
+# Assertion 4b: Cold-start rotation — wipe the marker and re-run. This is
+# the path the bug fix actually targets: DELETE old key + POST new key.
+# The new file must be non-empty AND differ from the first key, proving
+# rotation fired. Also assert the mock saw POST /key at least twice.
+rm -f "$KEY_FILE"
+set +e
+DEPENDENCY_TRACK_URL="$MOCK_URL" \
+  "$SANDBOXED" > "$WORK_DIR/init3.out" 2> "$WORK_DIR/init3.err"
+INIT_RC3=$?
+set -e
+[ "$INIT_RC3" -eq 0 ] || fail "cold-start rerun exited $INIT_RC3 (expected 0)"
+[ -s "$KEY_FILE" ]    || fail "$KEY_FILE missing after cold-start rerun"
+SECOND_KEY="$(tr -d '\n' < "$KEY_FILE")"
+[ "$SECOND_KEY" != "$FIRST_KEY" ] || \
+  fail "rotation did not fire: second key '$SECOND_KEY' equals first '$FIRST_KEY'"
+POST_COUNT=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$POST_COUNT" -ge 2 ] || \
+  fail "expected POST /key >=2 across runs, mock saw $POST_COUNT"
+echo "[test] rotation path fired: ${FIRST_KEY} -> ${SECOND_KEY} (POST /key count=${POST_COUNT})"
 
 echo "PASS: init-dtrack.sh writes unmasked Automation API key from POST /key"
