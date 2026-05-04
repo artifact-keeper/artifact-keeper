@@ -540,9 +540,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "639c29815925a5ff2fb11dc6f439faa264852991e49045a1369bdce3e53f330c"
+checksum = "d8d7fa82e5a4437e4766511843d661355af8005b30576db52b96b595865353dc"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -560,9 +560,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-c14n"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "827ebdf4f369f70c5c4401e30d381147c7fdc9ff00e540f85a1c41c89fcc21ed"
+checksum = "5d5802757aa34889959a88721cf22044fb13ab3b3fae556bfc94d3679f74d2b6"
 dependencies = [
  "bergshamra-core",
  "bergshamra-xml",
@@ -571,18 +571,18 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-core"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b204c2ccef3c8d51ecb685de865e9fdbb76af11792435cccd4b697a2fb12818"
+checksum = "9de25efa9a8386aad3d17cfd029277ae8ccb917475848eb66d6bf72c6a70ad75"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "bergshamra-crypto"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d8e2300454122717ab0d5d540f59aafcfaefc7b10ae9b62f65f1a446e214c"
+checksum = "7486bf4a51a6277de8b8f3979c43151ffed8c6636381b84b4825e19ca803884d"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -596,6 +596,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "hmac 0.12.1",
+ "kryptering",
  "md-5",
  "ml-dsa",
  "num-bigint-dig",
@@ -620,9 +621,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-dsig"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05a528ca5bb00770a8c0e5ad347603abc8bec9f7d2d0eb36cc164963e6896180"
+checksum = "79a4f0a9ec25c1a804dbb717ecf47da4579d41e35a0db127d83c29396fc79290"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -634,6 +635,7 @@ dependencies = [
  "der 0.7.10",
  "dsa",
  "ed25519-dalek",
+ "kryptering",
  "p256",
  "p384",
  "p521",
@@ -644,9 +646,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-enc"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d688af28d31730037363a5459cd9c9763095ee1464a9795a52b3907944006cf"
+checksum = "41620927810588fc9155932f1020fd501d8b658a2a4831e56333748a49ee647e"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -655,6 +657,7 @@ dependencies = [
  "bergshamra-keys",
  "bergshamra-transforms",
  "bergshamra-xml",
+ "kryptering",
  "p256",
  "p384",
  "p521",
@@ -664,9 +667,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-keys"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98e9fc659292660af63ef4f1e407449e591bc85da84c3cff86f6ff52625b3d8f"
+checksum = "5c4b1a745bef9d6ea50a8ed8145d364a85892a8b2e5a499b9435089b14df167b"
 dependencies = [
  "base64",
  "bergshamra-core",
@@ -696,6 +699,7 @@ dependencies = [
  "signature 2.2.0",
  "slh-dsa",
  "spki 0.7.3",
+ "tsp-ltv",
  "uppsala",
  "x25519-dalek",
  "x509-cert",
@@ -703,9 +707,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-pkcs12"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1877c79eb896cba65d8fa1c1099da26da6e14fb1d4a7a851f12dfefca4ce083"
+checksum = "9d46759b4868e86830544904e1d15ae061bc387384c7a806703096fb51e380c5"
 dependencies = [
  "aes",
  "bergshamra-core",
@@ -721,9 +725,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-transforms"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "396d95a7b243f7f2e479b2119591c3547c85f61613012a126f984b9a7eae8f2a"
+checksum = "e467a1622d7fe18fc784f19d2ba0355dc82d2d425c90b2269c10361dc9b8e88a"
 dependencies = [
  "base64",
  "bergshamra-c14n",
@@ -736,9 +740,9 @@ dependencies = [
 
 [[package]]
 name = "bergshamra-xml"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "728be7c1ce772d87807d1727b3b32726b5850f20a004e962b7d3ccff26cb01ba"
+checksum = "644aeb454e2791fd16ce90db48a9175a2a464991dc76022e1ca7503815c79772"
 dependencies = [
  "bergshamra-core",
  "uppsala",
@@ -758,6 +762,12 @@ name = "bit-vec"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
+
+[[package]]
+name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
@@ -1068,6 +1078,18 @@ name = "cmov"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de0758edba32d61d1fd9f4d69491b47604b91ee2f7e6b33de7e54ca4ebe55dc3"
+
+[[package]]
+name = "cms"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b77c319abfd5219629c45c34c89ba945ed3c5e49fcde9d16b6c3885f118a730"
+dependencies = [
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "spki 0.7.3",
+ "x509-cert",
+]
 
 [[package]]
 name = "cobs"
@@ -1453,6 +1475,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77727bb15fa921304124b128af125e7e3b968275d1b108b379190264f4423710"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "cryptoki"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60d645cc2c5faf466571c0c752d39d8fbc2746773b2f043ac8f9cd73bec55db9"
+dependencies = [
+ "bitflags 1.3.2",
+ "cryptoki-sys",
+ "libloading",
+ "log",
+ "paste",
+ "secrecy",
+]
+
+[[package]]
+name = "cryptoki-sys"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "750380200f47d4ff677be725b6e0d78b590e1d0343573dcd4b62147f25dc6efa"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -2263,7 +2308,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27d12c0aed7f1e24276a241aadc4cb8ea9f83000f34bc062b7cc2d51e3b0fabd"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "debugid",
  "fxhash",
  "serde",
@@ -2351,7 +2396,7 @@ version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "libc",
  "libgit2-sys",
  "log",
@@ -3015,6 +3060,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "kryptering"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec2448476edac64a0fed5f3dc93a8ce0298711e6e3e856908c3b5ef2fe26464c"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "aes-kw",
+ "cbc",
+ "cryptoki",
+ "des",
+ "digest 0.10.7",
+ "dsa",
+ "ecdsa",
+ "ed25519-dalek",
+ "hkdf",
+ "hmac 0.12.1",
+ "md-5",
+ "ml-dsa",
+ "num-bigint-dig",
+ "num-traits",
+ "p256",
+ "p384",
+ "p521",
+ "pbkdf2",
+ "pkcs8 0.11.0-rc.11",
+ "rand 0.8.5",
+ "ripemd",
+ "rsa",
+ "sha1",
+ "sha2 0.10.9",
+ "sha3 0.10.8",
+ "signature 2.2.0",
+ "slh-dsa",
+ "thiserror 2.0.18",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3123,6 +3207,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
+dependencies = [
+ "cfg-if",
+ "winapi",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3144,7 +3238,7 @@ version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d0b95e02c851351f877147b7deea7b1afb1df71b63aa5f8270716e0c5720616"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "libc",
  "redox_syscall 0.7.0",
 ]
@@ -3709,7 +3803,7 @@ version = "0.10.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f38c4372413cdaaf3cc79dd92d29d7d9f5ab09b51b10dded508fb90bb70b9222"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "cfg-if",
  "foreign-types",
  "libc",
@@ -4057,7 +4151,7 @@ version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97baced388464909d42d89643fe4361939af9b7ce7a31ee32a168f832a70f2a0"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "crc32fast",
  "fdeflate",
  "flate2",
@@ -4462,7 +4556,7 @@ version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
 ]
 
 [[package]]
@@ -4491,7 +4585,7 @@ version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
 ]
 
 [[package]]
@@ -4500,7 +4594,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49f3fe0889e69e2ae9e41f4d6c4c0181701d00e4697b356fb1f74173a5e0ee27"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
 ]
 
 [[package]]
@@ -4825,7 +4919,7 @@ version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
@@ -4838,7 +4932,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
@@ -5026,12 +5120,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "secrecy"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3297343eaf830f66ede390ea39da1d462b6b0c1b000f420d0a83f898bbbe6ef"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
@@ -5479,7 +5582,7 @@ checksum = "aa003f0038df784eb8fecbbac13affe3da23b45194bd57dba231c8f48199c526"
 dependencies = [
  "atoi",
  "base64",
- "bitflags",
+ "bitflags 2.10.0",
  "byteorder",
  "bytes",
  "chrono",
@@ -5523,7 +5626,7 @@ checksum = "db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46"
 dependencies = [
  "atoi",
  "base64",
- "bitflags",
+ "bitflags 2.10.0",
  "byteorder",
  "chrono",
  "crc",
@@ -5646,7 +5749,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "core-foundation 0.9.4",
  "system-configuration-sys",
 ]
@@ -5667,7 +5770,7 @@ version = "0.27.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4592f674ce18521c2a81483873a49596655b179f71c5e05d10c1fe66c78745"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "cap-fs-ext",
  "cap-std",
  "fd-lock",
@@ -6119,7 +6222,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
  "async-compression",
- "bitflags",
+ "bitflags 2.10.0",
  "bytes",
  "futures-core",
  "futures-util",
@@ -6258,6 +6361,37 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tsp-ltv"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "072e18abb3fbc096b1c607cbb3eefffda07430f226c1a4cf8a9411185bc004d9"
+dependencies = [
+ "base64",
+ "chrono",
+ "cms",
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "digest 0.10.7",
+ "ecdsa",
+ "ed25519-dalek",
+ "hex",
+ "log",
+ "md-5",
+ "p256",
+ "p384",
+ "p521",
+ "pem-rfc7468",
+ "rsa",
+ "sha1",
+ "sha2 0.10.9",
+ "sha3 0.10.8",
+ "signature 2.2.0",
+ "spki 0.7.3",
+ "thiserror 2.0.18",
+ "x509-cert",
+]
 
 [[package]]
 name = "typed-path"
@@ -6674,7 +6808,7 @@ version = "0.236.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9b1e81f3eb254cf7404a82cee6926a4a3ccc5aad80cc3d43608a070c67aa1d7"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "hashbrown 0.15.5",
  "indexmap 2.13.0",
  "semver",
@@ -6687,7 +6821,7 @@ version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "hashbrown 0.15.5",
  "indexmap 2.13.0",
  "semver",
@@ -6713,7 +6847,7 @@ dependencies = [
  "addr2line",
  "anyhow",
  "async-trait",
- "bitflags",
+ "bitflags 2.10.0",
  "bumpalo",
  "cc",
  "cfg-if",
@@ -6966,7 +7100,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eeb3d8e4efdaae10aa01264e9946bba507e53707125dd0aa8584b5e13229a3c0"
 dependencies = [
  "anyhow",
- "bitflags",
+ "bitflags 2.10.0",
  "heck",
  "indexmap 2.13.0",
  "wit-parser 0.236.1",
@@ -6980,7 +7114,7 @@ checksum = "86fffc455304d2750ea2456394cdf6513d8771eb5b256876685b8bb9413bfb0e"
 dependencies = [
  "anyhow",
  "async-trait",
- "bitflags",
+ "bitflags 2.10.0",
  "bytes",
  "cap-fs-ext",
  "cap-net-ext",
@@ -7118,7 +7252,7 @@ checksum = "4e176546937d1311c7608276c8511d3ea9b8e7b916e89b720e12c4d4bbae067c"
 dependencies = [
  "anyhow",
  "async-trait",
- "bitflags",
+ "bitflags 2.10.0",
  "thiserror 2.0.18",
  "tracing",
  "wasmtime",
@@ -7269,7 +7403,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "193cae8e647981c35bc947fdd57ba7928b1fa0d4a79305f6dd2dc55221ac35ac"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "widestring",
  "windows-sys 0.59.0",
 ]
@@ -7604,7 +7738,7 @@ version = "0.36.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
- "bitflags",
+ "bitflags 2.10.0",
  "windows-sys 0.59.0",
 ]
 
@@ -7689,7 +7823,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d66ea20e9553b30172b5e831994e35fbde2d165325bec84fc43dbf6f4eb9cb2"
 dependencies = [
  "anyhow",
- "bitflags",
+ "bitflags 2.10.0",
  "indexmap 2.13.0",
  "log",
  "serde",
