@@ -139,6 +139,16 @@ RUN rm -rf /mnt/rootfs/var/cache/* /mnt/rootfs/var/log/* /mnt/rootfs/tmp/*
 FROM ghcr.io/aquasecurity/trivy:0.70.0 AS trivy-bin
 FROM ghcr.io/anchore/grype:v0.111.1 AS grype-bin
 
+# ---------- Stage 5b: Pre-seed the Grype vulnerability DB ----------
+# Populates the Grype DB at build time so the image works on egress-restricted
+# networks (e.g. ARC runner pods) without a first-scan network fetch from
+# grype.anchore.io. See artifact-keeper#1001.
+FROM alpine:3.23 AS grype-db-seed
+RUN apk add --no-cache ca-certificates
+COPY --from=grype-bin /grype /usr/local/bin/grype
+ENV GRYPE_DB_CACHE_DIR=/grype-db
+RUN mkdir -p /grype-db && grype db update && grype db status
+
 # ---------- Stage 6: UBI 9 Micro runtime ----------
 FROM registry.access.redhat.com/ubi9/ubi-micro:9.7
 
@@ -148,6 +158,9 @@ COPY --from=rootfs-builder /mnt/rootfs /
 # Copy scanner CLIs from official images
 COPY --from=trivy-bin /usr/local/bin/trivy /usr/local/bin/
 COPY --from=grype-bin /grype /usr/local/bin/
+
+# Pre-seeded Grype vulnerability DB (avoids first-scan network fetch)
+COPY --from=grype-db-seed --chown=1001:0 /grype-db /home/artifact/.cache/grype
 
 # Copy application binary
 COPY --from=builder /app/target/release/artifact-keeper /usr/local/bin/
@@ -159,6 +172,7 @@ ENV RUST_LOG=info \
     DATABASE_URL=set-database-url-at-runtime \
     STORAGE_PATH=/data/storage \
     BACKUP_PATH=/data/backups \
+    GRYPE_DB_CACHE_DIR=/home/artifact/.cache/grype \
     HOST=0.0.0.0 \
     PORT=8080
 
