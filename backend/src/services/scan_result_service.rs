@@ -193,16 +193,27 @@ impl ScanResultService {
         // Get source scan counts
         let source = self.get_scan(source_scan_id).await?;
 
-        // Create new scan result marked as reused
+        // Create new scan result marked as reused.
+        //
+        // Provenance fields propagate from the source scan so the dedup-copy
+        // row honors the PR #1006 invariant ("every newly-completed scan has
+        // scanner_version set going forward") and so migration 075's
+        // `IS NULL` legacy criterion stays accurate. `started_at` and
+        // `completed_at` are copied from the source for honest measurement:
+        // the reused row reflects when the original scan actually executed,
+        // which is more useful than NOW()/NOW() (the latter would suggest
+        // an instantaneous scan that never really happened). The dedup
+        // event itself is recoverable from `created_at`, which Postgres
+        // sets at INSERT time, plus `is_reused` and `source_scan_id`.
         let new_scan = sqlx::query_as!(
             ScanResult,
             r#"
             INSERT INTO scan_results (
                 artifact_id, repository_id, scan_type, status, started_at, completed_at,
                 findings_count, critical_count, high_count, medium_count, low_count, info_count,
-                checksum_sha256, source_scan_id, is_reused
+                scanner_version, checksum_sha256, source_scan_id, is_reused
             )
-            VALUES ($1, $2, $3, 'completed', NOW(), NOW(), $4, $5, $6, $7, $8, $9, $10, $11, true)
+            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)
             RETURNING id, artifact_id, repository_id, scan_type, status,
                       findings_count, critical_count, high_count, medium_count, low_count, info_count,
                       scanner_version, error_message, started_at, completed_at, created_at,
@@ -211,12 +222,15 @@ impl ScanResultService {
             artifact_id,
             repository_id,
             scan_type,
+            source.started_at,
+            source.completed_at,
             source.findings_count,
             source.critical_count,
             source.high_count,
             source.medium_count,
             source.low_count,
             source.info_count,
+            source.scanner_version,
             checksum_sha256,
             source_scan_id,
         )
@@ -360,7 +374,15 @@ impl ScanResultService {
         Ok(updated)
     }
 
-    /// Mark a scan as completed with severity counts.
+    /// Mark a scan as completed with severity counts and provenance.
+    ///
+    /// `scanner_version` is the binary version that produced the report
+    /// (e.g. `trivy-0.62.1`). `started_at` is the wall-clock timestamp of
+    /// when the scanner subprocess was kicked off (captured by the
+    /// orchestrator just before invoking `Scanner::scan`). Both fields are
+    /// persisted so consumers (E2E tests, operators) can verify a scan
+    /// actually ran and reproduce its result against the same scanner
+    /// version. See issue #902.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_scan(
         &self,
@@ -371,13 +393,17 @@ impl ScanResultService {
         medium: i32,
         low: i32,
         info: i32,
+        scanner_version: Option<&str>,
+        started_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
         sqlx::query!(
             r#"
             UPDATE scan_results
             SET status = 'completed', findings_count = $2,
                 critical_count = $3, high_count = $4, medium_count = $5,
-                low_count = $6, info_count = $7, completed_at = NOW()
+                low_count = $6, info_count = $7, completed_at = NOW(),
+                scanner_version = COALESCE($8, scanner_version),
+                started_at = $9
             WHERE id = $1
             "#,
             scan_id,
@@ -387,6 +413,8 @@ impl ScanResultService {
             medium,
             low,
             info,
+            scanner_version,
+            started_at,
         )
         .execute(&self.db)
         .await
@@ -395,16 +423,30 @@ impl ScanResultService {
         Ok(())
     }
 
-    /// Mark a scan as failed with an error message.
-    pub async fn fail_scan(&self, scan_id: Uuid, error: &str) -> Result<()> {
+    /// Mark a scan as failed with an error message and (when known) the
+    /// scanner binary version + start timestamp. `scanner_version` is
+    /// `None` when the scanner crashed before its version could be
+    /// captured (e.g. binary missing); `started_at` is always set to when
+    /// the orchestrator kicked off the scan attempt.
+    pub async fn fail_scan(
+        &self,
+        scan_id: Uuid,
+        error: &str,
+        scanner_version: Option<&str>,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
         sqlx::query!(
             r#"
             UPDATE scan_results
-            SET status = 'failed', error_message = $2, completed_at = NOW()
+            SET status = 'failed', error_message = $2, completed_at = NOW(),
+                scanner_version = COALESCE($3, scanner_version),
+                started_at = $4
             WHERE id = $1
             "#,
             scan_id,
             error,
+            scanner_version,
+            started_at,
         )
         .execute(&self.db)
         .await

@@ -10,14 +10,24 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
+    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
 };
+
+/// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
+/// Used by `Scanner::version()` to capture the running `oscap` binary
+/// version for `scan_results.scanner_version`.
+#[derive(Debug, Deserialize)]
+struct OpenScapHealth {
+    #[serde(default)]
+    version: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // OpenSCAP wrapper JSON response structures
@@ -54,6 +64,10 @@ pub struct OpenScapScanner {
     openscap_url: String,
     profile: String,
     scan_workspace: String,
+    /// Lazily-probed version string from the wrapper sidecar's `/health`
+    /// endpoint, e.g. `openscap-1.4.0`. Cached for the scanner's lifetime
+    /// so we do not GET `/health` on every scan.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl OpenScapScanner {
@@ -68,6 +82,34 @@ impl OpenScapScanner {
             openscap_url,
             profile,
             scan_workspace,
+            cached_version: OnceCell::new(),
+        }
+    }
+
+    /// Probe the OpenSCAP wrapper's `/health` endpoint to capture the
+    /// running `oscap` binary version. Returns `None` on any error so the
+    /// scan still completes; the version is metadata, not a scan result.
+    async fn probe_version(&self) -> Option<String> {
+        let url = format!("{}/health", self.openscap_url);
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let health: OpenScapHealth = resp.json().await.ok()?;
+        let raw = health.version?;
+        // `oscap --version` first line is e.g. `OpenSCAP command line tool
+        // (oscap) 1.4.0`. Capture just the version token for compactness.
+        let token = raw.split_whitespace().last()?.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(format!("openscap-{}", token))
         }
     }
 
@@ -181,6 +223,16 @@ impl Scanner for OpenScapScanner {
 
     fn scan_type(&self) -> &str {
         "openscap"
+    }
+
+    /// Probe the wrapper sidecar's `/health` endpoint once and cache the
+    /// `oscap` version string. Returns `None` if the wrapper is unreachable
+    /// or its response cannot be parsed.
+    async fn version(&self) -> Option<String> {
+        cached_cli_version(&self.cached_version, || async {
+            self.probe_version().await
+        })
+        .await
     }
 
     async fn scan(
@@ -349,5 +401,134 @@ mod tests {
 
         let result = scanner.scan(&artifact, None, &content).await;
         assert_scan_failed(&result, "OpenSCAP scan");
+    }
+
+    /// Build an `OpenScapScanner` pointing at `url`, using a fresh tempdir
+    /// for the scan workspace. The returned `_dir` guard must be kept
+    /// in scope for the test's lifetime so the directory is not dropped.
+    fn make_probe_scanner(url: String) -> (OpenScapScanner, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = OpenScapScanner::new(
+            url,
+            "standard".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        (scanner, dir)
+    }
+
+    /// Mount a `GET /health` mock on `server` that responds with `template`,
+    /// matching the openscap wrapper sidecar's healthcheck route.
+    async fn mount_health_mock(
+        server: &wiremock::MockServer,
+        template: wiremock::ResponseTemplate,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/health"))
+            .respond_with(template)
+            .mount(server)
+            .await;
+    }
+
+    /// `probe_version` returns `Some("openscap-<ver>")` when the wrapper's
+    /// `/health` endpoint responds 200 with a `version` field shaped like
+    /// the real `oscap --version` first line. This is the happy path the
+    /// orchestrator relies on for `scan_results.scanner_version`.
+    #[tokio::test]
+    async fn test_probe_version_success() {
+        let server = wiremock::MockServer::start().await;
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"version": "OpenSCAP command line tool (oscap) 1.4.0"}),
+            ),
+        )
+        .await;
+
+        let (scanner, _dir) = make_probe_scanner(server.uri());
+        let v = scanner.version().await;
+        assert_eq!(v, Some("openscap-1.4.0".to_string()));
+
+        // Second call must hit the cache, not the server. Wiremock would
+        // accept additional calls silently, so we instead assert the value
+        // is stable across two awaits. The cache populated above must not
+        // be re-run.
+        let v2 = scanner.version().await;
+        assert_eq!(v, v2);
+    }
+
+    /// `probe_version` returns `None` when the wrapper responds with a
+    /// non-2xx status (e.g. 503 during sidecar startup). The scan must
+    /// still proceed; the version field is metadata, not load-bearing.
+    #[tokio::test]
+    async fn test_probe_version_non_success_status_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        mount_health_mock(&server, wiremock::ResponseTemplate::new(503)).await;
+
+        let (scanner, _dir) = make_probe_scanner(server.uri());
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the response body cannot be
+    /// parsed as the expected JSON shape. Defensive: a misconfigured
+    /// reverse proxy might return HTML.
+    #[tokio::test]
+    async fn test_probe_version_malformed_body_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("<html>not json</html>")
+                .insert_header("content-type", "text/html"),
+        )
+        .await;
+
+        let (scanner, _dir) = make_probe_scanner(server.uri());
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the JSON is well-formed but the
+    /// `version` field is absent or null. The wrapper's health response
+    /// schema explicitly defaults this field to None.
+    #[tokio::test]
+    async fn test_probe_version_missing_field_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+        )
+        .await;
+
+        let (scanner, _dir) = make_probe_scanner(server.uri());
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the version field is present
+    /// but contains only whitespace. The token extraction
+    /// (`split_whitespace().last()`) yields nothing, so the function
+    /// short-circuits to None instead of producing `openscap-`.
+    #[tokio::test]
+    async fn test_probe_version_whitespace_only_field_returns_none() {
+        let server = wiremock::MockServer::start().await;
+        mount_health_mock(
+            &server,
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"version": "   "})),
+        )
+        .await;
+
+        let (scanner, _dir) = make_probe_scanner(server.uri());
+        assert_eq!(scanner.version().await, None);
+    }
+
+    /// `probe_version` returns `None` when the URL is unreachable
+    /// (connection refused). This exercises the `.send().await.ok()?`
+    /// short-circuit. Together with the success/error/missing tests above,
+    /// every branch of `probe_version` is covered without requiring a real
+    /// OpenSCAP wrapper sidecar.
+    #[tokio::test]
+    async fn test_probe_version_unreachable_returns_none() {
+        // Port 0 is reserved and yields connection refused.
+        let (scanner, _dir) = make_probe_scanner("http://127.0.0.1:0".to_string());
+        assert_eq!(scanner.version().await, None);
     }
 }

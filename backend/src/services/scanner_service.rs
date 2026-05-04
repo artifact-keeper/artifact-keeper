@@ -450,6 +450,148 @@ pub trait Scanner: Send + Sync {
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<Vec<RawFinding>>;
+
+    /// Best-effort scanner-binary version string (e.g. `trivy-0.62.1`,
+    /// `grype-0.83.0`). Persisted on `scan_results.scanner_version` so
+    /// operators can reproduce a scan and identify scanners with stale
+    /// vulnerability databases.
+    ///
+    /// The default implementation returns `None` so existing scanners that
+    /// do not yet probe a version remain compilable. Concrete scanners
+    /// should override this to shell out to `--version` (or equivalent) and
+    /// cache the result, so the orchestrator can call it once per scan
+    /// without per-call subprocess overhead.
+    async fn version(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Maximum wall-clock time we will wait for a scanner CLI's `--version`
+/// subcommand to return. A hung version probe is serialized through
+/// `OnceCell::get_or_init`, so any single hang would head-of-line block
+/// every concurrent scan (including the post-failure probe in `fail_scan`).
+/// Five seconds is generous for a `--version` flag that should print and
+/// exit immediately on any healthy binary, but tight enough that a stuck
+/// binary cannot stall the scan pipeline.
+const CAPTURE_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run an external CLI's `--version` subcommand and return its first stdout
+/// line, trimmed. Returns `None` when the binary is missing, fails, or
+/// hangs past `CAPTURE_CLI_VERSION_TIMEOUT`. Used by `Scanner::version()`
+/// implementations to capture the binary version string for the
+/// `scan_results.scanner_version` column.
+///
+/// `args` is the arg vector passed to the binary (typically `["--version"]`
+/// or `["version"]` depending on the tool's CLI conventions).
+pub(crate) async fn capture_cli_version(binary: &str, args: &[&str]) -> Option<String> {
+    capture_cli_version_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
+}
+
+/// Inner implementation of [`capture_cli_version`] parameterized on the
+/// timeout so tests can exercise the elapsed-timeout branch in milliseconds
+/// rather than the full production five-second wait.
+pub(crate) async fn capture_cli_version_with_timeout(
+    binary: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let fut = tokio::process::Command::new(binary).args(args).output();
+    let output = match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => return None, // spawn / IO error
+        Err(_) => {
+            warn!(
+                binary = binary,
+                timeout_ms = timeout.as_millis() as u64,
+                "scanner version probe timed out; recording NULL scanner_version"
+            );
+            return None;
+        }
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+/// Resolve a scanner's lazily-cached version string, probing once via
+/// `probe` and caching the result in `cell` for the scanner's lifetime.
+///
+/// Concrete `Scanner::version()` impls share this OnceCell + clone pattern;
+/// extracting it here keeps the per-scanner override to a single line and
+/// avoids near-identical method bodies across `trivy_fs_scanner`,
+/// `image_scanner`, `incus_scanner`, `grype_scanner`, and `openscap_scanner`.
+pub(crate) async fn cached_cli_version<F, Fut>(
+    cell: &tokio::sync::OnceCell<Option<String>>,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    cell.get_or_init(probe).await.clone()
+}
+
+/// Convenience wrapper around [`cached_cli_version`] for scanners that probe
+/// the Trivy CLI. Returns `Some("trivy-<ver>")` once the CLI has been
+/// probed, or `None` when the binary is missing or its output is unparseable.
+pub(crate) async fn cached_trivy_cli_version(
+    cell: &tokio::sync::OnceCell<Option<String>>,
+) -> Option<String> {
+    cached_cli_version(cell, || async {
+        let raw = capture_cli_version("trivy", &["--version"]).await?;
+        format_trivy_version(&raw)
+    })
+    .await
+}
+
+/// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token.
+/// Trivy emits `Version: 0.62.1` (or `Version: 0.62.1\n...`). We normalize
+/// to `trivy-<version>` to make the field self-describing in the DB.
+pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
+    let v = raw
+        .strip_prefix("Version:")
+        .map(str::trim)
+        .or_else(|| raw.strip_prefix("trivy").map(str::trim))
+        .unwrap_or(raw)
+        .trim();
+    let token = v.split_whitespace().next()?;
+    if token.is_empty() {
+        None
+    } else {
+        Some(format!("trivy-{}", token))
+    }
+}
+
+/// Parse a `grype --version` first stdout line into a `grype-X.Y.Z` token.
+/// Grype's `--version` (single dash-dash flag) emits a single line like
+/// `grype 0.83.0`, which we normalize to `grype-<version>` for consistency with
+/// `format_trivy_version`. Also tolerates a `Version:` prefix as a
+/// defensive shape (some packagings of `grype version` emit that).
+pub(crate) fn format_grype_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let mut parts = trimmed.split_whitespace();
+    let head = parts.next()?;
+    // Three output shapes:
+    //   `grype 0.83.0`   -> skip leading `grype`, take next token
+    //   `Version: 0.83.0` -> skip leading `Version:`, take next token
+    //   `0.83.0`         -> head is the version itself
+    let version = if head.eq_ignore_ascii_case("grype") || head.eq_ignore_ascii_case("Version:") {
+        parts.next()?
+    } else {
+        head
+    };
+    if version.is_empty() {
+        None
+    } else {
+        Some(format!("grype-{}", version))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1546,6 +1688,12 @@ impl ScannerService {
                 }
             };
 
+            // Capture wall-clock subprocess kickoff time so the persisted
+            // `scan_results.started_at` reflects when the scanner actually
+            // started, not when the row was created (rows are created above
+            // for dedup-checking and may sit briefly before scan invocation).
+            // See issue #902.
+            let started_at = chrono::Utc::now();
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {
                 Ok(findings) => {
                     let total = findings.len() as i32;
@@ -1558,6 +1706,13 @@ impl ScannerService {
                     let low = count(Severity::Low);
                     let info = count(Severity::Info);
 
+                    // Probe scanner binary version after a successful scan so
+                    // the persisted provenance matches the binary that just
+                    // ran. None on probe failure is acceptable: the field is
+                    // nullable and the silent-success migration (075) treats
+                    // NULL as "legacy / unknown" rather than as a hard error.
+                    let scanner_version = scanner.version().await;
+
                     // Persist findings
                     self.scan_result_service
                         .create_findings(scan_result.id, artifact_id, &findings)
@@ -1565,16 +1720,27 @@ impl ScannerService {
 
                     // Mark scan complete
                     self.scan_result_service
-                        .complete_scan(scan_result.id, total, critical, high, medium, low, info)
+                        .complete_scan(
+                            scan_result.id,
+                            total,
+                            critical,
+                            high,
+                            medium,
+                            low,
+                            info,
+                            scanner_version.as_deref(),
+                            started_at,
+                        )
                         .await?;
 
                     info!(
-                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high)",
+                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}",
                         scanner.name(),
                         artifact_id,
                         total,
                         critical,
                         high,
+                        scanner_version,
                     );
 
                     // Update quarantine status
@@ -1587,8 +1753,17 @@ impl ScannerService {
                         artifact_id,
                         e
                     );
+                    // Best-effort version probe even on failure: lets ops
+                    // distinguish "scanner crashed mid-scan" from "scanner
+                    // binary missing". `None` is acceptable for the latter.
+                    let scanner_version = scanner.version().await;
                     self.scan_result_service
-                        .fail_scan(scan_result.id, &e.to_string())
+                        .fail_scan(
+                            scan_result.id,
+                            &e.to_string(),
+                            scanner_version.as_deref(),
+                            started_at,
+                        )
                         .await?;
 
                     // Mark as flagged on failure (conservative)
@@ -2088,6 +2263,254 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    // -----------------------------------------------------------------------
+    // Scanner version parsing (issue #902)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_trivy_version_with_version_prefix() {
+        // Real `trivy --version` output: `Version: 0.62.1`
+        assert_eq!(
+            format_trivy_version("Version: 0.62.1"),
+            Some("trivy-0.62.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_trivy_version_with_extra_metadata() {
+        // Trivy can also emit `Version: 0.62.1\nVulnerability DB:\n  ...`
+        // capture_cli_version only returns the first line, but the parser
+        // must still tolerate trailing whitespace and additional tokens.
+        assert_eq!(
+            format_trivy_version("Version: 0.62.1   "),
+            Some("trivy-0.62.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_trivy_version_bare_token() {
+        // Defensive: some packagings emit just the version.
+        assert_eq!(
+            format_trivy_version("0.62.1"),
+            Some("trivy-0.62.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_trivy_version_empty_returns_none() {
+        assert_eq!(format_trivy_version(""), None);
+        assert_eq!(format_trivy_version("Version:"), None);
+    }
+
+    #[test]
+    fn test_format_grype_version_application_line() {
+        // Real `grype --version` output: `grype 0.83.0`
+        assert_eq!(
+            format_grype_version("grype 0.83.0"),
+            Some("grype-0.83.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_grype_version_bare_token() {
+        // Defensive shape: just the version number.
+        assert_eq!(
+            format_grype_version("0.83.0"),
+            Some("grype-0.83.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_grype_version_with_version_prefix() {
+        assert_eq!(
+            format_grype_version("Version: 0.83.0"),
+            Some("grype-0.83.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_grype_version_empty_returns_none() {
+        assert_eq!(format_grype_version(""), None);
+        assert_eq!(format_grype_version("   "), None);
+    }
+
+    #[test]
+    fn test_format_grype_version_application_only() {
+        // `grype` token without a following version should be None, not
+        // `grype-grype` or similar bogus output.
+        assert_eq!(format_grype_version("grype"), None);
+    }
+
+    /// `capture_cli_version` must return None on a missing binary rather
+    /// than panicking. Use a deliberately-nonexistent name so we exercise
+    /// the spawn-failure branch regardless of host scanner installation.
+    #[tokio::test]
+    async fn test_capture_cli_version_missing_binary_returns_none() {
+        let result =
+            capture_cli_version("definitely-not-a-real-binary-issue-902", &["--version"]).await;
+        assert_eq!(result, None);
+    }
+
+    /// A scanner CLI that hangs (does not print and exit) must not park the
+    /// version probe forever. Without the timeout, `OnceCell::get_or_init`
+    /// would serialize every concurrent caller behind the hung future, and
+    /// because `fail_scan` is awaited AFTER `scanner.version().await`, even
+    /// FAILED scans would never persist their failure row. Run `sleep` with
+    /// a 30s argument and a 50ms test-only timeout: we should observe the
+    /// elapsed branch, return None, and complete in well under a second.
+    /// Skipped on hosts without `/bin/sleep` (effectively never on Linux/macOS).
+    #[tokio::test]
+    async fn test_capture_cli_version_hung_binary_times_out() {
+        if !std::path::Path::new("/bin/sleep").exists() {
+            eprintln!("skipping: /bin/sleep not present on this host");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let result =
+            capture_cli_version_with_timeout("/bin/sleep", &["30"], Duration::from_millis(50))
+                .await;
+        let elapsed = started.elapsed();
+        assert_eq!(result, None, "timeout branch must return None");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout did not fire promptly; elapsed was {:?}",
+            elapsed
+        );
+    }
+
+    /// Default `Scanner::version()` returns None so existing scanners
+    /// (and any future ones added without an override) compile and behave
+    /// correctly: `scan_results.scanner_version` will be NULL for them
+    /// rather than triggering a panic or required-arg compile error.
+    #[tokio::test]
+    async fn test_scanner_trait_default_version_is_none() {
+        struct DummyScanner;
+        #[async_trait::async_trait]
+        impl Scanner for DummyScanner {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn scan_type(&self) -> &str {
+                "dummy"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<Vec<RawFinding>> {
+                Ok(vec![])
+            }
+        }
+        let s = DummyScanner;
+        assert_eq!(s.version().await, None);
+    }
+
+    /// Exercise the success path of `capture_cli_version_with_timeout`:
+    /// spawn succeeded, exit status was zero, stdout had a non-empty first
+    /// line. `/bin/echo` is part of POSIX baseline and always produces this
+    /// shape, so we use it as a stand-in for a healthy `--version` probe.
+    /// Verifies the trim + first-line slicing logic that the per-scanner
+    /// `version()` impls rely on. Skipped on hosts without `/bin/echo`.
+    #[tokio::test]
+    async fn test_capture_cli_version_success_returns_first_line() {
+        if !std::path::Path::new("/bin/echo").exists() {
+            eprintln!("skipping: /bin/echo not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/echo",
+            &["Version: 0.62.1"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, Some("Version: 0.62.1".to_string()));
+    }
+
+    /// Multi-line stdout: only the first line should be returned, with
+    /// trailing whitespace trimmed. `printf` is more portable than
+    /// `echo -e` for embedding `\n`; we shell out via `/bin/sh -c`.
+    #[tokio::test]
+    async fn test_capture_cli_version_success_multi_line_takes_first() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "printf 'grype 0.83.0\\nDB updated 2025-04-01\\n'"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, Some("grype 0.83.0".to_string()));
+    }
+
+    /// A binary that exits non-zero must yield None even if it printed
+    /// something on stdout. `/usr/bin/false` is POSIX-standard and always
+    /// exits 1 with empty stdout; combining shell redirection lets us
+    /// assert the exit-status branch independent of empty-stdout.
+    #[tokio::test]
+    async fn test_capture_cli_version_non_success_status_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        // Print a fake version to stdout, then exit non-zero. We must still
+        // observe None so callers do not record output from a crashed probe.
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "echo 'trivy 0.0.0'; exit 7"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, None);
+    }
+
+    /// A binary that exits zero with empty stdout (e.g. `/bin/true`) must
+    /// yield None. This exercises the `lines().next()?` early-return.
+    #[tokio::test]
+    async fn test_capture_cli_version_empty_stdout_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result =
+            capture_cli_version_with_timeout("/bin/sh", &["-c", "exit 0"], Duration::from_secs(2))
+                .await;
+        assert_eq!(result, None);
+    }
+
+    /// A binary whose first stdout line is whitespace-only must yield None,
+    /// not `Some("")`. This exercises the `if line.is_empty()` branch after
+    /// trimming.
+    #[tokio::test]
+    async fn test_capture_cli_version_whitespace_only_stdout_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "printf '   \\n'"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, None);
+    }
+
+    /// `capture_cli_version` (the non-timeout-parameterized wrapper) must
+    /// also propagate success. Exercise it once with `/bin/echo` so the
+    /// public wrapper line is covered alongside the inner helper.
+    #[tokio::test]
+    async fn test_capture_cli_version_wrapper_success_path() {
+        if !std::path::Path::new("/bin/echo").exists() {
+            eprintln!("skipping: /bin/echo not present on this host");
+            return;
+        }
+        let result = capture_cli_version("/bin/echo", &["trivy 0.62.1"]).await;
+        assert_eq!(result, Some("trivy 0.62.1".to_string()));
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)

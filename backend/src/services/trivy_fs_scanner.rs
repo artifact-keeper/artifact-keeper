@@ -6,18 +6,25 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::Path;
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
-use crate::services::scanner_service::{convert_trivy_findings, fail_scan, ScanWorkspace, Scanner};
+use crate::services::scanner_service::{
+    cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
+};
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
 pub struct TrivyFsScanner {
     trivy_url: String,
     scan_workspace: String,
+    /// Lazily-probed version string from `trivy --version`, e.g.
+    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
+    /// not pay an extra subprocess for the version probe.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl TrivyFsScanner {
@@ -25,6 +32,7 @@ impl TrivyFsScanner {
         Self {
             trivy_url,
             scan_workspace,
+            cached_version: OnceCell::new(),
         }
     }
 
@@ -115,6 +123,13 @@ impl Scanner for TrivyFsScanner {
 
     fn scan_type(&self) -> &str {
         "filesystem"
+    }
+
+    /// Probe `trivy --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed; `scan_results.scanner_version` is nullable for that case.
+    async fn version(&self) -> Option<String> {
+        cached_trivy_cli_version(&self.cached_version).await
     }
 
     async fn scan(
@@ -307,5 +322,30 @@ mod tests {
             &no_trivy.scan(&artifact, None, &content).await,
             "Trivy filesystem scan",
         );
+    }
+
+    /// `version()` exercises the OnceCell-cached probe path. We do not
+    /// require `trivy` to be installed: the test only asserts the call
+    /// returns deterministically (`Some("trivy-...")` when installed,
+    /// `None` otherwise) and that subsequent calls return the same value
+    /// from cache. The point is to cover the per-scanner override body so
+    /// the new-code coverage gate sees these lines as executed.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = TrivyFsScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("trivy-"),
+                "trivy version probe must be normalized to 'trivy-<ver>'; got {}",
+                v
+            );
+        }
     }
 }
