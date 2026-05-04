@@ -100,7 +100,7 @@ impl GrypeScanner {
                 return Err(AppError::Internal("Grype binary not available".to_string()));
             }
             return Err(AppError::Internal(format!(
-                "Grype scan failed (exit {}): {}",
+                "Grype scan failed ({}): {}",
                 output.status, stderr
             )));
         }
