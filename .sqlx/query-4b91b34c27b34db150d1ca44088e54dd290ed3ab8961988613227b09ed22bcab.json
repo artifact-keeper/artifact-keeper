@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_results (\n                artifact_id, repository_id, scan_type, status, started_at, completed_at,\n                findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                scanner_version, checksum_sha256, source_scan_id, is_reused\n            )\n            VALUES ($1, $2, $3, 'completed', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, true)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id\n            FROM scan_results\n            WHERE ($1::uuid IS NULL OR repository_id = $1)\n              AND ($2::uuid IS NULL OR artifact_id = $2)\n              AND ($3::text IS NULL OR status = $3)\n            ORDER BY created_at DESC\n            LIMIT $4 OFFSET $5\n            ",
   "describe": {
     "columns": [
       {
@@ -82,24 +82,25 @@
         "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "is_reused",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "source_scan_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
         "Uuid",
-        "Varchar",
-        "Timestamptz",
-        "Timestamptz",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Int4",
-        "Varchar",
-        "Bpchar",
-        "Uuid"
+        "Text",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -118,8 +119,10 @@
       true,
       true,
       true,
-      false
+      false,
+      false,
+      true
     ]
   },
-  "hash": "fc330d55903c477c87d9180904aa370599f62240305431b1216adfa2d8f31884"
+  "hash": "4b91b34c27b34db150d1ca44088e54dd290ed3ab8961988613227b09ed22bcab"
 }

@@ -569,11 +569,11 @@ async fn serve_file(
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE '%/' || $2
+          AND path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,
-        filename
+        super::escape_filename_for_like(filename)
     )
     .fetch_optional(&state.db)
     .await
@@ -866,11 +866,11 @@ async fn serve_metadata(
         FROM artifacts a
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.path LIKE '%/' || $2
+          AND a.path LIKE '%/' || $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo_id,
-        filename
+        super::escape_filename_for_like(filename)
     )
     .fetch_optional(db)
     .await
