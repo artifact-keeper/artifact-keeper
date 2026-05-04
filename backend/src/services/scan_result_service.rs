@@ -164,6 +164,14 @@ impl ScanResultService {
         // Get source scan counts
         let source = self.get_scan(source_scan_id).await?;
 
+        // Wrap both INSERTs in a transaction so a failure of the second INSERT
+        // (scan_findings) rolls back the first INSERT (scan_results). See #1035.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         // Create new scan result marked as reused
         let new_scan = sqlx::query_as!(
             ScanResult,
@@ -190,7 +198,7 @@ impl ScanResultService {
             checksum_sha256,
             source_scan_id,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -212,9 +220,13 @@ impl ScanResultService {
             artifact_id,
             source_scan_id,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(new_scan)
     }
