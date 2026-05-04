@@ -174,7 +174,6 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid) {
 ///   - `recalculate_score(repository_id)` (per-repo, joins through artifacts)
 ///   - `get_dashboard_summary()` (global)
 #[tokio::test]
-#[ignore] // requires PostgreSQL
 async fn rescan_does_not_inflate_finding_counts() {
     const SCANS: usize = 10;
     const FINDINGS_PER_SCAN: usize = 15;
