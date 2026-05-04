@@ -9,10 +9,11 @@
 //! Requires PostgreSQL with all migrations applied (75 as of v1.1.x):
 //!
 //! ```sh
+//! TEST_PG_PW="$(openssl rand -hex 16)"
 //! podman run -d --rm --name ak-test-pg -p 5432:5432 \
-//!     -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=artifact_registry postgres:16
+//!     -e POSTGRES_PASSWORD="${TEST_PG_PW}" -e POSTGRES_DB=artifact_registry postgres:16
 //! # apply backend/migrations/*.sql in lexicographic order
-//! DATABASE_URL="postgres://postgres:postgres@localhost:5432/artifact_registry" \
+//! DATABASE_URL="postgres://postgres:${TEST_PG_PW}@localhost:5432/artifact_registry" \
 //!     cargo test --test scan_dashboard_aggregation_tests -- --ignored
 //! ```
 
@@ -24,7 +25,7 @@ use artifact_keeper_backend::services::scan_result_service::ScanResultService;
 
 async fn connect_db() -> PgPool {
     let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/artifact_registry".into());
+        .expect("DATABASE_URL must be set; see module docstring for setup");
     PgPool::connect(&url)
         .await
         .expect("failed to connect to test database")
