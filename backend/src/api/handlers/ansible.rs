@@ -12,7 +12,7 @@
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,7 +26,6 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::ansible::AnsibleHandler;
-use crate::models::repository::RepositoryType;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -84,13 +83,7 @@ async fn list_collections(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     let data: Vec<serde_json::Value> = artifacts
         .iter()
@@ -133,11 +126,7 @@ async fn list_collections(
         "data": data,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -156,31 +145,10 @@ async fn collection_info(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let collection_name = format!("{}-{}", namespace, name);
-    let artifact = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.size_bytes,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND LOWER(a.name) = LOWER($2)
-        ORDER BY a.created_at DESC
-        LIMIT 1
-        "#,
-        repo.id,
-        collection_name
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection not found").into_response())?;
+    let artifact =
+        proxy_helpers::find_artifact_by_name_lowercase(&state.db, repo.id, &collection_name)
+            .await?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection not found").into_response())?;
 
     let latest_version = artifact.version.clone().unwrap_or_default();
     let description = artifact
@@ -212,11 +180,7 @@ async fn collection_info(
         ),
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -230,29 +194,9 @@ async fn version_list(
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
 
     let collection_name = format!("{}-{}", namespace, name);
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND LOWER(a.name) = LOWER($2)
-        ORDER BY a.created_at DESC
-        "#,
-        repo.id,
-        collection_name
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    let artifacts =
+        proxy_helpers::list_artifacts_by_name_lowercase(&state.db, repo.id, &collection_name)
+            .await?;
 
     let versions: Vec<serde_json::Value> = artifacts
         .iter()
@@ -281,11 +225,7 @@ async fn version_list(
         "data": versions,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -307,31 +247,13 @@ async fn version_info(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid path: {}", e)).into_response())?;
 
     let collection_name = format!("{}-{}", namespace, name);
-    let artifact = sqlx::query!(
-        r#"
-        SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-          AND LOWER(a.name) = LOWER($2)
-          AND a.version = $3
-        LIMIT 1
-        "#,
+    let artifact = proxy_helpers::find_artifact_by_name_version(
+        &state.db,
         repo.id,
-        collection_name,
-        version
+        &collection_name,
+        &version,
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
+    .await?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection version not found").into_response())?;
 
     let download_count: i64 = sqlx::query_scalar!(
@@ -366,11 +288,7 @@ async fn version_info(
         "metadata": artifact.metadata.unwrap_or(serde_json::json!({})),
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&json).unwrap()))
-        .unwrap())
+    Ok(super::json_response(&json))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,126 +303,38 @@ async fn download_collection(
 
     let filename = file_path.trim_start_matches('/');
 
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, name, version, size_bytes, checksum_sha256, storage_key
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path LIKE '%/' || $2
-        LIMIT 1
-        "#,
-        repo.id,
-        filename
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Collection file not found").into_response());
-
-    let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let upstream_path = format!("download/{}", filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
-            }
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
+    let artifact =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, filename).await? {
+            Some(a) => a,
+            None => {
                 let upstream_path = format!("download/{}", filename);
-                let vfilename = filename.to_string();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let vfilename = vfilename.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_path_suffix(
-                                &db, &state, member_id, &location, &vfilename,
-                            )
-                            .await
-                        }
+                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                    &state,
+                    &repo,
+                    proxy_helpers::DownloadResponseOpts {
+                        upstream_path: &upstream_path,
+                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(filename),
+                        default_content_type: "application/octet-stream",
+                        content_disposition_filename: None,
                     },
                 )
-                .await?;
-
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                .await?
+                {
+                    return Ok(resp);
+                }
+                return Err((StatusCode::NOT_FOUND, "Collection file not found").into_response());
             }
-            return Err(not_found);
-        }
-    };
+        };
 
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
-        .await
-        .map_err(|e| e.into_response())?;
-
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
+    proxy_helpers::serve_local_artifact(
+        &state,
+        &repo,
+        artifact.id,
+        &artifact.storage_key,
+        "application/gzip",
+        Some(filename),
     )
-    .execute(&state.db)
-    .await;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/gzip")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -515,57 +345,15 @@ async fn upload_collection(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = require_auth_basic(auth, "ansible")?.user_id;
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
 
-    let mut tarball: Option<bytes::Bytes> = None;
-    let mut collection_json: Option<serde_json::Value> = None;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
-    {
-        let field_name = field.name().unwrap_or("").to_string();
-        match field_name.as_str() {
-            "file" => {
-                tarball = Some(field.bytes().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to read file: {}", e),
-                    )
-                        .into_response()
-                })?);
-            }
-            "collection" | "metadata" => {
-                let data = field.bytes().await.map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to read collection JSON: {}", e),
-                    )
-                        .into_response()
-                })?;
-                collection_json = Some(serde_json::from_slice(&data).map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Invalid collection JSON: {}", e),
-                    )
-                        .into_response()
-                })?);
-            }
-            _ => {}
-        }
-    }
-
-    let tarball =
-        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
-
-    if tarball.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
-    }
+    let (tarball, collection_json) =
+        proxy_helpers::parse_multipart_file_with_json(multipart, &["collection", "metadata"])
+            .await?;
 
     let (namespace, collection_name, collection_version) = if let Some(ref json) = collection_json {
         let namespace = json
@@ -622,43 +410,16 @@ async fn upload_collection(
 
     let artifact_path = format!("{}/{}/{}", full_name, collection_version, filename);
 
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
         repo.id,
-        artifact_path
+        &artifact_path,
+        "Collection version already exists",
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Collection version already exists").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Store the file
     let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, tarball.clone())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
-            )
-                .into_response()
-        })?;
+    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, tarball.clone()).await?;
 
     let ansible_metadata = serde_json::json!({
         "namespace": namespace,
@@ -670,52 +431,29 @@ async fn upload_collection(
 
     let size_bytes = tarball.len() as i64;
 
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        full_name,
-        collection_version,
-        size_bytes,
-        computed_sha256,
-        "application/gzip",
-        storage_key,
-        user_id,
+    let artifact_id = proxy_helpers::insert_artifact(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &artifact_path,
+            name: &full_name,
+            version: &collection_version,
+            size_bytes,
+            checksum_sha256: &computed_sha256,
+            content_type: "application/gzip",
+            storage_key: &storage_key,
+            uploaded_by: user_id,
+        },
     )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'ansible', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
+    proxy_helpers::record_artifact_metadata(
+        &state.db,
         artifact_id,
-        ansible_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
         repo.id,
+        "ansible",
+        &ansible_metadata,
     )
-    .execute(&state.db)
     .await;
 
     info!(
@@ -844,5 +582,110 @@ mod tests {
         assert_eq!(metadata["collection_name"], "testcoll");
         assert_eq!(metadata["version"], "1.0.0");
         assert_eq!(metadata["filename"], "testns-testcoll-1.0.0.tar.gz");
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for the proxy_helpers-call paths.
+    //
+    // No-op without DATABASE_URL; the CI coverage job seeds Postgres so
+    // these run there and instrument the refactored helper-call sites.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_ansible_download_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/download/missing-pkg-1.0.tar.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_download_serves_local_artifact() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "ansible/community-general-1.0.0.tar.gz",
+            "community-general/1.0.0/community-general-1.0.0.tar.gz",
+            "community-general",
+            "1.0.0",
+            "application/gzip",
+            bytes::Bytes::from_static(b"fake-tar"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/download/community-general-1.0.0.tar.gz",
+                f.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"fake-tar");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_collection_info_404_when_missing() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/api/v3/collections/none/missing/", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_upload_unauthenticated_401() {
+        let Some(f) = tdh::Fixture::setup("local", "ansible").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ansible_upload_remote_repo_405() {
+        let Some(f) = tdh::Fixture::setup("remote", "ansible").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::post(
+            format!("/{}/api/v3/artifacts/collections/", f.repo_key),
+            "multipart/form-data; boundary=B",
+            bytes::Bytes::from_static(b"--B--\r\n"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
     }
 }

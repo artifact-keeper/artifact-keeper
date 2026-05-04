@@ -7,12 +7,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
 use std::path::Path;
+use tokio::sync::OnceCell;
 use tracing::info;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{fail_scan, ScanWorkspace, Scanner};
+use crate::services::scanner_service::{
+    cached_cli_version, capture_cli_version, fail_scan, format_grype_version, ScanWorkspace,
+    Scanner,
+};
 
 // ---------------------------------------------------------------------------
 // Grype JSON output structures
@@ -66,11 +70,18 @@ pub struct GrypeArtifact {
 /// Grype-based vulnerability scanner for packages and archives.
 pub struct GrypeScanner {
     scan_workspace: String,
+    /// Lazily-probed version string from `grype --version`, e.g.
+    /// `grype-0.83.0`. Cached for the scanner's lifetime so each scan does
+    /// not pay an extra subprocess for the version probe.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl GrypeScanner {
     pub fn new(scan_workspace: String) -> Self {
-        Self { scan_workspace }
+        Self {
+            scan_workspace,
+            cached_version: OnceCell::new(),
+        }
     }
 
     /// Run grype against the workspace directory.
@@ -142,6 +153,17 @@ impl Scanner for GrypeScanner {
 
     fn scan_type(&self) -> &str {
         "grype"
+    }
+
+    /// Probe `grype --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed.
+    async fn version(&self) -> Option<String> {
+        cached_cli_version(&self.cached_version, || async {
+            let raw = capture_cli_version("grype", &["--version"]).await?;
+            format_grype_version(&raw)
+        })
+        .await
     }
 
     async fn scan(
@@ -331,5 +353,25 @@ mod tests {
         assert_eq!(report.matches.len(), 1);
         assert_eq!(report.matches[0].vulnerability.id, "CVE-2021-44228");
         assert_eq!(report.matches[0].artifact.name, "log4j-core");
+    }
+
+    /// `version()` exercises the OnceCell-cached `grype --version` probe.
+    /// As with the Trivy version test, we accept either Some or None
+    /// depending on whether `grype` is installed on the test host: we only
+    /// require that repeated calls return the same value (cache fidelity)
+    /// and that any returned token starts with `grype-`.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let scanner = GrypeScanner::new("/tmp/grype-version-cov-test".to_string());
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("grype-"),
+                "grype version probe must be normalized to 'grype-<ver>'; got {}",
+                v
+            );
+        }
     }
 }
