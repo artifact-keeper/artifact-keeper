@@ -782,6 +782,8 @@ mod tests {
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            proxy_max_concurrent_fetches: 20,
+            proxy_queue_timeout_secs: 10,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,

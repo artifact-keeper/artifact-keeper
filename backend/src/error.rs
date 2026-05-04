@@ -80,6 +80,29 @@ pub enum AppError {
     /// by status code alone.
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// Service is temporarily over capacity. Maps to HTTP 503 with a
+    /// `Retry-After` header telling the client how long to back off.
+    /// Used by the proxy service when the upstream-fetch semaphore queue
+    /// saturates and `proxy_queue_timeout_secs` fires before a permit
+    /// becomes available.
+    ///
+    /// Distinct from `ServiceUnavailable` (which is "feature is turned
+    /// off / dependency missing") so the error code differs and clients
+    /// can decide whether to back off and retry (`OVERLOADED`) versus
+    /// escalate to the operator (`SERVICE_UNAVAILABLE`).
+    ///
+    /// The `message` is the public user-facing string (must NOT include
+    /// capacity tunables — those leak useful info for DoS planning); the
+    /// concrete limit and timeout get logged server-side via tracing.
+    /// The `retry_after_secs` populates the `Retry-After` response header
+    /// so well-behaved clients (cargo, npm, pip, kubelet) back off rather
+    /// than retry-storm the moment they receive 503.
+    #[error("Service overloaded: {message}")]
+    Overloaded {
+        message: String,
+        retry_after_secs: u64,
+    },
 }
 
 impl AppError {
@@ -107,6 +130,7 @@ impl AppError {
             Self::Wasm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WASM_ERROR"),
             Self::BadGateway(_) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY"),
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+            Self::Overloaded { .. } => (StatusCode::SERVICE_UNAVAILABLE, "OVERLOADED"),
         }
     }
 
@@ -136,6 +160,7 @@ impl AppError {
             | Self::QuotaExceeded(msg)
             | Self::BadGateway(msg)
             | Self::ServiceUnavailable(msg) => msg.clone(),
+            Self::Overloaded { message, .. } => message.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }
@@ -148,12 +173,29 @@ impl IntoResponse for AppError {
 
         tracing::error!(error = %self, code = code, "Request error");
 
+        // Capacity-class errors (503 Overloaded) emit a Retry-After header
+        // so well-behaved clients back off instead of retry-storming the
+        // moment they receive 503. Without this, a saturated proxy turns
+        // its own self-defense into a self-DoS via client retry loops.
+        let retry_after = match &self {
+            Self::Overloaded {
+                retry_after_secs, ..
+            } => Some(*retry_after_secs),
+            _ => None,
+        };
+
         let body = Json(json!({
             "code": code,
             "message": message,
         }));
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert("Retry-After", value);
+            }
+        }
+        response
     }
 }
 

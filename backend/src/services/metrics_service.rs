@@ -62,6 +62,32 @@ pub fn record_webhook_delivery(event: &str, success: bool) {
     counter!("ak_webhook_deliveries_total", "event" => event.to_string(), "status" => status.to_string()).increment(1);
 }
 
+/// Record a single permit acquire-wait observation in the proxy stampede
+/// limiter. Includes both successful acquires (wait under the queue
+/// timeout) and timeouts (wait equal to the queue timeout). Operators
+/// dashboard the histogram p50/p95 to size `PROXY_MAX_CONCURRENT_FETCHES`
+/// against real workloads.
+pub fn record_proxy_queue_wait(seconds: f64) {
+    histogram!("ak_proxy_queue_wait_seconds").record(seconds);
+}
+
+/// Update the gauge of currently in-flight upstream proxy fetches.
+/// Reflects how close the limiter is to saturating relative to the
+/// configured `PROXY_MAX_CONCURRENT_FETCHES`. Pair with the queue-full
+/// counter to detect chronic saturation.
+pub fn set_proxy_upstream_inflight(inflight: f64) {
+    gauge!("ak_proxy_upstream_inflight").set(inflight);
+}
+
+/// Increment the queue-full counter. Fires every time a proxy fetch
+/// returns 503 Overloaded because the queue timeout fired. A non-zero
+/// rate is the canonical signal that `PROXY_MAX_CONCURRENT_FETCHES` is
+/// undersized for the current workload (or that an upstream is slow
+/// enough to fill the queue).
+pub fn record_proxy_queue_full() {
+    counter!("ak_proxy_queue_full_total").increment(1);
+}
+
 /// Record an outbound URL that was rejected by SSRF validation, either
 /// at handler entry (`validate_outbound_url`) or on a redirect hop
 /// inside the shared HTTP client. `reason` is `"hostname"` or `"ip"`,

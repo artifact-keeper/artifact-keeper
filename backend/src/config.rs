@@ -182,6 +182,25 @@ pub struct Config {
     pub rate_limit_exempt_usernames: Vec<String>,
     pub rate_limit_exempt_service_accounts: bool,
 
+    /// Maximum number of concurrent in-flight upstream fetches the proxy
+    /// service will issue at once. Bounds peak load against upstream
+    /// registries during cache stampedes (N concurrent clients hitting a
+    /// cold cache key). Defaults to 20.
+    ///
+    /// **Setting to 0 disables stampede protection entirely** — no
+    /// semaphore is allocated and the acquire path becomes a no-op.
+    /// Intended only for benchmarks or as an emergency kill switch when a
+    /// limiter regression is suspected. A startup warning fires when the
+    /// value is 0 to make the disabled state visible in logs.
+    pub proxy_max_concurrent_fetches: u32,
+
+    /// Time in seconds a proxy fetch will wait for a semaphore permit
+    /// before giving up and returning 503 (Overloaded) to the client.
+    /// Defaults to 10. Tighter than typical client read timeouts (npm
+    /// install, cargo fetch, pip install) so a saturated proxy fails
+    /// fast instead of letting the client time out first.
+    pub proxy_queue_timeout_secs: u64,
+
     /// Number of consecutive failed login attempts before a local account is
     /// locked. Set to 0 to disable account lockout. Default: 5.
     pub account_lockout_threshold: u32,
@@ -324,6 +343,8 @@ redacted_debug!(Config {
     show rate_limit_window_secs,
     show rate_limit_exempt_usernames,
     show rate_limit_exempt_service_accounts,
+    show proxy_max_concurrent_fetches,
+    show proxy_queue_timeout_secs,
     show account_lockout_threshold,
     show account_lockout_duration_minutes,
     show quarantine_enabled,
@@ -402,6 +423,8 @@ impl Default for Config {
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            proxy_max_concurrent_fetches: 20,
+            proxy_queue_timeout_secs: 10,
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -547,6 +570,8 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            proxy_max_concurrent_fetches: env_parse("PROXY_MAX_CONCURRENT_FETCHES", 20),
+            proxy_queue_timeout_secs: env_parse("PROXY_QUEUE_TIMEOUT_SECS", 10),
             rate_limit_exempt_service_accounts: matches!(
                 env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
                 Ok("true" | "1")

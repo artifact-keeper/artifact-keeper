@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Proxy stampede protection.** Bounded concurrent in-flight upstream fetches
+  across remote/proxy repositories via a `tokio::sync::Semaphore` (default 20
+  permits, 10s queue timeout). When the queue saturates, requests return 503
+  Service Unavailable (new `OVERLOADED` error code) so clients can back off
+  rather than blocking indefinitely. Closes the cache-stampede / thundering-
+  herd failure mode from discussion #872. The acquire path is the chokepoint
+  inside `fetch_from_upstream`, so all upstream HTTP entry points are bounded
+  uniformly. Operators can disable via `PROXY_MAX_CONCURRENT_FETCHES=0`
+  (logs a startup warning).
+- **Proxy observability metrics.** `ak_proxy_upstream_inflight` (gauge) for
+  current saturation, `ak_proxy_queue_full_total` (counter) for 503 events,
+  and `ak_proxy_queue_wait_seconds` (histogram) for permit acquire latency.
+- **`AppError::Overloaded`** variant mapped to HTTP 503 with code
+  `OVERLOADED` for capacity-related rejections, distinct from `BAD_GATEWAY`
+  upstream-failure responses.
 ### Security
 
 - **API-token cache invalidation on user deactivation** (#931) -- when an admin deactivates or deletes a user (`PATCH /api/v1/users/{id}`, `DELETE /api/v1/users/{id}`), updates a service account (`PATCH/DELETE /api/v1/service-accounts/{id}`), or runs a federated SSO offboarding sync (`AuthService::deactivate_missing_users`), every cached API-token validation belonging to that user or service account is now rejected immediately rather than continuing to authenticate for up to 5 minutes (the previous `API_TOKEN_CACHE_TTL_SECS` window). Caveat: the invalidation map is per-process. In multi-replica deployments (Helm `replicas > 1`) only the replica that handled the admin action evicts immediately; other replicas still reject the cached entry within the same 5-minute window via the existing `WHERE is_active = true` SQL filter, but cache hits on those replicas can still authenticate during that window. A v1.2.0 follow-up will move the signal into the database or a Redis pub-sub channel so it is observed by every replica.
