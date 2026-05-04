@@ -261,15 +261,29 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 optional_auth_middleware,
             )),
         )
-        // User management routes require admin privileges
+        // User management routes require admin privileges, EXCEPT for
+        // `POST /users/{id}/password` which a user must be able to call
+        // for themselves (issue #1010 — forced password reset on first
+        // login). The `change_password` handler enforces the ownership
+        // check (`auth.user_id == id`) and the current-password
+        // requirement itself, so mounting it under `auth_middleware`
+        // (rather than `admin_middleware`) is safe. Each sub-router has
+        // its middleware applied before being merged so per-route layers
+        // are preserved under a single `/users` nest.
         .nest(
             "/users",
-            handlers::users::router()
-                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+            handlers::users::self_service_router()
                 .layer(middleware::from_fn_with_state(
                     auth_service.clone(),
-                    admin_middleware,
-                )),
+                    auth_middleware,
+                ))
+                .merge(
+                    handlers::users::router().layer(middleware::from_fn_with_state(
+                        auth_service.clone(),
+                        admin_middleware,
+                    )),
+                )
+                .layer(DefaultBodyLimit::max(1024 * 1024)), // 1 MB
         )
         // Profile routes (authenticated user context) with auth middleware
         .nest(

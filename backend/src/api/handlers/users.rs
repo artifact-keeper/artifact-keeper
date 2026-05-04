@@ -20,7 +20,14 @@ use crate::services::auth_service::{
 };
 use std::sync::atomic::Ordering;
 
-/// Create user routes
+/// Create user routes that require admin privileges.
+///
+/// The `change_password` route is intentionally NOT included here — see
+/// [`self_service_router`]. A non-admin must be able to change their OWN
+/// password (issue #1010), and the `change_password` handler enforces
+/// ownership (`auth.user_id == path id`) plus the current-password check
+/// itself. Mounting it behind `admin_middleware` would lock non-admins out
+/// of the forced-password-reset flow on first login.
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(list_users).post(create_user))
@@ -29,8 +36,18 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/roles/:role_id", delete(revoke_role))
         .route("/:id/tokens", get(list_user_tokens).post(create_api_token))
         .route("/:id/tokens/:token_id", delete(revoke_api_token))
-        .route("/:id/password", post(change_password))
         .route("/:id/password/reset", post(reset_password))
+}
+
+/// User routes that only require an authenticated caller (not admin).
+///
+/// The `change_password` handler performs its own ownership check: it only
+/// allows the call when `auth.user_id == path id` OR `auth.is_admin`, and
+/// requires the current password for self-service changes. This router is
+/// mounted at the same `/users` prefix as [`router`] but with the standard
+/// `auth_middleware` instead of `admin_middleware` (issue #1010).
+pub fn self_service_router() -> Router<SharedState> {
+    Router::new().route("/:id/password", post(change_password))
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -1580,5 +1597,344 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at least 8 characters"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for issue #1010:
+//   Non-admin users were unable to change their own password because the
+//   entire `/users` axum nest was wrapped in `admin_middleware`. The fix
+//   carved `POST /users/:id/password` into a dedicated `self_service_router`
+//   mounted under `auth_middleware`, while the rest of the user-management
+//   routes stayed admin-only.
+//
+// These tests rebuild the same composition as `routes.rs::api_v1_routes`
+// (self_service_router under auth_middleware merged with admin_router under
+// admin_middleware, all nested at `/users`) and exercise it through real
+// JWT-authenticated requests via `tower::ServiceExt::oneshot`. They use
+// stub handlers so no live database is required: the production
+// `change_password` SQL would error out against a lazy pool, but the
+// regression we are guarding is at the middleware/routing layer, not the
+// handler body.
+//
+// A direct reference to `super::self_service_router` is intentionally kept
+// inside the test module so this regression test fails to compile on any
+// branch where the fix has been reverted.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod password_route_middleware_tests {
+    use crate::api::middleware::auth::{admin_middleware, auth_middleware, AuthExtension};
+    use crate::config::Config;
+    use crate::models::user::{AuthProvider, User};
+    use crate::services::auth_service::AuthService;
+    use axum::{
+        body::Body,
+        extract::{Extension, Path},
+        http::{Request, StatusCode},
+        middleware,
+        response::IntoResponse,
+        routing::{get, post},
+        Router,
+    };
+    use chrono::Utc;
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    // ---- fixtures ---------------------------------------------------------
+
+    fn lazy_pool() -> PgPool {
+        // No socket is opened until a query runs, so this is safe in unit
+        // tests without a live Postgres instance. Stub handlers below never
+        // touch the pool, so no query is ever issued.
+        PgPool::connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("connect_lazy never fails for a syntactically valid URL")
+    }
+
+    fn make_test_config() -> Arc<Config> {
+        Arc::new(Config {
+            jwt_secret: "regression-test-secret-key-for-issue-1010-unit-test".to_string(),
+            ..Config::default()
+        })
+    }
+
+    fn make_user(is_admin: bool) -> User {
+        let now = Utc::now();
+        User {
+            id: Uuid::new_v4(),
+            username: if is_admin {
+                "admin_user".to_string()
+            } else {
+                "regular_user".to_string()
+            },
+            email: if is_admin {
+                "admin@example.com".to_string()
+            } else {
+                "regular@example.com".to_string()
+            },
+            password_hash: None,
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            display_name: None,
+            is_active: true,
+            is_admin,
+            is_service_account: false,
+            must_change_password: false,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_backup_codes: None,
+            totp_verified_at: None,
+            last_login_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // ---- stub handlers ----------------------------------------------------
+    //
+    // These stand in for `change_password` and `list_users`/`get_user` in
+    // the test router. They preserve the contract that matters for the
+    // regression: the change_password stub mirrors the real handler's
+    // ownership check (`auth.user_id == path id` OR `auth.is_admin`); the
+    // admin-only stubs simply assert that the request reached them (the
+    // admin gate is upstream of the handler).
+
+    async fn stub_change_password(
+        Extension(auth): Extension<AuthExtension>,
+        Path(id): Path<Uuid>,
+    ) -> impl IntoResponse {
+        // Same ownership rule the production handler enforces: a non-admin
+        // can only change their own password. The middleware composition is
+        // what determines whether we even reach this handler — that is the
+        // bug under test.
+        if auth.user_id != id && !auth.is_admin {
+            return (
+                StatusCode::FORBIDDEN,
+                "Cannot change other users' passwords",
+            )
+                .into_response();
+        }
+        (StatusCode::OK, "password-changed").into_response()
+    }
+
+    async fn stub_list_users(Extension(_auth): Extension<AuthExtension>) -> impl IntoResponse {
+        (StatusCode::OK, "user-list").into_response()
+    }
+
+    async fn stub_get_user(
+        Extension(_auth): Extension<AuthExtension>,
+        Path(_id): Path<Uuid>,
+    ) -> impl IntoResponse {
+        (StatusCode::OK, "user-detail").into_response()
+    }
+
+    // ---- router builder ---------------------------------------------------
+
+    /// Build a `/users` test app with the same middleware composition as the
+    /// production `routes.rs::api_v1_routes` `/users` nest after the #1010
+    /// fix: a self-service router carrying just the change-password route
+    /// behind `auth_middleware`, merged with an admin-only router behind
+    /// `admin_middleware`.
+    ///
+    /// The reference to `super::self_service_router` below is what makes
+    /// this regression test fail to compile if the fix is reverted; the
+    /// compile dependency is what proves the production fix function still
+    /// exists.
+    fn build_users_test_app(auth_service: Arc<AuthService>) -> Router {
+        // Compile-time anchor to the production fix. If `self_service_router`
+        // is removed (i.e. the fix is reverted), this test will fail to
+        // compile. The production function returns `Router<SharedState>`
+        // which we cannot ground to `()` here without a full AppState, so
+        // we only take a function-pointer reference to prove existence.
+        let _production_self_service: fn() -> Router<crate::api::SharedState> =
+            super::self_service_router;
+        let _production_admin: fn() -> Router<crate::api::SharedState> = super::router;
+
+        let self_service: Router = Router::new()
+            .route("/:id/password", post(stub_change_password))
+            .layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            ));
+
+        let admin_only: Router = Router::new()
+            .route("/", get(stub_list_users))
+            .route("/:id", get(stub_get_user))
+            .layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                admin_middleware,
+            ));
+
+        Router::new().nest("/users", self_service.merge(admin_only))
+    }
+
+    /// POST `/users/:id/password` request with a Bearer token and a
+    /// minimal valid JSON body. The body content does not matter for the
+    /// middleware/routing regression — the stub handler ignores it.
+    fn password_change_request(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"new_password":"NewSecurePass123!"}"#))
+            .unwrap()
+    }
+
+    /// GET request with a Bearer token and an empty body.
+    fn bearer_get(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Run a request through the app and return `(status, body_text)` —
+    /// every regression test below makes both assertions, so this collapses
+    /// the boilerplate.
+    async fn send(app: Router, req: Request<Body>) -> (StatusCode, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = body_text(resp).await;
+        (status, body)
+    }
+
+    /// Build the `/users` test app and mint a JWT for a fresh user with the
+    /// requested admin flag. Returns `(app, user, access_token)`. Most
+    /// regression tests need exactly this triple.
+    fn setup_with_user(is_admin: bool) -> (Router, User, String) {
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let user = make_user(is_admin);
+        let tokens = auth_service
+            .generate_tokens(&user)
+            .expect("mint access token");
+        let app = build_users_test_app(auth_service);
+        (app, user, tokens.access_token)
+    }
+
+    // ---- the regression tests --------------------------------------------
+
+    #[tokio::test]
+    async fn test_non_admin_can_change_own_password_through_user_routes() {
+        // The original bug: this exact request returned 403 "Admin access
+        // required" because `POST /users/:id/password` lived under
+        // `admin_middleware`. After the fix it must reach the handler.
+        let (app, user, token) = setup_with_user(/* is_admin */ false);
+
+        let uri = format!("/users/{}/password", user.id);
+        let (status, body) = send(app, password_change_request(&uri, &token)).await;
+
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin self-password-change must not be blocked by admin middleware (bug #1010); body was: {body}"
+        );
+        assert!(
+            !body.contains("Admin access required"),
+            "response must not be the admin-gate rejection (bug #1010); status={status}, body={body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "non-admin changing own password should reach the handler and succeed; body was: {body}"
+        );
+        assert!(body.contains("password-changed"));
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_change_another_users_password() {
+        // Ownership guard preserved: even though the route is reachable
+        // without admin, the handler still rejects cross-user password
+        // changes from non-admins.
+        let (app, _attacker, token) = setup_with_user(/* is_admin */ false);
+        let victim_id = Uuid::new_v4();
+
+        let uri = format!("/users/{}/password", victim_id);
+        let (status, body) = send(app, password_change_request(&uri, &token)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin must not change another user's password; body was: {body}"
+        );
+        assert!(
+            body.contains("Cannot change other users' passwords"),
+            "expected ownership-rejection message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_can_change_any_users_password() {
+        // Regression guard for the admin path: the fix must not have
+        // accidentally locked admins out of resetting other users.
+        let (app, _admin, token) = setup_with_user(/* is_admin */ true);
+        let target_id = Uuid::new_v4();
+
+        let uri = format!("/users/{}/password", target_id);
+        let (status, body) = send(app, password_change_request(&uri, &token)).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin must be able to change any user's password; body was: {body}"
+        );
+        assert!(body.contains("password-changed"));
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_still_blocked_from_admin_only_user_routes() {
+        // Regression guard for the admin gate: list/get/etc. must still be
+        // admin-only after the fix splits out the password route.
+        let (app, _user, token) = setup_with_user(/* is_admin */ false);
+
+        // GET /users (list) must be admin-only.
+        let (status, body) = send(app.clone(), bearer_get("/users", &token)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin must not list users; body was: {body}"
+        );
+        assert!(
+            body.contains("Admin access required"),
+            "expected admin-gate message on /users list, got: {body}"
+        );
+
+        // GET /users/:id (detail) must also still be admin-only.
+        let detail_uri = format!("/users/{}", Uuid::new_v4());
+        let (status, body) = send(app, bearer_get(&detail_uri, &token)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "non-admin must not view another user's detail; body was: {body}"
+        );
+        assert!(body.contains("Admin access required"));
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_password_change_rejected() {
+        // The self-service route still requires authentication — `auth_middleware`
+        // (not anonymous) — so a missing Authorization header must be rejected
+        // at the middleware with 401 before the handler is reached.
+        let auth_service = Arc::new(AuthService::new(lazy_pool(), make_test_config()));
+        let app = build_users_test_app(auth_service);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/users/{}/password", Uuid::new_v4()))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"new_password":"NewSecurePass123!"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
