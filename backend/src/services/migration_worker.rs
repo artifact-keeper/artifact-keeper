@@ -192,36 +192,28 @@ impl MigrationWorker {
         // key. Conflicts (existing repo with same key but different type or
         // format) are logged and the source repo is skipped so the rest of
         // the job can still make progress.
+        //
         // `list_repositories` returns `ArtifactoryError`; the `?` converts via
         // `MigrationError::from(ArtifactoryError)` on the existing `#[from]` impl.
         let source_repos = client.list_repositories().await?;
-        let mut repos_to_process: Vec<&String> = Vec::with_capacity(repos.len());
-        for repo_key in &repos {
-            let source_repo = match source_repos.iter().find(|r| r.key == *repo_key) {
-                Some(r) => r,
-                None => {
-                    tracing::error!(
-                        job_id = %job_id, repo = %repo_key,
-                        "Source repository not found in source registry; skipping",
-                    );
-                    total_failed += 1;
-                    continue;
-                }
-            };
+        let plan = resolve_repos_for_provisioning(&repos, &source_repos);
+        for missing_key in &plan.missing {
+            tracing::error!(
+                job_id = %job_id, repo = %missing_key,
+                "Source repository not found in source registry; skipping",
+            );
+            total_failed += 1;
+        }
+        for unsupported in &plan.unsupported {
+            tracing::error!(
+                job_id = %job_id, repo = %unsupported.repo_key, error = %unsupported.reason,
+                "Failed to prepare repository migration config; skipping",
+            );
+            total_failed += 1;
+        }
 
-            let migration_config =
-                match MigrationService::prepare_repository_migration(source_repo, None) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            job_id = %job_id, repo = %repo_key, error = %e,
-                            "Failed to prepare repository migration config; skipping",
-                        );
-                        total_failed += 1;
-                        continue;
-                    }
-                };
-
+        let mut repos_to_process: Vec<String> = Vec::with_capacity(plan.resolved.len());
+        for migration_config in plan.resolved {
             // Skip if a repo with the same key already exists with a
             // compatible type+format; recreate would be ambiguous and
             // potentially destructive. Surface incompatible matches as an
@@ -238,13 +230,13 @@ impl MigrationWorker {
                 match conflict.conflict_type {
                     Some(ConflictType::SameKey) => {
                         tracing::info!(
-                            job_id = %job_id, repo = %repo_key,
+                            job_id = %job_id, repo = %migration_config.target_key,
                             "Destination repository already exists with matching type+format; reusing",
                         );
                     }
                     _ => {
                         tracing::error!(
-                            job_id = %job_id, repo = %repo_key,
+                            job_id = %job_id, repo = %migration_config.target_key,
                             conflict = ?conflict.conflict_type,
                             message = %conflict.message,
                             "Destination repository conflict; skipping artifact transfer for this repo",
@@ -261,7 +253,7 @@ impl MigrationWorker {
                 {
                     Ok(_) => {
                         tracing::info!(
-                            job_id = %job_id, repo = %repo_key,
+                            job_id = %job_id, repo = %migration_config.target_key,
                             format = %migration_config.package_type,
                             repo_type = ?migration_config.repo_type,
                             "Provisioned destination repository",
@@ -269,7 +261,7 @@ impl MigrationWorker {
                     }
                     Err(e) => {
                         tracing::error!(
-                            job_id = %job_id, repo = %repo_key, error = %e,
+                            job_id = %job_id, repo = %migration_config.target_key, error = %e,
                             "Failed to create destination repository; skipping",
                         );
                         total_failed += 1;
@@ -278,11 +270,11 @@ impl MigrationWorker {
                 }
             }
 
-            repos_to_process.push(repo_key);
+            repos_to_process.push(migration_config.target_key);
         }
 
         // Process each repository
-        for repo_key in repos_to_process {
+        for repo_key in &repos_to_process {
             // Check for pause/cancel
             if self.cancel_token.is_cancelled() {
                 tracing::info!(job_id = %job_id, "Migration cancelled by user");
@@ -1352,6 +1344,59 @@ pub(crate) fn verify_expected_checksums(
     None
 }
 
+/// A source repository requested for migration that could not be turned
+/// into a [`RepositoryMigrationConfig`] (typically because the source's
+/// repository type or package format isn't recognized by Artifact Keeper).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnsupportedRepo {
+    pub repo_key: String,
+    pub reason: String,
+}
+
+/// Outcome of pre-pass resolution before destination provisioning.
+///
+/// Each requested key in `process_job`'s `include_repos` list lands in
+/// exactly one of the three buckets: it has a valid source-side row and
+/// gets turned into a `RepositoryMigrationConfig` (`resolved`); the source
+/// has no row with that key (`missing`); or the source row exists but its
+/// type/format can't be mapped to a destination config (`unsupported`).
+#[derive(Debug, Default)]
+pub(crate) struct ResolveRepoPlan {
+    pub resolved: Vec<crate::services::migration_service::RepositoryMigrationConfig>,
+    pub missing: Vec<String>,
+    pub unsupported: Vec<UnsupportedRepo>,
+}
+
+/// Match each requested repository key against the source-side repository
+/// list and prepare a `RepositoryMigrationConfig` for it.
+///
+/// Pure (no DB, no I/O) so it can be unit-tested end-to-end. The DB-touching
+/// `check_repository_conflict` / `create_repository` follow-up runs in
+/// `MigrationWorker::process_job` over the `resolved` slice.
+pub(crate) fn resolve_repos_for_provisioning(
+    requested: &[String],
+    source_repos: &[crate::services::artifactory_client::RepositoryListItem],
+) -> ResolveRepoPlan {
+    let mut plan = ResolveRepoPlan::default();
+    for repo_key in requested {
+        let source_repo = match source_repos.iter().find(|r| &r.key == repo_key) {
+            Some(r) => r,
+            None => {
+                plan.missing.push(repo_key.clone());
+                continue;
+            }
+        };
+        match MigrationService::prepare_repository_migration(source_repo, None) {
+            Ok(c) => plan.resolved.push(c),
+            Err(e) => plan.unsupported.push(UnsupportedRepo {
+                repo_key: repo_key.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+    plan
+}
+
 /// Determine the final job status based on completed and failed counts.
 /// Returns Failed only when all items failed (failed > 0 and completed == 0),
 /// otherwise returns Completed.
@@ -2411,5 +2456,129 @@ mod tests {
             ..WorkerConfig::default()
         };
         assert!(!config.verify_checksums);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_repos_for_provisioning — pre-pass before create_repository
+    // (the fix for the silent-failure bug: process_job would previously
+    // skip create_repository entirely; now we resolve each requested key
+    // against the source's listing first.)
+    // -----------------------------------------------------------------------
+
+    use crate::services::artifactory_client::RepositoryListItem;
+
+    fn mk_source_repo(key: &str, repo_type: &str, package_type: &str) -> RepositoryListItem {
+        RepositoryListItem {
+            key: key.into(),
+            repo_type: repo_type.into(),
+            package_type: package_type.into(),
+            url: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_repos_all_present_and_supported() {
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("npm-releases", "LOCAL", "Npm"),
+        ];
+        let requested = vec!["maven-releases".to_string(), "npm-releases".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 2);
+        assert!(plan.missing.is_empty());
+        assert!(plan.unsupported.is_empty());
+        let resolved_keys: Vec<&str> = plan.resolved.iter().map(|c| c.target_key.as_str()).collect();
+        assert!(resolved_keys.contains(&"maven-releases"));
+        assert!(resolved_keys.contains(&"npm-releases"));
+    }
+
+    #[test]
+    fn test_resolve_repos_missing_from_source_lands_in_missing_bucket() {
+        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
+        let requested = vec![
+            "maven-releases".to_string(),
+            "does-not-exist".to_string(),
+        ];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        assert_eq!(plan.missing, vec!["does-not-exist".to_string()]);
+        assert!(plan.unsupported.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_empty_request_yields_empty_plan() {
+        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
+        let plan = resolve_repos_for_provisioning(&[], &source);
+        assert!(plan.resolved.is_empty());
+        assert!(plan.missing.is_empty());
+        assert!(plan.unsupported.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_extra_source_repos_are_ignored() {
+        // Source has repos we did NOT request; those should not show up
+        // anywhere in the plan.
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("unrequested-repo", "LOCAL", "Generic"),
+        ];
+        let requested = vec!["maven-releases".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        assert_eq!(plan.resolved[0].target_key, "maven-releases");
+        assert!(plan.missing.is_empty());
+        assert!(plan.unsupported.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_unsupported_repo_type_lands_in_unsupported_bucket() {
+        // `prepare_repository_migration` rejects unknown repo types via
+        // RepositoryType::from_artifactory; we surface that here as
+        // `unsupported` rather than panicking or pretending the key is
+        // missing from source.
+        let source = vec![mk_source_repo("weird-repo", "BOGUS_TYPE", "Maven")];
+        let requested = vec!["weird-repo".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert!(plan.resolved.is_empty());
+        assert!(plan.missing.is_empty());
+        assert_eq!(plan.unsupported.len(), 1);
+        assert_eq!(plan.unsupported[0].repo_key, "weird-repo");
+        assert!(!plan.unsupported[0].reason.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_repos_target_key_matches_source_key_by_default() {
+        // We don't currently rename repos; documenting the contract so a
+        // future change that breaks it gets caught here.
+        let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
+        let requested = vec!["maven-releases".to_string()];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        let cfg = &plan.resolved[0];
+        assert_eq!(cfg.source_key, "maven-releases");
+        assert_eq!(cfg.target_key, "maven-releases");
+    }
+
+    #[test]
+    fn test_resolve_repos_unsupported_repo_does_not_block_subsequent_repos() {
+        // Mixed batch: 1 valid + 1 unsupported + 1 missing. All three
+        // should reach their respective buckets; the unsupported one
+        // must not short-circuit the loop.
+        let source = vec![
+            mk_source_repo("maven-releases", "LOCAL", "Maven"),
+            mk_source_repo("weird-repo", "BOGUS_TYPE", "Maven"),
+        ];
+        let requested = vec![
+            "maven-releases".to_string(),
+            "weird-repo".to_string(),
+            "missing-repo".to_string(),
+        ];
+        let plan = resolve_repos_for_provisioning(&requested, &source);
+        assert_eq!(plan.resolved.len(), 1);
+        assert_eq!(plan.resolved[0].target_key, "maven-releases");
+        assert_eq!(plan.missing, vec!["missing-repo".to_string()]);
+        assert_eq!(plan.unsupported.len(), 1);
+        assert_eq!(plan.unsupported[0].repo_key, "weird-repo");
     }
 }
