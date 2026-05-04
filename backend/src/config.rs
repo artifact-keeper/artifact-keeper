@@ -113,6 +113,16 @@ pub struct Config {
     /// How often (in seconds) the lifecycle scheduler checks for due policies.
     pub lifecycle_check_interval_secs: u64,
 
+    /// Threshold (in seconds) before a `scan_results` row stuck in
+    /// `status='running'` is considered orphaned by the janitor and
+    /// transitioned to `failed`. Default 1800 (30 minutes); raise this above
+    /// the slowest expected scan (issue #1015).
+    pub stuck_scan_threshold_secs: u64,
+
+    /// How often (in seconds) the stuck-scan janitor sweeps for orphaned
+    /// `running` rows. Default 600 (10 minutes).
+    pub stuck_scan_check_interval_secs: u64,
+
     /// Maximum upload size in bytes for artifact uploads.
     /// Defaults to 10 GB (10737418240 bytes). Set to 0 to disable the limit.
     pub max_upload_size_bytes: u64,
@@ -191,6 +201,8 @@ redacted_debug!(Config {
     show otel_service_name,
     show gc_schedule,
     show lifecycle_check_interval_secs,
+    show stuck_scan_threshold_secs,
+    show stuck_scan_check_interval_secs,
     show max_upload_size_bytes,
     show allow_local_admin_login,
     show proxy_max_concurrent_fetches,
@@ -263,6 +275,8 @@ impl Config {
                 .unwrap_or_else(|_| "artifact-keeper".into()),
             gc_schedule: env::var("GC_SCHEDULE").unwrap_or_else(|_| "0 0 * * * *".into()),
             lifecycle_check_interval_secs: env_parse("LIFECYCLE_CHECK_INTERVAL_SECS", 60),
+            stuck_scan_threshold_secs: env_parse("STUCK_SCAN_THRESHOLD_SECS", 1800),
+            stuck_scan_check_interval_secs: env_parse("STUCK_SCAN_CHECK_INTERVAL_SECS", 600),
             max_upload_size_bytes: env_parse("MAX_UPLOAD_SIZE", 10_737_418_240_u64),
             proxy_max_concurrent_fetches: env_parse("PROXY_MAX_CONCURRENT_FETCHES", 20).max(1),
             proxy_max_artifact_size_bytes: env_parse(
@@ -381,6 +395,8 @@ impl Default for Config {
             otel_service_name: "test".to_string(),
             gc_schedule: "0 0 * * * *".to_string(),
             lifecycle_check_interval_secs: 60,
+            stuck_scan_threshold_secs: 1800,
+            stuck_scan_check_interval_secs: 600,
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             proxy_max_concurrent_fetches: 20,

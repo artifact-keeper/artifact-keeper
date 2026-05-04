@@ -102,13 +102,12 @@ async fn insert_running_scan(
 }
 
 async fn fetch_status_and_error(pool: &PgPool, scan_id: Uuid) -> (String, Option<String>) {
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT status, error_message FROM scan_results WHERE id = $1",
-    )
-    .bind(scan_id)
-    .fetch_one(pool)
-    .await
-    .expect("fetch scan");
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_message FROM scan_results WHERE id = $1")
+            .bind(scan_id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch scan");
     row
 }
 
@@ -161,7 +160,10 @@ async fn test_cleanup_stuck_scans_marks_old_running_as_failed() {
     );
 
     let (status, error) = fetch_status_and_error(&pool, stuck_id).await;
-    assert_eq!(status, "failed", "stuck row should be transitioned to failed");
+    assert_eq!(
+        status, "failed",
+        "stuck row should be transitioned to failed"
+    );
     let err = error.expect("failed row should have a diagnostic error_message");
     assert!(
         err.to_lowercase().contains("janitor")
@@ -192,7 +194,10 @@ async fn test_cleanup_stuck_scans_leaves_fresh_running_rows_alone() {
         .expect("janitor should succeed");
 
     let (status, error) = fetch_status_and_error(&pool, fresh_id).await;
-    assert_eq!(status, "running", "fresh in-progress row must not be reaped");
+    assert_eq!(
+        status, "running",
+        "fresh in-progress row must not be reaped"
+    );
     assert!(
         error.is_none(),
         "fresh row must not get an error_message (got {:?})",
@@ -285,7 +290,10 @@ async fn test_cleanup_stuck_scans_returns_count_of_reaped_rows() {
         .await
         .expect("janitor should succeed");
 
-    assert_eq!(cleaned, 3, "janitor should report exactly the rows it reaped");
+    assert_eq!(
+        cleaned, 3u64,
+        "janitor should report exactly the rows it reaped"
+    );
 
     cleanup(&pool, repo_id).await;
 }

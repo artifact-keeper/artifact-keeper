@@ -1,5 +1,7 @@
 //! Service for managing scan results and findings.
 
+use std::time::Duration;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -282,6 +284,47 @@ impl ScanResultService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Reap scan_results rows wedged in `status='running'` past the supplied
+    /// threshold. Pre-allocated rows can get stuck if the scan worker crashes
+    /// (OOM, pod evicted, panic, deploy mid-scan) before reaching its terminal
+    /// UPDATE; those rows then accumulate forever and pollute dashboards
+    /// (issue #1015).
+    ///
+    /// Transitions matching rows to `status='failed'`, sets `completed_at` to
+    /// now, and writes a diagnostic `error_message`. Rows already in a terminal
+    /// state (`completed`, `failed`) are not touched, so this is safe to run
+    /// concurrently with an in-flight scan that completes mid-tick.
+    ///
+    /// Returns the count of rows reaped.
+    pub async fn cleanup_stuck_scans(&self, stuck_threshold: Duration) -> Result<u64> {
+        // Cap at i64::MAX seconds so the cast is well-defined for any sane
+        // threshold; in practice operators configure minutes or hours here.
+        let secs = stuck_threshold.as_secs().min(i64::MAX as u64) as i64;
+        let error_message = format!(
+            "janitor: scan worker did not complete within {}s (stuck in 'running')",
+            secs
+        );
+
+        let result = sqlx::query!(
+            r#"
+            UPDATE scan_results
+            SET status = 'failed',
+                error_message = $1,
+                completed_at = NOW()
+            WHERE status = 'running'
+              AND started_at IS NOT NULL
+              AND started_at < NOW() - make_interval(secs => $2::double precision)
+            "#,
+            error_message,
+            secs as f64,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(result.rows_affected())
     }
 
     /// Get a scan result by ID.

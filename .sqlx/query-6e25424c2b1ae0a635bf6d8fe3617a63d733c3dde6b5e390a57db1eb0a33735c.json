@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE scan_results\n            SET status = 'failed',\n                error_message = $1,\n                completed_at = NOW()\n            WHERE status = 'running'\n              AND started_at IS NOT NULL\n              AND started_at < NOW() - make_interval(secs => $2::double precision)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6e25424c2b1ae0a635bf6d8fe3617a63d733c3dde6b5e390a57db1eb0a33735c"
+}
