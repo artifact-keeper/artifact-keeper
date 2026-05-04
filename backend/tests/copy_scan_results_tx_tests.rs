@@ -82,6 +82,16 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid) {
         .await;
 }
 
+/// Count `scan_results` rows for a given artifact. Used to verify that the
+/// transaction rollback in #1035 leaves no orphan rows behind.
+async fn count_scan_results_for(pool: &PgPool, artifact_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("count scan_results")
+}
+
 /// #1035 — `copy_scan_results` must roll back the first INSERT when the
 /// second INSERT fails.
 ///
@@ -172,12 +182,7 @@ async fn copy_scan_results_rolls_back_first_insert_when_findings_insert_fails() 
     .expect("install trigger");
 
     // --- Sanity: pre-call, the destination has zero scan_results rows.
-    let pre_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
-            .bind(dest_artifact_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count pre");
+    let pre_count = count_scan_results_for(&pool, dest_artifact_id).await;
     assert_eq!(pre_count, 0, "destination must start with no scans");
 
     // --- Act: call copy_scan_results. Expected: returns Err because the
@@ -202,12 +207,7 @@ async fn copy_scan_results_rolls_back_first_insert_when_findings_insert_fails() 
     // committed. Pre-fix, the row from step (1) was already in the table
     // when step (2) errored. Post-fix, both INSERTs share a transaction
     // so the row is rolled back.
-    let post_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
-            .bind(dest_artifact_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count post");
+    let post_count = count_scan_results_for(&pool, dest_artifact_id).await;
     assert_eq!(
         post_count, 0,
         "scan_results row from the first INSERT must be rolled back when the \
