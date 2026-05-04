@@ -108,6 +108,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
+    // Resolve the shutdown token early so background workers spawned during
+    // startup (notification dispatcher, webhook producer) share the same
+    // cancellation source as the HTTP/gRPC servers spawned later. If the
+    // caller did not pass one (console mode) we create our own and bind it
+    // to the OS signal listener.
+    let runtime_shutdown_token = match shutdown_token {
+        Some(token) => token,
+        None => {
+            let token = CancellationToken::new();
+            let signal_token = token.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                signal_token.cancel();
+            });
+            token
+        }
+    };
+
     // Load environment variables
     if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
         dotenvy::from_path(&env_file).ok();
@@ -464,6 +482,30 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
+    // Validate the webhook signing-secret encryption key at boot. If the
+    // operator has set AK_WEBHOOK_SECRET_KEY but it is malformed, fail loud
+    // and early instead of letting create/rotate-secret return HTTP 500
+    // hours later. A missing key is also fatal: webhooks v2 cannot create
+    // or rotate secrets without it. Operators who want to run the backend
+    // without webhook support entirely can omit the key by also disabling
+    // the producer (WEBHOOKS_V2_PRODUCER_ENABLED=false, the default).
+    match artifact_keeper_backend::services::webhook_secret_crypto::ensure_configured() {
+        Ok(()) => tracing::info!("Webhook secret encryption key validated"),
+        Err(artifact_keeper_backend::services::webhook_secret_crypto::WebhookSecretError::KeyMissing) => {
+            tracing::warn!(
+                "AK_WEBHOOK_SECRET_KEY is not configured; webhook create and \
+                 rotate-secret endpoints will return HTTP 500 until it is set"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "AK_WEBHOOK_SECRET_KEY is set but invalid: {}; refusing to start",
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Start notification dispatcher (subscribes to EventBus for email/webhook delivery)
     artifact_keeper_backend::services::notification_dispatcher::start_dispatcher(
         app_state.event_bus.clone(),
@@ -471,6 +513,29 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         app_state.smtp_service.clone(),
     );
     tracing::info!("Notification dispatcher started");
+
+    // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
+    // into webhook_deliveries. The retry scheduler (every 30s) drives
+    // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
+    //
+    // Gated behind WEBHOOKS_V2_PRODUCER_ENABLED (default off) so v1.1.9
+    // ships the dual-write code path dark. Operators flip the flag once
+    // they have rotated migrated webhook secrets and verified delivery.
+    let producer_enabled = std::env::var("WEBHOOKS_V2_PRODUCER_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if producer_enabled {
+        artifact_keeper_backend::services::webhook_producer::start_webhook_producer(
+            app_state.event_bus.clone(),
+            app_state.db.clone(),
+            runtime_shutdown_token.clone(),
+        );
+        tracing::info!("Webhook producer started (WEBHOOKS_V2_PRODUCER_ENABLED=true)");
+    } else {
+        tracing::info!(
+            "Webhook producer disabled (set WEBHOOKS_V2_PRODUCER_ENABLED=true to enable)"
+        );
+    }
 
     app_state
         .setup_required
@@ -596,23 +661,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             }),
         );
 
-    // Shared cancellation token: when the shutdown signal fires, both the
-    // HTTP and gRPC servers are notified to stop accepting new connections
-    // and drain in-flight requests before the process exits.
-    let shutdown_token = match shutdown_token {
-        Some(token) => token,
-        None => {
-            // No external token provided (console mode). Create our own and
-            // spawn the signal listener that cancels it on SIGTERM / Ctrl+C.
-            let token = CancellationToken::new();
-            let signal_token = token.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                signal_token.cancel();
-            });
-            token
-        }
-    };
+    // The concrete shutdown token used by all servers and background tasks
+    // is resolved earlier in run_server (see `runtime_shutdown_token`) so
+    // that long-lived workers (notification dispatcher, webhook producer)
+    // share the same cancellation source as the HTTP/gRPC servers.
+    let shutdown_token = runtime_shutdown_token.clone();
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;

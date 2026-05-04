@@ -35,6 +35,29 @@ pub fn map_event_type(event_type: &str) -> &str {
     }
 }
 
+/// Lookup table used by the v1.1.9 data migration that copies
+/// `notification_subscriptions` rows (System B) into the `webhooks` table
+/// (System A).
+///
+/// Notification event types use dot-separated names
+/// (e.g. `artifact.uploaded`) while webhook event types use underscore
+/// names (e.g. `artifact_uploaded`). Each tuple is
+/// `(notification_event_type, webhook_event_type)`. This constant is the
+/// authoritative source for the equivalent SQL `CASE` expression in
+/// `migrations/081_migrate_notification_subscriptions_to_webhooks.sql`;
+/// keeping both in sync prevents migrated rows from drifting out of the
+/// webhook event vocabulary.
+pub const NOTIFICATION_TO_WEBHOOK_EVENT_MAP: &[(&str, &str)] = &[
+    ("artifact.uploaded", "artifact_uploaded"),
+    ("artifact.deleted", "artifact_deleted"),
+    ("scan.completed", "scan_completed"),
+    ("scan.vulnerability_found", "scan_vulnerability_found"),
+    ("repository.updated", "repository_updated"),
+    ("repository.deleted", "repository_deleted"),
+    ("build.completed", "build_completed"),
+    ("build.failed", "build_failed"),
+];
+
 /// Row type for notification subscription lookups.
 #[derive(Debug)]
 struct SubscriptionRow {
@@ -429,6 +452,129 @@ mod tests {
     #[test]
     fn test_map_event_type_empty_string() {
         assert_eq!(map_event_type(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // NOTIFICATION_TO_WEBHOOK_EVENT_MAP
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_to_webhook_event_map_covers_all_valid_event_types() {
+        // Every event type the notifications API accepts must have a
+        // webhook equivalent so the data migration cannot drop events.
+        use crate::api::handlers::notifications::VALID_EVENT_TYPES;
+        for et in VALID_EVENT_TYPES {
+            assert!(
+                NOTIFICATION_TO_WEBHOOK_EVENT_MAP
+                    .iter()
+                    .any(|(n, _)| n == et),
+                "missing webhook mapping for notification event '{}'",
+                et
+            );
+        }
+    }
+
+    #[test]
+    fn test_notification_to_webhook_event_map_uses_underscore_names() {
+        // Webhook events use underscore-separated names; verify the map
+        // does not accidentally store a dot-form value on the webhook side.
+        for (_, webhook_name) in NOTIFICATION_TO_WEBHOOK_EVENT_MAP {
+            assert!(
+                !webhook_name.contains('.'),
+                "webhook event name '{}' must not contain a dot",
+                webhook_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_notification_to_webhook_event_map_artifact_uploaded() {
+        let webhook_name = NOTIFICATION_TO_WEBHOOK_EVENT_MAP
+            .iter()
+            .find(|(n, _)| *n == "artifact.uploaded")
+            .map(|(_, w)| *w);
+        assert_eq!(webhook_name, Some("artifact_uploaded"));
+    }
+
+    #[test]
+    fn test_notification_to_webhook_event_map_no_duplicate_keys() {
+        let mut seen: Vec<&str> = Vec::new();
+        for (n, _) in NOTIFICATION_TO_WEBHOOK_EVENT_MAP {
+            assert!(!seen.contains(n), "duplicate key in mapping: {}", n);
+            seen.push(n);
+        }
+    }
+
+    #[test]
+    fn test_migration_081_case_matches_rust_map() {
+        // Drift fence: regex-extract every WHEN '<x>' THEN '<y>' pair from
+        // the migration's CASE expression and assert the set equals the
+        // Rust constant. Without this, a future migration edit can silently
+        // drop a mapping (or rename one) and the build will not catch it
+        // until customers report missing deliveries on the migrated rows.
+        const SQL: &str =
+            include_str!("../../migrations/081_migrate_notification_subscriptions_to_webhooks.sql");
+
+        // Hand-rolled scanner (no regex dep): line-oriented walk over the
+        // migration. For each line that starts (after trimming) with the
+        // word `WHEN`, find the first single-quoted literal and the first
+        // single-quoted literal AFTER the word `THEN`. The migration's CASE
+        // arms are written one per line; this pattern matches them and
+        // ignores any other quoted text in the file.
+        fn extract_pairs(sql: &str) -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            for raw in sql.lines() {
+                let line = raw.trim_start();
+                if !line.to_ascii_uppercase().starts_with("WHEN") {
+                    continue;
+                }
+                // Split on `THEN` (case-insensitive) so we can pick the
+                // quoted literal in each half independently.
+                let upper = line.to_ascii_uppercase();
+                let then_idx = match upper.find("THEN") {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let (lhs, rhs) = line.split_at(then_idx);
+                let when_lit = match extract_first_quoted(lhs) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let then_lit = match extract_first_quoted(&rhs[4..]) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                out.push((when_lit, then_lit));
+            }
+            out
+        }
+
+        fn extract_first_quoted(s: &str) -> Option<String> {
+            let bytes = s.as_bytes();
+            let start = bytes.iter().position(|&b| b == b'\'')?;
+            let rest = &bytes[start + 1..];
+            let end = rest.iter().position(|&b| b == b'\'')?;
+            Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+        }
+
+        let mut sql_pairs = extract_pairs(SQL);
+        sql_pairs.sort();
+        sql_pairs.dedup();
+
+        let mut rust_pairs: Vec<(String, String)> = NOTIFICATION_TO_WEBHOOK_EVENT_MAP
+            .iter()
+            .map(|(n, w)| ((*n).to_string(), (*w).to_string()))
+            .collect();
+        rust_pairs.sort();
+
+        assert!(
+            !sql_pairs.is_empty(),
+            "migration 081 contained no WHEN/THEN pairs; regex broken or file empty"
+        );
+        assert_eq!(
+            sql_pairs, rust_pairs,
+            "migration 081 CASE pairs drifted from NOTIFICATION_TO_WEBHOOK_EVENT_MAP"
+        );
     }
 
     // -----------------------------------------------------------------------
