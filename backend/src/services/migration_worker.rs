@@ -2488,7 +2488,11 @@ mod tests {
         assert_eq!(plan.resolved.len(), 2);
         assert!(plan.missing.is_empty());
         assert!(plan.unsupported.is_empty());
-        let resolved_keys: Vec<&str> = plan.resolved.iter().map(|c| c.target_key.as_str()).collect();
+        let resolved_keys: Vec<&str> = plan
+            .resolved
+            .iter()
+            .map(|c| c.target_key.as_str())
+            .collect();
         assert!(resolved_keys.contains(&"maven-releases"));
         assert!(resolved_keys.contains(&"npm-releases"));
     }
@@ -2496,10 +2500,7 @@ mod tests {
     #[test]
     fn test_resolve_repos_missing_from_source_lands_in_missing_bucket() {
         let source = vec![mk_source_repo("maven-releases", "LOCAL", "Maven")];
-        let requested = vec![
-            "maven-releases".to_string(),
-            "does-not-exist".to_string(),
-        ];
+        let requested = vec!["maven-releases".to_string(), "does-not-exist".to_string()];
         let plan = resolve_repos_for_provisioning(&requested, &source);
         assert_eq!(plan.resolved.len(), 1);
         assert_eq!(plan.missing, vec!["does-not-exist".to_string()]);
