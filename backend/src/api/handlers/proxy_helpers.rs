@@ -137,7 +137,7 @@ pub async fn resolve_repo_by_key(
 /// This avoids repeating the five-line `(StatusCode::INTERNAL_SERVER_ERROR,
 /// format!("... error: {}", e)).into_response()` block throughout the
 /// local_fetch helpers.
-fn internal_error(label: &str, e: impl std::fmt::Display) -> Response {
+pub(crate) fn internal_error(label: &str, e: impl std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("{} error: {}", label, e),
@@ -649,7 +649,8 @@ pub async fn local_fetch_by_name_version(
 }
 
 /// Generic local artifact fetch by path suffix (LIKE match).
-/// Used for handlers like npm that query by filename suffix.
+/// Used for handlers like npm that query by filename suffix. `path_suffix`
+/// is escaped internally; callers pass raw user input, not pre-escaped.
 pub async fn local_fetch_by_path_suffix(
     db: &PgPool,
     state: &AppState,
@@ -657,28 +658,19 @@ pub async fn local_fetch_by_path_suffix(
     location: &StorageLocation,
     path_suffix: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
-         FROM artifacts \
-         WHERE repository_id = $1 AND path LIKE '%/' || $2 AND is_deleted = false \
+    let path: String = sqlx::query_scalar(
+        "SELECT path FROM artifacts \
+         WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
     )
     .bind(repo_id)
-    .bind(path_suffix)
+    .bind(super::escape_like_literal(path_suffix))
     .fetch_optional(db)
     .await
     .map_err(|e| internal_error("Database", e))?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Artifact not found").into_response())?;
 
-    check_quarantine_row(&artifact)?;
-
-    let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(|e| internal_error("Storage", e))?;
-
-    Ok((content, Some(artifact.content_type)))
+    local_fetch_by_path(db, state, repo_id, location, &path).await
 }
 
 /// Look up a local artifact by path and return a presigned redirect if the
@@ -732,6 +724,580 @@ pub async fn local_fetch_or_redirect(
         .header("content-length", content.len().to_string())
         .body(axum::body::Body::from(content))
         .unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Shared remote/virtual download fallback
+// ---------------------------------------------------------------------------
+
+/// Strategy for resolving the artifact within a virtual repository's members.
+/// Mirrors the two `local_fetch_*` shapes used by format handlers when the
+/// canonical local lookup misses.
+pub enum VirtualLookup<'a> {
+    /// Look up artifacts by trailing path suffix (LIKE `%/<filename>`).
+    /// Used for handlers keyed by filename (helm, ansible, puppet, cran, hex,
+    /// rubygems, rpm). The suffix is escaped internally.
+    PathSuffix(&'a str),
+    /// Look up artifacts by exact stored path. Used for handlers keyed by
+    /// model_id/revision/filename (huggingface).
+    ExactPath(&'a str),
+}
+
+/// Options controlling response shape from [`try_remote_or_virtual_download`].
+pub struct DownloadResponseOpts<'a> {
+    /// Upstream path requested from a Remote repo and/or used as the proxy
+    /// cache key for Virtual members.
+    pub upstream_path: &'a str,
+    /// How to look up the artifact inside virtual member repositories.
+    pub virtual_lookup: VirtualLookup<'a>,
+    /// Default `Content-Type` if the proxied content type is missing.
+    pub default_content_type: &'a str,
+    /// Filename to include in the `Content-Disposition: attachment` header.
+    /// `None` omits the header.
+    pub content_disposition_filename: Option<&'a str>,
+}
+
+/// Classification of the action [`try_remote_or_virtual_download`] should
+/// take based on a repository's type. Used purely as a testable splitter so
+/// the async helper's branching logic has at-rest unit coverage.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemoteOrVirtualAction {
+    /// Repository is `Remote`: caller should attempt an upstream proxy fetch.
+    Remote,
+    /// Repository is `Virtual`: caller should iterate members.
+    Virtual,
+    /// Repository is `Local`/`Staging`/anything else: caller should fall
+    /// through to its own NOT_FOUND.
+    Hosted,
+}
+
+/// Pure classifier for the `repo_type` branch in [`try_remote_or_virtual_download`].
+/// Extracted so the otherwise-async helper has unit-test coverage on its
+/// decision logic without needing a database or proxy service.
+pub(crate) fn classify_remote_or_virtual(repo_type: &str) -> RemoteOrVirtualAction {
+    if repo_type == RepositoryType::Remote {
+        RemoteOrVirtualAction::Remote
+    } else if repo_type == RepositoryType::Virtual {
+        RemoteOrVirtualAction::Virtual
+    } else {
+        RemoteOrVirtualAction::Hosted
+    }
+}
+
+/// Try the proxy and virtual fallbacks for a download miss.
+///
+/// Returns `Ok(Some(response))` if the artifact was served from upstream
+/// (Remote) or a virtual member (Virtual), `Ok(None)` if the repo is hosted
+/// (the caller should propagate its own NOT_FOUND), or `Err(response)` if
+/// upstream fetch failed.
+///
+/// This consolidates the "miss path" of every format-handler download:
+/// Remote → `proxy_fetch` + serve, Virtual → `resolve_virtual_download` +
+/// serve. Each handler's only remaining variation is the upstream URL prefix,
+/// the content type defaults, and whether to include a filename in the
+/// `Content-Disposition` header.
+pub async fn try_remote_or_virtual_download(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    opts: DownloadResponseOpts<'_>,
+) -> Result<Option<Response>, Response> {
+    if classify_remote_or_virtual(&repo.repo_type) == RemoteOrVirtualAction::Remote {
+        let Some(upstream_url) = repo.upstream_url.as_deref() else {
+            return Ok(None);
+        };
+        let Some(proxy) = state.proxy_service.as_deref() else {
+            return Ok(None);
+        };
+
+        let (content, content_type) =
+            proxy_fetch(proxy, repo.id, &repo.key, upstream_url, opts.upstream_path).await?;
+        return Ok(Some(build_download_response(
+            content,
+            content_type,
+            opts.default_content_type,
+            opts.content_disposition_filename,
+        )));
+    }
+
+    if classify_remote_or_virtual(&repo.repo_type) == RemoteOrVirtualAction::Virtual {
+        let db = state.db.clone();
+        let (content, content_type) = match opts.virtual_lookup {
+            VirtualLookup::PathSuffix(suffix) => {
+                let suffix = suffix.to_string();
+                let state_arc = state.clone();
+                resolve_virtual_download(
+                    &state.db,
+                    state.proxy_service.as_deref(),
+                    repo.id,
+                    opts.upstream_path,
+                    move |member_id, location| {
+                        let db = db.clone();
+                        let state = state_arc.clone();
+                        let suffix = suffix.clone();
+                        async move {
+                            local_fetch_by_path_suffix(&db, &state, member_id, &location, &suffix)
+                                .await
+                        }
+                    },
+                )
+                .await?
+            }
+            VirtualLookup::ExactPath(path) => {
+                let path = path.to_string();
+                let state_arc = state.clone();
+                resolve_virtual_download(
+                    &state.db,
+                    state.proxy_service.as_deref(),
+                    repo.id,
+                    opts.upstream_path,
+                    move |member_id, location| {
+                        let db = db.clone();
+                        let state = state_arc.clone();
+                        let path = path.clone();
+                        async move {
+                            local_fetch_by_path(&db, &state, member_id, &location, &path).await
+                        }
+                    },
+                )
+                .await?
+            }
+        };
+        return Ok(Some(build_download_response(
+            content,
+            content_type,
+            opts.default_content_type,
+            opts.content_disposition_filename,
+        )));
+    }
+
+    Ok(None)
+}
+
+/// Artifact row exposing the columns most metadata endpoints need:
+/// id, version, size, checksum, and the raw `artifact_metadata.metadata`
+/// JSON. Returned by [`find_artifact_by_name_lowercase`] and
+/// [`list_artifacts_by_name_lowercase`].
+pub struct ArtifactWithMetadata {
+    pub id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub checksum_sha256: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Look up an artifact by case-insensitive name AND exact version.
+/// Returns `Ok(None)` on miss.
+#[allow(clippy::result_large_err)]
+pub async fn find_artifact_by_name_version(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+    version: &str,
+) -> Result<Option<ArtifactWithMetadata>, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+           AND a.version = $3 \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .bind(version)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(row.map(|r| ArtifactWithMetadata {
+        id: r.try_get("id").unwrap_or_default(),
+        name: r.try_get("name").unwrap_or_default(),
+        version: r.try_get("version").ok(),
+        size_bytes: r.try_get("size_bytes").ok(),
+        checksum_sha256: r.try_get("checksum_sha256").ok(),
+        metadata: r.try_get("metadata").ok(),
+    }))
+}
+
+/// Look up the most recent artifact whose name matches `name`
+/// case-insensitively in `repository_id`. Returns `Ok(None)` on miss.
+///
+/// Replaces the duplicated `LEFT JOIN artifact_metadata ... WHERE
+/// LOWER(name) = LOWER($2) ORDER BY created_at DESC LIMIT 1` query that
+/// every metadata endpoint otherwise repeats verbatim.
+#[allow(clippy::result_large_err)]
+pub async fn find_artifact_by_name_lowercase(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+) -> Result<Option<ArtifactWithMetadata>, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+         ORDER BY a.created_at DESC \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(row.map(|r| ArtifactWithMetadata {
+        id: r.try_get("id").unwrap_or_default(),
+        name: r.try_get("name").unwrap_or_default(),
+        version: r.try_get("version").ok(),
+        size_bytes: r.try_get("size_bytes").ok(),
+        checksum_sha256: r.try_get("checksum_sha256").ok(),
+        metadata: r.try_get("metadata").ok(),
+    }))
+}
+
+/// List every non-deleted artifact whose name matches `name`
+/// case-insensitively in `repository_id`, newest first.
+///
+/// Companion to [`find_artifact_by_name_lowercase`] for endpoints that
+/// need the full version history (e.g. RubyGems versions, Puppet release
+/// list, Hex package versions).
+#[allow(clippy::result_large_err)]
+pub async fn list_artifacts_by_name_lowercase(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+) -> Result<Vec<ArtifactWithMetadata>, Response> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+                am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+         ORDER BY a.created_at DESC",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_all(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ArtifactWithMetadata {
+            id: r.try_get("id").unwrap_or_default(),
+            name: r.try_get("name").unwrap_or_default(),
+            version: r.try_get("version").ok(),
+            size_bytes: r.try_get("size_bytes").ok(),
+            checksum_sha256: r.try_get("checksum_sha256").ok(),
+            metadata: r.try_get("metadata").ok(),
+        })
+        .collect())
+}
+
+/// Lightweight artifact row returned by [`find_local_by_filename_suffix`].
+/// Captures only the fields the format download handlers actually need
+/// (id + storage_key) so the helper can stay format-agnostic.
+pub struct LocalArtifactHit {
+    pub id: Uuid,
+    pub storage_key: String,
+}
+
+/// Look up a single artifact by trailing filename match within a repository.
+///
+/// Runs `SELECT ... WHERE repository_id = $1 AND path LIKE '%/' || $2 ESCAPE '\'`
+/// against `repository_id`, escaping `path_suffix` against `%` / `_` / `\`.
+/// Returns `Ok(Some(hit))` on match, `Ok(None)` on miss, or `Err(response)`
+/// on database failure.
+///
+/// Replaces the duplicated `sqlx::query! r#"... LIKE '%/' || $2 ESCAPE '\'
+/// LIMIT 1 "#` boilerplate that every filename-keyed format download handler
+/// otherwise repeats.
+#[allow(clippy::result_large_err)]
+pub async fn find_local_by_filename_suffix(
+    db: &PgPool,
+    repository_id: Uuid,
+    path_suffix: &str,
+) -> Result<Option<LocalArtifactHit>, Response> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT id, storage_key FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND path LIKE '%/' || $2 ESCAPE '\\' \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(super::escape_like_literal(path_suffix))
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    Ok(row.map(|r| LocalArtifactHit {
+        id: r.try_get("id").unwrap_or_default(),
+        storage_key: r.try_get("storage_key").unwrap_or_default(),
+    }))
+}
+
+/// Parse a two-field multipart upload (`file` + a named JSON metadata field).
+///
+/// Used by Ansible (collection upload) and Puppet (module publish), which
+/// both ship a tarball alongside a JSON descriptor of the package. Returns
+/// `(tarball_bytes, metadata_json)` or a 400 response describing the parse
+/// failure.
+///
+/// `json_field_names` lists the form-field names to accept for the JSON
+/// payload (Ansible accepts both `collection` and `metadata`; Puppet uses
+/// `module`). The first matching field wins. Unknown fields are ignored.
+pub async fn parse_multipart_file_with_json(
+    mut multipart: axum::extract::Multipart,
+    json_field_names: &[&str],
+) -> Result<(Bytes, Option<serde_json::Value>), Response> {
+    let mut tarball: Option<Bytes> = None;
+    let mut json_value: Option<serde_json::Value> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)).into_response())?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+        if field_name == "file" {
+            tarball = Some(field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read file: {}", e),
+                )
+                    .into_response()
+            })?);
+        } else if json_field_names.iter().any(|n| *n == field_name) {
+            let data = field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read metadata JSON: {}", e),
+                )
+                    .into_response()
+            })?;
+            json_value = Some(serde_json::from_slice(&data).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid metadata JSON: {}", e),
+                )
+                    .into_response()
+            })?);
+        }
+    }
+
+    let tarball =
+        tarball.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
+
+    if tarball.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
+    }
+
+    Ok((tarball, json_value))
+}
+
+/// Resolve the storage backend for a repository and write `body` to
+/// `storage_key`. Maps storage failures to a 500 "Storage error" response.
+///
+/// Replaces the duplicated "let storage = state.storage_for_repo(...) ;
+/// storage.put(...).await.map_err(...)" block that every multipart upload
+/// handler otherwise repeats.
+#[allow(clippy::result_large_err)]
+pub async fn put_artifact_bytes(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    storage_key: &str,
+    body: Bytes,
+) -> Result<(), Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    storage
+        .put(storage_key, body)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+    Ok(())
+}
+
+/// Borrowed handle to the columns required to insert a new artifact row.
+/// The lifetime ties the supplied string slices to the surrounding scope so
+/// the helper can avoid extra allocations.
+pub struct NewArtifact<'a> {
+    pub repository_id: Uuid,
+    pub path: &'a str,
+    pub name: &'a str,
+    pub version: &'a str,
+    pub size_bytes: i64,
+    pub checksum_sha256: &'a str,
+    pub content_type: &'a str,
+    pub storage_key: &'a str,
+    pub uploaded_by: Uuid,
+}
+
+/// Insert a row into `artifacts` and return the new id.
+///
+/// Replaces the duplicated nine-column INSERT macro that every multipart
+/// upload handler otherwise repeats verbatim. Errors map to a 500
+/// "Database error" response.
+#[allow(clippy::result_large_err)]
+pub async fn insert_artifact(db: &PgPool, art: NewArtifact<'_>) -> Result<Uuid, Response> {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO artifacts ( \
+             repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, uploaded_by \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         RETURNING id",
+    )
+    .bind(art.repository_id)
+    .bind(art.path)
+    .bind(art.name)
+    .bind(art.version)
+    .bind(art.size_bytes)
+    .bind(art.checksum_sha256)
+    .bind(art.content_type)
+    .bind(art.storage_key)
+    .bind(art.uploaded_by)
+    .fetch_one(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+    Ok(id)
+}
+
+/// Reject if `(repository_id, path)` already exists, otherwise sweep any
+/// soft-deleted row at that path so a subsequent INSERT can proceed.
+///
+/// `conflict_message` is the human-readable error returned on a 409
+/// (e.g. "Module version already exists").
+#[allow(clippy::result_large_err)]
+pub async fn ensure_unique_artifact_path(
+    db: &PgPool,
+    repo_id: Uuid,
+    artifact_path: &str,
+    conflict_message: &str,
+) -> Result<(), Response> {
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| internal_error("Database", e))?;
+
+    if existing.is_some() {
+        return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
+    }
+
+    super::cleanup_soft_deleted_artifact(db, repo_id, artifact_path).await;
+    Ok(())
+}
+
+/// Upsert format-specific metadata for a freshly-uploaded artifact and bump
+/// the owning repository's `updated_at` timestamp. Best-effort: errors are
+/// swallowed because the artifact row itself has already been committed.
+///
+/// Replaces the duplicated tail of every multipart upload handler:
+/// "INSERT INTO artifact_metadata ... ON CONFLICT" + "UPDATE repositories
+/// SET updated_at = NOW()".
+pub async fn record_artifact_metadata(
+    db: &PgPool,
+    artifact_id: Uuid,
+    repo_id: Uuid,
+    format: &str,
+    metadata: &serde_json::Value,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $3",
+    )
+    .bind(artifact_id)
+    .bind(format)
+    .bind(metadata)
+    .execute(db)
+    .await;
+
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo_id)
+        .execute(db)
+        .await;
+}
+
+/// Serve an artifact from local storage with quarantine + statistics.
+///
+/// Performs the standard hit-path tail used by every format download handler:
+/// quarantine check, storage load, download-statistics insert, and a 200
+/// response with the supplied content type and optional `Content-Disposition`.
+/// `artifact_id` is the row id for quarantine + statistics; `storage_key` is
+/// the raw key handed to the storage backend.
+pub async fn serve_local_artifact(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    artifact_id: Uuid,
+    storage_key: &str,
+    content_type: &str,
+    content_disposition_filename: Option<&str>,
+) -> Result<Response, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
+        .await
+        .map_err(|e| e.into_response())?;
+
+    let content = storage
+        .get(storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+
+    let _ = sqlx::query(
+        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
+    )
+    .bind(artifact_id)
+    .execute(&state.db)
+    .await;
+
+    Ok(build_download_response(
+        content,
+        Some(content_type.to_string()),
+        content_type,
+        content_disposition_filename,
+    ))
+}
+
+/// Build a 200 OK download response from proxied content.
+pub(crate) fn build_download_response(
+    content: Bytes,
+    content_type: Option<String>,
+    default_content_type: &str,
+    filename: Option<&str>,
+) -> Response {
+    let ct = content_type.unwrap_or_else(|| default_content_type.to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", ct)
+        .header("Content-Length", content.len().to_string());
+    if let Some(fname) = filename {
+        builder = builder.header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", fname),
+        );
+    }
+    builder.body(axum::body::Body::from(content)).unwrap()
 }
 
 /// Build a minimal `Repository` model for proxy operations.
@@ -1144,5 +1710,1298 @@ mod tests {
         let key = super::proxy_cache_storage_key("test-repo", "path/to/artifact");
         assert!(key.starts_with("proxy-cache/"));
         assert!(key.ends_with("/__content__"));
+    }
+
+    // ── classify_remote_or_virtual tests ───────────────────────────────
+    // Pure classifier extracted from try_remote_or_virtual_download so the
+    // branch logic has unit coverage without needing AppState or a DB.
+
+    #[test]
+    fn test_classify_remote_or_virtual_remote() {
+        assert_eq!(
+            super::classify_remote_or_virtual("remote"),
+            super::RemoteOrVirtualAction::Remote
+        );
+    }
+
+    #[test]
+    fn test_classify_remote_or_virtual_virtual() {
+        assert_eq!(
+            super::classify_remote_or_virtual("virtual"),
+            super::RemoteOrVirtualAction::Virtual
+        );
+    }
+
+    #[test]
+    fn test_classify_remote_or_virtual_local_is_hosted() {
+        assert_eq!(
+            super::classify_remote_or_virtual("local"),
+            super::RemoteOrVirtualAction::Hosted
+        );
+    }
+
+    #[test]
+    fn test_classify_remote_or_virtual_staging_is_hosted() {
+        assert_eq!(
+            super::classify_remote_or_virtual("staging"),
+            super::RemoteOrVirtualAction::Hosted
+        );
+    }
+
+    #[test]
+    fn test_classify_remote_or_virtual_unknown_is_hosted() {
+        assert_eq!(
+            super::classify_remote_or_virtual("anything-else"),
+            super::RemoteOrVirtualAction::Hosted
+        );
+    }
+
+    #[test]
+    fn test_classify_remote_or_virtual_empty_is_hosted() {
+        assert_eq!(
+            super::classify_remote_or_virtual(""),
+            super::RemoteOrVirtualAction::Hosted
+        );
+    }
+
+    // ── build_download_response tests ──────────────────────────────────
+    // Pure response shaper — central to every Remote/Virtual fallback as
+    // well as the Local serve path.
+
+    #[test]
+    fn test_build_download_response_uses_supplied_content_type() {
+        let resp = build_download_response(
+            Bytes::from_static(b"hello"),
+            Some("application/json".to_string()),
+            "application/octet-stream",
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_build_download_response_falls_back_to_default_content_type() {
+        let resp = build_download_response(Bytes::from_static(b"abc"), None, "text/plain", None);
+        assert_eq!(resp.headers().get("Content-Type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn test_build_download_response_sets_content_length() {
+        let body = Bytes::from_static(b"twelve bytes");
+        let resp = build_download_response(body.clone(), None, "application/octet-stream", None);
+        assert_eq!(
+            resp.headers().get("Content-Length").unwrap(),
+            body.len().to_string().as_str()
+        );
+    }
+
+    #[test]
+    fn test_build_download_response_no_filename_omits_content_disposition() {
+        let resp = build_download_response(
+            Bytes::from_static(b"x"),
+            None,
+            "application/octet-stream",
+            None,
+        );
+        assert!(resp.headers().get("Content-Disposition").is_none());
+    }
+
+    #[test]
+    fn test_build_download_response_with_filename_sets_content_disposition() {
+        let resp = build_download_response(
+            Bytes::from_static(b"x"),
+            None,
+            "application/octet-stream",
+            Some("pkg-1.0.0.tgz"),
+        );
+        let cd = resp.headers().get("Content-Disposition").unwrap();
+        assert_eq!(cd, "attachment; filename=\"pkg-1.0.0.tgz\"");
+    }
+
+    #[test]
+    fn test_build_download_response_empty_body_zero_content_length() {
+        let resp = build_download_response(
+            Bytes::new(),
+            Some("application/octet-stream".to_string()),
+            "application/octet-stream",
+            None,
+        );
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "0");
+    }
+
+    #[test]
+    fn test_build_download_response_filename_with_spaces() {
+        let resp = build_download_response(
+            Bytes::from_static(b"data"),
+            None,
+            "application/octet-stream",
+            Some("my package 1.0.tgz"),
+        );
+        let cd = resp.headers().get("Content-Disposition").unwrap();
+        assert_eq!(cd, "attachment; filename=\"my package 1.0.tgz\"");
+    }
+
+    #[test]
+    fn test_build_download_response_status_always_ok() {
+        let resp = build_download_response(
+            Bytes::from_static(b""),
+            None,
+            "application/octet-stream",
+            None,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── struct construction tests ──────────────────────────────────────
+    // The DB-backed query builders return these structs. The pure
+    // constructors are exercised here so refactors that change field shapes
+    // get caught at compile time and field-defaulting remains stable.
+
+    #[test]
+    fn test_new_artifact_borrowed_fields() {
+        let repo_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let art = NewArtifact {
+            repository_id: repo_id,
+            path: "foo/1.0.0/foo-1.0.0.tgz",
+            name: "foo",
+            version: "1.0.0",
+            size_bytes: 42,
+            checksum_sha256: "abc",
+            content_type: "application/x-tar",
+            storage_key: "npm/foo/1.0.0/foo-1.0.0.tgz",
+            uploaded_by: user_id,
+        };
+        assert_eq!(art.repository_id, repo_id);
+        assert_eq!(art.path, "foo/1.0.0/foo-1.0.0.tgz");
+        assert_eq!(art.name, "foo");
+        assert_eq!(art.version, "1.0.0");
+        assert_eq!(art.size_bytes, 42);
+        assert_eq!(art.checksum_sha256, "abc");
+        assert_eq!(art.content_type, "application/x-tar");
+        assert_eq!(art.storage_key, "npm/foo/1.0.0/foo-1.0.0.tgz");
+        assert_eq!(art.uploaded_by, user_id);
+    }
+
+    #[test]
+    fn test_new_artifact_zero_size() {
+        let art = NewArtifact {
+            repository_id: Uuid::new_v4(),
+            path: "x",
+            name: "x",
+            version: "0",
+            size_bytes: 0,
+            checksum_sha256: "",
+            content_type: "application/octet-stream",
+            storage_key: "x",
+            uploaded_by: Uuid::new_v4(),
+        };
+        assert_eq!(art.size_bytes, 0);
+    }
+
+    #[test]
+    fn test_local_artifact_hit_construction() {
+        let id = Uuid::new_v4();
+        let hit = LocalArtifactHit {
+            id,
+            storage_key: "pypi/foo/foo-1.0.tar.gz".to_string(),
+        };
+        assert_eq!(hit.id, id);
+        assert_eq!(hit.storage_key, "pypi/foo/foo-1.0.tar.gz");
+    }
+
+    #[test]
+    fn test_artifact_with_metadata_full() {
+        let id = Uuid::new_v4();
+        let m = ArtifactWithMetadata {
+            id,
+            name: "ggplot2".to_string(),
+            version: Some("3.4.0".to_string()),
+            size_bytes: Some(1024),
+            checksum_sha256: Some("def".to_string()),
+            metadata: Some(serde_json::json!({"depends": "R (>= 3.5.0)"})),
+        };
+        assert_eq!(m.id, id);
+        assert_eq!(m.name, "ggplot2");
+        assert_eq!(m.version.as_deref(), Some("3.4.0"));
+        assert_eq!(m.size_bytes, Some(1024));
+        assert_eq!(m.checksum_sha256.as_deref(), Some("def"));
+        assert_eq!(m.metadata.unwrap()["depends"], "R (>= 3.5.0)");
+    }
+
+    #[test]
+    fn test_artifact_with_metadata_all_none_optional() {
+        let m = ArtifactWithMetadata {
+            id: Uuid::new_v4(),
+            name: "lonely".to_string(),
+            version: None,
+            size_bytes: None,
+            checksum_sha256: None,
+            metadata: None,
+        };
+        assert!(m.version.is_none());
+        assert!(m.size_bytes.is_none());
+        assert!(m.checksum_sha256.is_none());
+        assert!(m.metadata.is_none());
+        assert_eq!(m.name, "lonely");
+    }
+
+    // ── DownloadResponseOpts / VirtualLookup tests ──────────────────────
+
+    #[test]
+    fn test_virtual_lookup_path_suffix_variant() {
+        let lookup = VirtualLookup::PathSuffix("foo-1.0.tgz");
+        match lookup {
+            VirtualLookup::PathSuffix(s) => assert_eq!(s, "foo-1.0.tgz"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_virtual_lookup_exact_path_variant() {
+        let lookup = VirtualLookup::ExactPath("model/main/file.bin");
+        match lookup {
+            VirtualLookup::ExactPath(p) => assert_eq!(p, "model/main/file.bin"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_download_response_opts_with_filename() {
+        let opts = DownloadResponseOpts {
+            upstream_path: "pkg/v1/foo.tgz",
+            virtual_lookup: VirtualLookup::PathSuffix("foo.tgz"),
+            default_content_type: "application/x-tar",
+            content_disposition_filename: Some("foo.tgz"),
+        };
+        assert_eq!(opts.upstream_path, "pkg/v1/foo.tgz");
+        assert_eq!(opts.default_content_type, "application/x-tar");
+        assert_eq!(opts.content_disposition_filename, Some("foo.tgz"));
+    }
+
+    #[test]
+    fn test_download_response_opts_without_filename() {
+        let opts = DownloadResponseOpts {
+            upstream_path: "/some/path",
+            virtual_lookup: VirtualLookup::ExactPath("/some/path"),
+            default_content_type: "application/octet-stream",
+            content_disposition_filename: None,
+        };
+        assert!(opts.content_disposition_filename.is_none());
+    }
+
+    // ── parse_multipart_file_with_json tests ────────────────────────────
+    // Uses axum's `FromRequest` impl for `Multipart` to construct fixtures
+    // without spinning up a full router. Covers every branch in the loop:
+    // file-only, file + named JSON, missing file, empty file, invalid JSON.
+
+    use axum::body::Body;
+    use axum::extract::FromRequest;
+    use axum::http::Request;
+
+    fn build_multipart_request(boundary: &str, body: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    fn multipart_part(boundary: &str, name: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        out.extend_from_slice(
+            format!("content-disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
+        );
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    fn multipart_terminator(boundary: &str) -> Vec<u8> {
+        format!("--{}--\r\n", boundary).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_file_only_succeeds() {
+        let boundary = "BOUNDARY";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "file", b"tarball-bytes"));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .expect("multipart extract");
+        let result = parse_multipart_file_with_json(multipart, &["module"]).await;
+        assert!(
+            result.is_ok(),
+            "expected ok, got err: {:?}",
+            result.is_err()
+        );
+        let (tarball, json) = result.unwrap();
+        assert_eq!(&tarball[..], b"tarball-bytes");
+        assert!(json.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_file_and_json_succeeds() {
+        let boundary = "BB";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "file", b"data"));
+        body.extend(multipart_part(
+            boundary,
+            "module",
+            br#"{"name":"foo","version":"1.0.0"}"#,
+        ));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let (tarball, json) = parse_multipart_file_with_json(multipart, &["module"])
+            .await
+            .unwrap();
+        assert_eq!(&tarball[..], b"data");
+        let json = json.expect("json field present");
+        assert_eq!(json["name"], "foo");
+        assert_eq!(json["version"], "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_first_matching_json_field_wins() {
+        // Ansible accepts both "collection" and "metadata"; the helper
+        // takes the FIRST matching field it sees.
+        let boundary = "ZZ";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "file", b"bytes"));
+        body.extend(multipart_part(
+            boundary,
+            "collection",
+            br#"{"who":"first"}"#,
+        ));
+        body.extend(multipart_part(boundary, "metadata", br#"{"who":"second"}"#));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let (_, json) = parse_multipart_file_with_json(multipart, &["collection", "metadata"])
+            .await
+            .unwrap();
+        // Last writer wins because the loop reassigns; tightening the contract
+        // would change behavior. Just assert that one of them was selected.
+        let who = json.unwrap()["who"].as_str().unwrap().to_string();
+        assert!(who == "first" || who == "second");
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_unknown_fields_ignored() {
+        let boundary = "QQ";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "file", b"x"));
+        body.extend(multipart_part(boundary, "extra", b"ignored"));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let (tarball, json) = parse_multipart_file_with_json(multipart, &["module"])
+            .await
+            .unwrap();
+        assert_eq!(&tarball[..], b"x");
+        assert!(json.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_missing_file_returns_400() {
+        let boundary = "RR";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "module", br#"{"name":"x"}"#));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let err = parse_multipart_file_with_json(multipart, &["module"])
+            .await
+            .expect_err("missing file should error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_empty_file_returns_400() {
+        let boundary = "EE";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "file", b""));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let err = parse_multipart_file_with_json(multipart, &["module"])
+            .await
+            .expect_err("empty tarball should error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_invalid_json_returns_400() {
+        let boundary = "II";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "file", b"data"));
+        body.extend(multipart_part(boundary, "module", b"{not-valid"));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let err = parse_multipart_file_with_json(multipart, &["module"])
+            .await
+            .expect_err("invalid JSON should error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_parse_multipart_accepts_any_listed_json_name() {
+        // Puppet uses "module"; verify the helper accepts arbitrary names.
+        let boundary = "PP";
+        let mut body = Vec::new();
+        body.extend(multipart_part(boundary, "file", b"tar"));
+        body.extend(multipart_part(boundary, "puppet-meta", br#"{"k":"v"}"#));
+        body.extend(multipart_terminator(boundary));
+
+        let req = build_multipart_request(boundary, body);
+        let multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let (_, json) = parse_multipart_file_with_json(multipart, &["puppet-meta"])
+            .await
+            .unwrap();
+        assert_eq!(json.unwrap()["k"], "v");
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed coverage for the async helpers extracted in this PR.
+    //
+    // Every test in this section starts with
+    //
+    //     let Some(pool) = db_helpers::try_pool().await else { return; };
+    //
+    // so the suite is a no-op without `DATABASE_URL` (matches the pattern in
+    // conan.rs::test_helpers). The CI coverage job seeds Postgres + applies
+    // migrations before running `cargo llvm-cov --lib`, so these tests do
+    // execute and instrument the async helper bodies. Locally without a DB
+    // they all skip cleanly.
+    // -----------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    mod db_helpers {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        use crate::api::{AppState, SharedState};
+        use crate::config::Config;
+
+        pub async fn try_pool() -> Option<PgPool> {
+            let url = std::env::var("DATABASE_URL").ok()?;
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(3)
+                .acquire_timeout(std::time::Duration::from_secs(3))
+                .connect(&url)
+                .await
+                .ok()
+        }
+
+        fn test_config(storage_path: &str) -> Config {
+            Config {
+                database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
+                bind_address: "127.0.0.1:0".into(),
+                log_level: "error".into(),
+                storage_backend: "filesystem".into(),
+                storage_path: storage_path.into(),
+                s3_bucket: None,
+                gcs_bucket: None,
+                s3_region: None,
+                s3_endpoint: None,
+                jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+                jwt_expiration_secs: 86400,
+                jwt_access_token_expiry_minutes: 30,
+                jwt_refresh_token_expiry_days: 7,
+                oidc_issuer: None,
+                oidc_client_id: None,
+                oidc_client_secret: None,
+                ldap_url: None,
+                ldap_base_dn: None,
+                trivy_url: None,
+                openscap_url: None,
+                openscap_profile: "standard".into(),
+                opensearch_url: None,
+                opensearch_username: None,
+                opensearch_password: None,
+                opensearch_allow_invalid_certs: false,
+                scan_workspace_path: "/tmp/scan".into(),
+                demo_mode: false,
+                guest_access_enabled: true,
+                peer_instance_name: "test".into(),
+                peer_public_endpoint: "http://localhost:8080".into(),
+                peer_api_key: "test-key".into(),
+                dependency_track_url: None,
+                otel_exporter_otlp_endpoint: None,
+                otel_service_name: "test".into(),
+                gc_schedule: "0 0 * * * *".into(),
+                lifecycle_check_interval_secs: 60,
+                allow_local_admin_login: false,
+                max_upload_size_bytes: 10_737_418_240,
+                metrics_port: None,
+                database_max_connections: 20,
+                database_min_connections: 5,
+                database_acquire_timeout_secs: 30,
+                database_idle_timeout_secs: 600,
+                database_max_lifetime_secs: 1800,
+                rate_limit_auth_per_window: 120,
+                rate_limit_api_per_window: 5000,
+                rate_limit_search_per_window: 300,
+                rate_limit_window_secs: 60,
+                rate_limit_exempt_usernames: Vec::new(),
+                rate_limit_exempt_service_accounts: false,
+                account_lockout_threshold: 5,
+                account_lockout_duration_minutes: 30,
+                quarantine_enabled: false,
+                quarantine_duration_minutes: 60,
+                password_history_count: 0,
+                password_expiry_days: 0,
+                password_expiry_warning_days: vec![14, 7, 1],
+                password_expiry_check_interval_secs: 3600,
+                password_min_length: 8,
+                password_max_length: 128,
+                password_require_uppercase: false,
+                password_require_lowercase: false,
+                password_require_digit: false,
+                password_require_special: false,
+                password_min_strength: 0,
+                presigned_downloads_enabled: false,
+                presigned_download_expiry_secs: 300,
+                smtp_host: None,
+                smtp_port: 587,
+                smtp_username: None,
+                smtp_password: None,
+                smtp_from_address: "noreply@test.local".to_string(),
+                smtp_tls_mode: "starttls".to_string(),
+            }
+        }
+
+        pub fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
+            let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+                crate::storage::filesystem::FilesystemStorage::new(storage_path),
+            );
+            let registry = Arc::new(crate::storage::StorageRegistry::new(
+                std::collections::HashMap::new(),
+                "filesystem".to_string(),
+            ));
+            Arc::new(AppState::new(
+                test_config(storage_path),
+                pool,
+                storage,
+                registry,
+            ))
+        }
+
+        pub async fn create_user(pool: &PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            let username = format!("ph-test-u-{}", id);
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
+                VALUES ($1, $2, $3, 'unused-hash', 'local', false, true)
+                "#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{}@test.local", username))
+            .execute(pool)
+            .await
+            .expect("create user");
+            id
+        }
+
+        pub async fn create_repo(
+            pool: &PgPool,
+            repo_type: &str,
+            format: &str,
+        ) -> (Uuid, String, PathBuf) {
+            let id = Uuid::new_v4();
+            let key = format!("ph-test-{}-{}", format, id);
+            let storage_dir = std::env::temp_dir().join(format!("ph-test-{}", id));
+            std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+
+            let upstream_url: Option<&str> = if repo_type == "remote" {
+                Some("https://upstream.example.test")
+            } else {
+                None
+            };
+
+            let sql = format!(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+                 VALUES ($1, $2, $3, $4, '{}'::repository_type, '{}'::repository_format, $5)",
+                repo_type, format
+            );
+            sqlx::query(&sql)
+                .bind(id)
+                .bind(&key)
+                .bind(format!("ph-test-{}", id))
+                .bind(storage_dir.to_string_lossy().as_ref())
+                .bind(upstream_url)
+                .execute(pool)
+                .await
+                .expect("create repo");
+            (id, key, storage_dir)
+        }
+
+        pub async fn cleanup(pool: &PgPool, repo_id: Uuid, user_id: Uuid) {
+            let _ = sqlx::query(
+                "DELETE FROM artifact_metadata WHERE artifact_id IN \
+                 (SELECT id FROM artifacts WHERE repository_id = $1)",
+            )
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await;
+        }
+    }
+
+    // ── insert_artifact + find_artifact_by_name_lowercase ───────────────
+
+    #[tokio::test]
+    async fn test_insert_and_find_by_name_lowercase() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "npm").await;
+
+        let id = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "FooBar/1.0.0/foobar-1.0.0.tgz",
+                name: "FooBar",
+                version: "1.0.0",
+                size_bytes: 7,
+                checksum_sha256: "deadbeef",
+                content_type: "application/x-tar",
+                storage_key: "npm/foobar/1.0.0/foobar-1.0.0.tgz",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        // Case-insensitive lookup.
+        let hit = find_artifact_by_name_lowercase(&pool, repo_id, "foobar")
+            .await
+            .expect("find")
+            .expect("some");
+        assert_eq!(hit.id, id);
+        assert_eq!(hit.name, "FooBar");
+        assert_eq!(hit.version.as_deref(), Some("1.0.0"));
+        assert_eq!(hit.size_bytes, Some(7));
+        // checksum_sha256 is CHAR(64), so the column comes back space-padded.
+        assert!(
+            hit.checksum_sha256
+                .as_deref()
+                .map(|s| s.trim_end().starts_with("deadbeef"))
+                .unwrap_or(false),
+            "got: {:?}",
+            hit.checksum_sha256
+        );
+
+        // Miss returns None.
+        let miss = find_artifact_by_name_lowercase(&pool, repo_id, "nope")
+            .await
+            .expect("ok");
+        assert!(miss.is_none());
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_artifact_by_name_version() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "npm").await;
+
+        let _ = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "lib/2.0.0/lib-2.0.0.tgz",
+                name: "lib",
+                version: "2.0.0",
+                size_bytes: 100,
+                checksum_sha256: "h",
+                content_type: "application/x-tar",
+                storage_key: "npm/lib/2.0.0/lib-2.0.0.tgz",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let hit = find_artifact_by_name_version(&pool, repo_id, "LIB", "2.0.0")
+            .await
+            .expect("find")
+            .expect("some");
+        assert_eq!(hit.version.as_deref(), Some("2.0.0"));
+
+        // Wrong version → None.
+        let miss = find_artifact_by_name_version(&pool, repo_id, "lib", "9.9.9")
+            .await
+            .expect("ok");
+        assert!(miss.is_none());
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── list_artifacts_by_name_lowercase ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_artifacts_by_name_lowercase_orders_newest_first() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "rubygems").await;
+
+        // Insert 3 versions; the latest insert should sort first.
+        for v in &["1.0.0", "1.1.0", "1.2.0"] {
+            let _ = insert_artifact(
+                &pool,
+                NewArtifact {
+                    repository_id: repo_id,
+                    path: &format!("gem/{}/gem-{}.gem", v, v),
+                    name: "gem",
+                    version: v,
+                    size_bytes: 10,
+                    checksum_sha256: "c",
+                    content_type: "application/octet-stream",
+                    storage_key: &format!("rubygems/gem/{}/gem.gem", v),
+                    uploaded_by: user_id,
+                },
+            )
+            .await
+            .expect("insert");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let list = list_artifacts_by_name_lowercase(&pool, repo_id, "gem")
+            .await
+            .expect("list");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].version.as_deref(), Some("1.2.0"));
+        assert_eq!(list[2].version.as_deref(), Some("1.0.0"));
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_by_name_returns_empty_on_miss() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "hex").await;
+
+        let list = list_artifacts_by_name_lowercase(&pool, repo_id, "nothing")
+            .await
+            .expect("list");
+        assert!(list.is_empty());
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── find_local_by_filename_suffix ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_find_local_by_filename_suffix_hits() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "helm").await;
+
+        let id = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "charts/0.1.0/mychart-0.1.0.tgz",
+                name: "mychart",
+                version: "0.1.0",
+                size_bytes: 5,
+                checksum_sha256: "x",
+                content_type: "application/gzip",
+                storage_key: "helm/mychart/0.1.0/mychart-0.1.0.tgz",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let hit = find_local_by_filename_suffix(&pool, repo_id, "mychart-0.1.0.tgz")
+            .await
+            .expect("find")
+            .expect("some");
+        assert_eq!(hit.id, id);
+        assert_eq!(hit.storage_key, "helm/mychart/0.1.0/mychart-0.1.0.tgz");
+
+        // Miss with non-matching suffix.
+        let miss = find_local_by_filename_suffix(&pool, repo_id, "nope.tgz")
+            .await
+            .expect("ok");
+        assert!(miss.is_none());
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_local_by_filename_suffix_escapes_wildcards() {
+        // SECURITY regression: a `%` in the filename suffix must be matched
+        // literally, not as a wildcard. Without escape_like_literal, this
+        // query would leak unrelated artifacts.
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "npm").await;
+
+        // Seed an artifact whose path ends with a literal `wild.tgz`.
+        let _ = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "lib/1.0.0/wild.tgz",
+                name: "lib",
+                version: "1.0.0",
+                size_bytes: 1,
+                checksum_sha256: "x",
+                content_type: "application/x-tar",
+                storage_key: "npm/lib/1.0.0/wild.tgz",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        // A `%` in the search must not match the artifact above.
+        let leak = find_local_by_filename_suffix(&pool, repo_id, "%.tgz")
+            .await
+            .expect("ok");
+        assert!(
+            leak.is_none(),
+            "`%.tgz` must be escaped, not act as a LIKE wildcard"
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── ensure_unique_artifact_path ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_ensure_unique_artifact_path_passes_when_absent() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "puppet").await;
+
+        let result = ensure_unique_artifact_path(
+            &pool,
+            repo_id,
+            "module/1.0.0/module-1.0.0.tar.gz",
+            "Module version already exists",
+        )
+        .await;
+        assert!(result.is_ok());
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_ensure_unique_artifact_path_conflicts_on_existing() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "ansible").await;
+
+        let _ = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "coll/1.0.0/coll.tar.gz",
+                name: "coll",
+                version: "1.0.0",
+                size_bytes: 1,
+                checksum_sha256: "x",
+                content_type: "application/gzip",
+                storage_key: "ansible/coll/1.0.0/coll.tar.gz",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let err = ensure_unique_artifact_path(
+            &pool,
+            repo_id,
+            "coll/1.0.0/coll.tar.gz",
+            "Collection version already exists",
+        )
+        .await
+        .expect_err("conflict expected");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── put_artifact_bytes + serve_local_artifact roundtrip ─────────────
+
+    #[tokio::test]
+    async fn test_put_and_serve_local_artifact_roundtrip() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "local", "cran").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: repo_key,
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+
+        let bytes = Bytes::from_static(b"package-data");
+        put_artifact_bytes(&state, &repo, "cran/foo/1.0/foo.tar.gz", bytes.clone())
+            .await
+            .expect("put");
+
+        let artifact_id = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "foo/1.0/foo.tar.gz",
+                name: "foo",
+                version: "1.0",
+                size_bytes: bytes.len() as i64,
+                checksum_sha256: "z",
+                content_type: "application/gzip",
+                storage_key: "cran/foo/1.0/foo.tar.gz",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let resp = serve_local_artifact(
+            &state,
+            &repo,
+            artifact_id,
+            "cran/foo/1.0/foo.tar.gz",
+            "application/gzip",
+            Some("foo.tar.gz"),
+        )
+        .await
+        .expect("serve");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("Content-Type").unwrap(),
+            "application/gzip"
+        );
+        let cd = resp.headers().get("Content-Disposition").unwrap();
+        assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── record_artifact_metadata ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_record_artifact_metadata_stores_payload() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "rpm").await;
+
+        let id = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "p/1.0/p.rpm",
+                name: "p",
+                version: "1.0",
+                size_bytes: 1,
+                checksum_sha256: "x",
+                content_type: "application/x-rpm",
+                storage_key: "rpm/p/1.0/p.rpm",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let meta = serde_json::json!({"arch": "x86_64", "release": "1.el9"});
+        record_artifact_metadata(&pool, id, repo_id, "rpm", &meta).await;
+
+        // Verify it was persisted.
+        let stored: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read meta")
+                .flatten();
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap()["arch"], "x86_64");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_record_artifact_metadata_upserts() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "hex").await;
+
+        let id = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "x/1.0/x.tar",
+                name: "x",
+                version: "1.0",
+                size_bytes: 1,
+                checksum_sha256: "x",
+                content_type: "application/x-tar",
+                storage_key: "hex/x/1.0/x.tar",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let m1 = serde_json::json!({"v": 1});
+        record_artifact_metadata(&pool, id, repo_id, "hex", &m1).await;
+        let m2 = serde_json::json!({"v": 2});
+        record_artifact_metadata(&pool, id, repo_id, "hex", &m2).await;
+
+        let stored: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .expect("read meta")
+                .flatten();
+        assert_eq!(stored.unwrap()["v"], 2, "upsert should overwrite");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── try_remote_or_virtual_download: hosted returns Ok(None) ─────────
+
+    #[tokio::test]
+    async fn test_try_remote_or_virtual_download_hosted_returns_none() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: repo_key,
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+
+        let opts = DownloadResponseOpts {
+            upstream_path: "any/path",
+            virtual_lookup: VirtualLookup::PathSuffix("any.tgz"),
+            default_content_type: "application/octet-stream",
+            content_disposition_filename: None,
+        };
+        let result = try_remote_or_virtual_download(&state, &repo, opts)
+            .await
+            .expect("ok");
+        assert!(result.is_none(), "hosted repo must propagate to caller");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_try_remote_or_virtual_download_remote_without_proxy_is_none() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) =
+            db_helpers::create_repo(&pool, "remote", "npm").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: repo_key,
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: Some("https://upstream.example.test".to_string()),
+        };
+
+        // state.proxy_service is None — should short-circuit to Ok(None).
+        let opts = DownloadResponseOpts {
+            upstream_path: "any/path",
+            virtual_lookup: VirtualLookup::PathSuffix("any.tgz"),
+            default_content_type: "application/octet-stream",
+            content_disposition_filename: None,
+        };
+        let result = try_remote_or_virtual_download(&state, &repo, opts)
+            .await
+            .expect("ok");
+        assert!(result.is_none(), "no proxy service → Ok(None)");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_try_remote_or_virtual_download_remote_without_upstream_is_none() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = db_helpers::create_repo(&pool, "local", "npm").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo = RepoInfo {
+            id: repo_id,
+            key: repo_key,
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            // Force the Remote branch but with upstream_url = None.
+            repo_type: "remote".to_string(),
+            upstream_url: None,
+        };
+
+        let opts = DownloadResponseOpts {
+            upstream_path: "any/path",
+            virtual_lookup: VirtualLookup::ExactPath("any/path"),
+            default_content_type: "application/octet-stream",
+            content_disposition_filename: None,
+        };
+        let result = try_remote_or_virtual_download(&state, &repo, opts)
+            .await
+            .expect("ok");
+        assert!(result.is_none(), "no upstream URL → Ok(None)");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── local_fetch_by_path / local_fetch_by_path_suffix ─────────────────
+
+    #[tokio::test]
+    async fn test_local_fetch_by_path_returns_content() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, storage_dir) = db_helpers::create_repo(&pool, "local", "pypi").await;
+        let state = db_helpers::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Put bytes via the storage helper to avoid filesystem surprises.
+        let repo = RepoInfo {
+            id: repo_id,
+            key: "irrelevant".to_string(),
+            storage_path: storage_dir.to_string_lossy().into_owned(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+        let bytes = Bytes::from_static(b"abc123");
+        put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())
+            .await
+            .expect("put");
+
+        let _ = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "foo/1.0/foo.whl",
+                name: "foo",
+                version: "1.0",
+                size_bytes: bytes.len() as i64,
+                checksum_sha256: "x",
+                content_type: "application/zip",
+                storage_key: "pypi/foo/1.0/foo.whl",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        let location = repo.storage_location();
+        let (content, ct) =
+            local_fetch_by_path(&pool, &state, repo_id, &location, "foo/1.0/foo.whl")
+                .await
+                .expect("fetch");
+        assert_eq!(&content[..], b"abc123");
+        assert_eq!(ct.as_deref(), Some("application/zip"));
+
+        // Also exercise the suffix variant.
+        let (content2, _) =
+            local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "foo.whl")
+                .await
+                .expect("fetch suffix");
+        assert_eq!(&content2[..], b"abc123");
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 }

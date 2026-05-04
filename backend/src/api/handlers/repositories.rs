@@ -2322,6 +2322,46 @@ pub async fn remove_virtual_member(
     Ok(())
 }
 
+/// Compare the input set of (member_key, member_id) pairs against the
+/// `RETURNING` set produced by the bulk UNNEST UPDATE, and surface any
+/// missing ids as a 404 listing the affected member keys.
+///
+/// `returned` is the slice of `member_repo_id`s that the UPDATE actually
+/// matched. If its length equals the requested count, every requested
+/// (virtual_repo_id, member_repo_id) row was present and updated, and we
+/// return Ok(()). Otherwise some member row was deleted between the
+/// resolve pass and the UPDATE (TOCTOU). The error message lists the
+/// requested keys whose ids did not appear in `returned`, in the order
+/// they were submitted, so the caller can retry with a fresh resolve.
+///
+/// Pure: does not touch the database or any handler state. Lives at
+/// module scope so unit tests can exercise the TOCTOU branch without
+/// running the full handler.
+pub(crate) fn detect_bulk_update_misses<'a, I>(
+    virtual_repo_key: &str,
+    requested: I,
+    returned: &[Uuid],
+) -> Result<()>
+where
+    I: IntoIterator<Item = (&'a str, Uuid)>,
+{
+    let requested: Vec<(&str, Uuid)> = requested.into_iter().collect();
+    if requested.len() == returned.len() {
+        return Ok(());
+    }
+    let returned_set: std::collections::HashSet<Uuid> = returned.iter().copied().collect();
+    let missing: Vec<&str> = requested
+        .iter()
+        .filter(|(_, id)| !returned_set.contains(id))
+        .map(|(key, _)| *key)
+        .collect();
+    Err(AppError::NotFound(format!(
+        "members no longer exist on virtual repository {}: {}",
+        virtual_repo_key,
+        missing.join(", ")
+    )))
+}
+
 /// Update priorities for all members (bulk reorder)
 #[utoipa::path(
     put,
@@ -2360,21 +2400,86 @@ pub async fn update_virtual_members(
         ));
     }
 
-    // Update priorities for each member
+    // Resolve every member_repo lookup up front. Reads do not need
+    // transactional protection and resolving first means a bad key fails
+    // fast with 404 before the UPDATE runs.
+    //
+    // Per-member defensive checks also run during the resolve pass:
+    //   - authz: the caller must have rights on each member repo, not just
+    //     the virtual parent (issue #913).
+    //   - self-membership / cycle detection (issue #915): the current
+    //     contract is "update existing rows only" so neither can be
+    //     introduced today, but the checks remain so a future contract
+    //     extension to upsert missing rows cannot slip a cycle in.
+    let mut resolved_member_ids: Vec<Uuid> = Vec::with_capacity(payload.members.len());
+    let mut priorities: Vec<i32> = Vec::with_capacity(payload.members.len());
     for member in &payload.members {
         let member_repo = service.get_by_key(&member.member_key).await?;
         authorize_virtual_member_mutation(&auth, &virtual_repo, &member_repo, "update")?;
 
-        sqlx::query(
-            "UPDATE virtual_repo_members SET priority = $1 WHERE virtual_repo_id = $2 AND member_repo_id = $3",
-        )
-        .bind(member.priority)
-        .bind(virtual_repo.id)
-        .bind(member_repo.id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        if member_repo.id == virtual_repo.id {
+            return Err(AppError::Validation(
+                "A virtual repository cannot be a member of itself".to_string(),
+            ));
+        }
+
+        if member_repo.repo_type == RepositoryType::Virtual
+            && service
+                .would_create_cycle(virtual_repo.id, member_repo.id)
+                .await?
+        {
+            return Err(AppError::Validation(format!(
+                "Updating member {} would leave virtual repository {} in a cycle",
+                member_repo.key, virtual_repo.key
+            )));
+        }
+
+        resolved_member_ids.push(member_repo.id);
+        priorities.push(member.priority);
     }
+
+    // Single-statement bulk update via UNNEST(uuid[], int4[]). This is atomic
+    // by construction in Postgres: the entire statement either succeeds and
+    // updates every matching row, or fails and updates none. Removes the
+    // need for an explicit transaction, the per-row lock-ordering sort, and
+    // the rows_affected loop guard. Concurrent PUTs serialise at the row-
+    // lock layer of this single statement and produce a deterministic final
+    // state (one wins, the other overwrites it; never a row-level mix).
+    //
+    // RETURNING gives us the set of member_repo_ids that actually matched
+    // the (virtual_repo_id, member_repo_id) predicate. If that set is
+    // smaller than the input set, some member row was deleted between the
+    // resolve pass and the UPDATE (TOCTOU), and we surface a 404 listing
+    // the missing keys so the caller can retry with a fresh resolution.
+    let updated: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        UPDATE virtual_repo_members
+           SET priority = c.priority
+          FROM (
+            SELECT * FROM UNNEST($2::uuid[], $3::int4[])
+                     AS t(member_repo_id, priority)
+          ) AS c
+         WHERE virtual_repo_members.virtual_repo_id = $1
+           AND virtual_repo_members.member_repo_id = c.member_repo_id
+        RETURNING virtual_repo_members.member_repo_id
+        "#,
+    )
+    .bind(virtual_repo.id)
+    .bind(&resolved_member_ids)
+    .bind(&priorities)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    detect_bulk_update_misses(
+        &virtual_repo.key,
+        payload
+            .members
+            .iter()
+            .map(|m| m.member_key.as_str())
+            .zip(resolved_member_ids.iter().copied()),
+        &updated,
+    )?;
 
     // Return updated list. Pass the same auth context so the listing is
     // filtered to caller-visible members consistently.
@@ -3687,6 +3792,136 @@ mod tests {
         assert_eq!(req.members[1].priority, 2);
     }
 
+    // -------------------------------------------------------------------
+    // detect_bulk_update_misses (issue #912 TOCTOU detection)
+    //
+    // The bulk UPDATE ... FROM UNNEST(...) RETURNING produces the set of
+    // member_repo_ids that actually matched. If a member row was deleted
+    // between the resolve pass and the UPDATE, the RETURNING set is
+    // smaller than the input. The handler converts that gap into a 404
+    // listing the requested keys that are no longer present. The
+    // detection logic is a pure function over (requested, returned)
+    // pairs so the entire branch is unit-testable without a database.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_bulk_update_misses_all_present_returns_ok() {
+        // Happy path: every requested id is in the RETURNING set, so the
+        // branch returns Ok(()) and the handler proceeds to list members.
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let requested = [("repo-a", id_a), ("repo-b", id_b)];
+        let returned = vec![id_b, id_a];
+        let result = detect_bulk_update_misses("v-repo", requested.iter().copied(), &returned);
+        assert!(result.is_ok(), "all-present must return Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_detect_bulk_update_misses_empty_inputs_returns_ok() {
+        // Edge case: empty payload and empty RETURNING. The handler
+        // does not currently call the helper with an empty input but
+        // the contract should still be Ok(()) so a future caller that
+        // passes-through an empty request does not 404 spuriously.
+        let result = detect_bulk_update_misses("v-repo", std::iter::empty::<(&str, Uuid)>(), &[]);
+        assert!(result.is_ok(), "empty input must return Ok, got {result:?}");
+    }
+
+    #[test]
+    fn test_detect_bulk_update_misses_single_missing_returns_404() {
+        // The most common TOCTOU shape: one member was deleted between
+        // resolve and UPDATE. Helper must surface that one key in a 404.
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let requested = [("repo-a", id_a), ("repo-b", id_b)];
+        // Only id_a came back. id_b was deleted.
+        let returned = vec![id_a];
+        let err = detect_bulk_update_misses("v-repo", requested.iter().copied(), &returned)
+            .expect_err("single missing must be Err");
+        match err {
+            AppError::NotFound(msg) => {
+                assert!(
+                    msg.contains("repo-b"),
+                    "missing key must appear in error message, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("repo-a"),
+                    "present key must not appear in error message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("v-repo"),
+                    "virtual repo key must appear in error message, got: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_detect_bulk_update_misses_all_missing_returns_404_with_every_key() {
+        // Worst case: the entire member set was deleted while the
+        // PUT was in flight. Every requested key must appear in the 404.
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_c = Uuid::new_v4();
+        let requested = [("a", id_a), ("b", id_b), ("c", id_c)];
+        let returned: Vec<Uuid> = vec![];
+        let err = detect_bulk_update_misses("v-repo", requested.iter().copied(), &returned)
+            .expect_err("all-missing must be Err");
+        match err {
+            AppError::NotFound(msg) => {
+                for key in ["a", "b", "c"] {
+                    assert!(
+                        msg.contains(key),
+                        "missing key '{key}' must appear in error, got: {msg}"
+                    );
+                }
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_detect_bulk_update_misses_preserves_submission_order() {
+        // The 404 message lists missing keys in the order the caller
+        // submitted them, NOT in RETURNING order or set-iteration order.
+        // This is load-bearing: callers diff the missing list against
+        // their own submission order to figure out which retry to make.
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let id4 = Uuid::new_v4();
+        // Submit in order [first, second, third, fourth]; second and
+        // fourth get deleted between resolve and UPDATE.
+        let requested = [
+            ("first", id1),
+            ("second", id2),
+            ("third", id3),
+            ("fourth", id4),
+        ];
+        let returned = vec![id1, id3];
+        let err = detect_bulk_update_misses("v-repo", requested.iter().copied(), &returned)
+            .expect_err("partial-missing must be Err");
+        match err {
+            AppError::NotFound(msg) => {
+                let second_pos = msg.find("second").expect("'second' must appear");
+                let fourth_pos = msg.find("fourth").expect("'fourth' must appear");
+                assert!(
+                    second_pos < fourth_pos,
+                    "missing keys must be listed in submission order; got: {msg}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    // Note: the original `test_update_virtual_members_resolution_preserves_order`
+    // unit test was removed during code review. It exercised
+    // `Vec::iter().map().collect()` and `serde_json::from_str`, neither of
+    // which touches the single-statement `UPDATE ... FROM UNNEST(...)`
+    // bulk update or the RETURNING-set comparison that fixes the #912 bug.
+    // A real DB-backed regression test (including a concurrent-PUT race)
+    // lives in `backend/tests/virtual_members_atomicity_test.rs`.
+
     #[test]
     fn test_virtual_member_response_serialization() {
         let resp = VirtualMemberResponse {
@@ -3701,6 +3936,63 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"member_repo_key\":\"upstream\""));
         assert!(json.contains("\"priority\":1"));
+    }
+
+    /// Structural guard for the defensive cycle / self-membership check
+    /// inside `update_virtual_members` (issue #915 second-pass review).
+    ///
+    /// The handler today only updates priorities of existing rows, so it
+    /// cannot insert a new edge and therefore cannot introduce a cycle.
+    /// The defensive check is preserved against a future contract change
+    /// (e.g. upsert semantics). Because no integration harness here can
+    /// observe the no-op behaviour, this test asserts on the *source
+    /// text* of the handler so the protection cannot be silently dropped
+    /// in a refactor without the test failing.
+    ///
+    /// Required substrings are constructed via `format!` so this test's
+    /// own source text does not accidentally satisfy the search.
+    #[test]
+    fn test_update_virtual_members_defensive_check_present() {
+        let source = include_str!("repositories.rs");
+
+        // Locate the `update_virtual_members` handler body.
+        let handler_marker = format!("pub async fn {}{}(", "update_virtual", "_members");
+        let handler_start = source
+            .find(&handler_marker)
+            .expect("update_virtual_members handler must exist");
+        // Slice from the handler signature forward; bound at the next
+        // top-level `pub` item or end of file.
+        let after_sig = &source[handler_start..];
+        let handler_end = after_sig[1..]
+            .find("\npub ")
+            .map(|i| i + 1)
+            .unwrap_or(after_sig.len());
+        let handler_body = &after_sig[..handler_end];
+
+        // The handler's body must still call the cycle helper.
+        let cycle_call = format!("{}_{}_{}", "would", "create", "cycle");
+        assert!(
+            handler_body.contains(&cycle_call),
+            "update_virtual_members must keep its defensive cycle check"
+        );
+
+        // ...and must still reject self-membership before updating.
+        // The exact comparison is `member_repo.id == virtual_repo.id`.
+        let self_check = format!("{}.id == {}.id", "member_repo", "virtual_repo");
+        assert!(
+            handler_body.contains(&self_check),
+            "update_virtual_members must keep its self-membership equality check"
+        );
+
+        // ...and the validation message string must remain.
+        let cannot_be_member_msg = format!(
+            "{} {} {} {} {}",
+            "A virtual repository", "cannot be", "a member", "of", "itself"
+        );
+        assert!(
+            handler_body.contains(&cannot_be_member_msg),
+            "self-membership rejection message must remain unchanged"
+        );
     }
 
     // -----------------------------------------------------------------------

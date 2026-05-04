@@ -120,6 +120,91 @@ pub(crate) fn build_dependency_info_from_findings(
         .collect()
 }
 
+/// Extract just the scan_result IDs from the `(scan_type, id)` pairs returned
+/// by [`ScannerService::prepare_artifact_scan`].
+///
+/// Used by the trigger-scan handler to build `TriggerScanResponse.scan_result_ids`
+/// without consuming the underlying vector (the same pairs are also collected
+/// into a HashMap and handed to the spawned worker).
+pub(crate) fn extract_scan_result_ids(prepared: &[(String, Uuid)]) -> Vec<Uuid> {
+    prepared.iter().map(|(_, id)| *id).collect()
+}
+
+/// Convert the `(scan_type, id)` pairs returned by
+/// [`ScannerService::prepare_artifact_scan`] into the HashMap shape consumed by
+/// [`ScannerService::scan_artifact_with_prepared`].
+///
+/// Pulled out as a free function so the trigger-scan handler can build the map
+/// without owning a HashMap import, and so the conversion is unit-testable
+/// without spinning up a database.
+pub(crate) fn prepared_pairs_to_map(prepared: Vec<(String, Uuid)>) -> HashMap<String, Uuid> {
+    prepared.into_iter().collect()
+}
+
+/// Outcome of consulting the prepared-id map for one scanner inside
+/// `scan_artifact_inner`'s loop. The DB-bound caller does the actual
+/// row lookup or insert; this enum encodes the *decision* in a way that
+/// is unit-testable without a database.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PreparedScanAction {
+    /// A pre-allocated row id was popped from the map. The caller should
+    /// reuse this row (UPDATE in the dedup path, GET in the fresh-scan
+    /// path) instead of inserting a new one.
+    Reuse(Uuid),
+    /// No matching prepared id (either because the trigger handler didn't
+    /// pre-allocate, or the scanner set changed between prepare and
+    /// execute). Caller falls back to inserting a fresh row.
+    InsertFresh,
+}
+
+/// Resolve the prepared-id outcome for a single scanner without touching
+/// the database. The caller invokes `prepared.remove(scan_type)` and
+/// hands the result here.
+pub(crate) fn resolve_prepared_action(prepared_id: Option<Uuid>) -> PreparedScanAction {
+    match prepared_id {
+        Some(id) => PreparedScanAction::Reuse(id),
+        None => PreparedScanAction::InsertFresh,
+    }
+}
+
+/// Truncate a hex checksum string to its first 8 characters (or fewer if
+/// the input is shorter) for use in human-readable log messages.
+///
+/// Lifted out of the inline `&checksum[..8.min(checksum.len())]` slice in
+/// the reuse-path log line so it is unit-testable and so a future change
+/// (longer prefix, sha-prefix scheme, etc.) is a single edit.
+pub(crate) fn checksum_log_prefix(checksum: &str) -> &str {
+    &checksum[..8.min(checksum.len())]
+}
+
+/// Decide whether a reusable scan match should be skipped because it points at
+/// the same artifact we are currently scanning.
+///
+/// `find_reusable_scan` returns the most recent completed scan for a given
+/// `(checksum, scan_type)` pair. When the matched scan's `artifact_id` equals
+/// the current artifact's id, copying would be a no-op (we are reusing our
+/// own previous scan). The caller skips the reuse path in that case and runs
+/// a fresh scan instead.
+pub(crate) fn should_skip_reuse_for_same_artifact(
+    source_artifact_id: Uuid,
+    current_artifact_id: Uuid,
+) -> bool {
+    source_artifact_id == current_artifact_id
+}
+
+/// Build the user-facing message for an artifact-level trigger response.
+pub(crate) fn build_artifact_scan_message(artifact_id: Uuid) -> String {
+    format!("Scan queued for artifact {}", artifact_id)
+}
+
+/// Build the user-facing message for a repository-level trigger response.
+pub(crate) fn build_repository_scan_message(repository_id: Uuid, artifact_count: i64) -> String {
+    format!(
+        "Repository scan queued for {} ({} artifacts)",
+        repository_id, artifact_count
+    )
+}
+
 /// Shared scan workspace utilities for scanners that need to write artifact
 /// content to disk, optionally extract archives, and clean up after scanning.
 pub(crate) struct ScanWorkspace;
@@ -365,6 +450,148 @@ pub trait Scanner: Send + Sync {
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<Vec<RawFinding>>;
+
+    /// Best-effort scanner-binary version string (e.g. `trivy-0.62.1`,
+    /// `grype-0.83.0`). Persisted on `scan_results.scanner_version` so
+    /// operators can reproduce a scan and identify scanners with stale
+    /// vulnerability databases.
+    ///
+    /// The default implementation returns `None` so existing scanners that
+    /// do not yet probe a version remain compilable. Concrete scanners
+    /// should override this to shell out to `--version` (or equivalent) and
+    /// cache the result, so the orchestrator can call it once per scan
+    /// without per-call subprocess overhead.
+    async fn version(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Maximum wall-clock time we will wait for a scanner CLI's `--version`
+/// subcommand to return. A hung version probe is serialized through
+/// `OnceCell::get_or_init`, so any single hang would head-of-line block
+/// every concurrent scan (including the post-failure probe in `fail_scan`).
+/// Five seconds is generous for a `--version` flag that should print and
+/// exit immediately on any healthy binary, but tight enough that a stuck
+/// binary cannot stall the scan pipeline.
+const CAPTURE_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run an external CLI's `--version` subcommand and return its first stdout
+/// line, trimmed. Returns `None` when the binary is missing, fails, or
+/// hangs past `CAPTURE_CLI_VERSION_TIMEOUT`. Used by `Scanner::version()`
+/// implementations to capture the binary version string for the
+/// `scan_results.scanner_version` column.
+///
+/// `args` is the arg vector passed to the binary (typically `["--version"]`
+/// or `["version"]` depending on the tool's CLI conventions).
+pub(crate) async fn capture_cli_version(binary: &str, args: &[&str]) -> Option<String> {
+    capture_cli_version_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
+}
+
+/// Inner implementation of [`capture_cli_version`] parameterized on the
+/// timeout so tests can exercise the elapsed-timeout branch in milliseconds
+/// rather than the full production five-second wait.
+pub(crate) async fn capture_cli_version_with_timeout(
+    binary: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let fut = tokio::process::Command::new(binary).args(args).output();
+    let output = match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => return None, // spawn / IO error
+        Err(_) => {
+            warn!(
+                binary = binary,
+                timeout_ms = timeout.as_millis() as u64,
+                "scanner version probe timed out; recording NULL scanner_version"
+            );
+            return None;
+        }
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+/// Resolve a scanner's lazily-cached version string, probing once via
+/// `probe` and caching the result in `cell` for the scanner's lifetime.
+///
+/// Concrete `Scanner::version()` impls share this OnceCell + clone pattern;
+/// extracting it here keeps the per-scanner override to a single line and
+/// avoids near-identical method bodies across `trivy_fs_scanner`,
+/// `image_scanner`, `incus_scanner`, `grype_scanner`, and `openscap_scanner`.
+pub(crate) async fn cached_cli_version<F, Fut>(
+    cell: &tokio::sync::OnceCell<Option<String>>,
+    probe: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    cell.get_or_init(probe).await.clone()
+}
+
+/// Convenience wrapper around [`cached_cli_version`] for scanners that probe
+/// the Trivy CLI. Returns `Some("trivy-<ver>")` once the CLI has been
+/// probed, or `None` when the binary is missing or its output is unparseable.
+pub(crate) async fn cached_trivy_cli_version(
+    cell: &tokio::sync::OnceCell<Option<String>>,
+) -> Option<String> {
+    cached_cli_version(cell, || async {
+        let raw = capture_cli_version("trivy", &["--version"]).await?;
+        format_trivy_version(&raw)
+    })
+    .await
+}
+
+/// Parse a Trivy `--version` first stdout line into a `trivy-X.Y.Z` token.
+/// Trivy emits `Version: 0.62.1` (or `Version: 0.62.1\n...`). We normalize
+/// to `trivy-<version>` to make the field self-describing in the DB.
+pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
+    let v = raw
+        .strip_prefix("Version:")
+        .map(str::trim)
+        .or_else(|| raw.strip_prefix("trivy").map(str::trim))
+        .unwrap_or(raw)
+        .trim();
+    let token = v.split_whitespace().next()?;
+    if token.is_empty() {
+        None
+    } else {
+        Some(format!("trivy-{}", token))
+    }
+}
+
+/// Parse a `grype --version` first stdout line into a `grype-X.Y.Z` token.
+/// Grype's `--version` (single dash-dash flag) emits a single line like
+/// `grype 0.83.0`, which we normalize to `grype-<version>` for consistency with
+/// `format_trivy_version`. Also tolerates a `Version:` prefix as a
+/// defensive shape (some packagings of `grype version` emit that).
+pub(crate) fn format_grype_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let mut parts = trimmed.split_whitespace();
+    let head = parts.next()?;
+    // Three output shapes:
+    //   `grype 0.83.0`   -> skip leading `grype`, take next token
+    //   `Version: 0.83.0` -> skip leading `Version:`, take next token
+    //   `0.83.0`         -> head is the version itself
+    let version = if head.eq_ignore_ascii_case("grype") || head.eq_ignore_ascii_case("Version:") {
+        parts.next()?
+    } else {
+        head
+    };
+    if version.is_empty() {
+        None
+    } else {
+        Some(format!("grype-{}", version))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,11 +1464,99 @@ impl ScannerService {
         self.dependency_track = Some(dt);
     }
 
+    /// Synchronously create one placeholder `running` scan_result row per
+    /// configured scanner for the given artifact, returning the row IDs.
+    ///
+    /// This is the synchronous half of the trigger-scan path: it commits real
+    /// rows to the database before the caller spawns the actual scan worker.
+    /// Returns `(scan_type, scan_result_id)` pairs that the caller can pass to
+    /// [`scan_artifact_with_prepared`] (and surface in the API response so
+    /// clients can pin polling to specific scan IDs without racing concurrent
+    /// scans on the same artifact).
+    ///
+    /// Returns `Ok(vec![])` when scanning is disabled for the artifact's
+    /// repository and `force` is false (matching `scan_artifact_with_options`).
+    /// Returns `Ok(vec![])` when the artifact is missing or soft-deleted, so
+    /// the caller can decide whether to surface a 404 separately.
+    pub async fn prepare_artifact_scan(
+        &self,
+        artifact_id: Uuid,
+        force: bool,
+    ) -> Result<Vec<(String, Uuid)>> {
+        let artifact = sqlx::query!(
+            r#"
+            SELECT repository_id, checksum_sha256
+            FROM artifacts
+            WHERE id = $1 AND is_deleted = false
+            "#,
+            artifact_id,
+        )
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let Some(artifact) = artifact else {
+            return Ok(vec![]);
+        };
+
+        if !force
+            && !self
+                .scan_config_service
+                .is_scan_enabled(artifact.repository_id)
+                .await?
+        {
+            return Ok(vec![]);
+        }
+
+        let mut prepared = Vec::with_capacity(self.scanners.len());
+        for scanner in &self.scanners {
+            let row = self
+                .scan_result_service
+                .create_scan_result_with_checksum(
+                    artifact_id,
+                    artifact.repository_id,
+                    scanner.scan_type(),
+                    Some(&artifact.checksum_sha256),
+                )
+                .await?;
+            prepared.push((scanner.scan_type().to_string(), row.id));
+        }
+
+        Ok(prepared)
+    }
+
+    /// Scan a single artifact using pre-allocated scan_result row IDs.
+    ///
+    /// Companion to [`prepare_artifact_scan`]: when the caller has already
+    /// committed placeholder rows (so it could surface their IDs in the
+    /// trigger response), this variant reuses those IDs instead of inserting
+    /// new ones. Falls back to creating a row on the fly if a scanner has no
+    /// matching prepared ID (e.g. scanner set changed between prepare and
+    /// execute).
+    pub async fn scan_artifact_with_prepared(
+        &self,
+        artifact_id: Uuid,
+        prepared: HashMap<String, Uuid>,
+        force: bool,
+    ) -> Result<()> {
+        self.scan_artifact_inner(artifact_id, force, Some(prepared))
+            .await
+    }
+
     /// Scan a single artifact: run all applicable scanners, persist results,
     /// recalculate the repository security score.
     /// Scan a single artifact. When `force` is true, skip the repo scan-enabled check
     /// (used for on-demand scans triggered manually by an admin).
     pub async fn scan_artifact_with_options(&self, artifact_id: Uuid, force: bool) -> Result<()> {
+        self.scan_artifact_inner(artifact_id, force, None).await
+    }
+
+    async fn scan_artifact_inner(
+        &self,
+        artifact_id: Uuid,
+        force: bool,
+        prepared: Option<HashMap<String, Uuid>>,
+    ) -> Result<()> {
         // Fetch artifact and content
         let artifact = sqlx::query_as!(
             Artifact,
@@ -1297,8 +1612,14 @@ impl ScannerService {
 
         let checksum = &artifact.checksum_sha256;
         const DEDUP_TTL_DAYS: i32 = 30;
+        let mut prepared = prepared.unwrap_or_default();
 
         for scanner in &self.scanners {
+            // Take any pre-allocated row id committed by the trigger handler.
+            // The id was already returned to the client in TriggerScanResponse,
+            // so we must keep the same row alive (UPDATE rather than INSERT).
+            let prepared_action = resolve_prepared_action(prepared.remove(scanner.scan_type()));
+
             // Check for reusable scan results (same hash + scan type within TTL)
             if let Ok(Some(source_scan)) = self
                 .scan_result_service
@@ -1306,25 +1627,33 @@ impl ScannerService {
                 .await
             {
                 // Skip if the source scan is for the same artifact (already scanned)
-                if source_scan.artifact_id != artifact_id {
-                    match self
-                        .scan_result_service
-                        .copy_scan_results(
-                            source_scan.id,
-                            artifact_id,
-                            artifact.repository_id,
-                            scanner.scan_type(),
-                            checksum,
-                        )
-                        .await
-                    {
+                if !should_skip_reuse_for_same_artifact(source_scan.artifact_id, artifact_id) {
+                    let copied = match prepared_action {
+                        PreparedScanAction::Reuse(target_id) => {
+                            self.scan_result_service
+                                .convert_to_reused(target_id, source_scan.id, artifact_id)
+                                .await
+                        }
+                        PreparedScanAction::InsertFresh => {
+                            self.scan_result_service
+                                .copy_scan_results(
+                                    source_scan.id,
+                                    artifact_id,
+                                    artifact.repository_id,
+                                    scanner.scan_type(),
+                                    checksum,
+                                )
+                                .await
+                        }
+                    };
+                    match copied {
                         Ok(reused) => {
                             info!(
                                 "Reusing scan results from {} for artifact {} (scanner={}, hash={}..)",
                                 source_scan.id,
                                 artifact_id,
                                 scanner.name(),
-                                &checksum[..8.min(checksum.len())],
+                                checksum_log_prefix(checksum),
                             );
                             // Update quarantine status based on copied findings
                             self.update_quarantine_status(artifact_id, reused.findings_count)
@@ -1341,16 +1670,30 @@ impl ScannerService {
                 }
             }
 
-            let scan_result = self
-                .scan_result_service
-                .create_scan_result_with_checksum(
-                    artifact_id,
-                    artifact.repository_id,
-                    scanner.scan_type(),
-                    Some(checksum),
-                )
-                .await?;
+            // Either reuse path failed or no reusable scan: run a fresh scan.
+            // If we still have a prepared id, reuse it; otherwise create a row.
+            let scan_result = match prepared_action {
+                PreparedScanAction::Reuse(target_id) => {
+                    self.scan_result_service.get_scan(target_id).await?
+                }
+                PreparedScanAction::InsertFresh => {
+                    self.scan_result_service
+                        .create_scan_result_with_checksum(
+                            artifact_id,
+                            artifact.repository_id,
+                            scanner.scan_type(),
+                            Some(checksum),
+                        )
+                        .await?
+                }
+            };
 
+            // Capture wall-clock subprocess kickoff time so the persisted
+            // `scan_results.started_at` reflects when the scanner actually
+            // started, not when the row was created (rows are created above
+            // for dedup-checking and may sit briefly before scan invocation).
+            // See issue #902.
+            let started_at = chrono::Utc::now();
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {
                 Ok(findings) => {
                     let total = findings.len() as i32;
@@ -1363,6 +1706,13 @@ impl ScannerService {
                     let low = count(Severity::Low);
                     let info = count(Severity::Info);
 
+                    // Probe scanner binary version after a successful scan so
+                    // the persisted provenance matches the binary that just
+                    // ran. None on probe failure is acceptable: the field is
+                    // nullable and the silent-success migration (075) treats
+                    // NULL as "legacy / unknown" rather than as a hard error.
+                    let scanner_version = scanner.version().await;
+
                     // Persist findings
                     self.scan_result_service
                         .create_findings(scan_result.id, artifact_id, &findings)
@@ -1370,16 +1720,27 @@ impl ScannerService {
 
                     // Mark scan complete
                     self.scan_result_service
-                        .complete_scan(scan_result.id, total, critical, high, medium, low, info)
+                        .complete_scan(
+                            scan_result.id,
+                            total,
+                            critical,
+                            high,
+                            medium,
+                            low,
+                            info,
+                            scanner_version.as_deref(),
+                            started_at,
+                        )
                         .await?;
 
                     info!(
-                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high)",
+                        "Scan {} completed for artifact {}: {} findings ({} critical, {} high), scanner_version={:?}",
                         scanner.name(),
                         artifact_id,
                         total,
                         critical,
                         high,
+                        scanner_version,
                     );
 
                     // Update quarantine status
@@ -1392,8 +1753,17 @@ impl ScannerService {
                         artifact_id,
                         e
                     );
+                    // Best-effort version probe even on failure: lets ops
+                    // distinguish "scanner crashed mid-scan" from "scanner
+                    // binary missing". `None` is acceptable for the latter.
+                    let scanner_version = scanner.version().await;
                     self.scan_result_service
-                        .fail_scan(scan_result.id, &e.to_string())
+                        .fail_scan(
+                            scan_result.id,
+                            &e.to_string(),
+                            scanner_version.as_deref(),
+                            started_at,
+                        )
                         .await?;
 
                     // Mark as flagged on failure (conservative)
@@ -1893,6 +2263,254 @@ mod tests {
     use bytes::Bytes;
     use chrono::Utc;
     use uuid::Uuid;
+
+    // -----------------------------------------------------------------------
+    // Scanner version parsing (issue #902)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_trivy_version_with_version_prefix() {
+        // Real `trivy --version` output: `Version: 0.62.1`
+        assert_eq!(
+            format_trivy_version("Version: 0.62.1"),
+            Some("trivy-0.62.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_trivy_version_with_extra_metadata() {
+        // Trivy can also emit `Version: 0.62.1\nVulnerability DB:\n  ...`
+        // capture_cli_version only returns the first line, but the parser
+        // must still tolerate trailing whitespace and additional tokens.
+        assert_eq!(
+            format_trivy_version("Version: 0.62.1   "),
+            Some("trivy-0.62.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_trivy_version_bare_token() {
+        // Defensive: some packagings emit just the version.
+        assert_eq!(
+            format_trivy_version("0.62.1"),
+            Some("trivy-0.62.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_trivy_version_empty_returns_none() {
+        assert_eq!(format_trivy_version(""), None);
+        assert_eq!(format_trivy_version("Version:"), None);
+    }
+
+    #[test]
+    fn test_format_grype_version_application_line() {
+        // Real `grype --version` output: `grype 0.83.0`
+        assert_eq!(
+            format_grype_version("grype 0.83.0"),
+            Some("grype-0.83.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_grype_version_bare_token() {
+        // Defensive shape: just the version number.
+        assert_eq!(
+            format_grype_version("0.83.0"),
+            Some("grype-0.83.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_grype_version_with_version_prefix() {
+        assert_eq!(
+            format_grype_version("Version: 0.83.0"),
+            Some("grype-0.83.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_grype_version_empty_returns_none() {
+        assert_eq!(format_grype_version(""), None);
+        assert_eq!(format_grype_version("   "), None);
+    }
+
+    #[test]
+    fn test_format_grype_version_application_only() {
+        // `grype` token without a following version should be None, not
+        // `grype-grype` or similar bogus output.
+        assert_eq!(format_grype_version("grype"), None);
+    }
+
+    /// `capture_cli_version` must return None on a missing binary rather
+    /// than panicking. Use a deliberately-nonexistent name so we exercise
+    /// the spawn-failure branch regardless of host scanner installation.
+    #[tokio::test]
+    async fn test_capture_cli_version_missing_binary_returns_none() {
+        let result =
+            capture_cli_version("definitely-not-a-real-binary-issue-902", &["--version"]).await;
+        assert_eq!(result, None);
+    }
+
+    /// A scanner CLI that hangs (does not print and exit) must not park the
+    /// version probe forever. Without the timeout, `OnceCell::get_or_init`
+    /// would serialize every concurrent caller behind the hung future, and
+    /// because `fail_scan` is awaited AFTER `scanner.version().await`, even
+    /// FAILED scans would never persist their failure row. Run `sleep` with
+    /// a 30s argument and a 50ms test-only timeout: we should observe the
+    /// elapsed branch, return None, and complete in well under a second.
+    /// Skipped on hosts without `/bin/sleep` (effectively never on Linux/macOS).
+    #[tokio::test]
+    async fn test_capture_cli_version_hung_binary_times_out() {
+        if !std::path::Path::new("/bin/sleep").exists() {
+            eprintln!("skipping: /bin/sleep not present on this host");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let result =
+            capture_cli_version_with_timeout("/bin/sleep", &["30"], Duration::from_millis(50))
+                .await;
+        let elapsed = started.elapsed();
+        assert_eq!(result, None, "timeout branch must return None");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout did not fire promptly; elapsed was {:?}",
+            elapsed
+        );
+    }
+
+    /// Default `Scanner::version()` returns None so existing scanners
+    /// (and any future ones added without an override) compile and behave
+    /// correctly: `scan_results.scanner_version` will be NULL for them
+    /// rather than triggering a panic or required-arg compile error.
+    #[tokio::test]
+    async fn test_scanner_trait_default_version_is_none() {
+        struct DummyScanner;
+        #[async_trait::async_trait]
+        impl Scanner for DummyScanner {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn scan_type(&self) -> &str {
+                "dummy"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<Vec<RawFinding>> {
+                Ok(vec![])
+            }
+        }
+        let s = DummyScanner;
+        assert_eq!(s.version().await, None);
+    }
+
+    /// Exercise the success path of `capture_cli_version_with_timeout`:
+    /// spawn succeeded, exit status was zero, stdout had a non-empty first
+    /// line. `/bin/echo` is part of POSIX baseline and always produces this
+    /// shape, so we use it as a stand-in for a healthy `--version` probe.
+    /// Verifies the trim + first-line slicing logic that the per-scanner
+    /// `version()` impls rely on. Skipped on hosts without `/bin/echo`.
+    #[tokio::test]
+    async fn test_capture_cli_version_success_returns_first_line() {
+        if !std::path::Path::new("/bin/echo").exists() {
+            eprintln!("skipping: /bin/echo not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/echo",
+            &["Version: 0.62.1"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, Some("Version: 0.62.1".to_string()));
+    }
+
+    /// Multi-line stdout: only the first line should be returned, with
+    /// trailing whitespace trimmed. `printf` is more portable than
+    /// `echo -e` for embedding `\n`; we shell out via `/bin/sh -c`.
+    #[tokio::test]
+    async fn test_capture_cli_version_success_multi_line_takes_first() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "printf 'grype 0.83.0\\nDB updated 2025-04-01\\n'"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, Some("grype 0.83.0".to_string()));
+    }
+
+    /// A binary that exits non-zero must yield None even if it printed
+    /// something on stdout. `/usr/bin/false` is POSIX-standard and always
+    /// exits 1 with empty stdout; combining shell redirection lets us
+    /// assert the exit-status branch independent of empty-stdout.
+    #[tokio::test]
+    async fn test_capture_cli_version_non_success_status_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        // Print a fake version to stdout, then exit non-zero. We must still
+        // observe None so callers do not record output from a crashed probe.
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "echo 'trivy 0.0.0'; exit 7"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, None);
+    }
+
+    /// A binary that exits zero with empty stdout (e.g. `/bin/true`) must
+    /// yield None. This exercises the `lines().next()?` early-return.
+    #[tokio::test]
+    async fn test_capture_cli_version_empty_stdout_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result =
+            capture_cli_version_with_timeout("/bin/sh", &["-c", "exit 0"], Duration::from_secs(2))
+                .await;
+        assert_eq!(result, None);
+    }
+
+    /// A binary whose first stdout line is whitespace-only must yield None,
+    /// not `Some("")`. This exercises the `if line.is_empty()` branch after
+    /// trimming.
+    #[tokio::test]
+    async fn test_capture_cli_version_whitespace_only_stdout_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        let result = capture_cli_version_with_timeout(
+            "/bin/sh",
+            &["-c", "printf '   \\n'"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, None);
+    }
+
+    /// `capture_cli_version` (the non-timeout-parameterized wrapper) must
+    /// also propagate success. Exercise it once with `/bin/echo` so the
+    /// public wrapper line is covered alongside the inner helper.
+    #[tokio::test]
+    async fn test_capture_cli_version_wrapper_success_path() {
+        if !std::path::Path::new("/bin/echo").exists() {
+            eprintln!("skipping: /bin/echo not present on this host");
+            return;
+        }
+        let result = capture_cli_version("/bin/echo", &["trivy 0.62.1"]).await;
+        assert_eq!(result, Some("trivy 0.62.1".to_string()));
+    }
 
     // -----------------------------------------------------------------------
     // Pure helper functions (moved from module scope — test-only)
@@ -6177,5 +6795,194 @@ mod tests {
         assert_eq!(deps[0].name, "zzz");
         assert_eq!(deps[1].name, "aaa");
         assert_eq!(deps[2].name, "mmm");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure helpers introduced for the trigger-scan / pre-allocated-row path.
+    // These are unit-tested here so the new lines they contain are exercised
+    // by `cargo llvm-cov --lib` (the integration-tier DB tests for the same
+    // path live in `backend/tests/scan_convert_to_reused_tests.rs`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_scan_result_ids_empty() {
+        let prepared: Vec<(String, Uuid)> = vec![];
+        let ids = extract_scan_result_ids(&prepared);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_scan_result_ids_single_scanner() {
+        let id = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id)];
+        let ids = extract_scan_result_ids(&prepared);
+        assert_eq!(ids, vec![id]);
+    }
+
+    #[test]
+    fn test_extract_scan_result_ids_preserves_order() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+        let prepared = vec![
+            ("trivy".to_string(), id1),
+            ("grype".to_string(), id2),
+            ("image".to_string(), id3),
+        ];
+        let ids = extract_scan_result_ids(&prepared);
+        assert_eq!(ids, vec![id1, id2, id3]);
+    }
+
+    #[test]
+    fn test_extract_scan_result_ids_does_not_consume_input() {
+        // Caller relies on still having the pairs after this call so it can
+        // also build the HashMap. Asserting on the post-call state of the
+        // Vec is the cheapest way to pin that contract.
+        let id = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id)];
+        let _ids = extract_scan_result_ids(&prepared);
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].0, "trivy");
+    }
+
+    #[test]
+    fn test_prepared_pairs_to_map_empty() {
+        let map = prepared_pairs_to_map(vec![]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_prepared_pairs_to_map_round_trip() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id1), ("grype".to_string(), id2)];
+        let map = prepared_pairs_to_map(prepared);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("trivy"), Some(&id1));
+        assert_eq!(map.get("grype"), Some(&id2));
+    }
+
+    #[test]
+    fn test_prepared_pairs_to_map_duplicate_scan_type_last_wins() {
+        // HashMap collect semantics: later entries overwrite earlier ones.
+        // This documents the behavior so a future change to a more strict
+        // collector (e.g. detecting duplicates) is an explicit decision.
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let prepared = vec![("trivy".to_string(), id1), ("trivy".to_string(), id2)];
+        let map = prepared_pairs_to_map(prepared);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("trivy"), Some(&id2));
+    }
+
+    #[test]
+    fn test_should_skip_reuse_for_same_artifact_true() {
+        let id = Uuid::new_v4();
+        assert!(should_skip_reuse_for_same_artifact(id, id));
+    }
+
+    #[test]
+    fn test_should_skip_reuse_for_same_artifact_false() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert!(!should_skip_reuse_for_same_artifact(a, b));
+    }
+
+    #[test]
+    fn test_should_skip_reuse_for_same_artifact_nil_vs_real() {
+        let nil = Uuid::nil();
+        let real = Uuid::new_v4();
+        assert!(!should_skip_reuse_for_same_artifact(nil, real));
+        assert!(should_skip_reuse_for_same_artifact(nil, nil));
+    }
+
+    #[test]
+    fn test_build_artifact_scan_message_includes_id() {
+        let id = Uuid::new_v4();
+        let msg = build_artifact_scan_message(id);
+        assert!(msg.contains(&id.to_string()));
+        assert!(msg.starts_with("Scan queued for artifact "));
+    }
+
+    #[test]
+    fn test_build_artifact_scan_message_nil_uuid() {
+        let msg = build_artifact_scan_message(Uuid::nil());
+        assert_eq!(
+            msg,
+            "Scan queued for artifact 00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn test_build_repository_scan_message_includes_count_and_id() {
+        let repo = Uuid::new_v4();
+        let msg = build_repository_scan_message(repo, 42);
+        assert!(msg.contains(&repo.to_string()));
+        assert!(msg.contains("42 artifacts"));
+        assert!(msg.starts_with("Repository scan queued for "));
+    }
+
+    #[test]
+    fn test_build_repository_scan_message_zero_artifacts() {
+        let repo = Uuid::nil();
+        let msg = build_repository_scan_message(repo, 0);
+        assert!(msg.contains("0 artifacts"));
+    }
+
+    #[test]
+    fn test_build_repository_scan_message_large_count() {
+        let repo = Uuid::new_v4();
+        let msg = build_repository_scan_message(repo, 1_000_000);
+        assert!(msg.contains("1000000 artifacts"));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_prepared_action / checksum_log_prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_prepared_action_some_returns_reuse() {
+        let id = Uuid::new_v4();
+        let action = resolve_prepared_action(Some(id));
+        assert_eq!(action, PreparedScanAction::Reuse(id));
+    }
+
+    #[test]
+    fn test_resolve_prepared_action_none_returns_insert_fresh() {
+        let action = resolve_prepared_action(None);
+        assert_eq!(action, PreparedScanAction::InsertFresh);
+    }
+
+    #[test]
+    fn test_resolve_prepared_action_distinct_ids_are_distinct() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        assert_ne!(
+            resolve_prepared_action(Some(id1)),
+            resolve_prepared_action(Some(id2))
+        );
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_long_checksum_truncates_to_8() {
+        let cs = "abcdef0123456789abcdef0123456789";
+        assert_eq!(checksum_log_prefix(cs), "abcdef01");
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_short_checksum_returns_whole_string() {
+        let cs = "abc";
+        assert_eq!(checksum_log_prefix(cs), "abc");
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_empty_returns_empty() {
+        assert_eq!(checksum_log_prefix(""), "");
+    }
+
+    #[test]
+    fn test_checksum_log_prefix_exactly_eight_chars() {
+        let cs = "12345678";
+        assert_eq!(checksum_log_prefix(cs), "12345678");
     }
 }
