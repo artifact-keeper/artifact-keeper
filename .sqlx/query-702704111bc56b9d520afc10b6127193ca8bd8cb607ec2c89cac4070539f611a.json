@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT repository_id, checksum_sha256\n            FROM artifacts\n            WHERE id = $1 AND is_deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "repository_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "checksum_sha256",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "702704111bc56b9d520afc10b6127193ca8bd8cb607ec2c89cac4070539f611a"
+}

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at\n            FROM scan_results\n            WHERE checksum_sha256 = $1\n              AND scan_type = $2\n              AND status = 'completed'\n              AND completed_at > NOW() - ($3 || ' days')::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
+  "query": "\n            SELECT id, artifact_id, repository_id, scan_type, status,\n                   findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                   scanner_version, error_message, started_at, completed_at, created_at,\n                   is_reused, source_scan_id\n            FROM scan_results\n            WHERE checksum_sha256 = $1\n              AND scan_type = $2\n              AND status = 'completed'\n              AND completed_at > NOW() - ($3 || ' days')::interval\n            ORDER BY completed_at DESC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -82,6 +82,16 @@
         "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "is_reused",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "source_scan_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -107,8 +117,10 @@
       true,
       true,
       true,
-      false
+      false,
+      false,
+      true
     ]
   },
-  "hash": "0dfed086da2ddd03aba0a562a49eb899f1e29a72612b55cf5e6385c23f83aba2"
+  "hash": "e92aa15e2f807755e2b5a16b19ce735c3aa918a347b1885a6d9a6d142de674a9"
 }
