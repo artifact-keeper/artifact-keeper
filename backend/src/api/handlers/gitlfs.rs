@@ -848,8 +848,15 @@ async fn create_lock(
 
 async fn list_locks(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
 ) -> Result<Response, Response> {
+    // Per the Git LFS file-locking spec, GET /locks requires authentication
+    // (https://github.com/git-lfs/git-lfs/blob/main/docs/api/locking.md).
+    // Without it, anyone can enumerate file locks (paths, owners, timestamps)
+    // for any LFS repo on this server. Match the auth pattern used by the
+    // sibling lock handlers (create_lock, delete_lock, verify_locks).
+    let _user_id = require_auth_basic(auth, "git-lfs")?.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     let rows = sqlx::query!(
@@ -1459,5 +1466,29 @@ mod tests {
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth-required lock endpoints (regression guard)
+    //
+    // Per the Git LFS file-locking spec, every locks endpoint requires
+    // authentication. `require_auth_basic` is the seam every lock handler
+    // (create_lock, delete_lock, verify_locks, list_locks) routes through.
+    // If a refactor ever drops the auth call from a handler, this test still
+    // proves the helper rejects unauthenticated callers — and the handler's
+    // type signature (Extension<Option<AuthExtension>>) makes the bypass a
+    // compile error rather than a silent regression.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_require_auth_basic_rejects_missing_auth() {
+        // Calling the auth helper without any AuthExtension must produce an
+        // error response — this is what every locks handler relies on to
+        // enforce authentication.
+        let result = require_auth_basic(None, "git-lfs");
+        assert!(
+            result.is_err(),
+            "require_auth_basic(None, ...) must return Err to deny unauthenticated callers"
+        );
     }
 }
