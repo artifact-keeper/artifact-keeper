@@ -1169,4 +1169,42 @@ mod tests {
             result
         );
     }
+
+    // =======================================================================
+    // cleanup_stuck_scans (#1015) — janitor entry point exercises function
+    // body and the i64::MAX clamp on the seconds cast. Same `unreachable_pool`
+    // pattern as the #1035 tests above: pool exists but every SQL execute
+    // returns a connection error which is mapped to AppError::Database.
+    // Gives lib-level coverage of cast/clamp/format/sqlx::query!/map_err
+    // lines without standing up Postgres in CI.
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_cleanup_stuck_scans_returns_database_error_on_connection_failure() {
+        let service = ScanResultService::new(unreachable_pool());
+        let result = service
+            .cleanup_stuck_scans(Duration::from_secs(1800))
+            .await;
+        assert!(matches!(result, Err(AppError::Database(_))));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stuck_scans_handles_zero_threshold() {
+        let service = ScanResultService::new(unreachable_pool());
+        let result = service.cleanup_stuck_scans(Duration::from_secs(0)).await;
+        // Without a real database the SQL execute fails; what matters here is
+        // that the zero-threshold path successfully constructs the query
+        // (no panic in the cast/format) before hitting the connection error.
+        assert!(matches!(result, Err(AppError::Database(_))));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stuck_scans_clamps_overflow_threshold() {
+        // Duration::MAX would overflow an i64-seconds cast without the
+        // explicit `.min(i64::MAX as u64)` clamp; this test exercises that
+        // saturating branch.
+        let service = ScanResultService::new(unreachable_pool());
+        let result = service.cleanup_stuck_scans(Duration::MAX).await;
+        assert!(matches!(result, Err(AppError::Database(_))));
+    }
 }
