@@ -2641,4 +2641,25 @@ mod tests {
             "handler-side read via the per-repo backend would 500 because the file lives on the global backend, not the per-repo one"
         );
     }
+
+    /// Direct exercise of the MockBackend `exists`/`delete` impls used by
+    /// the routing tests above. Without an explicit driver, those trait
+    /// methods are uncovered new lines even though the type is reachable.
+    #[tokio::test]
+    async fn test_mock_backend_exists_and_delete_round_trip() {
+        let backend: Arc<dyn RepoStorageBackend> = Arc::new(MockBackend::new());
+        backend
+            .put("k", Bytes::from_static(b"v"))
+            .await
+            .expect("put");
+        assert!(
+            backend.exists("k").await.expect("exists ok"),
+            "key should be present after put"
+        );
+        backend.delete("k").await.expect("delete ok");
+        assert!(
+            !backend.exists("k").await.expect("exists ok"),
+            "key should be gone after delete"
+        );
+    }
 }
