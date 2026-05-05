@@ -1361,12 +1361,16 @@ pub async fn download_artifact(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &key, upstream_url, &path)
-                        .await
-                        .map_err(|_| {
-                            AppError::NotFound("Artifact not found upstream".to_string())
-                        })?;
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &key,
+                    &repo.storage_location(),
+                    upstream_url,
+                    &path,
+                )
+                .await
+                .map_err(|_| AppError::NotFound("Artifact not found upstream".to_string()))?;
 
                 let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
                 let filename = path.rsplit('/').next().unwrap_or(&path);

@@ -646,6 +646,7 @@ async fn recipe_file_download(
                         proxy,
                         repo.id,
                         &repo_key,
+                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )
@@ -1164,6 +1165,7 @@ async fn package_file_download(
                             proxy,
                             repo.id,
                             &repo_key,
+                            &repo.storage_location(),
                             upstream_url,
                             &upstream_path,
                         )

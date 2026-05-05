@@ -603,9 +603,16 @@ async fn try_upstream_fetch(
     let proxy = state.proxy_service.as_ref()?;
     let image = normalize_docker_image(&repo.image, upstream_url);
     let upstream_path = format!("v2/{}/{}", image, path_suffix);
-    proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, &upstream_path)
-        .await
-        .ok()
+    proxy_helpers::proxy_fetch(
+        proxy,
+        repo.id,
+        &repo.key,
+        &repo.location,
+        upstream_url,
+        &upstream_path,
+    )
+    .await
+    .ok()
 }
 
 /// Build an OCI registry response from proxied upstream content.
@@ -2114,10 +2121,12 @@ struct UpstreamTagsPage {
 }
 
 #[rustfmt::skip]
+#[allow(clippy::too_many_arguments)]
 async fn fetch_upstream_tags_page(
     state: &SharedState,
     repo_id: Uuid,
     repo_key: &str,
+    location: &crate::storage::StorageLocation,
     upstream_url: &str,
     image: &str,
     n: usize,
@@ -2133,7 +2142,7 @@ async fn fetch_upstream_tags_page(
 
     let upstream_path = format!("v2/{}/{}", image, build_remote_tags_list_path(n, last));
     let (content, _ct, link) =
-        proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, upstream_url, &upstream_path)
+        proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, location, upstream_url, &upstream_path)
             .await
             .map_err(|resp| match resp.status() {
                 StatusCode::NOT_FOUND => oci_error(
@@ -2181,10 +2190,12 @@ async fn fetch_upstream_tags_page(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_upstream_tags(
     state: &SharedState,
     repo_id: Uuid,
     repo_key: &str,
+    location: &crate::storage::StorageLocation,
     upstream_url: &str,
     image: &str,
     max_tags: usize,
@@ -2208,6 +2219,7 @@ async fn collect_upstream_tags(
             state,
             repo_id,
             repo_key,
+            location,
             upstream_url,
             image,
             remaining,
@@ -2267,8 +2279,17 @@ async fn tags_list_remote(
         )
     })?;
     let image = normalize_docker_image(&repo.image, upstream_url);
-    let (tags, upstream_has_more) =
-        collect_upstream_tags(state, repo.id, &repo.key, upstream_url, &image, n + 1, last).await?;
+    let (tags, upstream_has_more) = collect_upstream_tags(
+        state,
+        repo.id,
+        &repo.key,
+        &repo.location,
+        upstream_url,
+        &image,
+        n + 1,
+        last,
+    )
+    .await?;
     Ok(split_remote_tags_page(tags, n, upstream_has_more))
 }
 
@@ -2293,6 +2314,7 @@ async fn tags_list_virtual(
             let image = image.clone();
             let member_id = member.id;
             let member_key = member.key.clone();
+            let member_location = member.storage_location();
             let repo_type = member.repo_type.clone();
             let upstream_url = member.upstream_url.clone();
             async move {
@@ -2301,6 +2323,7 @@ async fn tags_list_virtual(
                         state,
                         member_id,
                         &member_key,
+                        &member_location,
                         upstream_url.as_deref(),
                         &image,
                         member_limit,
@@ -2327,10 +2350,12 @@ async fn tags_list_virtual(
 }
 
 /// Fetch tags from a single remote virtual member via upstream proxy.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_tags_from_remote_member(
     state: &SharedState,
     member_id: Uuid,
     member_key: &str,
+    member_location: &crate::storage::StorageLocation,
     upstream_url: Option<&str>,
     image_name: &str,
     n_limit: usize,
@@ -2342,6 +2367,7 @@ async fn fetch_tags_from_remote_member(
         state,
         member_id,
         member_key,
+        member_location,
         upstream_url,
         &image,
         n_limit,

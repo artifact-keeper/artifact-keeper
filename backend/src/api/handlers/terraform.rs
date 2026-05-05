@@ -240,6 +240,7 @@ async fn download_module(
                         proxy,
                         repo.id,
                         &repo_key,
+                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )
@@ -797,6 +798,7 @@ async fn download_provider(
                         proxy,
                         repo.id,
                         &repo_key,
+                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )

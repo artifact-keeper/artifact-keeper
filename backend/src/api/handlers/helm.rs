@@ -263,6 +263,7 @@ async fn download_chart(
                         proxy,
                         repo.id,
                         &repo_key,
+                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )

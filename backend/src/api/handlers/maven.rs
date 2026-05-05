@@ -747,9 +747,15 @@ async fn download(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, _content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
-                        .await?;
+                let (content, _content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    &repo.storage_location(),
+                    upstream_url,
+                    &path,
+                )
+                .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "text/xml")
@@ -791,6 +797,7 @@ async fn download(
                                 proxy,
                                 member.id,
                                 &member.key,
+                                &member.storage_location(),
                                 upstream_url,
                                 &path,
                             )
@@ -875,6 +882,7 @@ async fn download(
                                 proxy,
                                 member.id,
                                 &member.key,
+                                &member.storage_location(),
                                 upstream_url,
                                 &path,
                             )
@@ -956,9 +964,15 @@ async fn download(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let (content, _content_type) =
-                    proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &path)
-                        .await?;
+                let (content, _content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    &repo.storage_location(),
+                    upstream_url,
+                    &path,
+                )
+                .await?;
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(CONTENT_TYPE, "text/plain")
@@ -994,6 +1008,7 @@ async fn download(
                             proxy,
                             member.id,
                             &member.key,
+                            &member.storage_location(),
                             upstream_url,
                             &path,
                         )
@@ -1119,9 +1134,15 @@ async fn serve_artifact(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    let (content, content_type) =
-                        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, path)
-                            .await?;
+                    let (content, content_type) = proxy_helpers::proxy_fetch(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        &repo.storage_location(),
+                        upstream_url,
+                        path,
+                    )
+                    .await?;
 
                     let ct =
                         content_type.unwrap_or_else(|| content_type_for_path(path).to_string());

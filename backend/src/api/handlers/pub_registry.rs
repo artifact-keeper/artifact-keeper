@@ -286,6 +286,7 @@ async fn download_archive(
                         proxy,
                         repo.id,
                         &repo_key,
+                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )

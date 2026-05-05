@@ -363,9 +363,15 @@ async fn apk_index(
             (&repo.upstream_url, &state.proxy_service)
         {
             let upstream_path = build_apk_index_upstream_path(&branch, &repository, &arch);
-            let (content, content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path)
-                    .await?;
+            let (content, content_type) = proxy_helpers::proxy_fetch(
+                proxy,
+                repo.id,
+                &repo_key,
+                &repo.storage_location(),
+                upstream_url,
+                &upstream_path,
+            )
+            .await?;
 
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -400,6 +406,7 @@ async fn apk_index(
                 proxy,
                 member.id,
                 &member.key,
+                &member.storage_location(),
                 upstream_url,
                 &upstream_path,
             )
@@ -675,8 +682,15 @@ async fn try_proxy_apk(
         _ => return Ok(None),
     };
     let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
-    let (content, content_type) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path).await?;
+    let (content, content_type) = proxy_helpers::proxy_fetch(
+        proxy,
+        repo.id,
+        repo_key,
+        &repo.storage_location(),
+        upstream_url,
+        &upstream_path,
+    )
+    .await?;
     Ok(Some(
         Response::builder()
             .status(StatusCode::OK)

@@ -443,7 +443,7 @@ impl ProxyService {
     /// Uses a `__content__` leaf file to avoid file/directory collisions
     /// when one path is a prefix of another (e.g., npm metadata at `is-odd`
     /// vs tarball at `is-odd/-/is-odd-3.0.1.tgz`).
-    fn cache_storage_key(repo_key: &str, path: &str) -> String {
+    pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> String {
         format!(
             "proxy-cache/{}/{}/__content__",
             repo_key,
@@ -452,7 +452,7 @@ impl ProxyService {
     }
 
     /// Generate storage key for cache metadata
-    fn cache_metadata_key(repo_key: &str, path: &str) -> String {
+    pub(crate) fn cache_metadata_key(repo_key: &str, path: &str) -> String {
         format!(
             "proxy-cache/{}/{}/__cache_meta__.json",
             repo_key,

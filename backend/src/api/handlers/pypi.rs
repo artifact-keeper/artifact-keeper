@@ -281,6 +281,7 @@ async fn simple_project(
                     proxy,
                     repo.id,
                     &repo_key,
+                    &repo.storage_location(),
                     upstream_url,
                     &upstream_path,
                 )
@@ -376,6 +377,7 @@ async fn simple_project(
                     proxy,
                     member.id,
                     &member.key,
+                    &member.storage_location(),
                     upstream_url,
                     &upstream_path,
                 )
@@ -594,8 +596,15 @@ async fn serve_file(
                     let normalized = PypiHandler::normalize_name(project);
                     let local_cache_path = format!("simple/{}/{}", normalized, filename);
 
-                    if let Some((content, _ct)) =
-                        proxy_helpers::proxy_check_cache(proxy, repo_key, &local_cache_path).await
+                    if let Some((content, _ct)) = proxy_helpers::proxy_check_cache(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        &repo.storage_location(),
+                        upstream_url,
+                        &local_cache_path,
+                    )
+                    .await
                     {
                         return Ok(build_file_response(filename, content));
                     }
@@ -605,6 +614,7 @@ async fn serve_file(
                         proxy,
                         repo.id,
                         repo_key,
+                        &repo.storage_location(),
                         upstream_url,
                         project,
                         filename,
@@ -671,7 +681,10 @@ async fn serve_file(
 
                             if let Some((content, _ct)) = proxy_helpers::proxy_check_cache(
                                 proxy,
+                                member.id,
                                 &member.key,
+                                &member.storage_location(),
+                                upstream_url,
                                 &local_cache_path,
                             )
                             .await
@@ -683,6 +696,7 @@ async fn serve_file(
                                 proxy,
                                 member.id,
                                 &member.key,
+                                &member.storage_location(),
                                 upstream_url,
                                 project,
                                 filename,
@@ -755,6 +769,7 @@ async fn fetch_from_pypi_remote(
     proxy: &crate::services::proxy_service::ProxyService,
     repo_id: uuid::Uuid,
     repo_key: &str,
+    location: &crate::storage::StorageLocation,
     upstream_url: &str,
     project: &str,
     filename: &str,
@@ -762,9 +777,15 @@ async fn fetch_from_pypi_remote(
     let normalized = PypiHandler::normalize_name(project);
 
     let index_path = format!("simple/{}/", normalized);
-    let (index_bytes, _ct, effective_url) =
-        proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, upstream_url, &index_path)
-            .await?;
+    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
+        proxy,
+        repo_id,
+        repo_key,
+        location,
+        upstream_url,
+        &index_path,
+    )
+    .await?;
 
     let index_html = String::from_utf8_lossy(&index_bytes);
 
@@ -818,6 +839,7 @@ async fn fetch_from_pypi_remote(
         proxy,
         repo_id,
         repo_key,
+        location,
         &fetch_base,
         &fetch_path,
         &local_cache_path,

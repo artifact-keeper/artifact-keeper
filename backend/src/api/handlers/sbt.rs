@@ -100,6 +100,7 @@ async fn download_by_path(
                         proxy,
                         repo.id,
                         &repo_key,
+                        &repo.storage_location(),
                         upstream_url,
                         artifact_path,
                     )

@@ -364,6 +364,7 @@ async fn get_package_metadata(
                     proxy,
                     repo.id,
                     repo_key,
+                    &repo.storage_location(),
                     upstream_url,
                     &encoded_name,
                 )
@@ -420,6 +421,7 @@ async fn get_package_metadata(
                 proxy,
                 member.id,
                 &member.key,
+                &member.storage_location(),
                 upstream_url,
                 &encoded_name,
             )
@@ -532,8 +534,15 @@ async fn fetch_remote_packument(
         .as_ref()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()).into_response())?;
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let (content, _ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &encoded_name).await?;
+    let (content, _ct) = proxy_helpers::proxy_fetch(
+        proxy,
+        repo.id,
+        repo_key,
+        &repo.storage_location(),
+        upstream_url,
+        &encoded_name,
+    )
+    .await?;
     let mut json: serde_json::Value = serde_json::from_slice(&content).map_err(|e| {
         AppError::Internal(format!("Invalid JSON from upstream: {}", e)).into_response()
     })?;
@@ -587,9 +596,15 @@ async fn fetch_virtual_packument(
         };
 
         let encoded_name = encode_package_name_for_upstream(package_name);
-        let result =
-            proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, &encoded_name)
-                .await;
+        let result = proxy_helpers::proxy_fetch(
+            proxy,
+            member.id,
+            &member.key,
+            &member.storage_location(),
+            upstream_url,
+            &encoded_name,
+        )
+        .await;
 
         match result {
             Ok((content, _ct)) => {
@@ -796,9 +811,15 @@ async fn serve_tarball(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _content_type) =
-                proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path)
-                    .await?;
+            let (content, _content_type) = proxy_helpers::proxy_fetch(
+                proxy,
+                repo.id,
+                repo_key,
+                &repo.storage_location(),
+                upstream_url,
+                &upstream_path,
+            )
+            .await?;
 
             // The upstream registry may return application/octet-stream for
             // npm tarballs, which also gets persisted by the proxy cache.
