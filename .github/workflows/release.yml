@@ -34,14 +34,20 @@ jobs:
     name: Mesh Replication E2E (optional)
     uses: ./.github/workflows/mesh-e2e.yml
     with:
-      image_tag: dev
+      # Validate against the release/1.1.x dev tag built from THIS branch,
+      # not main's `:dev`. Without this the gate tested whatever was on
+      # main at the time of the tag run instead of the actual rc commit.
+      image_tag: 1.1-dev
     secrets: inherit
 
   release-gate:
     name: Release Gate (Full Suite)
     uses: artifact-keeper/artifact-keeper-test/.github/workflows/release-gate.yml@main
     with:
-      backend_tag: dev
+      # Same reasoning as mesh-e2e-gate above: test the release/1.1.x dev
+      # image, not main's. v1.1.9-rc.2's release-gate failed on a python
+      # regression that was actually in main (#1004), not on release/1.1.x.
+      backend_tag: 1.1-dev
       test_suite: all
     secrets: inherit
 
