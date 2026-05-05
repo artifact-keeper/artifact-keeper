@@ -2409,20 +2409,14 @@ mod tests {
     /// In-memory `StorageBackend` for testing cache routing.
     /// Records every put/get so tests can assert which backend was hit.
     struct MockBackend {
-        name: String,
         store: Mutex<StdHashMap<String, Bytes>>,
     }
 
     impl MockBackend {
-        fn new(name: &str) -> Self {
+        fn new() -> Self {
             Self {
-                name: name.to_string(),
                 store: Mutex::new(StdHashMap::new()),
             }
-        }
-
-        fn name(&self) -> &str {
-            &self.name
         }
 
         fn snapshot_keys(&self) -> Vec<String> {
@@ -2486,13 +2480,21 @@ mod tests {
         }
     }
 
-    fn make_test_proxy_with_registry(registry: Arc<StorageRegistry>) -> ProxyService {
-        make_test_proxy_inner(Some(registry))
+    /// Build a `(MockBackend, StorageRegistry)` pair where `name` is both the
+    /// registry key and the registry's default backend. Used by routing tests
+    /// to set up a single-backend registry without boilerplate.
+    fn make_test_registry(name: &str) -> (Arc<MockBackend>, Arc<StorageRegistry>) {
+        let backend = Arc::new(MockBackend::new());
+        let mut backends: StdHashMap<String, Arc<dyn RepoStorageBackend>> = StdHashMap::new();
+        backends.insert(name.to_string(), backend.clone());
+        let registry = Arc::new(StorageRegistry::new(backends, name.to_string()));
+        (backend, registry)
     }
 
-    fn make_test_proxy_inner(registry: Option<Arc<StorageRegistry>>) -> ProxyService {
-        // Build a minimal ProxyService for routing tests. The pool is lazy so
-        // it never actually connects (these tests don't touch the DB).
+    /// Build a minimal `ProxyService` for routing tests. The pool is lazy so
+    /// it never actually connects (these tests don't touch the DB). When
+    /// `registry` is `Some`, it is wired in via `with_storage_registry`.
+    fn make_test_proxy(registry: Option<Arc<StorageRegistry>>) -> ProxyService {
         let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none")
             .expect("connect_lazy never fails for a syntactically valid URL");
         let global_backend: Arc<dyn crate::services::storage_service::StorageBackend> =
@@ -2513,12 +2515,8 @@ mod tests {
     /// what `state.storage_for_repo(...)` returns in the real handler path).
     #[tokio::test]
     async fn test_per_repo_storage_resolves_via_registry_for_bug_1016() {
-        let backend = Arc::new(MockBackend::new("mock-s3"));
-        let mut backends: StdHashMap<String, Arc<dyn RepoStorageBackend>> = StdHashMap::new();
-        backends.insert("mock-s3".to_string(), backend.clone());
-        let registry = Arc::new(StorageRegistry::new(backends, "mock-s3".to_string()));
-
-        let proxy = make_test_proxy_with_registry(registry);
+        let (backend, registry) = make_test_registry("mock-s3");
+        let proxy = make_test_proxy(Some(registry));
         let repo = make_test_repo("debian-proxy", "mock-s3", "ignored");
 
         let resolved = proxy
@@ -2539,7 +2537,6 @@ mod tests {
             "expected key on registry backend; got {:?}",
             recorded
         );
-        assert_eq!(backend.name(), "mock-s3");
     }
 
     /// Bug #1016 regression: `cache_put` followed by `cache_get` round-trips
@@ -2548,12 +2545,8 @@ mod tests {
     /// via `state.storage_for_repo(...)` find the cached file.
     #[tokio::test]
     async fn test_cache_put_get_routes_through_per_repo_backend_for_bug_1016() {
-        let per_repo_backend = Arc::new(MockBackend::new("repo-backend"));
-        let mut backends: StdHashMap<String, Arc<dyn RepoStorageBackend>> = StdHashMap::new();
-        backends.insert("repo-backend".to_string(), per_repo_backend.clone());
-        let registry = Arc::new(StorageRegistry::new(backends, "repo-backend".to_string()));
-
-        let proxy = make_test_proxy_with_registry(registry);
+        let (per_repo_backend, registry) = make_test_registry("repo-backend");
+        let proxy = make_test_proxy(Some(registry));
         let repo = make_test_repo("debian-proxy", "repo-backend", "/data/debian");
 
         let per_repo = proxy.per_repo_storage(&repo);
@@ -2595,15 +2588,7 @@ mod tests {
     /// that construct `ProxyService::new` without a registry) keep working.
     #[tokio::test]
     async fn test_per_repo_storage_returns_none_without_registry() {
-        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none").unwrap();
-        let global_backend: Arc<dyn crate::services::storage_service::StorageBackend> =
-            Arc::new(crate::services::storage_service::FilesystemBackend::new(
-                std::path::PathBuf::from("/tmp/ak-test-no-registry"),
-            ));
-        let storage = Arc::new(StorageService::new(global_backend));
-        let config = crate::config::Config::default();
-        let proxy = ProxyService::new(pool, storage, &config);
-
+        let proxy = make_test_proxy(None);
         let repo = make_test_repo("any", "filesystem", "/tmp/whatever");
         assert!(
             proxy.per_repo_storage(&repo).is_none(),
@@ -2619,11 +2604,11 @@ mod tests {
     async fn test_bug_1016_repro_without_registry_misses_per_repo_backend() {
         // Per-repo backend (mirrors what `state.storage_for_repo(...)` would
         // return for the repo). Handlers read from this backend.
-        let per_repo_backend = Arc::new(MockBackend::new("per-repo"));
+        let per_repo_backend = Arc::new(MockBackend::new());
 
         // Build the ProxyService WITHOUT a registry — this reproduces the
         // pre-fix wiring and demonstrates why second downloads fail.
-        let proxy = make_test_proxy_inner(None);
+        let proxy = make_test_proxy(None);
         let repo = make_test_repo("debian-proxy", "per-repo", "/data/debian");
         let per_repo_resolved = proxy.per_repo_storage(&repo);
         assert!(
