@@ -359,14 +359,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     app_state.set_metrics_handle(metrics_handle);
 
-    // Initialize proxy service for remote repository caching
+    // Initialize proxy service for remote repository caching.
+    // The storage_registry hook is REQUIRED so cache reads/writes go through
+    // the same per-repo backend that download handlers use; without it,
+    // already-cached APT/PyPI/etc. artifacts fail to download a second time
+    // (issue #1016).
     match StorageService::from_config(&config).await {
         Ok(storage_svc) => {
-            let proxy_service = Arc::new(ProxyService::new(
-                db_pool.clone(),
-                Arc::new(storage_svc),
-                &config,
-            ));
+            let proxy_service = Arc::new(
+                ProxyService::new(db_pool.clone(), Arc::new(storage_svc), &config)
+                    .with_storage_registry(storage_registry.clone()),
+            );
             app_state.set_proxy_service(proxy_service);
             tracing::info!("Proxy service initialized for remote repositories");
         }

@@ -134,11 +134,6 @@ impl ProxyService {
     /// `StorageRegistry` is configured. Returns `None` when no registry is
     /// available (the legacy global-storage path is used in that case so
     /// existing tests and old callers keep working).
-    ///
-    /// Wired into hot paths (`cache_artifact`, `get_cached_artifact`, ...) by
-    /// the follow-up fix commit; introduced here as scaffolding so the
-    /// regression tests can be authored first (test → fix order).
-    #[allow(dead_code)]
     fn per_repo_storage(&self, repo: &Repository) -> Option<Arc<dyn RepoStorageBackend>> {
         let registry = self.storage_registry.as_ref()?;
         match registry.backend_for(&repo.storage_location()) {
@@ -158,7 +153,6 @@ impl ProxyService {
     /// back to the global `StorageService` otherwise. Routing writes here is
     /// what makes second downloads of cached artifacts succeed: handlers read
     /// via `storage_for_repo`, so the cache must land on the same backend.
-    #[allow(dead_code)]
     async fn cache_put(
         &self,
         per_repo: Option<&Arc<dyn RepoStorageBackend>>,
@@ -176,7 +170,6 @@ impl ProxyService {
     /// global `StorageService` otherwise. The fallback preserves the legacy
     /// behavior used by tests that construct `ProxyService` without a
     /// registry.
-    #[allow(dead_code)]
     async fn cache_get(
         &self,
         per_repo: Option<&Arc<dyn RepoStorageBackend>>,
@@ -191,7 +184,6 @@ impl ProxyService {
 
     /// Delete a key from the per-repo backend if available, falling back to
     /// the global `StorageService` otherwise.
-    #[allow(dead_code)]
     async fn cache_delete(
         &self,
         per_repo: Option<&Arc<dyn RepoStorageBackend>>,
@@ -215,10 +207,10 @@ impl ProxyService {
     }
 
     /// Check whether an artifact is already present in the proxy cache
-    /// under the given `path` (without contacting upstream).
-    ///
-    /// Returns `Ok(Some((content, content_type)))` on cache hit, `Ok(None)`
-    /// on cache miss or expired entry.
+    /// under the given `path` (without contacting upstream), using the legacy
+    /// global storage. Prefer [`get_cached_artifact_for_repo`] when a
+    /// `Repository` is in scope: it routes through the per-repo backend so
+    /// the lookup matches what download handlers see (bug #1016).
     pub async fn get_cached_artifact_by_path(
         &self,
         repo_key: &str,
@@ -226,7 +218,24 @@ impl ProxyService {
     ) -> Result<Option<(Bytes, Option<String>)>> {
         let cache_key = Self::cache_storage_key(repo_key, path);
         let metadata_key = Self::cache_metadata_key(repo_key, path);
-        self.get_cached_artifact(&cache_key, &metadata_key).await
+        self.get_cached_artifact(None, &cache_key, &metadata_key)
+            .await
+    }
+
+    /// Check whether an artifact is already present in the proxy cache for
+    /// `repo` under `path`. Routes through the per-repo storage backend so
+    /// the cache lookup matches the backend that handlers read from when
+    /// serving by `artifacts.storage_key` (bug #1016).
+    pub async fn get_cached_artifact_for_repo(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        let cache_key = Self::cache_storage_key(&repo.key, path);
+        let metadata_key = Self::cache_metadata_key(&repo.key, path);
+        let per_repo = self.per_repo_storage(repo);
+        self.get_cached_artifact(per_repo.as_ref(), &cache_key, &metadata_key)
+            .await
     }
 
     /// Fetch artifact from upstream, but use `cache_path` instead of
@@ -256,9 +265,14 @@ impl ProxyService {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path);
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path);
 
+        // Resolve the per-repo backend once and pass it through to all cache
+        // I/O so writes and reads land on the same storage that handlers use.
+        let per_repo = self.per_repo_storage(repo);
+
         // Check if we have a valid cached copy
-        if let Some((content, content_type)) =
-            self.get_cached_artifact(&cache_key, &metadata_key).await?
+        if let Some((content, content_type)) = self
+            .get_cached_artifact(per_repo.as_ref(), &cache_key, &metadata_key)
+            .await?
         {
             return Ok((content, content_type));
         }
@@ -271,6 +285,7 @@ impl ProxyService {
             Ok((content, content_type, etag, _effective_url)) => {
                 let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
                 self.cache_artifact(
+                    per_repo.as_ref(),
                     &cache_key,
                     &metadata_key,
                     &content,
@@ -286,7 +301,7 @@ impl ProxyService {
             }
             Err(upstream_err) => {
                 if let Ok(Some((stale_content, stale_content_type))) = self
-                    .get_stale_cached_artifact(&cache_key, &metadata_key)
+                    .get_stale_cached_artifact(per_repo.as_ref(), &cache_key, &metadata_key)
                     .await
                 {
                     tracing::warn!(
@@ -318,8 +333,12 @@ impl ProxyService {
 
         let metadata_key = Self::cache_metadata_key(&repo.key, path);
 
-        // Try to load existing cache metadata
-        let metadata = match self.load_cache_metadata(&metadata_key).await? {
+        // Try to load existing cache metadata from the per-repo backend.
+        let per_repo = self.per_repo_storage(repo);
+        let metadata = match self
+            .load_cache_metadata(per_repo.as_ref(), &metadata_key)
+            .await?
+        {
             Some(m) => m,
             None => return Ok(true), // No cache, definitely need to fetch
         };
@@ -375,9 +394,12 @@ impl ProxyService {
         let cache_key = Self::cache_storage_key(&repo.key, path);
         let metadata_key = Self::cache_metadata_key(&repo.key, path);
 
-        // Delete both content and metadata
-        let _ = self.storage.delete(&cache_key).await;
-        let _ = self.storage.delete(&metadata_key).await;
+        // Delete both content and metadata from the per-repo backend (or
+        // global fallback) so it actually removes the file the handlers
+        // would try to read.
+        let per_repo = self.per_repo_storage(repo);
+        let _ = self.cache_delete(per_repo.as_ref(), &cache_key).await;
+        let _ = self.cache_delete(per_repo.as_ref(), &metadata_key).await;
 
         Ok(())
     }
@@ -438,14 +460,21 @@ impl ProxyService {
         )
     }
 
-    /// Attempt to retrieve a cached artifact if valid
+    /// Attempt to retrieve a cached artifact if valid.
+    ///
+    /// `per_repo` is the registry-resolved per-repo backend (preferred) or
+    /// `None` to fall back to the global storage. Routing through the
+    /// per-repo backend is what makes second downloads of cached APT/PyPI
+    /// packages work — handlers read by `artifacts.storage_key` from the
+    /// same backend (bug #1016).
     async fn get_cached_artifact(
         &self,
+        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
         // Check if metadata exists
-        let metadata = match self.load_cache_metadata(metadata_key).await? {
+        let metadata = match self.load_cache_metadata(per_repo, metadata_key).await? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -457,7 +486,7 @@ impl ProxyService {
         }
 
         // Try to get cached content
-        match self.storage.get(cache_key).await {
+        match self.cache_get(per_repo, cache_key).await {
             Ok(content) => {
                 // Verify checksum
                 let actual_checksum = StorageService::calculate_hash(&content);
@@ -479,9 +508,14 @@ impl ProxyService {
         }
     }
 
-    /// Load cache metadata from storage
-    async fn load_cache_metadata(&self, metadata_key: &str) -> Result<Option<CacheMetadata>> {
-        match self.storage.get(metadata_key).await {
+    /// Load cache metadata from storage. Uses the per-repo backend when
+    /// supplied; otherwise falls back to the global storage.
+    async fn load_cache_metadata(
+        &self,
+        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
+        metadata_key: &str,
+    ) -> Result<Option<CacheMetadata>> {
+        match self.cache_get(per_repo, metadata_key).await {
             Ok(data) => {
                 let metadata: CacheMetadata = serde_json::from_slice(&data)?;
                 Ok(Some(metadata))
@@ -845,9 +879,16 @@ impl ProxyService {
 
     /// Cache artifact content and metadata, and record the artifact in the
     /// database so that it appears in repository listings and storage usage.
+    ///
+    /// Content and metadata are written through `per_repo` (the registry-
+    /// resolved per-repo backend) when supplied, otherwise they fall back to
+    /// the global `StorageService`. Routing through the per-repo backend is
+    /// what allows subsequent reads (which go via
+    /// `state.storage_for_repo(...)`) to find the cached file (bug #1016).
     #[allow(clippy::too_many_arguments)]
     async fn cache_artifact(
         &self,
+        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
         cache_key: &str,
         metadata_key: &str,
         content: &Bytes,
@@ -872,12 +913,11 @@ impl ProxyService {
         };
 
         // Store content
-        self.storage.put(cache_key, content.clone()).await?;
+        self.cache_put(per_repo, cache_key, content.clone()).await?;
 
         // Store metadata
         let metadata_json = serde_json::to_vec(&metadata)?;
-        self.storage
-            .put(metadata_key, Bytes::from(metadata_json))
+        self.cache_put(per_repo, metadata_key, Bytes::from(metadata_json))
             .await?;
 
         // Record the cached artifact in the database so it shows up in
@@ -955,17 +995,18 @@ impl ProxyService {
     /// Used as a fallback when upstream is unavailable.
     async fn get_stale_cached_artifact(
         &self,
+        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
         // Load metadata without checking expiry
-        let metadata = match self.load_cache_metadata(metadata_key).await? {
+        let metadata = match self.load_cache_metadata(per_repo, metadata_key).await? {
             Some(m) => m,
             None => return Ok(None),
         };
 
         // Try to get cached content
-        match self.storage.get(cache_key).await {
+        match self.cache_get(per_repo, cache_key).await {
             Ok(content) => {
                 // Verify checksum
                 let actual_checksum = StorageService::calculate_hash(&content);
