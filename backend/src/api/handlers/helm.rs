@@ -27,6 +27,7 @@ use crate::api::middleware::auth::{require_auth_basic, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::helm::{generate_index_yaml, ChartYaml, HelmHandler, HelmIndex};
 use crate::models::repository::RepositoryType;
+use crate::services::proxy_service::ProxyService;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -212,6 +213,179 @@ async fn index_yaml(
 // GET /helm/{repo_key}/charts/{filename} -- Download chart package
 // ---------------------------------------------------------------------------
 
+/// Resolve a chart download URL from an upstream index entry.
+///
+/// Absolute URLs are returned unchanged so charts hosted on a different
+/// domain (e.g. GitHub Releases) work correctly. Relative URLs are
+/// resolved against the repo's `upstream_url`.
+fn resolve_chart_url(upstream_url: &str, chart_url: &str) -> String {
+    if chart_url.starts_with("http://") || chart_url.starts_with("https://") {
+        chart_url.to_string()
+    } else {
+        let base = upstream_url.trim_end_matches('/');
+        let path = chart_url.trim_start_matches('/');
+        format!("{}/{}", base, path)
+    }
+}
+
+/// Fetch a chart by looking up its real download URL from the upstream's
+/// `index.yaml` instead of assuming `{upstream_url}/charts/{name}-{version}.tgz`.
+///
+/// The `index.yaml` request goes through the proxy cache, so the extra round-trip
+/// is typically free after the first virtual-index request. The chart content is
+/// cached under the stable key `charts/{filename}` regardless of where the actual
+/// bytes come from, so subsequent downloads are served from cache.
+async fn fetch_chart_via_index(
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    name: &str,
+    version: &str,
+    filename: &str,
+) -> Result<(Bytes, Option<String>), Response> {
+    let (index_bytes, _) =
+        proxy_helpers::proxy_fetch(proxy, repo_id, repo_key, upstream_url, "index.yaml").await?;
+
+    let yaml_str = String::from_utf8(index_bytes.to_vec()).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Invalid UTF-8 in upstream index.yaml",
+        )
+            .into_response()
+    })?;
+    let index: HelmIndex = serde_yaml::from_str(&yaml_str).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "Failed to parse upstream index.yaml",
+        )
+            .into_response()
+    })?;
+
+    let chart_url = index
+        .entries
+        .get(name)
+        .and_then(|entries| entries.iter().find(|e| e.chart.version == version))
+        .and_then(|entry| entry.urls.first())
+        .cloned()
+        .ok_or_else(|| {
+            (StatusCode::NOT_FOUND, "Chart not found in upstream index").into_response()
+        })?;
+
+    let fetch_url = resolve_chart_url(upstream_url, &chart_url);
+    let cache_path = format!("charts/{}", filename);
+    proxy_helpers::proxy_fetch_with_cache_key(
+        proxy,
+        repo_id,
+        repo_key,
+        upstream_url,
+        &fetch_url,
+        &cache_path,
+    )
+    .await
+}
+
+/// Attempt to download a chart from a Remote or Virtual repo by resolving the
+/// real download URL from each upstream's `index.yaml`.
+///
+/// For Virtual repos the members are tried in priority order: hosted members
+/// (local storage) are checked before remote members so that promoted/cached
+/// artifacts are served without an upstream round-trip.
+async fn download_chart_via_index(
+    state: &SharedState,
+    repo: &RepoInfo,
+    name: &str,
+    version: &str,
+    filename: &str,
+) -> Result<Option<Response>, Response> {
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+
+    if repo.repo_type == RepositoryType::Remote {
+        let Some(upstream_url) = repo.upstream_url.as_deref() else {
+            return Ok(None);
+        };
+        let (content, content_type) = fetch_chart_via_index(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            name,
+            version,
+            filename,
+        )
+        .await?;
+        return Ok(Some(proxy_helpers::build_download_response(
+            content,
+            content_type,
+            "application/gzip",
+            Some(filename),
+        )));
+    }
+
+    if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        for member in &members {
+            if member.repo_type != RepositoryType::Remote {
+                // Hosted / staging member: check local storage.
+                if let Ok((content, ct)) = proxy_helpers::local_fetch_by_path_suffix(
+                    &state.db,
+                    state,
+                    member.id,
+                    &member.storage_location(),
+                    filename,
+                )
+                .await
+                {
+                    return Ok(Some(proxy_helpers::build_download_response(
+                        content,
+                        ct,
+                        "application/gzip",
+                        Some(filename),
+                    )));
+                }
+                continue;
+            }
+
+            let Some(upstream_url) = member.upstream_url.as_deref() else {
+                continue;
+            };
+            match fetch_chart_via_index(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                name,
+                version,
+                filename,
+            )
+            .await
+            {
+                Ok((content, content_type)) => {
+                    return Ok(Some(proxy_helpers::build_download_response(
+                        content,
+                        content_type,
+                        "application/gzip",
+                        Some(filename),
+                    )));
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "helm index lookup miss for member '{}' chart '{}-{}'",
+                        member.key,
+                        name,
+                        version
+                    );
+                }
+            }
+        }
+        return Ok(None);
+    }
+
+    Ok(None)
+}
+
 async fn download_chart(
     State(state): State<SharedState>,
     Path((repo_key, filename)): Path<(String, String)>,
@@ -223,21 +397,23 @@ async fn download_chart(
         match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, &filename).await? {
             Some(a) => a,
             None => {
-                let upstream_path = format!("charts/{}", filename);
-                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
-                    &state,
-                    &repo,
-                    proxy_helpers::DownloadResponseOpts {
-                        upstream_path: &upstream_path,
-                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(&filename),
-                        default_content_type: "application/gzip",
-                        content_disposition_filename: Some(&filename),
-                    },
-                )
-                .await?
-                {
-                    return Ok(resp);
+                // Parse name and version so we can look up the real download URL
+                // from the upstream's index.yaml instead of assuming
+                // {upstream_url}/charts/{name}-{version}.tgz.
+                let info = HelmHandler::parse_path(&filename).ok();
+                let name_version = info
+                    .as_ref()
+                    .and_then(|i| i.name.as_deref().zip(i.version.as_deref()))
+                    .map(|(n, v)| (n.to_string(), v.to_string()));
+
+                if let Some((name, version)) = name_version {
+                    if let Some(resp) =
+                        download_chart_via_index(&state, &repo, &name, &version, &filename).await?
+                    {
+                        return Ok(resp);
+                    }
                 }
+
                 return Err((StatusCode::NOT_FOUND, "Chart not found").into_response());
             }
         };
@@ -451,6 +627,76 @@ async fn delete_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // resolve_chart_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_chart_url_absolute_https() {
+        let url = resolve_chart_url(
+            "https://charts.bitnami.com/bitnami",
+            "https://github.com/bitnami/charts/releases/download/nginx-1.0.0/nginx-1.0.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://github.com/bitnami/charts/releases/download/nginx-1.0.0/nginx-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_absolute_http() {
+        let url = resolve_chart_url("https://example.com", "http://other.example.com/chart.tgz");
+        assert_eq!(url, "http://other.example.com/chart.tgz");
+    }
+
+    #[test]
+    fn test_resolve_chart_url_absolute_same_origin() {
+        let url = resolve_chart_url(
+            "https://charts.jetstack.io",
+            "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_relative() {
+        let url = resolve_chart_url(
+            "https://charts.jetstack.io",
+            "charts/cert-manager-v1.14.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_relative_leading_slash() {
+        let url = resolve_chart_url(
+            "https://charts.jetstack.io",
+            "/charts/cert-manager-v1.14.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chart_url_upstream_trailing_slash() {
+        let url = resolve_chart_url(
+            "https://charts.jetstack.io/",
+            "charts/cert-manager-v1.14.0.tgz",
+        );
+        assert_eq!(
+            url,
+            "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Format-specific logic: filename, artifact_path, storage_key
