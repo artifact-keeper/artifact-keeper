@@ -75,6 +75,7 @@ fn test_config(storage_path: &str) -> Config {
         metrics_port: None,
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
+        ..Default::default()
     }
 }
 

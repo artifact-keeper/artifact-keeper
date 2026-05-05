@@ -2178,6 +2178,7 @@ mod tests {
             metrics_port: None,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            ..Default::default()
         };
         Arc::new(AppState::new(config, pool, storage, registry))
     }
