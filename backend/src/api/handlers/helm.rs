@@ -1160,8 +1160,7 @@ entries:
             upstream_url: None,
         };
 
-        let result =
-            download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+        let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
@@ -1184,8 +1183,7 @@ entries:
             upstream_url: None,
         };
 
-        let result =
-            download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+        let result = download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(matches!(result, Ok(None)));
