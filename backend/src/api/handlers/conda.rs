@@ -1086,7 +1086,6 @@ async fn channeldata_json(
                     proxy,
                     repo.id,
                     &repo_key,
-                    &repo.storage_location(),
                     upstream_url,
                     "channeldata.json",
                 )
@@ -1463,7 +1462,6 @@ async fn serve_repodata(
                     proxy,
                     repo.id,
                     repo_key,
-                    &repo.storage_location(),
                     upstream_url,
                     &upstream_path,
                 )
@@ -2354,7 +2352,6 @@ async fn download_package(
                         proxy,
                         repo.id,
                         &repo_key,
-                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )

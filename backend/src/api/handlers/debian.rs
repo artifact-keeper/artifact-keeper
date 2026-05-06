@@ -405,15 +405,9 @@ impl<'a> DebianProxy<'a> {
             _ => return Ok(()),
         };
         let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
-        let (content, upstream_ct) = proxy_helpers::proxy_fetch(
-            proxy,
-            repo.id,
-            self.repo_key,
-            &repo.storage_location(),
-            upstream_url,
-            &upstream_path,
-        )
-        .await?;
+        let (content, upstream_ct) =
+            proxy_helpers::proxy_fetch(proxy, repo.id, self.repo_key, upstream_url, &upstream_path)
+                .await?;
         Err(Response::builder()
             .status(StatusCode::OK)
             .header(
@@ -776,15 +770,8 @@ async fn dists_proxy_catchall(
     };
 
     let upstream_path = format!("dists/{}/{}", distribution, dists_path);
-    let (content, upstream_ct) = proxy_helpers::proxy_fetch(
-        proxy,
-        repo.id,
-        &repo_key,
-        &repo.storage_location(),
-        upstream_url,
-        &upstream_path,
-    )
-    .await?;
+    let (content, upstream_ct) =
+        proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path).await?;
 
     let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
 
@@ -873,7 +860,6 @@ async fn pool_download(
                         proxy,
                         repo.id,
                         &repo_key,
-                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )

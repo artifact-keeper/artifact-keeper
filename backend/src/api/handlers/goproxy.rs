@@ -357,15 +357,9 @@ async fn try_proxy_go_metadata(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
-                proxy,
-                repo.id,
-                &repo.key,
-                &repo.storage_location(),
-                upstream_url,
-                upstream_path,
-            )
-            .await
+            if let Ok((content, content_type)) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo.key, upstream_url, upstream_path)
+                    .await
             {
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -585,7 +579,6 @@ async fn get_mod_file(
                         proxy,
                         repo.id,
                         &repo.key,
-                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )
@@ -725,7 +718,6 @@ async fn download_zip(
                         proxy,
                         repo.id,
                         &repo.key,
-                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )

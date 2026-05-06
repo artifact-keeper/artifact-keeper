@@ -22,7 +22,6 @@ use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::models::repository::{Repository, RepositoryFormat, RepositoryType};
 use crate::services::storage_service::StorageService;
-use crate::storage::{StorageBackend as RepoStorageBackend, StorageRegistry};
 
 /// Default cache TTL in seconds (24 hours)
 pub const DEFAULT_CACHE_TTL_SECS: i64 = 86400;
@@ -65,16 +64,7 @@ struct RegistryTokenResponse {
 /// Proxy service for fetching and caching artifacts from upstream repositories
 pub struct ProxyService {
     db: PgPool,
-    /// Fallback storage used when no `storage_registry` is configured (legacy
-    /// path; kept so older constructors and unit tests keep working).
     storage: Arc<StorageService>,
-    /// Optional registry that resolves a per-repository `StorageBackend`. When
-    /// set, all cache reads/writes go through the same backend that handlers
-    /// use via `state.storage_for_repo(...)`. This is required to fix bug
-    /// #1016 — without it, the proxy writes cached content to one backend
-    /// and downstream handlers read from a different one, producing 500
-    /// errors on second download of cached APT/PyPI/etc. packages.
-    storage_registry: Option<Arc<StorageRegistry>>,
     http_client: Client,
     /// In-memory cache for OCI registry bearer tokens.
     /// Key: "{realm}\0{service}\0{scope}", Value: (token, created_at, ttl_secs)
@@ -88,13 +78,7 @@ pub struct ProxyService {
 }
 
 impl ProxyService {
-    /// Create a new proxy service.
-    ///
-    /// Without a `StorageRegistry`, cache reads/writes go through the supplied
-    /// `StorageService` only. Use [`ProxyService::with_storage_registry`] in
-    /// production to route cache I/O through the same per-repository backend
-    /// that handlers use, otherwise downloads of already-cached artifacts will
-    /// 500 when the per-repo backend differs from the global one (bug #1016).
+    /// Create a new proxy service
     pub fn new(db: PgPool, storage: Arc<StorageService>, config: &Config) -> Self {
         let http_client = crate::services::http_client::base_client_builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -109,90 +93,11 @@ impl ProxyService {
         Self {
             db,
             storage,
-            storage_registry: None,
             http_client,
             token_cache: RwLock::new(HashMap::new()),
             fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             queue_timeout: Duration::from_secs(config.proxy_queue_timeout_secs),
             max_artifact_size: config.proxy_max_artifact_size_bytes,
-        }
-    }
-
-    /// Builder-style setter that wires in a `StorageRegistry`.
-    ///
-    /// When configured, cache reads and writes are routed through the
-    /// per-repository backend resolved via the registry from
-    /// `repo.storage_location()`. This must match the backend that
-    /// `AppState::storage_for_repo` returns, otherwise format download
-    /// handlers will fail to load cached artifacts (bug #1016).
-    pub fn with_storage_registry(mut self, registry: Arc<StorageRegistry>) -> Self {
-        self.storage_registry = Some(registry);
-        self
-    }
-
-    /// Resolve the per-repo storage backend to use for cache I/O if a
-    /// `StorageRegistry` is configured. Returns `None` when no registry is
-    /// available (the legacy global-storage path is used in that case so
-    /// existing tests and old callers keep working).
-    fn per_repo_storage(&self, repo: &Repository) -> Option<Arc<dyn RepoStorageBackend>> {
-        let registry = self.storage_registry.as_ref()?;
-        match registry.backend_for(&repo.storage_location()) {
-            Ok(backend) => Some(backend),
-            Err(e) => {
-                tracing::warn!(
-                    repo_key = %repo.key,
-                    error = %e,
-                    "Failed to resolve per-repo storage for proxy cache, falling back to global storage"
-                );
-                None
-            }
-        }
-    }
-
-    /// Write a key/content pair to the per-repo backend if available, falling
-    /// back to the global `StorageService` otherwise. Routing writes here is
-    /// what makes second downloads of cached artifacts succeed: handlers read
-    /// via `storage_for_repo`, so the cache must land on the same backend.
-    async fn cache_put(
-        &self,
-        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
-        key: &str,
-        content: Bytes,
-    ) -> Result<()> {
-        if let Some(backend) = per_repo {
-            backend.put(key, content).await
-        } else {
-            self.storage.put(key, content).await
-        }
-    }
-
-    /// Read a key from the per-repo backend if available, falling back to the
-    /// global `StorageService` otherwise. The fallback preserves the legacy
-    /// behavior used by tests that construct `ProxyService` without a
-    /// registry.
-    async fn cache_get(
-        &self,
-        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
-        key: &str,
-    ) -> Result<Bytes> {
-        if let Some(backend) = per_repo {
-            backend.get(key).await
-        } else {
-            self.storage.get(key).await
-        }
-    }
-
-    /// Delete a key from the per-repo backend if available, falling back to
-    /// the global `StorageService` otherwise.
-    async fn cache_delete(
-        &self,
-        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
-        key: &str,
-    ) -> Result<()> {
-        if let Some(backend) = per_repo {
-            backend.delete(key).await
-        } else {
-            self.storage.delete(key).await
         }
     }
 
@@ -207,10 +112,10 @@ impl ProxyService {
     }
 
     /// Check whether an artifact is already present in the proxy cache
-    /// under the given `path` (without contacting upstream), using the legacy
-    /// global storage. Prefer [`get_cached_artifact_for_repo`] when a
-    /// `Repository` is in scope: it routes through the per-repo backend so
-    /// the lookup matches what download handlers see (bug #1016).
+    /// under the given `path` (without contacting upstream).
+    ///
+    /// Returns `Ok(Some((content, content_type)))` on cache hit, `Ok(None)`
+    /// on cache miss or expired entry.
     pub async fn get_cached_artifact_by_path(
         &self,
         repo_key: &str,
@@ -218,24 +123,7 @@ impl ProxyService {
     ) -> Result<Option<(Bytes, Option<String>)>> {
         let cache_key = Self::cache_storage_key(repo_key, path);
         let metadata_key = Self::cache_metadata_key(repo_key, path);
-        self.get_cached_artifact(None, &cache_key, &metadata_key)
-            .await
-    }
-
-    /// Check whether an artifact is already present in the proxy cache for
-    /// `repo` under `path`. Routes through the per-repo storage backend so
-    /// the cache lookup matches the backend that handlers read from when
-    /// serving by `artifacts.storage_key` (bug #1016).
-    pub async fn get_cached_artifact_for_repo(
-        &self,
-        repo: &Repository,
-        path: &str,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
-        let cache_key = Self::cache_storage_key(&repo.key, path);
-        let metadata_key = Self::cache_metadata_key(&repo.key, path);
-        let per_repo = self.per_repo_storage(repo);
-        self.get_cached_artifact(per_repo.as_ref(), &cache_key, &metadata_key)
-            .await
+        self.get_cached_artifact(&cache_key, &metadata_key).await
     }
 
     /// Fetch artifact from upstream, but use `cache_path` instead of
@@ -265,14 +153,9 @@ impl ProxyService {
         let cache_key = Self::cache_storage_key(&repo.key, cache_path);
         let metadata_key = Self::cache_metadata_key(&repo.key, cache_path);
 
-        // Resolve the per-repo backend once and pass it through to all cache
-        // I/O so writes and reads land on the same storage that handlers use.
-        let per_repo = self.per_repo_storage(repo);
-
         // Check if we have a valid cached copy
-        if let Some((content, content_type)) = self
-            .get_cached_artifact(per_repo.as_ref(), &cache_key, &metadata_key)
-            .await?
+        if let Some((content, content_type)) =
+            self.get_cached_artifact(&cache_key, &metadata_key).await?
         {
             return Ok((content, content_type));
         }
@@ -285,7 +168,6 @@ impl ProxyService {
             Ok((content, content_type, etag, _effective_url)) => {
                 let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
                 self.cache_artifact(
-                    per_repo.as_ref(),
                     &cache_key,
                     &metadata_key,
                     &content,
@@ -301,7 +183,7 @@ impl ProxyService {
             }
             Err(upstream_err) => {
                 if let Ok(Some((stale_content, stale_content_type))) = self
-                    .get_stale_cached_artifact(per_repo.as_ref(), &cache_key, &metadata_key)
+                    .get_stale_cached_artifact(&cache_key, &metadata_key)
                     .await
                 {
                     tracing::warn!(
@@ -333,12 +215,8 @@ impl ProxyService {
 
         let metadata_key = Self::cache_metadata_key(&repo.key, path);
 
-        // Try to load existing cache metadata from the per-repo backend.
-        let per_repo = self.per_repo_storage(repo);
-        let metadata = match self
-            .load_cache_metadata(per_repo.as_ref(), &metadata_key)
-            .await?
-        {
+        // Try to load existing cache metadata
+        let metadata = match self.load_cache_metadata(&metadata_key).await? {
             Some(m) => m,
             None => return Ok(true), // No cache, definitely need to fetch
         };
@@ -394,12 +272,9 @@ impl ProxyService {
         let cache_key = Self::cache_storage_key(&repo.key, path);
         let metadata_key = Self::cache_metadata_key(&repo.key, path);
 
-        // Delete both content and metadata from the per-repo backend (or
-        // global fallback) so it actually removes the file the handlers
-        // would try to read.
-        let per_repo = self.per_repo_storage(repo);
-        let _ = self.cache_delete(per_repo.as_ref(), &cache_key).await;
-        let _ = self.cache_delete(per_repo.as_ref(), &metadata_key).await;
+        // Delete both content and metadata
+        let _ = self.storage.delete(&cache_key).await;
+        let _ = self.storage.delete(&metadata_key).await;
 
         Ok(())
     }
@@ -443,7 +318,7 @@ impl ProxyService {
     /// Uses a `__content__` leaf file to avoid file/directory collisions
     /// when one path is a prefix of another (e.g., npm metadata at `is-odd`
     /// vs tarball at `is-odd/-/is-odd-3.0.1.tgz`).
-    pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> String {
+    fn cache_storage_key(repo_key: &str, path: &str) -> String {
         format!(
             "proxy-cache/{}/{}/__content__",
             repo_key,
@@ -452,7 +327,7 @@ impl ProxyService {
     }
 
     /// Generate storage key for cache metadata
-    pub(crate) fn cache_metadata_key(repo_key: &str, path: &str) -> String {
+    fn cache_metadata_key(repo_key: &str, path: &str) -> String {
         format!(
             "proxy-cache/{}/{}/__cache_meta__.json",
             repo_key,
@@ -460,21 +335,14 @@ impl ProxyService {
         )
     }
 
-    /// Attempt to retrieve a cached artifact if valid.
-    ///
-    /// `per_repo` is the registry-resolved per-repo backend (preferred) or
-    /// `None` to fall back to the global storage. Routing through the
-    /// per-repo backend is what makes second downloads of cached APT/PyPI
-    /// packages work — handlers read by `artifacts.storage_key` from the
-    /// same backend (bug #1016).
+    /// Attempt to retrieve a cached artifact if valid
     async fn get_cached_artifact(
         &self,
-        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
         // Check if metadata exists
-        let metadata = match self.load_cache_metadata(per_repo, metadata_key).await? {
+        let metadata = match self.load_cache_metadata(metadata_key).await? {
             Some(m) => m,
             None => return Ok(None),
         };
@@ -486,7 +354,7 @@ impl ProxyService {
         }
 
         // Try to get cached content
-        match self.cache_get(per_repo, cache_key).await {
+        match self.storage.get(cache_key).await {
             Ok(content) => {
                 // Verify checksum
                 let actual_checksum = StorageService::calculate_hash(&content);
@@ -508,14 +376,9 @@ impl ProxyService {
         }
     }
 
-    /// Load cache metadata from storage. Uses the per-repo backend when
-    /// supplied; otherwise falls back to the global storage.
-    async fn load_cache_metadata(
-        &self,
-        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
-        metadata_key: &str,
-    ) -> Result<Option<CacheMetadata>> {
-        match self.cache_get(per_repo, metadata_key).await {
+    /// Load cache metadata from storage
+    async fn load_cache_metadata(&self, metadata_key: &str) -> Result<Option<CacheMetadata>> {
+        match self.storage.get(metadata_key).await {
             Ok(data) => {
                 let metadata: CacheMetadata = serde_json::from_slice(&data)?;
                 Ok(Some(metadata))
@@ -879,16 +742,9 @@ impl ProxyService {
 
     /// Cache artifact content and metadata, and record the artifact in the
     /// database so that it appears in repository listings and storage usage.
-    ///
-    /// Content and metadata are written through `per_repo` (the registry-
-    /// resolved per-repo backend) when supplied, otherwise they fall back to
-    /// the global `StorageService`. Routing through the per-repo backend is
-    /// what allows subsequent reads (which go via
-    /// `state.storage_for_repo(...)`) to find the cached file (bug #1016).
     #[allow(clippy::too_many_arguments)]
     async fn cache_artifact(
         &self,
-        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
         cache_key: &str,
         metadata_key: &str,
         content: &Bytes,
@@ -913,11 +769,12 @@ impl ProxyService {
         };
 
         // Store content
-        self.cache_put(per_repo, cache_key, content.clone()).await?;
+        self.storage.put(cache_key, content.clone()).await?;
 
         // Store metadata
         let metadata_json = serde_json::to_vec(&metadata)?;
-        self.cache_put(per_repo, metadata_key, Bytes::from(metadata_json))
+        self.storage
+            .put(metadata_key, Bytes::from(metadata_json))
             .await?;
 
         // Record the cached artifact in the database so it shows up in
@@ -995,18 +852,17 @@ impl ProxyService {
     /// Used as a fallback when upstream is unavailable.
     async fn get_stale_cached_artifact(
         &self,
-        per_repo: Option<&Arc<dyn RepoStorageBackend>>,
         cache_key: &str,
         metadata_key: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
         // Load metadata without checking expiry
-        let metadata = match self.load_cache_metadata(per_repo, metadata_key).await? {
+        let metadata = match self.load_cache_metadata(metadata_key).await? {
             Some(m) => m,
             None => return Ok(None),
         };
 
         // Try to get cached content
-        match self.cache_get(per_repo, cache_key).await {
+        match self.storage.get(cache_key).await {
             Ok(content) => {
                 // Verify checksum
                 let actual_checksum = StorageService::calculate_hash(&content);
@@ -2383,283 +2239,5 @@ mod tests {
         assert!(result.is_ok());
         let (content, _ct, _etag, _url) = result.unwrap();
         assert_eq!(content.len(), 512);
-    }
-
-    // =======================================================================
-    // Regression: bug #1016 — cached artifact storage routing
-    //
-    // When the proxy caches an artifact, the cache content must land on the
-    // SAME storage backend that download handlers read from via
-    // `state.storage_for_repo(...)`. Otherwise the second download of an
-    // already-cached APT/PyPI/etc. package fails with a 500 Internal Server
-    // Error (filesystem: "OS error 2 - No such file"; S3: NoSuchKey).
-    //
-    // These tests pin down the routing contract by:
-    //   1. Building a ProxyService with a `StorageRegistry`.
-    //   2. Resolving the per-repo backend for a Repository.
-    //   3. Asserting writes/reads go to that same backend (NOT the
-    //      ProxyService's global StorageService).
-    // =======================================================================
-
-    use crate::storage::{StorageBackend as RepoStorageBackend, StorageRegistry};
-    use async_trait::async_trait;
-    use std::collections::HashMap as StdHashMap;
-    use std::sync::Mutex;
-
-    /// In-memory `StorageBackend` for testing cache routing.
-    /// Records every put/get so tests can assert which backend was hit.
-    struct MockBackend {
-        store: Mutex<StdHashMap<String, Bytes>>,
-    }
-
-    impl MockBackend {
-        fn new() -> Self {
-            Self {
-                store: Mutex::new(StdHashMap::new()),
-            }
-        }
-
-        fn snapshot_keys(&self) -> Vec<String> {
-            let guard = self.store.lock().unwrap();
-            let mut keys: Vec<String> = guard.keys().cloned().collect();
-            keys.sort();
-            keys
-        }
-    }
-
-    #[async_trait]
-    impl RepoStorageBackend for MockBackend {
-        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
-            self.store.lock().unwrap().insert(key.to_string(), content);
-            Ok(())
-        }
-
-        async fn get(&self, key: &str) -> Result<Bytes> {
-            self.store
-                .lock()
-                .unwrap()
-                .get(key)
-                .cloned()
-                .ok_or_else(|| AppError::NotFound(format!("not found: {}", key)))
-        }
-
-        async fn exists(&self, key: &str) -> Result<bool> {
-            Ok(self.store.lock().unwrap().contains_key(key))
-        }
-
-        async fn delete(&self, key: &str) -> Result<()> {
-            self.store.lock().unwrap().remove(key);
-            Ok(())
-        }
-    }
-
-    fn make_test_repo(key: &str, backend_name: &str, path: &str) -> Repository {
-        Repository {
-            id: Uuid::nil(),
-            key: key.to_string(),
-            name: key.to_string(),
-            description: None,
-            format: RepositoryFormat::Debian,
-            repo_type: RepositoryType::Remote,
-            storage_backend: backend_name.to_string(),
-            storage_path: path.to_string(),
-            upstream_url: Some("https://deb.example.com".to_string()),
-            is_public: true,
-            quota_bytes: None,
-            replication_priority: crate::models::repository::ReplicationPriority::OnDemand,
-            promotion_target_id: None,
-            promotion_policy_id: None,
-            curation_enabled: false,
-            curation_source_repo_id: None,
-            curation_target_repo_id: None,
-            curation_default_action: "review".to_string(),
-            curation_sync_interval_secs: 0,
-            curation_auto_fetch: false,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    /// Build a `(MockBackend, StorageRegistry)` pair where `name` is both the
-    /// registry key and the registry's default backend. Used by routing tests
-    /// to set up a single-backend registry without boilerplate.
-    fn make_test_registry(name: &str) -> (Arc<MockBackend>, Arc<StorageRegistry>) {
-        let backend = Arc::new(MockBackend::new());
-        let mut backends: StdHashMap<String, Arc<dyn RepoStorageBackend>> = StdHashMap::new();
-        backends.insert(name.to_string(), backend.clone());
-        let registry = Arc::new(StorageRegistry::new(backends, name.to_string()));
-        (backend, registry)
-    }
-
-    /// Build a minimal `ProxyService` for routing tests. The pool is lazy so
-    /// it never actually connects (these tests don't touch the DB). When
-    /// `registry` is `Some`, it is wired in via `with_storage_registry`.
-    fn make_test_proxy(registry: Option<Arc<StorageRegistry>>) -> ProxyService {
-        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none")
-            .expect("connect_lazy never fails for a syntactically valid URL");
-        let global_backend: Arc<dyn crate::services::storage_service::StorageBackend> =
-            Arc::new(crate::services::storage_service::FilesystemBackend::new(
-                std::path::PathBuf::from("/tmp/ak-test-global-storage"),
-            ));
-        let storage = Arc::new(StorageService::new(global_backend));
-        let config = crate::config::Config::default();
-        let svc = ProxyService::new(pool, storage, &config);
-        match registry {
-            Some(r) => svc.with_storage_registry(r),
-            None => svc,
-        }
-    }
-
-    /// Bug #1016 regression: when a `StorageRegistry` is configured,
-    /// `per_repo_storage` returns the registry-resolved backend (matches
-    /// what `state.storage_for_repo(...)` returns in the real handler path).
-    #[tokio::test]
-    async fn test_per_repo_storage_resolves_via_registry_for_bug_1016() {
-        let (backend, registry) = make_test_registry("mock-s3");
-        let proxy = make_test_proxy(Some(registry));
-        let repo = make_test_repo("debian-proxy", "mock-s3", "ignored");
-
-        let resolved = proxy
-            .per_repo_storage(&repo)
-            .expect("registry-resolved backend should be returned");
-
-        // Round-trip through the resolved backend. Then check the same key
-        // appears in the original mock backend (proves identity).
-        let key = "proxy-cache/debian-proxy/pool/main/p/php7.4/php7.4_test.deb/__content__";
-        resolved
-            .put(key, Bytes::from_static(b"deb-bytes"))
-            .await
-            .unwrap();
-
-        let recorded = backend.snapshot_keys();
-        assert!(
-            recorded.contains(&key.to_string()),
-            "expected key on registry backend; got {:?}",
-            recorded
-        );
-    }
-
-    /// Bug #1016 regression: `cache_put` followed by `cache_get` round-trips
-    /// through the per-repo backend, NOT the global `StorageService`. This
-    /// is the exact write/read symmetry the proxy needs so handlers reading
-    /// via `state.storage_for_repo(...)` find the cached file.
-    #[tokio::test]
-    async fn test_cache_put_get_routes_through_per_repo_backend_for_bug_1016() {
-        let (per_repo_backend, registry) = make_test_registry("repo-backend");
-        let proxy = make_test_proxy(Some(registry));
-        let repo = make_test_repo("debian-proxy", "repo-backend", "/data/debian");
-
-        let per_repo = proxy.per_repo_storage(&repo);
-        assert!(
-            per_repo.is_some(),
-            "registry-resolved backend should be Some when registry is configured"
-        );
-
-        // Use the production cache key shape (matches proxy_service::cache_storage_key).
-        let cache_key = ProxyService::cache_storage_key(
-            &repo.key,
-            "pool/main/p/php7.4/php7.4_7.4.33-26+0~20260213.114+debian13~1.gbpd8dc34_all.deb",
-        );
-        let payload = Bytes::from_static(b"<deb file body>");
-
-        proxy
-            .cache_put(per_repo.as_ref(), &cache_key, payload.clone())
-            .await
-            .unwrap();
-
-        // Read via the same routing helper.
-        let read_back = proxy
-            .cache_get(per_repo.as_ref(), &cache_key)
-            .await
-            .unwrap();
-        assert_eq!(read_back, payload);
-
-        // The per-repo mock backend should hold the key.
-        let keys = per_repo_backend.snapshot_keys();
-        assert!(
-            keys.iter().any(|k| k == &cache_key),
-            "cache_put must land on the per-repo backend; got keys {:?}",
-            keys
-        );
-    }
-
-    /// Without a registry, routing falls back to the global StorageService.
-    /// This pins the back-compat path so older callers (and existing tests
-    /// that construct `ProxyService::new` without a registry) keep working.
-    #[tokio::test]
-    async fn test_per_repo_storage_returns_none_without_registry() {
-        let proxy = make_test_proxy(None);
-        let repo = make_test_repo("any", "filesystem", "/tmp/whatever");
-        assert!(
-            proxy.per_repo_storage(&repo).is_none(),
-            "without a registry, per_repo_storage must return None so cache I/O falls back to the global StorageService"
-        );
-    }
-
-    /// Bug #1016 demonstration: when `ProxyService` is built WITHOUT the
-    /// `StorageRegistry` (the pre-fix code path), cache writes do NOT land
-    /// on the per-repo backend that handlers later read from. This pins the
-    /// failure mode so we keep the registry wiring in `main.rs`.
-    #[tokio::test]
-    async fn test_bug_1016_repro_without_registry_misses_per_repo_backend() {
-        // Per-repo backend (mirrors what `state.storage_for_repo(...)` would
-        // return for the repo). Handlers read from this backend.
-        let per_repo_backend = Arc::new(MockBackend::new());
-
-        // Build the ProxyService WITHOUT a registry — this reproduces the
-        // pre-fix wiring and demonstrates why second downloads fail.
-        let proxy = make_test_proxy(None);
-        let repo = make_test_repo("debian-proxy", "per-repo", "/data/debian");
-        let per_repo_resolved = proxy.per_repo_storage(&repo);
-        assert!(
-            per_repo_resolved.is_none(),
-            "no registry => no per-repo routing"
-        );
-
-        // Pre-fix behavior: cache_put goes to the global StorageService, NOT
-        // to the per-repo backend that handlers read from. Verify the
-        // per-repo backend stays empty after the cache write.
-        let cache_key =
-            ProxyService::cache_storage_key(&repo.key, "pool/main/p/php7.4/php7.4_test.deb");
-        proxy
-            .cache_put(
-                per_repo_resolved.as_ref(),
-                &cache_key,
-                Bytes::from_static(b"x"),
-            )
-            .await
-            .unwrap();
-        assert!(
-            per_repo_backend.snapshot_keys().is_empty(),
-            "without registry, cache_put falls back to global storage and never reaches the per-repo backend (this is bug #1016)"
-        );
-
-        // And the read path (which handlers go through) sees nothing.
-        let read_via_per_repo = per_repo_backend.get(&cache_key).await;
-        assert!(
-            matches!(read_via_per_repo, Err(AppError::NotFound(_))),
-            "handler-side read via the per-repo backend would 500 because the file lives on the global backend, not the per-repo one"
-        );
-    }
-
-    /// Direct exercise of the MockBackend `exists`/`delete` impls used by
-    /// the routing tests above. Without an explicit driver, those trait
-    /// methods are uncovered new lines even though the type is reachable.
-    #[tokio::test]
-    async fn test_mock_backend_exists_and_delete_round_trip() {
-        let backend: Arc<dyn RepoStorageBackend> = Arc::new(MockBackend::new());
-        backend
-            .put("k", Bytes::from_static(b"v"))
-            .await
-            .expect("put");
-        assert!(
-            backend.exists("k").await.expect("exists ok"),
-            "key should be present after put"
-        );
-        backend.delete("k").await.expect("delete ok");
-        assert!(
-            !backend.exists("k").await.expect("exists ok"),
-            "key should be gone after delete"
-        );
     }
 }

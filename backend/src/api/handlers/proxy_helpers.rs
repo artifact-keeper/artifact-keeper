@@ -183,25 +183,17 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
 }
 
 /// Attempt to fetch an artifact from the upstream via the proxy service.
-///
-/// Builds a `Repository` shape for the proxy from the caller-supplied
-/// `location`. The `location` MUST be the real `StorageLocation` from the
-/// caller's `Repository` (or `RepoInfo`/`OciRepoInfo`) so that proxy cache
-/// I/O routes through the same per-repo backend that download handlers read
-/// from via `state.storage_for_repo(...)`. Passing a synthesized location
-/// (`backend: "filesystem"`, `path: ""`) silently re-introduces bug #1016
-/// because the cache write lands on a different backend than the read.
-///
+/// Constructs a minimal `Repository` model from handler-level repo info.
 /// Returns `(content_bytes, content_type)` on success.
 pub async fn proxy_fetch(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
-    location: &StorageLocation,
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url, location);
+    // Construct a minimal Repository that satisfies ProxyService::fetch_artifact
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
 
     proxy_service
         .fetch_artifact(&repo, path)
@@ -210,25 +202,15 @@ pub async fn proxy_fetch(
 }
 
 /// Check whether an artifact is present in the proxy cache under `path`
-/// without contacting upstream. Returns `Some` on cache hit, `None` on miss
-/// or expired entry.
-///
-/// Routes the lookup through the per-repo storage backend resolved from the
-/// caller-supplied `location`. This is required so the cache hit/miss
-/// decision matches the backend that download handlers read from
-/// (bug #1016) — checking only the legacy global storage would silently
-/// miss artifacts cached on the per-repo S3/R2 backend.
+/// without contacting upstream. Returns `Ok(Some(...))` on cache hit,
+/// `Ok(None)` on miss or expired entry.
 pub async fn proxy_check_cache(
     proxy_service: &ProxyService,
-    repo_id: Uuid,
     repo_key: &str,
-    location: &StorageLocation,
-    upstream_url: &str,
     path: &str,
 ) -> Option<(Bytes, Option<String>)> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url, location);
     match proxy_service
-        .get_cached_artifact_for_repo(&repo, path)
+        .get_cached_artifact_by_path(repo_key, path)
         .await
     {
         Ok(result) => result,
@@ -247,19 +229,15 @@ pub async fn proxy_check_cache(
 /// Fetch from upstream using `fetch_path` for the URL but `cache_path` for
 /// the proxy cache key. This lets callers store content under a predictable
 /// local path even when the upstream download URL varies between requests.
-///
-/// `location` MUST be the real `StorageLocation` of the caller's repository
-/// — see [`proxy_fetch`] for why.
 pub async fn proxy_fetch_with_cache_key(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
-    location: &StorageLocation,
     upstream_url: &str,
     fetch_path: &str,
     cache_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url, location);
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
 
     proxy_service
         .fetch_artifact_with_cache_path(&repo, fetch_path, cache_path)
@@ -275,19 +253,14 @@ pub async fn proxy_fetch_with_cache_key(
 /// Returns `(content, content_type, effective_url)`. The effective URL is the
 /// final URL after any redirects, which callers can use as a base for resolving
 /// relative URLs in the response body.
-///
-/// `location` is unused for the cache (this call bypasses it) but is taken
-/// here for signature symmetry with the other helpers and so future
-/// instrumentation can attribute the upstream call to the correct backend.
 pub async fn proxy_fetch_uncached(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
-    location: &StorageLocation,
     upstream_url: &str,
     path: &str,
 ) -> Result<(Bytes, Option<String>, String), Response> {
-    let repo = build_remote_repo(repo_id, repo_key, upstream_url, location);
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
 
     proxy_service
         .fetch_upstream_direct(&repo, path)
@@ -329,15 +302,8 @@ where
             if let (Some(proxy), Some(upstream_url)) =
                 (proxy_service, member.upstream_url.as_deref())
             {
-                if let Ok(result) = proxy_fetch(
-                    proxy,
-                    member.id,
-                    &member.key,
-                    &member.storage_location(),
-                    upstream_url,
-                    path,
-                )
-                .await
+                if let Ok(result) =
+                    proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await
                 {
                     return Ok(result);
                 }
@@ -389,16 +355,7 @@ where
             continue;
         };
 
-        match proxy_fetch(
-            proxy,
-            member.id,
-            &member.key,
-            &member.storage_location(),
-            upstream_url,
-            path,
-        )
-        .await
-        {
+        match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
             Ok((bytes, _content_type)) => match transform(bytes, member.key.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(_e) => {
@@ -460,16 +417,7 @@ where
             continue;
         };
 
-        match proxy_fetch(
-            proxy,
-            member.id,
-            &member.key,
-            &member.storage_location(),
-            upstream_url,
-            path,
-        )
-        .await
-        {
+        match proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await {
             Ok((bytes, _content_type)) => match extract(bytes, member.key.clone()).await {
                 Ok(data) => {
                     results.push((member.key.clone(), data));
@@ -622,20 +570,7 @@ pub async fn local_fetch_by_path_suffix(
 }
 
 /// Build a minimal `Repository` model for proxy operations.
-///
-/// The `location` MUST be the real `StorageLocation` of the caller's
-/// repository so that `ProxyService` resolves cache I/O to the same backend
-/// that download handlers read from. Earlier versions of this helper
-/// hardcoded `storage_backend: "filesystem", storage_path: ""`, which
-/// silently routed cache writes to a fresh filesystem backend rooted at the
-/// process cwd while reads went to the configured S3/R2 backend — that was
-/// the root cause of bug #1016.
-fn build_remote_repo(
-    id: Uuid,
-    key: &str,
-    upstream_url: &str,
-    location: &StorageLocation,
-) -> Repository {
+fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repository {
     Repository {
         id,
         key: key.to_string(),
@@ -643,8 +578,8 @@ fn build_remote_repo(
         description: None,
         format: RepositoryFormat::Generic,
         repo_type: RepositoryType::Remote,
-        storage_backend: location.backend.clone(),
-        storage_path: location.path.clone(),
+        storage_backend: "filesystem".to_string(),
+        storage_path: String::new(),
         upstream_url: Some(upstream_url.to_string()),
         is_public: false,
         quota_bytes: None,
@@ -738,34 +673,17 @@ mod tests {
 
     // ── build_remote_repo tests ──────────────────────────────────────
 
-    fn loc(backend: &str, path: &str) -> StorageLocation {
-        StorageLocation {
-            backend: backend.to_string(),
-            path: path.to_string(),
-        }
-    }
-
     #[test]
     fn test_build_remote_repo_sets_id() {
         let id = Uuid::new_v4();
-        let repo = build_remote_repo(
-            id,
-            "my-repo",
-            "https://upstream.example.com",
-            &loc("filesystem", "/data/my-repo"),
-        );
+        let repo = build_remote_repo(id, "my-repo", "https://upstream.example.com");
         assert_eq!(repo.id, id);
     }
 
     #[test]
     fn test_build_remote_repo_key_and_name_match() {
         let id = Uuid::new_v4();
-        let repo = build_remote_repo(
-            id,
-            "npm-remote",
-            "https://registry.npmjs.org",
-            &loc("filesystem", "/data/npm-remote"),
-        );
+        let repo = build_remote_repo(id, "npm-remote", "https://registry.npmjs.org");
         assert_eq!(repo.key, "npm-remote");
         assert_eq!(repo.name, "npm-remote");
     }
@@ -774,58 +692,37 @@ mod tests {
     fn test_build_remote_repo_upstream_url() {
         let id = Uuid::new_v4();
         let url = "https://pypi.org/simple/";
-        let repo = build_remote_repo(id, "pypi-proxy", url, &loc("s3-prod", "/proxies/pypi"));
+        let repo = build_remote_repo(id, "pypi-proxy", url);
         assert_eq!(repo.upstream_url, Some(url.to_string()));
     }
 
     #[test]
     fn test_build_remote_repo_type_is_remote() {
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            "r",
-            "https://x.com",
-            &loc("filesystem", "/data/r"),
-        );
+        let repo = build_remote_repo(Uuid::new_v4(), "r", "https://x.com");
         assert_eq!(repo.repo_type, RepositoryType::Remote);
     }
 
     #[test]
     fn test_build_remote_repo_format_is_generic() {
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            "r",
-            "https://x.com",
-            &loc("filesystem", "/data/r"),
-        );
+        let repo = build_remote_repo(Uuid::new_v4(), "r", "https://x.com");
         assert_eq!(repo.format, RepositoryFormat::Generic);
     }
 
-    /// Bug #1016 regression: `build_remote_repo` MUST forward the caller's
-    /// real `StorageLocation` so the proxy resolves cache I/O to the same
-    /// backend that handlers read from. Earlier versions hardcoded
-    /// `"filesystem", ""` here, which routed cache writes to a fresh
-    /// filesystem backend rooted at cwd while reads went to the real S3/R2
-    /// backend.
     #[test]
-    fn test_build_remote_repo_propagates_storage_location_for_bug_1016() {
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            "debian-proxy",
-            "https://deb.example.com",
-            &loc("s3-prod", "/proxies/debian"),
-        );
-        assert_eq!(repo.storage_backend, "s3-prod");
-        assert_eq!(repo.storage_path, "/proxies/debian");
+    fn test_build_remote_repo_storage_backend_filesystem() {
+        let repo = build_remote_repo(Uuid::new_v4(), "r", "https://x.com");
+        assert_eq!(repo.storage_backend, "filesystem");
+    }
+
+    #[test]
+    fn test_build_remote_repo_storage_path_empty() {
+        let repo = build_remote_repo(Uuid::new_v4(), "r", "https://x.com");
+        assert!(repo.storage_path.is_empty());
     }
 
     #[test]
     fn test_build_remote_repo_defaults() {
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            "k",
-            "https://u.com",
-            &loc("filesystem", "/data/k"),
-        );
+        let repo = build_remote_repo(Uuid::new_v4(), "k", "https://u.com");
         assert!(repo.description.is_none());
         assert!(!repo.is_public);
         assert!(repo.quota_bytes.is_none());
@@ -837,12 +734,7 @@ mod tests {
     #[test]
     fn test_build_remote_repo_timestamps_set() {
         let before = Utc::now();
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            "k",
-            "https://u.com",
-            &loc("filesystem", "/data/k"),
-        );
+        let repo = build_remote_repo(Uuid::new_v4(), "k", "https://u.com");
         let after = Utc::now();
         assert!(repo.created_at >= before && repo.created_at <= after);
         assert!(repo.updated_at >= before && repo.updated_at <= after);
@@ -1000,12 +892,7 @@ mod tests {
     #[test]
     fn test_build_remote_repo_fields() {
         let id = uuid::Uuid::new_v4();
-        let location = StorageLocation {
-            backend: "filesystem".to_string(),
-            path: "/data/test-repo".to_string(),
-        };
-        let repo =
-            super::build_remote_repo(id, "test-repo", "https://upstream.example.com", &location);
+        let repo = super::build_remote_repo(id, "test-repo", "https://upstream.example.com");
         assert_eq!(repo.id, id);
         assert_eq!(repo.key, "test-repo");
         assert_eq!(
@@ -1021,11 +908,7 @@ mod tests {
     #[test]
     fn test_build_remote_repo_always_remote_type() {
         let id = uuid::Uuid::new_v4();
-        let location = StorageLocation {
-            backend: "filesystem".to_string(),
-            path: "/data/any-key".to_string(),
-        };
-        let repo = super::build_remote_repo(id, "any-key", "https://example.com", &location);
+        let repo = super::build_remote_repo(id, "any-key", "https://example.com");
         assert_eq!(
             repo.repo_type,
             crate::models::repository::RepositoryType::Remote
@@ -1052,643 +935,5 @@ mod tests {
     #[test]
     fn test_reject_write_virtual_rejected() {
         assert!(super::reject_write_if_not_hosted("virtual").is_err());
-    }
-
-    // =======================================================================
-    // Bug #1016 regression: full handler-to-cache routing
-    //
-    // The earlier fix (`#1016` initial) routed cache I/O through the per-repo
-    // backend inside `ProxyService` — but every format handler called
-    // `proxy_helpers::proxy_fetch` which internally synthesized a `Repository`
-    // with `storage_backend: "filesystem", storage_path: ""`. That synthetic
-    // repo caused `per_repo_storage` to resolve to a fresh filesystem backend
-    // rooted at the process cwd, NOT the configured S3/R2 backend that
-    // download handlers read from. Result: writer wrote to filesystem, reader
-    // read from S3, second download → NoSuchKey → 500.
-    //
-    // The fix below: helpers take an explicit `&StorageLocation` from the
-    // caller so the synthesized repo carries the real backend. The test pins
-    // the contract by:
-    //   1. Building a `ProxyService` with a `StorageRegistry` that maps a
-    //      named per-repo backend ("s3-test").
-    //   2. Pre-seeding that backend with cache content + metadata under the
-    //      production cache-key shape.
-    //   3. Calling `proxy_check_cache` through the helper with a
-    //      `StorageLocation { backend: "s3-test", path: "/data/debian" }`.
-    //   4. Asserting the cache hit returns the seeded bytes — proving the
-    //      helper threaded the location all the way through to the registry.
-    //
-    // If the helper ever regresses to a synthetic `"filesystem"`/`""`
-    // location, this test fails because the registry lookup will resolve a
-    // different backend than the one that holds the seeded content.
-    // =======================================================================
-
-    use crate::error::Result as AkResult;
-    use crate::services::proxy_service::{CacheMetadata, ProxyService};
-    use crate::services::storage_service::{FilesystemBackend, StorageService};
-    use crate::storage::{StorageBackend as RepoStorageBackend, StorageRegistry};
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use chrono::Utc;
-    use sqlx::PgPool;
-    use std::collections::HashMap as StdHashMap;
-    use std::sync::{Arc, Mutex};
-
-    /// In-memory `StorageBackend` for routing tests.
-    struct MockBackend {
-        store: Mutex<StdHashMap<String, Bytes>>,
-    }
-
-    impl MockBackend {
-        fn new() -> Self {
-            Self {
-                store: Mutex::new(StdHashMap::new()),
-            }
-        }
-
-        fn insert(&self, key: &str, content: Bytes) {
-            self.store.lock().unwrap().insert(key.to_string(), content);
-        }
-    }
-
-    #[async_trait]
-    impl RepoStorageBackend for MockBackend {
-        async fn put(&self, key: &str, content: Bytes) -> AkResult<()> {
-            self.store.lock().unwrap().insert(key.to_string(), content);
-            Ok(())
-        }
-        async fn get(&self, key: &str) -> AkResult<Bytes> {
-            self.store
-                .lock()
-                .unwrap()
-                .get(key)
-                .cloned()
-                .ok_or_else(|| crate::error::AppError::NotFound(format!("not found: {}", key)))
-        }
-        async fn exists(&self, key: &str) -> AkResult<bool> {
-            Ok(self.store.lock().unwrap().contains_key(key))
-        }
-        async fn delete(&self, key: &str) -> AkResult<()> {
-            self.store.lock().unwrap().remove(key);
-            Ok(())
-        }
-    }
-
-    /// Bug #1016 full-path regression: when a handler calls
-    /// `proxy_helpers::proxy_check_cache` with the real
-    /// `StorageLocation` from its `Repository`, the lookup MUST route
-    /// through the registry-resolved per-repo backend that holds cached
-    /// content. If the helper synthesizes a `"filesystem"`/`""` location
-    /// (the original bug), the registry resolves a different backend and
-    /// the seeded content is invisible — second download 500s.
-    #[tokio::test]
-    async fn test_proxy_check_cache_routes_through_per_repo_backend_for_bug_1016() {
-        // 1. Stand up a per-repo backend identified as "s3-test" in the
-        //    registry. This stands in for a real S3-backed Debian proxy repo.
-        let per_repo_backend: Arc<MockBackend> = Arc::new(MockBackend::new());
-        let mut backends: StdHashMap<String, Arc<dyn RepoStorageBackend>> = StdHashMap::new();
-        backends.insert("s3-test".to_string(), per_repo_backend.clone());
-        let registry = Arc::new(StorageRegistry::new(backends, "s3-test".to_string()));
-
-        // 2. Pre-seed the per-repo backend with cache content + metadata
-        //    under the production cache-key shape. This simulates a
-        //    previously-cached artifact that handlers would fetch on a
-        //    second download.
-        let repo_key = "debian-proxy";
-        let cache_path = "pool/main/p/php7.4/php7.4_test.deb";
-        let payload = Bytes::from_static(b"<deb file body>");
-        let storage_key = ProxyService::cache_storage_key(repo_key, cache_path);
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, cache_path);
-
-        let metadata = CacheMetadata {
-            cached_at: Utc::now(),
-            upstream_etag: None,
-            expires_at: Utc::now() + chrono::Duration::hours(1),
-            content_type: Some("application/vnd.debian.binary-package".to_string()),
-            size_bytes: payload.len() as i64,
-            checksum_sha256: StorageService::calculate_hash(&payload),
-        };
-        per_repo_backend.insert(&storage_key, payload.clone());
-        per_repo_backend.insert(
-            &metadata_key,
-            Bytes::from(serde_json::to_vec(&metadata).unwrap()),
-        );
-
-        // 3. Build a ProxyService wired to that registry. The global storage
-        //    is a throwaway filesystem backend in /tmp so a regression that
-        //    silently falls back to global storage would NOT find the seeded
-        //    bytes (which only exist on the per-repo mock backend).
-        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none")
-            .expect("connect_lazy never fails for a syntactically valid URL");
-        let global_backend: Arc<dyn crate::services::storage_service::StorageBackend> = Arc::new(
-            FilesystemBackend::new(std::path::PathBuf::from("/tmp/ak-helpers-test-global-only")),
-        );
-        let global_storage = Arc::new(StorageService::new(global_backend));
-        let config = crate::config::Config::default();
-        let proxy =
-            ProxyService::new(pool, global_storage, &config).with_storage_registry(registry);
-
-        // 4. Call the helper with the REAL storage location of the repo
-        //    (matches `repo.storage_location()` in the handler).
-        let location = StorageLocation {
-            backend: "s3-test".to_string(),
-            path: "/data/debian".to_string(),
-        };
-        let result = super::proxy_check_cache(
-            &proxy,
-            Uuid::new_v4(),
-            repo_key,
-            &location,
-            "https://deb.example.com",
-            cache_path,
-        )
-        .await;
-
-        // 5. The seeded bytes must be returned — proving the helper threaded
-        //    the StorageLocation through to the registry-resolved per-repo
-        //    backend. With the pre-fix synthetic location ("filesystem"/""),
-        //    the registry would resolve a different backend and this would
-        //    return None (cache miss), reproducing bug #1016 in the helper
-        //    layer.
-        let (content, content_type) = result.expect(
-            "expected cache hit on the per-repo backend; if this is None, the helper is \
-             routing through the wrong storage location (bug #1016)",
-        );
-        assert_eq!(content, payload);
-        assert_eq!(
-            content_type.as_deref(),
-            Some("application/vnd.debian.binary-package")
-        );
-    }
-
-    /// Bug #1016 negative test: when the helper is called with a
-    /// `StorageLocation` whose `backend` is NOT registered in the
-    /// `StorageRegistry`, the per-repo lookup falls back to global storage
-    /// (which is empty in this test), producing a cache miss. This pins the
-    /// other half of the contract: the helper does not silently coerce an
-    /// unknown location into the registry's default backend.
-    #[tokio::test]
-    async fn test_proxy_check_cache_misses_when_location_does_not_match_seeded_backend() {
-        let per_repo_backend: Arc<MockBackend> = Arc::new(MockBackend::new());
-        let mut backends: StdHashMap<String, Arc<dyn RepoStorageBackend>> = StdHashMap::new();
-        backends.insert("s3-test".to_string(), per_repo_backend.clone());
-        let registry = Arc::new(StorageRegistry::new(backends, "s3-test".to_string()));
-
-        let repo_key = "debian-proxy";
-        let cache_path = "pool/main/p/php7.4/php7.4_test.deb";
-        let payload = Bytes::from_static(b"<deb file body>");
-        let storage_key = ProxyService::cache_storage_key(repo_key, cache_path);
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, cache_path);
-        let metadata = CacheMetadata {
-            cached_at: Utc::now(),
-            upstream_etag: None,
-            expires_at: Utc::now() + chrono::Duration::hours(1),
-            content_type: Some("application/octet-stream".to_string()),
-            size_bytes: payload.len() as i64,
-            checksum_sha256: StorageService::calculate_hash(&payload),
-        };
-        per_repo_backend.insert(&storage_key, payload.clone());
-        per_repo_backend.insert(
-            &metadata_key,
-            Bytes::from(serde_json::to_vec(&metadata).unwrap()),
-        );
-
-        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none").unwrap();
-        let global_backend: Arc<dyn crate::services::storage_service::StorageBackend> =
-            Arc::new(FilesystemBackend::new(std::path::PathBuf::from(
-                "/tmp/ak-helpers-test-global-only-2",
-            )));
-        let global_storage = Arc::new(StorageService::new(global_backend));
-        let config = crate::config::Config::default();
-        let proxy =
-            ProxyService::new(pool, global_storage, &config).with_storage_registry(registry);
-
-        // Caller passes a location whose backend is NOT registered. The
-        // registry's `backend_for` should fail to resolve, the proxy should
-        // fall back to global storage, and the global storage has no seeded
-        // content => miss.
-        let bad_location = StorageLocation {
-            backend: "wrong-backend".to_string(),
-            path: "/data/debian".to_string(),
-        };
-        let result = super::proxy_check_cache(
-            &proxy,
-            Uuid::new_v4(),
-            repo_key,
-            &bad_location,
-            "https://deb.example.com",
-            cache_path,
-        )
-        .await;
-
-        assert!(
-            result.is_none(),
-            "expected cache miss when the location's backend is not in the registry; \
-             got a hit, which means the helper is silently coercing the location"
-        );
-    }
-
-    // =======================================================================
-    // Helper-level coverage for `proxy_fetch`, `proxy_fetch_with_cache_key`,
-    // and `proxy_fetch_uncached`.
-    //
-    // These helpers all thread `&StorageLocation` into a synthesized
-    // `Repository` and forward to a `ProxyService` method. The cache-hit
-    // tests below pre-seed the per-repo backend so the helpers short-circuit
-    // before any HTTP traffic, exercising:
-    //
-    //   * the helper body (build_remote_repo + ProxyService dispatch),
-    //   * the registry-resolved cache-hit fast path inside ProxyService,
-    //   * the MockBackend's full `RepoStorageBackend` surface (put/get/delete
-    //     get used across these tests).
-    //
-    // Validation-error tests exercise the early-return branches without
-    // needing a live upstream.
-    // =======================================================================
-
-    /// Build a `(MockBackend, ProxyService, repo_key, location)` tuple
-    /// pre-seeded with one cache entry. Reused by the cache-hit tests so
-    /// each helper doesn't re-derive the same scaffolding.
-    async fn make_seeded_proxy(
-        repo_key: &str,
-        cache_path: &str,
-        payload: Bytes,
-        content_type: &str,
-    ) -> (Arc<MockBackend>, ProxyService, StorageLocation) {
-        let per_repo: Arc<MockBackend> = Arc::new(MockBackend::new());
-        let mut backends: StdHashMap<String, Arc<dyn RepoStorageBackend>> = StdHashMap::new();
-        backends.insert("s3-helper".to_string(), per_repo.clone());
-        let registry = Arc::new(StorageRegistry::new(backends, "s3-helper".to_string()));
-
-        let storage_key = ProxyService::cache_storage_key(repo_key, cache_path);
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, cache_path);
-        let metadata = CacheMetadata {
-            cached_at: Utc::now(),
-            upstream_etag: None,
-            expires_at: Utc::now() + chrono::Duration::hours(1),
-            content_type: Some(content_type.to_string()),
-            size_bytes: payload.len() as i64,
-            checksum_sha256: StorageService::calculate_hash(&payload),
-        };
-        // Use `MockBackend::put` via the `RepoStorageBackend` trait so the
-        // trait `put` is exercised by these tests (covers the put body).
-        let backend_dyn: Arc<dyn RepoStorageBackend> = per_repo.clone();
-        backend_dyn.put(&storage_key, payload).await.unwrap();
-        backend_dyn
-            .put(
-                &metadata_key,
-                Bytes::from(serde_json::to_vec(&metadata).unwrap()),
-            )
-            .await
-            .unwrap();
-
-        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none").unwrap();
-        let global_backend: Arc<dyn crate::services::storage_service::StorageBackend> =
-            Arc::new(FilesystemBackend::new(std::path::PathBuf::from(
-                "/tmp/ak-helpers-test-global-helper",
-            )));
-        let global_storage = Arc::new(StorageService::new(global_backend));
-        let config = crate::config::Config::default();
-        let proxy =
-            ProxyService::new(pool, global_storage, &config).with_storage_registry(registry);
-        let location = StorageLocation {
-            backend: "s3-helper".to_string(),
-            path: "/data/helper".to_string(),
-        };
-        (per_repo, proxy, location)
-    }
-
-    /// `proxy_fetch` MUST route the cache-hit lookup through the same
-    /// per-repo backend as `proxy_check_cache`. With the cache pre-seeded
-    /// on the registry-resolved backend, the helper returns the cached
-    /// bytes without contacting upstream — proving the helper threads the
-    /// real `StorageLocation` into `ProxyService::fetch_artifact`.
-    #[tokio::test]
-    async fn test_proxy_fetch_returns_cached_bytes_without_upstream() {
-        let repo_key = "debian-proxy";
-        let cache_path = "pool/main/p/php7.4/php7.4_test.deb";
-        let payload = Bytes::from_static(b"<deb file body>");
-        let (per_repo, proxy, location) =
-            make_seeded_proxy(repo_key, cache_path, payload.clone(), "application/x-deb").await;
-
-        let (content, content_type) = super::proxy_fetch(
-            &proxy,
-            Uuid::new_v4(),
-            repo_key,
-            &location,
-            "https://deb.example.com",
-            cache_path,
-        )
-        .await
-        .expect(
-            "expected cache hit on the per-repo backend; if this errors, the helper is \
-             routing through the wrong storage location (bug #1016)",
-        );
-
-        assert_eq!(content, payload);
-        assert_eq!(content_type.as_deref(), Some("application/x-deb"));
-        // Sanity: the seeded keys are still on the per-repo backend.
-        assert!(per_repo
-            .store
-            .lock()
-            .unwrap()
-            .contains_key(&ProxyService::cache_storage_key(repo_key, cache_path)));
-    }
-
-    /// `proxy_fetch_with_cache_key` lets callers separate the upstream
-    /// fetch path from the cache lookup path (e.g., PyPI resolves a file
-    /// URL on a different domain but caches under `simple/{name}/{file}`).
-    /// When the cache is seeded under `cache_path`, the helper must hit
-    /// it and short-circuit, exercising both the helper body and the
-    /// `fetch_artifact_with_cache_path` cache-hit branch.
-    #[tokio::test]
-    async fn test_proxy_fetch_with_cache_key_returns_cached_bytes() {
-        let repo_key = "pypi-proxy";
-        // cache_path differs from fetch_path: this is the whole point of
-        // the helper.
-        let cache_path = "simple/requests/requests-2.31.0.tar.gz";
-        let fetch_path = "packages/source/r/requests/requests-2.31.0.tar.gz";
-        let payload = Bytes::from_static(b"<tar.gz body>");
-        let (_per_repo, proxy, location) =
-            make_seeded_proxy(repo_key, cache_path, payload.clone(), "application/gzip").await;
-
-        let (content, content_type) = super::proxy_fetch_with_cache_key(
-            &proxy,
-            Uuid::new_v4(),
-            repo_key,
-            &location,
-            "https://pypi.example.com",
-            fetch_path,
-            cache_path,
-        )
-        .await
-        .expect(
-            "expected cache hit when cache_path matches the seeded entry; \
-             if this errors, the helper is not threading the location through to \
-             fetch_artifact_with_cache_path's cache-hit branch",
-        );
-
-        assert_eq!(content, payload);
-        assert_eq!(content_type.as_deref(), Some("application/gzip"));
-    }
-
-    /// `proxy_fetch_uncached` always bypasses the cache, so we cannot
-    /// exercise it via a cache-hit fixture. Instead, pin the early-return
-    /// validation branches in the underlying `fetch_upstream_direct`: a
-    /// repo that lies about being Remote must fail with a Validation error
-    /// (the helper never builds the upstream URL or makes a network call).
-    /// This covers the helper body lines plus the underlying validation
-    /// branch in ProxyService.
-    #[tokio::test]
-    async fn test_proxy_fetch_uncached_rejects_when_underlying_repo_not_remote() {
-        // Build a normal seeded proxy (we don't actually use the cache here),
-        // then call `fetch_upstream_direct` directly with a non-Remote repo
-        // to drive the validation branch.
-        let (_per_repo, proxy, _location) = make_seeded_proxy(
-            "any",
-            "anything",
-            Bytes::from_static(b"x"),
-            "application/octet-stream",
-        )
-        .await;
-
-        let mut local_repo = build_remote_repo(
-            Uuid::new_v4(),
-            "local-repo",
-            "https://upstream.example.com",
-            &StorageLocation {
-                backend: "s3-helper".to_string(),
-                path: "/data/helper".to_string(),
-            },
-        );
-        local_repo.repo_type = RepositoryType::Local;
-
-        let err = proxy
-            .fetch_upstream_direct(&local_repo, "some/path")
-            .await
-            .expect_err("non-Remote repo must fail validation in fetch_upstream_direct");
-        let msg = format!("{}", err);
-        assert!(
-            msg.contains("only supported for remote repositories"),
-            "unexpected error: {}",
-            msg
-        );
-    }
-
-    /// `invalidate_cache` MUST delete cache content + metadata from the
-    /// per-repo backend (the same backend that handlers read from). With a
-    /// real `StorageLocation` and a registry, both keys vanish from the
-    /// mock backend, exercising `cache_delete` (private) through the
-    /// per-repo branch.
-    #[tokio::test]
-    async fn test_invalidate_cache_removes_entries_from_per_repo_backend() {
-        let repo_key = "debian-proxy";
-        let cache_path = "pool/main/p/php7.4/php7.4_test.deb";
-        let payload = Bytes::from_static(b"<deb file body>");
-        let (per_repo, proxy, location) =
-            make_seeded_proxy(repo_key, cache_path, payload.clone(), "application/x-deb").await;
-
-        let storage_key = ProxyService::cache_storage_key(repo_key, cache_path);
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, cache_path);
-        // Pre-condition: both keys present.
-        assert!(per_repo.store.lock().unwrap().contains_key(&storage_key));
-        assert!(per_repo.store.lock().unwrap().contains_key(&metadata_key));
-
-        // Use `build_remote_repo` directly so the call mirrors what the
-        // helpers construct.
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            repo_key,
-            "https://deb.example.com",
-            &location,
-        );
-        proxy
-            .invalidate_cache(&repo, cache_path)
-            .await
-            .expect("invalidate_cache must succeed");
-
-        // Post-condition: both keys gone from the per-repo backend.
-        let store = per_repo.store.lock().unwrap();
-        assert!(
-            !store.contains_key(&storage_key),
-            "content key should be removed from the per-repo backend"
-        );
-        assert!(
-            !store.contains_key(&metadata_key),
-            "metadata key should be removed from the per-repo backend"
-        );
-    }
-
-    /// `check_upstream` returns `false` (no fetch needed) when valid,
-    /// non-expired metadata exists on the per-repo backend AND the cached
-    /// metadata has no ETag (TTL-only path). This exercises lines around
-    /// the `per_repo_storage` resolution + `load_cache_metadata` happy
-    /// path inside `check_upstream`.
-    #[tokio::test]
-    async fn test_check_upstream_returns_false_for_fresh_cached_metadata() {
-        let repo_key = "debian-proxy";
-        let cache_path = "pool/main/p/php7.4/php7.4_test.deb";
-        let payload = Bytes::from_static(b"<deb file body>");
-        let (_per_repo, proxy, location) =
-            make_seeded_proxy(repo_key, cache_path, payload, "application/x-deb").await;
-
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            repo_key,
-            "https://deb.example.com",
-            &location,
-        );
-
-        let needs_fetch = proxy
-            .check_upstream(&repo, cache_path)
-            .await
-            .expect("check_upstream must succeed when metadata exists and is non-expired");
-        assert!(
-            !needs_fetch,
-            "fresh cached metadata with no ETag should NOT require a re-fetch"
-        );
-    }
-
-    /// `check_upstream` returns `true` (must fetch) when no cache metadata
-    /// exists at all — exercises the `None => return Ok(true)` branch.
-    #[tokio::test]
-    async fn test_check_upstream_returns_true_when_cache_missing() {
-        let repo_key = "debian-proxy";
-        let unseeded_path = "pool/main/never/cached.deb";
-        let (_per_repo, proxy, location) = make_seeded_proxy(
-            repo_key,
-            "some/other/path",
-            Bytes::from_static(b"x"),
-            "application/octet-stream",
-        )
-        .await;
-
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            repo_key,
-            "https://deb.example.com",
-            &location,
-        );
-
-        let needs_fetch = proxy
-            .check_upstream(&repo, unseeded_path)
-            .await
-            .expect("check_upstream must succeed when no cache metadata is found");
-        assert!(
-            needs_fetch,
-            "missing cache metadata should require a fresh upstream fetch"
-        );
-    }
-
-    /// `check_upstream` rejects non-Remote repos with a Validation error,
-    /// independent of any cache state. Pins the early-return branch.
-    #[tokio::test]
-    async fn test_check_upstream_rejects_non_remote_repo() {
-        let (_per_repo, proxy, location) = make_seeded_proxy(
-            "any",
-            "anything",
-            Bytes::from_static(b"x"),
-            "application/octet-stream",
-        )
-        .await;
-        let mut repo = build_remote_repo(
-            Uuid::new_v4(),
-            "local-repo",
-            "https://upstream.example.com",
-            &location,
-        );
-        repo.repo_type = RepositoryType::Local;
-
-        let err = proxy
-            .check_upstream(&repo, "some/path")
-            .await
-            .expect_err("non-Remote repo must fail validation in check_upstream");
-        assert!(
-            format!("{}", err).contains("only supported for remote repositories"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    /// `get_cached_artifact_by_path` is the legacy global-storage cache
-    /// lookup (no `Repository` in scope). It should miss when the cache is
-    /// only seeded on the per-repo backend, since it intentionally doesn't
-    /// route through the registry. This pins the back-compat surface so a
-    /// future refactor doesn't silently merge it with the per-repo path.
-    #[tokio::test]
-    async fn test_get_cached_artifact_by_path_does_not_see_per_repo_only_seeds() {
-        let repo_key = "debian-proxy";
-        let cache_path = "pool/main/p/php7.4/php7.4_test.deb";
-        let payload = Bytes::from_static(b"<deb file body>");
-        let (_per_repo, proxy, _location) =
-            make_seeded_proxy(repo_key, cache_path, payload, "application/x-deb").await;
-
-        // This call uses the global StorageService (a throwaway /tmp
-        // FilesystemBackend in `make_seeded_proxy`), so the per-repo seed
-        // is invisible: must return Ok(None).
-        let result = proxy
-            .get_cached_artifact_by_path(repo_key, cache_path)
-            .await
-            .expect("get_cached_artifact_by_path must not error on a clean global backend");
-        assert!(
-            result.is_none(),
-            "legacy by-path lookup must NOT resolve through the per-repo backend; \
-             a Some result here would mean the back-compat path silently uses the registry"
-        );
-    }
-
-    /// `invalidate_cache` MUST also work when no registry is configured
-    /// (legacy back-compat path). With `per_repo_storage` returning None,
-    /// the call falls back to the global `StorageService` for both
-    /// `cache_delete` invocations. Pinning this exercises the else-branch
-    /// of `cache_delete` (private) without needing a registry.
-    #[tokio::test]
-    async fn test_invalidate_cache_falls_back_to_global_storage_without_registry() {
-        let pool = PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/none").unwrap();
-        let global_backend: Arc<dyn crate::services::storage_service::StorageBackend> =
-            Arc::new(FilesystemBackend::new(std::path::PathBuf::from(
-                "/tmp/ak-helpers-invalidate-fallback",
-            )));
-        let global_storage = Arc::new(StorageService::new(global_backend));
-        let config = crate::config::Config::default();
-        // No `with_storage_registry` call: per_repo_storage returns None.
-        let proxy = ProxyService::new(pool, global_storage, &config);
-
-        let location = StorageLocation {
-            backend: "filesystem".to_string(),
-            path: "/tmp/whatever".to_string(),
-        };
-        let repo = build_remote_repo(
-            Uuid::new_v4(),
-            "no-registry-repo",
-            "https://upstream.example.com",
-            &location,
-        );
-
-        // The cache entries don't exist on the FS backend; `cache_delete`
-        // tolerates NotFound. This is success-on-no-op semantics, exactly
-        // what `invalidate_cache` swallows via `let _ = ...`.
-        proxy
-            .invalidate_cache(&repo, "any/path/that/does/not/exist")
-            .await
-            .expect("invalidate_cache must succeed even when keys are absent");
-    }
-
-    /// Direct exercise of the MockBackend's `delete` and `exists` impls.
-    /// Without this, those trait methods are only reachable in tests that
-    /// don't actually call them, leaving them as uncovered new lines.
-    #[tokio::test]
-    async fn test_mock_backend_delete_and_exists_round_trip() {
-        let backend: Arc<dyn RepoStorageBackend> = Arc::new(MockBackend::new());
-        backend
-            .put("k", Bytes::from_static(b"v"))
-            .await
-            .expect("put");
-        assert!(backend.exists("k").await.expect("exists ok"));
-        backend.delete("k").await.expect("delete ok");
-        assert!(
-            !backend.exists("k").await.expect("exists after delete ok"),
-            "key should be gone after delete"
-        );
     }
 }

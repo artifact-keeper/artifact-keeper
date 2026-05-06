@@ -192,7 +192,6 @@ async fn download_pod(
                         proxy,
                         repo.id,
                         &repo_key,
-                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )

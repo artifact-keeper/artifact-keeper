@@ -99,7 +99,6 @@ async fn package_info(
                     proxy,
                     repo.id,
                     &repo_key,
-                    &repo.storage_location(),
                     upstream_url,
                     &upstream_path,
                 )
@@ -223,7 +222,6 @@ async fn download_tarball(
                         proxy,
                         repo.id,
                         &repo_key,
-                        &repo.storage_location(),
                         upstream_url,
                         &upstream_path,
                     )
@@ -524,15 +522,9 @@ async fn list_names(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) = proxy_helpers::proxy_fetch(
-                proxy,
-                repo.id,
-                &repo_key,
-                &repo.storage_location(),
-                upstream_url,
-                "names",
-            )
-            .await?;
+            let (content, content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "names")
+                    .await?;
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(
@@ -601,15 +593,9 @@ async fn list_versions(
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, content_type) = proxy_helpers::proxy_fetch(
-                proxy,
-                repo.id,
-                &repo_key,
-                &repo.storage_location(),
-                upstream_url,
-                "versions",
-            )
-            .await?;
+            let (content, content_type) =
+                proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, "versions")
+                    .await?;
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(

@@ -129,16 +129,10 @@ async fn resolve_upstream_dl_url(
 
     // Fetch config.json from upstream.
     let proxy = state.proxy_service.as_ref()?;
-    let config_bytes = proxy_helpers::proxy_fetch(
-        proxy,
-        repo.id,
-        repo_key,
-        &repo.storage_location(),
-        base_url,
-        "config.json",
-    )
-    .await
-    .ok()?;
+    let config_bytes =
+        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, "config.json")
+            .await
+            .ok()?;
 
     let config: serde_json::Value = serde_json::from_slice(&config_bytes.0).ok()?;
     let dl_url = config.get("dl")?.as_str()?.to_string();
@@ -820,7 +814,6 @@ async fn download(
                         proxy,
                         repo.id,
                         &repo_key,
-                        &repo.storage_location(),
                         &dl_base,
                         &dl_path,
                         &cache_path,
@@ -1071,15 +1064,7 @@ async fn try_remote_index(
 
     let base_url = repo.index_upstream_url.as_deref().unwrap_or(upstream_url);
     let index_path = cargo_sparse_index_path_upstream(name_lower);
-    let result = proxy_helpers::proxy_fetch(
-        proxy,
-        repo.id,
-        repo_key,
-        &repo.storage_location(),
-        base_url,
-        &index_path,
-    )
-    .await;
+    let result = proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, base_url, &index_path).await;
 
     Some(result.map(|(content, content_type)| {
         index_cache_set(index_cache, cache_key.to_string(), content.clone());
@@ -1196,7 +1181,6 @@ async fn try_virtual_index(
                     proxy,
                     member.id,
                     &member.key,
-                    &member.storage_location(),
                     &base_url,
                     &index_path,
                 )
