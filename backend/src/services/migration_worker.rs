@@ -226,7 +226,10 @@ impl MigrationWorker {
             total_failed += 1;
         }
 
-        let mut repos_to_process: Vec<String> = Vec::with_capacity(plan.resolved.len());
+        // (target_key, package_type) — package_type is threaded into
+        // process_repository_artifacts so the INSERT can populate name+version
+        // using format-aware filename parsing (see artifact_metadata module).
+        let mut repos_to_process: Vec<(String, String)> = Vec::with_capacity(plan.resolved.len());
         for migration_config in plan.resolved {
             // Skip if a repo with the same key already exists with a
             // compatible type+format; recreate would be ambiguous and
@@ -297,11 +300,11 @@ impl MigrationWorker {
                 }
             }
 
-            repos_to_process.push(migration_config.target_key);
+            repos_to_process.push((migration_config.target_key, migration_config.package_type));
         }
 
         // Process each repository
-        for repo_key in &repos_to_process {
+        for (repo_key, package_type) in &repos_to_process {
             // Check for pause/cancel
             if self.cancel_token.is_cancelled() {
                 tracing::info!(job_id = %job_id, "Migration cancelled by user");
@@ -321,6 +324,7 @@ impl MigrationWorker {
                         job_id,
                         client.clone(),
                         repo_key,
+                        package_type,
                         conflict_resolution,
                         include_metadata,
                         &mut total_completed,
@@ -388,6 +392,7 @@ impl MigrationWorker {
         job_id: Uuid,
         client: Arc<dyn SourceRegistry>,
         repo_key: &str,
+        package_type: &str,
         conflict_resolution: ConflictResolution,
         include_metadata: bool,
         completed: &mut i32,
@@ -465,6 +470,7 @@ impl MigrationWorker {
                     item_id,
                     client.clone(),
                     repo_key,
+                    package_type,
                     &artifact_path,
                     &source_path,
                     size,
@@ -551,6 +557,7 @@ impl MigrationWorker {
         item_id: Uuid,
         client: Arc<dyn SourceRegistry>,
         repo_key: &str,
+        package_type: &str,
         artifact_path: &str,
         source_path: &str,
         size: i64,
@@ -580,7 +587,13 @@ impl MigrationWorker {
         }
 
         match self
-            .transfer_artifact(client, repo_key, artifact_path, include_metadata)
+            .transfer_artifact(
+                client,
+                repo_key,
+                package_type,
+                artifact_path,
+                include_metadata,
+            )
             .await
         {
             Ok(transfer_result) => {
@@ -757,6 +770,7 @@ impl MigrationWorker {
         &self,
         client: Arc<dyn SourceRegistry>,
         repo_key: &str,
+        package_type: &str,
         artifact_path: &str,
         include_metadata: bool,
     ) -> Result<TransferResult, MigrationError> {
@@ -801,18 +815,33 @@ impl MigrationWorker {
                     .await?;
 
             if let Some((repository_id,)) = repo_id {
-                let name = extract_name_from_path(artifact_path);
+                // Format-aware name + version. extract_name_from_path returns
+                // the filename, which is what Artifact Keeper stored prior to
+                // this fix — leaving `name` set to the full filename and
+                // `version` NULL. That broke per-format index endpoints
+                // (PyPI simple/, Helm index.yaml, npm metadata) since those
+                // group by canonical package name and require a version.
+                // parse_name_and_version uses the destination repo's package
+                // type to choose the right parser; unknown formats fall back
+                // to the legacy filename-as-name behaviour with NULL version.
+                let filename = extract_name_from_path(artifact_path);
+                let parsed = crate::services::artifact_metadata::parse_name_and_version(
+                    package_type,
+                    filename,
+                    artifact_path,
+                );
                 let path_str = format!("{}/{}", repo_key, artifact_path);
                 sqlx::query(
                     r#"
-                    INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, storage_key, content_type)
-                    VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream')
+                    INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, storage_key, content_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/octet-stream')
                     ON CONFLICT (repository_id, path) WHERE is_deleted = false DO NOTHING
                     "#,
                 )
                 .bind(repository_id)
                 .bind(&path_str)
-                .bind(name)
+                .bind(&parsed.name)
+                .bind(parsed.version.as_deref())
                 .bind(content_size as i64)
                 .bind(&sha256_hex)
                 .bind(&storage_key)
