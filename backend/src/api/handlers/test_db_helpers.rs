@@ -402,3 +402,44 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(&self.storage_dir);
     }
 }
+
+/// Build a [`crate::services::proxy_service::ProxyService`] backed by a
+/// filesystem cache at `storage_path`.
+///
+/// Pass a real `PgPool` from [`try_pool`] — `ProxyService::fetch_from_upstream`
+/// calls `load_upstream_auth` which queries the database before every HTTP
+/// request. A lazy/fake pool will cause that query to fail and the fetch to
+/// return BAD_GATEWAY.
+pub fn build_proxy_service_with_fs(
+    pool: PgPool,
+    storage_path: &str,
+) -> Arc<crate::services::proxy_service::ProxyService> {
+    use crate::services::storage_service::{FilesystemBackend, StorageService};
+    let backend = Arc::new(FilesystemBackend::new(std::path::PathBuf::from(
+        storage_path,
+    )));
+    Arc::new(crate::services::proxy_service::ProxyService::new(
+        pool,
+        Arc::new(StorageService::new(backend)),
+    ))
+}
+
+/// Build a [`SharedState`] that includes `proxy` as the proxy service.
+/// Accepts any `PgPool` so callers can supply a lazy/fake pool for tests
+/// that do not need a real database.
+pub fn build_state_with_proxy(
+    pool: PgPool,
+    storage_path: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+) -> crate::api::SharedState {
+    let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+        crate::storage::filesystem::FilesystemStorage::new(storage_path),
+    );
+    let registry = Arc::new(crate::storage::StorageRegistry::new(
+        std::collections::HashMap::new(),
+        "filesystem".to_string(),
+    ));
+    let mut state = crate::api::AppState::new(cfg(storage_path), pool, storage, registry);
+    state.set_proxy_service(proxy);
+    Arc::new(state)
+}

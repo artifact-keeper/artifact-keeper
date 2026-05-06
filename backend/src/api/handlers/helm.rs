@@ -874,4 +874,320 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         f.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // fetch_chart_via_index — wiremock-backed unit tests
+    // -----------------------------------------------------------------------
+
+    fn make_index_yaml(chart_name: &str, version: &str, url: &str) -> String {
+        format!(
+            r#"apiVersion: v1
+generated: "2024-01-01T00:00:00Z"
+entries:
+  {chart_name}:
+    - apiVersion: v2
+      name: {chart_name}
+      version: {version}
+      urls:
+        - {url}
+      created: "2024-01-01T00:00:00Z"
+      digest: abc123deadbeef
+"#
+        )
+    }
+
+    fn proxy_tmp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("helm-proxy-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    // Tests that make real HTTP calls need a live database pool because
+    // ProxyService::fetch_from_upstream calls load_upstream_auth which queries
+    // the DB. Tests that return before any HTTP call can use a fake lazy pool.
+
+    #[tokio::test]
+    async fn test_fetch_chart_via_index_success_relative_url() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+        let index_yaml = make_index_yaml("mychart", "1.0.0", "charts/mychart-1.0.0.tgz");
+        let chart_bytes: &[u8] = b"fake-chart-content";
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/mychart-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chart_bytes))
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = fetch_chart_via_index(
+            &proxy,
+            repo_id,
+            "helm-proxy",
+            &upstream_url,
+            "mychart",
+            "1.0.0",
+            "mychart-1.0.0.tgz",
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        match result {
+            Ok((bytes, _)) => assert_eq!(&bytes[..], chart_bytes),
+            Err(_) => panic!("fetch_chart_via_index should succeed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chart_via_index_success_absolute_url() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+        let abs_chart_url = format!("{}/charts/abs-chart-1.0.0.tgz", upstream_url);
+        let index_yaml = make_index_yaml("abs-chart", "1.0.0", &abs_chart_url);
+        let chart_bytes: &[u8] = b"absolute-url-chart";
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/abs-chart-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chart_bytes))
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = fetch_chart_via_index(
+            &proxy,
+            repo_id,
+            "helm-proxy-abs",
+            &upstream_url,
+            "abs-chart",
+            "1.0.0",
+            "abs-chart-1.0.0.tgz",
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        match result {
+            Ok((bytes, _)) => assert_eq!(&bytes[..], chart_bytes),
+            Err(_) => panic!("fetch_chart_via_index (absolute URL) should succeed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chart_via_index_chart_not_in_index() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+        let index_yaml = "apiVersion: v1\ngenerated: \"2024-01-01T00:00:00Z\"\nentries: {}\n";
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = fetch_chart_via_index(
+            &proxy,
+            repo_id,
+            "helm-proxy",
+            &upstream_url,
+            "nonexistent",
+            "9.9.9",
+            "nonexistent-9.9.9.tgz",
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        match result {
+            Err(resp) => assert_eq!(resp.status(), StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected NOT_FOUND for missing chart"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_chart_via_index_invalid_yaml() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"not_valid_helm_index: [unclosed"),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool, tmp.to_str().unwrap());
+        let repo_id = uuid::Uuid::new_v4();
+
+        let result = fetch_chart_via_index(
+            &proxy,
+            repo_id,
+            "helm-proxy",
+            &upstream_url,
+            "mychart",
+            "1.0.0",
+            "mychart-1.0.0.tgz",
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        match result {
+            Err(resp) => assert_eq!(resp.status(), StatusCode::BAD_GATEWAY),
+            Ok(_) => panic!("expected BAD_GATEWAY for invalid YAML"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // download_chart_via_index — path-coverage tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_chart_via_index_remote_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let upstream_url = server.uri();
+        let index_yaml = make_index_yaml("tc", "2.0.0", "charts/tc-2.0.0.tgz");
+
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/tc-2.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tc-content"))
+            .mount(&server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "helm-remote-dl".to_string(),
+            storage_path: tmp.to_str().unwrap().to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: Some(upstream_url),
+        };
+
+        let result = download_chart_via_index(&state, &repo, "tc", "2.0.0", "tc-2.0.0.tgz").await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        match result {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected Some response, got None"),
+            Err(_) => panic!("expected Ok"),
+        }
+    }
+
+    // These two tests return Ok(None) before any HTTP call so they work
+    // without a real database.
+
+    #[tokio::test]
+    async fn test_download_chart_via_index_remote_no_upstream_url() {
+        let tmp = proxy_tmp_dir();
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "helm-remote-no-up".to_string(),
+            storage_path: tmp.to_str().unwrap().to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "remote".to_string(),
+            upstream_url: None,
+        };
+
+        let result =
+            download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn test_download_chart_via_index_local_repo_returns_none() {
+        let tmp = proxy_tmp_dir();
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool, tmp.to_str().unwrap(), proxy);
+
+        let repo = RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "helm-hosted".to_string(),
+            storage_path: tmp.to_str().unwrap().to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "local".to_string(),
+            upstream_url: None,
+        };
+
+        let result =
+            download_chart_via_index(&state, &repo, "ch", "1.0.0", "ch-1.0.0.tgz").await;
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(matches!(result, Ok(None)));
+    }
 }
