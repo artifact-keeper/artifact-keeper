@@ -830,7 +830,26 @@ impl MigrationWorker {
                     filename,
                     artifact_path,
                 );
-                let path_str = format!("{}/{}", repo_key, artifact_path);
+                // Match the path shape AK's per-format publish handlers
+                // already use: `<name>/<version>/<filename>`. Without this,
+                // the migration produced paths like
+                // `<repo>/<source-relative-path>` which collide with the
+                // download lookups: npm's `serve_tarball` matches
+                // `path LIKE '<package>/%/<filename>'` (no leading wildcard)
+                // and never finds migrated rows. PyPI and Helm tolerate the
+                // legacy shape because their lookups use a leading-wildcard
+                // pattern, but writing the canonical publish shape here
+                // closes the inconsistency for everyone and keeps a single
+                // source-of-truth path layout in the artifacts table.
+                // Falls back to the legacy `<repo>/<source-path>` shape only
+                // when the format-aware parser couldn't recover a version
+                // (unknown format / unparseable filename).
+                let path_str = match parsed.version.as_deref() {
+                    Some(ver) if !ver.is_empty() => {
+                        format!("{}/{}/{}", parsed.name, ver, filename)
+                    }
+                    _ => format!("{}/{}", repo_key, artifact_path),
+                };
                 sqlx::query(
                     r#"
                     INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, storage_key, content_type)
