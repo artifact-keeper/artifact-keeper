@@ -190,8 +190,39 @@ impl ScanResultService {
         scan_type: &str,
         checksum_sha256: &str,
     ) -> Result<ScanResult> {
-        // Get source scan counts
-        let source = self.get_scan(source_scan_id).await?;
+        // Wrap the SELECT and both INSERTs in a single transaction:
+        //
+        // - The two INSERTs (scan_results, then scan_findings) must commit
+        //   atomically; a failure of the second must roll back the first.
+        //   See #1035/#1060.
+        // - The source-scan SELECT runs inside the txn with `FOR SHARE` so
+        //   a concurrent DELETE on the source row cannot land between the
+        //   count read and the INSERT INTO scan_findings ... SELECT, which
+        //   would otherwise leave the new row claiming N findings while the
+        //   SELECT copied 0 rows. See #1058.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let source = sqlx::query_as!(
+            ScanResult,
+            r#"
+            SELECT id, artifact_id, repository_id, scan_type, status,
+                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
+            FROM scan_results
+            WHERE id = $1
+            FOR SHARE
+            "#,
+            source_scan_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Source scan result not found".to_string()))?;
 
         // Create new scan result marked as reused.
         //
@@ -234,7 +265,7 @@ impl ScanResultService {
             checksum_sha256,
             source_scan_id,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -256,9 +287,13 @@ impl ScanResultService {
             artifact_id,
             source_scan_id,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(new_scan)
     }
@@ -285,15 +320,36 @@ impl ScanResultService {
         source_scan_id: Uuid,
         artifact_id: Uuid,
     ) -> Result<ScanResult> {
-        // Pull source counts so we can copy them onto the target.
-        let source = self.get_scan(source_scan_id).await?;
-        let (findings, critical, high, medium, low, info) = target_counts_from_source(&source);
-
         let mut tx = self
             .db
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Pull source counts so we can copy them onto the target. The SELECT
+        // runs inside the txn with `FOR SHARE` to close the TOCTOU window
+        // (#1058): without the lock, a concurrent DELETE on the source row
+        // could land between the count read here and the findings INSERT
+        // below, leaving the converted target row claiming N findings while
+        // the INSERT ... SELECT copies 0 rows.
+        let source = sqlx::query_as!(
+            ScanResult,
+            r#"
+            SELECT id, artifact_id, repository_id, scan_type, status,
+                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
+            FROM scan_results
+            WHERE id = $1
+            FOR SHARE
+            "#,
+            source_scan_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Source scan result not found".to_string()))?;
+        let (findings, critical, high, medium, low, info) = target_counts_from_source(&source);
 
         // Status guard: only convert a row that is still 'running'. If another
         // caller already converted this row, the UPDATE matches zero rows and
