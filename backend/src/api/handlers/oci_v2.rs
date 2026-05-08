@@ -2162,7 +2162,10 @@ async fn fetch_upstream_tags_page(
     })?;
 
     let parsed = serde_json::from_slice::<serde_json::Value>(&content).map_err(|e| {
-        warn!("Invalid upstream tags/list response for {}: {}", ctx.image, e);
+        warn!(
+            "Invalid upstream tags/list response for {}: {}",
+            ctx.image, e
+        );
         oci_error(
             StatusCode::BAD_GATEWAY,
             "UNKNOWN",
