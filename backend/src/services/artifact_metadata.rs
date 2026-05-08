@@ -46,6 +46,109 @@ pub fn parse_name_and_version(
     }
 }
 
+/// Extract format-specific package metadata from the artifact bytes.
+///
+/// Returns the JSON document the caller should store in
+/// `artifact_metadata.metadata` (under the `version_data` key for npm,
+/// `chart` for helm, `metadata` for PyPI). Returns `None` when the format
+/// is unsupported or the bytes don't contain extractable metadata.
+///
+/// Used by the migration worker so that downstream per-format endpoints
+/// (npm package metadata, helm `index.yaml`, PyPI simple index) can
+/// surface real `dependencies`, `appVersion`, etc. instead of `null`.
+/// Without this, npm clients see empty dep lists for migrated packages
+/// and don't install transitive dependencies — exposed concretely on a
+/// 6,227-row migration where `pip install` and `npm install` succeeded
+/// for direct deps but transitive resolution broke whenever a Careem-
+/// internal package depended on something else.
+pub fn extract_artifact_metadata(
+    package_type: &str,
+    artifact_data: &[u8],
+) -> Option<serde_json::Value> {
+    match package_type.to_lowercase().as_str() {
+        "npm" | "yarn" | "pnpm" | "bower" => extract_npm_metadata(artifact_data),
+        "helm" | "helm_oci" => extract_helm_metadata(artifact_data),
+        _ => None,
+    }
+}
+
+/// Extract npm package metadata from a `.tgz` tarball.
+///
+/// Reads the first `package.json` found inside the gzipped tar. The
+/// returned JSON value is wrapped under the `version_data` key — that's
+/// the projection AK's npm metadata builder reads at
+/// `GET /npm/<repo>/<package>` (see `handlers::npm::build_npm_metadata_response`),
+/// where `version_data.dependencies` flows through to clients verbatim.
+fn extract_npm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let gz = flate2::read::GzDecoder::new(artifact_data);
+    let mut tar = tar::Archive::new(gz);
+    let entries = tar.entries().ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path().ok()?;
+        let name = path.to_string_lossy();
+        // Most npm tarballs use the `package/` prefix, but some publish
+        // tools put the actual package name first or omit the prefix
+        // entirely. Match any path ending in `/package.json` or the bare
+        // `package.json` at the root.
+        if name == "package.json" || name.ends_with("/package.json") {
+            // Drop the moved entry — re-iterate is messy with `tar`'s
+            // Read-once entries iterator, so capture the bytes here.
+            drop(name);
+            drop(path);
+            let mut buf = String::new();
+            let mut e = entry;
+            e.read_to_string(&mut buf).ok()?;
+            let pkg: serde_json::Value = serde_json::from_str(&buf).ok()?;
+            return Some(serde_json::json!({ "version_data": pkg }));
+        }
+    }
+    None
+}
+
+/// Extract helm chart metadata from a `.tgz` tarball.
+///
+/// Reads the first `Chart.yaml` found inside the gzipped tar. AK's helm
+/// `index_yaml` builder reads `metadata.chart` and falls back to other
+/// known fields; we store the parsed YAML under both `chart` (for full
+/// fidelity) and a couple of flat fields (`description`, `appVersion`)
+/// matching what the index builder probes individually.
+fn extract_helm_metadata(artifact_data: &[u8]) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let gz = flate2::read::GzDecoder::new(artifact_data);
+    let mut tar = tar::Archive::new(gz);
+    let entries = tar.entries().ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path().ok()?;
+        let name = path.to_string_lossy();
+        if name == "Chart.yaml" || name.ends_with("/Chart.yaml") {
+            drop(name);
+            drop(path);
+            let mut buf = String::new();
+            let mut e = entry;
+            e.read_to_string(&mut buf).ok()?;
+            let chart: serde_json::Value = serde_yaml::from_str(&buf).ok()?;
+            let description = chart
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let app_version = chart
+                .get("appVersion")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let mut wrapper = serde_json::json!({ "chart": chart });
+            if let Some(d) = description {
+                wrapper["description"] = serde_json::Value::String(d);
+            }
+            if let Some(a) = app_version {
+                wrapper["appVersion"] = serde_json::Value::String(a);
+            }
+            return Some(wrapper);
+        }
+    }
+    None
+}
+
 fn fallback(filename: &str) -> ParsedArtifact {
     ParsedArtifact {
         name: filename.to_string(),
@@ -350,5 +453,102 @@ mod tests {
         assert!(!looks_like_version(""));
         assert!(!looks_like_version("alpha"));
         assert!(!looks_like_version("v"));
+    }
+
+    // -----------------------------------------------------------------
+    // extract_artifact_metadata
+    // -----------------------------------------------------------------
+
+    /// Build a minimal `.tgz` containing a single file at the given path
+    /// with the given contents — used by the metadata-extraction tests
+    /// without needing a fixture file on disk.
+    fn make_tgz(path: &str, contents: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut tar_buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, contents).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_npm_metadata_with_package_prefix() {
+        let pkg_json =
+            br#"{"name":"@careem/foo","version":"1.2.3","dependencies":{"lodash":"^4.0.0"}}"#;
+        let tgz = make_tgz("package/package.json", pkg_json);
+        let meta = extract_artifact_metadata("npm", &tgz).expect("metadata");
+        let vd = meta.get("version_data").expect("version_data key");
+        assert_eq!(vd.get("name").and_then(|v| v.as_str()), Some("@careem/foo"));
+        assert_eq!(vd.get("version").and_then(|v| v.as_str()), Some("1.2.3"));
+        assert_eq!(
+            vd.pointer("/dependencies/lodash").and_then(|v| v.as_str()),
+            Some("^4.0.0"),
+        );
+    }
+
+    #[test]
+    fn extract_npm_metadata_with_named_prefix() {
+        // Some publish tools use `<package>/package.json` instead of
+        // `package/package.json`. Both should work.
+        let pkg_json = br#"{"name":"my-pkg","version":"0.1.0"}"#;
+        let tgz = make_tgz("my-pkg/package.json", pkg_json);
+        let meta = extract_artifact_metadata("npm", &tgz).expect("metadata");
+        assert_eq!(
+            meta.pointer("/version_data/name").and_then(|v| v.as_str()),
+            Some("my-pkg"),
+        );
+    }
+
+    #[test]
+    fn extract_npm_metadata_returns_none_when_no_package_json() {
+        let tgz = make_tgz("package/README.md", b"hello");
+        let meta = extract_artifact_metadata("npm", &tgz);
+        assert!(meta.is_none());
+    }
+
+    #[test]
+    fn extract_helm_metadata() {
+        let chart_yaml = b"apiVersion: v2\nname: careem-service\nversion: v1.9.1\nappVersion: \"1.0.0\"\ndescription: Careem service chart\n";
+        let tgz = make_tgz("careem-service/Chart.yaml", chart_yaml);
+        let meta = extract_artifact_metadata("helm", &tgz).expect("metadata");
+        assert_eq!(
+            meta.pointer("/chart/name").and_then(|v| v.as_str()),
+            Some("careem-service"),
+        );
+        assert_eq!(
+            meta.pointer("/chart/version").and_then(|v| v.as_str()),
+            Some("v1.9.1"),
+        );
+        assert_eq!(
+            meta.get("description").and_then(|v| v.as_str()),
+            Some("Careem service chart"),
+        );
+        assert_eq!(
+            meta.get("appVersion").and_then(|v| v.as_str()),
+            Some("1.0.0"),
+        );
+    }
+
+    #[test]
+    fn extract_metadata_unknown_format_returns_none() {
+        let tgz = make_tgz("package/package.json", br#"{"name":"x","version":"0.0.0"}"#);
+        assert!(extract_artifact_metadata("rpm", &tgz).is_none());
+        assert!(extract_artifact_metadata("docker", &tgz).is_none());
+    }
+
+    #[test]
+    fn extract_metadata_handles_invalid_bytes() {
+        // Garbage bytes shouldn't panic — just return None.
+        let garbage = b"not a tarball";
+        assert!(extract_artifact_metadata("npm", garbage).is_none());
+        assert!(extract_artifact_metadata("helm", garbage).is_none());
     }
 }

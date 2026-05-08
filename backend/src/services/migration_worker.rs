@@ -784,6 +784,19 @@ impl MigrationWorker {
         // the source uses (issue #856).
         let (sha256_hex, sha1_hex) = compute_dual_checksums(&artifact_data);
 
+        // Extract format-specific package metadata (npm package.json, helm
+        // Chart.yaml, etc.) from the artifact bytes BEFORE we move them
+        // into storage.put. Without this, downstream per-format endpoints
+        // (npm metadata, helm index.yaml) return null `dependencies` /
+        // `appVersion` for migrated artifacts, breaking transitive resolution
+        // in npm clients and dropping useful info from helm `helm search`.
+        // Returns None for unknown formats / unparseable bytes; the artifact
+        // INSERT proceeds either way and only the metadata row is skipped.
+        let extracted_metadata = crate::services::artifact_metadata::extract_artifact_metadata(
+            package_type,
+            &artifact_data,
+        );
+
         // Get metadata if requested
         let metadata = if include_metadata {
             match client.get_properties(repo_key, artifact_path).await {
@@ -866,6 +879,36 @@ impl MigrationWorker {
                 .bind(&storage_key)
                 .execute(&self.db)
                 .await?;
+
+                // Upsert format-specific package metadata. Look up the
+                // artifact id by (repository_id, path) — works whether the
+                // INSERT above produced a new row or hit ON CONFLICT DO
+                // NOTHING on a re-run, and avoids the RETURNING/DO UPDATE
+                // dance that ON CONFLICT DO NOTHING would require.
+                if let Some(metadata_json) = &extracted_metadata {
+                    let artifact_row: Option<(Uuid,)> = sqlx::query_as(
+                        "SELECT id FROM artifacts \
+                         WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
+                         LIMIT 1",
+                    )
+                    .bind(repository_id)
+                    .bind(&path_str)
+                    .fetch_optional(&self.db)
+                    .await?;
+                    if let Some((artifact_id,)) = artifact_row {
+                        sqlx::query(
+                            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                             VALUES ($1, $2, $3) \
+                             ON CONFLICT (artifact_id) DO UPDATE \
+                             SET metadata = EXCLUDED.metadata",
+                        )
+                        .bind(artifact_id)
+                        .bind(package_type)
+                        .bind(metadata_json)
+                        .execute(&self.db)
+                        .await?;
+                    }
+                }
             }
         }
 
