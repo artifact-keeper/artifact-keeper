@@ -282,6 +282,26 @@ pub fn spawn_all(
         });
     }
 
+    // Webhook previous-secret cleanup (every 10 minutes). Clears the
+    // overlap-window ciphertext once the rotation grace period expires.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let mut ticker = interval(Duration::from_secs(600));
+            loop {
+                ticker.tick().await;
+                match crate::api::handlers::webhooks::cleanup_expired_previous_secrets(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::info!("Cleared {} expired webhook previous-secret entries", n)
+                    }
+                    Err(e) => tracing::warn!("Webhook previous-secret cleanup failed: {}", e),
+                }
+            }
+        });
+    }
+
     // Curation upstream metadata sync (checks every 5 minutes for repos due for sync)
     {
         let db = db.clone();
