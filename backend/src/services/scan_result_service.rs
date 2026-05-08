@@ -200,6 +200,13 @@ impl ScanResultService {
         //   count read and the INSERT INTO scan_findings ... SELECT, which
         //   would otherwise leave the new row claiming N findings while the
         //   SELECT copied 0 rows. See #1058.
+        //
+        // Invariant relied upon: scan_findings rows are only ever deleted
+        // via the `ON DELETE CASCADE` from scan_results(id) (migration 022).
+        // A direct `DELETE FROM scan_findings WHERE scan_result_id = $X`
+        // would NOT be blocked by FOR SHARE on the parent row and would
+        // re-open this race. Don't add such a path without taking
+        // FOR SHARE on the parent here too.
         let mut tx = self
             .db
             .begin()
