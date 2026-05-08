@@ -414,8 +414,14 @@ pub struct ScanConfigResponse {
 )]
 async fn get_dashboard(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<DashboardResponse>> {
+    // Gate global aggregate CVE counts behind admin. Without this, any
+    // authenticated user (admin or not) sees aggregate finding counts across
+    // every repository in a multi-tenant deployment, leaking which repos have
+    // active vulnerabilities and compounding any breach. See #1034.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let summary = svc.get_dashboard_summary().await?;
 
