@@ -427,7 +427,7 @@ impl ProxyService {
 
         if trimmed.is_empty() {
             return Err(AppError::Validation(
-                "proxy cache path must not be empty".to_string(),
+                "Proxy cache path must not be empty".to_string(),
             ));
         }
 
@@ -436,7 +436,19 @@ impl ProxyService {
         // helpers). Reject early.
         if trimmed.contains('\0') {
             return Err(AppError::Validation(
-                "proxy cache path must not contain NUL bytes".to_string(),
+                "Proxy cache path must not contain NUL bytes".to_string(),
+            ));
+        }
+
+        // Backslash is a Windows path separator. Some object-store SDKs
+        // normalize `\` to `/` before signing URLs; others do not. Either
+        // way, a request like `..\\foo` would otherwise pass the
+        // `..`-segment check (because split('/') leaves it as a single
+        // segment) and only get caught (or worse, miscaught) downstream.
+        // Reject at the boundary.
+        if trimmed.contains('\\') {
+            return Err(AppError::Validation(
+                "Proxy cache path must not contain backslashes".to_string(),
             ));
         }
 
@@ -446,7 +458,7 @@ impl ProxyService {
         for segment in trimmed.split('/') {
             if segment == ".." || segment == "." {
                 return Err(AppError::Validation(format!(
-                    "proxy cache path must not contain `{}` segment",
+                    "Proxy cache path must not contain `{}` segment",
                     segment
                 )));
             }
@@ -454,7 +466,7 @@ impl ProxyService {
             // storage backends and should not appear in a normalized path.
             if segment.is_empty() {
                 return Err(AppError::Validation(
-                    "proxy cache path must not contain empty segments".to_string(),
+                    "Proxy cache path must not contain empty segments".to_string(),
                 ));
             }
         }
@@ -467,7 +479,7 @@ impl ProxyService {
             .any(|b| b < 0x20 && b != b'\t')
         {
             return Err(AppError::Validation(
-                "proxy cache path must not contain control characters".to_string(),
+                "Proxy cache path must not contain control characters".to_string(),
             ));
         }
 
@@ -1413,6 +1425,21 @@ mod tests {
     fn test_cache_storage_key_rejects_nul_byte() {
         let result = ProxyService::cache_storage_key("npm-proxy", "express\0evil");
         assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_backslash() {
+        // Windows-style separator. `..\\foo` would otherwise pass the `..`
+        // segment check because split('/') leaves it as a single segment,
+        // and some object-store SDKs normalize `\` to `/` before signing.
+        assert!(matches!(
+            ProxyService::cache_storage_key("npm-proxy", "..\\etc\\passwd"),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            ProxyService::cache_storage_key("npm-proxy", "express\\latest"),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]

@@ -176,6 +176,16 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::NotFound(_) => {
             (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
         }
+        // AppError::Validation here means the request path failed
+        // boundary checks (e.g., #1052 path-traversal validator).
+        // Surface a generic 400 without echoing the validator's reason
+        // string back to the client - those reasons are useful in logs
+        // (above) but become a probe oracle if returned to the caller,
+        // letting an attacker enumerate which characters/segments are
+        // blocked.
+        crate::error::AppError::Validation(_) => {
+            (StatusCode::BAD_REQUEST, "Invalid artifact path").into_response()
+        }
         _ => (
             StatusCode::BAD_GATEWAY,
             format!("Failed to fetch from upstream: {}", e),
