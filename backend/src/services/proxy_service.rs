@@ -114,8 +114,8 @@ impl ProxyService {
         repo_key: &str,
         path: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        let cache_key = Self::cache_storage_key(repo_key, path);
-        let metadata_key = Self::cache_metadata_key(repo_key, path);
+        let cache_key = Self::cache_storage_key(repo_key, path)?;
+        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
         self.get_cached_artifact(&cache_key, &metadata_key).await
     }
 
@@ -155,8 +155,16 @@ impl ProxyService {
     /// (not implemented here) so the #1018 fix stays scoped to "do not
     /// buffer the body".
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
-        let cache_key = Self::cache_storage_key(repo_key, path);
-        let metadata_key = Self::cache_metadata_key(repo_key, path);
+        // A path that fails validation cannot have produced a cache entry
+        // we'd want to redirect to anyway: treat it as a miss so the caller
+        // falls through to the slow path / upstream fetch, where the same
+        // validation will surface the error to the client.
+        let Ok(cache_key) = Self::cache_storage_key(repo_key, path) else {
+            return false;
+        };
+        let Ok(metadata_key) = Self::cache_metadata_key(repo_key, path) else {
+            return false;
+        };
 
         let Ok(Some(metadata)) = self.load_cache_metadata(&metadata_key).await else {
             return false;
@@ -193,8 +201,8 @@ impl ProxyService {
         })?;
 
         // Cache keys use the caller-supplied cache_path
-        let cache_key = Self::cache_storage_key(&repo.key, cache_path);
-        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path);
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
 
         // Check if we have a valid cached copy
         if let Some((content, content_type)) =
@@ -256,7 +264,7 @@ impl ProxyService {
             AppError::Config("Remote repository missing upstream_url".to_string())
         })?;
 
-        let metadata_key = Self::cache_metadata_key(&repo.key, path);
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
 
         // Try to load existing cache metadata
         let metadata = match self.load_cache_metadata(&metadata_key).await? {
@@ -336,8 +344,8 @@ impl ProxyService {
 
     /// Invalidate cached artifact
     pub async fn invalidate_cache(&self, repo: &Repository, path: &str) -> Result<()> {
-        let cache_key = Self::cache_storage_key(&repo.key, path);
-        let metadata_key = Self::cache_metadata_key(&repo.key, path);
+        let cache_key = Self::cache_storage_key(&repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
 
         // Delete both content and metadata
         let _ = self.storage.delete(&cache_key).await;
@@ -392,21 +400,78 @@ impl ProxyService {
     /// in `is_cache_fresh` checks. Keeping a single source of truth for
     /// the key formula prevents the freshness check and the presign
     /// target from drifting out of sync (#1018).
-    pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> String {
-        format!(
-            "proxy-cache/{}/{}/__content__",
-            repo_key,
-            path.trim_start_matches('/').trim_end_matches('/')
-        )
+    pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> Result<String> {
+        let trimmed = Self::validate_cache_path(path)?;
+        Ok(format!("proxy-cache/{}/{}/__content__", repo_key, trimmed))
     }
 
     /// Generate storage key for cache metadata
-    fn cache_metadata_key(repo_key: &str, path: &str) -> String {
-        format!(
+    fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
+        let trimmed = Self::validate_cache_path(path)?;
+        Ok(format!(
             "proxy-cache/{}/{}/__cache_meta__.json",
-            repo_key,
-            path.trim_start_matches('/').trim_end_matches('/')
-        )
+            repo_key, trimmed
+        ))
+    }
+
+    /// Reject paths that would let a caller escape the proxy cache
+    /// directory or smuggle bytes the storage backend will misinterpret.
+    /// Returns the trimmed path on success.
+    ///
+    /// Storage backends generally reject `..` already (filesystem.rs has
+    /// explicit traversal tests). This is the helper-boundary belt to that
+    /// suspenders so a future call site that bypasses the storage check
+    /// still cannot escape (#1018 R3-7 / #1052).
+    fn validate_cache_path(path: &str) -> Result<&str> {
+        let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+
+        if trimmed.is_empty() {
+            return Err(AppError::Validation(
+                "proxy cache path must not be empty".to_string(),
+            ));
+        }
+
+        // NUL terminates C strings and is a classic smuggling vector for
+        // storage backends written in C/C++ (e.g. libfuse, native S3 SDK
+        // helpers). Reject early.
+        if trimmed.contains('\0') {
+            return Err(AppError::Validation(
+                "proxy cache path must not contain NUL bytes".to_string(),
+            ));
+        }
+
+        // Reject any path segment that is exactly `..` or `.`. Substrings
+        // like `..foo` or `foo..bar` are fine (they are just bytes inside a
+        // filename) and reflect legitimate package names.
+        for segment in trimmed.split('/') {
+            if segment == ".." || segment == "." {
+                return Err(AppError::Validation(format!(
+                    "proxy cache path must not contain `{}` segment",
+                    segment
+                )));
+            }
+            // Empty segments come from `//` which is ambiguous to many
+            // storage backends and should not appear in a normalized path.
+            if segment.is_empty() {
+                return Err(AppError::Validation(
+                    "proxy cache path must not contain empty segments".to_string(),
+                ));
+            }
+        }
+
+        // C0 control bytes (other than the standard whitespace already
+        // handled by the empty/segment checks) have no place in a cache
+        // path; they confuse log scrapers and some object-store sign URLs.
+        if trimmed
+            .bytes()
+            .any(|b| b < 0x20 && b != b'\t')
+        {
+            return Err(AppError::Validation(
+                "proxy cache path must not contain control characters".to_string(),
+            ));
+        }
+
+        Ok(trimmed)
     }
 
     /// Attempt to retrieve a cached artifact if valid
@@ -1173,7 +1238,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key() {
         assert_eq!(
-            ProxyService::cache_storage_key("maven-central", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"),
+            ProxyService::cache_storage_key("maven-central", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar").unwrap(),
             "proxy-cache/maven-central/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar/__content__"
         );
     }
@@ -1181,7 +1246,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_strips_leading_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "/express"),
+            ProxyService::cache_storage_key("npm-proxy", "/express").unwrap(),
             "proxy-cache/npm-proxy/express/__content__"
         );
     }
@@ -1189,7 +1254,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_no_leading_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "express"),
+            ProxyService::cache_storage_key("npm-proxy", "express").unwrap(),
             "proxy-cache/npm-proxy/express/__content__"
         );
     }
@@ -1197,7 +1262,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_scoped_npm_package() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "@types/node/-/node-18.0.0.tgz"),
+            ProxyService::cache_storage_key("npm-proxy", "@types/node/-/node-18.0.0.tgz").unwrap(),
             "proxy-cache/npm-proxy/@types/node/-/node-18.0.0.tgz/__content__"
         );
     }
@@ -1207,7 +1272,8 @@ mod tests {
         let key = ProxyService::cache_storage_key(
             "maven",
             "com/example/group/artifact/1.0/artifact-1.0.pom",
-        );
+        )
+        .unwrap();
         assert!(key.starts_with("proxy-cache/maven/"));
         assert!(key.ends_with("/__content__"));
     }
@@ -1219,7 +1285,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_key() {
         assert_eq!(
-            ProxyService::cache_metadata_key("npm-registry", "express"),
+            ProxyService::cache_metadata_key("npm-registry", "express").unwrap(),
             "proxy-cache/npm-registry/express/__cache_meta__.json"
         );
     }
@@ -1227,7 +1293,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_strips_leading_slash() {
         assert_eq!(
-            ProxyService::cache_metadata_key("repo", "/some/path"),
+            ProxyService::cache_metadata_key("repo", "/some/path").unwrap(),
             "proxy-cache/repo/some/path/__cache_meta__.json"
         );
     }
@@ -1235,7 +1301,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_strips_trailing_slash() {
         assert_eq!(
-            ProxyService::cache_metadata_key("pypi-remote", "simple/numpy/"),
+            ProxyService::cache_metadata_key("pypi-remote", "simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
         );
     }
@@ -1243,7 +1309,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_strips_trailing_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("pypi-remote", "simple/numpy/"),
+            ProxyService::cache_storage_key("pypi-remote", "simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__content__"
         );
     }
@@ -1251,11 +1317,11 @@ mod tests {
     #[test]
     fn test_cache_keys_strip_both_slashes() {
         assert_eq!(
-            ProxyService::cache_metadata_key("pypi-remote", "/simple/numpy/"),
+            ProxyService::cache_metadata_key("pypi-remote", "/simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
         );
         assert_eq!(
-            ProxyService::cache_storage_key("pypi-remote", "/simple/numpy/"),
+            ProxyService::cache_storage_key("pypi-remote", "/simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__content__"
         );
     }
@@ -1265,8 +1331,8 @@ mod tests {
         // Both keys should share the same prefix structure
         let repo_key = "npm-proxy";
         let path = "lodash";
-        let storage_key = ProxyService::cache_storage_key(repo_key, path);
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, path);
+        let storage_key = ProxyService::cache_storage_key(repo_key, path).unwrap();
+        let metadata_key = ProxyService::cache_metadata_key(repo_key, path).unwrap();
 
         // Both start with the same prefix
         let storage_prefix = storage_key.rsplit_once('/').unwrap().0;
@@ -1286,8 +1352,9 @@ mod tests {
     fn test_cache_keys_no_file_directory_collision() {
         // Metadata cached at "is-odd" and tarball at "is-odd/-/is-odd-3.0.1.tgz"
         // must not collide (one as file, other needing it as directory)
-        let meta_key = ProxyService::cache_storage_key("npm-proxy", "is-odd");
-        let tarball_key = ProxyService::cache_storage_key("npm-proxy", "is-odd/-/is-odd-3.0.1.tgz");
+        let meta_key = ProxyService::cache_storage_key("npm-proxy", "is-odd").unwrap();
+        let tarball_key =
+            ProxyService::cache_storage_key("npm-proxy", "is-odd/-/is-odd-3.0.1.tgz").unwrap();
 
         // Both should be inside the "is-odd" directory, not at the same level
         assert!(meta_key.contains("is-odd/__content__"));
@@ -1296,22 +1363,104 @@ mod tests {
 
     #[test]
     fn test_cache_keys_different_repos_do_not_collide() {
-        let key1 = ProxyService::cache_storage_key("npm-proxy-1", "express");
-        let key2 = ProxyService::cache_storage_key("npm-proxy-2", "express");
+        let key1 = ProxyService::cache_storage_key("npm-proxy-1", "express").unwrap();
+        let key2 = ProxyService::cache_storage_key("npm-proxy-2", "express").unwrap();
         assert_ne!(key1, key2);
     }
 
     #[test]
     fn test_cache_keys_different_paths_do_not_collide() {
-        let key1 = ProxyService::cache_storage_key("repo", "path/a");
-        let key2 = ProxyService::cache_storage_key("repo", "path/b");
+        let key1 = ProxyService::cache_storage_key("repo", "path/a").unwrap();
+        let key2 = ProxyService::cache_storage_key("repo", "path/b").unwrap();
         assert_ne!(key1, key2);
+    }
+
+    // =======================================================================
+    // Path traversal / sanitization tests (#1052)
+    // =======================================================================
+
+    #[test]
+    fn test_cache_storage_key_rejects_dotdot_segment() {
+        // `../foo` would escape the proxy-cache/<repo>/ namespace.
+        let result = ProxyService::cache_storage_key("npm-proxy", "../etc/passwd");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_dotdot_in_middle() {
+        // `foo/../bar` escapes one level even though there is a leading
+        // legitimate segment.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express/../lodash");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_dot_segment() {
+        // `.` is a no-op on filesystems but ambiguous to object stores.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express/./latest");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_accepts_dotdot_substring() {
+        // `..foo` and `foo..bar` are not segments containing exactly `..`,
+        // they are legitimate filename bytes.
+        assert!(ProxyService::cache_storage_key("npm-proxy", "..foo").is_ok());
+        assert!(ProxyService::cache_storage_key("npm-proxy", "package..tgz").is_ok());
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_nul_byte() {
+        let result = ProxyService::cache_storage_key("npm-proxy", "express\0evil");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_control_chars() {
+        // CR/LF can split log lines and confuse some sign-URL paths.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express\nevil");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_empty_path() {
+        let result = ProxyService::cache_storage_key("npm-proxy", "");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_only_slashes() {
+        let result = ProxyService::cache_storage_key("npm-proxy", "//");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_double_slash() {
+        // `foo//bar` after trim-edges still has an empty middle segment.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express//latest");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_metadata_key_applies_same_validation() {
+        // The metadata helper shares the same validator, so traversal is
+        // rejected on both helpers (preventing a partial bypass where one
+        // path produces a valid metadata key but invalid storage key, or
+        // vice-versa).
+        assert!(matches!(
+            ProxyService::cache_metadata_key("npm-proxy", "../etc/passwd"),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            ProxyService::cache_metadata_key("npm-proxy", "express\0evil"),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]
     fn test_storage_and_metadata_keys_do_not_collide() {
-        let storage = ProxyService::cache_storage_key("repo", "package");
-        let metadata = ProxyService::cache_metadata_key("repo", "package");
+        let storage = ProxyService::cache_storage_key("repo", "package").unwrap();
+        let metadata = ProxyService::cache_metadata_key("repo", "package").unwrap();
         assert_ne!(storage, metadata);
     }
 
@@ -1667,7 +1816,8 @@ mod tests {
         let key = ProxyService::cache_storage_key(
             "my-pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
-        );
+        )
+        .unwrap();
         assert_eq!(
             key,
             "proxy-cache/my-pypi-remote/simple/requests/requests-2.31.0.tar.gz/__content__"
@@ -1679,7 +1829,8 @@ mod tests {
         let key = ProxyService::cache_metadata_key(
             "my-pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
-        );
+        )
+        .unwrap();
         assert_eq!(
             key,
             "proxy-cache/my-pypi-remote/simple/requests/requests-2.31.0.tar.gz/__cache_meta__.json"
@@ -1691,7 +1842,8 @@ mod tests {
         let key = ProxyService::cache_storage_key(
             "pypi-proxy",
             "simple/flask/flask-3.0.0-py3-none-any.whl",
-        );
+        )
+        .unwrap();
         assert!(key.starts_with("proxy-cache/pypi-proxy/simple/flask/"));
         assert!(key.ends_with("/__content__"));
     }
@@ -1701,9 +1853,11 @@ mod tests {
         let pypi_key = ProxyService::cache_storage_key(
             "pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
-        );
+        )
+        .unwrap();
         let npm_key =
-            ProxyService::cache_storage_key("npm-remote", "simple/requests/requests-2.31.0.tar.gz");
+            ProxyService::cache_storage_key("npm-remote", "simple/requests/requests-2.31.0.tar.gz")
+                .unwrap();
         assert_ne!(pypi_key, npm_key);
     }
 
@@ -1711,20 +1865,38 @@ mod tests {
 
     #[test]
     fn test_cache_key_with_custom_path_differs_from_fetch_path() {
-        let fetch_path = "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz";
+        // Pre-#1052 this test passed an upstream URL as the path argument,
+        // which produced a cache key embedding `https://...` (an empty
+        // segment from the `//`). The new validator rejects that path
+        // shape on purpose - URLs are not valid cache paths and the
+        // previous behavior was a footgun. The test now exercises the
+        // intended invariant: two well-formed cache_paths produce
+        // distinct cache keys.
+        let upstream_relative = "packages/ab/cd/requests-2.31.0.tar.gz";
         let cache_path = "simple/requests/requests-2.31.0.tar.gz";
-        let fetch_key = ProxyService::cache_storage_key("pypi-remote", fetch_path);
-        let cache_key = ProxyService::cache_storage_key("pypi-remote", cache_path);
+        let fetch_key =
+            ProxyService::cache_storage_key("pypi-remote", upstream_relative).unwrap();
+        let cache_key = ProxyService::cache_storage_key("pypi-remote", cache_path).unwrap();
         assert_ne!(
             fetch_key, cache_key,
-            "cache key should differ from fetch key"
+            "cache key should differ when distinct paths are used"
         );
+
+        // And a URL-shaped path is now an explicit error rather than a
+        // funny-looking cache key.
+        assert!(matches!(
+            ProxyService::cache_storage_key(
+                "pypi-remote",
+                "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz",
+            ),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]
     fn test_cache_metadata_key_with_custom_path() {
         let cache_path = "simple/numpy/numpy-1.26.0.tar.gz";
-        let key = ProxyService::cache_metadata_key("pypi-remote", cache_path);
+        let key = ProxyService::cache_metadata_key("pypi-remote", cache_path).unwrap();
         assert!(key.contains("pypi-remote"));
         assert!(key.contains("numpy"));
     }
@@ -1754,8 +1926,8 @@ mod tests {
         // as manual cache_storage_key + cache_metadata_key calls
         let repo_key = "test-pypi";
         let path = "simple/flask/flask-3.0.0.tar.gz";
-        let expected_storage = ProxyService::cache_storage_key(repo_key, path);
-        let expected_meta = ProxyService::cache_metadata_key(repo_key, path);
+        let expected_storage = ProxyService::cache_storage_key(repo_key, path).unwrap();
+        let expected_meta = ProxyService::cache_metadata_key(repo_key, path).unwrap();
         // The function internally calls these same methods, so keys should match
         assert!(expected_storage.contains("test-pypi"));
         assert!(expected_meta.contains("test-pypi"));
