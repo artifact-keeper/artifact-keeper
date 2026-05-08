@@ -738,6 +738,18 @@ impl ScanResultService {
 
     /// Recalculate and materialize the security score for a repository.
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        // Wrap the three sequential queries (counts, last_scan_at, upsert)
+        // in a single transaction so a concurrent reader between them sees
+        // a consistent snapshot. Without the transaction, the upsert could
+        // commit a score derived from counts taken at T0 with last_scan_at
+        // taken at T1, where the data shifted between the two reads. Same
+        // race pattern as #1035 (copy_scan_results); see #1059.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         // Count non-acknowledged findings by severity across all completed scans
         // for this repository's artifacts.
         let counts = sqlx::query!(
@@ -756,7 +768,7 @@ impl ScanResultService {
             "#,
             repository_id,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -777,7 +789,7 @@ impl ScanResultService {
             "#,
             repository_id,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -815,9 +827,13 @@ impl ScanResultService {
             acknowledged,
             last_scan_at,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
     }
