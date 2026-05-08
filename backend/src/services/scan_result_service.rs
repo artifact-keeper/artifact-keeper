@@ -1628,5 +1628,71 @@ mod tests {
 
             cleanup_repo(&pool, repo_id).await;
         }
+
+        /// #1059 coverage: recalculate_score runs end-to-end inside the
+        /// transaction wrap. Exercises tx.begin, the three queries that
+        /// each take `&mut *tx`, and tx.commit.
+        #[tokio::test]
+        async fn recalculate_score_commits_transaction() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+
+            // Empty repo (no artifacts, no findings) is a valid input - the
+            // counts query returns zeros, last_scan_at is None, and the
+            // upsert lands a 100/A score row. That fully traverses the
+            // transaction's three queries plus the commit.
+            let score = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score");
+
+            assert_eq!(score.repository_id, repo_id);
+            assert_eq!(score.score, 100);
+            assert_eq!(score.grade, "A");
+            assert_eq!(score.total_findings, 0);
+            assert_eq!(score.critical_count, 0);
+            assert!(score.last_scan_at.is_none());
+
+            // Calling a second time should hit the ON CONFLICT branch of the
+            // upsert and still commit cleanly through the transaction.
+            let score2 = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score idempotent");
+            assert_eq!(score2.repository_id, repo_id);
+            assert_eq!(score2.id, score.id);
+            let repo_id = insert_test_repo(&pool).await;
+
+            // Empty repo (no artifacts, no findings) is a valid input — the
+            // counts query returns zeros, last_scan_at is None, and the
+            // upsert lands a 100/A score row. That fully traverses the
+            // transaction's three queries plus the commit.
+            let score = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score");
+
+            assert_eq!(score.repository_id, repo_id);
+            assert_eq!(score.score, 100);
+            assert_eq!(score.grade, "A");
+            assert_eq!(score.total_findings, 0);
+            assert_eq!(score.critical_count, 0);
+            assert!(score.last_scan_at.is_none());
+
+            // Calling a second time should hit the ON CONFLICT branch of the
+            // upsert and still commit cleanly through the transaction.
+            let score2 = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score idempotent");
+            assert_eq!(score2.repository_id, repo_id);
+            assert_eq!(score2.id, score.id);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
     }
 }
