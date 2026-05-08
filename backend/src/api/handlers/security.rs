@@ -409,6 +409,7 @@ pub struct ScanConfigResponse {
     tag = "security",
     responses(
         (status = 200, description = "Security dashboard summary", body = DashboardResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -416,10 +417,7 @@ async fn get_dashboard(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<DashboardResponse>> {
-    // Gate global aggregate CVE counts behind admin. Without this, any
-    // authenticated user (admin or not) sees aggregate finding counts across
-    // every repository in a multi-tenant deployment, leaking which repos have
-    // active vulnerabilities and compounding any breach. See #1034.
+    // Aggregate counts span all repos; restrict to admin. See #1034.
     auth.require_admin()?;
 
     let svc = ScanResultService::new(state.db.clone());
@@ -448,13 +446,20 @@ async fn get_dashboard(
     tag = "security",
     responses(
         (status = 200, description = "All repository security scores", body = Vec<ScoreResponse>),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_all_scores(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<ScoreResponse>>> {
+    // Same gate as `get_dashboard` (#1034). The leaderboard returns
+    // per-repo IDs + grades + per-severity counts, which is richer
+    // metadata than the dashboard aggregates and an even bigger
+    // multi-tenant info leak.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let scores = svc.get_all_scores().await?;
     let response: Vec<ScoreResponse> = scores.into_iter().map(ScoreResponse::from).collect();
