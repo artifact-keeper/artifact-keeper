@@ -474,10 +474,7 @@ impl ProxyService {
         // C0 control bytes (other than the standard whitespace already
         // handled by the empty/segment checks) have no place in a cache
         // path; they confuse log scrapers and some object-store sign URLs.
-        if trimmed
-            .bytes()
-            .any(|b| b < 0x20 && b != b'\t')
-        {
+        if trimmed.bytes().any(|b| b < 0x20 && b != b'\t') {
             return Err(AppError::Validation(
                 "Proxy cache path must not contain control characters".to_string(),
             ));
@@ -1901,8 +1898,7 @@ mod tests {
         // distinct cache keys.
         let upstream_relative = "packages/ab/cd/requests-2.31.0.tar.gz";
         let cache_path = "simple/requests/requests-2.31.0.tar.gz";
-        let fetch_key =
-            ProxyService::cache_storage_key("pypi-remote", upstream_relative).unwrap();
+        let fetch_key = ProxyService::cache_storage_key("pypi-remote", upstream_relative).unwrap();
         let cache_key = ProxyService::cache_storage_key("pypi-remote", cache_path).unwrap();
         assert_ne!(
             fetch_key, cache_key,

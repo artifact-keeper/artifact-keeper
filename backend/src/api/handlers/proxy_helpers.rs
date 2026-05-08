@@ -232,8 +232,8 @@ pub async fn proxy_fetch_or_redirect(
     upstream_url: &str,
     path: &str,
 ) -> Result<Response, Response> {
-    let cache_key =
-        ProxyService::cache_storage_key(repo_key, path).map_err(|e| map_proxy_error(repo_key, path, e))?;
+    let cache_key = ProxyService::cache_storage_key(repo_key, path)
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     let presigned_enabled = state.config.presigned_downloads_enabled;
     let storage_location = StorageLocation {
