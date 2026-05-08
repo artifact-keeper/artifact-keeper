@@ -739,14 +739,24 @@ impl ScanResultService {
     /// Recalculate and materialize the security score for a repository.
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
         // Wrap the three sequential queries (counts, last_scan_at, upsert)
-        // in a single transaction so a concurrent reader between them sees
-        // a consistent snapshot. Without the transaction, the upsert could
-        // commit a score derived from counts taken at T0 with last_scan_at
-        // taken at T1, where the data shifted between the two reads. Same
-        // race pattern as #1035 (copy_scan_results); see #1059.
+        // in a single REPEATABLE READ transaction so all three statements
+        // observe the same snapshot. The default sqlx transaction is
+        // READ COMMITTED, where each statement re-evaluates the snapshot,
+        // so a concurrent writer that commits between the first and second
+        // SELECT remains visible to the second - the very interleaving
+        // #1059 was filed to close. REPEATABLE READ pins the snapshot at
+        // the first statement and forces the whole tx to read from there.
+        // Same race pattern as #1035 (copy_scan_results); see #1059.
         let mut tx = self
             .db
             .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        // Use runtime sqlx::query (not the compile-checked macro): the
+        // statement has no parameters and returns no rows, so we don't
+        // need a cached entry under SQLX_OFFLINE.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
