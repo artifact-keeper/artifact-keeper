@@ -176,5 +176,5 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
-axum-test = "16"
+axum-test = "18"
 wiremock = "0.6"

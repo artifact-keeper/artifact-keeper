@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE scan_results\n            SET status = 'completed', findings_count = $2,\n                critical_count = $3, high_count = $4, medium_count = $5,\n                low_count = $6, info_count = $7, completed_at = NOW(),\n                scanner_version = COALESCE($8, scanner_version),\n                started_at = $9\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3a759b06e99f06c265fa08ac2e72cf5eab306504e2c1d479d928be22f43ca8d2"
+}

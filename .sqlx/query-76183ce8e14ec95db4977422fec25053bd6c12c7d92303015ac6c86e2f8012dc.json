@@ -1,42 +1,37 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, path, name, version, size_bytes, checksum_sha256, storage_key\n        FROM artifacts\n        WHERE repository_id = $1\n          AND is_deleted = false\n          AND path LIKE '%/' || $2\n        LIMIT 1\n        ",
+  "query": "\n        SELECT a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,\n               am.metadata as \"metadata?\"\n        FROM artifacts a\n        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id\n        WHERE a.repository_id = $1\n          AND a.is_deleted = false\n          AND a.path LIKE 'pool/' || $2 || '/%' ESCAPE '\\'\n        ORDER BY a.name, a.created_at DESC\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 1,
         "name": "path",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "name",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "version",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "size_bytes",
         "type_info": "Int8"
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "checksum_sha256",
         "type_info": "Bpchar"
       },
       {
-        "ordinal": 6,
-        "name": "storage_key",
-        "type_info": "Varchar"
+        "ordinal": 5,
+        "name": "metadata?",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -48,12 +43,11 @@
     "nullable": [
       false,
       false,
-      false,
       true,
       false,
       false,
       false
     ]
   },
-  "hash": "aac2d535a213bee4cf8a9f68ec6abbe21277c79179e870378e1bd309358c55c5"
+  "hash": "76183ce8e14ec95db4977422fec25053bd6c12c7d92303015ac6c86e2f8012dc"
 }

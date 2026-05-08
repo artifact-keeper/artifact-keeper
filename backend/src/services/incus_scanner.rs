@@ -13,6 +13,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
+use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
@@ -20,7 +21,9 @@ use crate::formats::incus::{IncusFileType, IncusHandler};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
-use crate::services::scanner_service::{convert_trivy_findings, fail_scan, ScanWorkspace, Scanner};
+use crate::services::scanner_service::{
+    cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
+};
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
 async fn write_temp_file(path: &Path, content: &Bytes, label: &str) -> Result<()> {
@@ -93,6 +96,10 @@ async fn run_trivy_scan(
 pub struct IncusScanner {
     trivy_url: String,
     scan_workspace: String,
+    /// Lazily-probed version string from `trivy --version`, e.g.
+    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
+    /// not pay an extra subprocess for the version probe.
+    cached_version: OnceCell<Option<String>>,
 }
 
 impl IncusScanner {
@@ -100,6 +107,7 @@ impl IncusScanner {
         Self {
             trivy_url,
             scan_workspace,
+            cached_version: OnceCell::new(),
         }
     }
 
@@ -240,6 +248,14 @@ impl Scanner for IncusScanner {
 
     fn scan_type(&self) -> &str {
         "incus"
+    }
+
+    /// Probe `trivy --version` once and cache the parsed version string.
+    /// Returns `None` if the binary is missing or its output cannot be
+    /// parsed. The Incus scanner shells out to the same `trivy` binary as
+    /// `TrivyFsScanner`, so the format is also `trivy-<version>`.
+    async fn version(&self) -> Option<String> {
+        cached_trivy_cli_version(&self.cached_version).await
     }
 
     async fn scan(
@@ -1088,5 +1104,29 @@ mod tests {
         let report: TrivyReport = serde_json::from_str(json).unwrap();
         assert_eq!(report.results.len(), 1);
         assert!(report.results[0].vulnerabilities.is_none());
+    }
+
+    /// `version()` covers the OnceCell-cached `trivy --version` probe path
+    /// for the Incus scanner. The Incus scanner shares the Trivy binary
+    /// with `TrivyFsScanner`, so the format is also `trivy-<ver>`. We
+    /// tolerate hosts both with and without `trivy` installed; the
+    /// assertion is on caching plus the prefix shape.
+    #[tokio::test]
+    async fn test_version_is_cached_and_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = IncusScanner::new(
+            "http://localhost:0".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+        let v1 = scanner.version().await;
+        let v2 = scanner.version().await;
+        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        if let Some(v) = v1 {
+            assert!(
+                v.starts_with("trivy-"),
+                "incus scanner version must be normalized 'trivy-<ver>'; got {}",
+                v
+            );
+        }
     }
 }
