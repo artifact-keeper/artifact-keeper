@@ -2176,16 +2176,24 @@ struct UpstreamTagsPage {
     next_last: Option<String>,
 }
 
-async fn fetch_upstream_tags_page(
-    state: &SharedState,
+/// Inputs shared across `fetch_upstream_tags_page`, `collect_upstream_tags`,
+/// and `fetch_tags_from_remote_member`. Bundling them avoids passing the same
+/// five values through every call (state + repo_id + repo_key + upstream_url +
+/// image), which previously pushed each helper to seven positional arguments.
+struct TagsFetchCtx<'a> {
+    state: &'a SharedState,
     repo_id: Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    image: &str,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    image: &'a str,
+}
+
+async fn fetch_upstream_tags_page(
+    ctx: &TagsFetchCtx<'_>,
     n: usize,
     last: Option<&str>,
 ) -> Result<UpstreamTagsPage, Response> {
-    let proxy = state.proxy_service.as_ref().ok_or_else(|| {
+    let proxy = ctx.state.proxy_service.as_ref().ok_or_else(|| {
         oci_error(
             StatusCode::BAD_GATEWAY,
             "UNKNOWN",
@@ -2193,12 +2201,12 @@ async fn fetch_upstream_tags_page(
         )
     })?;
 
-    let upstream_path = format!("v2/{}/{}", image, build_remote_tags_list_path(n, last));
+    let upstream_path = format!("v2/{}/{}", ctx.image, build_remote_tags_list_path(n, last));
     let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached_with_link(
         proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
+        ctx.repo_id,
+        ctx.repo_key,
+        ctx.upstream_url,
         &upstream_path,
     )
     .await
@@ -2216,7 +2224,10 @@ async fn fetch_upstream_tags_page(
     })?;
 
     let parsed = serde_json::from_slice::<serde_json::Value>(&content).map_err(|e| {
-        warn!("Invalid upstream tags/list response for {}: {}", image, e);
+        warn!(
+            "Invalid upstream tags/list response for {}: {}",
+            ctx.image, e
+        );
         oci_error(
             StatusCode::BAD_GATEWAY,
             "UNKNOWN",
@@ -2226,7 +2237,7 @@ async fn fetch_upstream_tags_page(
     let tags = parsed["tags"].as_array().ok_or_else(|| {
         warn!(
             "Upstream tags/list response for {} is missing a tags array",
-            image
+            ctx.image
         );
         oci_error(
             StatusCode::BAD_GATEWAY,
@@ -2245,11 +2256,7 @@ async fn fetch_upstream_tags_page(
 }
 
 async fn collect_upstream_tags(
-    state: &SharedState,
-    repo_id: Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    image: &str,
+    ctx: &TagsFetchCtx<'_>,
     max_tags: usize,
     last: Option<&str>,
 ) -> Result<(Vec<String>, bool), Response> {
@@ -2267,22 +2274,13 @@ async fn collect_upstream_tags(
             return Ok((collected, false));
         }
 
-        let page = fetch_upstream_tags_page(
-            state,
-            repo_id,
-            repo_key,
-            upstream_url,
-            image,
-            remaining,
-            cursor.as_deref(),
-        )
-        .await?;
+        let page = fetch_upstream_tags_page(ctx, remaining, cursor.as_deref()).await?;
         pages_fetched += 1;
 
         if pages_fetched > 1024 {
             warn!(
                 "Stopping upstream tags pagination for {} after {} pages to avoid a loop",
-                image, pages_fetched
+                ctx.image, pages_fetched
             );
             return Ok((collected, true));
         }
@@ -2301,7 +2299,7 @@ async fn collect_upstream_tags(
                 if collected.len() == before_len || cursor.as_deref() == Some(next_last.as_str()) {
                     warn!(
                         "Upstream tags pagination for {} returned a non-advancing cursor, stopping early",
-                        image
+                        ctx.image
                     );
                     return Ok((collected, true));
                 }
@@ -2330,8 +2328,14 @@ async fn tags_list_remote(
         )
     })?;
     let image = normalize_docker_image(&repo.image, upstream_url);
-    let (tags, upstream_has_more) =
-        collect_upstream_tags(state, repo.id, &repo.key, upstream_url, &image, n + 1, last).await?;
+    let ctx = TagsFetchCtx {
+        state,
+        repo_id: repo.id,
+        repo_key: &repo.key,
+        upstream_url,
+        image: &image,
+    };
+    let (tags, upstream_has_more) = collect_upstream_tags(&ctx, n + 1, last).await?;
     Ok(split_remote_tags_page(tags, n, upstream_has_more))
 }
 
@@ -2401,23 +2405,22 @@ async fn fetch_tags_from_remote_member(
 ) -> Option<Vec<String>> {
     let upstream_url = upstream_url?;
     let image = normalize_docker_image(image_name, upstream_url);
-    let (tags, upstream_has_more) = collect_upstream_tags(
+    let ctx = TagsFetchCtx {
         state,
-        member_id,
-        member_key,
+        repo_id: member_id,
+        repo_key: member_key,
         upstream_url,
-        &image,
-        n_limit,
-        last,
-    )
-    .await
-    .map_err(|_| {
-        tracing::debug!(
-            "Virtual member '{}': upstream tags/list failed, skipping",
-            member_key
-        );
-    })
-    .ok()?;
+        image: &image,
+    };
+    let (tags, upstream_has_more) = collect_upstream_tags(&ctx, n_limit, last)
+        .await
+        .map_err(|_| {
+            tracing::debug!(
+                "Virtual member '{}': upstream tags/list failed, skipping",
+                member_key
+            );
+        })
+        .ok()?;
 
     tracing::debug!(
         "Virtual member '{}': fetched {} tags from upstream (has_more={})",
