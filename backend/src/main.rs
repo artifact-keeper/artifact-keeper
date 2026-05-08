@@ -140,7 +140,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     )))]
     tracing::info!("Global allocator: system");
     #[cfg(feature = "profiling")]
-    tracing::info!("Jemalloc profiling enabled — set _RJEM_MALLOC_CONF=prof:true to activate");
+    tracing::info!("Jemalloc profiling enabled - set _RJEM_MALLOC_CONF=prof:true to activate");
 
     tracing::info!("Starting Artifact Keeper");
 
@@ -163,6 +163,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Provision admin user on first boot; returns true when setup lock is needed
     let setup_required = provision_admin_user(&db_pool, &config.storage_path).await?;
+
+    // Log loudly at WARN level when setup is still required so log-based
+    // alerting and SIEM rules can surface "this server has not had its
+    // admin password changed". Before #889, the same condition surfaced
+    // implicitly via /readyz returning 503; that signal was load-bearing
+    // for some operators and we removed it (the 503 caused Kubernetes
+    // restart loops). Emitting a structured WARN here preserves the
+    // alert path without driving Kubernetes to restart the pod.
+    if setup_required {
+        tracing::warn!(
+            event = "setup_required",
+            "Default admin password has not been changed. API mutations are gated by the setup middleware until the change-password flow runs. See the deployment documentation for credential bootstrap details."
+        );
+    }
 
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
     // This bridges the gap between env-var-based deployment and the database-backed
@@ -630,7 +644,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let cve_history_server = CveHistoryGrpcServer::new(grpc_db_pool.clone());
     let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db_pool);
 
-    // gRPC auth interceptor — validates JWT Bearer tokens
+    // gRPC auth interceptor - validates JWT Bearer tokens
     let grpc_auth =
         artifact_keeper_backend::grpc::auth_interceptor::AuthInterceptor::new(&config.jwt_secret);
 
@@ -681,7 +695,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
-            "Starting unauthenticated metrics listener — \
+            "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
         let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
@@ -1013,7 +1027,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .eq_ignore_ascii_case("true")
     {
         tracing::info!(
-            "SKIP_ADMIN_PROVISIONING=true — skipping built-in admin user creation. \
+            "SKIP_ADMIN_PROVISIONING=true - skipping built-in admin user creation. \
              Admin access must be granted via SSO group mapping."
         );
         return Ok(false);
