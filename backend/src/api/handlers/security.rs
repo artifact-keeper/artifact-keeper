@@ -692,6 +692,17 @@ async fn acknowledge_finding(
     Path(finding_id): Path<Uuid>,
     Json(body): Json<AcknowledgeRequest>,
 ) -> Result<Json<FindingResponse>> {
+    // Acknowledging suppresses a finding from dashboard counts
+    // (`COUNT(*) FILTER (WHERE NOT is_acknowledged)`). Without an authz
+    // gate, any authenticated user can hide CVEs from any repository they
+    // do not own by passing its finding UUID. Combined with #962, which
+    // makes those counts authoritative, this lets a malicious tenant
+    // launder vulnerabilities out of another tenant's dashboard view.
+    // The codebase has no per-user repo-membership table for non-token
+    // auth, so we gate on admin - the same gate #1034 applies to the
+    // dashboard surface the attacker is trying to poison. See #1032.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let user_id = auth.user_id;
 
@@ -718,9 +729,15 @@ async fn acknowledge_finding(
 )]
 async fn revoke_acknowledgment(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(finding_id): Path<Uuid>,
 ) -> Result<Json<FindingResponse>> {
+    // Symmetric gate with acknowledge_finding (#1032): both write to the
+    // same row. Allowing un-privileged un-acknowledge would let an attacker
+    // un-hide a finding the admin previously acknowledged for a legitimate
+    // reason, churning dashboard counts.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let f = svc.revoke_acknowledgment(finding_id).await?;
 
