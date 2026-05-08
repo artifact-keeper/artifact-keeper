@@ -682,6 +682,7 @@ async fn list_findings(
     request_body = AcknowledgeRequest,
     responses(
         (status = 200, description = "Finding acknowledged", body = FindingResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -692,15 +693,10 @@ async fn acknowledge_finding(
     Path(finding_id): Path<Uuid>,
     Json(body): Json<AcknowledgeRequest>,
 ) -> Result<Json<FindingResponse>> {
-    // Acknowledging suppresses a finding from dashboard counts
-    // (`COUNT(*) FILTER (WHERE NOT is_acknowledged)`). Without an authz
-    // gate, any authenticated user can hide CVEs from any repository they
-    // do not own by passing its finding UUID. Combined with #962, which
-    // makes those counts authoritative, this lets a malicious tenant
-    // launder vulnerabilities out of another tenant's dashboard view.
-    // The codebase has no per-user repo-membership table for non-token
-    // auth, so we gate on admin - the same gate #1034 applies to the
-    // dashboard surface the attacker is trying to poison. See #1032.
+    // Admin-only: non-admins could otherwise hide findings from any
+    // repo by passing its UUID, suppressing them from #962's dashboard
+    // counts. No per-user repo-membership model exists; admin gate
+    // matches the dashboard gate in #1034. See #1032.
     auth.require_admin()?;
 
     let svc = ScanResultService::new(state.db.clone());
@@ -723,6 +719,7 @@ async fn acknowledge_finding(
     ),
     responses(
         (status = 200, description = "Acknowledgment revoked", body = FindingResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
