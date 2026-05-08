@@ -18,6 +18,25 @@ use utoipa::{OpenApi, ToSchema};
 use crate::api::SharedState;
 use crate::storage::StorageBackend;
 
+/// Canonical status string for a healthy db / migrations / storage check.
+/// Held as a module-private constant so the readiness gate (`is_ready`) and
+/// the call sites that build `CheckStatus` agree on one spelling. If a future
+/// cleanup ever renames this vocabulary, both ends move together rather than
+/// drifting silently and making the gate return false for everything.
+const STATUS_HEALTHY: &str = "healthy";
+
+/// Canonical status string for an unhealthy db / migrations / storage check.
+const STATUS_UNHEALTHY: &str = "unhealthy";
+
+/// Status string for a setup_complete check that has finished (admin
+/// password was changed). Distinct from STATUS_HEALTHY because setup is
+/// informational, not a readiness gate (see #889) — the vocabulary
+/// difference signals that to readers and to anything diffing the JSON.
+const SETUP_COMPLETE: &str = "complete";
+
+/// Status string for a setup_complete check that has NOT yet finished.
+const SETUP_INCOMPLETE: &str = "incomplete";
+
 #[derive(Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: String,
@@ -270,11 +289,11 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
 pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoResponse {
     let db_check = match sqlx::query("SELECT 1").fetch_one(&state.db).await {
         Ok(_) => CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         },
         Err(e) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some(format!("Database unreachable: {}", e)),
         },
     };
@@ -286,43 +305,62 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
     .await
     {
         Ok(true) => CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         },
         Ok(false) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some("No successful migrations found".to_string()),
         },
         Err(e) => CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some(format!("Migration check failed: {}", e)),
         },
     };
 
-    // Setup state is informational only. It surfaces "admin password not yet
-    // changed" so dashboards and operators can see the condition, but it is
-    // intentionally excluded from the readiness gate (see #889 — restarting
-    // the pod here makes setup impossible via `kubectl exec`).
     let setup_required = state
         .setup_required
         .load(std::sync::atomic::Ordering::Relaxed);
+    let (status_code, response) = build_readyz_response(db_check, migrations_check, setup_required);
+
+    if setup_required {
+        tracing::debug!("/readyz: setup incomplete (informational, not blocking readiness)");
+    }
+
+    (status_code, Json(response))
+}
+
+/// Pure response-builder for the readiness probe.
+///
+/// Splits "what the response says" from "how we discovered it" so the
+/// readiness logic is unit-testable without spinning up a `SharedState` or
+/// a database pool. The handler is now a thin DB-binding wrapper around
+/// this function. Any future regression in the readiness gate (#889) can
+/// be caught by exercising this function directly with the three input
+/// values, since it is the same logic the handler runs.
+///
+/// Setup state is informational only. It surfaces "admin password not yet
+/// changed" so dashboards and operators can see the condition, but it is
+/// intentionally excluded from the readiness gate (see #889 — restarting
+/// the pod here makes setup impossible via `kubectl exec`).
+fn build_readyz_response(
+    db_check: CheckStatus,
+    migrations_check: CheckStatus,
+    setup_required: bool,
+) -> (StatusCode, ReadyzResponse) {
     let setup_check = if setup_required {
         CheckStatus {
-            status: "incomplete".to_string(),
+            status: SETUP_INCOMPLETE.to_string(),
             message: Some("Admin password change required".to_string()),
         }
     } else {
         CheckStatus {
-            status: "complete".to_string(),
+            status: SETUP_COMPLETE.to_string(),
             message: None,
         }
     };
 
     let ready = is_ready(&db_check, &migrations_check);
-
-    if setup_required {
-        tracing::debug!("/readyz: setup incomplete (informational, not blocking readiness)");
-    }
 
     let response = ReadyzResponse {
         status: if ready {
@@ -343,7 +381,7 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    (status_code, Json(response))
+    (status_code, response)
 }
 
 /// Compute whether the service should be reported as ready.
@@ -351,8 +389,12 @@ pub async fn readiness_check(State(state): State<SharedState>) -> impl IntoRespo
 /// Only the database and migrations checks gate readiness. Setup state is
 /// informational and intentionally excluded — see the docstring on
 /// [`readiness_check`] and issue #889.
+///
+/// Uses the [`STATUS_HEALTHY`] constant rather than a string literal so that
+/// the gate cannot silently start returning `false` if the vocabulary used
+/// by upstream check builders is ever changed without updating this site.
 fn is_ready(db_check: &CheckStatus, migrations_check: &CheckStatus) -> bool {
-    db_check.status == "healthy" && migrations_check.status == "healthy"
+    db_check.status == STATUS_HEALTHY && migrations_check.status == STATUS_HEALTHY
 }
 
 /// Liveness probe — confirms the process is alive and can serve HTTP.
@@ -629,9 +671,25 @@ pub struct HealthApiDoc;
 mod tests {
     use super::*;
 
+    // The test helpers below intentionally use TWO distinct status-string
+    // vocabularies, matching what the production code emits:
+    //
+    //   * `healthy` / `unhealthy` for db / migrations / storage checks
+    //     (anything that gates readiness or overall health)
+    //   * `complete` / `incomplete` for setup_complete (informational only,
+    //     intentionally NOT a readiness driver — see #889)
+    //
+    // The two vocabularies coexist on purpose. If you write a new test that
+    // mixes them up (e.g. uses `unhealthy_check` for the setup_complete
+    // field), the test passes for the wrong reason. The readyz tests below
+    // drive `build_readyz_response` with `setup_required: bool` directly
+    // rather than constructing a setup CheckStatus by hand, which avoids
+    // the issue inside this module; the comment is here to warn anyone
+    // adding new tests that bypass `build_readyz_response`.
+
     fn healthy_check() -> CheckStatus {
         CheckStatus {
-            status: "healthy".to_string(),
+            status: STATUS_HEALTHY.to_string(),
             message: None,
         }
     }
@@ -778,21 +836,14 @@ mod tests {
 
     fn unhealthy_check(message: &str) -> CheckStatus {
         CheckStatus {
-            status: "unhealthy".to_string(),
+            status: STATUS_UNHEALTHY.to_string(),
             message: Some(message.to_string()),
-        }
-    }
-
-    fn setup_incomplete_check() -> CheckStatus {
-        CheckStatus {
-            status: "incomplete".to_string(),
-            message: Some("Admin password change required".to_string()),
         }
     }
 
     fn setup_complete_check() -> CheckStatus {
         CheckStatus {
-            status: "complete".to_string(),
+            status: SETUP_COMPLETE.to_string(),
             message: None,
         }
     }
@@ -834,56 +885,85 @@ mod tests {
     /// decision must remain "ready" so Kubernetes does not restart the pod
     /// and kick the operator out of `kubectl exec` while they change the
     /// default admin password.
+    ///
+    /// Drives `build_readyz_response` directly — the same pure function the
+    /// handler runs after performing its DB queries — so a future regression
+    /// that re-adds setup_complete to the all-healthy gate will fail this
+    /// test, not just a copy of the response shape.
     #[test]
-    fn test_readyz_ready_when_only_setup_incomplete() {
-        let db_check = healthy_check();
-        let migrations_check = healthy_check();
-
-        assert!(
-            is_ready(&db_check, &migrations_check),
-            "is_ready must ignore setup state"
+    fn test_build_readyz_response_ready_when_only_setup_incomplete() {
+        let (status_code, response) = build_readyz_response(
+            healthy_check(),
+            healthy_check(),
+            true, // setup_required
         );
 
-        // Build the response a real call would produce in this state.
-        let response = ReadyzResponse {
-            status: "ready".to_string(),
-            checks: ReadyzChecks {
-                database: db_check,
-                migrations: migrations_check,
-                setup_complete: setup_incomplete_check(),
-            },
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        // Status is "ready" overall...
-        assert!(json.contains("\"status\":\"ready\""));
-        // ...but the informational setup field still surfaces the condition.
-        assert!(json.contains("\"incomplete\""));
-        assert!(json.contains("Admin password change required"));
+        // The actual handler decision: 200 OK, status="ready".
+        assert_eq!(
+            status_code,
+            StatusCode::OK,
+            "setup_required must NOT drive 503 (#889)"
+        );
+        assert_eq!(response.status, "ready");
+
+        // The informational setup field still surfaces the condition.
+        assert_eq!(response.checks.setup_complete.status, SETUP_INCOMPLETE);
+        assert_eq!(
+            response.checks.setup_complete.message.as_deref(),
+            Some("Admin password change required"),
+        );
+    }
+
+    /// Symmetric: when setup is complete and everything is healthy, the
+    /// handler returns 200 with status="ready" and `setup_complete=complete`.
+    #[test]
+    fn test_build_readyz_response_ready_when_all_complete() {
+        let (status_code, response) = build_readyz_response(
+            healthy_check(),
+            healthy_check(),
+            false, // setup_required
+        );
+
+        assert_eq!(status_code, StatusCode::OK);
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.checks.setup_complete.status, SETUP_COMPLETE);
+        assert!(response.checks.setup_complete.message.is_none());
     }
 
     /// An unhealthy database must always drive a not-ready response,
-    /// regardless of whether setup is complete or incomplete.
+    /// regardless of whether setup is complete or incomplete. Exercises
+    /// the same `build_readyz_response` the handler runs.
     #[test]
-    fn test_readyz_not_ready_when_db_unhealthy_regardless_of_setup() {
-        let db_check = unhealthy_check("Database unreachable: timeout");
+    fn test_build_readyz_response_not_ready_when_db_unhealthy_regardless_of_setup() {
+        for setup_required in [false, true] {
+            let (status_code, response) = build_readyz_response(
+                unhealthy_check("Database unreachable: timeout"),
+                healthy_check(),
+                setup_required,
+            );
+            assert_eq!(
+                status_code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unhealthy db must drive 503 (setup_required={})",
+                setup_required,
+            );
+            assert_eq!(response.status, "not_ready");
+            assert_eq!(response.checks.database.status, STATUS_UNHEALTHY);
+        }
+    }
 
-        assert!(
-            !is_ready(&db_check, &healthy_check()),
-            "is_ready must return false when db is unhealthy"
-        );
-
-        for setup in [setup_complete_check(), setup_incomplete_check()] {
-            let response = ReadyzResponse {
-                status: "not_ready".to_string(),
-                checks: ReadyzChecks {
-                    database: unhealthy_check("Database unreachable: timeout"),
-                    migrations: healthy_check(),
-                    setup_complete: setup,
-                },
-            };
-            let json = serde_json::to_string(&response).unwrap();
-            assert!(json.contains("\"not_ready\""));
-            assert!(json.contains("Database unreachable"));
+    /// Migrations failures also drive 503, regardless of setup state.
+    #[test]
+    fn test_build_readyz_response_not_ready_when_migrations_unhealthy() {
+        for setup_required in [false, true] {
+            let (status_code, response) = build_readyz_response(
+                healthy_check(),
+                unhealthy_check("No successful migrations found"),
+                setup_required,
+            );
+            assert_eq!(status_code, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.status, "not_ready");
+            assert_eq!(response.checks.migrations.status, STATUS_UNHEALTHY);
         }
     }
 

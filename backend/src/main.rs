@@ -164,6 +164,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Provision admin user on first boot; returns true when setup lock is needed
     let setup_required = provision_admin_user(&db_pool, &config.storage_path).await?;
 
+    // Log loudly at WARN level when setup is still required so log-based
+    // alerting and SIEM rules can surface "this server has not had its
+    // admin password changed". Before #889, the same condition surfaced
+    // implicitly via /readyz returning 503; that signal was load-bearing
+    // for some operators and we removed it (the 503 caused Kubernetes
+    // restart loops). Emitting a structured WARN here preserves the
+    // alert path without driving Kubernetes to restart the pod.
+    if setup_required {
+        tracing::warn!(
+            event = "setup_required",
+            "Default admin password has not been changed; API mutations are gated by setup middleware until the admin password is set. See storage_path/admin.password for the default credential and the /api/v1/auth/login + change-password flow to complete setup."
+        );
+    }
+
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
     // This bridges the gap between env-var-based deployment and the database-backed
     // SSO config that the handlers actually use (fixes #238).
