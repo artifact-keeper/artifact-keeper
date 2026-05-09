@@ -164,25 +164,20 @@ pub fn start_webhook_producer(
 ///
 /// Looks up enabled webhooks whose `events` array contains the mapped event
 /// type and whose `repository_id` is either NULL (global) or matches the
-/// event's entity_id when interpretable as a UUID. For each match, INSERTs a
-/// row into `webhook_deliveries` with `attempts = 0`, `next_retry_at = NOW()`,
+/// event's `repository_id` field. For each match, INSERTs a row into
+/// `webhook_deliveries` with `attempts = 0`, `next_retry_at = NOW()`,
 /// `success = false`. The retry scheduler picks these up on its tick.
 ///
-/// # Repository scoping limitation
+/// # Repository scoping (#948)
 ///
-/// `event.entity_id` is parsed as a `repository_id`. This works correctly
-/// for `repository.*` events because the EventBus carries the repo UUID in
-/// `entity_id`. It is a category error for `user.*`, `build.*`, and
-/// `artifact.*` events: their `entity_id` is the user/build/artifact UUID
-/// respectively, not the owning repository. For those events, the
-/// `repository_id = $2` arm of the WHERE clause never matches, so only
-/// global-scoped webhooks (repository_id IS NULL) fire. The same flaw
-/// exists in `notification_dispatcher.rs::dispatch_event`.
-///
-/// FIXME(#948): Thread an explicit `repository_id: Option<Uuid>` through
-/// `DomainEvent` so this scoping is correct for non-repo events. Until
-/// then, scoping non-repo events requires the operator to use a global
-/// webhook subscription.
+/// Repo scoping uses the publisher-set `event.repository_id` field, not a
+/// parse of `entity_id`. For repo-scoped events (`repository.*`) the
+/// publisher calls `EventBus::emit_for_repo` which threads the repo UUID
+/// through. For non-repo events (`user.*`, `group.*`, etc.) the field is
+/// `None`, so only global webhooks (`repository_id IS NULL`) match. The
+/// pre-#948 implementation parsed `entity_id` as a UUID, which was a
+/// category error for non-repo events whose `entity_id` is the user/group
+/// UUID rather than the owning repo's UUID.
 ///
 /// Uses `sqlx::query()` (not the macro) to avoid contention on the offline
 /// SQLx query cache while parallel webhook PRs are in flight (E1, E2, E4).
@@ -195,9 +190,7 @@ async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Res
         }
     };
 
-    // Try to parse entity_id as a UUID for repository scoping. If it is not
-    // a UUID, only global webhooks (repository_id IS NULL) match.
-    let repo_id: Option<uuid::Uuid> = uuid::Uuid::parse_str(&event.entity_id).ok();
+    let repo_id: Option<uuid::Uuid> = event.repository_id;
 
     let raw_rows = sqlx::query(
         r#"
@@ -269,6 +262,7 @@ mod tests {
         DomainEvent {
             event_type: event_type.to_string(),
             entity_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            repository_id: None,
             actor: Some("alice".into()),
             timestamp: "2026-04-08T12:00:00Z".into(),
         }
@@ -463,6 +457,7 @@ mod tests {
         let event = DomainEvent {
             event_type: "user.deleted".into(),
             entity_id: "u-7".into(),
+            repository_id: None,
             actor: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
         };
@@ -485,6 +480,7 @@ mod tests {
         let event = DomainEvent {
             event_type: "build.failed".into(),
             entity_id: "build-99".into(),
+            repository_id: None,
             actor: Some("ci".into()),
             timestamp: "2026-04-27T16:30:00.123456789Z".into(),
         };

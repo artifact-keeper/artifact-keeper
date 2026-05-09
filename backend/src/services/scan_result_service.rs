@@ -738,6 +738,28 @@ impl ScanResultService {
 
     /// Recalculate and materialize the security score for a repository.
     pub async fn recalculate_score(&self, repository_id: Uuid) -> Result<RepoSecurityScore> {
+        // Wrap the three sequential queries (counts, last_scan_at, upsert)
+        // in a single REPEATABLE READ transaction so all three statements
+        // observe the same snapshot. The default sqlx transaction is
+        // READ COMMITTED, where each statement re-evaluates the snapshot,
+        // so a concurrent writer that commits between the first and second
+        // SELECT remains visible to the second - the very interleaving
+        // #1059 was filed to close. REPEATABLE READ pins the snapshot at
+        // the first statement and forces the whole tx to read from there.
+        // Same race pattern as #1035 (copy_scan_results); see #1059.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        // Use runtime sqlx::query (not the compile-checked macro): the
+        // statement has no parameters and returns no rows, so we don't
+        // need a cached entry under SQLX_OFFLINE.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
         // Count non-acknowledged findings by severity across all completed scans
         // for this repository's artifacts.
         let counts = sqlx::query!(
@@ -756,7 +778,7 @@ impl ScanResultService {
             "#,
             repository_id,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -777,7 +799,7 @@ impl ScanResultService {
             "#,
             repository_id,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -815,9 +837,13 @@ impl ScanResultService {
             acknowledged,
             last_scan_at,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
     }
@@ -1599,6 +1625,72 @@ mod tests {
                     .await
                     .expect("count findings");
             assert_eq!(findings, 1);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #1059 coverage: recalculate_score runs end-to-end inside the
+        /// transaction wrap. Exercises tx.begin, the three queries that
+        /// each take `&mut *tx`, and tx.commit.
+        #[tokio::test]
+        async fn recalculate_score_commits_transaction() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+
+            // Empty repo (no artifacts, no findings) is a valid input - the
+            // counts query returns zeros, last_scan_at is None, and the
+            // upsert lands a 100/A score row. That fully traverses the
+            // transaction's three queries plus the commit.
+            let score = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score");
+
+            assert_eq!(score.repository_id, repo_id);
+            assert_eq!(score.score, 100);
+            assert_eq!(score.grade, "A");
+            assert_eq!(score.total_findings, 0);
+            assert_eq!(score.critical_count, 0);
+            assert!(score.last_scan_at.is_none());
+
+            // Calling a second time should hit the ON CONFLICT branch of the
+            // upsert and still commit cleanly through the transaction.
+            let score2 = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score idempotent");
+            assert_eq!(score2.repository_id, repo_id);
+            assert_eq!(score2.id, score.id);
+            let repo_id = insert_test_repo(&pool).await;
+
+            // Empty repo (no artifacts, no findings) is a valid input — the
+            // counts query returns zeros, last_scan_at is None, and the
+            // upsert lands a 100/A score row. That fully traverses the
+            // transaction's three queries plus the commit.
+            let score = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score");
+
+            assert_eq!(score.repository_id, repo_id);
+            assert_eq!(score.score, 100);
+            assert_eq!(score.grade, "A");
+            assert_eq!(score.total_findings, 0);
+            assert_eq!(score.critical_count, 0);
+            assert!(score.last_scan_at.is_none());
+
+            // Calling a second time should hit the ON CONFLICT branch of the
+            // upsert and still commit cleanly through the transaction.
+            let score2 = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate_score idempotent");
+            assert_eq!(score2.repository_id, repo_id);
+            assert_eq!(score2.id, score.id);
 
             cleanup_repo(&pool, repo_id).await;
         }
