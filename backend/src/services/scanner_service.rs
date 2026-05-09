@@ -2617,6 +2617,72 @@ mod tests {
     }
 
     /// TTL constants are sane: hits last much longer than misses, and the
+    /// Round 1 review feedback (#1012 R1): exercise the concurrent-miss
+    /// path where two callers simultaneously see an empty cache, both
+    /// drop the read lock, both probe, then race for the write lock.
+    /// The double-checked re-check under the write lock is supposed to
+    /// prevent the second caller from overwriting the first's still-fresh
+    /// entry. Without this test the re-check branch is unexercised.
+    ///
+    /// Acceptable outcomes:
+    /// - Probe counter is in [1, 2] (deliberate non-single-flight; both
+    ///   callers may probe before either finishes).
+    /// - Both callers return the SAME value (the winner of the write-lock
+    ///   race; the loser discards its `probed` and reads the winner's).
+    #[tokio::test]
+    async fn test_version_cache_concurrent_miss_returns_consistent_value() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cell = Arc::new(VersionCache::default());
+        let probe_count = Arc::new(AtomicUsize::new(0));
+
+        // The probe sleeps briefly so both callers reliably overlap on
+        // the slow path. The returned value is fixed so a passing test
+        // means both callers ended up with the same cache entry.
+        let make_probe = |pc: Arc<AtomicUsize>| {
+            move || {
+                let pc = pc.clone();
+                async move {
+                    pc.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Some("trivy-0.62.1".to_string())
+                }
+            }
+        };
+
+        let a_cell = cell.clone();
+        let a_pc = probe_count.clone();
+        let b_cell = cell.clone();
+        let b_pc = probe_count.clone();
+
+        let (a, b) = tokio::join!(
+            cached_cli_version(&a_cell, make_probe(a_pc)),
+            cached_cli_version(&b_cell, make_probe(b_pc)),
+        );
+
+        assert_eq!(
+            a,
+            Some("trivy-0.62.1".to_string()),
+            "first caller must return the probed value"
+        );
+        assert_eq!(
+            a, b,
+            "concurrent callers MUST observe the same cache entry; \
+             the write-lock re-check ensures whoever loses the write \
+             race reads the winner's value rather than its own probe"
+        );
+
+        let probes = probe_count.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&probes),
+            "expected 1 or 2 probes (deliberate non-single-flight on miss); \
+             observed {}. >2 means the re-check is broken or the cache lost \
+             the just-written entry.",
+            probes
+        );
+    }
+
     /// miss TTL is long enough to dampen probe storms but short enough that
     /// operators see the version field populate within a reasonable window.
     #[test]
