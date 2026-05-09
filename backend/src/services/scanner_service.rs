@@ -487,6 +487,16 @@ pub(crate) async fn capture_cli_version(binary: &str, args: &[&str]) -> Option<S
     capture_cli_version_with_timeout(binary, args, CAPTURE_CLI_VERSION_TIMEOUT).await
 }
 
+/// Maximum bytes of stdout we read from a `--version` invocation.
+///
+/// Legitimate `--version` output is well under 1 KiB across every scanner
+/// we shell out to (Trivy, Grype, OpenSCAP, etc.). 64 KiB is a generous
+/// ceiling that protects against a malicious / compromised binary on
+/// PATH emitting unbounded output and OOM'ing the backend (see #1014).
+/// Bytes beyond the cap are dropped; the version token always lives in
+/// the first line, so a sane binary is unaffected.
+const CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES: u64 = 64 * 1024;
+
 /// Inner implementation of [`capture_cli_version`] parameterized on the
 /// timeout so tests can exercise the elapsed-timeout branch in milliseconds
 /// rather than the full production five-second wait.
@@ -495,11 +505,56 @@ pub(crate) async fn capture_cli_version_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<String> {
-    let fut = tokio::process::Command::new(binary).args(args).output();
-    let output = match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) => return None, // spawn / IO error
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    // Spawn with stdout piped so we can bound the read. `Command::output`
+    // would buffer the entire stdout into memory unconditionally - a
+    // hostile binary printing 1 GiB to stdout would OOM the backend.
+    let mut child = match tokio::process::Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return None, // spawn / IO error
+    };
+
+    // Read at most CAP bytes of stdout; anything beyond is silently
+    // dropped (the child's pipe buffer fills, the child either keeps
+    // writing into a discarded buffer or blocks on SIGPIPE on close -
+    // either way we move on once we have our 64 KiB).
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            // Pipe wasn't set up - kill the child to avoid a leaked process
+            // and treat as a probe failure.
+            let _ = child.kill().await;
+            return None;
+        }
+    };
+    // `AsyncReadExt::take(N)` consumes the reader by value and returns a
+    // `Take<R>` that yields at most N bytes. This is the bound: any
+    // bytes the binary writes beyond N stay in the kernel pipe and are
+    // dropped when the child is killed / exits, never landing in `buf`.
+    let mut limited = stdout.take(CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES);
+    let mut buf = Vec::with_capacity(1024);
+    let read_result = tokio::time::timeout(timeout, limited.read_to_end(&mut buf)).await;
+
+    // Always reap the child to avoid zombies. Use a short remaining-budget
+    // wait; if it has already exited the wait is immediate.
+    let wait_status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+
+    match read_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => return None,
         Err(_) => {
+            // Timeout reading stdout: kill the child if it is still alive.
+            if !matches!(wait_status, Ok(Ok(_))) {
+                let _ = child.kill().await;
+            }
             warn!(
                 binary = binary,
                 timeout_ms = timeout.as_millis() as u64,
@@ -507,12 +562,16 @@ pub(crate) async fn capture_cli_version_with_timeout(
             );
             return None;
         }
-    };
-    if !output.status.success() {
+    }
+
+    // Did the binary exit successfully?
+    let exit_ok = matches!(wait_status, Ok(Ok(s)) if s.success());
+    if !exit_ok {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().next()?.trim();
+
+    let stdout_str = String::from_utf8_lossy(&buf);
+    let line = stdout_str.lines().next()?.trim();
     if line.is_empty() {
         None
     } else {
