@@ -6,8 +6,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::io::AsyncReadExt;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -505,11 +508,16 @@ pub(crate) async fn capture_cli_version_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<String> {
-    use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
+    // Always kill+reap a child before returning so we never leave a
+    // zombie. `child.kill()` on Unix sends SIGKILL but does not reap;
+    // a subsequent `child.wait()` is required.
+    async fn kill_and_reap(child: &mut tokio::process::Child) {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
 
     // Spawn with stdout piped so we can bound the read. `Command::output`
-    // would buffer the entire stdout into memory unconditionally - a
+    // would buffer the entire stdout into memory unconditionally; a
     // hostile binary printing 1 GiB to stdout would OOM the backend.
     let mut child = match tokio::process::Command::new(binary)
         .args(args)
@@ -522,39 +530,40 @@ pub(crate) async fn capture_cli_version_with_timeout(
         Err(_) => return None, // spawn / IO error
     };
 
-    // Read at most CAP bytes of stdout; anything beyond is silently
-    // dropped (the child's pipe buffer fills, the child either keeps
-    // writing into a discarded buffer or blocks on SIGPIPE on close -
-    // either way we move on once we have our 64 KiB).
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            // Pipe wasn't set up - kill the child to avoid a leaked process
-            // and treat as a probe failure.
-            let _ = child.kill().await;
+            // Pipe wasn't set up; kill+reap and treat as a probe failure.
+            kill_and_reap(&mut child).await;
             return None;
         }
     };
     // `AsyncReadExt::take(N)` consumes the reader by value and returns a
-    // `Take<R>` that yields at most N bytes. This is the bound: any
-    // bytes the binary writes beyond N stay in the kernel pipe and are
-    // dropped when the child is killed / exits, never landing in `buf`.
+    // `Take<R>` that yields at most N bytes. Any bytes the binary writes
+    // beyond N stay in the kernel pipe and are dropped when the child is
+    // killed (or when its stdout pipe is closed on EOF), never landing in
+    // `buf`. This is the OOM bound from #1014.
     let mut limited = stdout.take(CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES);
     let mut buf = Vec::with_capacity(1024);
     let read_result = tokio::time::timeout(timeout, limited.read_to_end(&mut buf)).await;
 
-    // Always reap the child to avoid zombies. Use a short remaining-budget
-    // wait; if it has already exited the wait is immediate.
-    let wait_status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-
+    // Handle the read outcome BEFORE waiting on the child. Issuing
+    // `child.wait()` concurrently with the read (the previous shape) was
+    // racy: a wait that lost the race against the read would return Err
+    // even when the child later exited cleanly, falsely producing
+    // `exit_ok = false` and a `None` return. See #1014 R1.
     match read_result {
         Ok(Ok(_)) => {}
-        Ok(Err(_)) => return None,
+        Ok(Err(_)) => {
+            // Read I/O error; kill+reap to be safe.
+            kill_and_reap(&mut child).await;
+            return None;
+        }
         Err(_) => {
-            // Timeout reading stdout: kill the child if it is still alive.
-            if !matches!(wait_status, Ok(Ok(_))) {
-                let _ = child.kill().await;
-            }
+            // Read budget exhausted. Kill+reap (the child is still running
+            // - it filled the pipe but we did not drain it fast enough,
+            // or it is stuck before stdout EOF).
+            kill_and_reap(&mut child).await;
             warn!(
                 binary = binary,
                 timeout_ms = timeout.as_millis() as u64,
@@ -564,9 +573,33 @@ pub(crate) async fn capture_cli_version_with_timeout(
         }
     }
 
-    // Did the binary exit successfully?
+    // Detect cap-hit truncation. read_to_end returning at least
+    // CAP bytes means the binary may have more output we did not read,
+    // and the buffer can be a midway split through a non-version line.
+    // A legitimate `--version` invocation never reaches 64 KiB. Treat
+    // this as a probe failure rather than risk parsing garbage. Issue
+    // a debug log so operators can correlate this with a misbehaving
+    // binary on PATH.
+    if buf.len() as u64 >= CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES {
+        tracing::debug!(
+            binary = binary,
+            cap_bytes = CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES,
+            "scanner --version stdout reached cap; treating probe as failure"
+        );
+        kill_and_reap(&mut child).await;
+        return None;
+    }
+
+    // Read drained successfully; now wait for the child to exit. With
+    // stdout already EOF'd this is essentially instantaneous, but bound
+    // it on a small wall-clock budget to defend against a child that
+    // closes stdout but lingers (e.g., stuck on stderr that we redirected
+    // to /dev/null, or on signal handling).
+    let wait_status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     let exit_ok = matches!(wait_status, Ok(Ok(s)) if s.success());
     if !exit_ok {
+        // Child did not exit cleanly; kill+reap before returning.
+        kill_and_reap(&mut child).await;
         return None;
     }
 
@@ -2556,6 +2589,30 @@ mod tests {
         )
         .await;
         assert_eq!(result, None);
+    }
+
+    /// #1014 acceptance test: a binary that emits more than the
+    /// `CAPTURE_CLI_VERSION_STDOUT_CAP_BYTES` cap MUST NOT OOM the
+    /// backend. The implementation bounds the read to 64 KiB via
+    /// `AsyncReadExt::take`, kills the child after the cap is hit, and
+    /// returns `None` (because parsing a midway-truncated buffer would
+    /// risk recording garbage as the scanner_version). The test must
+    /// complete quickly without consuming gigabytes of memory.
+    #[tokio::test]
+    async fn test_capture_cli_version_capped_stdout_returns_none() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            eprintln!("skipping: /bin/sh not present on this host");
+            return;
+        }
+        // `yes` emits "y\n" forever (POSIX). Piping it to `head -c
+        // <large>` would still eventually hit the disk - we want to
+        // hit the in-memory cap. Using `dd if=/dev/zero bs=1024
+        // count=128` gives us 128 KiB of NULs - well past the 64 KiB
+        // cap and produces in milliseconds.
+        let cmd = "dd if=/dev/zero bs=1024 count=128 2>/dev/null";
+        let result =
+            capture_cli_version_with_timeout("/bin/sh", &["-c", cmd], Duration::from_secs(5)).await;
+        assert_eq!(result, None, "binary blowing past the cap must yield None");
     }
 
     /// `capture_cli_version` (the non-timeout-parameterized wrapper) must
