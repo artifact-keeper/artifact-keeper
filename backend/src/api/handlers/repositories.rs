@@ -902,9 +902,8 @@ pub async fn create_repository(
         .await?;
     }
 
-    state.event_bus.emit_for_repo(
+    state.event_bus.emit_repository_event(
         "repository.created",
-        repo.id,
         repo.id,
         Some(auth.username.clone()),
     );
@@ -1111,9 +1110,8 @@ pub async fn update_repository(
 
     let storage_used = service.get_storage_usage(repo.id).await?;
 
-    state.event_bus.emit_for_repo(
+    state.event_bus.emit_repository_event(
         "repository.updated",
-        repo.id,
         repo.id,
         Some(auth.username.clone()),
     );
@@ -1169,9 +1167,8 @@ pub async fn delete_repository(
         cache.remove(&key);
     }
 
-    state.event_bus.emit_for_repo(
+    state.event_bus.emit_repository_event(
         "repository.deleted",
-        repo.id,
         repo.id,
         Some(auth.username.clone()),
     );

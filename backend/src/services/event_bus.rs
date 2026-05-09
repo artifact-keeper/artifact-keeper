@@ -94,7 +94,12 @@ impl EventBus {
     }
 
     /// Like [`EventBus::emit`] but threads an explicit `repository_id` into
-    /// the published event. See #948.
+    /// the published event. Use this when the affected entity is NOT the
+    /// repository itself (e.g., a `user.created` triggered from a
+    /// repo-scoped admin action). For `repository.*` events where the
+    /// entity_id and repository_id coincide, prefer
+    /// [`EventBus::emit_repository_event`] which takes the UUID once.
+    /// See #948.
     pub fn emit_for_repo(
         &self,
         event_type: &str,
@@ -108,6 +113,15 @@ impl EventBus {
             repository_id,
             actor,
         ));
+    }
+
+    /// Convenience for `repository.*` events where the affected entity IS
+    /// the repository. Sets both `entity_id` and `repository_id` to
+    /// `repo_id`, avoiding the visually-duplicated argument at the call
+    /// site that `emit_for_repo(.., repo.id, repo.id, ..)` produces.
+    /// See #948.
+    pub fn emit_repository_event(&self, event_type: &str, repo_id: Uuid, actor: Option<String>) {
+        self.emit_for_repo(event_type, repo_id, repo_id, actor);
     }
 }
 
@@ -304,5 +318,22 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert_eq!(event.repository_id, Some(repo_id));
         assert_eq!(event.entity_id, "u-1");
+    }
+
+    #[tokio::test]
+    async fn emit_repository_event_uses_repo_id_for_both_fields() {
+        // For `repository.*` events the affected entity IS the repository,
+        // so entity_id and repository_id coincide. The shortcut takes the
+        // UUID once.
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let repo_id = Uuid::new_v4();
+
+        bus.emit_repository_event("repository.created", repo_id, Some("alice".into()));
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, "repository.created");
+        assert_eq!(event.entity_id, repo_id.to_string());
+        assert_eq!(event.repository_id, Some(repo_id));
     }
 }
