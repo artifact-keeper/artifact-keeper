@@ -176,6 +176,16 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         crate::error::AppError::NotFound(_) => {
             (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
         }
+        // AppError::Validation here means the request path failed
+        // boundary checks (e.g., #1052 path-traversal validator).
+        // Surface a generic 400 without echoing the validator's reason
+        // string back to the client - those reasons are useful in logs
+        // (above) but become a probe oracle if returned to the caller,
+        // letting an attacker enumerate which characters/segments are
+        // blocked.
+        crate::error::AppError::Validation(_) => {
+            (StatusCode::BAD_REQUEST, "Invalid artifact path").into_response()
+        }
         _ => (
             StatusCode::BAD_GATEWAY,
             format!("Failed to fetch from upstream: {}", e),
@@ -222,7 +232,8 @@ pub async fn proxy_fetch_or_redirect(
     upstream_url: &str,
     path: &str,
 ) -> Result<Response, Response> {
-    let cache_key = ProxyService::cache_storage_key(repo_key, path);
+    let cache_key = ProxyService::cache_storage_key(repo_key, path)
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     let presigned_enabled = state.config.presigned_downloads_enabled;
     let storage_location = StorageLocation {
@@ -1597,10 +1608,15 @@ mod tests {
     }
 
     #[test]
-    fn test_map_proxy_error_validation_becomes_bad_gateway() {
-        let err = crate::error::AppError::Validation("bad input".to_string());
+    fn test_map_proxy_error_validation_becomes_bad_request() {
+        // Per #1107 R1 security review: Validation errors must return a
+        // generic 400 (not 502) so the validator's specific reject reason
+        // is not echoed back to the client as a probe oracle.
+        let err = crate::error::AppError::Validation(
+            "Proxy cache path must not contain `..` segment".to_string(),
+        );
         let response = map_proxy_error("repo-key", "pkg", err);
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     // ── RepoInfo::storage_location tests ───────────────────────────────
