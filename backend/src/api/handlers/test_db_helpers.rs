@@ -89,6 +89,7 @@ fn cfg(storage_path: &str) -> Config {
         rate_limit_auth_per_window: 120,
         rate_limit_api_per_window: 5000,
         rate_limit_search_per_window: 300,
+        rate_limit_presign_per_window: 30,
         rate_limit_window_secs: 60,
         rate_limit_exempt_usernames: Vec::new(),
         rate_limit_exempt_service_accounts: false,
