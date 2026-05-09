@@ -52,6 +52,7 @@ pub fn create_router(state: SharedState) -> Router {
     let upload_limit = state.config.max_upload_size_bytes;
 
     let format_routes = Router::new()
+        .nest("/general", handlers::general::router())
         .nest("/npm", handlers::npm::router())
         .nest("/maven", handlers::maven::router())
         .nest("/pypi", handlers::pypi::router())

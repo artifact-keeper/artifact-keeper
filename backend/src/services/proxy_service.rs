@@ -382,8 +382,17 @@ impl ProxyService {
         }
     }
 
-    /// Build full upstream URL for an artifact path
+    /// Build full upstream URL for an artifact path.
+    ///
+    /// If `path` is already an absolute URL (starts with `http://` or
+    /// `https://`), it is returned unchanged. This lets callers supply URLs
+    /// discovered from upstream index files (e.g. a Helm `index.yaml` entry
+    /// whose `urls` field points to a GitHub Releases download) without
+    /// needing to know whether the URL shares the same origin as `base_url`.
     fn build_upstream_url(base_url: &str, path: &str) -> String {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return path.to_string();
+        }
         let base = base_url.trim_end_matches('/');
         let path = path.trim_start_matches('/');
         format!("{}/{}", base, path)
@@ -1218,6 +1227,41 @@ mod tests {
                 "@scope/package/-/package-1.0.0.tgz"
             ),
             "https://registry.npmjs.org/@scope/package/-/package-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_upstream_url_absolute_https_path() {
+        // Absolute https URL is returned unchanged regardless of base
+        assert_eq!(
+            ProxyService::build_upstream_url(
+                "https://charts.bitnami.com/bitnami",
+                "https://github.com/bitnami/charts/releases/download/nginx-1.0.0/nginx-1.0.0.tgz"
+            ),
+            "https://github.com/bitnami/charts/releases/download/nginx-1.0.0/nginx-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_upstream_url_absolute_http_path() {
+        assert_eq!(
+            ProxyService::build_upstream_url(
+                "https://example.com",
+                "http://other.example.com/chart-1.0.0.tgz"
+            ),
+            "http://other.example.com/chart-1.0.0.tgz"
+        );
+    }
+
+    #[test]
+    fn test_build_upstream_url_absolute_same_origin() {
+        // Absolute URL with the same origin is still returned as-is
+        assert_eq!(
+            ProxyService::build_upstream_url(
+                "https://charts.jetstack.io",
+                "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
+            ),
+            "https://charts.jetstack.io/charts/cert-manager-v1.14.0.tgz"
         );
     }
 

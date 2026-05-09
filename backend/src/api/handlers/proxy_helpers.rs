@@ -398,12 +398,91 @@ pub async fn proxy_fetch_uncached_with_link(
         .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
-/// Resolve virtual repository members and attempt to find an artifact.
-/// Iterates through members by priority, trying local storage first,
-/// then proxy for remote members.
+/// Strategy for fetching an artifact from a single virtual member.
 ///
-/// `local_fetch` should attempt to load from local storage for a given repo_id.
-/// Returns the first successful result, or the last error.
+/// Exposed for unit testing the branching logic in
+/// [`resolve_virtual_download`] without requiring a live database or
+/// proxy service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtualMemberFetchStrategy {
+    /// Query the `artifacts` table via the caller's `local_fetch` closure.
+    ///
+    /// Used for Local and Staging members where the database is the
+    /// source of truth and no cache TTL applies.
+    Local,
+    /// Go through `ProxyService` so that `__cache_meta__.json` is
+    /// consulted and cache TTL is honoured.
+    ///
+    /// Used for Remote members. If `proxy_service` is not available or
+    /// the member has no `upstream_url`, the member is skipped entirely
+    /// (see [`VirtualMemberFetchStrategy::Skip`]).
+    Proxy,
+    /// Skip this member without attempting any fetch.
+    ///
+    /// Produced when a Remote member cannot be proxied because either
+    /// the shared `ProxyService` is absent or the member has no
+    /// upstream URL configured.
+    Skip,
+}
+
+/// Decide how to fetch an artifact from a single virtual member.
+///
+/// Returning [`VirtualMemberFetchStrategy::Local`] for Remote members
+/// would re-introduce the cache TTL bypass that this function exists to
+/// prevent — proxy-cached artifacts are recorded in the `artifacts`
+/// table but the generic local fetchers do not consult
+/// `__cache_meta__.json`, so serving them as "local" would make the
+/// cache effectively immortal.
+pub(crate) fn virtual_member_fetch_strategy(
+    member_type: &RepositoryType,
+    has_proxy_service: bool,
+    has_upstream_url: bool,
+) -> VirtualMemberFetchStrategy {
+    match member_type {
+        RepositoryType::Remote => {
+            if has_proxy_service && has_upstream_url {
+                VirtualMemberFetchStrategy::Proxy
+            } else {
+                VirtualMemberFetchStrategy::Skip
+            }
+        }
+        // Local, Staging, and (defensively) any other type default to
+        // the local DB path. Virtual-as-member is not expected but falls
+        // through to Local here rather than causing infinite recursion.
+        _ => VirtualMemberFetchStrategy::Local,
+    }
+}
+
+/// Resolve virtual repository members and attempt to find an artifact.
+///
+/// Iterates through members in priority order using type-specific fetch
+/// strategies (see [`virtual_member_fetch_strategy`]):
+///
+/// * **Local** / **Staging** members — query the `artifacts` table via
+///   `local_fetch` and read from storage. These repositories are the
+///   authoritative source for their content and have no TTL concept.
+/// * **Remote** members — always go through [`ProxyService`] (never
+///   `local_fetch`). `ProxyService` consults the `__cache_meta__.json`
+///   sidecar in object storage to decide between serving a cached copy
+///   or re-fetching from upstream when the cache has expired.
+///
+/// Previously, this function called `local_fetch` for every member type —
+/// including Remote ones. Because the proxy cache persists an `artifacts`
+/// row for each cached object (for listing / quota accounting), the
+/// generic `local_fetch_by_*` helpers would happily return cached bytes
+/// directly from storage without consulting `__cache_meta__.json`,
+/// silently bypassing the cache TTL. This meant that once an artifact
+/// was cached on behalf of a virtual repository, subsequent requests
+/// never re-validated it against upstream regardless of how much time
+/// had passed. Routing Remote members straight through `proxy_fetch`
+/// restores the expected TTL semantics.
+///
+/// `local_fetch` is still invoked for Local / Staging members because
+/// those do not have a proxy cache and querying the database is the
+/// only way to find their artifacts.
+///
+/// Returns the first successful result, or `NOT_FOUND` if no member
+/// has the artifact.
 pub async fn resolve_virtual_download<F, Fut>(
     db: &PgPool,
     proxy_service: Option<&ProxyService>,
@@ -422,22 +501,32 @@ where
     }
 
     for member in &members {
-        // Try local storage first (works for Local, Staging, and cached Remote)
-        if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
-            return Ok(result);
-        }
+        let strategy = virtual_member_fetch_strategy(
+            &member.repo_type,
+            proxy_service.is_some(),
+            member.upstream_url.is_some(),
+        );
 
-        // If member is remote, try proxy
-        if member.repo_type == RepositoryType::Remote {
-            if let (Some(proxy), Some(upstream_url)) =
-                (proxy_service, member.upstream_url.as_deref())
-            {
-                if let Ok(result) =
-                    proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await
+        match strategy {
+            VirtualMemberFetchStrategy::Proxy => {
+                // Both branches above are guaranteed by `strategy`:
+                // proxy_service and upstream_url must be present.
+                if let (Some(proxy), Some(upstream_url)) =
+                    (proxy_service, member.upstream_url.as_deref())
                 {
+                    if let Ok(result) =
+                        proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await
+                    {
+                        return Ok(result);
+                    }
+                }
+            }
+            VirtualMemberFetchStrategy::Local => {
+                if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
                     return Ok(result);
                 }
             }
+            VirtualMemberFetchStrategy::Skip => {}
         }
     }
 
@@ -3183,5 +3272,94 @@ mod tests {
         assert_eq!(&content2[..], b"abc123");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    // ── virtual_member_fetch_strategy tests ────────────────────────────
+    //
+    // These guard the fix for the virtual-download TTL bypass: Remote
+    // members must go through the proxy service (which consults
+    // __cache_meta__.json), not through local_fetch (which would return
+    // proxy-cached bytes straight from the artifacts table without any
+    // expiry check).
+
+    use super::{virtual_member_fetch_strategy, VirtualMemberFetchStrategy};
+    use crate::models::repository::RepositoryType;
+
+    #[test]
+    fn test_strategy_remote_with_proxy_and_upstream_goes_to_proxy() {
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Remote, true, true),
+            VirtualMemberFetchStrategy::Proxy,
+        );
+    }
+
+    #[test]
+    fn test_strategy_remote_without_proxy_service_is_skipped() {
+        // Without a shared ProxyService we cannot honour TTL at all, so
+        // rather than silently fall back to local_fetch (which would
+        // bypass TTL) we skip the member.
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Remote, false, true),
+            VirtualMemberFetchStrategy::Skip,
+        );
+    }
+
+    #[test]
+    fn test_strategy_remote_without_upstream_url_is_skipped() {
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Remote, true, false),
+            VirtualMemberFetchStrategy::Skip,
+        );
+    }
+
+    #[test]
+    fn test_strategy_remote_without_anything_is_skipped() {
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Remote, false, false),
+            VirtualMemberFetchStrategy::Skip,
+        );
+    }
+
+    #[test]
+    fn test_strategy_local_always_goes_local_regardless_of_proxy() {
+        // Local members don't have a proxy cache; the proxy_service
+        // presence is irrelevant.
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Local, true, true),
+            VirtualMemberFetchStrategy::Local,
+        );
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Local, false, false),
+            VirtualMemberFetchStrategy::Local,
+        );
+    }
+
+    #[test]
+    fn test_strategy_staging_goes_local() {
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Staging, true, true),
+            VirtualMemberFetchStrategy::Local,
+        );
+    }
+
+    #[test]
+    fn test_strategy_virtual_falls_through_to_local() {
+        // Nested virtual repositories are not supported as members, but
+        // if one ever appears we prefer a terminating Local lookup over
+        // infinite proxy recursion.
+        assert_eq!(
+            virtual_member_fetch_strategy(&RepositoryType::Virtual, true, true),
+            VirtualMemberFetchStrategy::Local,
+        );
+    }
+
+    #[test]
+    fn test_strategy_remote_with_only_upstream_no_proxy_skipped() {
+        // Defence-in-depth: confirm that an orphan Remote member (one
+        // with upstream_url set but no shared ProxyService) does not
+        // accidentally fall back to local_fetch.
+        let result = virtual_member_fetch_strategy(&RepositoryType::Remote, false, true);
+        assert_ne!(result, VirtualMemberFetchStrategy::Local);
+        assert_eq!(result, VirtualMemberFetchStrategy::Skip);
     }
 }

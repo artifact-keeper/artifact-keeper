@@ -109,6 +109,7 @@ pub mod curation;
 pub mod debian;
 pub mod dependency_track;
 pub mod events;
+pub mod general;
 pub mod gitlfs;
 pub mod goproxy;
 pub mod groups;

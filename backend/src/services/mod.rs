@@ -1,6 +1,7 @@
 //! Business logic services.
 
 pub mod artifact_label_service;
+pub mod artifact_metadata;
 pub mod artifact_service;
 pub mod artifactory_client;
 pub mod artifactory_import;
