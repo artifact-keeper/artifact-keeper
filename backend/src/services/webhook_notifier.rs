@@ -14,20 +14,27 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Build the freeform `disabled_reason` string written when the retry
+/// loop dead-letters a delivery. Pure helper so the format is unit
+/// tested without needing a Postgres fixture.
+pub fn format_disabled_reason(last_delivery_id: Uuid) -> String {
+    format!(
+        "Auto-disabled after dead-letter (delivery {})",
+        last_delivery_id
+    )
+}
+
 /// Mark a webhook as auto-disabled because its delivery exhausted the
 /// retry budget. Returns `Ok(true)` if the row was actually flipped
 /// (i.e. it was previously enabled), `Ok(false)` if it was already
-/// disabled. Errors propagate to the caller, which logs and continues
-/// — auto-disable failure must not retry the dead-lettered delivery.
+/// disabled. Errors propagate to the caller, which logs and continues;
+/// auto-disable failure must not retry the dead-lettered delivery.
 pub async fn auto_disable_webhook_for_dead_letter(
     db: &PgPool,
     webhook_id: Uuid,
     last_delivery_id: Uuid,
 ) -> std::result::Result<bool, String> {
-    let reason = format!(
-        "Auto-disabled after dead-letter (delivery {})",
-        last_delivery_id
-    );
+    let reason = format_disabled_reason(last_delivery_id);
 
     let result = sqlx::query(
         r#"
@@ -59,10 +66,26 @@ pub async fn auto_disable_webhook_for_dead_letter(
 
 #[cfg(test)]
 mod tests {
-    // The function above issues real SQL; full coverage lives in the
-    // integration test suite (deferred). Pure-function unit testing of
-    // the SQL is not feasible without an embedded-Postgres harness
-    // (#952). Keeping this stub so future tests have a home.
+    use super::*;
+
     #[test]
-    fn module_compiles() {}
+    fn format_disabled_reason_includes_delivery_id() {
+        let id = Uuid::nil();
+        let reason = format_disabled_reason(id);
+        assert!(reason.contains("dead-letter"));
+        assert!(reason.contains(&id.to_string()));
+    }
+
+    #[test]
+    fn format_disabled_reason_is_stable() {
+        let id = Uuid::nil();
+        assert_eq!(format_disabled_reason(id), format_disabled_reason(id));
+    }
+
+    #[test]
+    fn format_disabled_reason_varies_with_delivery_id() {
+        let a = format_disabled_reason(Uuid::nil());
+        let b = format_disabled_reason(Uuid::new_v4());
+        assert_ne!(a, b);
+    }
 }

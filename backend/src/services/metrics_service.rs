@@ -204,4 +204,19 @@ mod tests {
     fn test_set_user_gauge_does_not_panic() {
         set_user_gauge(25);
     }
+
+    #[test]
+    fn test_record_webhook_delivery_enqueued_does_not_panic() {
+        record_webhook_delivery_enqueued("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_record_webhook_delivery_enqueue_failed_does_not_panic() {
+        record_webhook_delivery_enqueue_failed("artifact.uploaded", "db_error");
+    }
+
+    #[test]
+    fn test_record_webhook_dead_letter_does_not_panic() {
+        record_webhook_dead_letter("artifact.uploaded");
+    }
 }
