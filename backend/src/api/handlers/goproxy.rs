@@ -239,7 +239,11 @@ const SUMDB_ALLOWLIST: &[&str] = &["sum.golang.org", "sum.golang.google.cn"];
 
 /// Returns true iff `host` is a permitted upstream sumdb hostname.
 /// Comparison is case-insensitive per RFC 1035.
-fn is_sumdb_host_allowed(host: &str) -> bool {
+///
+/// Visibility is `pub` (not `pub(crate)`) to expose the function to the
+/// `tests/security_regression_tests.rs` integration test, which validates
+/// the GHSA-mc8p-6758-jfp2 host allowlist from outside the crate.
+pub fn is_sumdb_host_allowed(host: &str) -> bool {
     SUMDB_ALLOWLIST
         .iter()
         .any(|allowed| host.eq_ignore_ascii_case(allowed))
