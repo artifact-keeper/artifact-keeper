@@ -2339,7 +2339,7 @@ mod tests {
     #[test]
     fn delivery_headers_emit_signature_when_secret_present() {
         let secrets = ["whsec_a"];
-        let secret_refs: Vec<&str> = secrets.iter().copied().collect();
+        let secret_refs: Vec<&str> = secrets.to_vec();
         let inputs = sample_inputs(&secret_refs, b"{}");
         let h = build_delivery_request_headers(&inputs);
         let sig = header(&h, "X-ArtifactKeeper-Signature").unwrap();
@@ -2352,7 +2352,7 @@ mod tests {
     #[test]
     fn delivery_headers_emit_two_v1_tokens_during_rotation() {
         let secrets = ["whsec_new", "whsec_old"];
-        let secret_refs: Vec<&str> = secrets.iter().copied().collect();
+        let secret_refs: Vec<&str> = secrets.to_vec();
         let inputs = sample_inputs(&secret_refs, b"{}");
         let h = build_delivery_request_headers(&inputs);
         let sig = header(&h, "X-ArtifactKeeper-Signature").unwrap();
