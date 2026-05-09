@@ -75,9 +75,20 @@ if [ -z "$API_KEY" ]; then
   exit 1
 fi
 
-echo "$API_KEY" > "$API_KEY_FILE"
-chmod 644 "$API_KEY_FILE"
-echo "[dtrack-init] API key written to $API_KEY_FILE"
+# Defense-in-depth (#1038): the key file holds an unmasked DT API key.
+# Container isolation prevents cross-container access, but tightening the
+# in-container mode to 0600 (owner read/write only) blocks any in-container
+# unprivileged process or sidecar from reading it. The backend reads the
+# file as the same UID that wrote it, so 0600 is sufficient.
+#
+# Use `umask 077` BEFORE the redirect rather than write-then-chmod so
+# the secret is never briefly readable on disk.
+(
+  umask 077
+  echo "$API_KEY" > "$API_KEY_FILE"
+)
+chmod 600 "$API_KEY_FILE"
+echo "[dtrack-init] API key written to $API_KEY_FILE (mode 0600)"
 
 # Enable NVD API 2.0 mirroring (NIST retired legacy feeds; DTrack 4.10.0+ supports API 2.0)
 echo "[dtrack-init] Enabling NVD API 2.0 vulnerability source..."
