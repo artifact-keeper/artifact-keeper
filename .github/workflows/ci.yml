@@ -346,14 +346,18 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
-        # Pass `-- --ignored` so DB-backed integration tests gated by
-        # `#[ignore = "requires running DB / HTTP server"]` actually
-        # execute now that this job provisions postgres. Without this,
-        # 12+ integration test files (lifecycle_policy_tests,
-        # refresh_token_rotation_tests, meili_reindex_tests,
-        # api_token_cache_flush_tests, grpc_sbom_tests, integration_tests,
-        # etc.) were silently skipped. See #1031.
-        run: cargo test --workspace --test '*' --verbose -- --ignored
+        # Pass `-- --include-ignored` so the integration job runs BOTH
+        # ordinary tests AND tests gated by `#[ignore = "requires
+        # running DB / HTTP server"]`, now that this job provisions
+        # postgres. Without `--include-ignored`, the 12+ integration
+        # test files (lifecycle_policy_tests, refresh_token_rotation_tests,
+        # meili_reindex_tests, api_token_cache_flush_tests, grpc_sbom_tests,
+        # integration_tests, etc.) were silently skipped.
+        #
+        # `-- --ignored` (without `include-`) is a footgun: it would do
+        # the opposite, running ONLY ignored tests and skipping the rest.
+        # See #1031.
+        run: cargo test --workspace --test '*' --verbose -- --include-ignored
 
   # ════════════════════════════════════════════════════════════════════════════
   # SMOKE E2E (Every Push/PR) — self-contained via Docker-in-Docker on ARC
