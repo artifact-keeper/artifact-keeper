@@ -1,5 +1,6 @@
 use serde::Serialize;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 /// A domain event published when entities change.
 #[derive(Debug, Clone, Serialize)]
@@ -9,6 +10,14 @@ pub struct DomainEvent {
     pub event_type: String,
     /// UUID or key of the affected entity
     pub entity_id: String,
+    /// The owning repository, if this event is repo-scoped. Set explicitly
+    /// by the publisher (NOT parsed from `entity_id`) so repo-scoped
+    /// webhook and notification subscriptions can match non-repo events
+    /// (`user.*`, `group.*`, `quality_gate.*`, etc.) whose `entity_id` is
+    /// the affected entity's UUID rather than the owning repo's UUID.
+    /// See #948.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<Uuid>,
     /// Username of the actor who triggered the change
     pub actor: Option<String>,
     /// ISO 8601 timestamp
@@ -16,15 +25,37 @@ pub struct DomainEvent {
 }
 
 impl DomainEvent {
-    /// Create a domain event timestamped to now.
+    /// Create a non-repo-scoped domain event timestamped to now.
+    /// Use [`DomainEvent::now_for_repo`] for events owned by a specific
+    /// repository.
     pub fn now(
         event_type: impl Into<String>,
         entity_id: impl Into<String>,
         actor: Option<String>,
     ) -> Self {
+        Self::now_with_repo(event_type, entity_id, None, actor)
+    }
+
+    /// Create a repo-scoped domain event timestamped to now.
+    pub fn now_for_repo(
+        event_type: impl Into<String>,
+        entity_id: impl Into<String>,
+        repository_id: Uuid,
+        actor: Option<String>,
+    ) -> Self {
+        Self::now_with_repo(event_type, entity_id, Some(repository_id), actor)
+    }
+
+    fn now_with_repo(
+        event_type: impl Into<String>,
+        entity_id: impl Into<String>,
+        repository_id: Option<Uuid>,
+        actor: Option<String>,
+    ) -> Self {
         Self {
             event_type: event_type.into(),
             entity_id: entity_id.into(),
+            repository_id,
             actor,
             timestamp: chrono::Utc::now().to_rfc3339(),
         }
@@ -55,9 +86,42 @@ impl EventBus {
         self.tx.subscribe()
     }
 
-    /// Convenience: create a timestamped domain event and publish it in one call.
+    /// Convenience: create a timestamped non-repo-scoped domain event and
+    /// publish it in one call. Use [`EventBus::emit_for_repo`] for events
+    /// owned by a specific repository so repo-scoped subscriptions match.
     pub fn emit(&self, event_type: &str, entity_id: impl ToString, actor: Option<String>) {
         self.publish(DomainEvent::now(event_type, entity_id.to_string(), actor));
+    }
+
+    /// Like [`EventBus::emit`] but threads an explicit `repository_id` into
+    /// the published event. Use this when the affected entity is NOT the
+    /// repository itself (e.g., a `user.created` triggered from a
+    /// repo-scoped admin action). For `repository.*` events where the
+    /// entity_id and repository_id coincide, prefer
+    /// [`EventBus::emit_repository_event`] which takes the UUID once.
+    /// See #948.
+    pub fn emit_for_repo(
+        &self,
+        event_type: &str,
+        entity_id: impl ToString,
+        repository_id: Uuid,
+        actor: Option<String>,
+    ) {
+        self.publish(DomainEvent::now_for_repo(
+            event_type,
+            entity_id.to_string(),
+            repository_id,
+            actor,
+        ));
+    }
+
+    /// Convenience for `repository.*` events where the affected entity IS
+    /// the repository. Sets both `entity_id` and `repository_id` to
+    /// `repo_id`, avoiding the visually-duplicated argument at the call
+    /// site that `emit_for_repo(.., repo.id, repo.id, ..)` produces.
+    /// See #948.
+    pub fn emit_repository_event(&self, event_type: &str, repo_id: Uuid, actor: Option<String>) {
+        self.emit_for_repo(event_type, repo_id, repo_id, actor);
     }
 }
 
@@ -73,6 +137,7 @@ mod tests {
         bus.publish(DomainEvent {
             event_type: "user.created".into(),
             entity_id: "abc-123".into(),
+            repository_id: None,
             actor: Some("admin".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
         });
@@ -89,6 +154,7 @@ mod tests {
         bus.publish(DomainEvent {
             event_type: "test".into(),
             entity_id: "x".into(),
+            repository_id: None,
             actor: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
         });
@@ -104,6 +170,7 @@ mod tests {
             bus.publish(DomainEvent {
                 event_type: format!("event.{i}"),
                 entity_id: i.to_string(),
+                repository_id: None,
                 actor: None,
                 timestamp: "2026-01-01T00:00:00Z".into(),
             });
@@ -125,6 +192,7 @@ mod tests {
         bus.publish(DomainEvent {
             event_type: "repo.created".into(),
             entity_id: "repo-1".into(),
+            repository_id: None,
             actor: Some("alice".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
         });
@@ -193,11 +261,79 @@ mod tests {
         let event = DomainEvent {
             event_type: "user.deleted".into(),
             entity_id: "u-42".into(),
+            repository_id: None,
             actor: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""type":"user.deleted""#));
         assert!(!json.contains("event_type"));
+    }
+
+    #[test]
+    fn domain_event_now_for_repo_sets_repository_id() {
+        let repo_id = Uuid::new_v4();
+        let event = DomainEvent::now_for_repo("user.created", "u-7", repo_id, None);
+        assert_eq!(event.repository_id, Some(repo_id));
+        assert_eq!(event.event_type, "user.created");
+    }
+
+    #[test]
+    fn domain_event_now_leaves_repository_id_none() {
+        let event = DomainEvent::now("group.deleted", "g-7", None);
+        assert!(event.repository_id.is_none());
+    }
+
+    #[test]
+    fn domain_event_repository_id_omitted_when_none() {
+        // The serde `skip_serializing_if = "Option::is_none"` keeps the
+        // payload backward-compatible for non-repo events.
+        let event = DomainEvent::now("group.deleted", "g-7", None);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("repository_id"));
+    }
+
+    #[test]
+    fn domain_event_repository_id_present_when_set() {
+        let repo_id = Uuid::new_v4();
+        let event = DomainEvent::now_for_repo("repository.created", "r-1", repo_id, None);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("repository_id"));
+        assert!(json.contains(&repo_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn emit_for_repo_threads_repository_id() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let repo_id = Uuid::new_v4();
+
+        bus.emit_for_repo(
+            "user.created",
+            "u-1".to_string(),
+            repo_id,
+            Some("alice".into()),
+        );
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.repository_id, Some(repo_id));
+        assert_eq!(event.entity_id, "u-1");
+    }
+
+    #[tokio::test]
+    async fn emit_repository_event_uses_repo_id_for_both_fields() {
+        // For `repository.*` events the affected entity IS the repository,
+        // so entity_id and repository_id coincide. The shortcut takes the
+        // UUID once.
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let repo_id = Uuid::new_v4();
+
+        bus.emit_repository_event("repository.created", repo_id, Some("alice".into()));
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type, "repository.created");
+        assert_eq!(event.entity_id, repo_id.to_string());
+        assert_eq!(event.repository_id, Some(repo_id));
     }
 }

@@ -179,9 +179,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
     let upload_limit = state.config.max_upload_size_bytes;
 
     // Rate limiters and exemptions, driven by Config fields.
-    let exemptions = Arc::new(RateLimitExemptions::new(
+    let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
         state.config.rate_limit_exempt_usernames.clone(),
         state.config.rate_limit_exempt_service_accounts,
+        state.config.rate_limit_trusted_cidrs.clone(),
     ));
 
     let auth_rate_limiter = Arc::new(RateLimiter::new(

@@ -22,9 +22,13 @@ on:
 permissions:
   contents: read
 
+# Concurrency: keyed by `event_name` + `ref` so push, pull_request, and
+# workflow_dispatch are isolated from each other. `cancel-in-progress` is
+# only true for auto-triggered runs (push / pull_request); a manual run
+# (`workflow_dispatch`) is never cancelled by a subsequent push.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
