@@ -78,6 +78,17 @@ pub struct ProxyService {
 }
 
 impl ProxyService {
+    /// Maximum cache-key length in bytes.
+    ///
+    /// All major object stores cap object key length at 1024 bytes:
+    /// AWS S3 returns 400 `KeyTooLongError` past this limit, Azure Blob
+    /// Storage caps blob names at 1024 chars, and Google Cloud Storage
+    /// likewise enforces 1024 bytes. Filesystem backends typically
+    /// allow longer paths but we hold the line at the lowest common
+    /// denominator so a switch from filesystem to S3 cannot turn an
+    /// existing repo into a broken one (#1044).
+    const MAX_STORAGE_KEY_BYTES: usize = 1024;
+
     /// Create a new proxy service
     pub fn new(db: PgPool, storage: Arc<StorageService>) -> Self {
         let http_client = crate::services::http_client::base_client_builder()
@@ -411,16 +422,44 @@ impl ProxyService {
     /// target from drifting out of sync (#1018).
     pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> Result<String> {
         let trimmed = Self::validate_cache_path(path)?;
-        Ok(format!("proxy-cache/{}/{}/__content__", repo_key, trimmed))
+        let key = format!("proxy-cache/{}/{}/__content__", repo_key, trimmed);
+        Self::check_cache_key_length(repo_key, trimmed)?;
+        Ok(key)
     }
 
     /// Generate storage key for cache metadata
     fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
         let trimmed = Self::validate_cache_path(path)?;
-        Ok(format!(
-            "proxy-cache/{}/{}/__cache_meta__.json",
-            repo_key, trimmed
-        ))
+        let key = format!("proxy-cache/{}/{}/__cache_meta__.json", repo_key, trimmed);
+        Self::check_cache_key_length(repo_key, trimmed)?;
+        Ok(key)
+    }
+
+    /// Reject cache paths whose final formatted key would exceed
+    /// [`Self::MAX_STORAGE_KEY_BYTES`].
+    ///
+    /// Both `cache_storage_key` (`__content__` suffix, 11 chars) and
+    /// `cache_metadata_key` (`__cache_meta__.json` suffix, 19 chars) are
+    /// checked against the *larger* suffix so a path can't slip through
+    /// `cache_storage_key` only to fail when the matching metadata key is
+    /// later derived. Returning `Validation` early keeps the failure local
+    /// to the helper instead of surfacing as an opaque 400/500 from the
+    /// object-store SDK mid-fetch (#1044).
+    fn check_cache_key_length(repo_key: &str, trimmed_path: &str) -> Result<()> {
+        // Worst case suffix is "__cache_meta__.json" (19 bytes).
+        const PREFIX: &str = "proxy-cache/";
+        const WORST_SUFFIX: &str = "__cache_meta__.json";
+        // Two interior '/' separators are added by the format!() calls.
+        let worst_len =
+            PREFIX.len() + repo_key.len() + 1 + trimmed_path.len() + 1 + WORST_SUFFIX.len();
+        if worst_len > Self::MAX_STORAGE_KEY_BYTES {
+            return Err(AppError::Validation(format!(
+                "Proxy cache key exceeds {}-byte object-store limit (would be {} bytes)",
+                Self::MAX_STORAGE_KEY_BYTES,
+                worst_len
+            )));
+        }
+        Ok(())
     }
 
     /// Reject paths that would let a caller escape the proxy cache
@@ -1426,6 +1465,82 @@ mod tests {
         let key1 = ProxyService::cache_storage_key("repo", "path/a").unwrap();
         let key2 = ProxyService::cache_storage_key("repo", "path/b").unwrap();
         assert_ne!(key1, key2);
+    }
+
+    // =======================================================================
+    // Cache-key length cap tests (#1044)
+    //
+    // S3/Azure/GCS all reject object keys longer than 1024 bytes. The
+    // helpers must surface a clean Validation error rather than letting
+    // an over-long key escape and trip the storage backend mid-fetch.
+    // =======================================================================
+
+    #[test]
+    fn test_cache_storage_key_just_under_limit_succeeds() {
+        // Pick a path length that lands the metadata key (worst case)
+        // exactly at MAX_STORAGE_KEY_BYTES. Both helpers should accept it.
+        // metadata key = "proxy-cache/" (12) + repo + "/" (1) + path + "/" (1)
+        //               + "__cache_meta__.json" (19)
+        let repo = "r";
+        let fixed = 12 + repo.len() + 1 + 1 + 19;
+        let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - fixed;
+        let path = "a".repeat(path_len);
+
+        let storage_key = ProxyService::cache_storage_key(repo, &path)
+            .expect("storage key just under limit should succeed");
+        let metadata_key = ProxyService::cache_metadata_key(repo, &path)
+            .expect("metadata key just under limit should succeed");
+
+        assert_eq!(metadata_key.len(), ProxyService::MAX_STORAGE_KEY_BYTES);
+        assert!(storage_key.len() <= ProxyService::MAX_STORAGE_KEY_BYTES);
+    }
+
+    #[test]
+    fn test_cache_storage_key_just_over_limit_returns_validation() {
+        // Path long enough that even the smaller-suffix storage key
+        // would overflow 1024 bytes. Both helpers must reject.
+        let repo = "r";
+        // storage key fixed bytes: 12 + repo + "/" + "/" + 11 (__content__).
+        let storage_fixed = 12 + repo.len() + 1 + 1 + 11;
+        let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - storage_fixed + 1;
+        let path = "a".repeat(path_len);
+
+        let storage_result = ProxyService::cache_storage_key(repo, &path);
+        let metadata_result = ProxyService::cache_metadata_key(repo, &path);
+
+        assert!(matches!(storage_result, Err(AppError::Validation(_))));
+        assert!(matches!(metadata_result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_when_only_metadata_overflows() {
+        // Construct a path where the storage-suffix key (`__content__`,
+        // 11 bytes) would fit in 1024 but the metadata-suffix key
+        // (`__cache_meta__.json`, 19 bytes) would not. Both helpers must
+        // reject so callers cannot enter a state where storage is
+        // writable but metadata is not.
+        let repo = "r";
+        // storage-only fixed bytes: 12 + repo + "/" + "/" + 11 (__content__) = 26
+        let storage_fixed = 12 + repo.len() + 1 + 1 + 11;
+        // Pick a path length that fits the storage variant but is 1 byte
+        // too long for the metadata variant (which has an 8-byte longer
+        // suffix). Any value in [MAX-storage_fixed-7, MAX-storage_fixed]
+        // works; pick the largest legal storage length.
+        let path_len = ProxyService::MAX_STORAGE_KEY_BYTES - storage_fixed;
+        let path = "a".repeat(path_len);
+
+        // Sanity: the storage key alone fits.
+        let direct_storage_len = storage_fixed + path.len();
+        assert_eq!(direct_storage_len, ProxyService::MAX_STORAGE_KEY_BYTES);
+
+        // But the metadata variant overflows by 8 bytes (suffix delta),
+        // and the helper rejects both because we measure against the
+        // worst-case suffix.
+        let storage_result = ProxyService::cache_storage_key(repo, &path);
+        let metadata_result = ProxyService::cache_metadata_key(repo, &path);
+
+        assert!(matches!(storage_result, Err(AppError::Validation(_))));
+        assert!(matches!(metadata_result, Err(AppError::Validation(_))));
     }
 
     // =======================================================================

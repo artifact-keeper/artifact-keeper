@@ -13,7 +13,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
-use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
@@ -23,6 +22,7 @@ use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
     cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
+    VersionCache,
 };
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
@@ -97,9 +97,10 @@ pub struct IncusScanner {
     trivy_url: String,
     scan_workspace: String,
     /// Lazily-probed version string from `trivy --version`, e.g.
-    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
-    /// not pay an extra subprocess for the version probe.
-    cached_version: OnceCell<Option<String>>,
+    /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
+    /// does not pay an extra subprocess; failed probes expire after 60s so
+    /// the field starts populating once the binary becomes available.
+    cached_version: VersionCache,
 }
 
 impl IncusScanner {
@@ -107,7 +108,7 @@ impl IncusScanner {
         Self {
             trivy_url,
             scan_workspace,
-            cached_version: OnceCell::new(),
+            cached_version: VersionCache::new(),
         }
     }
 
@@ -1106,7 +1107,7 @@ mod tests {
         assert!(report.results[0].vulnerabilities.is_none());
     }
 
-    /// `version()` covers the OnceCell-cached `trivy --version` probe path
+    /// `version()` covers the TTL-backed cached `trivy --version` probe path
     /// for the Incus scanner. The Incus scanner shares the Trivy binary
     /// with `TrivyFsScanner`, so the format is also `trivy-<ver>`. We
     /// tolerate hosts both with and without `trivy` installed; the
@@ -1120,7 +1121,7 @@ mod tests {
         );
         let v1 = scanner.version().await;
         let v2 = scanner.version().await;
-        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        assert_eq!(v1, v2, "VersionCache must return identical value on repeat");
         if let Some(v) = v1 {
             assert!(
                 v.starts_with("trivy-"),

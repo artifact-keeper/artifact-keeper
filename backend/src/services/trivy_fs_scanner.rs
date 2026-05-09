@@ -6,7 +6,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::Path;
-use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
@@ -15,6 +14,7 @@ use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
     cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
+    VersionCache,
 };
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
@@ -22,9 +22,10 @@ pub struct TrivyFsScanner {
     trivy_url: String,
     scan_workspace: String,
     /// Lazily-probed version string from `trivy --version`, e.g.
-    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
-    /// not pay an extra subprocess for the version probe.
-    cached_version: OnceCell<Option<String>>,
+    /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
+    /// does not pay an extra subprocess; failed probes expire after 60s so
+    /// the field starts populating once the binary becomes available.
+    cached_version: VersionCache,
 }
 
 impl TrivyFsScanner {
@@ -32,7 +33,7 @@ impl TrivyFsScanner {
         Self {
             trivy_url,
             scan_workspace,
-            cached_version: OnceCell::new(),
+            cached_version: VersionCache::new(),
         }
     }
 
@@ -324,7 +325,7 @@ mod tests {
         );
     }
 
-    /// `version()` exercises the OnceCell-cached probe path. We do not
+    /// `version()` exercises the TTL-backed cached probe path. We do not
     /// require `trivy` to be installed: the test only asserts the call
     /// returns deterministically (`Some("trivy-...")` when installed,
     /// `None` otherwise) and that subsequent calls return the same value
@@ -339,7 +340,7 @@ mod tests {
         );
         let v1 = scanner.version().await;
         let v2 = scanner.version().await;
-        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        assert_eq!(v1, v2, "VersionCache must return identical value on repeat");
         if let Some(v) = v1 {
             assert!(
                 v.starts_with("trivy-"),

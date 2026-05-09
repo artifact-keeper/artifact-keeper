@@ -10,14 +10,13 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner,
+    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner, VersionCache,
 };
 
 /// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
@@ -65,9 +64,11 @@ pub struct OpenScapScanner {
     profile: String,
     scan_workspace: String,
     /// Lazily-probed version string from the wrapper sidecar's `/health`
-    /// endpoint, e.g. `openscap-1.4.0`. Cached for the scanner's lifetime
-    /// so we do not GET `/health` on every scan.
-    cached_version: OnceCell<Option<String>>,
+    /// endpoint, e.g. `openscap-1.4.0`. Successful probes are cached for an
+    /// hour; failed probes (sidecar starting up, transient network blip)
+    /// expire after 60s so the field starts populating once the sidecar is
+    /// reachable.
+    cached_version: VersionCache,
 }
 
 impl OpenScapScanner {
@@ -82,7 +83,7 @@ impl OpenScapScanner {
             openscap_url,
             profile,
             scan_workspace,
-            cached_version: OnceCell::new(),
+            cached_version: VersionCache::new(),
         }
     }
 
