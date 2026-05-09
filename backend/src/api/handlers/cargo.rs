@@ -1079,14 +1079,25 @@ async fn try_remote_index(
 
 /// Try to resolve a crate index from a virtual repo's member repositories.
 ///
-/// Iterates members in priority order: local index entries first, then upstream
-/// proxy for remote members. Honours each member's `index_upstream_url` from
-/// `repository_config` (falls back to `upstream_url` when absent).
+/// Iterates members in priority order. Dispatch by member type:
+///
+/// * **Remote** — always go through [`ProxyService`] (via `proxy_fetch`) so
+///   that `__cache_meta__.json` governs freshness (default 24 h, per-repo
+///   configurable). This returns the raw upstream sparse-index JSON and
+///   therefore stays in sync with yanks, new releases, and dep changes
+///   whenever the cache expires. Uses each member's `index_upstream_url`
+///   config override when present, falling back to `upstream_url`.
+///
+/// * **Local / Staging** — the `artifacts` table is authoritative for
+///   repos that host crates directly; rebuild the sparse-index lines from
+///   DB rows.
+///
+/// * **Virtual** (nested) — skipped defensively to avoid recursion; not
+///   a supported configuration.
 ///
 /// NOTE: This does not use `resolve_virtual_metadata` because cargo index
-/// resolution interleaves local DB queries with remote proxy fallback per
-/// member, and uses `index_upstream_url` config overrides for the proxy URL.
-/// The shared helper only handles remote members in isolation.
+/// resolution honours `index_upstream_url` config overrides for the proxy
+/// URL, which the shared helper does not know about.
 async fn try_virtual_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1131,52 +1142,30 @@ async fn try_virtual_index(
 
     let index_path = cargo_sparse_index_path_upstream(name_lower);
 
+    // Iterate members in priority order. For each member, pick the lookup
+    // strategy that matches its type:
+    //
+    // * Remote members go straight through the proxy (ProxyService consults
+    //   __cache_meta__.json and re-fetches from upstream when the cache has
+    //   expired). We deliberately skip the DB-rebuild path for Remote members,
+    //   because proxy-cached .crate downloads leave rows in the artifacts
+    //   table; rebuilding the sparse index from those rows would serve a
+    //   stale snapshot that ignores upstream yanks / new releases and never
+    //   re-validates with crates.io. See the PR introducing this change for
+    //   details on the prior bypass.
+    //
+    // * Local and Staging members have no proxy cache; the artifacts table is
+    //   the authoritative source for the crates they host. We build the index
+    //   from their rows exactly as we do for the top-level hosted case.
     for member in &members {
-        // Try building the index from local artifacts first.
-        let rows = sqlx::query(
-            r#"
-            SELECT a.name, a.version, a.checksum_sha256,
-                   am.metadata
-            FROM artifacts a
-            LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-            WHERE a.repository_id = $1
-              AND a.name = $2
-              AND a.is_deleted = false
-            ORDER BY a.created_at ASC
-            "#,
-        )
-        .bind(member.id)
-        .bind(name_lower)
-        .fetch_all(&state.db)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to query artifacts for member {}: {}", member.id, e);
-            Vec::new()
-        });
+        match member.repo_type {
+            RepositoryType::Remote => {
+                let (Some(proxy), Some(upstream_url)) =
+                    (&state.proxy_service, &member.upstream_url)
+                else {
+                    continue;
+                };
 
-        if !rows.is_empty() {
-            let lines: Vec<String> = rows
-                .iter()
-                .map(|row| {
-                    let vers: Option<String> = row.get("version");
-                    let vers = vers.as_deref().unwrap_or("0.0.0");
-                    let cksum: String = row.get("checksum_sha256");
-                    let meta: Option<serde_json::Value> = row.get("metadata");
-                    build_index_entry(name_lower, vers, &cksum, meta.as_ref())
-                })
-                .collect();
-            let body = bytes::Bytes::from(lines.join("\n"));
-            index_cache_set(index_cache, cache_key.to_string(), body.clone());
-            return Some(Ok(index_response(
-                body,
-                Some("application/json".to_string()),
-            )));
-        }
-
-        // For remote members, try the upstream proxy.
-        if member.repo_type == RepositoryType::Remote {
-            if let (Some(proxy), Some(upstream_url)) = (&state.proxy_service, &member.upstream_url)
-            {
                 let base_url = index_url_overrides
                     .get(&member.id)
                     .cloned()
@@ -1194,6 +1183,52 @@ async fn try_virtual_index(
                     index_cache_set(index_cache, cache_key.to_string(), content.clone());
                     return Some(Ok(index_response(content, content_type)));
                 }
+            }
+            RepositoryType::Local | RepositoryType::Staging => {
+                let rows = sqlx::query(
+                    r#"
+                    SELECT a.name, a.version, a.checksum_sha256,
+                           am.metadata
+                    FROM artifacts a
+                    LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+                    WHERE a.repository_id = $1
+                      AND a.name = $2
+                      AND a.is_deleted = false
+                    ORDER BY a.created_at ASC
+                    "#,
+                )
+                .bind(member.id)
+                .bind(name_lower)
+                .fetch_all(&state.db)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to query artifacts for member {}: {}", member.id, e);
+                    Vec::new()
+                });
+
+                if !rows.is_empty() {
+                    let lines: Vec<String> = rows
+                        .iter()
+                        .map(|row| {
+                            let vers: Option<String> = row.get("version");
+                            let vers = vers.as_deref().unwrap_or("0.0.0");
+                            let cksum: String = row.get("checksum_sha256");
+                            let meta: Option<serde_json::Value> = row.get("metadata");
+                            build_index_entry(name_lower, vers, &cksum, meta.as_ref())
+                        })
+                        .collect();
+                    let body = bytes::Bytes::from(lines.join("\n"));
+                    index_cache_set(index_cache, cache_key.to_string(), body.clone());
+                    return Some(Ok(index_response(
+                        body,
+                        Some("application/json".to_string()),
+                    )));
+                }
+            }
+            RepositoryType::Virtual => {
+                // Nested virtuals are not supported and would cause recursion.
+                // Skip defensively rather than attempting a lookup.
+                continue;
             }
         }
     }
