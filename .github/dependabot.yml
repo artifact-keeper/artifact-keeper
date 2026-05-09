@@ -33,3 +33,21 @@ updates:
       - "cargo"
     commit-message:
       prefix: "chore"
+    # The RustCrypto digest 0.10 -> 0.11 ecosystem migration is mid-flight.
+    # Bumping any one of sha2 / hmac / md-5 / sha1 in isolation is not
+    # mergeable: the new versions require digest 0.11, which is not
+    # type-compatible with the digest 0.10 traits the rest of the workspace
+    # (and transitives like rsa, blake2, sqlx, object_store) still use.
+    # See artifact-keeper#844 / #848 for the closed dependabot PRs and the
+    # tracking analysis. Reassess once rsa publishes a sha2 0.11 release
+    # and blake2 reaches 0.11 stable; at that point a single coordinated
+    # bump PR can land sha2 + hmac + md-5 + sha1 together.
+    ignore:
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "md-5"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "sha1"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]

@@ -113,8 +113,12 @@ tonic-build = "0.12"
 # URL parsing and resolution
 url = "2.5"
 
-# XML Digital Signatures (SAML signature verification)
-bergshamra = "0.4"
+# XML Digital Signatures (SAML signature verification).
+# Pinned to 0.3.x: 0.4.0 pulls in `kryptering 0.1.0` (HSM/PKCS11 support),
+# which fails to cross-compile on Windows because it does u64.into() on
+# `cryptoki::types::Ulong`, but `Ulong: From<u32>` only on Windows targets
+# where CK_ULONG = u32. Unblock once kryptering ships a Windows-portable fix.
+bergshamra = "=0.3.1"
 
 # SMTP email delivery
 lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }

@@ -3,6 +3,7 @@
 //! Provides per-IP and per-user rate limiting with configurable limits.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,18 +16,104 @@ use axum::{
 
 use super::auth::AuthExtension;
 
-/// Set of users and service account flags that bypass rate limiting.
+/// A parsed CIDR range used for IP-based rate-limit exemption (#969).
+///
+/// Stored as `(network, prefix_len)` so the membership check is a constant-
+/// time bitmask compare, no allocations. Supports both IPv4 and IPv6.
+#[derive(Debug, Clone, Copy)]
+pub struct CidrRange {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl CidrRange {
+    /// Parse a CIDR string of the form `"10.0.0.0/8"` or `"fc00::/7"`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (addr_str, prefix_str) = s
+            .split_once('/')
+            .ok_or_else(|| format!("missing '/' in CIDR: {}", s))?;
+        let network: IpAddr = addr_str
+            .parse()
+            .map_err(|e| format!("invalid IP '{}': {}", addr_str, e))?;
+        let prefix_len: u8 = prefix_str
+            .parse()
+            .map_err(|e| format!("invalid prefix length '{}': {}", prefix_str, e))?;
+        let max_prefix = match network {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix_len > max_prefix {
+            return Err(format!(
+                "prefix length {} exceeds maximum {} for {}",
+                prefix_len, max_prefix, addr_str
+            ));
+        }
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+
+    /// Whether `ip` falls within this CIDR range.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let net_bits = u32::from(net);
+                let ip_bits = u32::from(ip);
+                let mask = if self.prefix_len == 0 {
+                    0
+                } else {
+                    u32::MAX
+                        .checked_shl(32 - self.prefix_len as u32)
+                        .unwrap_or(0)
+                };
+                (net_bits & mask) == (ip_bits & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let net_bits = u128::from(net);
+                let ip_bits = u128::from(ip);
+                let mask = if self.prefix_len == 0 {
+                    0
+                } else {
+                    u128::MAX
+                        .checked_shl(128 - self.prefix_len as u32)
+                        .unwrap_or(0)
+                };
+                (net_bits & mask) == (ip_bits & mask)
+            }
+            // Mixed family: a v4 CIDR never contains a v6 address (and
+            // vice versa). Operators wanting to cover both must list both.
+            _ => false,
+        }
+    }
+}
+
+/// Set of users, service-account flags, and trusted CIDR ranges that bypass
+/// rate limiting.
 #[derive(Debug, Clone)]
 pub struct RateLimitExemptions {
     pub usernames: HashSet<String>,
     pub exempt_service_accounts: bool,
+    /// IPs in any of these ranges bypass the limiter regardless of auth
+    /// state. Intended for trusted internal callers (sidecar probes,
+    /// service-mesh nodes, in-cluster CI runners). See #969.
+    pub trusted_cidrs: Vec<CidrRange>,
 }
 
 impl RateLimitExemptions {
     pub fn new(usernames: Vec<String>, exempt_service_accounts: bool) -> Self {
+        Self::with_cidrs(usernames, exempt_service_accounts, Vec::new())
+    }
+
+    pub fn with_cidrs(
+        usernames: Vec<String>,
+        exempt_service_accounts: bool,
+        trusted_cidrs: Vec<CidrRange>,
+    ) -> Self {
         Self {
             usernames: usernames.into_iter().collect(),
             exempt_service_accounts,
+            trusted_cidrs,
         }
     }
 
@@ -40,8 +127,13 @@ impl RateLimitExemptions {
         false
     }
 
+    /// Whether `ip` falls within any of the trusted CIDR ranges.
+    pub fn is_trusted_cidr(&self, ip: IpAddr) -> bool {
+        self.trusted_cidrs.iter().any(|cidr| cidr.contains(ip))
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.usernames.is_empty() && !self.exempt_service_accounts
+        self.usernames.is_empty() && !self.exempt_service_accounts && self.trusted_cidrs.is_empty()
     }
 }
 
@@ -152,7 +244,7 @@ pub async fn rate_limit_middleware(
                 .and_then(|opt| opt.clone())
         });
 
-    // Check exemptions before rate limiting
+    // User/service-account exemptions
     if let Some(ref auth) = auth {
         if state.exemptions.is_exempt(auth) {
             let mut response = next.run(request).await;
@@ -160,6 +252,22 @@ pub async fn rate_limit_middleware(
                 response.headers_mut().insert("X-RateLimit-Exempt", value);
             }
             return response;
+        }
+    }
+
+    // Trusted-CIDR exemption (#969). Applies to authed and unauthed
+    // requests alike: a sidecar probe or in-cluster CI runner calling
+    // /api/v1/auth/login from a known internal range bypasses the
+    // limiter so concurrent test pods don't exhaust the auth bucket.
+    if !state.exemptions.trusted_cidrs.is_empty() {
+        if let Some(ip) = extract_client_ip_addr(&request) {
+            if state.exemptions.is_trusted_cidr(ip) {
+                let mut response = next.run(request).await;
+                if let Ok(value) = HeaderValue::from_str("trusted-cidr") {
+                    response.headers_mut().insert("X-RateLimit-Exempt", value);
+                }
+                return response;
+            }
         }
     }
 
@@ -225,29 +333,45 @@ pub async fn rate_limit_middleware(
 /// by the trusted reverse proxy. As a last resort, all unauthenticated
 /// requests share a single bucket.
 fn extract_client_ip(request: &Request) -> String {
-    // Use the actual TCP connection peer address (set by axum's ConnectInfo)
+    if let Some(ip) = extract_client_ip_addr(request) {
+        return format!("ip:{}", ip);
+    }
+    // Fall back to a stringly-typed XFF first-token even when it does NOT
+    // parse as an IpAddr - this preserves pre-#969 bucket behavior for
+    // hostnames or malformed entries (the rate-limit key was always a
+    // String and never required parseability).
+    if let Some(xff) = request.headers().get("x-forwarded-for") {
+        if let Ok(xff_str) = xff.to_str() {
+            if let Some(first) = xff_str.split(',').next() {
+                return format!("ip:{}", first.trim());
+            }
+        }
+    }
+    "ip:unknown".to_string()
+}
+
+/// Extract the client IP as a parsed `IpAddr` for CIDR matching (#969).
+/// Returns `None` if the address cannot be resolved or does not parse.
+fn extract_client_ip_addr(request: &Request) -> Option<IpAddr> {
+    // ConnectInfo: the actual TCP peer.
     if let Some(connect_info) = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
     {
-        return format!("ip:{}", connect_info.0.ip());
+        return Some(connect_info.0.ip());
     }
 
-    // In Kubernetes (no ConnectInfo), fall back to X-Forwarded-For from
-    // trusted ingress controllers. This is safe when the backend sits
-    // behind a known reverse proxy that sets XFF correctly.
+    // X-Forwarded-For from a trusted ingress (Kubernetes deployment).
     if let Some(xff) = request.headers().get("x-forwarded-for") {
         if let Ok(xff_str) = xff.to_str() {
-            if let Some(first_ip) = xff_str.split(',').next() {
-                return format!("ip:{}", first_ip.trim());
+            if let Some(first) = xff_str.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                    return Some(ip);
+                }
             }
         }
     }
-
-    // Last resort: all unauthenticated requests share one bucket.
-    // This is conservative but prevents bypass via header spoofing
-    // in environments without a trusted proxy.
-    "ip:unknown".to_string()
+    None
 }
 
 #[cfg(test)]
@@ -549,5 +673,124 @@ mod tests {
         assert!(ex.is_exempt(&make_auth("ci-bot", false)));
         assert!(ex.is_exempt(&make_auth("deploy-sa", true)));
         assert!(!ex.is_exempt(&make_auth("alice", false)));
+    }
+
+    // ── CIDR parsing & matching (#969) ───────────────────────────────────────
+
+    #[test]
+    fn test_cidr_parse_ipv4() {
+        let cidr = CidrRange::parse("10.0.0.0/8").unwrap();
+        assert_eq!(cidr.prefix_len, 8);
+    }
+
+    #[test]
+    fn test_cidr_parse_ipv6() {
+        let cidr = CidrRange::parse("fc00::/7").unwrap();
+        assert_eq!(cidr.prefix_len, 7);
+    }
+
+    #[test]
+    fn test_cidr_parse_loopback() {
+        assert!(CidrRange::parse("127.0.0.1/32").is_ok());
+        assert!(CidrRange::parse("::1/128").is_ok());
+    }
+
+    #[test]
+    fn test_cidr_parse_rejects_missing_slash() {
+        assert!(CidrRange::parse("10.0.0.0").is_err());
+    }
+
+    #[test]
+    fn test_cidr_parse_rejects_bad_ip() {
+        assert!(CidrRange::parse("not-an-ip/8").is_err());
+    }
+
+    #[test]
+    fn test_cidr_parse_rejects_oversize_prefix() {
+        // /33 is invalid for IPv4
+        assert!(CidrRange::parse("10.0.0.0/33").is_err());
+        // /129 is invalid for IPv6
+        assert!(CidrRange::parse("::/129").is_err());
+    }
+
+    #[test]
+    fn test_cidr_parse_zero_prefix_matches_everything() {
+        // 0.0.0.0/0 must accept any IPv4.
+        let cidr = CidrRange::parse("0.0.0.0/0").unwrap();
+        assert!(cidr.contains("1.2.3.4".parse().unwrap()));
+        assert!(cidr.contains("203.0.113.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cidr_contains_ipv4_in_range() {
+        let cidr = CidrRange::parse("10.0.0.0/8").unwrap();
+        assert!(cidr.contains("10.0.0.1".parse().unwrap()));
+        assert!(cidr.contains("10.255.255.254".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cidr_contains_ipv4_out_of_range() {
+        let cidr = CidrRange::parse("10.0.0.0/8").unwrap();
+        assert!(!cidr.contains("11.0.0.1".parse().unwrap()));
+        assert!(!cidr.contains("192.168.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cidr_contains_ipv6_in_range() {
+        let cidr = CidrRange::parse("fc00::/7").unwrap();
+        assert!(cidr.contains("fc00::1".parse().unwrap()));
+        assert!(cidr.contains("fd12:3456:789a::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cidr_contains_ipv6_out_of_range() {
+        let cidr = CidrRange::parse("fc00::/7").unwrap();
+        assert!(!cidr.contains("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cidr_mixed_family_does_not_match() {
+        // A v4 CIDR never contains a v6 address.
+        let v4 = CidrRange::parse("10.0.0.0/8").unwrap();
+        assert!(!v4.contains("::1".parse().unwrap()));
+        // And vice versa.
+        let v6 = CidrRange::parse("fc00::/7").unwrap();
+        assert!(!v6.contains("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_exemptions_is_trusted_cidr() {
+        let cidrs = vec![
+            CidrRange::parse("10.0.0.0/8").unwrap(),
+            CidrRange::parse("fc00::/7").unwrap(),
+            CidrRange::parse("127.0.0.1/32").unwrap(),
+        ];
+        let ex = RateLimitExemptions::with_cidrs(Vec::new(), false, cidrs);
+
+        assert!(ex.is_trusted_cidr("10.0.0.5".parse().unwrap()));
+        assert!(ex.is_trusted_cidr("fc00::1".parse().unwrap()));
+        assert!(ex.is_trusted_cidr("127.0.0.1".parse().unwrap()));
+        assert!(!ex.is_trusted_cidr("8.8.8.8".parse().unwrap()));
+        assert!(!ex.is_trusted_cidr("2001:db8::1".parse().unwrap()));
+        // 127.0.0.2 is NOT in 127.0.0.1/32 (single host)
+        assert!(!ex.is_trusted_cidr("127.0.0.2".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_exemptions_is_empty_with_only_cidrs() {
+        let ex = RateLimitExemptions::with_cidrs(
+            Vec::new(),
+            false,
+            vec![CidrRange::parse("10.0.0.0/8").unwrap()],
+        );
+        // is_empty must report false when CIDRs are configured, otherwise
+        // the middleware will skip the per-IP check.
+        assert!(!ex.is_empty());
+    }
+
+    #[test]
+    fn test_exemptions_is_empty_truly_empty() {
+        let ex = RateLimitExemptions::with_cidrs(Vec::new(), false, Vec::new());
+        assert!(ex.is_empty());
     }
 }

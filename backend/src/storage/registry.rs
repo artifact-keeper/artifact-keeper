@@ -272,4 +272,73 @@ mod tests {
         let registry = StorageRegistry::new(HashMap::new(), "filesystem".to_string());
         assert_eq!(registry.default_backend(), "filesystem");
     }
+
+    // -- #1054: registry / primary-storage coincidence ------------------------
+    //
+    // `is_cache_fresh` reads via `state.storage` (the global primary backend
+    // built in `main.rs`); the presigned redirect signs against
+    // `state.storage_for_repo(default_location)` which goes through this
+    // registry's `backend_for`. The fast-path / slow-path coincidence relied
+    // on by the proxy fix in #1018 requires those two code paths to resolve
+    // to the same backend. The contract isn't enforced anywhere, so a future
+    // change that adds wrapping/caching in `backend_for` could silently
+    // break it. Pin the contract here.
+
+    #[tokio::test]
+    async fn test_backend_for_default_cloud_returns_same_arc_as_primary() {
+        // Cloud backends (S3, GCS, Azure) are stored as shared `Arc`s in the
+        // registry map. `backend_for(default_location)` must return that
+        // same `Arc` (`Arc::ptr_eq`), not a wrapped or re-instantiated one,
+        // or the freshness probe and the redirect target would point at
+        // different backend objects.
+        let primary: Arc<dyn StorageBackend> = Arc::new(MockBackend::new("s3-primary"));
+        let mut backends: HashMap<String, Arc<dyn StorageBackend>> = HashMap::new();
+        backends.insert("s3-primary".to_string(), primary.clone());
+        let registry = StorageRegistry::new(backends, "s3-primary".to_string());
+
+        let default_location = StorageLocation {
+            backend: registry.default_backend().to_string(),
+            path: "default-path".to_string(),
+        };
+        let resolved = registry.backend_for(&default_location).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&primary, &resolved),
+            "default cloud backend must be the SAME Arc instance as the \
+             primary registered backend, not a wrapped or re-instantiated \
+             one (#1054)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backend_for_default_filesystem_writes_and_reads_coincide() {
+        // Filesystem backends are constructed fresh per `backend_for` call
+        // (see the `if location.backend == "filesystem"` early return), so
+        // `Arc::ptr_eq` is not the right invariant. The behavior contract
+        // is that two `FilesystemStorage` instances pointing at the same
+        // path observe each other's writes. Pin that.
+        use crate::storage::filesystem::FilesystemStorage;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let primary: Arc<dyn StorageBackend> = Arc::new(FilesystemStorage::new(&path));
+        let registry = StorageRegistry::new(HashMap::new(), "filesystem".to_string());
+        let resolved = registry
+            .backend_for(&StorageLocation {
+                backend: "filesystem".to_string(),
+                path: path.clone(),
+            })
+            .unwrap();
+
+        // Write via primary (the freshness-probe path), read via resolved
+        // (the redirect path). They must observe the same bytes.
+        primary
+            .put("coincide-key", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let bytes = resolved.get("coincide-key").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"hello"));
+    }
 }
