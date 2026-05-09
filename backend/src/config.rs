@@ -178,6 +178,14 @@ pub struct Config {
     pub rate_limit_auth_per_window: u32,
     pub rate_limit_api_per_window: u32,
     pub rate_limit_search_per_window: u32,
+    /// Per-IP requests-per-window cap on endpoints that mint presigned
+    /// download URLs. Stricter than the API bucket because the presign
+    /// path is O(1) memory per request: an attacker can issue many
+    /// concurrent requests from a single host without backend memory
+    /// pressure, but each minted URL becomes a separate egress out of
+    /// the storage backend the attacker can drive in parallel. See
+    /// #1053. Env var: `RATE_LIMIT_PRESIGN_PER_MIN`. Default: 30.
+    pub rate_limit_presign_per_window: u32,
     pub rate_limit_window_secs: u64,
     pub rate_limit_exempt_usernames: Vec<String>,
     pub rate_limit_exempt_service_accounts: bool,
@@ -406,6 +414,7 @@ impl Default for Config {
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
             rate_limit_search_per_window: 300,
+            rate_limit_presign_per_window: 30,
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
@@ -545,6 +554,7 @@ impl Config {
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
             rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
+            rate_limit_presign_per_window: env_parse("RATE_LIMIT_PRESIGN_PER_MIN", 30),
             rate_limit_window_secs: env_parse("RATE_LIMIT_WINDOW_SECS", 60),
             rate_limit_exempt_usernames: env::var("RATE_LIMIT_EXEMPT_USERNAMES")
                 .ok()
