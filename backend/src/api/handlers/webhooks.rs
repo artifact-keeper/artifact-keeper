@@ -2409,6 +2409,34 @@ mod tests {
         assert!(v2.contains(&legacy[7..]));
     }
 
+    #[test]
+    fn delivery_headers_skip_non_object_custom_headers() {
+        // headers = JSON array (not an object): the `as_object()` branch
+        // returns None and the loop is skipped without panicking.
+        let custom = serde_json::json!(["X-Stray", "ignored"]);
+        let mut inputs = sample_inputs(&[], b"{}");
+        inputs.custom_headers = Some(&custom);
+        let h = build_delivery_request_headers(&inputs);
+        assert!(header(&h, "X-Stray").is_none());
+        // Required v2 headers are still emitted.
+        assert!(header(&h, "X-ArtifactKeeper-Delivery").is_some());
+    }
+
+    #[test]
+    fn delivery_headers_signature_omitted_when_secrets_slice_empty() {
+        // Sanity duplicate of delivery_headers_omit_signature_when_no_secrets
+        // that explicitly exercises the "no secrets and custom headers
+        // present" combination — covers the join branch where the
+        // signature push is gated but custom-header push is not.
+        let custom = serde_json::json!({"X-Trace": "abc"});
+        let mut inputs = sample_inputs(&[], b"{}");
+        inputs.custom_headers = Some(&custom);
+        let h = build_delivery_request_headers(&inputs);
+        assert_eq!(header(&h, "X-Trace"), Some("abc"));
+        assert!(header(&h, "X-ArtifactKeeper-Signature").is_none());
+        assert!(header(&h, "X-Webhook-Signature").is_none());
+    }
+
     // ---------------- validate_event_version ----------------
 
     #[test]
