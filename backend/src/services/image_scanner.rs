@@ -1,13 +1,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
-use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{cached_trivy_cli_version, Scanner};
+use crate::services::scanner_service::{cached_trivy_cli_version, Scanner, VersionCache};
 
 // Trivy JSON report structures
 #[derive(Debug, Deserialize)]
@@ -53,9 +52,10 @@ pub struct ImageScanner {
     trivy_url: String,
     http: reqwest::Client,
     /// Lazily-probed version string from `trivy --version`, e.g.
-    /// `trivy-0.62.1`. Cached for the scanner's lifetime so each scan does
-    /// not pay an extra subprocess for the version probe.
-    cached_version: OnceCell<Option<String>>,
+    /// `trivy-0.62.1`. Successful probes are cached for an hour so each scan
+    /// does not pay an extra subprocess; failed probes expire after 60s so
+    /// the field starts populating once the binary becomes available.
+    cached_version: VersionCache,
 }
 
 impl ImageScanner {
@@ -66,7 +66,7 @@ impl ImageScanner {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
-            cached_version: OnceCell::new(),
+            cached_version: VersionCache::new(),
         }
     }
 
@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(report.results[0].vulnerabilities.as_ref().unwrap().len(), 1);
     }
 
-    /// `version()` covers the OnceCell-cached `trivy --version` probe path
+    /// `version()` covers the TTL-backed cached `trivy --version` probe path
     /// for the container-image scanner. As with the Trivy filesystem
     /// scanner, we tolerate hosts both with and without `trivy` installed:
     /// the assertion is that repeated calls are cached and that any
@@ -611,7 +611,7 @@ mod tests {
         let scanner = ImageScanner::new("http://localhost:0".to_string());
         let v1 = scanner.version().await;
         let v2 = scanner.version().await;
-        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        assert_eq!(v1, v2, "VersionCache must return identical value on repeat");
         if let Some(v) = v1 {
             assert!(
                 v.starts_with("trivy-"),

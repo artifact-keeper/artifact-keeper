@@ -612,30 +612,117 @@ pub(crate) async fn capture_cli_version_with_timeout(
     }
 }
 
-/// Resolve a scanner's lazily-cached version string, probing once via
-/// `probe` and caching the result in `cell` for the scanner's lifetime.
+/// TTL applied to a successful version probe. Versions only change when the
+/// scanner binary is upgraded, which on long-lived backend pods only happens
+/// at deploy/restart time, so a long hit TTL is safe and cheap.
+pub(crate) const VERSION_CACHE_HIT_TTL: Duration = Duration::from_secs(3600);
+
+/// TTL applied to a failed version probe. A short miss TTL ensures that a
+/// transient probe failure (binary missing on PATH, init container still
+/// pulling, scanner pod momentarily unreachable) is retried promptly so that
+/// the `scan_results.scanner_version` column starts populating as soon as
+/// the operator fixes the underlying issue, without requiring a pod restart.
+pub(crate) const VERSION_CACHE_MISS_TTL: Duration = Duration::from_secs(60);
+
+/// Time-bounded cache for a scanner's CLI version string.
 ///
-/// Concrete `Scanner::version()` impls share this OnceCell + clone pattern;
+/// Replaces the previous `tokio::sync::OnceCell<Option<String>>` cache, which
+/// pinned a `None` result for the entire process lifetime once the first
+/// probe failed. With `VersionCache`, `Some(_)` values are cached for
+/// [`VERSION_CACHE_HIT_TTL`] and `None` values for the much shorter
+/// [`VERSION_CACHE_MISS_TTL`], so transient probe failures are retried.
+#[derive(Debug, Default)]
+pub(crate) struct VersionCache {
+    inner: RwLock<Option<(Instant, Option<String>)>>,
+}
+
+impl VersionCache {
+    /// Create an empty cache. The first call to [`cached_cli_version`] will
+    /// run the probe.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: RwLock::new(None),
+        }
+    }
+
+    /// Test-only: overwrite the cache entry with a stored timestamp computed
+    /// as `Instant::now() - age`. Used to simulate a cache entry that is
+    /// older than `VERSION_CACHE_MISS_TTL` without sleeping for 60s in
+    /// tests.
+    #[cfg(test)]
+    pub(crate) async fn set_with_age(&self, value: Option<String>, age: Duration) {
+        let stored_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        let mut guard = self.inner.write().await;
+        *guard = Some((stored_at, value));
+    }
+
+    /// Test-only: snapshot the current cached value, ignoring TTL.
+    #[cfg(test)]
+    pub(crate) async fn peek(&self) -> Option<Option<String>> {
+        self.inner.read().await.as_ref().map(|(_, v)| v.clone())
+    }
+}
+
+/// Resolve a scanner's lazily-cached version string, probing via `probe`
+/// when the cache is empty or the previous entry has expired.
+///
+/// Concrete `Scanner::version()` impls share this cache + clone pattern;
 /// extracting it here keeps the per-scanner override to a single line and
 /// avoids near-identical method bodies across `trivy_fs_scanner`,
 /// `image_scanner`, `incus_scanner`, `grype_scanner`, and `openscap_scanner`.
-pub(crate) async fn cached_cli_version<F, Fut>(
-    cell: &tokio::sync::OnceCell<Option<String>>,
-    probe: F,
-) -> Option<String>
+///
+/// TTL semantics:
+/// * `Some(version)` is cached for [`VERSION_CACHE_HIT_TTL`].
+/// * `None` is cached for [`VERSION_CACHE_MISS_TTL`] so transient probe
+///   failures (binary not yet on PATH, scanner pod restarting) are retried
+///   without waiting for a backend pod restart.
+pub(crate) async fn cached_cli_version<F, Fut>(cell: &VersionCache, probe: F) -> Option<String>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Option<String>>,
 {
-    cell.get_or_init(probe).await.clone()
+    // Fast path: read lock, check TTL, return cached clone.
+    {
+        let guard = cell.inner.read().await;
+        if let Some((stored_at, ref value)) = *guard {
+            let ttl = if value.is_some() {
+                VERSION_CACHE_HIT_TTL
+            } else {
+                VERSION_CACHE_MISS_TTL
+            };
+            if stored_at.elapsed() < ttl {
+                return value.clone();
+            }
+        }
+    }
+
+    // Slow path: probe outside any lock, then take a write lock.
+    // We accept that two concurrent callers may both race a probe on cache
+    // miss; that is harmless and strictly better than holding a write lock
+    // across an external `Command` invocation that may take seconds.
+    let probed = probe().await;
+    let mut guard = cell.inner.write().await;
+    // Re-check: another writer may have refreshed the cell while we were
+    // probing. Prefer the still-fresh existing entry over our just-probed
+    // value to keep the TTL window stable.
+    if let Some((stored_at, ref value)) = *guard {
+        let ttl = if value.is_some() {
+            VERSION_CACHE_HIT_TTL
+        } else {
+            VERSION_CACHE_MISS_TTL
+        };
+        if stored_at.elapsed() < ttl {
+            return value.clone();
+        }
+    }
+    *guard = Some((Instant::now(), probed.clone()));
+    probed
 }
 
 /// Convenience wrapper around [`cached_cli_version`] for scanners that probe
 /// the Trivy CLI. Returns `Some("trivy-<ver>")` once the CLI has been
 /// probed, or `None` when the binary is missing or its output is unparseable.
-pub(crate) async fn cached_trivy_cli_version(
-    cell: &tokio::sync::OnceCell<Option<String>>,
-) -> Option<String> {
+pub(crate) async fn cached_trivy_cli_version(cell: &VersionCache) -> Option<String> {
     cached_cli_version(cell, || async {
         let raw = capture_cli_version("trivy", &["--version"]).await?;
         format_trivy_version(&raw)
@@ -2393,6 +2480,159 @@ mod tests {
     fn test_format_trivy_version_empty_returns_none() {
         assert_eq!(format_trivy_version(""), None);
         assert_eq!(format_trivy_version("Version:"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // VersionCache TTL semantics (issue #1012)
+    // -----------------------------------------------------------------------
+
+    /// Probe counter helper: lets us assert how many times the probe ran
+    /// across multiple `cached_cli_version` calls.
+    fn counted_probe(
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        result: Option<String>,
+    ) -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> + Send
+    {
+        move || {
+            let counter = counter.clone();
+            let result = result.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                result
+            })
+        }
+    }
+
+    /// First probe returns Some, second call returns the cached Some without
+    /// re-probing. This is the steady-state path: scanners are deployed once
+    /// per pod lifecycle, so re-probing on every scan would be pure waste.
+    #[tokio::test]
+    async fn test_version_cache_caches_some_no_reprobe() {
+        let cache = VersionCache::new();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = counted_probe(counter.clone(), Some("trivy-0.62.1".to_string()));
+
+        let v1 = cached_cli_version(&cache, &probe).await;
+        let v2 = cached_cli_version(&cache, &probe).await;
+
+        assert_eq!(v1, Some("trivy-0.62.1".to_string()));
+        assert_eq!(v2, Some("trivy-0.62.1".to_string()));
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Some(_) entries must be cached for the long TTL; second call should not re-probe"
+        );
+    }
+
+    /// First probe returns None, second call within MISS_TTL returns the
+    /// cached None without re-probing. Demonstrates that we still have a
+    /// cache (we are not hammering the missing binary on every call), just
+    /// with a much shorter TTL than for hits.
+    #[tokio::test]
+    async fn test_version_cache_caches_none_within_miss_ttl() {
+        let cache = VersionCache::new();
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = counted_probe(counter.clone(), None);
+
+        let v1 = cached_cli_version(&cache, &probe).await;
+        let v2 = cached_cli_version(&cache, &probe).await;
+
+        assert_eq!(v1, None);
+        assert_eq!(v2, None);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "None entries must be cached within MISS_TTL; second call should not re-probe"
+        );
+    }
+
+    /// First probe returns None, but after the MISS_TTL elapses the cache
+    /// re-probes. This is the regression test for issue #1012: previously a
+    /// permanent OnceCell stored None forever, so `scan_results.scanner_version`
+    /// stayed NULL until a pod restart. Now, once the operator installs the
+    /// missing binary, the cache picks it up within 60s.
+    #[tokio::test]
+    async fn test_version_cache_reprobes_after_miss_ttl() {
+        let cache = VersionCache::new();
+        // Seed the cache with an aged-out None entry (older than MISS_TTL).
+        cache
+            .set_with_age(None, VERSION_CACHE_MISS_TTL + Duration::from_secs(1))
+            .await;
+        assert_eq!(cache.peek().await, Some(None), "seed must be visible");
+
+        // Now the binary becomes available: probe returns Some.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = counted_probe(counter.clone(), Some("trivy-0.63.0".to_string()));
+
+        let v = cached_cli_version(&cache, &probe).await;
+        assert_eq!(
+            v,
+            Some("trivy-0.63.0".to_string()),
+            "expired None must be replaced by the fresh probe result"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "expired None must trigger a re-probe"
+        );
+
+        // And the new Some is itself cached (no further probing).
+        let v2 = cached_cli_version(&cache, &probe).await;
+        assert_eq!(v2, Some("trivy-0.63.0".to_string()));
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fresh Some must be cached and not re-probed"
+        );
+    }
+
+    /// Sanity check: a Some entry that is older than MISS_TTL but younger
+    /// than HIT_TTL is still served from cache. Hits and misses use
+    /// different TTLs, and we must read the right one.
+    #[tokio::test]
+    async fn test_version_cache_some_survives_past_miss_ttl() {
+        let cache = VersionCache::new();
+        // Stored Some, aged just past MISS_TTL but well under HIT_TTL.
+        cache
+            .set_with_age(
+                Some("trivy-0.62.1".to_string()),
+                VERSION_CACHE_MISS_TTL + Duration::from_secs(5),
+            )
+            .await;
+
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = counted_probe(counter.clone(), Some("trivy-IGNORED".to_string()));
+
+        let v = cached_cli_version(&cache, &probe).await;
+        assert_eq!(
+            v,
+            Some("trivy-0.62.1".to_string()),
+            "Some entries must use the long HIT_TTL, not the short MISS_TTL"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Some entry within HIT_TTL must not trigger a re-probe"
+        );
+    }
+
+    /// TTL constants are sane: hits last much longer than misses, and the
+    /// miss TTL is long enough to dampen probe storms but short enough that
+    /// operators see the version field populate within a reasonable window.
+    #[test]
+    fn test_version_cache_ttl_constants_are_sane() {
+        assert!(
+            VERSION_CACHE_HIT_TTL > VERSION_CACHE_MISS_TTL,
+            "hit TTL must exceed miss TTL"
+        );
+        assert!(
+            VERSION_CACHE_MISS_TTL >= Duration::from_secs(30),
+            "miss TTL must be long enough to avoid hammering a missing binary"
+        );
+        assert!(
+            VERSION_CACHE_MISS_TTL <= Duration::from_secs(300),
+            "miss TTL must be short enough that the column populates promptly after a fix"
+        );
     }
 
     #[test]

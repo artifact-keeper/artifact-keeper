@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::Deserialize;
 use std::path::Path;
-use tokio::sync::OnceCell;
 use tracing::info;
 
 use crate::error::{AppError, Result};
@@ -15,7 +14,7 @@ use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
     cached_cli_version, capture_cli_version, fail_scan, format_grype_version, ScanWorkspace,
-    Scanner,
+    Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -71,16 +70,17 @@ pub struct GrypeArtifact {
 pub struct GrypeScanner {
     scan_workspace: String,
     /// Lazily-probed version string from `grype --version`, e.g.
-    /// `grype-0.83.0`. Cached for the scanner's lifetime so each scan does
-    /// not pay an extra subprocess for the version probe.
-    cached_version: OnceCell<Option<String>>,
+    /// `grype-0.83.0`. Successful probes are cached for an hour so each scan
+    /// does not pay an extra subprocess; failed probes expire after 60s so
+    /// the field starts populating once the binary becomes available.
+    cached_version: VersionCache,
 }
 
 impl GrypeScanner {
     pub fn new(scan_workspace: String) -> Self {
         Self {
             scan_workspace,
-            cached_version: OnceCell::new(),
+            cached_version: VersionCache::new(),
         }
     }
 
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(report.matches[0].artifact.name, "log4j-core");
     }
 
-    /// `version()` exercises the OnceCell-cached `grype --version` probe.
+    /// `version()` exercises the TTL-backed cached `grype --version` probe.
     /// As with the Trivy version test, we accept either Some or None
     /// depending on whether `grype` is installed on the test host: we only
     /// require that repeated calls return the same value (cache fidelity)
@@ -365,7 +365,7 @@ mod tests {
         let scanner = GrypeScanner::new("/tmp/grype-version-cov-test".to_string());
         let v1 = scanner.version().await;
         let v2 = scanner.version().await;
-        assert_eq!(v1, v2, "OnceCell must return identical value on repeat");
+        assert_eq!(v1, v2, "VersionCache must return identical value on repeat");
         if let Some(v) = v1 {
             assert!(
                 v.starts_with("grype-"),
