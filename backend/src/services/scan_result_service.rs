@@ -889,14 +889,32 @@ impl ScanResultService {
 
     /// Get aggregate dashboard summary across all repositories.
     pub async fn get_dashboard_summary(&self) -> Result<DashboardSummary> {
+        // The three finding counts (total / critical / high) all draw from
+        // the same `scan_findings JOIN latest_scans` set, so they are
+        // collapsed into one subquery using FILTER aggregates rather than
+        // three near-identical IN-subqueries.
         let summary = sqlx::query!(
             r#"
+            WITH latest_scans AS (
+                SELECT DISTINCT ON (artifact_id, scan_type) id
+                FROM scan_results
+                WHERE status = 'completed'
+                ORDER BY artifact_id, scan_type,
+                         completed_at DESC NULLS LAST, created_at DESC
+            ),
+            latest_findings AS (
+                SELECT sf.severity, sf.is_acknowledged
+                FROM scan_findings sf
+                JOIN latest_scans ls ON ls.id = sf.scan_result_id
+            )
             SELECT
                 (SELECT COUNT(*) FROM scan_configs WHERE scan_enabled = true) as "repos_with_scanning!",
                 (SELECT COUNT(*) FROM scan_results) as "total_scans!",
-                (SELECT COUNT(*) FROM scan_findings WHERE NOT is_acknowledged) as "total_findings!",
-                (SELECT COUNT(*) FROM scan_findings WHERE severity = 'critical' AND NOT is_acknowledged) as "critical_findings!",
-                (SELECT COUNT(*) FROM scan_findings WHERE severity = 'high' AND NOT is_acknowledged) as "high_findings!",
+                (SELECT COUNT(*) FROM latest_findings WHERE NOT is_acknowledged) as "total_findings!",
+                (SELECT COUNT(*) FROM latest_findings
+                   WHERE severity = 'critical' AND NOT is_acknowledged) as "critical_findings!",
+                (SELECT COUNT(*) FROM latest_findings
+                   WHERE severity = 'high' AND NOT is_acknowledged) as "high_findings!",
                 (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'A') as "repos_grade_a!",
                 (SELECT COUNT(*) FROM repo_security_scores WHERE grade = 'F') as "repos_grade_f!"
             "#,
