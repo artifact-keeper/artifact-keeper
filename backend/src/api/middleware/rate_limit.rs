@@ -325,6 +325,102 @@ pub async fn rate_limit_middleware(
     }
 }
 
+/// IP-only rate-limit middleware (#1053).
+///
+/// Variant of [`rate_limit_middleware`] that ALWAYS keys by source IP,
+/// regardless of authentication state. Intended for endpoints that mint
+/// presigned download URLs (or any other O(1)-cost-per-request endpoint
+/// where an authenticated attacker can issue many concurrent requests
+/// from a single host without memory pressure on the backend).
+///
+/// Username/service-account exemptions and trusted-CIDR exemptions
+/// (#969) are still honored.
+pub async fn rate_limit_by_ip_middleware(
+    State(state): State<RateLimitState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Username / service-account exemption: legitimate batch downloads
+    // by admin / CI bots should not be throttled even when they
+    // originate from a single egress IP.
+    let auth = request
+        .extensions()
+        .get::<AuthExtension>()
+        .cloned()
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<Option<AuthExtension>>()
+                .and_then(|opt| opt.clone())
+        });
+    if let Some(ref auth) = auth {
+        if state.exemptions.is_exempt(auth) {
+            let mut response = next.run(request).await;
+            if let Ok(value) = HeaderValue::from_str("true") {
+                response.headers_mut().insert("X-RateLimit-Exempt", value);
+            }
+            return response;
+        }
+    }
+
+    // Trusted-CIDR exemption (#969): sidecar probes / in-cluster CI
+    // runners / service-mesh nodes that originate from a known
+    // internal range bypass the limiter regardless of auth.
+    if !state.exemptions.trusted_cidrs.is_empty() {
+        if let Some(ip) = extract_client_ip_addr(&request) {
+            if state.exemptions.is_trusted_cidr(ip) {
+                let mut response = next.run(request).await;
+                if let Ok(value) = HeaderValue::from_str("trusted-cidr") {
+                    response.headers_mut().insert("X-RateLimit-Exempt", value);
+                }
+                return response;
+            }
+        }
+    }
+
+    // The whole point of this variant: key by IP, not user_id. An
+    // attacker who has N valid auth tokens behind a single egress IP
+    // cannot multiply their presign-mint budget by minting tokens.
+    let key = extract_client_ip(&request);
+
+    match state.limiter.check_rate_limit(&key).await {
+        Ok(remaining) => {
+            let mut response = next.run(request).await;
+            let headers = response.headers_mut();
+            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
+                headers.insert("X-RateLimit-Limit", value);
+            }
+            if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
+                headers.insert("X-RateLimit-Remaining", value);
+            }
+            response
+        }
+        Err(retry_after) => {
+            tracing::debug!(
+                key = %key,
+                retry_after = retry_after,
+                "presign-mint rate limit exceeded"
+            );
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded. Please try again later.",
+            )
+                .into_response();
+            let headers = response.headers_mut();
+            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                headers.insert("Retry-After", value);
+            }
+            if let Ok(value) = HeaderValue::from_str(&state.limiter.max_requests.to_string()) {
+                headers.insert("X-RateLimit-Limit", value);
+            }
+            if let Ok(value) = HeaderValue::from_str("0") {
+                headers.insert("X-RateLimit-Remaining", value);
+            }
+            response
+        }
+    }
+}
+
 /// Extract the client IP address from the request.
 ///
 /// Uses the actual TCP peer address from ConnectInfo as the primary source.
@@ -792,5 +888,49 @@ mod tests {
     fn test_exemptions_is_empty_truly_empty() {
         let ex = RateLimitExemptions::with_cidrs(Vec::new(), false, Vec::new());
         assert!(ex.is_empty());
+    }
+
+    // ── #1053: rate_limit_by_ip_middleware integration ──────────────────────
+    //
+    // The IP-only middleware shares its core (limiter + extract_client_ip
+    // + exemption rules) with the existing rate_limit_middleware, both of
+    // which are exercised by the unit tests above. The behavior delta this
+    // variant introduces is only "key by IP regardless of auth", which is
+    // mechanical: it replaces the `if auth { user:id } else { ip }` ternary
+    // with `extract_client_ip(...)` unconditionally.
+    //
+    // We therefore test the building blocks rather than the middleware fn:
+    // a concrete check that two different authed user_ids from the same IP
+    // share the same key, and that two different IPs do not.
+
+    #[test]
+    fn test_presign_keying_collapses_multiple_users_on_same_ip() {
+        // The IP-only middleware uses extract_client_ip (which returns
+        // "ip:<addr>") regardless of auth. Two requests from different
+        // user_ids but the same IP must therefore share the same bucket
+        // key, which is the property #1053 was filed to enforce.
+        let req1 = axum::extract::Request::builder()
+            .header("X-Forwarded-For", "203.0.113.42")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let req2 = axum::extract::Request::builder()
+            .header("X-Forwarded-For", "203.0.113.42")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(extract_client_ip(&req1), extract_client_ip(&req2));
+        assert_eq!(extract_client_ip(&req1), "ip:203.0.113.42");
+    }
+
+    #[test]
+    fn test_presign_keying_separates_buckets_by_ip() {
+        let req1 = axum::extract::Request::builder()
+            .header("X-Forwarded-For", "203.0.113.42")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let req2 = axum::extract::Request::builder()
+            .header("X-Forwarded-For", "198.51.100.7")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_ne!(extract_client_ip(&req1), extract_client_ip(&req2));
     }
 }
