@@ -988,16 +988,60 @@ pub(crate) fn has_signing_secret(
     hash_present || enc_present
 }
 
-/// Calculate retry delay in seconds for webhook delivery.
-/// Schedule: 30s, 2m, 15m, 1h, 4h (caps at 4h for attempt >= 5).
+/// V2 retry schedule: 12 attempts, jittered exponential, capped near 24h.
+/// `attempt` is 1-indexed (the attempt number we are scheduling).
+///
+/// Schedule (without jitter): 30s, 1m, 2m, 5m, 10m, 30m, 1h, 2h, 4h, 8h,
+/// 16h, 24h. Total max retry window: ~37h, but most failures resolve in
+/// the first hour. Each computed delay is jittered +/- 20% so a herd of
+/// receivers that all fail at the same instant don't synchronize their
+/// next retry.
 pub(crate) fn webhook_retry_delay_secs(attempt: i32) -> i64 {
+    let base = base_delay_secs(attempt);
+    apply_jitter(base, deterministic_jitter_seed(attempt))
+}
+
+/// Pure base-schedule lookup, exposed for tests so they can pin the
+/// schedule without dealing with jitter randomness.
+pub(crate) fn base_delay_secs(attempt: i32) -> i64 {
     match attempt {
         1 => 30,
-        2 => 120,
-        3 => 900,
-        4 => 3600,
-        _ => 14400,
+        2 => 60,
+        3 => 120,
+        4 => 300,
+        5 => 600,
+        6 => 1_800,
+        7 => 3_600,
+        8 => 7_200,
+        9 => 14_400,
+        10 => 28_800,
+        11 => 57_600,
+        _ => 86_400,
     }
+}
+
+/// Apply +/- 20% jitter to a base delay. A `seed` of 0 returns the base
+/// unchanged so unit tests can opt out of randomness.
+pub(crate) fn apply_jitter(base: i64, seed: u64) -> i64 {
+    if seed == 0 {
+        return base;
+    }
+    let span = (base / 5).max(1);
+    let mag = (seed as i64).rem_euclid(span);
+    let delta = if seed & 1 == 0 { mag } else { -mag };
+    (base + delta).max(1)
+}
+
+/// Cheap PRNG seed used at runtime; tests can pass 0 to disable jitter.
+fn deterministic_jitter_seed(attempt: i32) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos
+        .wrapping_add(attempt as u64)
+        .wrapping_mul(2_654_435_761)
 }
 
 /// Outcome of a webhook delivery retry attempt.
@@ -1636,21 +1680,63 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // webhook_retry_delay_secs
+    // webhook_retry_delay_secs / base_delay_secs / apply_jitter
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_webhook_retry_backoff_schedule() {
-        assert_eq!(webhook_retry_delay_secs(1), 30);
-        assert_eq!(webhook_retry_delay_secs(2), 120);
-        assert_eq!(webhook_retry_delay_secs(3), 900);
-        assert_eq!(webhook_retry_delay_secs(4), 3600);
-        assert_eq!(webhook_retry_delay_secs(5), 14400);
+    fn base_schedule_caps_at_24h() {
+        assert_eq!(base_delay_secs(12), 86_400);
+        assert_eq!(base_delay_secs(99), 86_400);
     }
 
     #[test]
-    fn test_webhook_retry_backoff_capped() {
-        assert_eq!(webhook_retry_delay_secs(10), 14400);
+    fn base_schedule_attempt_1_is_30s() {
+        assert_eq!(base_delay_secs(1), 30);
+    }
+
+    #[test]
+    fn base_schedule_is_monotonically_non_decreasing() {
+        let mut last = 0;
+        for attempt in 1..=12 {
+            let d = base_delay_secs(attempt);
+            assert!(
+                d >= last,
+                "schedule regressed at attempt {}: {} < {}",
+                attempt,
+                d,
+                last
+            );
+            last = d;
+        }
+    }
+
+    #[test]
+    fn jitter_with_zero_seed_is_no_op() {
+        assert_eq!(apply_jitter(600, 0), 600);
+    }
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        let base = 1_000;
+        for seed in 1..200u64 {
+            let v = apply_jitter(base, seed);
+            let delta = (v - base).abs();
+            assert!(
+                delta <= base / 5,
+                "delta {} exceeded 20% of {}",
+                delta,
+                base
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_clamps_to_min_1() {
+        // base=4, seed odd -> potential negative drag; result must stay >= 1.
+        for seed in 1..50u64 {
+            let v = apply_jitter(4, seed);
+            assert!(v >= 1, "jittered delay went below 1 for seed {}", seed);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1673,29 +1759,50 @@ mod tests {
 
     #[test]
     fn test_retry_outcome_retry_first_attempt() {
-        // attempts=0, max=5: new_attempts = 1 < 5 → Retry with delay for attempt 1
-        assert_eq!(
-            determine_retry_outcome(false, 0, 5),
-            RetryOutcome::Retry { delay_secs: 30 }
-        );
+        // attempts=0, max=5: new_attempts = 1 < 5 → Retry with delay for attempt 1.
+        // V2 base is 30s with +/- 20% jitter.
+        match determine_retry_outcome(false, 0, 5) {
+            RetryOutcome::Retry { delay_secs } => {
+                assert!(
+                    (24..=36).contains(&delay_secs),
+                    "delay {} outside attempt-1 jitter window (24..=36)",
+                    delay_secs
+                );
+            }
+            other => panic!("expected Retry, got {:?}", other),
+        }
     }
 
     #[test]
     fn test_retry_outcome_retry_second_attempt() {
-        // attempts=1, max=5: new_attempts = 2 < 5 → Retry with delay for attempt 2
-        assert_eq!(
-            determine_retry_outcome(false, 1, 5),
-            RetryOutcome::Retry { delay_secs: 120 }
-        );
+        // attempts=1, max=5: new_attempts = 2 < 5 → Retry with delay for attempt 2.
+        // V2 base is 60s with +/- 20% jitter.
+        match determine_retry_outcome(false, 1, 5) {
+            RetryOutcome::Retry { delay_secs } => {
+                assert!(
+                    (48..=72).contains(&delay_secs),
+                    "delay {} outside attempt-2 jitter window (48..=72)",
+                    delay_secs
+                );
+            }
+            other => panic!("expected Retry, got {:?}", other),
+        }
     }
 
     #[test]
     fn test_retry_outcome_retry_third_attempt() {
-        // attempts=2, max=5: new_attempts = 3 < 5 → Retry with delay for attempt 3
-        assert_eq!(
-            determine_retry_outcome(false, 2, 5),
-            RetryOutcome::Retry { delay_secs: 900 }
-        );
+        // attempts=2, max=5: new_attempts = 3 < 5 → Retry with delay for attempt 3.
+        // V2 base is 120s with +/- 20% jitter.
+        match determine_retry_outcome(false, 2, 5) {
+            RetryOutcome::Retry { delay_secs } => {
+                assert!(
+                    (96..=144).contains(&delay_secs),
+                    "delay {} outside attempt-3 jitter window (96..=144)",
+                    delay_secs
+                );
+            }
+            other => panic!("expected Retry, got {:?}", other),
+        }
     }
 
     #[test]
