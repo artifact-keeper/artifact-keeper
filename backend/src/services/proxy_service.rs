@@ -114,9 +114,67 @@ impl ProxyService {
         repo_key: &str,
         path: &str,
     ) -> Result<Option<(Bytes, Option<String>)>> {
-        let cache_key = Self::cache_storage_key(repo_key, path);
-        let metadata_key = Self::cache_metadata_key(repo_key, path);
+        let cache_key = Self::cache_storage_key(repo_key, path)?;
+        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
         self.get_cached_artifact(&cache_key, &metadata_key).await
+    }
+
+    /// Metadata-only freshness check for a proxy-cached artifact.
+    ///
+    /// Loads only the cache metadata sidecar (small JSON) and verifies that
+    /// the underlying content object exists in the storage backend. Does
+    /// NOT download the cached body, which is the whole point of a
+    /// metadata-only probe before issuing a presigned redirect (#1018).
+    ///
+    /// Returns `true` only when both:
+    ///   * the metadata exists and has not expired, and
+    ///   * the content object exists in the backing storage.
+    ///
+    /// # Integrity / SHA-256 self-heal divergence (fast vs. slow path)
+    ///
+    /// The slow path (`get_cached_artifact`) recomputes the SHA-256 of the
+    /// cached body and, on mismatch, returns `None` so the caller re-fetches
+    /// from upstream and overwrites the cache entry — i.e. the cache
+    /// self-heals on the next read.
+    ///
+    /// The fast path that this probe gates (presigned redirect to the
+    /// cached object) does **not** download the body and therefore cannot
+    /// recompute the SHA-256. It trusts the storage backend's own
+    /// integrity guarantees (S3/GCS/Azure object checksums, ETags,
+    /// versioning, etc.). Concretely:
+    ///
+    ///   * a SHA-mismatched cache entry served via a presigned URL will
+    ///     **not** be detected or healed until either (a) the next slow-path
+    ///     access of the same key, or (b) the cache TTL expires and the
+    ///     entry is refreshed from upstream;
+    ///   * this matches existing presign+redirect semantics elsewhere in
+    ///     the codebase — presigned URLs have always trusted the storage
+    ///     backend, the proxy cache is no different.
+    ///
+    /// ETag-based revalidation on the fast path is a deliberate follow-up
+    /// (not implemented here) so the #1018 fix stays scoped to "do not
+    /// buffer the body".
+    pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
+        // A path that fails validation cannot have produced a cache entry
+        // we'd want to redirect to anyway: treat it as a miss so the caller
+        // falls through to the slow path / upstream fetch, where the same
+        // validation will surface the error to the client.
+        let Ok(cache_key) = Self::cache_storage_key(repo_key, path) else {
+            return false;
+        };
+        let Ok(metadata_key) = Self::cache_metadata_key(repo_key, path) else {
+            return false;
+        };
+
+        let Ok(Some(metadata)) = self.load_cache_metadata(&metadata_key).await else {
+            return false;
+        };
+        if Utc::now() > metadata.expires_at {
+            return false;
+        }
+        // exists() is a HEAD-equivalent on cloud backends and does not pull
+        // the object body into memory.
+        matches!(self.storage.exists(&cache_key).await, Ok(true))
     }
 
     /// Fetch artifact from upstream, but use `cache_path` instead of
@@ -143,8 +201,8 @@ impl ProxyService {
         })?;
 
         // Cache keys use the caller-supplied cache_path
-        let cache_key = Self::cache_storage_key(&repo.key, cache_path);
-        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path);
+        let cache_key = Self::cache_storage_key(&repo.key, cache_path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, cache_path)?;
 
         // Check if we have a valid cached copy
         if let Some((content, content_type)) =
@@ -206,7 +264,7 @@ impl ProxyService {
             AppError::Config("Remote repository missing upstream_url".to_string())
         })?;
 
-        let metadata_key = Self::cache_metadata_key(&repo.key, path);
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
 
         // Try to load existing cache metadata
         let metadata = match self.load_cache_metadata(&metadata_key).await? {
@@ -286,8 +344,8 @@ impl ProxyService {
 
     /// Invalidate cached artifact
     pub async fn invalidate_cache(&self, repo: &Repository, path: &str) -> Result<()> {
-        let cache_key = Self::cache_storage_key(&repo.key, path);
-        let metadata_key = Self::cache_metadata_key(&repo.key, path);
+        let cache_key = Self::cache_storage_key(&repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
 
         // Delete both content and metadata
         let _ = self.storage.delete(&cache_key).await;
@@ -335,21 +393,94 @@ impl ProxyService {
     /// Uses a `__content__` leaf file to avoid file/directory collisions
     /// when one path is a prefix of another (e.g., npm metadata at `is-odd`
     /// vs tarball at `is-odd/-/is-odd-3.0.1.tgz`).
-    fn cache_storage_key(repo_key: &str, path: &str) -> String {
-        format!(
-            "proxy-cache/{}/{}/__content__",
-            repo_key,
-            path.trim_start_matches('/').trim_end_matches('/')
-        )
+    ///
+    /// Visible to the rest of the crate so that the proxy fast-path in
+    /// `api::handlers::proxy_helpers::proxy_fetch_or_redirect` can sign
+    /// presigned URLs against the *exact* same key the freshness probe
+    /// in `is_cache_fresh` checks. Keeping a single source of truth for
+    /// the key formula prevents the freshness check and the presign
+    /// target from drifting out of sync (#1018).
+    pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> Result<String> {
+        let trimmed = Self::validate_cache_path(path)?;
+        Ok(format!("proxy-cache/{}/{}/__content__", repo_key, trimmed))
     }
 
     /// Generate storage key for cache metadata
-    fn cache_metadata_key(repo_key: &str, path: &str) -> String {
-        format!(
+    fn cache_metadata_key(repo_key: &str, path: &str) -> Result<String> {
+        let trimmed = Self::validate_cache_path(path)?;
+        Ok(format!(
             "proxy-cache/{}/{}/__cache_meta__.json",
-            repo_key,
-            path.trim_start_matches('/').trim_end_matches('/')
-        )
+            repo_key, trimmed
+        ))
+    }
+
+    /// Reject paths that would let a caller escape the proxy cache
+    /// directory or smuggle bytes the storage backend will misinterpret.
+    /// Returns the trimmed path on success.
+    ///
+    /// Storage backends generally reject `..` already (filesystem.rs has
+    /// explicit traversal tests). This is the helper-boundary belt to that
+    /// suspenders so a future call site that bypasses the storage check
+    /// still cannot escape (#1018 R3-7 / #1052).
+    fn validate_cache_path(path: &str) -> Result<&str> {
+        let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+
+        if trimmed.is_empty() {
+            return Err(AppError::Validation(
+                "Proxy cache path must not be empty".to_string(),
+            ));
+        }
+
+        // NUL terminates C strings and is a classic smuggling vector for
+        // storage backends written in C/C++ (e.g. libfuse, native S3 SDK
+        // helpers). Reject early.
+        if trimmed.contains('\0') {
+            return Err(AppError::Validation(
+                "Proxy cache path must not contain NUL bytes".to_string(),
+            ));
+        }
+
+        // Backslash is a Windows path separator. Some object-store SDKs
+        // normalize `\` to `/` before signing URLs; others do not. Either
+        // way, a request like `..\\foo` would otherwise pass the
+        // `..`-segment check (because split('/') leaves it as a single
+        // segment) and only get caught (or worse, miscaught) downstream.
+        // Reject at the boundary.
+        if trimmed.contains('\\') {
+            return Err(AppError::Validation(
+                "Proxy cache path must not contain backslashes".to_string(),
+            ));
+        }
+
+        // Reject any path segment that is exactly `..` or `.`. Substrings
+        // like `..foo` or `foo..bar` are fine (they are just bytes inside a
+        // filename) and reflect legitimate package names.
+        for segment in trimmed.split('/') {
+            if segment == ".." || segment == "." {
+                return Err(AppError::Validation(format!(
+                    "Proxy cache path must not contain `{}` segment",
+                    segment
+                )));
+            }
+            // Empty segments come from `//` which is ambiguous to many
+            // storage backends and should not appear in a normalized path.
+            if segment.is_empty() {
+                return Err(AppError::Validation(
+                    "Proxy cache path must not contain empty segments".to_string(),
+                ));
+            }
+        }
+
+        // C0 control bytes (other than the standard whitespace already
+        // handled by the empty/segment checks) have no place in a cache
+        // path; they confuse log scrapers and some object-store sign URLs.
+        if trimmed.bytes().any(|b| b < 0x20 && b != b'\t') {
+            return Err(AppError::Validation(
+                "Proxy cache path must not contain control characters".to_string(),
+            ));
+        }
+
+        Ok(trimmed)
     }
 
     /// Attempt to retrieve a cached artifact if valid
@@ -1116,7 +1247,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key() {
         assert_eq!(
-            ProxyService::cache_storage_key("maven-central", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar"),
+            ProxyService::cache_storage_key("maven-central", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar").unwrap(),
             "proxy-cache/maven-central/org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar/__content__"
         );
     }
@@ -1124,7 +1255,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_strips_leading_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "/express"),
+            ProxyService::cache_storage_key("npm-proxy", "/express").unwrap(),
             "proxy-cache/npm-proxy/express/__content__"
         );
     }
@@ -1132,7 +1263,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_no_leading_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "express"),
+            ProxyService::cache_storage_key("npm-proxy", "express").unwrap(),
             "proxy-cache/npm-proxy/express/__content__"
         );
     }
@@ -1140,7 +1271,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_scoped_npm_package() {
         assert_eq!(
-            ProxyService::cache_storage_key("npm-proxy", "@types/node/-/node-18.0.0.tgz"),
+            ProxyService::cache_storage_key("npm-proxy", "@types/node/-/node-18.0.0.tgz").unwrap(),
             "proxy-cache/npm-proxy/@types/node/-/node-18.0.0.tgz/__content__"
         );
     }
@@ -1150,7 +1281,8 @@ mod tests {
         let key = ProxyService::cache_storage_key(
             "maven",
             "com/example/group/artifact/1.0/artifact-1.0.pom",
-        );
+        )
+        .unwrap();
         assert!(key.starts_with("proxy-cache/maven/"));
         assert!(key.ends_with("/__content__"));
     }
@@ -1162,7 +1294,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_key() {
         assert_eq!(
-            ProxyService::cache_metadata_key("npm-registry", "express"),
+            ProxyService::cache_metadata_key("npm-registry", "express").unwrap(),
             "proxy-cache/npm-registry/express/__cache_meta__.json"
         );
     }
@@ -1170,7 +1302,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_strips_leading_slash() {
         assert_eq!(
-            ProxyService::cache_metadata_key("repo", "/some/path"),
+            ProxyService::cache_metadata_key("repo", "/some/path").unwrap(),
             "proxy-cache/repo/some/path/__cache_meta__.json"
         );
     }
@@ -1178,7 +1310,7 @@ mod tests {
     #[test]
     fn test_cache_metadata_key_strips_trailing_slash() {
         assert_eq!(
-            ProxyService::cache_metadata_key("pypi-remote", "simple/numpy/"),
+            ProxyService::cache_metadata_key("pypi-remote", "simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
         );
     }
@@ -1186,7 +1318,7 @@ mod tests {
     #[test]
     fn test_cache_storage_key_strips_trailing_slash() {
         assert_eq!(
-            ProxyService::cache_storage_key("pypi-remote", "simple/numpy/"),
+            ProxyService::cache_storage_key("pypi-remote", "simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__content__"
         );
     }
@@ -1194,11 +1326,11 @@ mod tests {
     #[test]
     fn test_cache_keys_strip_both_slashes() {
         assert_eq!(
-            ProxyService::cache_metadata_key("pypi-remote", "/simple/numpy/"),
+            ProxyService::cache_metadata_key("pypi-remote", "/simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__cache_meta__.json"
         );
         assert_eq!(
-            ProxyService::cache_storage_key("pypi-remote", "/simple/numpy/"),
+            ProxyService::cache_storage_key("pypi-remote", "/simple/numpy/").unwrap(),
             "proxy-cache/pypi-remote/simple/numpy/__content__"
         );
     }
@@ -1208,8 +1340,8 @@ mod tests {
         // Both keys should share the same prefix structure
         let repo_key = "npm-proxy";
         let path = "lodash";
-        let storage_key = ProxyService::cache_storage_key(repo_key, path);
-        let metadata_key = ProxyService::cache_metadata_key(repo_key, path);
+        let storage_key = ProxyService::cache_storage_key(repo_key, path).unwrap();
+        let metadata_key = ProxyService::cache_metadata_key(repo_key, path).unwrap();
 
         // Both start with the same prefix
         let storage_prefix = storage_key.rsplit_once('/').unwrap().0;
@@ -1229,8 +1361,9 @@ mod tests {
     fn test_cache_keys_no_file_directory_collision() {
         // Metadata cached at "is-odd" and tarball at "is-odd/-/is-odd-3.0.1.tgz"
         // must not collide (one as file, other needing it as directory)
-        let meta_key = ProxyService::cache_storage_key("npm-proxy", "is-odd");
-        let tarball_key = ProxyService::cache_storage_key("npm-proxy", "is-odd/-/is-odd-3.0.1.tgz");
+        let meta_key = ProxyService::cache_storage_key("npm-proxy", "is-odd").unwrap();
+        let tarball_key =
+            ProxyService::cache_storage_key("npm-proxy", "is-odd/-/is-odd-3.0.1.tgz").unwrap();
 
         // Both should be inside the "is-odd" directory, not at the same level
         assert!(meta_key.contains("is-odd/__content__"));
@@ -1239,22 +1372,119 @@ mod tests {
 
     #[test]
     fn test_cache_keys_different_repos_do_not_collide() {
-        let key1 = ProxyService::cache_storage_key("npm-proxy-1", "express");
-        let key2 = ProxyService::cache_storage_key("npm-proxy-2", "express");
+        let key1 = ProxyService::cache_storage_key("npm-proxy-1", "express").unwrap();
+        let key2 = ProxyService::cache_storage_key("npm-proxy-2", "express").unwrap();
         assert_ne!(key1, key2);
     }
 
     #[test]
     fn test_cache_keys_different_paths_do_not_collide() {
-        let key1 = ProxyService::cache_storage_key("repo", "path/a");
-        let key2 = ProxyService::cache_storage_key("repo", "path/b");
+        let key1 = ProxyService::cache_storage_key("repo", "path/a").unwrap();
+        let key2 = ProxyService::cache_storage_key("repo", "path/b").unwrap();
         assert_ne!(key1, key2);
+    }
+
+    // =======================================================================
+    // Path traversal / sanitization tests (#1052)
+    // =======================================================================
+
+    #[test]
+    fn test_cache_storage_key_rejects_dotdot_segment() {
+        // `../foo` would escape the proxy-cache/<repo>/ namespace.
+        let result = ProxyService::cache_storage_key("npm-proxy", "../etc/passwd");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_dotdot_in_middle() {
+        // `foo/../bar` escapes one level even though there is a leading
+        // legitimate segment.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express/../lodash");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_dot_segment() {
+        // `.` is a no-op on filesystems but ambiguous to object stores.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express/./latest");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_accepts_dotdot_substring() {
+        // `..foo` and `foo..bar` are not segments containing exactly `..`,
+        // they are legitimate filename bytes.
+        assert!(ProxyService::cache_storage_key("npm-proxy", "..foo").is_ok());
+        assert!(ProxyService::cache_storage_key("npm-proxy", "package..tgz").is_ok());
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_nul_byte() {
+        let result = ProxyService::cache_storage_key("npm-proxy", "express\0evil");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_backslash() {
+        // Windows-style separator. `..\\foo` would otherwise pass the `..`
+        // segment check because split('/') leaves it as a single segment,
+        // and some object-store SDKs normalize `\` to `/` before signing.
+        assert!(matches!(
+            ProxyService::cache_storage_key("npm-proxy", "..\\etc\\passwd"),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            ProxyService::cache_storage_key("npm-proxy", "express\\latest"),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_control_chars() {
+        // CR/LF can split log lines and confuse some sign-URL paths.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express\nevil");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_empty_path() {
+        let result = ProxyService::cache_storage_key("npm-proxy", "");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_only_slashes() {
+        let result = ProxyService::cache_storage_key("npm-proxy", "//");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_storage_key_rejects_double_slash() {
+        // `foo//bar` after trim-edges still has an empty middle segment.
+        let result = ProxyService::cache_storage_key("npm-proxy", "express//latest");
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn test_cache_metadata_key_applies_same_validation() {
+        // The metadata helper shares the same validator, so traversal is
+        // rejected on both helpers (preventing a partial bypass where one
+        // path produces a valid metadata key but invalid storage key, or
+        // vice-versa).
+        assert!(matches!(
+            ProxyService::cache_metadata_key("npm-proxy", "../etc/passwd"),
+            Err(AppError::Validation(_))
+        ));
+        assert!(matches!(
+            ProxyService::cache_metadata_key("npm-proxy", "express\0evil"),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]
     fn test_storage_and_metadata_keys_do_not_collide() {
-        let storage = ProxyService::cache_storage_key("repo", "package");
-        let metadata = ProxyService::cache_metadata_key("repo", "package");
+        let storage = ProxyService::cache_storage_key("repo", "package").unwrap();
+        let metadata = ProxyService::cache_metadata_key("repo", "package").unwrap();
         assert_ne!(storage, metadata);
     }
 
@@ -1610,7 +1840,8 @@ mod tests {
         let key = ProxyService::cache_storage_key(
             "my-pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
-        );
+        )
+        .unwrap();
         assert_eq!(
             key,
             "proxy-cache/my-pypi-remote/simple/requests/requests-2.31.0.tar.gz/__content__"
@@ -1622,7 +1853,8 @@ mod tests {
         let key = ProxyService::cache_metadata_key(
             "my-pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
-        );
+        )
+        .unwrap();
         assert_eq!(
             key,
             "proxy-cache/my-pypi-remote/simple/requests/requests-2.31.0.tar.gz/__cache_meta__.json"
@@ -1634,7 +1866,8 @@ mod tests {
         let key = ProxyService::cache_storage_key(
             "pypi-proxy",
             "simple/flask/flask-3.0.0-py3-none-any.whl",
-        );
+        )
+        .unwrap();
         assert!(key.starts_with("proxy-cache/pypi-proxy/simple/flask/"));
         assert!(key.ends_with("/__content__"));
     }
@@ -1644,9 +1877,11 @@ mod tests {
         let pypi_key = ProxyService::cache_storage_key(
             "pypi-remote",
             "simple/requests/requests-2.31.0.tar.gz",
-        );
+        )
+        .unwrap();
         let npm_key =
-            ProxyService::cache_storage_key("npm-remote", "simple/requests/requests-2.31.0.tar.gz");
+            ProxyService::cache_storage_key("npm-remote", "simple/requests/requests-2.31.0.tar.gz")
+                .unwrap();
         assert_ne!(pypi_key, npm_key);
     }
 
@@ -1654,20 +1889,37 @@ mod tests {
 
     #[test]
     fn test_cache_key_with_custom_path_differs_from_fetch_path() {
-        let fetch_path = "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz";
+        // Pre-#1052 this test passed an upstream URL as the path argument,
+        // which produced a cache key embedding `https://...` (an empty
+        // segment from the `//`). The new validator rejects that path
+        // shape on purpose - URLs are not valid cache paths and the
+        // previous behavior was a footgun. The test now exercises the
+        // intended invariant: two well-formed cache_paths produce
+        // distinct cache keys.
+        let upstream_relative = "packages/ab/cd/requests-2.31.0.tar.gz";
         let cache_path = "simple/requests/requests-2.31.0.tar.gz";
-        let fetch_key = ProxyService::cache_storage_key("pypi-remote", fetch_path);
-        let cache_key = ProxyService::cache_storage_key("pypi-remote", cache_path);
+        let fetch_key = ProxyService::cache_storage_key("pypi-remote", upstream_relative).unwrap();
+        let cache_key = ProxyService::cache_storage_key("pypi-remote", cache_path).unwrap();
         assert_ne!(
             fetch_key, cache_key,
-            "cache key should differ from fetch key"
+            "cache key should differ when distinct paths are used"
         );
+
+        // And a URL-shaped path is now an explicit error rather than a
+        // funny-looking cache key.
+        assert!(matches!(
+            ProxyService::cache_storage_key(
+                "pypi-remote",
+                "https://files.pythonhosted.org/packages/ab/cd/requests-2.31.0.tar.gz",
+            ),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]
     fn test_cache_metadata_key_with_custom_path() {
         let cache_path = "simple/numpy/numpy-1.26.0.tar.gz";
-        let key = ProxyService::cache_metadata_key("pypi-remote", cache_path);
+        let key = ProxyService::cache_metadata_key("pypi-remote", cache_path).unwrap();
         assert!(key.contains("pypi-remote"));
         assert!(key.contains("numpy"));
     }
@@ -1697,8 +1949,8 @@ mod tests {
         // as manual cache_storage_key + cache_metadata_key calls
         let repo_key = "test-pypi";
         let path = "simple/flask/flask-3.0.0.tar.gz";
-        let expected_storage = ProxyService::cache_storage_key(repo_key, path);
-        let expected_meta = ProxyService::cache_metadata_key(repo_key, path);
+        let expected_storage = ProxyService::cache_storage_key(repo_key, path).unwrap();
+        let expected_meta = ProxyService::cache_metadata_key(repo_key, path).unwrap();
         // The function internally calls these same methods, so keys should match
         assert!(expected_storage.contains("test-pypi"));
         assert!(expected_meta.contains("test-pypi"));
@@ -2015,5 +2267,193 @@ mod tests {
         assert_eq!(capped, 3600);
         let effective = capped.saturating_mul(9) / 10;
         assert_eq!(effective, 3240);
+    }
+
+    // =======================================================================
+    // is_cache_fresh tests (#1018 R3-2)
+    // =======================================================================
+    //
+    // Direct unit coverage for the metadata-only freshness probe used by the
+    // proxy fast path. The probe is the gate that decides whether the
+    // presigned-redirect short-circuit fires, so any silent regression here
+    // (e.g. the probe always returning true, or accidentally downloading the
+    // body) re-introduces the buffered-download bug behind a different code
+    // path. These tests fix the contract:
+    //   * missing metadata sidecar         -> false
+    //   * expired metadata                 -> false
+    //   * valid metadata, content missing  -> false
+    //   * valid metadata, content present  -> true
+    //
+    // and crucially never invoke `storage.get(...)` on the cached body.
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Programmable storage backend for `is_cache_fresh` tests.
+    ///
+    /// Lets each test wire up just enough behavior:
+    ///   * `metadata` is the JSON bytes returned by `get(metadata_key)`,
+    ///     or `None` to simulate a missing sidecar (`AppError::NotFound`).
+    ///   * `content_exists` is what `exists(content_key)` returns.
+    ///   * `get_calls` records every `get(...)` call so tests can assert
+    ///     the body was never downloaded.
+    struct CacheFreshMock {
+        metadata: Option<Bytes>,
+        content_exists: bool,
+        get_calls: AtomicUsize,
+    }
+
+    impl CacheFreshMock {
+        fn new(metadata: Option<Bytes>, content_exists: bool) -> Self {
+            Self {
+                metadata,
+                content_exists,
+                get_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for CacheFreshMock {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            self.get_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if key.ends_with("__cache_meta__.json") {
+                match &self.metadata {
+                    Some(b) => Ok(b.clone()),
+                    None => Err(AppError::NotFound(key.to_string())),
+                }
+            } else {
+                // Body access on the fast path is forbidden — return
+                // NotFound so accidental hits surface as test failures
+                // rather than fake successes.
+                Err(AppError::NotFound(key.to_string()))
+            }
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            if key.ends_with("__content__") {
+                Ok(self.content_exists)
+            } else {
+                // Metadata sidecar exists iff metadata bytes are present.
+                Ok(self.metadata.is_some())
+            }
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    /// Build a `ProxyService` whose storage is the supplied mock. The DB
+    /// pool is a lazy connection that is never dialed because
+    /// `is_cache_fresh` does not touch the database.
+    fn build_proxy_service_with_storage(
+        storage: Arc<dyn crate::services::storage_service::StorageBackend>,
+    ) -> ProxyService {
+        let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("connect_lazy should not fail");
+        ProxyService::new(pool, Arc::new(StorageService::new(storage)))
+    }
+
+    fn fresh_metadata_bytes() -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at: Utc::now(),
+            upstream_etag: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            content_type: Some("application/octet-stream".to_string()),
+            size_bytes: 42,
+            checksum_sha256: "a".repeat(64),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    fn expired_metadata_bytes() -> Bytes {
+        let metadata = CacheMetadata {
+            cached_at: Utc::now() - chrono::Duration::hours(2),
+            upstream_etag: None,
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            content_type: None,
+            size_bytes: 0,
+            checksum_sha256: String::new(),
+        };
+        Bytes::from(serde_json::to_vec(&metadata).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_metadata_sidecar_missing() {
+        let mock = Arc::new(CacheFreshMock::new(/* metadata = */ None, true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "missing metadata sidecar must yield is_cache_fresh = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_metadata_expired() {
+        let mock = Arc::new(CacheFreshMock::new(Some(expired_metadata_bytes()), true));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "expired metadata (expires_at < now) must yield is_cache_fresh = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_content_missing() {
+        // Metadata is valid and unexpired, but the underlying content
+        // object has been evicted (e.g. lifecycle policy). The freshness
+        // probe must catch this so the fast path does not sign a URL
+        // pointing at a 404.
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(fresh_metadata_bytes()),
+            /* content_exists = */ false,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "valid metadata with missing content object must yield is_cache_fresh = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_true_when_metadata_valid_and_content_exists() {
+        let mock = Arc::new(CacheFreshMock::new(
+            Some(fresh_metadata_bytes()),
+            /* content_exists = */ true,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "valid metadata + existing content must yield is_cache_fresh = true"
+        );
+        // Belt-and-suspenders: the probe must never download the body.
+        // It is only allowed to call `get` on the metadata sidecar.
+        assert_eq!(
+            mock.get_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "is_cache_fresh must read metadata exactly once and never the body"
+        );
     }
 }

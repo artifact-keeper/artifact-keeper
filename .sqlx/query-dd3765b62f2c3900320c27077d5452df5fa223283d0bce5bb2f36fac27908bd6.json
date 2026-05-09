@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)\n            VALUES ($1, $2, $3, 'running', NOW(), $4)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at\n            ",
+  "query": "\n            INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, started_at, checksum_sha256)\n            VALUES ($1, $2, $3, 'running', NOW(), $4)\n            RETURNING id, artifact_id, repository_id, scan_type, status,\n                      findings_count, critical_count, high_count, medium_count, low_count, info_count,\n                      scanner_version, error_message, started_at, completed_at, created_at,\n                      is_reused, source_scan_id\n            ",
   "describe": {
     "columns": [
       {
@@ -82,6 +82,16 @@
         "ordinal": 15,
         "name": "created_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "is_reused",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "source_scan_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -108,8 +118,10 @@
       true,
       true,
       true,
-      false
+      false,
+      false,
+      true
     ]
   },
-  "hash": "6e3e09a17bbfbc1d2c68dd49869f3bc7754c08b886ae9ed0177fcf49b659f2e1"
+  "hash": "dd3765b62f2c3900320c27077d5452df5fa223283d0bce5bb2f36fac27908bd6"
 }

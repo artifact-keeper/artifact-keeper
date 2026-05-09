@@ -741,16 +741,22 @@ async fn npm_local_fetch(
     // Fall back to a pattern that anchors the match on the decoded package
     // name, covering locally published artifacts whose path follows the
     // layout "{package_name}/{version}/{filename}".
-    let pkg_path_prefix = format!("{}/%/", package_name);
+    //
+    // Escape `%` and `_` from user-supplied package_name and filename so
+    // they're treated as literals; the literal `/%/` separator below
+    // remains a wildcard. ESCAPE '\' on the SQL side selects backslash as
+    // the escape character. See `super::escape_like_literal`.
+    let pkg_path_prefix = format!("{}/%/", super::escape_like_literal(package_name));
+    let filename_escaped = super::escape_like_literal(filename);
     let artifact = sqlx::query_as::<_, proxy_helpers::LocalArtifactRow>(
         "SELECT storage_key, content_type, quarantine_status, quarantine_until \
          FROM artifacts \
-         WHERE repository_id = $1 AND path LIKE $2 || $3 AND is_deleted = false \
+         WHERE repository_id = $1 AND path LIKE $2 || $3 ESCAPE '\\' AND is_deleted = false \
          LIMIT 1",
     )
     .bind(repo_id)
     .bind(&pkg_path_prefix)
-    .bind(filename)
+    .bind(&filename_escaped)
     .fetch_optional(db)
     .await
     .map_err(|e| {
@@ -838,14 +844,23 @@ async fn serve_tarball(
     // name in the path match to avoid returning a different package's tarball
     // when two packages share the same filename (e.g. @types/mdurl and mdurl
     // both produce mdurl-2.0.0.tgz).
-    let path_pattern = format!("{}/%/{}", package_name, filename);
+    //
+    // Escape `%` and `_` in user-supplied package_name and filename so they
+    // are treated as literals; the `/%/` separator remains a wildcard.
+    // ESCAPE '\' on the SQL side selects backslash as the escape character.
+    // See `super::escape_like_literal`.
+    let path_pattern = format!(
+        "{}/%/{}",
+        super::escape_like_literal(package_name),
+        super::escape_like_literal(filename)
+    );
     let artifact = sqlx::query!(
         r#"
         SELECT id, path, name, size_bytes, checksum_sha256, storage_key
         FROM artifacts
         WHERE repository_id = $1
           AND is_deleted = false
-          AND path LIKE $2
+          AND path LIKE $2 ESCAPE '\'
         LIMIT 1
         "#,
         repo.id,

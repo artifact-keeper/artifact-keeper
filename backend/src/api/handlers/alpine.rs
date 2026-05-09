@@ -114,7 +114,7 @@ async fn list_alpine_artifacts(
     repository: &str,
     arch: &str,
 ) -> Result<Vec<AlpineArtifact>, Response> {
-    let path_prefix = format!("{}/{}/{}/", branch, repository, arch);
+    let path_prefix = super::escape_path_prefix(&[branch, repository, arch]);
     let rows = sqlx::query!(
         r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
@@ -123,7 +123,7 @@ async fn list_alpine_artifacts(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.path LIKE $2 || '%'
+          AND a.path LIKE $2 || '%' ESCAPE '\'
         ORDER BY a.name, a.created_at DESC
         "#,
         repo_id,
