@@ -156,11 +156,11 @@ async fn fetch_package_entries(
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         WHERE a.repository_id = $1
           AND a.is_deleted = false
-          AND a.path LIKE 'pool/' || $2 || '/%'
+          AND a.path LIKE 'pool/' || $2 || '/%' ESCAPE '\'
         ORDER BY a.name, a.created_at DESC
         "#,
         repo_id,
-        component
+        super::escape_like_literal(component)
     )
     .fetch_all(db)
     .await

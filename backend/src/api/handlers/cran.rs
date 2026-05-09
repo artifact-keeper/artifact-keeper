@@ -199,126 +199,38 @@ async fn download_package(
 ) -> Result<Response, Response> {
     let repo = resolve_cran_repo(&state.db, &repo_key).await?;
 
-    let artifact = sqlx::query!(
-        r#"
-        SELECT id, path, name, version, size_bytes, checksum_sha256, storage_key
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND path LIKE '%/' || $2
-        LIMIT 1
-        "#,
-        repo.id,
-        filename
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Package not found").into_response());
-
-    let artifact = match artifact {
-        Ok(a) => a,
-        Err(not_found) => {
-            if repo.repo_type == RepositoryType::Remote {
-                if let (Some(ref upstream_url), Some(ref proxy)) =
-                    (&repo.upstream_url, &state.proxy_service)
-                {
-                    let upstream_path = format!("src/contrib/{}", filename);
-                    let (content, content_type) = proxy_helpers::proxy_fetch(
-                        proxy,
-                        repo.id,
-                        &repo_key,
-                        upstream_url,
-                        &upstream_path,
-                    )
-                    .await?;
-                    return Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            "Content-Type",
-                            content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                        )
-                        .body(Body::from(content))
-                        .unwrap());
-                }
-            }
-            // Virtual repo: try each member in priority order
-            if repo.repo_type == RepositoryType::Virtual {
-                let db = state.db.clone();
+    let artifact =
+        match proxy_helpers::find_local_by_filename_suffix(&state.db, repo.id, &filename).await? {
+            Some(a) => a,
+            None => {
                 let upstream_path = format!("src/contrib/{}", filename);
-                let vfilename = filename.clone();
-                let (content, content_type) = proxy_helpers::resolve_virtual_download(
-                    &state.db,
-                    state.proxy_service.as_deref(),
-                    repo.id,
-                    &upstream_path,
-                    |member_id, location| {
-                        let db = db.clone();
-                        let state = state.clone();
-                        let vfilename = vfilename.clone();
-                        async move {
-                            proxy_helpers::local_fetch_by_path_suffix(
-                                &db, &state, member_id, &location, &vfilename,
-                            )
-                            .await
-                        }
+                if let Some(resp) = proxy_helpers::try_remote_or_virtual_download(
+                    &state,
+                    &repo,
+                    proxy_helpers::DownloadResponseOpts {
+                        upstream_path: &upstream_path,
+                        virtual_lookup: proxy_helpers::VirtualLookup::PathSuffix(&filename),
+                        default_content_type: "application/octet-stream",
+                        content_disposition_filename: None,
                     },
                 )
-                .await?;
-
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        "Content-Type",
-                        content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-                    )
-                    .header(CONTENT_LENGTH, content.len().to_string())
-                    .body(Body::from(content))
-                    .unwrap());
+                .await?
+                {
+                    return Ok(resp);
+                }
+                return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
             }
-            return Err(not_found);
-        }
-    };
+        };
 
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
-        .await
-        .map_err(|e| e.into_response())?;
-
-    let content = storage.get(&artifact.storage_key).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
-
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
+    proxy_helpers::serve_local_artifact(
+        &state,
+        &repo,
+        artifact.id,
+        &artifact.storage_key,
+        "application/x-gzip",
+        Some(&filename),
     )
-    .execute(&state.db)
-    .await;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/x-gzip")
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", filename),
-        )
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -345,31 +257,17 @@ async fn binary_index(
     )
     .fetch_all(&state.db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     let _ = rversion; // Used for route matching; filtering done via metadata
     let mut index = String::new();
     for a in &artifacts {
-        index.push_str(&format!("Package: {}\n", a.name));
-        index.push_str(&format!(
-            "Version: {}\n",
-            a.version.clone().unwrap_or_default()
-        ));
-        if let Some(deps) = a
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("depends"))
-            .and_then(|v| v.as_str())
-        {
-            index.push_str(&format!("Depends: {}\n", deps));
-        }
-        index.push('\n');
+        write_dcf_record(
+            &mut index,
+            &a.name,
+            a.version.as_deref().unwrap_or_default(),
+            a.metadata.as_ref(),
+        );
     }
 
     Ok(Response::builder()
@@ -378,6 +276,26 @@ async fn binary_index(
         .header(CONTENT_LENGTH, index.len().to_string())
         .body(Body::from(index))
         .unwrap())
+}
+
+/// Append one CRAN DCF "Package/Version/Depends" record (followed by the
+/// blank-line terminator) to `out`. Shared by the source and binary
+/// PACKAGES index builders.
+fn write_dcf_record(
+    out: &mut String,
+    name: &str,
+    version: &str,
+    metadata: Option<&serde_json::Value>,
+) {
+    out.push_str(&format!("Package: {}\n", name));
+    out.push_str(&format!("Version: {}\n", version));
+    if let Some(deps) = metadata
+        .and_then(|m| m.get("depends"))
+        .and_then(|v| v.as_str())
+    {
+        out.push_str(&format!("Depends: {}\n", deps));
+    }
+    out.push('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -418,40 +336,16 @@ async fn upload_package(
 
     let artifact_path = format!("{}/{}/{}", pkg_name, pkg_version, filename);
 
-    // Check for duplicate
-    let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
         repo.id,
-        artifact_path
+        &artifact_path,
+        "Package version already exists",
     )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package version already exists").into_response());
-    }
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
-    // Store the file
     let storage_key = format!("cran/{}/{}/{}", pkg_name, pkg_version, filename);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage error: {}", e),
-        )
-            .into_response()
-    })?;
+    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let pkg_metadata = serde_json::json!({
         "name": pkg_name,
@@ -462,53 +356,24 @@ async fn upload_package(
 
     let size_bytes = body.len() as i64;
 
-    let artifact_id = sqlx::query_scalar!(
-        r#"
-        INSERT INTO artifacts (
-            repository_id, path, name, version, size_bytes,
-            checksum_sha256, content_type, storage_key, uploaded_by
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        RETURNING id
-        "#,
-        repo.id,
-        artifact_path,
-        pkg_name,
-        pkg_version,
-        size_bytes,
-        computed_sha256,
-        "application/x-gzip",
-        storage_key,
-        user_id,
+    let artifact_id = proxy_helpers::insert_artifact(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &artifact_path,
+            name: &pkg_name,
+            version: &pkg_version,
+            size_bytes,
+            checksum_sha256: &computed_sha256,
+            content_type: "application/x-gzip",
+            storage_key: &storage_key,
+            uploaded_by: user_id,
+        },
     )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .await?;
 
-    let _ = sqlx::query!(
-        r#"
-        INSERT INTO artifact_metadata (artifact_id, format, metadata)
-        VALUES ($1, 'cran', $2)
-        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-        "#,
-        artifact_id,
-        pkg_metadata,
-    )
-    .execute(&state.db)
-    .await;
-
-    let _ = sqlx::query!(
-        "UPDATE repositories SET updated_at = NOW() WHERE id = $1",
-        repo.id,
-    )
-    .execute(&state.db)
-    .await;
+    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, "cran", &pkg_metadata)
+        .await;
 
     info!(
         "CRAN upload: {} {} ({}) to repo {}",
@@ -540,30 +405,16 @@ async fn build_source_index(db: &PgPool, repo_id: uuid::Uuid) -> Result<String, 
     )
     .fetch_all(db)
     .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?;
+    .map_err(super::db_err)?;
 
     let mut index = String::new();
     for a in &artifacts {
-        index.push_str(&format!("Package: {}\n", a.name));
-        index.push_str(&format!(
-            "Version: {}\n",
-            a.version.clone().unwrap_or_default()
-        ));
-        if let Some(deps) = a
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("depends"))
-            .and_then(|v| v.as_str())
-        {
-            index.push_str(&format!("Depends: {}\n", deps));
-        }
-        index.push('\n');
+        write_dcf_record(
+            &mut index,
+            &a.name,
+            a.version.as_deref().unwrap_or_default(),
+            a.metadata.as_ref(),
+        );
     }
 
     Ok(index)
@@ -728,5 +579,268 @@ mod tests {
         assert_eq!(metadata["name"], "tidyr");
         assert_eq!(metadata["version"], "1.3.0");
         assert_eq!(metadata["is_binary"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // write_dcf_record — DCF text formatter shared by source + binary index
+    // builders. Pure function, no DB or storage dependencies.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_dcf_record_no_depends() {
+        let mut out = String::new();
+        write_dcf_record(&mut out, "ggplot2", "3.4.0", None);
+        assert_eq!(out, "Package: ggplot2\nVersion: 3.4.0\n\n");
+    }
+
+    #[test]
+    fn test_write_dcf_record_with_depends() {
+        let mut out = String::new();
+        let meta = serde_json::json!({"depends": "R (>= 3.5.0)"});
+        write_dcf_record(&mut out, "dplyr", "1.1.0", Some(&meta));
+        assert_eq!(
+            out,
+            "Package: dplyr\nVersion: 1.1.0\nDepends: R (>= 3.5.0)\n\n"
+        );
+    }
+
+    #[test]
+    fn test_write_dcf_record_metadata_without_depends_field() {
+        let mut out = String::new();
+        let meta = serde_json::json!({"is_binary": false});
+        write_dcf_record(&mut out, "tidyr", "1.3.0", Some(&meta));
+        // `depends` missing → no `Depends:` line.
+        assert_eq!(out, "Package: tidyr\nVersion: 1.3.0\n\n");
+    }
+
+    #[test]
+    fn test_write_dcf_record_depends_must_be_string() {
+        let mut out = String::new();
+        // `depends` present but not a string → no `Depends:` line.
+        let meta = serde_json::json!({"depends": ["R", "tidyr"]});
+        write_dcf_record(&mut out, "x", "0.1", Some(&meta));
+        assert_eq!(out, "Package: x\nVersion: 0.1\n\n");
+    }
+
+    #[test]
+    fn test_write_dcf_record_appends_to_existing() {
+        let mut out = String::from("Package: prior\nVersion: 0.1\n\n");
+        write_dcf_record(&mut out, "next", "0.2", None);
+        assert!(out.starts_with("Package: prior\n"));
+        assert!(out.ends_with("Package: next\nVersion: 0.2\n\n"));
+    }
+
+    #[test]
+    fn test_write_dcf_record_blank_line_terminator() {
+        let mut out = String::new();
+        write_dcf_record(&mut out, "p", "1.0", None);
+        // Records are separated by a blank line for DCF parsers.
+        assert!(out.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_write_dcf_record_empty_version() {
+        let mut out = String::new();
+        write_dcf_record(&mut out, "noversion", "", None);
+        assert_eq!(out, "Package: noversion\nVersion: \n\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed router tests for download_package, upload_package, and
+    // build_source_index. Use the shared `test_db_helpers::Fixture` so this
+    // file does not duplicate the per-test scaffolding.
+    //
+    // No-op without DATABASE_URL; the CI coverage job seeds Postgres so
+    // these run there and instrument the refactored helper-call paths.
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    #[tokio::test]
+    async fn test_cran_download_404_when_artifact_missing_local() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/missing_1.0.0.tar.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_download_serves_local_artifact_when_present() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        tdh::seed_artifact(
+            &f.state,
+            &f.pool,
+            &repo,
+            "cran/dplyr/1.1.0/dplyr_1.1.0.tar.gz",
+            "dplyr/1.1.0/dplyr_1.1.0.tar.gz",
+            "dplyr",
+            "1.1.0",
+            "application/x-gzip",
+            Bytes::from_static(b"fake-r-pkg"),
+            f.user_id,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/dplyr_1.1.0.tar.gz", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"fake-r-pkg");
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_rejects_unauthenticated() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let req = tdh::put(
+            format!("/{}/src/contrib/foo_1.0.tar.gz", f.repo_key),
+            Bytes::from_static(b"data"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_rejects_remote_repo() {
+        let Some(f) = tdh::Fixture::setup("remote", "cran").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/src/contrib/foo_1.0.tar.gz", f.repo_key),
+            Bytes::from_static(b"pkg"),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_rejects_empty_body() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/src/contrib/foo_1.0.tar.gz", f.repo_key),
+            Bytes::new(),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_succeeds_for_hosted() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_with_auth(super::router());
+        let body: Vec<u8> = vec![0u8; 32];
+        let req = tdh::put(
+            format!("/{}/src/contrib/dplyr_1.1.0.tar.gz", f.repo_key),
+            Bytes::from(body),
+        );
+        let (status, _) = tdh::send(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_upload_conflict_returns_409() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app1 = f.router_with_auth(super::router());
+        let body1: Vec<u8> = vec![1u8; 16];
+        let req1 = tdh::put(
+            format!("/{}/src/contrib/dup_1.0.tar.gz", f.repo_key),
+            Bytes::from(body1),
+        );
+        assert_eq!(tdh::send(app1, req1).await.0, StatusCode::OK);
+
+        let app2 = f.router_with_auth(super::router());
+        let body2: Vec<u8> = vec![1u8; 16];
+        let req2 = tdh::put(
+            format!("/{}/src/contrib/dup_1.0.tar.gz", f.repo_key),
+            Bytes::from(body2),
+        );
+        let (status, _) = tdh::send(app2, req2).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_package_index_empty_repo() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_cran_package_index_with_seeded_artifact() {
+        let Some(f) = tdh::Fixture::setup("local", "cran").await else {
+            return;
+        };
+        let id = crate::api::handlers::proxy_helpers::insert_artifact(
+            &f.pool,
+            crate::api::handlers::proxy_helpers::NewArtifact {
+                repository_id: f.repo_id,
+                path: "ggplot2/3.4.0/ggplot2_3.4.0.tar.gz",
+                name: "ggplot2",
+                version: "3.4.0",
+                size_bytes: 50,
+                checksum_sha256: "y",
+                content_type: "application/x-gzip",
+                storage_key: "cran/ggplot2/3.4.0/ggplot2_3.4.0.tar.gz",
+                uploaded_by: f.user_id,
+            },
+        )
+        .await
+        .expect("insert");
+        let meta = serde_json::json!({"depends": "R (>= 3.5.0)"});
+        crate::api::handlers::proxy_helpers::record_artifact_metadata(
+            &f.pool, id, f.repo_id, "cran", &meta,
+        )
+        .await;
+
+        let app = f.router_anon(super::router());
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/src/contrib/PACKAGES", f.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Package: ggplot2"));
+        assert!(text.contains("Version: 3.4.0"));
+        assert!(text.contains("Depends: R (>= 3.5.0)"));
+        f.teardown().await;
     }
 }

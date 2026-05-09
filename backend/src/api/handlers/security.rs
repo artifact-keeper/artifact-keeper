@@ -96,6 +96,16 @@ pub struct TriggerScanRequest {
 pub struct TriggerScanResponse {
     pub message: String,
     pub artifacts_queued: u32,
+    /// Scan result IDs created (one per active scanner) when triggering an
+    /// artifact-level scan. Empty for repository-level scans (where the
+    /// per-artifact rows are created inside the spawned worker) and for
+    /// artifact-level triggers when no scanners are configured.
+    ///
+    /// Clients (and the release-gate test in artifact-keeper-test#58) should
+    /// poll `GET /api/v1/security/scans/{id}` against these IDs rather than
+    /// guessing the most-recent scan from `GET /artifacts/{id}/scans`.
+    #[serde(default)]
+    pub scan_result_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -133,6 +143,16 @@ pub struct ScanResponse {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// True when the row was synthesized by the dedup path (`copy_scan_results`)
+    /// because a prior scan with the same `(checksum_sha256, scan_type)` pair
+    /// already existed within the dedup TTL. No scanner was actually invoked
+    /// for this row; counts and findings were copied from `source_scan_id`.
+    pub is_reused: bool,
+    /// When `is_reused` is true, the `id` of the source scan whose results
+    /// were copied. Useful for distinguishing "fresh scan" from "deduped
+    /// satisfaction" in release-gate provenance checks. None for original
+    /// (non-reused) scans.
+    pub source_scan_id: Option<Uuid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +184,8 @@ impl ScanResponse {
             started_at: s.started_at,
             completed_at: s.completed_at,
             created_at: s.created_at,
+            is_reused: s.is_reused,
+            source_scan_id: s.source_scan_id,
         }
     }
 }
@@ -387,13 +409,17 @@ pub struct ScanConfigResponse {
     tag = "security",
     responses(
         (status = 200, description = "Security dashboard summary", body = DashboardResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_dashboard(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<DashboardResponse>> {
+    // Aggregate counts span all repos; restrict to admin. See #1034.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let summary = svc.get_dashboard_summary().await?;
 
@@ -420,13 +446,20 @@ async fn get_dashboard(
     tag = "security",
     responses(
         (status = 200, description = "All repository security scores", body = Vec<ScoreResponse>),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_all_scores(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
 ) -> Result<Json<Vec<ScoreResponse>>> {
+    // Same gate as `get_dashboard` (#1034). The leaderboard returns
+    // per-repo IDs + grades + per-severity counts, which is richer
+    // metadata than the dashboard aggregates and an even bigger
+    // multi-tenant info leak.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let scores = svc.get_all_scores().await?;
     let response: Vec<ScoreResponse> = scores.into_iter().map(ScoreResponse::from).collect();
@@ -486,14 +519,27 @@ async fn trigger_scan(
         .clone();
 
     if let Some(artifact_id) = body.artifact_id {
+        // Pre-allocate one scan_result row per configured scanner so the IDs
+        // can be returned in this response. The actual scan work is still
+        // fire-and-forget (tokio::spawn) but uses these pre-committed IDs
+        // instead of inserting new rows. See artifact-keeper#906.
+        let prepared = scanner.prepare_artifact_scan(artifact_id, true).await?;
+        let scan_result_ids = crate::services::scanner_service::extract_scan_result_ids(&prepared);
+        let prepared_map = crate::services::scanner_service::prepared_pairs_to_map(prepared);
+
+        let scanner_for_spawn = scanner.clone();
         tokio::spawn(async move {
-            if let Err(e) = scanner.scan_artifact_with_options(artifact_id, true).await {
+            if let Err(e) = scanner_for_spawn
+                .scan_artifact_with_prepared(artifact_id, prepared_map, true)
+                .await
+            {
                 tracing::error!("Scan failed for artifact {}: {}", artifact_id, e);
             }
         });
         return Ok(Json(TriggerScanResponse {
-            message: format!("Scan queued for artifact {}", artifact_id),
+            message: crate::services::scanner_service::build_artifact_scan_message(artifact_id),
             artifacts_queued: 1,
+            scan_result_ids,
         }));
     }
 
@@ -517,12 +563,17 @@ async fn trigger_scan(
             tracing::error!("Repository scan failed for {}: {}", repository_id, e);
         }
     });
+    // Repository-level triggers don't pre-allocate per-artifact rows because
+    // the count can be large and individual rows are still created inside the
+    // worker. Clients that need scan_result_ids must trigger artifact-level
+    // scans (one per artifact_id) instead.
     Ok(Json(TriggerScanResponse {
-        message: format!(
-            "Repository scan queued for {} ({} artifacts)",
-            repository_id, count
+        message: crate::services::scanner_service::build_repository_scan_message(
+            repository_id,
+            count,
         ),
         artifacts_queued: count as u32,
+        scan_result_ids: Vec::new(),
     }))
 }
 
@@ -642,6 +693,7 @@ async fn list_findings(
     request_body = AcknowledgeRequest,
     responses(
         (status = 200, description = "Finding acknowledged", body = FindingResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -652,6 +704,12 @@ async fn acknowledge_finding(
     Path(finding_id): Path<Uuid>,
     Json(body): Json<AcknowledgeRequest>,
 ) -> Result<Json<FindingResponse>> {
+    // Admin-only: non-admins could otherwise hide findings from any
+    // repo by passing its UUID, suppressing them from #962's dashboard
+    // counts. No per-user repo-membership model exists; admin gate
+    // matches the dashboard gate in #1034. See #1032.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let user_id = auth.user_id;
 
@@ -672,15 +730,22 @@ async fn acknowledge_finding(
     ),
     responses(
         (status = 200, description = "Acknowledgment revoked", body = FindingResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn revoke_acknowledgment(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(finding_id): Path<Uuid>,
 ) -> Result<Json<FindingResponse>> {
+    // Symmetric gate with acknowledge_finding (#1032): both write to the
+    // same row. Allowing un-privileged un-acknowledge would let an attacker
+    // un-hide a finding the admin previously acknowledged for a legitimate
+    // reason, churning dashboard counts.
+    auth.require_admin()?;
+
     let svc = ScanResultService::new(state.db.clone());
     let f = svc.revoke_acknowledgment(finding_id).await?;
 
@@ -1073,6 +1138,7 @@ mod tests {
         TriggerScanResponse {
             message: format!("Scan queued for artifact {}", artifact_id),
             artifacts_queued: 1,
+            scan_result_ids: Vec::new(),
         }
     }
 
@@ -1084,6 +1150,7 @@ mod tests {
                 repository_id, count
             ),
             artifacts_queued: count as u32,
+            scan_result_ids: Vec::new(),
         }
     }
 
@@ -1267,6 +1334,8 @@ mod tests {
             started_at: Some(chrono::Utc::now()),
             completed_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            is_reused: false,
+            source_scan_id: None,
         }
     }
 
@@ -1313,6 +1382,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             created_at: chrono::Utc::now(),
+            is_reused: false,
+            source_scan_id: None,
         };
         let resp = scan_result_to_response(scan, None, None);
         assert_eq!(resp.artifact_name, None);
@@ -1322,6 +1393,8 @@ mod tests {
             Some("Scanner not available".to_string())
         );
         assert_eq!(resp.status, "failed");
+        assert!(!resp.is_reused);
+        assert!(resp.source_scan_id.is_none());
     }
 
     #[test]
@@ -1343,6 +1416,8 @@ mod tests {
             started_at: Some(chrono::Utc::now()),
             completed_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
+            is_reused: false,
+            source_scan_id: None,
         };
         let resp = scan_result_to_response(scan, Some("lib".to_string()), None);
         assert_eq!(resp.findings_count, 100);
@@ -1351,6 +1426,37 @@ mod tests {
         assert_eq!(resp.medium_count, 30);
         assert_eq!(resp.low_count, 25);
         assert_eq!(resp.info_count, 15);
+    }
+
+    #[test]
+    fn test_scan_response_propagates_reuse_metadata() {
+        let source_id = Uuid::new_v4();
+        let scan = ScanResult {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            scan_type: "trivy".to_string(),
+            status: "completed".to_string(),
+            findings_count: 7,
+            critical_count: 1,
+            high_count: 2,
+            medium_count: 2,
+            low_count: 2,
+            info_count: 0,
+            scanner_version: None,
+            error_message: None,
+            started_at: Some(chrono::Utc::now()),
+            completed_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            is_reused: true,
+            source_scan_id: Some(source_id),
+        };
+        let resp = scan_result_to_response(scan, Some("artifact".into()), None);
+        assert!(resp.is_reused);
+        assert_eq!(resp.source_scan_id, Some(source_id));
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["is_reused"], true);
+        assert_eq!(json["source_scan_id"], source_id.to_string());
     }
 
     #[test]
@@ -1802,10 +1908,30 @@ mod tests {
         let resp = TriggerScanResponse {
             message: "Scan queued".to_string(),
             artifacts_queued: 42,
+            scan_result_ids: Vec::new(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"artifacts_queued\":42"));
         assert!(json.contains("Scan queued"));
+        // Empty list serializes to [] (not omitted) so callers can rely on the
+        // field always being present.
+        assert!(json.contains("\"scan_result_ids\":[]"));
+    }
+
+    #[test]
+    fn test_trigger_scan_response_with_scan_result_ids() {
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let resp = TriggerScanResponse {
+            message: "Scan queued for artifact".to_string(),
+            artifacts_queued: 1,
+            scan_result_ids: vec![id1, id2],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        let ids = json["scan_result_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], id1.to_string());
+        assert_eq!(ids[1], id2.to_string());
     }
 
     #[test]
