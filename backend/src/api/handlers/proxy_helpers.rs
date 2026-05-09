@@ -1608,10 +1608,15 @@ mod tests {
     }
 
     #[test]
-    fn test_map_proxy_error_validation_becomes_bad_gateway() {
-        let err = crate::error::AppError::Validation("bad input".to_string());
+    fn test_map_proxy_error_validation_becomes_bad_request() {
+        // Per #1107 R1 security review: Validation errors must return a
+        // generic 400 (not 502) so the validator's specific reject reason
+        // is not echoed back to the client as a probe oracle.
+        let err = crate::error::AppError::Validation(
+            "Proxy cache path must not contain `..` segment".to_string(),
+        );
         let response = map_proxy_error("repo-key", "pkg", err);
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     // ── RepoInfo::storage_location tests ───────────────────────────────
