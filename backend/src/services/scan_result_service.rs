@@ -760,10 +760,30 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Count non-acknowledged findings by severity across all completed scans
-        // for this repository's artifacts.
+        // Count non-acknowledged findings by severity, but only from the
+        // LATEST completed scan per (artifact_id, scan_type) within the
+        // repository (#962). Without this restriction, rescanning the
+        // same artifact N times multiplied the repo's finding counts by
+        // N because every scan_results row owns its own set of
+        // scan_findings rows. See #1126 for the matching fix applied
+        // to get_dashboard_summary; #1127 forward-ports it here.
+        //
+        // Note: the `legacy_unverified = false` filter present on
+        // release/1.1.x is omitted because main lacks that column
+        // (migration 075 on main is the unrelated `075_quarantine_period.sql`).
+        // Re-add when migration 080 lands.
         let counts = sqlx::query!(
             r#"
+            WITH latest_scans AS (
+                SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+                FROM scan_results sr
+                JOIN artifacts a ON a.id = sr.artifact_id
+                WHERE a.repository_id = $1
+                  AND NOT a.is_deleted
+                  AND sr.status = 'completed'
+                ORDER BY sr.artifact_id, sr.scan_type,
+                         sr.completed_at DESC NULLS LAST, sr.created_at DESC
+            )
             SELECT
                 COUNT(*) FILTER (WHERE severity = 'critical' AND NOT is_acknowledged) as "critical!",
                 COUNT(*) FILTER (WHERE severity = 'high' AND NOT is_acknowledged) as "high!",
@@ -772,9 +792,7 @@ impl ScanResultService {
                 COUNT(*) FILTER (WHERE is_acknowledged) as "acknowledged!",
                 COUNT(*) as "total!"
             FROM scan_findings
-            WHERE artifact_id IN (
-                SELECT id FROM artifacts WHERE repository_id = $1 AND NOT is_deleted
-            )
+            WHERE scan_result_id IN (SELECT id FROM latest_scans)
             "#,
             repository_id,
         )

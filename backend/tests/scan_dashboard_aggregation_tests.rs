@@ -1,14 +1,13 @@
-//! Integration tests for scan finding aggregation (#1029, forward-port of #962/#1036).
+//! Integration tests for scan finding aggregation
+//! (#1029 + #1127, forward-port of #962 / #1036 / #1029-followup).
 //!
 //! Reproduces the dashboard inflation bug where rescanning the same artifact
-//! N times made `get_dashboard_summary` count findings N times instead of
-//! once. The fix restricts aggregation to the LATEST completed scan per
-//! (artifact_id, scan_type) via a DISTINCT ON CTE.
+//! N times made `get_dashboard_summary` AND `recalculate_score` count
+//! findings N times instead of once. The fix restricts aggregation to the
+//! LATEST completed scan per (artifact_id, scan_type) via a DISTINCT ON CTE.
 //!
-//! NOTE: On main, `recalculate_score` is NOT yet forward-ported (per #1029
-//! scope), so this test only exercises `get_dashboard_summary`. The
-//! per-repo path will be re-added when `recalculate_score` is also
-//! forward-ported.
+//! Both paths are now covered: the global dashboard via #1126, and the
+//! per-repo score via #1127.
 //!
 //! Requires PostgreSQL with all migrations applied:
 //!
@@ -182,13 +181,9 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid) {
         .await;
 }
 
-/// Reproduces the dashboard half of #962: 1 artifact rescanned 10 times with
-/// 15 findings each must NOT add 150 findings to the dashboard total.
-///
-/// TODO(#1029 follow-up): once `recalculate_score` is forward-ported to main,
-/// re-add the per-repo path assertions from the release/1.1.x version of
-/// this test. Today main's `recalculate_score` still counts across all
-/// scans, so asserting on it here would intentionally fail.
+/// Reproduces both halves of #962: 1 artifact rescanned 10 times with 15
+/// findings each must NOT add 150 findings to either the dashboard total
+/// (#1126) or the per-repo security score (#1127).
 #[tokio::test]
 #[ignore = "requires DATABASE_URL; run with --ignored"]
 async fn rescan_does_not_inflate_dashboard_finding_counts() {
@@ -263,6 +258,28 @@ async fn rescan_does_not_inflate_dashboard_finding_counts() {
     assert_eq!(
         delta_high, 4,
         "dashboard high_findings delta should be 4 (latest scan only)"
+    );
+
+    // -------- Per-repo path: recalculate_score (#1127) --------------------
+    // Same invariant: a per-repo score recalculation must aggregate from
+    // the latest scan only. Pre-#1127, this returned 150 instead of 15.
+    let score = svc
+        .recalculate_score(repo_id)
+        .await
+        .expect("recalculate_score");
+    assert_eq!(
+        score.total_findings, EXPECTED as i32,
+        "recalculate_score.total_findings = {} (expected {}). \
+         150 = bug #962 (the per-repo half) still inflating per rescan",
+        score.total_findings, EXPECTED
+    );
+    assert_eq!(
+        score.critical_count, 4,
+        "recalculate_score.critical_count should be 4 (latest scan only)"
+    );
+    assert_eq!(
+        score.high_count, 4,
+        "recalculate_score.high_count should be 4 (latest scan only)"
     );
 
     cleanup(&pool, repo_id).await;
