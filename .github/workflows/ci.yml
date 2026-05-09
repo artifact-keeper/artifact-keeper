@@ -346,7 +346,14 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
-        run: cargo test --workspace --test '*' --verbose
+        # Pass `-- --ignored` so DB-backed integration tests gated by
+        # `#[ignore = "requires running DB / HTTP server"]` actually
+        # execute now that this job provisions postgres. Without this,
+        # 12+ integration test files (lifecycle_policy_tests,
+        # refresh_token_rotation_tests, meili_reindex_tests,
+        # api_token_cache_flush_tests, grpc_sbom_tests, integration_tests,
+        # etc.) were silently skipped. See #1031.
+        run: cargo test --workspace --test '*' --verbose -- --ignored
 
   # ════════════════════════════════════════════════════════════════════════════
   # SMOKE E2E (Every Push/PR) — self-contained via Docker-in-Docker on ARC
