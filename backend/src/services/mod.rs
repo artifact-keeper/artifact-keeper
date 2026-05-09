@@ -71,6 +71,7 @@ pub mod wasm_runtime;
 pub mod webhook_payloads;
 pub mod webhook_producer;
 pub mod webhook_secret_crypto;
+pub mod webhook_signing;
 
 // Observability & lifecycle
 pub mod analytics_service;
