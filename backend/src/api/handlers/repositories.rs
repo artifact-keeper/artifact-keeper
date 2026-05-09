@@ -902,9 +902,12 @@ pub async fn create_repository(
         .await?;
     }
 
-    state
-        .event_bus
-        .emit("repository.created", repo.id, Some(auth.username.clone()));
+    state.event_bus.emit_for_repo(
+        "repository.created",
+        repo.id,
+        repo.id,
+        Some(auth.username.clone()),
+    );
 
     let mut response = repo_to_response(repo, 0);
     if let Some(ref at) = payload.upstream_auth_type {
@@ -1108,9 +1111,12 @@ pub async fn update_repository(
 
     let storage_used = service.get_storage_usage(repo.id).await?;
 
-    state
-        .event_bus
-        .emit("repository.updated", repo.id, Some(auth.username.clone()));
+    state.event_bus.emit_for_repo(
+        "repository.updated",
+        repo.id,
+        repo.id,
+        Some(auth.username.clone()),
+    );
 
     Ok(Json(repo_to_response(repo, storage_used)))
 }
@@ -1163,9 +1169,12 @@ pub async fn delete_repository(
         cache.remove(&key);
     }
 
-    state
-        .event_bus
-        .emit("repository.deleted", repo.id, Some(auth.username.clone()));
+    state.event_bus.emit_for_repo(
+        "repository.deleted",
+        repo.id,
+        repo.id,
+        Some(auth.username.clone()),
+    );
     Ok(())
 }
 
