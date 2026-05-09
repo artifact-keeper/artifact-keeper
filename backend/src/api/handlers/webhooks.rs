@@ -15,6 +15,21 @@ use crate::error::{AppError, Result};
 use crate::services::webhook_payloads::{self, PayloadTemplate};
 use crate::services::webhook_secret_crypto;
 
+/// Versions the backend currently knows how to render. Adding a new
+/// version is an additive change; removing one is a breaking change.
+pub const SUPPORTED_EVENT_VERSIONS: &[&str] = &["2026-04-01"];
+
+fn validate_event_version(v: &str) -> std::result::Result<(), AppError> {
+    if SUPPORTED_EVENT_VERSIONS.contains(&v) {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "unsupported event_schema_version '{}', supported: {:?}",
+            v, SUPPORTED_EVENT_VERSIONS
+        )))
+    }
+}
+
 /// Create webhook routes
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -82,6 +97,10 @@ pub struct CreateWebhookRequest {
     /// Payload layout for the target platform (default: generic).
     #[serde(default)]
     pub payload_template: PayloadTemplate,
+    /// Pinned event payload version. Defaults to "2026-04-01" when omitted.
+    /// Must match a value in `SUPPORTED_EVENT_VERSIONS` or the request is
+    /// rejected with HTTP 422.
+    pub event_schema_version: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -95,6 +114,10 @@ pub struct WebhookResponse {
     #[schema(value_type = Option<Object>)]
     pub headers: Option<serde_json::Value>,
     pub payload_template: PayloadTemplate,
+    /// Pinned event payload version (e.g. "2026-04-01"). Determines the
+    /// shape of the rendered payload and the value sent in the
+    /// `X-ArtifactKeeper-Event-Version` header.
+    pub event_schema_version: String,
     /// Short non-reversible identifier for the current signing secret
     /// (`whsec_...abcd`), suitable for display in operator UIs. The raw
     /// secret is never returned by GET or LIST.
@@ -163,8 +186,8 @@ pub async fn list_webhooks(
     let webhooks = sqlx::query(
         r#"
         SELECT id, name, url, events, is_enabled, repository_id, headers,
-               payload_template, secret_digest, secret_previous_expires_at,
-               last_triggered_at, created_at
+               payload_template, event_schema_version, secret_digest,
+               secret_previous_expires_at, last_triggered_at, created_at
         FROM webhooks
         WHERE ($1::uuid IS NULL OR repository_id = $1)
           AND ($2::boolean IS NULL OR is_enabled = $2)
@@ -211,6 +234,7 @@ pub async fn list_webhooks(
                 repository_id: w.get("repository_id"),
                 headers: w.get("headers"),
                 payload_template: PayloadTemplate::from_str_lossy(&tpl),
+                event_schema_version: w.get("event_schema_version"),
                 secret_digest: w.get("secret_digest"),
                 secret_rotation_active: prev_expires
                     .map(|e| e > chrono::Utc::now())
@@ -258,6 +282,13 @@ pub async fn create_webhook(
         ));
     }
 
+    let event_version = payload
+        .event_schema_version
+        .as_deref()
+        .unwrap_or("2026-04-01")
+        .to_string();
+    validate_event_version(&event_version)?;
+
     // Use the caller-provided secret if any, otherwise generate one.
     let raw_secret = payload
         .secret
@@ -278,11 +309,11 @@ pub async fn create_webhook(
         r#"
         INSERT INTO webhooks
             (name, url, events, repository_id, headers, payload_template,
-             secret_encrypted, secret_digest)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             secret_encrypted, secret_digest, event_schema_version)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING id, name, url, events, is_enabled, repository_id, headers,
-                  payload_template, secret_digest, secret_previous_expires_at,
-                  last_triggered_at, created_at
+                  payload_template, event_schema_version, secret_digest,
+                  secret_previous_expires_at, last_triggered_at, created_at
         "#,
     )
     .bind(&payload.name)
@@ -293,6 +324,7 @@ pub async fn create_webhook(
     .bind(&template_str)
     .bind(&secret_encrypted)
     .bind(&secret_digest)
+    .bind(&event_version)
     .fetch_one(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -309,6 +341,7 @@ pub async fn create_webhook(
         repository_id: webhook.get("repository_id"),
         headers: webhook.get("headers"),
         payload_template: PayloadTemplate::from_str_lossy(&tpl),
+        event_schema_version: webhook.get("event_schema_version"),
         secret_digest: webhook.get("secret_digest"),
         secret_rotation_active: prev_expires
             .map(|e| e > chrono::Utc::now())
@@ -347,8 +380,8 @@ pub async fn get_webhook(
     let webhook = sqlx::query(
         r#"
         SELECT id, name, url, events, is_enabled, repository_id, headers,
-               payload_template, secret_digest, secret_previous_expires_at,
-               last_triggered_at, created_at
+               payload_template, event_schema_version, secret_digest,
+               secret_previous_expires_at, last_triggered_at, created_at
         FROM webhooks
         WHERE id = $1
         "#,
@@ -371,6 +404,7 @@ pub async fn get_webhook(
         repository_id: webhook.get("repository_id"),
         headers: webhook.get("headers"),
         payload_template: PayloadTemplate::from_str_lossy(&tpl),
+        event_schema_version: webhook.get("event_schema_version"),
         secret_digest: webhook.get("secret_digest"),
         secret_rotation_active: prev_expires
             .map(|e| e > chrono::Utc::now())
@@ -1742,6 +1776,7 @@ mod tests {
             repository_id: None,
             headers: None,
             payload_template: PayloadTemplate::Generic,
+            event_schema_version: "2026-04-01".to_string(),
             secret_digest: Some("whsec_...abcd".to_string()),
             secret_rotation_active: false,
             last_triggered_at: None,
@@ -1752,6 +1787,7 @@ mod tests {
         assert_eq!(json["is_enabled"], true);
         assert_eq!(json["events"].as_array().unwrap().len(), 1);
         assert_eq!(json["payload_template"], "generic");
+        assert_eq!(json["event_schema_version"], "2026-04-01");
     }
 
     #[test]
@@ -1770,6 +1806,7 @@ mod tests {
             repository_id: None,
             headers: None,
             payload_template: PayloadTemplate::Generic,
+            event_schema_version: "2026-04-01".to_string(),
             secret_digest: Some("whsec_...abcd".to_string()),
             secret_rotation_active: false,
             last_triggered_at: None,
