@@ -190,8 +190,46 @@ impl ScanResultService {
         scan_type: &str,
         checksum_sha256: &str,
     ) -> Result<ScanResult> {
-        // Get source scan counts
-        let source = self.get_scan(source_scan_id).await?;
+        // Wrap the SELECT and both INSERTs in a single transaction:
+        //
+        // - The two INSERTs (scan_results, then scan_findings) must commit
+        //   atomically; a failure of the second must roll back the first.
+        //   See #1035/#1060.
+        // - The source-scan SELECT runs inside the txn with `FOR SHARE` so
+        //   a concurrent DELETE on the source row cannot land between the
+        //   count read and the INSERT INTO scan_findings ... SELECT, which
+        //   would otherwise leave the new row claiming N findings while the
+        //   SELECT copied 0 rows. See #1058.
+        //
+        // Invariant relied upon: scan_findings rows are only ever deleted
+        // via the `ON DELETE CASCADE` from scan_results(id) (migration 022).
+        // A direct `DELETE FROM scan_findings WHERE scan_result_id = $X`
+        // would NOT be blocked by FOR SHARE on the parent row and would
+        // re-open this race. Don't add such a path without taking
+        // FOR SHARE on the parent here too.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let source = sqlx::query_as!(
+            ScanResult,
+            r#"
+            SELECT id, artifact_id, repository_id, scan_type, status,
+                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
+            FROM scan_results
+            WHERE id = $1
+            FOR SHARE
+            "#,
+            source_scan_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Source scan result not found".to_string()))?;
 
         // Create new scan result marked as reused.
         //
@@ -234,7 +272,7 @@ impl ScanResultService {
             checksum_sha256,
             source_scan_id,
         )
-        .fetch_one(&self.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -256,9 +294,13 @@ impl ScanResultService {
             artifact_id,
             source_scan_id,
         )
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(new_scan)
     }
@@ -285,15 +327,36 @@ impl ScanResultService {
         source_scan_id: Uuid,
         artifact_id: Uuid,
     ) -> Result<ScanResult> {
-        // Pull source counts so we can copy them onto the target.
-        let source = self.get_scan(source_scan_id).await?;
-        let (findings, critical, high, medium, low, info) = target_counts_from_source(&source);
-
         let mut tx = self
             .db
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Pull source counts so we can copy them onto the target. The SELECT
+        // runs inside the txn with `FOR SHARE` to close the TOCTOU window
+        // (#1058): without the lock, a concurrent DELETE on the source row
+        // could land between the count read here and the findings INSERT
+        // below, leaving the converted target row claiming N findings while
+        // the INSERT ... SELECT copies 0 rows.
+        let source = sqlx::query_as!(
+            ScanResult,
+            r#"
+            SELECT id, artifact_id, repository_id, scan_type, status,
+                   findings_count, critical_count, high_count, medium_count, low_count, info_count,
+                   scanner_version, error_message, started_at, completed_at, created_at,
+                   is_reused, source_scan_id
+            FROM scan_results
+            WHERE id = $1
+            FOR SHARE
+            "#,
+            source_scan_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Source scan result not found".to_string()))?;
+        let (findings, critical, high, medium, low, info) = target_counts_from_source(&source);
 
         // Status guard: only convert a row that is still 'running'. If another
         // caller already converted this row, the UPDATE matches zero rows and
@@ -1327,5 +1390,217 @@ mod tests {
         // updated.is_some() == true means the row was in 'running' state and
         // the UPDATE fired; the caller proceeds with the findings INSERT.
         assert!(!convert_should_noop(true));
+    }
+
+    // =======================================================================
+    // DB-backed tests for the transaction-wrapping fixes in #1058 / #1059.
+    //
+    // These opt into a real Postgres via test_db_helpers::try_pool(): when
+    // DATABASE_URL is unset they no-op so `cargo test --lib` stays usable
+    // without a database. The coverage CI job provisions Postgres and runs
+    // migrations, so these tests execute there and the new transaction
+    // lines (`tx.begin`, `&mut *tx`, `tx.commit`) are exercised.
+    // =======================================================================
+
+    mod db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as db_helpers;
+        use sqlx::PgPool;
+
+        async fn insert_test_repo(pool: &PgPool) -> Uuid {
+            let id = Uuid::new_v4();
+            let key = format!("scan-svc-{}", id.as_simple());
+            let storage_path = format!("/tmp/test-artifacts/{}", id);
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+                 VALUES ($1, $2, $2, $3, 'local', 'generic')",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(&storage_path)
+            .execute(pool)
+            .await
+            .expect("insert repo");
+            id
+        }
+
+        async fn insert_test_artifact(
+            pool: &PgPool,
+            repo_id: Uuid,
+            suffix: &str,
+        ) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let path = format!("{}/{}/pkg.tar.gz", id.as_simple(), suffix);
+            let checksum = format!("{:0>56}{:0>8}", id.as_simple(), suffix)
+                .chars()
+                .take(64)
+                .collect::<String>();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, \
+                    checksum_sha256, content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, 'pkg.tar.gz', $3, 1024, $4, \
+                    'application/octet-stream', $3, false)",
+            )
+            .bind(id)
+            .bind(repo_id)
+            .bind(&path)
+            .bind(&checksum)
+            .execute(pool)
+            .await
+            .expect("insert artifact");
+            (id, checksum)
+        }
+
+        async fn cleanup_repo(pool: &PgPool, repo_id: Uuid) {
+            // Order matters because of FK constraints. scan_findings ->
+            // scan_results -> artifacts -> repositories, plus the
+            // repo_security_scores side-table.
+            let _ = sqlx::query(
+                "DELETE FROM scan_findings WHERE scan_result_id IN \
+                 (SELECT id FROM scan_results WHERE repository_id = $1)",
+            )
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repo_security_scores WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo_id)
+                .execute(pool)
+                .await;
+        }
+
+        /// Build a completed source scan with one High finding.
+        async fn seed_completed_source_scan(
+            svc: &ScanResultService,
+            artifact_id: Uuid,
+            repo_id: Uuid,
+        ) -> Uuid {
+            let scan = svc
+                .create_scan_result(artifact_id, repo_id, "dependency")
+                .await
+                .expect("create source scan");
+            svc.create_findings(
+                scan.id,
+                artifact_id,
+                &[RawFinding {
+                    severity: Severity::High,
+                    title: "CVE-test".to_string(),
+                    description: None,
+                    cve_id: Some("CVE-2024-0000".to_string()),
+                    affected_component: Some("libtest".to_string()),
+                    affected_version: Some("1.0.0".to_string()),
+                    fixed_version: Some("1.0.1".to_string()),
+                    source: Some("test".to_string()),
+                    source_url: None,
+                }],
+            )
+            .await
+            .expect("create finding");
+            svc.complete_scan(
+                scan.id,
+                1,
+                0,
+                1,
+                0,
+                0,
+                0,
+                Some("test-scanner-1.0"),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("complete source scan");
+            scan.id
+        }
+
+        /// #1058 coverage: copy_scan_results runs end-to-end inside the
+        /// transaction wrap. Exercises tx.begin, the FOR SHARE SELECT on
+        /// scan_results, both INSERTs against `&mut *tx`, and tx.commit.
+        #[tokio::test]
+        async fn copy_scan_results_commits_transaction() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (src_aid, _) = insert_test_artifact(&pool, repo_id, "src").await;
+            let (dst_aid, dst_checksum) = insert_test_artifact(&pool, repo_id, "dst").await;
+            let src_scan_id = seed_completed_source_scan(&svc, src_aid, repo_id).await;
+
+            let copied = svc
+                .copy_scan_results(src_scan_id, dst_aid, repo_id, "dependency", &dst_checksum)
+                .await
+                .expect("copy_scan_results");
+
+            assert_eq!(copied.artifact_id, dst_aid);
+            assert!(copied.is_reused);
+            assert_eq!(copied.source_scan_id, Some(src_scan_id));
+            assert_eq!(copied.findings_count, 1);
+
+            // Verify the second INSERT actually committed the finding row.
+            let findings: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE scan_result_id = $1")
+                    .bind(copied.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count findings");
+            assert_eq!(findings, 1);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #1058 coverage: convert_to_reused runs end-to-end with the
+        /// source-scan SELECT moved inside the transaction. Exercises
+        /// tx.begin, the FOR SHARE SELECT, the UPDATE, the findings
+        /// INSERT, and tx.commit.
+        #[tokio::test]
+        async fn convert_to_reused_commits_transaction() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+
+            let repo_id = insert_test_repo(&pool).await;
+            let (src_aid, _) = insert_test_artifact(&pool, repo_id, "src").await;
+            let (dst_aid, _) = insert_test_artifact(&pool, repo_id, "dst").await;
+
+            let src_scan_id = seed_completed_source_scan(&svc, src_aid, repo_id).await;
+            let target = svc
+                .create_scan_result(dst_aid, repo_id, "dependency")
+                .await
+                .expect("create target running scan");
+
+            let converted = svc
+                .convert_to_reused(target.id, src_scan_id, dst_aid)
+                .await
+                .expect("convert_to_reused");
+
+            assert_eq!(converted.id, target.id);
+            assert!(converted.is_reused);
+            assert_eq!(converted.source_scan_id, Some(src_scan_id));
+            assert_eq!(converted.status, "completed");
+            assert_eq!(converted.findings_count, 1);
+
+            let findings: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE scan_result_id = $1")
+                    .bind(target.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count findings");
+            assert_eq!(findings, 1);
+
+            cleanup_repo(&pool, repo_id).await;
+        }
     }
 }
