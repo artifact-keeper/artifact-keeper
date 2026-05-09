@@ -1,0 +1,149 @@
+name: Release Branch Gate
+
+# Required process gate for `release/*` maintenance branches.
+#
+# Default policy: PRs against `release/*` MUST consist of commits that are
+# either already on `main` or are cherry-picks of commits already on `main`.
+# This enforces the "land on main first, then cherry-pick" workflow.
+#
+# Why: PR #1068 was authored directly against `release/1.1.x` without
+# going through main. It bundled +1489 lines, broke remote-proxy fetches
+# across every package format, and forced a revert mid-release-candidate
+# cycle. The resulting v1.1.9 ship slipped by days. This gate prevents
+# repeating that mistake by failing CI on PRs whose commits aren't
+# main-merged ancestors (or cherry-picks of such commits).
+#
+# Escape hatch: a PR with the label `release-process: approved` bypasses
+# this gate. Use sparingly for genuine stability-only fixes that
+# legitimately should NOT go to main first (rare; document in the PR
+# description).
+
+on:
+  pull_request:
+    branches: ['release/**']
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-branch-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify-main-ancestor:
+    name: Verify commits trace back to main
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Skip if 'release-process: approved' label is set"
+        id: skip
+        env:
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          set -euo pipefail
+          if echo "$LABELS_JSON" | jq -e '.[] | select(.name == "release-process: approved")' > /dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::PR carries 'release-process: approved' label; gate bypassed."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR head with full history
+        if: steps.skip.outputs.skip != 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch main
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+
+      - name: Verify every PR commit is on main or a cherry-pick of main
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          # Commits introduced by this PR, excluding merge commits.
+          # Rev-list base..head gives commits reachable from head but not
+          # base, which is exactly the PR's contribution.
+          mapfile -t pr_commits < <(git rev-list --no-merges "${PR_BASE_SHA}..${PR_HEAD_SHA}")
+
+          if [ "${#pr_commits[@]}" -eq 0 ]; then
+            echo "::notice::PR contains no non-merge commits; nothing to verify."
+            exit 0
+          fi
+
+          # Build a set of patch-ids from a recent slice of main history so
+          # we can cheaply detect cherry-picks (which change SHAs but
+          # preserve patch content). 1500 commits covers ~3 months of main
+          # at typical velocity; tune up if main moves faster.
+          echo "Indexing patch-ids from origin/main (last 1500 commits)..."
+          declare -A main_patch_ids
+          while read -r main_sha; do
+            pid=$(git show "$main_sha" 2>/dev/null | git patch-id --stable 2>/dev/null | awk '{print $1}' || true)
+            if [ -n "$pid" ]; then
+              main_patch_ids["$pid"]="$main_sha"
+            fi
+          done < <(git rev-list --no-merges -n 1500 origin/main)
+
+          echo "Indexed ${#main_patch_ids[@]} patch-ids from main."
+          echo
+
+          fail=0
+          fail_lines=()
+          for sha in "${pr_commits[@]}"; do
+            subject=$(git log -1 --format='%s' "$sha" 2>/dev/null || echo '<no subject>')
+            short=$(git rev-parse --short "$sha")
+
+            # Path A: commit is literally an ancestor of origin/main (this
+            # happens when the PR brings forward already-merged main
+            # commits, e.g. a merge of main into release/1.1.x).
+            if git merge-base --is-ancestor "$sha" origin/main; then
+              echo "  ✓ ${short} on main: ${subject}"
+              continue
+            fi
+
+            # Path B: a commit with matching patch-id exists on main
+            # (cherry-pick or rebase).
+            pid=$(git show "$sha" 2>/dev/null | git patch-id --stable 2>/dev/null | awk '{print $1}' || true)
+            if [ -n "$pid" ] && [ -n "${main_patch_ids[$pid]:-}" ]; then
+              main_short=$(git rev-parse --short "${main_patch_ids[$pid]}")
+              echo "  ✓ ${short} cherry-pick of ${main_short} on main: ${subject}"
+              continue
+            fi
+
+            # Neither: this commit was authored directly against the
+            # release branch and never went through main. Fail the gate.
+            fail=$((fail + 1))
+            fail_lines+=("  ✗ ${short}: ${subject}")
+          done
+
+          if [ "$fail" -gt 0 ]; then
+            echo
+            echo "::error title=Release branch gate failed::${fail} commit(s) on this PR are not on main and are not cherry-picks of main commits."
+            printf '%s\n' "${fail_lines[@]}"
+            echo
+            echo "This branch (${PR_BASE_REF}) is a maintenance line. The expected workflow is:"
+            echo "  1. Land the change on main first."
+            echo "  2. Soak through main's CI (the CI workflow gates main)."
+            echo "  3. Cherry-pick (\`git cherry-pick <sha>\`) the main commit(s) to ${PR_BASE_REF}."
+            echo
+            echo "If this PR genuinely cannot go through main first (e.g., a fix"
+            echo "that ONLY applies to the maintenance branch), apply the label"
+            echo "  release-process: approved"
+            echo "and re-run this check. Document the rationale in the PR body."
+            echo
+            echo "Reference: artifact-keeper#1090 / artifact-keeper#1068 (the bypass that motivated this gate)"
+            exit 1
+          fi
+
+          echo
+          echo "::notice::All ${#pr_commits[@]} PR commit(s) trace back to main. Gate passed."
