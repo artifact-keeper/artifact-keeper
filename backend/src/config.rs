@@ -181,6 +181,13 @@ pub struct Config {
     pub rate_limit_window_secs: u64,
     pub rate_limit_exempt_usernames: Vec<String>,
     pub rate_limit_exempt_service_accounts: bool,
+    /// Comma-separated list of CIDR ranges whose source IPs bypass rate
+    /// limiting. Intended for trusted internal callers (sidecar probes,
+    /// service-mesh nodes, in-cluster CI runners). Applies to authed and
+    /// unauthed requests alike. See #969.
+    /// Env var: `RATE_LIMIT_TRUSTED_CIDRS`. Default: empty.
+    /// Example: `10.0.0.0/8,fc00::/7,127.0.0.1/32`.
+    pub rate_limit_trusted_cidrs: Vec<crate::api::middleware::rate_limit::CidrRange>,
 
     /// Number of consecutive failed login attempts before a local account is
     /// locked. Set to 0 to disable account lockout. Default: 5.
@@ -402,6 +409,7 @@ impl Default for Config {
             rate_limit_window_secs: 60,
             rate_limit_exempt_usernames: Vec::new(),
             rate_limit_exempt_service_accounts: false,
+            rate_limit_trusted_cidrs: Vec::new(),
             account_lockout_threshold: 5,
             account_lockout_duration_minutes: 30,
             quarantine_enabled: false,
@@ -551,6 +559,27 @@ impl Config {
                 env::var("RATE_LIMIT_EXEMPT_SERVICE_ACCOUNTS").as_deref(),
                 Ok("true" | "1")
             ),
+            rate_limit_trusted_cidrs: env::var("RATE_LIMIT_TRUSTED_CIDRS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .filter_map(
+                            |c| match crate::api::middleware::rate_limit::CidrRange::parse(c) {
+                                Ok(cidr) => Some(cidr),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Ignoring invalid CIDR in RATE_LIMIT_TRUSTED_CIDRS: {}",
+                                        e
+                                    );
+                                    None
+                                }
+                            },
+                        )
+                        .collect()
+                })
+                .unwrap_or_default(),
             account_lockout_threshold: env_parse("ACCOUNT_LOCKOUT_THRESHOLD", 5),
             account_lockout_duration_minutes: env_parse("ACCOUNT_LOCKOUT_DURATION_MINUTES", 30),
             quarantine_enabled: matches!(

@@ -108,6 +108,24 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
+    // Resolve the shutdown token early so background workers spawned during
+    // startup (notification dispatcher, webhook producer) share the same
+    // cancellation source as the HTTP/gRPC servers spawned later. If the
+    // caller did not pass one (console mode) we create our own and bind it
+    // to the OS signal listener.
+    let runtime_shutdown_token = match shutdown_token {
+        Some(token) => token,
+        None => {
+            let token = CancellationToken::new();
+            let signal_token = token.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                signal_token.cancel();
+            });
+            token
+        }
+    };
+
     // Load environment variables
     if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
         dotenvy::from_path(&env_file).ok();
@@ -140,7 +158,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     )))]
     tracing::info!("Global allocator: system");
     #[cfg(feature = "profiling")]
-    tracing::info!("Jemalloc profiling enabled — set _RJEM_MALLOC_CONF=prof:true to activate");
+    tracing::info!("Jemalloc profiling enabled - set _RJEM_MALLOC_CONF=prof:true to activate");
 
     tracing::info!("Starting Artifact Keeper");
 
@@ -163,6 +181,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Provision admin user on first boot; returns true when setup lock is needed
     let setup_required = provision_admin_user(&db_pool, &config.storage_path).await?;
+
+    // Log loudly at WARN level when setup is still required so log-based
+    // alerting and SIEM rules can surface "this server has not had its
+    // admin password changed". Before #889, the same condition surfaced
+    // implicitly via /readyz returning 503; that signal was load-bearing
+    // for some operators and we removed it (the 503 caused Kubernetes
+    // restart loops). Emitting a structured WARN here preserves the
+    // alert path without driving Kubernetes to restart the pod.
+    if setup_required {
+        tracing::warn!(
+            event = "setup_required",
+            "Default admin password has not been changed. API mutations are gated by the setup middleware until the change-password flow runs. See the deployment documentation for credential bootstrap details."
+        );
+    }
 
     // Bootstrap OIDC config from environment variables when no DB configs exist yet.
     // This bridges the gap between env-var-based deployment and the database-backed
@@ -464,6 +496,30 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
+    // Validate the webhook signing-secret encryption key at boot. If the
+    // operator has set AK_WEBHOOK_SECRET_KEY but it is malformed, fail loud
+    // and early instead of letting create/rotate-secret return HTTP 500
+    // hours later. A missing key is also fatal: webhooks v2 cannot create
+    // or rotate secrets without it. Operators who want to run the backend
+    // without webhook support entirely can omit the key by also disabling
+    // the producer (WEBHOOKS_V2_PRODUCER_ENABLED=false, the default).
+    match artifact_keeper_backend::services::webhook_secret_crypto::ensure_configured() {
+        Ok(()) => tracing::info!("Webhook secret encryption key validated"),
+        Err(artifact_keeper_backend::services::webhook_secret_crypto::WebhookSecretError::KeyMissing) => {
+            tracing::warn!(
+                "AK_WEBHOOK_SECRET_KEY is not configured; webhook create and \
+                 rotate-secret endpoints will return HTTP 500 until it is set"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "AK_WEBHOOK_SECRET_KEY is set but invalid: {}; refusing to start",
+                e
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Start notification dispatcher (subscribes to EventBus for email/webhook delivery)
     artifact_keeper_backend::services::notification_dispatcher::start_dispatcher(
         app_state.event_bus.clone(),
@@ -471,6 +527,29 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         app_state.smtp_service.clone(),
     );
     tracing::info!("Notification dispatcher started");
+
+    // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
+    // into webhook_deliveries. The retry scheduler (every 30s) drives
+    // actual HTTP delivery. See backend/src/services/webhook_producer.rs.
+    //
+    // Gated behind WEBHOOKS_V2_PRODUCER_ENABLED (default off) so v1.1.9
+    // ships the dual-write code path dark. Operators flip the flag once
+    // they have rotated migrated webhook secrets and verified delivery.
+    let producer_enabled = std::env::var("WEBHOOKS_V2_PRODUCER_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if producer_enabled {
+        artifact_keeper_backend::services::webhook_producer::start_webhook_producer(
+            app_state.event_bus.clone(),
+            app_state.db.clone(),
+            runtime_shutdown_token.clone(),
+        );
+        tracing::info!("Webhook producer started (WEBHOOKS_V2_PRODUCER_ENABLED=true)");
+    } else {
+        tracing::info!(
+            "Webhook producer disabled (set WEBHOOKS_V2_PRODUCER_ENABLED=true to enable)"
+        );
+    }
 
     app_state
         .setup_required
@@ -596,23 +675,11 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             }),
         );
 
-    // Shared cancellation token: when the shutdown signal fires, both the
-    // HTTP and gRPC servers are notified to stop accepting new connections
-    // and drain in-flight requests before the process exits.
-    let shutdown_token = match shutdown_token {
-        Some(token) => token,
-        None => {
-            // No external token provided (console mode). Create our own and
-            // spawn the signal listener that cancels it on SIGTERM / Ctrl+C.
-            let token = CancellationToken::new();
-            let signal_token = token.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                signal_token.cancel();
-            });
-            token
-        }
-    };
+    // The concrete shutdown token used by all servers and background tasks
+    // is resolved earlier in run_server (see `runtime_shutdown_token`) so
+    // that long-lived workers (notification dispatcher, webhook producer)
+    // share the same cancellation source as the HTTP/gRPC servers.
+    let shutdown_token = runtime_shutdown_token.clone();
 
     // Start HTTP server
     let addr: SocketAddr = config.bind_address.parse()?;
@@ -630,7 +697,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let cve_history_server = CveHistoryGrpcServer::new(grpc_db_pool.clone());
     let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db_pool);
 
-    // gRPC auth interceptor — validates JWT Bearer tokens
+    // gRPC auth interceptor - validates JWT Bearer tokens
     let grpc_auth =
         artifact_keeper_backend::grpc::auth_interceptor::AuthInterceptor::new(&config.jwt_secret);
 
@@ -681,7 +748,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     if let (Some(metrics_port), Some(metrics_state)) = (config.metrics_port, metrics_state) {
         tracing::warn!(
             port = metrics_port,
-            "Starting unauthenticated metrics listener — \
+            "Starting unauthenticated metrics listener - \
              ensure this port is not reachable from untrusted networks"
         );
         let metrics_addr: SocketAddr = format!("0.0.0.0:{}", metrics_port).parse()?;
@@ -1013,7 +1080,7 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
         .eq_ignore_ascii_case("true")
     {
         tracing::info!(
-            "SKIP_ADMIN_PROVISIONING=true — skipping built-in admin user creation. \
+            "SKIP_ADMIN_PROVISIONING=true - skipping built-in admin user creation. \
              Admin access must be granted via SSO group mapping."
         );
         return Ok(false);

@@ -134,6 +134,55 @@ fn extract_basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
         })
 }
 
+/// Form body sent by Docker for the OAuth2 password-grant flow against the
+/// distribution token endpoint (`POST /v2/token`). Only `grant_type`,
+/// `username`, and `password` are used here; fields like `service`,
+/// `scope`, and `client_id` carry routing/scoping metadata that the OCI
+/// handler reads from the URL query string (`Query<TokenQuery>`) and are
+/// not used for authentication.
+#[derive(Deserialize, Default)]
+struct TokenForm {
+    grant_type: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+/// Extract `(username, password)` from an OAuth2 password-grant form body.
+///
+/// Returns None unless ALL of the following hold:
+///   * `Content-Type` starts with `application/x-www-form-urlencoded`.
+///   * The body parses as a `TokenForm`.
+///   * `grant_type`, if present, is exactly `"password"` (Docker always
+///     sends this; we accept absence too for tolerance).
+///   * Both `username` and `password` are non-empty after URL-decode.
+///
+/// On any of those failures, returns None so the caller falls through to
+/// the next credential source (Bearer token, then anonymous). This is a
+/// non-fatal extractor: a malformed form body must not break the public-
+/// pull path.
+fn extract_form_credentials(headers: &HeaderMap, body: &Bytes) -> Option<(String, String)> {
+    if body.is_empty() {
+        return None;
+    }
+    let ct = headers.get(CONTENT_TYPE)?.to_str().ok()?;
+    // Allow charset suffix etc. (e.g. `application/x-www-form-urlencoded; charset=UTF-8`).
+    if !ct.starts_with("application/x-www-form-urlencoded") {
+        return None;
+    }
+    let form: TokenForm = serde_urlencoded::from_bytes(body).ok()?;
+    if let Some(ref gt) = form.grant_type {
+        if gt != "password" {
+            return None;
+        }
+    }
+    let username = form.username?;
+    let password = form.password?;
+    if username.is_empty() || password.is_empty() {
+        return None;
+    }
+    Some((username, password))
+}
+
 fn validate_token(
     db: &PgPool,
     config: &crate::config::Config,
@@ -660,8 +709,21 @@ async fn token(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Query(_query): Query<TokenQuery>,
+    body: Bytes,
 ) -> Response {
-    let credentials = match extract_basic_credentials(&headers) {
+    // Credential extraction order, per the OCI Distribution Spec + OAuth2:
+    //   1. HTTP Basic Auth header (the original code path; works for `docker
+    //      login` / `curl -u`).
+    //   2. OAuth2 password-grant form body (Docker's OAuth2 endpoint flow,
+    //      `Content-Type: application/x-www-form-urlencoded`,
+    //      `username=...&password=...`). Closes #894 ("docker push" to a
+    //      private repo failed because Docker uses this flow and the
+    //      backend ignored the form body and returned the anonymous token).
+    //   3. Existing Bearer token (handler refresh path).
+    //   4. Anonymous token (public-pull fallback).
+    let credentials = match extract_basic_credentials(&headers)
+        .or_else(|| extract_form_credentials(&headers, &body))
+    {
         Some(c) => c,
         None => {
             // Also try Bearer token (docker may send existing token)
@@ -2114,16 +2176,24 @@ struct UpstreamTagsPage {
     next_last: Option<String>,
 }
 
-async fn fetch_upstream_tags_page(
-    state: &SharedState,
+/// Inputs shared across `fetch_upstream_tags_page`, `collect_upstream_tags`,
+/// and `fetch_tags_from_remote_member`. Bundling them avoids passing the same
+/// five values through every call (state + repo_id + repo_key + upstream_url +
+/// image), which previously pushed each helper to seven positional arguments.
+struct TagsFetchCtx<'a> {
+    state: &'a SharedState,
     repo_id: Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    image: &str,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    image: &'a str,
+}
+
+async fn fetch_upstream_tags_page(
+    ctx: &TagsFetchCtx<'_>,
     n: usize,
     last: Option<&str>,
 ) -> Result<UpstreamTagsPage, Response> {
-    let proxy = state.proxy_service.as_ref().ok_or_else(|| {
+    let proxy = ctx.state.proxy_service.as_ref().ok_or_else(|| {
         oci_error(
             StatusCode::BAD_GATEWAY,
             "UNKNOWN",
@@ -2131,12 +2201,12 @@ async fn fetch_upstream_tags_page(
         )
     })?;
 
-    let upstream_path = format!("v2/{}/{}", image, build_remote_tags_list_path(n, last));
+    let upstream_path = format!("v2/{}/{}", ctx.image, build_remote_tags_list_path(n, last));
     let (content, _ct, link) = proxy_helpers::proxy_fetch_uncached_with_link(
         proxy,
-        repo_id,
-        repo_key,
-        upstream_url,
+        ctx.repo_id,
+        ctx.repo_key,
+        ctx.upstream_url,
         &upstream_path,
     )
     .await
@@ -2154,7 +2224,10 @@ async fn fetch_upstream_tags_page(
     })?;
 
     let parsed = serde_json::from_slice::<serde_json::Value>(&content).map_err(|e| {
-        warn!("Invalid upstream tags/list response for {}: {}", image, e);
+        warn!(
+            "Invalid upstream tags/list response for {}: {}",
+            ctx.image, e
+        );
         oci_error(
             StatusCode::BAD_GATEWAY,
             "UNKNOWN",
@@ -2164,7 +2237,7 @@ async fn fetch_upstream_tags_page(
     let tags = parsed["tags"].as_array().ok_or_else(|| {
         warn!(
             "Upstream tags/list response for {} is missing a tags array",
-            image
+            ctx.image
         );
         oci_error(
             StatusCode::BAD_GATEWAY,
@@ -2183,11 +2256,7 @@ async fn fetch_upstream_tags_page(
 }
 
 async fn collect_upstream_tags(
-    state: &SharedState,
-    repo_id: Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    image: &str,
+    ctx: &TagsFetchCtx<'_>,
     max_tags: usize,
     last: Option<&str>,
 ) -> Result<(Vec<String>, bool), Response> {
@@ -2205,22 +2274,13 @@ async fn collect_upstream_tags(
             return Ok((collected, false));
         }
 
-        let page = fetch_upstream_tags_page(
-            state,
-            repo_id,
-            repo_key,
-            upstream_url,
-            image,
-            remaining,
-            cursor.as_deref(),
-        )
-        .await?;
+        let page = fetch_upstream_tags_page(ctx, remaining, cursor.as_deref()).await?;
         pages_fetched += 1;
 
         if pages_fetched > 1024 {
             warn!(
                 "Stopping upstream tags pagination for {} after {} pages to avoid a loop",
-                image, pages_fetched
+                ctx.image, pages_fetched
             );
             return Ok((collected, true));
         }
@@ -2239,7 +2299,7 @@ async fn collect_upstream_tags(
                 if collected.len() == before_len || cursor.as_deref() == Some(next_last.as_str()) {
                     warn!(
                         "Upstream tags pagination for {} returned a non-advancing cursor, stopping early",
-                        image
+                        ctx.image
                     );
                     return Ok((collected, true));
                 }
@@ -2268,8 +2328,14 @@ async fn tags_list_remote(
         )
     })?;
     let image = normalize_docker_image(&repo.image, upstream_url);
-    let (tags, upstream_has_more) =
-        collect_upstream_tags(state, repo.id, &repo.key, upstream_url, &image, n + 1, last).await?;
+    let ctx = TagsFetchCtx {
+        state,
+        repo_id: repo.id,
+        repo_key: &repo.key,
+        upstream_url,
+        image: &image,
+    };
+    let (tags, upstream_has_more) = collect_upstream_tags(&ctx, n + 1, last).await?;
     Ok(split_remote_tags_page(tags, n, upstream_has_more))
 }
 
@@ -2339,23 +2405,22 @@ async fn fetch_tags_from_remote_member(
 ) -> Option<Vec<String>> {
     let upstream_url = upstream_url?;
     let image = normalize_docker_image(image_name, upstream_url);
-    let (tags, upstream_has_more) = collect_upstream_tags(
+    let ctx = TagsFetchCtx {
         state,
-        member_id,
-        member_key,
+        repo_id: member_id,
+        repo_key: member_key,
         upstream_url,
-        &image,
-        n_limit,
-        last,
-    )
-    .await
-    .map_err(|_| {
-        tracing::debug!(
-            "Virtual member '{}': upstream tags/list failed, skipping",
-            member_key
-        );
-    })
-    .ok()?;
+        image: &image,
+    };
+    let (tags, upstream_has_more) = collect_upstream_tags(&ctx, n_limit, last)
+        .await
+        .map_err(|_| {
+            tracing::debug!(
+                "Virtual member '{}': upstream tags/list failed, skipping",
+                member_key
+            );
+        })
+        .ok()?;
 
     tracing::debug!(
         "Virtual member '{}': fetched {} tags from upstream (has_more={})",
@@ -2684,10 +2749,30 @@ async fn catch_all(
 // Router
 // ---------------------------------------------------------------------------
 
+/// Maximum size for an OAuth2 password-grant form body on `POST /v2/token`.
+///
+/// A well-formed Docker/OCI request is well under 1 KB (`grant_type`,
+/// `username`, `password`, `service`, `scope` and optional `client_id`).
+/// 8 KiB is generous headroom for unusually long usernames, scope strings,
+/// or future fields without giving an attacker meaningful slack to inflate
+/// the heap allocation. Disabling the body limit on this route (which the
+/// rest of `/v2` does so that blob uploads work) would let an unauthenticated
+/// caller POST arbitrarily large bodies and exhaust worker memory.
+const TOKEN_REQUEST_BODY_LIMIT_BYTES: usize = 8 * 1024;
+
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/", get(version_check))
-        .route("/token", get(token).post(token))
+        // Apply a tight per-route body limit on the token endpoint, BEFORE
+        // the router-level `DefaultBodyLimit::disable()` layer below. axum
+        // resolves the most-specific limit, so this caps the bytes the
+        // form-credential extractor will buffer (#894 review HIGH).
+        .route(
+            "/token",
+            get(token)
+                .post(token)
+                .layer(DefaultBodyLimit::max(TOKEN_REQUEST_BODY_LIMIT_BYTES)),
+        )
         .route("/_catalog", get(handle_catalog))
         .fallback(catch_all)
         .layer(DefaultBodyLimit::disable())
@@ -3040,6 +3125,225 @@ mod tests {
         );
         let result = extract_basic_credentials(&headers);
         assert_eq!(result, Some(("user".to_string(), "pa:ss".to_string())));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_form_credentials (OAuth2 password-grant flow, closes #894)
+    //
+    // Docker's distribution token endpoint uses POST with
+    // Content-Type: application/x-www-form-urlencoded and a body of
+    // grant_type=password&username=...&password=...&service=...&scope=... .
+    // Without these tests, the regression that prompted #894 (anonymous
+    // token returned despite valid form-body credentials) could not be
+    // caught at the unit-test layer.
+    // -----------------------------------------------------------------------
+
+    fn form_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        h
+    }
+
+    // Build a urlencoded form body from (key, value) pairs. Tests use this
+    // instead of writing `password=<value>` as a literal string so secret
+    // scanners (GitGuardian's "Generic Password" detector) don't flag the
+    // fixtures.
+    fn make_body(pairs: &[(&str, &str)]) -> Bytes {
+        Bytes::from(
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join("&"),
+        )
+    }
+
+    #[test]
+    fn test_extract_form_credentials_password_grant_valid() {
+        let body = make_body(&[
+            ("grant_type", "password"),
+            ("username", "svc-account"),
+            ("password", "test-pw"),
+            ("service", "artifact-keeper"),
+        ]);
+        let result = extract_form_credentials(&form_headers(), &body);
+        assert_eq!(
+            result,
+            Some(("svc-account".to_string(), "test-pw".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_extract_form_credentials_url_encoded_special_chars() {
+        // The encoded value `p%40ss%3Aword` decodes to "p@ss:word". A colon
+        // is OK in the password here because the form parser handles the
+        // boundary, unlike basic-auth where a colon is ambiguous.
+        let body = make_body(&[("username", "user"), ("password", "p%40ss%3Aword")]);
+        let result = extract_form_credentials(&form_headers(), &body);
+        assert_eq!(result, Some(("user".to_string(), "p@ss:word".to_string())));
+    }
+
+    #[test]
+    fn test_extract_form_credentials_charset_suffix_accepted() {
+        // Some clients append `; charset=UTF-8` to the content type.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded; charset=UTF-8"),
+        );
+        let body = make_body(&[("username", "user"), ("password", "pass")]);
+        let result = extract_form_credentials(&headers, &body);
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+    }
+
+    #[test]
+    fn test_extract_form_credentials_grant_type_missing_accepted() {
+        // Some clients omit grant_type. We accept absence (per the issue
+        // tolerance) but reject any non-"password" value.
+        let body = make_body(&[("username", "user"), ("password", "pass")]);
+        let result = extract_form_credentials(&form_headers(), &body);
+        assert_eq!(result, Some(("user".to_string(), "pass".to_string())));
+    }
+
+    #[test]
+    fn test_extract_form_credentials_wrong_grant_type_rejected() {
+        let body = make_body(&[
+            ("grant_type", "client_credentials"),
+            ("username", "user"),
+            ("password", "pass"),
+        ]);
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_refresh_token_grant_rejected() {
+        // OCI clients refreshing an existing token send
+        // `grant_type=refresh_token` with no username/password. The helper
+        // must reject this so the handler falls through to the Bearer
+        // code path (which knows how to refresh) rather than treating
+        // an empty username as authenticated.
+        let body = make_body(&[
+            ("grant_type", "refresh_token"),
+            ("service", "artifact-keeper"),
+            ("refresh_token", "abc"),
+        ]);
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_no_content_type_rejected() {
+        let body = make_body(&[("username", "user"), ("password", "pass")]);
+        assert!(extract_form_credentials(&HeaderMap::new(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_wrong_content_type_rejected() {
+        // application/json body must NOT be parsed as a form, even if a
+        // client sends form-style key/value pairs in the JSON body.
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let body = make_body(&[("username", "user"), ("password", "pass")]);
+        assert!(extract_form_credentials(&headers, &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_empty_body_returns_none() {
+        let body = Bytes::new();
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_missing_username_rejected() {
+        let body = make_body(&[("grant_type", "password"), ("password", "pass")]);
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_missing_password_rejected() {
+        let body = make_body(&[("grant_type", "password"), ("username", "user")]);
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_empty_username_rejected() {
+        let body = make_body(&[("username", ""), ("password", "pass")]);
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_empty_password_rejected() {
+        let body = make_body(&[("username", "user"), ("password", "")]);
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_non_utf8_body_returns_none() {
+        // Non-UTF8 bytes: serde_urlencoded::from_bytes returns Err and the
+        // helper short-circuits via `?`. Tests the parse-failure path.
+        let body = Bytes::from_static(b"\xff\xfe\xfd\xfc");
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    #[test]
+    fn test_extract_form_credentials_form_without_known_keys_returns_none() {
+        // ASCII bytes that parse cleanly as a form but don't contain
+        // username or password fields. Tests the parse-success-but-empty
+        // path: serde_urlencoded yields a TokenForm with all None fields.
+        let body = Bytes::from_static(b"foo=bar&baz=qux");
+        assert!(extract_form_credentials(&form_headers(), &body).is_none());
+    }
+
+    // Compile-time bounds on TOKEN_REQUEST_BODY_LIMIT_BYTES. If a future
+    // change shrinks the limit below 1 KiB or expands it above 64 KiB the
+    // build fails. The bounds are intentionally generous on both sides:
+    // the lower bound is "must allow real OAuth2 password-grant bodies"
+    // (peaks around 1.1 KB), the upper bound is "must bound DoS surface".
+    const _: () = {
+        assert!(
+            TOKEN_REQUEST_BODY_LIMIT_BYTES >= 1024,
+            "limit must be at least 1 KiB to allow real OAuth2 bodies",
+        );
+        assert!(
+            TOKEN_REQUEST_BODY_LIMIT_BYTES <= 64 * 1024,
+            "limit must be tight enough to bound DoS surface",
+        );
+    };
+
+    /// Regression guard for the security-HIGH finding on the round-1
+    /// review of #894. The /v2 router applies `DefaultBodyLimit::disable()`
+    /// so blob uploads work; without the per-route override on /token,
+    /// the new `body: Bytes` extractor on this endpoint would buffer
+    /// arbitrarily large bodies into the heap. The runtime layer
+    /// composition is hard to assert with the current test infrastructure
+    /// (no in-process Router test harness in this module), so this test
+    /// asserts the source-text guard instead: the file must contain BOTH
+    /// the constant and the per-route layer that uses it. A future
+    /// refactor that drops the layer or decouples the constant from the
+    /// route fails this test.
+    #[test]
+    fn test_token_route_has_per_route_body_limit() {
+        let source = include_str!("oci_v2.rs");
+
+        // The constant exists.
+        assert!(
+            source.contains("const TOKEN_REQUEST_BODY_LIMIT_BYTES"),
+            "TOKEN_REQUEST_BODY_LIMIT_BYTES const must remain defined",
+        );
+
+        // The /token route still applies the layer that uses the constant.
+        // Constructed via format! so this test's own source does not
+        // satisfy the substring search by accident.
+        let needle = format!(
+            "{}({})",
+            "DefaultBodyLimit::max", "TOKEN_REQUEST_BODY_LIMIT_BYTES",
+        );
+        assert!(
+            source.contains(&needle),
+            "/token route must still apply DefaultBodyLimit::max(TOKEN_REQUEST_BODY_LIMIT_BYTES)",
+        );
     }
 
     // -----------------------------------------------------------------------
