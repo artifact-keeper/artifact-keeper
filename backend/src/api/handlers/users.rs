@@ -881,6 +881,15 @@ pub async fn change_password(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Flip the in-process API-token cache invalidation map (#931) so any
+    // bearer tokens previously issued for this user can no longer satisfy
+    // the cache-hit path. `invalidate_user_tokens` revokes refresh
+    // tokens; this complements it by forcing per-request DB
+    // re-validation of access tokens on the next request. Pre-fix
+    // (#1023/#1027), the change_password / reset_password / force-change
+    // paths only revoked refresh tokens, leaving short-lived access
+    // tokens valid in the cache until the cache TTL elapsed.
+    invalidate_user_token_cache_entries(id);
     crate::services::auth_service::invalidate_user_tokens(id);
 
     // If this user had must_change_password, check if setup mode should be unlocked
@@ -999,6 +1008,10 @@ pub async fn reset_password(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Same rationale as change_password (#1023/#1027): flip the cache
+    // invalidation map so cached access tokens for this user are forced
+    // back through DB validation.
+    invalidate_user_token_cache_entries(id);
     crate::services::auth_service::invalidate_user_tokens(id);
 
     Ok(Json(ResetPasswordResponse {
@@ -1161,7 +1174,9 @@ pub async fn force_password_change(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // Invalidate existing sessions so the user must re-authenticate
+    // Invalidate existing sessions so the user must re-authenticate.
+    // See change_password for the cache-invalidation rationale (#1023/#1027).
+    invalidate_user_token_cache_entries(id);
     crate::services::auth_service::invalidate_user_tokens(id);
 
     state.event_bus.emit(
