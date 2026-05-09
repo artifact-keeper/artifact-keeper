@@ -581,37 +581,19 @@ pub async fn test_webhook(
 
     // Send webhook
     let client = crate::services::http_client::default_client();
-    let mut request = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        // v2 headers
-        .header("X-ArtifactKeeper-Delivery", test_delivery_id.to_string())
-        .header("X-ArtifactKeeper-Event", "test")
-        .header("X-ArtifactKeeper-Event-Version", &event_version)
-        // Legacy header retained for one release.
-        .header("X-Webhook-Event", "test");
-
-    // Add custom headers
-    if let Some(ref h) = headers {
-        if let Some(obj) = h.as_object() {
-            for (key, value) in obj {
-                if let Some(v) = value.as_str() {
-                    request = request.header(key.as_str(), v);
-                }
-            }
-        }
-    }
-
-    if !secret_refs.is_empty() {
-        let sig_header =
-            crate::services::webhook_signing::render_header(unix_secs, &body_bytes, &secret_refs);
-        request = request.header("X-ArtifactKeeper-Signature", &sig_header);
-        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
-            secret_refs[0],
-            unix_secs,
-            &body_bytes,
-        );
-        request = request.header("X-Webhook-Signature", format!("sha256={}", legacy_sig));
+    let header_inputs = DeliveryHeaderInputs {
+        delivery_id: test_delivery_id,
+        event: "test",
+        event_version: &event_version,
+        retry_attempt: None,
+        custom_headers: headers.as_ref(),
+        secrets: &secret_refs,
+        unix_secs,
+        body_bytes: &body_bytes,
+    };
+    let mut request = client.post(&url);
+    for (name, value) in build_delivery_request_headers(&header_inputs) {
+        request = request.header(name, value);
     }
 
     match request.body(body_bytes).send().await {
@@ -814,37 +796,19 @@ pub async fn redeliver(
 
     // Send webhook
     let client = crate::services::http_client::default_client();
-    let mut request = client
-        .post(&webhook_url)
-        .header("Content-Type", "application/json")
-        // v2 headers
-        .header("X-ArtifactKeeper-Delivery", delivery_id.to_string())
-        .header("X-ArtifactKeeper-Event", &delivery.event)
-        .header("X-ArtifactKeeper-Event-Version", &event_version)
-        // Legacy headers retained for one release.
-        .header("X-Webhook-Event", &delivery.event)
-        .header("X-Webhook-Delivery", delivery_id.to_string());
-
-    if let Some(headers) = webhook_headers {
-        if let Some(obj) = headers.as_object() {
-            for (key, value) in obj {
-                if let Some(v) = value.as_str() {
-                    request = request.header(key.as_str(), v);
-                }
-            }
-        }
-    }
-
-    if !secret_refs.is_empty() {
-        let sig_header =
-            crate::services::webhook_signing::render_header(unix_secs, &body_bytes, &secret_refs);
-        request = request.header("X-ArtifactKeeper-Signature", &sig_header);
-        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
-            secret_refs[0],
-            unix_secs,
-            &body_bytes,
-        );
-        request = request.header("X-Webhook-Signature", format!("sha256={}", legacy_sig));
+    let header_inputs = DeliveryHeaderInputs {
+        delivery_id,
+        event: &delivery.event,
+        event_version: &event_version,
+        retry_attempt: None,
+        custom_headers: webhook_headers.as_ref(),
+        secrets: &secret_refs,
+        unix_secs,
+        body_bytes: &body_bytes,
+    };
+    let mut request = client.post(&webhook_url);
+    for (name, value) in build_delivery_request_headers(&header_inputs) {
+        request = request.header(name, value);
     }
 
     let (success, response_status, response_body) = match request.body(body_bytes).send().await {
@@ -1196,6 +1160,92 @@ struct RetryDeliveryRow {
     pub max_attempts: i32,
 }
 
+/// Inputs to the v2-wire-contract header builder. Captured as a struct so
+/// the three delivery paths (test endpoint, retry path, manual redeliver)
+/// can share one well-tested header set.
+pub(crate) struct DeliveryHeaderInputs<'a> {
+    pub delivery_id: Uuid,
+    pub event: &'a str,
+    pub event_version: &'a str,
+    /// `Some(n)` on the retry path (1-indexed), `None` on the test/redeliver paths.
+    pub retry_attempt: Option<i32>,
+    /// Caller-supplied custom headers from the webhook row's `headers` JSON.
+    pub custom_headers: Option<&'a serde_json::Value>,
+    /// Webhook secrets ordered current-first. Empty means "no signing
+    /// configured" and the signature header is omitted.
+    pub secrets: &'a [&'a str],
+    /// `t=<unix_secs>` value embedded in the signature header. Caller MUST
+    /// pass the same value to `webhook_signing::render_header`.
+    pub unix_secs: i64,
+    /// Bytes that will be POSTed. Must equal the bytes signed by
+    /// `webhook_signing::render_header`.
+    pub body_bytes: &'a [u8],
+}
+
+/// Build the full ordered header set for a v2 webhook delivery. Returns
+/// `(header_name, header_value)` pairs so callers can fold them into a
+/// `reqwest::RequestBuilder` or assert against them in tests. The order
+/// matches the spec: required headers first, custom headers second,
+/// signature headers last.
+pub(crate) fn build_delivery_request_headers(
+    inputs: &DeliveryHeaderInputs<'_>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(16);
+
+    out.push(("Content-Type".into(), "application/json".into()));
+    // v2 headers
+    out.push((
+        "X-ArtifactKeeper-Delivery".into(),
+        inputs.delivery_id.to_string(),
+    ));
+    out.push(("X-ArtifactKeeper-Event".into(), inputs.event.into()));
+    out.push((
+        "X-ArtifactKeeper-Event-Version".into(),
+        inputs.event_version.into(),
+    ));
+    if let Some(attempt) = inputs.retry_attempt {
+        out.push(("X-ArtifactKeeper-Retry-Attempt".into(), attempt.to_string()));
+    }
+    // legacy headers (dropped in v1.3.0)
+    out.push(("X-Webhook-Event".into(), inputs.event.into()));
+    out.push(("X-Webhook-Delivery".into(), inputs.delivery_id.to_string()));
+    if let Some(attempt) = inputs.retry_attempt {
+        out.push(("X-Webhook-Retry-Attempt".into(), attempt.to_string()));
+    }
+
+    // Custom headers from the webhook row.
+    if let Some(h) = inputs.custom_headers {
+        if let Some(obj) = h.as_object() {
+            for (key, value) in obj {
+                if let Some(v) = value.as_str() {
+                    out.push((key.clone(), v.to_string()));
+                }
+            }
+        }
+    }
+
+    // Signature headers (if configured).
+    if !inputs.secrets.is_empty() {
+        let sig_header = crate::services::webhook_signing::render_header(
+            inputs.unix_secs,
+            inputs.body_bytes,
+            inputs.secrets,
+        );
+        out.push(("X-ArtifactKeeper-Signature".into(), sig_header));
+        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
+            inputs.secrets[0],
+            inputs.unix_secs,
+            inputs.body_bytes,
+        );
+        out.push((
+            "X-Webhook-Signature".into(),
+            format!("sha256={}", legacy_sig),
+        ));
+    }
+
+    out
+}
+
 /// Load and decrypt the secrets that should currently sign deliveries
 /// for the given webhook row. Returns up to two strings, ordered
 /// current-first. The legacy bcrypt `secret_hash` cannot sign because
@@ -1391,53 +1441,19 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             .unwrap_or_default();
         let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
 
-        let mut request = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            // v2 headers
-            .header("X-ArtifactKeeper-Delivery", delivery.id.to_string())
-            .header("X-ArtifactKeeper-Event", &delivery.event)
-            .header("X-ArtifactKeeper-Event-Version", &event_version)
-            .header(
-                "X-ArtifactKeeper-Retry-Attempt",
-                (delivery.attempts + 1).to_string(),
-            )
-            // Legacy headers retained for one release so existing
-            // receivers built against the placeholder wire continue to
-            // receive deliveries. Removed in v1.3.0.
-            .header("X-Webhook-Event", &delivery.event)
-            .header("X-Webhook-Delivery", delivery.id.to_string())
-            .header(
-                "X-Webhook-Retry-Attempt",
-                (delivery.attempts + 1).to_string(),
-            );
-
-        if let Some(ref h) = headers {
-            if let Some(obj) = h.as_object() {
-                for (key, value) in obj {
-                    if let Some(v) = value.as_str() {
-                        request = request.header(key.as_str(), v);
-                    }
-                }
-            }
-        }
-
-        if !secret_refs.is_empty() {
-            let sig_header = crate::services::webhook_signing::render_header(
-                unix_secs,
-                &body_bytes,
-                &secret_refs,
-            );
-            request = request.header("X-ArtifactKeeper-Signature", &sig_header);
-            // Legacy header carries only the first v1 token (current
-            // secret) for one release so receivers built against the
-            // placeholder header start receiving real signatures.
-            let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
-                secret_refs[0],
-                unix_secs,
-                &body_bytes,
-            );
-            request = request.header("X-Webhook-Signature", format!("sha256={}", legacy_sig));
+        let header_inputs = DeliveryHeaderInputs {
+            delivery_id: delivery.id,
+            event: &delivery.event,
+            event_version: &event_version,
+            retry_attempt: Some(delivery.attempts + 1),
+            custom_headers: headers.as_ref(),
+            secrets: &secret_refs,
+            unix_secs,
+            body_bytes: &body_bytes,
+        };
+        let mut request = client.post(&url);
+        for (name, value) in build_delivery_request_headers(&header_inputs) {
+            request = request.header(name, value);
         }
 
         let (success, response_status, response_body) = match request.body(body_bytes).send().await
@@ -2244,5 +2260,158 @@ mod tests {
         assert!(would_clear(Some(now), now));
         // Row in the past: cleared.
         assert!(would_clear(Some(now - chrono::Duration::seconds(1)), now));
+    }
+
+    // ---------------- DeliveryHeaderInputs / build_delivery_request_headers ----------------
+
+    fn sample_inputs<'a>(secrets: &'a [&'a str], body: &'a [u8]) -> DeliveryHeaderInputs<'a> {
+        DeliveryHeaderInputs {
+            delivery_id: Uuid::nil(),
+            event: "artifact.uploaded",
+            event_version: "2026-04-01",
+            retry_attempt: None,
+            custom_headers: None,
+            secrets,
+            unix_secs: 1_700_000_000,
+            body_bytes: body,
+        }
+    }
+
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn delivery_headers_include_required_v2_set() {
+        let inputs = sample_inputs(&[], b"{}");
+        let h = build_delivery_request_headers(&inputs);
+        assert_eq!(header(&h, "Content-Type"), Some("application/json"));
+        assert_eq!(
+            header(&h, "X-ArtifactKeeper-Delivery"),
+            Some(Uuid::nil().to_string().as_str())
+        );
+        assert_eq!(
+            header(&h, "X-ArtifactKeeper-Event"),
+            Some("artifact.uploaded")
+        );
+        assert_eq!(
+            header(&h, "X-ArtifactKeeper-Event-Version"),
+            Some("2026-04-01")
+        );
+    }
+
+    #[test]
+    fn delivery_headers_include_legacy_set() {
+        let inputs = sample_inputs(&[], b"{}");
+        let h = build_delivery_request_headers(&inputs);
+        assert_eq!(header(&h, "X-Webhook-Event"), Some("artifact.uploaded"));
+        assert!(header(&h, "X-Webhook-Delivery").is_some());
+    }
+
+    #[test]
+    fn delivery_headers_omit_retry_attempt_when_none() {
+        let inputs = sample_inputs(&[], b"{}");
+        let h = build_delivery_request_headers(&inputs);
+        assert!(header(&h, "X-ArtifactKeeper-Retry-Attempt").is_none());
+        assert!(header(&h, "X-Webhook-Retry-Attempt").is_none());
+    }
+
+    #[test]
+    fn delivery_headers_emit_retry_attempt_when_some() {
+        let mut inputs = sample_inputs(&[], b"{}");
+        inputs.retry_attempt = Some(7);
+        let h = build_delivery_request_headers(&inputs);
+        assert_eq!(header(&h, "X-ArtifactKeeper-Retry-Attempt"), Some("7"));
+        assert_eq!(header(&h, "X-Webhook-Retry-Attempt"), Some("7"));
+    }
+
+    #[test]
+    fn delivery_headers_omit_signature_when_no_secrets() {
+        let inputs = sample_inputs(&[], b"{}");
+        let h = build_delivery_request_headers(&inputs);
+        assert!(header(&h, "X-ArtifactKeeper-Signature").is_none());
+        assert!(header(&h, "X-Webhook-Signature").is_none());
+    }
+
+    #[test]
+    fn delivery_headers_emit_signature_when_secret_present() {
+        let secrets = ["whsec_a"];
+        let secret_refs: Vec<&str> = secrets.iter().copied().collect();
+        let inputs = sample_inputs(&secret_refs, b"{}");
+        let h = build_delivery_request_headers(&inputs);
+        let sig = header(&h, "X-ArtifactKeeper-Signature").unwrap();
+        assert!(sig.starts_with("t=1700000000,"));
+        assert_eq!(sig.matches("v1=").count(), 1);
+        let legacy = header(&h, "X-Webhook-Signature").unwrap();
+        assert!(legacy.starts_with("sha256="));
+    }
+
+    #[test]
+    fn delivery_headers_emit_two_v1_tokens_during_rotation() {
+        let secrets = ["whsec_new", "whsec_old"];
+        let secret_refs: Vec<&str> = secrets.iter().copied().collect();
+        let inputs = sample_inputs(&secret_refs, b"{}");
+        let h = build_delivery_request_headers(&inputs);
+        let sig = header(&h, "X-ArtifactKeeper-Signature").unwrap();
+        assert_eq!(sig.matches("v1=").count(), 2);
+    }
+
+    #[test]
+    fn delivery_headers_pass_through_custom_string_headers() {
+        let custom = serde_json::json!({"X-Trace-Id": "abc-123", "X-Drop-Me": 42});
+        let mut inputs = sample_inputs(&[], b"{}");
+        inputs.custom_headers = Some(&custom);
+        let h = build_delivery_request_headers(&inputs);
+        assert_eq!(header(&h, "X-Trace-Id"), Some("abc-123"));
+        // Non-string custom-header values are silently dropped (matches prior behavior).
+        assert_eq!(header(&h, "X-Drop-Me"), None);
+    }
+
+    #[test]
+    fn delivery_headers_signed_body_matches_signature() {
+        let secret = "whsec_test";
+        let body = b"hello world";
+        let unix_secs = 1_700_000_000;
+        let secret_refs = [secret];
+        let mut inputs = sample_inputs(&secret_refs, body);
+        inputs.unix_secs = unix_secs;
+        let h = build_delivery_request_headers(&inputs);
+        // The legacy header is HMAC over body alone (no timestamp prefix).
+        let legacy = header(&h, "X-Webhook-Signature").unwrap();
+        let expected_legacy = format!(
+            "sha256={}",
+            crate::services::webhook_signing::compute_v1_signature(secret, unix_secs, body)
+        );
+        assert_eq!(legacy, expected_legacy);
+        // The v2 header includes the same hex token.
+        let v2 = header(&h, "X-ArtifactKeeper-Signature").unwrap();
+        assert!(v2.contains(&legacy[7..]));
+    }
+
+    // ---------------- validate_event_version ----------------
+
+    #[test]
+    fn validate_event_version_accepts_known() {
+        assert!(validate_event_version("2026-04-01").is_ok());
+    }
+
+    #[test]
+    fn validate_event_version_rejects_unknown() {
+        let err = validate_event_version("9999-99-99").unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("9999-99-99"));
+                assert!(msg.contains("supported"));
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn supported_event_versions_includes_inaugural() {
+        assert!(SUPPORTED_EVENT_VERSIONS.contains(&"2026-04-01"));
     }
 }
