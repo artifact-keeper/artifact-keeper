@@ -186,7 +186,16 @@ async fn upsert_index_upstream_url(
     upsert_repo_config(db, repo_id, "index_upstream_url", index_url).await
 }
 
-/// Create repository routes
+/// Sub-router holding ONLY the artifact download route. Split out from
+/// the main `router()` so the caller can apply a stricter per-IP rate
+/// limit to it without touching the rest of the repository CRUD.
+/// See [`router_with_presign_layer`] and #1053.
+pub fn download_router() -> Router<SharedState> {
+    Router::new().route("/:key/download/*path", get(download_artifact))
+}
+
+/// Create repository routes (excluding the download route, which has
+/// stricter per-IP rate limiting; see [`download_router`] and #1053).
 pub fn router() -> Router<SharedState> {
     use axum::routing::{delete, post, put};
 
@@ -230,8 +239,8 @@ pub fn router() -> Router<SharedState> {
                 .post(upload_artifact_multipart_with_path)
                 .delete(delete_artifact),
         )
-        // Download uses a separate route prefix to avoid wildcard conflict
-        .route("/:key/download/*path", get(download_artifact))
+        // Note: `/:key/download/*path` lives in `download_router()` so it
+        // can carry a stricter per-IP presign-mint rate limit (#1053).
         // Security routes nested under repository
         .merge(super::security::repo_security_router())
         // Label routes nested under repository
@@ -902,9 +911,11 @@ pub async fn create_repository(
         .await?;
     }
 
-    state
-        .event_bus
-        .emit("repository.created", repo.id, Some(auth.username.clone()));
+    state.event_bus.emit_repository_event(
+        "repository.created",
+        repo.id,
+        Some(auth.username.clone()),
+    );
 
     let mut response = repo_to_response(repo, 0);
     if let Some(ref at) = payload.upstream_auth_type {
@@ -1108,9 +1119,11 @@ pub async fn update_repository(
 
     let storage_used = service.get_storage_usage(repo.id).await?;
 
-    state
-        .event_bus
-        .emit("repository.updated", repo.id, Some(auth.username.clone()));
+    state.event_bus.emit_repository_event(
+        "repository.updated",
+        repo.id,
+        Some(auth.username.clone()),
+    );
 
     Ok(Json(repo_to_response(repo, storage_used)))
 }
@@ -1163,9 +1176,11 @@ pub async fn delete_repository(
         cache.remove(&key);
     }
 
-    state
-        .event_bus
-        .emit("repository.deleted", repo.id, Some(auth.username.clone()));
+    state.event_bus.emit_repository_event(
+        "repository.deleted",
+        repo.id,
+        Some(auth.username.clone()),
+    );
     Ok(())
 }
 

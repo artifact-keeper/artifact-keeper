@@ -117,10 +117,12 @@ async fn dispatch_event(
 ) -> std::result::Result<(), String> {
     let notification_event = map_event_type(&event.event_type);
 
-    // Try to parse entity_id as a UUID (repository ID). If it is not a valid
-    // UUID, the event does not carry a repository context and we only match
-    // global subscriptions (repository_id IS NULL).
-    let repo_id: Option<uuid::Uuid> = uuid::Uuid::parse_str(&event.entity_id).ok();
+    // Repo scoping uses the publisher-set `event.repository_id` field, not a
+    // parse of `entity_id`. For repo-scoped events (`repository.*`) the
+    // publisher passes the repo UUID via `EventBus::emit_for_repo`. For
+    // non-repo events (`user.*`, `group.*`, etc.) it is None, and only
+    // global subscriptions match (`repository_id IS NULL`). See #948.
+    let repo_id: Option<uuid::Uuid> = event.repository_id;
 
     let rows = sqlx::query(
         r#"
@@ -377,6 +379,7 @@ mod tests {
         DomainEvent {
             event_type: "artifact.created".into(),
             entity_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            repository_id: None,
             actor: Some("alice".into()),
             timestamp: "2026-04-08T12:00:00Z".into(),
         }
@@ -387,6 +390,7 @@ mod tests {
         DomainEvent {
             event_type: "scan.completed".into(),
             entity_id: "repo-key-abc".into(),
+            repository_id: None,
             actor: None,
             timestamp: "2026-04-08T13:00:00Z".into(),
         }
@@ -653,6 +657,7 @@ mod tests {
         let event = DomainEvent {
             event_type: "build.failed".into(),
             entity_id: "build-42".into(),
+            repository_id: None,
             actor: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
         };
@@ -989,6 +994,7 @@ mod tests {
         let event = DomainEvent {
             event_type: "artifact.created".into(),
             entity_id: "abc".into(),
+            repository_id: None,
             actor: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
         };
