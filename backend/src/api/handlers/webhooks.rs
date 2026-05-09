@@ -1501,6 +1501,25 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
                 delivery.id,
                 new_attempts
             );
+
+            // Auto-disable + notifier. Failures here are logged but do
+            // not retry the (already dead-lettered) delivery.
+            if let Err(e) = crate::services::webhook_notifier::auto_disable_webhook_for_dead_letter(
+                db,
+                delivery.webhook_id,
+                delivery.id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    delivery_id = %delivery.id,
+                    webhook_id = %delivery.webhook_id,
+                    error = %e,
+                    "auto-disable on dead-letter failed"
+                );
+            }
+
+            crate::services::metrics_service::record_webhook_dead_letter(&delivery.event);
         } else if let RetryOutcome::Retry { delay_secs } = outcome {
             // Schedule next retry
             let _ = sqlx::query(

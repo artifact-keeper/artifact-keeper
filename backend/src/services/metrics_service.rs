@@ -84,6 +84,17 @@ pub fn record_webhook_delivery_enqueue_failed(event: &str, reason: &str) {
     .increment(1);
 }
 
+/// Record that a webhook delivery exhausted its retry budget and was
+/// dead-lettered. This is the signal ops watches to detect persistently
+/// failing receivers; auto-disable also fires on this transition.
+pub fn record_webhook_dead_letter(event: &str) {
+    counter!(
+        "ak_webhook_dead_letter_total",
+        "event" => event.to_string()
+    )
+    .increment(1);
+}
+
 /// Record an outbound URL that was rejected by SSRF validation, either
 /// at handler entry (`validate_outbound_url`) or on a redirect hop
 /// inside the shared HTTP client. `reason` is `"hostname"` or `"ip"`,
