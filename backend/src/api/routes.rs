@@ -12,7 +12,8 @@ use super::middleware::auth::{
 use super::middleware::demo::demo_guard;
 use super::middleware::guest_access::{guest_access_guard, GuestAccessState};
 use super::middleware::rate_limit::{
-    rate_limit_middleware, RateLimitExemptions, RateLimitState, RateLimiter,
+    rate_limit_by_ip_middleware, rate_limit_middleware, RateLimitExemptions, RateLimitState,
+    RateLimiter,
 };
 use super::middleware::setup::setup_guard;
 use super::middleware::tracing::correlation_id_middleware;
@@ -196,6 +197,12 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         state.config.rate_limit_search_per_window,
         state.config.rate_limit_window_secs,
     ));
+    // Stricter per-IP bucket for endpoints that mint presigned download
+    // URLs. See #1053.
+    let presign_rate_limiter = Arc::new(RateLimiter::new(
+        state.config.rate_limit_presign_per_window,
+        state.config.rate_limit_window_secs,
+    ));
 
     let auth_rate_limit_state = RateLimitState {
         limiter: Arc::clone(&auth_rate_limiter),
@@ -209,6 +216,10 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         limiter: Arc::clone(&search_rate_limiter),
         exemptions: Arc::clone(&exemptions),
     };
+    let presign_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&presign_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+    };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
@@ -216,6 +227,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
         let auth_cleanup = Arc::clone(&auth_rate_limiter);
         let api_cleanup = Arc::clone(&api_rate_limiter);
         let search_cleanup = Arc::clone(&search_rate_limiter);
+        let presign_cleanup = Arc::clone(&presign_rate_limiter);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -223,6 +235,7 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_cleanup.cleanup_expired().await;
                 api_cleanup.cleanup_expired().await;
                 search_cleanup.cleanup_expired().await;
+                presign_cleanup.cleanup_expired().await;
             }
         });
     }
@@ -260,11 +273,21 @@ fn api_v1_routes(state: SharedState) -> Router<SharedState> {
                 auth_middleware,
             )),
         )
-        // Repository routes with optional auth middleware
-        // (some endpoints require auth, others are optional - handlers will check)
+        // Repository routes with optional auth middleware. The download
+        // route (`/:key/download/*path`) carries an additional stricter
+        // per-IP rate limit (#1053) on top of the general API limit
+        // because it mints presigned URLs at O(1) memory cost per
+        // request - an attacker can drive much higher concurrency on
+        // this path than on memory-buffered endpoints.
         .nest(
             "/repositories",
             handlers::repositories::router()
+                .merge(handlers::repositories::download_router().layer(
+                    middleware::from_fn_with_state(
+                        presign_rate_limit_state,
+                        rate_limit_by_ip_middleware,
+                    ),
+                ))
                 .layer(if upload_limit == 0 {
                     DefaultBodyLimit::disable()
                 } else {
