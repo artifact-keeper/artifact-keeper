@@ -505,7 +505,8 @@ pub async fn test_webhook(
     use sqlx::Row;
 
     let webhook = sqlx::query(
-        "SELECT url, headers, secret_hash, payload_template FROM webhooks WHERE id = $1",
+        "SELECT url, headers, payload_template, event_schema_version \
+         FROM webhooks WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -515,9 +516,13 @@ pub async fn test_webhook(
 
     let url: String = webhook.get("url");
     let headers: Option<serde_json::Value> = webhook.get("headers");
-    let secret_hash: Option<String> = webhook.get("secret_hash");
     let tpl_str: String = webhook.get("payload_template");
     let template = PayloadTemplate::from_str_lossy(&tpl_str);
+    let event_version: String = webhook
+        .try_get::<Option<String>, _>("event_schema_version")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "2026-04-01".to_string());
 
     // Create test payload using the configured template
     let test_details = serde_json::json!({
@@ -529,11 +534,27 @@ pub async fn test_webhook(
     // Re-validate URL at delivery time to prevent DNS rebinding attacks
     validate_webhook_url(&url)?;
 
+    // Serialize once so the bytes we sign are exactly the bytes we POST.
+    let body_bytes = serde_json::to_vec(&payload).map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let unix_secs = chrono::Utc::now().timestamp();
+    let secrets = load_active_secrets(&state.db, id).await.unwrap_or_default();
+    let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
+
+    // Test deliveries have no `webhook_deliveries` row; mint a fresh
+    // delivery id so receivers still get a unique correlation handle.
+    let test_delivery_id = Uuid::new_v4();
+
     // Send webhook
     let client = crate::services::http_client::default_client();
     let mut request = client
         .post(&url)
         .header("Content-Type", "application/json")
+        // v2 headers
+        .header("X-ArtifactKeeper-Delivery", test_delivery_id.to_string())
+        .header("X-ArtifactKeeper-Event", "test")
+        .header("X-ArtifactKeeper-Event-Version", &event_version)
+        // Legacy header retained for one release.
         .header("X-Webhook-Event", "test");
 
     // Add custom headers
@@ -547,13 +568,19 @@ pub async fn test_webhook(
         }
     }
 
-    // Add signature if secret exists
-    if secret_hash.is_some() {
-        // In production, would sign payload with HMAC-SHA256
-        request = request.header("X-Webhook-Signature", "test-signature");
+    if !secret_refs.is_empty() {
+        let sig_header =
+            crate::services::webhook_signing::render_header(unix_secs, &body_bytes, &secret_refs);
+        request = request.header("X-ArtifactKeeper-Signature", &sig_header);
+        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
+            secret_refs[0],
+            unix_secs,
+            &body_bytes,
+        );
+        request = request.header("X-Webhook-Signature", format!("sha256={}", legacy_sig));
     }
 
-    match request.json(&payload).send().await {
+    match request.body(body_bytes).send().await {
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().await.ok();
@@ -717,28 +744,54 @@ pub async fn redeliver(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Delivery not found".to_string()))?;
 
-    // Get webhook details
-    let webhook = sqlx::query!(
-        "SELECT url, headers, secret_hash FROM webhooks WHERE id = $1",
-        webhook_id
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
+    // Get webhook details. Uses sqlx::query (not the macro) so we don't
+    // need to regenerate the offline cache for the new
+    // `event_schema_version` column added in migration 084. Signing-secret
+    // material is loaded separately via `load_active_secrets`.
+    use sqlx::Row;
+    let webhook_row =
+        sqlx::query("SELECT url, headers, event_schema_version FROM webhooks WHERE id = $1")
+            .bind(webhook_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("Webhook not found".to_string()))?;
+
+    let webhook_url: String = webhook_row.get("url");
+    let webhook_headers: Option<serde_json::Value> = webhook_row.get("headers");
+    let event_version: String = webhook_row
+        .try_get::<Option<String>, _>("event_schema_version")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "2026-04-01".to_string());
 
     // Re-validate URL at delivery time to prevent DNS rebinding attacks
-    validate_webhook_url(&webhook.url)?;
+    validate_webhook_url(&webhook_url)?;
+
+    // Serialize once so the bytes we sign are exactly the bytes we POST.
+    let body_bytes =
+        serde_json::to_vec(&delivery.payload).map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let unix_secs = chrono::Utc::now().timestamp();
+    let secrets = load_active_secrets(&state.db, webhook_id)
+        .await
+        .unwrap_or_default();
+    let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
 
     // Send webhook
     let client = crate::services::http_client::default_client();
     let mut request = client
-        .post(&webhook.url)
+        .post(&webhook_url)
         .header("Content-Type", "application/json")
+        // v2 headers
+        .header("X-ArtifactKeeper-Delivery", delivery_id.to_string())
+        .header("X-ArtifactKeeper-Event", &delivery.event)
+        .header("X-ArtifactKeeper-Event-Version", &event_version)
+        // Legacy headers retained for one release.
         .header("X-Webhook-Event", &delivery.event)
         .header("X-Webhook-Delivery", delivery_id.to_string());
 
-    if let Some(headers) = webhook.headers {
+    if let Some(headers) = webhook_headers {
         if let Some(obj) = headers.as_object() {
             for (key, value) in obj {
                 if let Some(v) = value.as_str() {
@@ -748,15 +801,26 @@ pub async fn redeliver(
         }
     }
 
-    let (success, response_status, response_body) =
-        match request.json(&delivery.payload).send().await {
-            Ok(response) => {
-                let status = response.status().as_u16() as i32;
-                let body = response.text().await.ok();
-                ((200..300).contains(&status), Some(status), body)
-            }
-            Err(e) => (false, None, Some(e.to_string())),
-        };
+    if !secret_refs.is_empty() {
+        let sig_header =
+            crate::services::webhook_signing::render_header(unix_secs, &body_bytes, &secret_refs);
+        request = request.header("X-ArtifactKeeper-Signature", &sig_header);
+        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
+            secret_refs[0],
+            unix_secs,
+            &body_bytes,
+        );
+        request = request.header("X-Webhook-Signature", format!("sha256={}", legacy_sig));
+    }
+
+    let (success, response_status, response_body) = match request.body(body_bytes).send().await {
+        Ok(response) => {
+            let status = response.status().as_u16() as i32;
+            let body = response.text().await.ok();
+            ((200..300).contains(&status), Some(status), body)
+        }
+        Err(e) => (false, None, Some(e.to_string())),
+    };
 
     // Update delivery record
     let updated = sqlx::query!(
@@ -979,6 +1043,12 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
 /// to a non-empty value. Rows where both are NULL or empty are treated
 /// as "no signing configured" and the retry path omits the
 /// `X-Webhook-Signature` header entirely.
+///
+/// Retained for one release after E2 wired up real HMAC signing in
+/// `process_webhook_retries`/`redeliver`/`test_webhook` (which now use
+/// `load_active_secrets` directly). External call sites and tests may
+/// still reference this helper. Removed in v1.3.0.
+#[allow(dead_code)]
 pub(crate) fn has_signing_secret(
     secret_hash: &Option<String>,
     secret_encrypted: Option<&[u8]>,
@@ -1092,6 +1162,75 @@ struct RetryDeliveryRow {
     pub max_attempts: i32,
 }
 
+/// Load and decrypt the secrets that should currently sign deliveries
+/// for the given webhook row. Returns up to two strings, ordered
+/// current-first. The legacy bcrypt `secret_hash` cannot sign because
+/// it is irreversible; rows that only have `secret_hash` and no
+/// `secret_encrypted` get an empty Vec and the caller MUST omit the
+/// signature header (the row is "configured but unrotated").
+async fn load_active_secrets(
+    db: &sqlx::PgPool,
+    webhook_id: Uuid,
+) -> std::result::Result<Vec<String>, String> {
+    use sqlx::Row;
+
+    let row = sqlx::query(
+        r#"
+        SELECT secret_encrypted,
+               secret_previous_encrypted,
+               secret_previous_expires_at
+        FROM webhooks
+        WHERE id = $1
+        "#,
+    )
+    .bind(webhook_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("load_active_secrets query: {}", e))?;
+
+    let row = match row {
+        Some(r) => r,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut out: Vec<String> = Vec::new();
+
+    let cur: Option<Vec<u8>> = row.get("secret_encrypted");
+    if let Some(bytes) = cur.as_deref() {
+        if !bytes.is_empty() {
+            match webhook_secret_crypto::decrypt_secret(bytes) {
+                Ok(s) => out.push(s),
+                Err(e) => {
+                    tracing::warn!(
+                        webhook_id = %webhook_id,
+                        error = %e,
+                        "failed to decrypt current webhook secret; skipping signature"
+                    );
+                }
+            }
+        }
+    }
+
+    let prev: Option<Vec<u8>> = row.get("secret_previous_encrypted");
+    let exp: Option<chrono::DateTime<chrono::Utc>> = row.get("secret_previous_expires_at");
+    if let (Some(bytes), Some(exp)) = (prev.as_deref(), exp) {
+        if !bytes.is_empty() && exp > chrono::Utc::now() {
+            match webhook_secret_crypto::decrypt_secret(bytes) {
+                Ok(s) => out.push(s),
+                Err(e) => {
+                    tracing::warn!(
+                        webhook_id = %webhook_id,
+                        error = %e,
+                        "failed to decrypt previous webhook secret; skipping fallback signature"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Process failed webhook deliveries that are due for retry.
 ///
 /// Queries the retry queue for deliveries where `next_retry_at <= NOW()`,
@@ -1142,21 +1281,17 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     for delivery in &rows {
-        // Look up the webhook URL, headers, and both signing-secret forms
-        // (using sqlx::query, not the macro, because the WHERE clause differs
-        // from the cached version). The retry path treats `secret_encrypted`
-        // (E1, AES-GCM) as authoritative for new rows and falls back to the
-        // legacy bcrypt `secret_hash` for un-rotated pre-v1.1.9 webhooks.
-        // Migration 081 leaves both NULL on rows it migrates so the operator
-        // is forced to rotate before signatures resume.
-        let webhook_row = sqlx::query(
-            "SELECT url, headers, secret_hash, secret_encrypted \
-             FROM webhooks WHERE id = $1 AND is_enabled = true",
-        )
-        .bind(delivery.webhook_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| format!("Failed to fetch webhook: {}", e))?;
+        // Look up the webhook URL and headers. Signing-secret material is
+        // loaded separately via `load_active_secrets` so the retry path can
+        // use the AES-GCM-decrypted secrets directly for HMAC. The legacy
+        // bcrypt `secret_hash` cannot sign (irreversible) and is therefore
+        // not read here.
+        let webhook_row =
+            sqlx::query("SELECT url, headers FROM webhooks WHERE id = $1 AND is_enabled = true")
+                .bind(delivery.webhook_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| format!("Failed to fetch webhook: {}", e))?;
 
         let webhook_row = match webhook_row {
             Some(w) => w,
@@ -1173,8 +1308,6 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
 
         let url: String = webhook_row.get("url");
         let headers: Option<serde_json::Value> = webhook_row.get("headers");
-        let secret_hash: Option<String> = webhook_row.get("secret_hash");
-        let secret_encrypted: Option<Vec<u8>> = webhook_row.get("secret_encrypted");
 
         // Validate URL before delivery (SSRF prevention)
         if validate_webhook_url(&url).is_err() {
@@ -1189,10 +1322,55 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             continue;
         }
 
-        // Build the request
+        // Serialize once so the bytes we sign are exactly the bytes we POST.
+        let body_bytes = match serde_json::to_vec(&delivery.payload) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    delivery_id = %delivery.id,
+                    error = %e,
+                    "Failed to serialize webhook payload; dead-lettering"
+                );
+                let _ =
+                    sqlx::query("UPDATE webhook_deliveries SET next_retry_at = NULL WHERE id = $1")
+                        .bind(delivery.id)
+                        .execute(db)
+                        .await;
+                continue;
+            }
+        };
+
+        // Look up the pinned event_schema_version for this webhook so
+        // the header is correct even when the delivery row was enqueued
+        // before E4 landed. Cheap; one row, one column.
+        let event_version: String =
+            sqlx::query_scalar("SELECT event_schema_version FROM webhooks WHERE id = $1")
+                .bind(delivery.webhook_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| format!("load event_schema_version: {}", e))?
+                .unwrap_or_else(|| "2026-04-01".to_string());
+
+        let unix_secs = chrono::Utc::now().timestamp();
+        let secrets = load_active_secrets(db, delivery.webhook_id)
+            .await
+            .unwrap_or_default();
+        let secret_refs: Vec<&str> = secrets.iter().map(|s| s.as_str()).collect();
+
         let mut request = client
             .post(&url)
             .header("Content-Type", "application/json")
+            // v2 headers
+            .header("X-ArtifactKeeper-Delivery", delivery.id.to_string())
+            .header("X-ArtifactKeeper-Event", &delivery.event)
+            .header("X-ArtifactKeeper-Event-Version", &event_version)
+            .header(
+                "X-ArtifactKeeper-Retry-Attempt",
+                (delivery.attempts + 1).to_string(),
+            )
+            // Legacy headers retained for one release so existing
+            // receivers built against the placeholder wire continue to
+            // receive deliveries. Removed in v1.3.0.
             .header("X-Webhook-Event", &delivery.event)
             .header("X-Webhook-Delivery", delivery.id.to_string())
             .header(
@@ -1210,30 +1388,37 @@ pub async fn process_webhook_retries(db: &sqlx::PgPool) -> std::result::Result<(
             }
         }
 
-        // Emit the signature header iff EITHER form of signing secret is
-        // configured. The actual HMAC is wired up in E2; today we still
-        // emit the placeholder string so the wire contract (header presence
-        // means "signing configured") is stable. Rows where BOTH forms are
-        // NULL (e.g. notifications migrated by migration 081 before the
-        // operator rotates) MUST NOT emit this header so receivers can
-        // distinguish "signing configured" from "legacy unsigned".
-        if has_signing_secret(&secret_hash, secret_encrypted.as_deref()) {
-            request = request.header("X-Webhook-Signature", "hmac-signature");
+        if !secret_refs.is_empty() {
+            let sig_header = crate::services::webhook_signing::render_header(
+                unix_secs,
+                &body_bytes,
+                &secret_refs,
+            );
+            request = request.header("X-ArtifactKeeper-Signature", &sig_header);
+            // Legacy header carries only the first v1 token (current
+            // secret) for one release so receivers built against the
+            // placeholder header start receiving real signatures.
+            let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
+                secret_refs[0],
+                unix_secs,
+                &body_bytes,
+            );
+            request = request.header("X-Webhook-Signature", format!("sha256={}", legacy_sig));
         }
 
-        let (success, response_status, response_body) =
-            match request.json(&delivery.payload).send().await {
-                Ok(response) => {
-                    let status = response.status().as_u16() as i32;
-                    let body = response.text().await.ok();
-                    (
-                        is_webhook_delivery_success(status as u16),
-                        Some(status),
-                        body,
-                    )
-                }
-                Err(e) => (false, None, Some(e.to_string())),
-            };
+        let (success, response_status, response_body) = match request.body(body_bytes).send().await
+        {
+            Ok(response) => {
+                let status = response.status().as_u16() as i32;
+                let body = response.text().await.ok();
+                (
+                    is_webhook_delivery_success(status as u16),
+                    Some(status),
+                    body,
+                )
+            }
+            Err(e) => (false, None, Some(e.to_string())),
+        };
 
         let new_attempts = delivery.attempts + 1;
         let outcome = determine_retry_outcome(success, delivery.attempts, delivery.max_attempts);
