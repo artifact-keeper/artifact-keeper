@@ -1246,12 +1246,50 @@ pub(crate) fn build_delivery_request_headers(
     out
 }
 
+/// Pure decision logic for `load_active_secrets`. Takes the already-loaded
+/// encrypted bytes and the previous-secret expiry, decrypts each via
+/// `webhook_secret_crypto::decrypt_secret`, and returns the surfaced
+/// secrets in current-first order. Bytes that are empty or that fail to
+/// decrypt are silently skipped (with a tracing::warn from the I/O
+/// wrapper); this function does no logging itself so unit tests can pin
+/// behavior without intercepting tracing output.
+///
+/// Returns a tuple `(secrets, decrypt_failures)` so the wrapper can log
+/// each failure with a stable message format. The Vec contents matter
+/// for the wire contract; the failure count is purely diagnostic.
+pub(crate) fn decide_active_secrets(
+    current_encrypted: Option<&[u8]>,
+    previous_encrypted: Option<&[u8]>,
+    previous_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::with_capacity(2);
+    let mut failures: usize = 0;
+
+    if let Some(bytes) = current_encrypted {
+        if !bytes.is_empty() {
+            match webhook_secret_crypto::decrypt_secret(bytes) {
+                Ok(s) => out.push(s),
+                Err(_) => failures += 1,
+            }
+        }
+    }
+
+    if let (Some(bytes), Some(exp)) = (previous_encrypted, previous_expires_at) {
+        if !bytes.is_empty() && exp > now {
+            match webhook_secret_crypto::decrypt_secret(bytes) {
+                Ok(s) => out.push(s),
+                Err(_) => failures += 1,
+            }
+        }
+    }
+
+    (out, failures)
+}
+
 /// Load and decrypt the secrets that should currently sign deliveries
-/// for the given webhook row. Returns up to two strings, ordered
-/// current-first. The legacy bcrypt `secret_hash` cannot sign because
-/// it is irreversible; rows that only have `secret_hash` and no
-/// `secret_encrypted` get an empty Vec and the caller MUST omit the
-/// signature header (the row is "configured but unrotated").
+/// for the given webhook row. Thin I/O wrapper around
+/// `decide_active_secrets`. See that function for the decision logic.
 async fn load_active_secrets(
     db: &sqlx::PgPool,
     webhook_id: Uuid,
@@ -1277,39 +1315,19 @@ async fn load_active_secrets(
         None => return Ok(Vec::new()),
     };
 
-    let mut out: Vec<String> = Vec::new();
-
     let cur: Option<Vec<u8>> = row.get("secret_encrypted");
-    if let Some(bytes) = cur.as_deref() {
-        if !bytes.is_empty() {
-            match webhook_secret_crypto::decrypt_secret(bytes) {
-                Ok(s) => out.push(s),
-                Err(e) => {
-                    tracing::warn!(
-                        webhook_id = %webhook_id,
-                        error = %e,
-                        "failed to decrypt current webhook secret; skipping signature"
-                    );
-                }
-            }
-        }
-    }
-
     let prev: Option<Vec<u8>> = row.get("secret_previous_encrypted");
     let exp: Option<chrono::DateTime<chrono::Utc>> = row.get("secret_previous_expires_at");
-    if let (Some(bytes), Some(exp)) = (prev.as_deref(), exp) {
-        if !bytes.is_empty() && exp > chrono::Utc::now() {
-            match webhook_secret_crypto::decrypt_secret(bytes) {
-                Ok(s) => out.push(s),
-                Err(e) => {
-                    tracing::warn!(
-                        webhook_id = %webhook_id,
-                        error = %e,
-                        "failed to decrypt previous webhook secret; skipping fallback signature"
-                    );
-                }
-            }
-        }
+
+    let (out, failures) =
+        decide_active_secrets(cur.as_deref(), prev.as_deref(), exp, chrono::Utc::now());
+
+    if failures > 0 {
+        tracing::warn!(
+            webhook_id = %webhook_id,
+            failures = failures,
+            "one or more webhook secrets failed to decrypt; deliveries may be unsigned"
+        );
     }
 
     Ok(out)
@@ -2413,5 +2431,110 @@ mod tests {
     #[test]
     fn supported_event_versions_includes_inaugural() {
         assert!(SUPPORTED_EVENT_VERSIONS.contains(&"2026-04-01"));
+    }
+
+    // ---------------- decide_active_secrets ----------------
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Serializes env mutation across tests (process-global env vars).
+    static SECRET_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn set_test_secret_key() {
+        // 32 bytes of zeros, base64-encoded — same shape webhook_secret_crypto's tests use.
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let key = B64.encode([0u8; 32]);
+        // SAFETY: SECRET_ENV_LOCK serializes env access for tests in this module.
+        unsafe {
+            std::env::set_var(crate::services::webhook_secret_crypto::ENV_KEY, key);
+        }
+    }
+
+    fn encrypt_test_secret(plaintext: &str) -> Vec<u8> {
+        crate::services::webhook_secret_crypto::encrypt_secret(plaintext)
+            .expect("test crypto roundtrip")
+    }
+
+    #[test]
+    fn decide_active_secrets_returns_only_current_when_no_previous() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let cur = encrypt_test_secret("whsec_alpha");
+        let now = chrono::Utc::now();
+        let (out, fails) = decide_active_secrets(Some(&cur), None, None, now);
+        assert_eq!(out, vec!["whsec_alpha".to_string()]);
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn decide_active_secrets_returns_both_during_overlap() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let cur = encrypt_test_secret("whsec_new");
+        let prev = encrypt_test_secret("whsec_old");
+        let now = chrono::Utc::now();
+        let exp = now + chrono::Duration::hours(12);
+        let (out, fails) = decide_active_secrets(Some(&cur), Some(&prev), Some(exp), now);
+        assert_eq!(out, vec!["whsec_new".to_string(), "whsec_old".to_string()]);
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn decide_active_secrets_skips_previous_after_expiry() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let cur = encrypt_test_secret("whsec_new");
+        let prev = encrypt_test_secret("whsec_old");
+        let now = chrono::Utc::now();
+        let exp = now - chrono::Duration::hours(1); // already expired
+        let (out, fails) = decide_active_secrets(Some(&cur), Some(&prev), Some(exp), now);
+        assert_eq!(out, vec!["whsec_new".to_string()]);
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn decide_active_secrets_returns_empty_when_neither_present() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let now = chrono::Utc::now();
+        let (out, fails) = decide_active_secrets(None, None, None, now);
+        assert!(out.is_empty());
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn decide_active_secrets_treats_empty_bytes_as_absent() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let empty: Vec<u8> = Vec::new();
+        let now = chrono::Utc::now();
+        let (out, fails) = decide_active_secrets(Some(&empty), Some(&empty), Some(now), now);
+        assert!(out.is_empty());
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn decide_active_secrets_counts_failed_decrypt() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        // Garbage bytes that won't decrypt under the test key.
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let now = chrono::Utc::now();
+        let (out, fails) = decide_active_secrets(Some(&garbage), None, None, now);
+        assert!(out.is_empty());
+        assert_eq!(fails, 1);
+    }
+
+    #[test]
+    fn decide_active_secrets_skips_previous_when_expiry_missing() {
+        let _g = SECRET_ENV_LOCK.lock().unwrap();
+        set_test_secret_key();
+        let cur = encrypt_test_secret("whsec_new");
+        let prev = encrypt_test_secret("whsec_old");
+        let now = chrono::Utc::now();
+        // Previous bytes present but expiry None means rotation row is malformed; treat as expired.
+        let (out, fails) = decide_active_secrets(Some(&cur), Some(&prev), None, now);
+        assert_eq!(out, vec!["whsec_new".to_string()]);
+        assert_eq!(fails, 0);
     }
 }
