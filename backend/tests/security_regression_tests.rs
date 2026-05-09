@@ -118,8 +118,11 @@ fn regression_ghsa_7f39_724h_cccm_maven_like_escape() {
 fn regression_ghsa_93ch_hrfh_5wcw_outbound_url_ssrf() {
     // IPv4-mapped IPv6 → AWS metadata IP. Pre-fix this slipped through.
     assert!(
-        validate_outbound_url("http://[::ffff:169.254.169.254]/latest/meta-data", "Test URL")
-            .is_err(),
+        validate_outbound_url(
+            "http://[::ffff:169.254.169.254]/latest/meta-data",
+            "Test URL"
+        )
+        .is_err(),
         "IPv4-mapped IPv6 form of AWS metadata IP must be blocked"
     );
 
