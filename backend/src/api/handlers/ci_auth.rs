@@ -44,7 +44,6 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::auth_service::AuthService;
 use crate::services::ci_oidc_service::CiOidcService;
-use sqlx;
 
 /// Create public CI auth routes (no auth middleware needed — the CI JWT is the
 /// credential).
@@ -121,31 +120,13 @@ pub async fn exchange_ci_token(
 
     // 5. Provision / sync the CI service account and generate tokens.
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (user, tokens) = auth_service
+    let (user, _tokens) = auth_service
         .authenticate_federated(CiOidcService::auth_provider(), credentials)
         .await?;
 
-    // 6. Assign the mapping's role to the service account.
-    //
-    //    This runs on every successful token exchange (not just the first),
-    //    so a user that was created without a role (e.g. due to a crash)
-    //    self-heals on the next login.  ON CONFLICT DO NOTHING makes it safe
-    //    to call repeatedly.
-    //
-    //    Note: `authenticate_federated` above uses its own DB connection, so
-    //    user creation and role assignment cannot share a single transaction
-    //    without a larger refactor.  The idempotent insert and per-login
-    //    execution are the mitigation.
-    if let Some(role_id) = mapping.role_id {
-        sqlx::query(
-            "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-        )
-        .bind(user.id)
-        .bind(role_id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-    }
+    // Issue a CI-scoped JWT so repository restrictions from the mapping are
+    // enforced by the normal repository guards (`AuthExtension::can_access_repo`).
+    let tokens = auth_service.generate_tokens_with_repo_scope(&user, mapping.allowed_repo_ids)?;
 
     Ok(Json(CiTokenResponse {
         access_token: tokens.access_token,

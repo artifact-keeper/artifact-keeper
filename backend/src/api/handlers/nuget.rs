@@ -982,6 +982,7 @@ mod tests {
             iat: now,
             exp: now + 300,
             token_type: "access".to_string(),
+            allowed_repo_ids: None,
         };
         encode(
             &Header::default(),

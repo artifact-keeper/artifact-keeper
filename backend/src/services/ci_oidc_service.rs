@@ -11,8 +11,6 @@
 //! number = higher priority); the first enabled mapping whose `claim_filters`
 //! all match the incoming JWT wins.  The mapping determines:
 //!
-//! * Which AK **Role** the resulting service account receives.
-//! * An optional explicit **repository scope** (`allowed_repo_ids`).
 //! * A **stable username** derived from the mapping's UUID — the same pipeline
 //!   configuration always authenticates as the same service account regardless
 //!   of the branch/ref, giving a clean audit trail.
@@ -59,9 +57,8 @@ pub struct CiOidcIdentityMapping {
     /// JSONB claim-filter map.  Each key is a claim name; the value is either
     /// a single string (exact match) or an array of strings (any-of match).
     pub claim_filters: serde_json::Value,
-    /// Optional AK Role assigned to the service account for this mapping.
-    pub role_id: Option<Uuid>,
-    /// Optional repository-scope restriction (further narrows Role access).
+    /// Optional repository restriction for this mapping.
+    /// `None` = unrestricted, `Some(vec![])` = deny all repos.
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -118,7 +115,6 @@ pub struct CreateCiOidcMappingRequest {
     pub name: String,
     pub priority: Option<i32>,
     pub claim_filters: serde_json::Value,
-    pub role_id: Option<Uuid>,
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     pub is_enabled: Option<bool>,
 }
@@ -128,7 +124,6 @@ pub struct UpdateCiOidcMappingRequest {
     pub name: Option<String>,
     pub priority: Option<i32>,
     pub claim_filters: Option<serde_json::Value>,
-    pub role_id: Option<Uuid>,
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     pub is_enabled: Option<bool>,
 }
@@ -140,7 +135,6 @@ pub struct CiOidcMappingResponse {
     pub name: String,
     pub priority: i32,
     pub claim_filters: serde_json::Value,
-    pub role_id: Option<Uuid>,
     pub allowed_repo_ids: Option<Vec<Uuid>>,
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -155,7 +149,6 @@ impl From<CiOidcIdentityMapping> for CiOidcMappingResponse {
             name: m.name,
             priority: m.priority,
             claim_filters: m.claim_filters,
-            role_id: m.role_id,
             allowed_repo_ids: m.allowed_repo_ids,
             is_enabled: m.is_enabled,
             created_at: m.created_at,
@@ -397,8 +390,8 @@ impl CiOidcService {
     pub async fn list_mappings(&self, provider_id: Uuid) -> Result<Vec<CiOidcMappingResponse>> {
         self.get(provider_id).await?;
         let rows = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, role_id,
-                      allowed_repo_ids, is_enabled, created_at, updated_at
+            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
+                      is_enabled, created_at, updated_at
                FROM ci_oidc_identity_mappings
                WHERE provider_id = $1
                ORDER BY priority ASC, created_at ASC"#,
@@ -416,8 +409,8 @@ impl CiOidcService {
         mapping_id: Uuid,
     ) -> Result<CiOidcMappingResponse> {
         sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, role_id,
-                      allowed_repo_ids, is_enabled, created_at, updated_at
+            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
+                      is_enabled, created_at, updated_at
                FROM ci_oidc_identity_mappings
                WHERE id = $1 AND provider_id = $2"#,
         )
@@ -441,18 +434,16 @@ impl CiOidcService {
 
         let row = sqlx::query_as::<_, CiOidcIdentityMapping>(
             r#"INSERT INTO ci_oidc_identity_mappings
-                    (provider_id, name, priority, claim_filters, role_id,
-                     allowed_repo_ids, is_enabled)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
-               RETURNING id, provider_id, name, priority, claim_filters, role_id,
-                         allowed_repo_ids, is_enabled, created_at, updated_at"#,
+                (provider_id, name, priority, claim_filters, allowed_repo_ids, is_enabled)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, provider_id, name, priority, claim_filters, allowed_repo_ids,
+                         is_enabled, created_at, updated_at"#,
         )
         .bind(provider_id)
         .bind(req.name)
         .bind(priority)
         .bind(req.claim_filters)
-        .bind(req.role_id)
-        .bind(req.allowed_repo_ids)
+       .bind(req.allowed_repo_ids)
         .bind(is_enabled)
         .fetch_one(&self.db)
         .await
@@ -467,8 +458,8 @@ impl CiOidcService {
         req: UpdateCiOidcMappingRequest,
     ) -> Result<CiOidcMappingResponse> {
         let existing = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, role_id,
-                      allowed_repo_ids, is_enabled, created_at, updated_at
+            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
+                      is_enabled, created_at, updated_at
                FROM ci_oidc_identity_mappings
                WHERE id = $1 AND provider_id = $2"#,
         )
@@ -484,20 +475,18 @@ impl CiOidcService {
                SET name             = $3,
                    priority         = $4,
                    claim_filters    = $5,
-                   role_id          = $6,
-                   allowed_repo_ids = $7,
-                   is_enabled       = $8,
+                   allowed_repo_ids = $6,
+                   is_enabled       = $7,
                    updated_at       = NOW()
                WHERE id = $1 AND provider_id = $2
-               RETURNING id, provider_id, name, priority, claim_filters, role_id,
-                         allowed_repo_ids, is_enabled, created_at, updated_at"#,
+               RETURNING id, provider_id, name, priority, claim_filters, allowed_repo_ids,
+                         is_enabled, created_at, updated_at"#,
         )
         .bind(mapping_id)
         .bind(provider_id)
         .bind(req.name.unwrap_or(existing.name))
         .bind(req.priority.unwrap_or(existing.priority))
         .bind(req.claim_filters.unwrap_or(existing.claim_filters))
-        .bind(req.role_id.or(existing.role_id))
         .bind(req.allowed_repo_ids.or(existing.allowed_repo_ids))
         .bind(req.is_enabled.unwrap_or(existing.is_enabled))
         .fetch_one(&self.db)
@@ -532,8 +521,8 @@ impl CiOidcService {
             r#"UPDATE ci_oidc_identity_mappings
                SET is_enabled = $3, updated_at = NOW()
                WHERE id = $1 AND provider_id = $2
-               RETURNING id, provider_id, name, priority, claim_filters, role_id,
-                         allowed_repo_ids, is_enabled, created_at, updated_at"#,
+               RETURNING id, provider_id, name, priority, claim_filters, allowed_repo_ids,
+                         is_enabled, created_at, updated_at"#,
         )
         .bind(mapping_id)
         .bind(provider_id)
@@ -615,8 +604,8 @@ impl CiOidcService {
         claims: &serde_json::Value,
     ) -> Result<CiOidcIdentityMapping> {
         let mappings = sqlx::query_as::<_, CiOidcIdentityMapping>(
-            r#"SELECT id, provider_id, name, priority, claim_filters, role_id,
-                      allowed_repo_ids, is_enabled, created_at, updated_at
+            r#"SELECT id, provider_id, name, priority, claim_filters, allowed_repo_ids,
+                      is_enabled, created_at, updated_at
                FROM ci_oidc_identity_mappings
                WHERE provider_id = $1 AND is_enabled = true
                ORDER BY priority ASC, created_at ASC"#,
@@ -879,7 +868,6 @@ mod tests {
             name: name.to_string(),
             priority: 10,
             claim_filters: json!({"sub": "ci:example"}),
-            role_id: None,
             allowed_repo_ids: None,
             is_enabled: true,
             created_at: now,
@@ -1120,7 +1108,6 @@ mod tests {
                     name: "main-branch".to_string(),
                     priority: None,
                     claim_filters: json!({"ref": "refs/heads/main"}),
-                    role_id: None,
                     allowed_repo_ids: None,
                     is_enabled: None,
                 },
@@ -1150,7 +1137,6 @@ mod tests {
                     name: Some("release-branch".to_string()),
                     priority: Some(5),
                     claim_filters: Some(json!({"ref": ["refs/heads/main", "refs/heads/release"]})),
-                    role_id: None,
                     allowed_repo_ids: None,
                     is_enabled: Some(true),
                 },
