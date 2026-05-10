@@ -62,16 +62,53 @@ fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
         .unwrap()
 }
 
+/// Escape a string so it is safe to embed in an HTTP `quoted-string` body
+/// (RFC 7230 §3.2.6 ABNF):
+///
+/// ```text
+/// qdtext       = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text
+/// quoted-pair  = "\" ( HTAB / SP / VCHAR / obs-text )
+/// obs-text     = %x80-FF
+/// ```
+///
+/// `"` and `\` get the standard `quoted-pair` backslash escape. HTAB and
+/// printable ASCII pass through verbatim. Everything else (CR, LF, NUL,
+/// other control chars, and `obs-text` ≥ 0x80) is percent-encoded
+/// byte-by-byte. CR/LF in particular **must** be dropped from the output:
+/// `pull_scope` / `push_scope` interpolate the URL-decoded `image_name`
+/// path parameter into the scope value, so a path containing
+/// `…%0D%0A…` would otherwise inject a follow-on header into the 401
+/// response. `obs-text` is percent-encoded rather than passed through so
+/// the result remains valid for `HeaderValue::from_str` (which accepts
+/// only ASCII-visible bytes plus HTAB).
+fn auth_challenge_quoted_value(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\t' | '\x20'..='\x21' | '\x23'..='\x5b' | '\x5d'..='\x7e' => escaped.push(ch),
+            _ => {
+                let mut buf = [0; 4];
+                for byte in ch.encode_utf8(&mut buf).as_bytes() {
+                    let _ = write!(&mut escaped, "%{byte:02X}");
+                }
+            }
+        }
+    }
+    escaped
+}
+
 fn www_authenticate_header(host: &str, scope: Option<&str>) -> String {
+    let realm = auth_challenge_quoted_value(&format!("{host}/v2/token"));
     match scope {
-        Some(s) => format!(
-            "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\",scope=\"{}\"",
-            host, s
-        ),
-        None => format!(
-            "Bearer realm=\"{}/v2/token\",service=\"artifact-keeper\"",
-            host
-        ),
+        Some(s) => {
+            let scope = auth_challenge_quoted_value(s);
+            format!("Bearer realm=\"{realm}\",service=\"artifact-keeper\",scope=\"{scope}\"")
+        }
+        None => format!("Bearer realm=\"{realm}\",service=\"artifact-keeper\""),
     }
 }
 
@@ -730,6 +767,11 @@ async fn token(
             if let Ok(claims) = validate_token(&state.db, &state.config, &headers) {
                 let auth_service =
                     AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+                // `AND is_active = true` mirrors `auth_service::authenticate`,
+                // `refresh_tokens`, and `validate_api_token`: a deactivated
+                // user must not be able to swap a still-valid Bearer JWT for
+                // a fresh OCI access token, even if the JWT itself hasn't
+                // expired and `invalidate_user_tokens` hasn't been called.
                 let user = match sqlx::query_as!(
                     crate::models::user::User,
                     r#"SELECT id, username, email, password_hash, display_name,
@@ -738,7 +780,7 @@ async fn token(
                        totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
                        failed_login_attempts, locked_until, last_failed_login_at,
                        password_changed_at, last_login_at, created_at, updated_at
-                       FROM users WHERE id = $1"#,
+                       FROM users WHERE id = $1 AND is_active = true"#,
                     claims.sub
                 )
                 .fetch_optional(&state.db)
@@ -2952,6 +2994,58 @@ mod tests {
         assert!(!header.contains("scope="));
     }
 
+    #[test]
+    fn test_www_authenticate_header_sanitizes_crlf_scope() {
+        // `pull_scope`/`push_scope` interpolate the URL-decoded `image_name`
+        // path parameter into the scope value. A path containing %0D%0A
+        // would otherwise inject a follow-on header into the 401 response.
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:myrepo/myimage:pull\r\nX-Injected:yes"),
+        );
+        assert!(HeaderValue::from_str(&header).is_ok());
+        assert!(header.contains("scope=\"repository:myrepo/myimage:pull%0D%0AX-Injected:yes\""));
+        assert!(!header.contains('\r'));
+        assert!(!header.contains('\n'));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_preserves_htab() {
+        // RFC 7230 §3.2.6 admits HTAB into qdtext, and `HeaderValue::from_str`
+        // accepts it. Pass through verbatim instead of percent-encoding to
+        // keep the challenge readable for clients while still rejecting
+        // CR/LF/NUL.
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:my\trepo/my\timage:pull"),
+        );
+        assert!(HeaderValue::from_str(&header).is_ok());
+        assert!(header.contains("scope=\"repository:my\trepo/my\timage:pull\""));
+        assert!(!header.contains("%09"));
+    }
+
+    #[test]
+    fn test_www_authenticate_header_percent_encodes_non_ascii_scope() {
+        // `obs-text` (>= 0x80) is technically allowed by RFC 7230 but marked
+        // obsolete and rejected by `HeaderValue::from_str`. Percent-encode
+        // each UTF-8 byte so the resulting header is parseable everywhere.
+        let header = www_authenticate_header(
+            "https://registry.example.com",
+            Some("repository:привет:pull"),
+        );
+        assert!(HeaderValue::from_str(&header).is_ok());
+        assert!(header.contains("%D0%BF"));
+        assert!(!header.chars().any(|c| (c as u32) >= 0x80));
+    }
+
+    #[test]
+    fn test_auth_challenge_quoted_value_escapes_quote_and_backslash() {
+        // `"` and `\` get the standard `quoted-pair` backslash escape so the
+        // surrounding quotes in the WWW-Authenticate header aren't broken.
+        assert_eq!(auth_challenge_quoted_value("a\"b"), "a\\\"b");
+        assert_eq!(auth_challenge_quoted_value("a\\b"), "a\\\\b");
+    }
+
     // -----------------------------------------------------------------------
     // unauthorized_challenge
     // -----------------------------------------------------------------------
@@ -4823,5 +4917,85 @@ mod tests {
         };
         assert_eq!(repo_key, mirror_key);
         // The handler must take the literal path, not the fallback.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deactivated user must not be able to swap a still-valid Bearer JWT for a
+// fresh OCI access token. DB-backed because the bug is observable only with
+// a real `users` row that we can flip `is_active` on between issuing the JWT
+// and the swap.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod token_claims_isactive_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// Pre-fix the Bearer-JWT swap path in `token()` selected the user by id
+    /// without an `is_active` filter. A deactivated user with an unexpired
+    /// JWT in hand could still mint a fresh OCI access token. This test
+    /// pins the corrected SQL.
+    #[tokio::test]
+    async fn deactivated_user_cannot_swap_bearer_jwt_for_oci_token() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("oci-isactive-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        // Sign a JWT for the user using the same AuthService the handler
+        // would, then flip is_active=false BEFORE the swap.
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let user = sqlx::query_as!(
+            crate::models::user::User,
+            r#"SELECT id, username, email, password_hash, display_name,
+               auth_provider as "auth_provider: crate::models::user::AuthProvider",
+               external_id, is_admin, is_active, is_service_account, must_change_password,
+               totp_secret, totp_enabled, totp_backup_codes, totp_verified_at,
+               failed_login_attempts, locked_until, last_failed_login_at,
+               password_changed_at, last_login_at, created_at, updated_at
+               FROM users WHERE id = $1"#,
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch user");
+        let tokens = auth_service.generate_tokens(&user).expect("sign jwt");
+
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("deactivate user");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/token")
+            .header("Authorization", format!("Bearer {}", tokens.access_token))
+            .body(Body::empty())
+            .unwrap();
+        let app = router().with_state(state);
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "deactivated user must not be able to swap Bearer JWT for fresh OCI token"
+        );
     }
 }
