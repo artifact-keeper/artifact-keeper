@@ -3082,6 +3082,9 @@ pub fn version_check_handler() -> axum::routing::MethodRouter<SharedState> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use std::sync::Arc;
 
     // -----------------------------------------------------------------------
     // oci_error
@@ -4100,6 +4103,60 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    fn lazy_pool() -> sqlx::PgPool {
+        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+        PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(1))
+            .connect_lazy_with(
+                PgConnectOptions::new()
+                    .host("127.0.0.1")
+                    .port(1)
+                    .username("invalid")
+                    .password("invalid")
+                    .database("invalid"),
+            )
+    }
+
+    fn test_state_with_secret(secret: &str) -> SharedState {
+        let mut config = crate::config::Config::default();
+        config.jwt_secret = secret.to_string();
+
+        let storage_root = std::env::temp_dir().join(format!("ak-oci-v2-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
+
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(
+                storage_root.to_str().expect("utf8 storage path"),
+            ),
+        );
+        let registry = Arc::new(crate::storage::StorageRegistry::new(
+            std::collections::HashMap::new(),
+            "filesystem".to_string(),
+        ));
+
+        Arc::new(crate::api::AppState::new(config, lazy_pool(), storage, registry))
+    }
+
+    fn mint_access_jwt(secret: &str, username: &str) -> String {
+        let now = Utc::now().timestamp();
+        let claims = crate::services::auth_service::Claims {
+            sub: Uuid::new_v4(),
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            iat: now,
+            exp: now + 300,
+            token_type: "access".to_string(),
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
+    }
+
     // -----------------------------------------------------------------------
     // version_check_ok
     // -----------------------------------------------------------------------
@@ -4128,6 +4185,47 @@ mod tests {
             resp.headers().get(CONTENT_TYPE).unwrap(),
             "application/json"
         );
+    }
+
+    #[tokio::test]
+    async fn test_version_check_accepts_basic_password_jwt() {
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let state = test_state_with_secret(secret);
+        let jwt = mint_access_jwt(secret, "ci-user");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", basic)).expect("header value"),
+        );
+
+        let resp = version_check(State(state), headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("Docker-Distribution-API-Version")
+                .expect("distribution header"),
+            "registry/2.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_version_check_rejects_basic_password_invalid_jwt() {
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let state = test_state_with_secret(secret);
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode("ci-user:not-a-valid-access-token");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", basic)).expect("header value"),
+        );
+
+        let resp = version_check(State(state), headers).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get("WWW-Authenticate").is_some());
     }
 
     // -----------------------------------------------------------------------

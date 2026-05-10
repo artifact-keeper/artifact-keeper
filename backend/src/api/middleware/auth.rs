@@ -1035,6 +1035,8 @@ pub async fn repo_visibility_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use jsonwebtoken::{encode, EncodingKey, Header};
 
     // -----------------------------------------------------------------------
     // extract_token_from_auth_header
@@ -2496,6 +2498,42 @@ mod tests {
         // exercising "auth fails, fall through" branches.
         let pool = lazy_pool();
         Arc::new(AuthService::new(pool, make_test_config_for_middleware()))
+    }
+
+    fn mint_access_jwt(secret: &str, username: &str) -> String {
+        let now = Utc::now().timestamp();
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            username: username.to_string(),
+            email: format!("{}@example.test", username),
+            is_admin: false,
+            iat: now,
+            exp: now + 300,
+            token_type: "access".to_string(),
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .expect("encode jwt")
+    }
+
+    #[tokio::test]
+    async fn test_try_resolve_auth_basic_falls_back_to_jwt_password() {
+        let secret = "test-secret-at-least-32-bytes-long-for-testing";
+        let mut cfg = crate::config::Config::default();
+        cfg.jwt_secret = secret.to_string();
+
+        let auth_service = AuthService::new(lazy_pool(), Arc::new(cfg));
+        let jwt = mint_access_jwt(secret, "ci-user");
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
+
+        let resolved = try_resolve_auth(&auth_service, ExtractedToken::Basic(&basic)).await;
+        let ext = resolved.expect("expected jwt fallback to authenticate basic password");
+        assert_eq!(ext.username, "ci-user");
+        assert!(!ext.is_admin);
+        assert!(!ext.is_api_token);
     }
 
     async fn run_through_auth_middleware(
