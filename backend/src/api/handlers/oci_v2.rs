@@ -798,43 +798,49 @@ async fn token(
     };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    let (user, tokens, authenticated_via_api_token) = match auth_service
-        .authenticate(&credentials.0, &credentials.1)
-        .await
-    {
-        Ok((user, tokens)) => (user, tokens, false),
-        Err(_) => {
-            // Fall back to API token in the password field (for service accounts
-            // and CI/CD pipelines that use `docker login -p <api-token>`)
-            match auth_service.validate_api_token(&credentials.1).await {
-                Ok(validation) => {
-                    // TODO: Enforce token scopes and allowed_repo_ids for OCI
-                    // token exchange. Currently the generated JWT inherits full
-                    // user privileges regardless of token restrictions.
-                    if !validation.scopes.is_empty()
-                        && !validation.scopes.contains(&"*".to_string())
-                    {
-                        warn!(
-                            user = %validation.user.username,
-                            scopes = ?validation.scopes,
-                            allowed_repo_ids = ?validation.allowed_repo_ids,
-                            "API token has scope/repo restrictions that are not \
-                             enforced during OCI token exchange"
-                        );
-                    }
-                    let user = validation.user;
-                    let tokens = match auth_service.generate_tokens(&user) {
-                        Ok(t) => t,
-                        Err(_) => {
-                            return oci_error(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "INTERNAL_ERROR",
-                                "failed to generate tokens",
-                            )
-                        }
-                    };
-                    (user, tokens, true)
+    // Try the API-token path first, fall back to username/password.
+    //
+    // Reverse order — `authenticate(username, api_token)` first — increments
+    // `failed_login_attempts` on every CI push that uses an API token in the
+    // password field (the standard `docker login -p $API_TOKEN` flow), since
+    // bcrypt-comparing the token against the user's password hash always
+    // fails. After `account_lockout_threshold` builds the service account
+    // locks itself out. `validate_api_token` has no failure-counter side
+    // effect, so trying it first keeps the lockout counter accurate while
+    // still falling through to bcrypt for actual passwords.
+    let (user, tokens, authenticated_via_api_token) =
+        match auth_service.validate_api_token(&credentials.1).await {
+            Ok(validation) => {
+                // TODO: Enforce token scopes and allowed_repo_ids for OCI
+                // token exchange. Currently the generated JWT inherits full
+                // user privileges regardless of token restrictions.
+                if !validation.scopes.is_empty() && !validation.scopes.contains(&"*".to_string()) {
+                    warn!(
+                        user = %validation.user.username,
+                        scopes = ?validation.scopes,
+                        allowed_repo_ids = ?validation.allowed_repo_ids,
+                        "API token has scope/repo restrictions that are not \
+                         enforced during OCI token exchange"
+                    );
                 }
+                let user = validation.user;
+                let tokens = match auth_service.generate_tokens(&user) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL_ERROR",
+                            "failed to generate tokens",
+                        )
+                    }
+                };
+                (user, tokens, true)
+            }
+            Err(_) => match auth_service
+                .authenticate(&credentials.0, &credentials.1)
+                .await
+            {
+                Ok((user, tokens)) => (user, tokens, false),
                 Err(_) => {
                     return oci_error(
                         StatusCode::UNAUTHORIZED,
@@ -842,9 +848,8 @@ async fn token(
                         "invalid username or password",
                     )
                 }
-            }
-        }
-    };
+            },
+        };
 
     // Block password-based OCI token requests when the user has TOTP 2FA
     // enabled. Docker CLI cannot perform a TOTP challenge, so the user
@@ -4823,5 +4828,107 @@ mod tests {
         };
         assert_eq!(repo_key, mirror_key);
         // The handler must take the literal path, not the fallback.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `docker login -p $API_TOKEN` regression: API-token-as-password must not
+// bump `failed_login_attempts`. DB-backed because the bug is observable only
+// after `authenticate` runs against a real user row.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod token_lockout_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// Pre-fix the OCI token endpoint called `auth_service::authenticate`
+    /// before `validate_api_token`. `authenticate(username, api_token)`
+    /// bcrypt-compares the API token against the user's password hash —
+    /// always a mismatch — and bumps `failed_login_attempts`. After
+    /// `account_lockout_threshold` CI builds the service account locked
+    /// itself out. This test pins the corrected order.
+    #[tokio::test]
+    async fn api_token_basic_auth_does_not_bump_failed_login_attempts() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // tdh::create_user inserts password_hash = 'unused'. Replace with a
+        // real bcrypt hash so `authenticate(username, api_token)` exercises
+        // the bcrypt-mismatch path that bumps the counter, rather than
+        // short-circuiting on a malformed-hash Err. cost=4 keeps the test
+        // sub-second.
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&pwd_hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("update password_hash");
+
+        let storage_dir = std::env::temp_dir().join(format!("oci-lockout-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (api_token, _) = auth_service
+            .generate_api_token(user_id, "lockout-regression", vec!["*".to_string()], None)
+            .await
+            .expect("generate API token");
+
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{api_token}"))
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri("/token")
+            .header("Authorization", basic)
+            .body(Body::empty())
+            .unwrap();
+        let app = router().with_state(state);
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65_536)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+
+        // Read the counter BEFORE cleanup so the assertion reflects the
+        // state set by `token()`.
+        let counter: i32 =
+            sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read counter");
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected 200, got {status}: body={body}"
+        );
+        let token = body["token"].as_str().expect("token field");
+        assert_ne!(token, "anonymous", "API token must yield a real JWT");
+        assert_eq!(
+            counter, 0,
+            "API-token-as-password must not bump failed_login_attempts (got {counter})"
+        );
     }
 }
