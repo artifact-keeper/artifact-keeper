@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::api::handlers::proxy_helpers;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 
 // ---------------------------------------------------------------------------
@@ -321,6 +322,26 @@ async fn authenticate_oci(
                             .validate_access_token(&tokens.access_token)
                             .map_err(|_| ())
                     });
+            }
+
+            // Final fallback: accept a valid AK access token (JWT) as the Docker
+            // password. Enables the CI/CD keyless push flow where the token from
+            // the OIDC exchange is used directly as the Docker credential.
+            if let Ok(claims) = auth_service.validate_access_token(&password) {
+                if let Ok(user) = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                    .bind(claims.sub)
+                    .fetch_one(db)
+                    .await
+                {
+                    return auth_service
+                        .generate_tokens(&user)
+                        .map_err(|_| ())
+                        .and_then(|tokens| {
+                            auth_service
+                                .validate_access_token(&tokens.access_token)
+                                .map_err(|_| ())
+                        });
+                }
             }
 
             Err(())
@@ -1037,11 +1058,51 @@ async fn token(
             {
                 Ok((user, tokens)) => (user, tokens, false),
                 Err(_) => {
-                    return oci_error(
-                        StatusCode::UNAUTHORIZED,
-                        "UNAUTHORIZED",
-                        "invalid username or password",
-                    )
+                    // Final fallback: accept a valid AK access token (JWT) as the
+                    // Docker password. This enables the CI/CD keyless push flow:
+                    //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
+                    //   2. docker login -u <ci-user> -p <access_token>  (this path)
+                    //   3. docker push ...
+                    // This mirrors how Artifactory handles its OIDC-issued tokens.
+                    match auth_service.validate_access_token(&credentials.1) {
+                        Ok(claims) => {
+                            let user = match sqlx::query_as::<_, User>(
+                                "SELECT * FROM users WHERE id = $1",
+                            )
+                            .bind(claims.sub)
+                            .fetch_one(&state.db)
+                            .await
+                            {
+                                Ok(u) => u,
+                                Err(_) => {
+                                    return oci_error(
+                                        StatusCode::UNAUTHORIZED,
+                                        "UNAUTHORIZED",
+                                        "user not found",
+                                    )
+                                }
+                            };
+                            let tokens = match auth_service.generate_tokens(&user) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    return oci_error(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "INTERNAL_ERROR",
+                                        "failed to generate tokens",
+                                    )
+                                }
+                            };
+                            // Treat like an API token: bypass the TOTP guard below.
+                            (user, tokens, true)
+                        }
+                        Err(_) => {
+                            return oci_error(
+                                StatusCode::UNAUTHORIZED,
+                                "UNAUTHORIZED",
+                                "invalid username or password",
+                            )
+                        }
+                    }
                 }
             },
         };
@@ -1109,6 +1170,12 @@ async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> 
 
         // Fall back to API token in the password field
         if auth_service.validate_api_token(&password).await.is_ok() {
+            return version_check_ok();
+        }
+
+        // Final fallback: accept AK JWT access token in the Basic password field.
+        // This enables CI keyless flows that use `docker login -u <ci-user> -p <access_token>`.
+        if auth_service.validate_access_token(&password).is_ok() {
             return version_check_ok();
         }
     }

@@ -31,6 +31,7 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
+use crate::models::user::User;
 use crate::services::auth_service::AuthService;
 
 // ---------------------------------------------------------------------------
@@ -614,11 +615,23 @@ async fn push_package(
                 ("apikey".to_string(), api_key.to_string())
             };
             let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-            let (user, _) = auth_service
-                .authenticate(&username, &password)
-                .await
-                .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
-            user.id
+            if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
+                user.id
+            } else if let Ok(validation) = auth_service.validate_api_token(&password).await {
+                validation.user.id
+            } else if let Ok(claims) = auth_service.validate_access_token(&password) {
+                let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                    .bind(claims.sub)
+                    .fetch_optional(&state.db)
+                    .await
+                    .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?
+                    .ok_or_else(|| {
+                        (StatusCode::UNAUTHORIZED, "Invalid API key").into_response()
+                    })?;
+                user.id
+            } else {
+                return Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response());
+            }
         }
     };
     let repo = resolve_nuget_repo(&state.db, &repo_key).await?;

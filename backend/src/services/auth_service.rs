@@ -1469,6 +1469,13 @@ impl AuthService {
                         .to_string(),
                 ))
             }
+            Some(AuthProvider::Ci) => {
+                // CI authentication is handled via the CI OIDC token exchange endpoint.
+                Err(AppError::Authentication(
+                    "CI authentication requires a CI-issued OIDC JWT. Use /api/v1/auth/ci/token."
+                        .to_string(),
+                ))
+            }
         }
     }
 

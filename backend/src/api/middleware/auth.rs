@@ -218,7 +218,7 @@ pub async fn require_auth_with_bearer_fallback(
 }
 
 /// Token extraction result
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ExtractedToken<'a> {
     /// JWT or API token from Bearer scheme
     Bearer(&'a str),
@@ -318,39 +318,19 @@ pub async fn auth_middleware(
     let had_header_credentials = !matches!(extracted, ExtractedToken::None);
 
     let header_result: Result<AuthExtension, &'static str> = match extracted {
-        // Replica-safe access-token validation. The async variant consults the
-        // DB credential-change watermark (#1173) so a password reset, TOTP
-        // change, or deactivation on a peer replica is honoured here on the
-        // request path within `CREDENTIAL_DB_CACHE_TTL_SECS`. The sync variant
-        // (which only reads the in-memory map) would silently keep accepting
-        // pre-change tokens across replicas — that's the architectural gap
-        // PR #1190 was supposed to close.
-        ExtractedToken::Bearer(token) => {
-            match auth_service.validate_access_token_async(token).await {
-                Ok(claims) => Ok(AuthExtension::from(claims)),
-                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => Ok(ext),
-                    Err(_) => Err("Invalid or expired token"),
-                },
-            }
+        ExtractedToken::Basic(encoded) if decode_basic_credentials(encoded).is_none() => {
+            Err("Invalid Basic auth credentials")
         }
-        ExtractedToken::ApiKey(token) => {
-            match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => Ok(ext),
-                Err(_) => Err("Invalid or expired API token"),
-            }
-        }
-        ExtractedToken::Basic(encoded) => match decode_basic_credentials(encoded) {
-            None => Err("Invalid Basic auth credentials"),
-            Some((username, password)) => {
-                match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
-                    Err(_) => Err("Invalid credentials"),
-                }
-            }
+        _ => match try_resolve_auth(&auth_service, extracted).await {
+            Some(ext) => Ok(ext),
+            None => match extracted {
+                ExtractedToken::Bearer(_) => Err("Invalid or expired token"),
+                ExtractedToken::ApiKey(_) => Err("Invalid or expired API token"),
+                ExtractedToken::Basic(_) => Err("Invalid credentials"),
+                ExtractedToken::None => Err("Missing authorization header"),
+                ExtractedToken::Invalid => Err("Invalid authorization header format"),
+            },
         },
-        ExtractedToken::None => Err("Missing authorization header"),
-        ExtractedToken::Invalid => Err("Invalid authorization header format"),
     };
 
     let header_error = match header_result {
@@ -452,6 +432,13 @@ pub(crate) async fn try_resolve_auth(
             // Try bcrypt username/password auth first
             if let Ok((user, _)) = auth_service.authenticate(&username, &password).await {
                 return Some(AuthExtension::from(user));
+            }
+            // Try treating the password as a short-lived JWT access token.
+            // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
+            // package managers like Maven, pip/twine, and Helm send the AK access
+            // token as the Basic auth password.
+            if let Ok(claims) = auth_service.validate_access_token(&password) {
+                return Some(AuthExtension::from(claims));
             }
             // Fall back to treating the password as an API token — compatible with
             // pip netrc / Artifactory-style `token:<api_token>` credential format
@@ -718,55 +705,19 @@ pub async fn admin_middleware(
 ) -> Response {
     let extracted = extract_token(&request);
 
-    let auth_ext = match extracted {
-        // Admin middleware uses the async (replica-safe) access-token validator
-        // for the same reason as the main auth middleware (#1173). An admin
-        // who has had their privileges revoked on replica A must lose access
-        // on replica B too, even if they're holding a Bearer token whose `iat`
-        // predates the revocation.
-        ExtractedToken::Bearer(token) => {
-            match auth_service.validate_access_token_async(token).await {
-                Ok(claims) => AuthExtension::from(claims),
-                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                    Ok(ext) => ext,
-                    Err(_) => {
-                        return (StatusCode::UNAUTHORIZED, "Invalid or expired token")
-                            .into_response()
-                    }
-                },
-            }
-        }
-        ExtractedToken::ApiKey(token) => {
-            match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => ext,
-                Err(_) => {
-                    return (StatusCode::UNAUTHORIZED, "Invalid or expired API token")
-                        .into_response()
-                }
-            }
-        }
-        ExtractedToken::Basic(encoded) => {
-            let Some((username, password)) = decode_basic_credentials(encoded) else {
-                return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials")
-                    .into_response();
-            };
-            match auth_service.authenticate(&username, &password).await {
-                Ok((user, _token_pair)) => AuthExtension::from(user),
-                Err(_) => {
-                    return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-                }
-            }
-        }
-        ExtractedToken::None => {
-            return (StatusCode::UNAUTHORIZED, "Missing authorization header").into_response();
-        }
-        ExtractedToken::Invalid => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Invalid authorization header format",
-            )
-                .into_response();
-        }
+    if matches!(extracted, ExtractedToken::Basic(encoded) if decode_basic_credentials(encoded).is_none()) {
+        return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials").into_response();
+    }
+
+    let Some(auth_ext) = try_resolve_auth(&auth_service, extracted).await else {
+        let msg = match extracted {
+            ExtractedToken::Bearer(_) => "Invalid or expired token",
+            ExtractedToken::ApiKey(_) => "Invalid or expired API token",
+            ExtractedToken::Basic(_) => "Invalid credentials",
+            ExtractedToken::None => "Missing authorization header",
+            ExtractedToken::Invalid => "Invalid authorization header format",
+        };
+        return (StatusCode::UNAUTHORIZED, msg).into_response();
     };
 
     if !auth_ext.is_admin {
