@@ -173,10 +173,49 @@ mod tests {
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    // RAII guard that snapshots env vars on construction and restores them on
+    // drop. Without this, set_var calls in these tests leaked process-wide:
+    // env is global and ENV_MUTEX only serializes writers among smtp tests,
+    // so parallel tests reading DATABASE_URL via try_pool() saw the bogus
+    // "postgres://test@localhost/test" URL until the next smtp test ran.
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvVarGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|&k| (k, env::var(k).ok())).collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(s) => env::set_var(k, s),
+                    None => env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    const SMTP_ENV_KEYS: &[&str] = &[
+        "DATABASE_URL",
+        "JWT_SECRET",
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+        "SMTP_FROM_ADDRESS",
+        "SMTP_TLS_MODE",
+    ];
+
     /// Build a minimal Config for testing. Sets only the required env vars
     /// and clears SMTP-related vars unless the caller sets them first.
     fn test_config_no_smtp() -> Config {
         let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
         env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
         env::remove_var("SMTP_HOST");
@@ -190,6 +229,7 @@ mod tests {
 
     fn test_config_with_smtp() -> Config {
         let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
         env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
         env::set_var("SMTP_HOST", "mail.example.com");
@@ -198,15 +238,7 @@ mod tests {
         env::set_var("SMTP_PASSWORD", "hunter2");
         env::set_var("SMTP_FROM_ADDRESS", "noreply@example.com");
         env::set_var("SMTP_TLS_MODE", "tls");
-        let config = Config::from_env().expect("test config should parse");
-        // Clean up
-        env::remove_var("SMTP_HOST");
-        env::remove_var("SMTP_PORT");
-        env::remove_var("SMTP_USERNAME");
-        env::remove_var("SMTP_PASSWORD");
-        env::remove_var("SMTP_FROM_ADDRESS");
-        env::remove_var("SMTP_TLS_MODE");
-        config
+        Config::from_env().expect("test config should parse")
     }
 
     #[test]
@@ -248,12 +280,12 @@ mod tests {
     #[test]
     fn test_invalid_from_address_returns_config_error() {
         let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
         env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
         env::set_var("SMTP_FROM_ADDRESS", "not-an-email");
         env::remove_var("SMTP_HOST");
         let config = Config::from_env().expect("config should parse");
-        env::remove_var("SMTP_FROM_ADDRESS");
 
         let result = SmtpService::new(&config);
         assert!(result.is_err(), "invalid from address should error");
@@ -284,24 +316,23 @@ mod tests {
     #[test]
     fn test_tls_mode_fallback_on_invalid() {
         let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
         env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
         env::set_var("SMTP_TLS_MODE", "invalid-mode");
         let config = Config::from_env().expect("config should parse");
-        env::remove_var("SMTP_TLS_MODE");
         assert_eq!(config.smtp_tls_mode, "starttls");
     }
 
     #[tokio::test]
     async fn test_dangerous_mode_builds_transport() {
         let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvVarGuard::capture(SMTP_ENV_KEYS);
         env::set_var("DATABASE_URL", "postgres://test@localhost/test");
         env::set_var("JWT_SECRET", "test-secret-at-least-32-chars-long!");
         env::set_var("SMTP_HOST", "localhost");
         env::set_var("SMTP_TLS_MODE", "none");
         let config = Config::from_env().expect("config should parse");
-        env::remove_var("SMTP_HOST");
-        env::remove_var("SMTP_TLS_MODE");
 
         let service = SmtpService::new(&config).expect("should build with dangerous mode");
         assert!(service.is_configured());
