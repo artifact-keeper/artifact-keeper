@@ -1101,6 +1101,9 @@ mod tests {
             .await
             .expect("provider should be created");
 
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+
         let created = svc
             .create_mapping(
                 provider.id,
@@ -1108,7 +1111,7 @@ mod tests {
                     name: "main-branch".to_string(),
                     priority: None,
                     claim_filters: json!({"ref": "refs/heads/main"}),
-                    allowed_repo_ids: None,
+                    allowed_repo_ids: Some(vec![repo_a]),
                     is_enabled: None,
                 },
             )
@@ -1116,6 +1119,7 @@ mod tests {
             .expect("mapping should be created");
         assert_eq!(created.priority, 100);
         assert!(created.is_enabled);
+        assert_eq!(created.allowed_repo_ids, Some(vec![repo_a]));
 
         let listed = svc
             .list_mappings(provider.id)
@@ -1128,6 +1132,7 @@ mod tests {
             .await
             .expect("mapping should be readable");
         assert_eq!(got.name, "main-branch");
+        assert_eq!(got.allowed_repo_ids, Some(vec![repo_a]));
 
         let updated = svc
             .update_mapping(
@@ -1137,7 +1142,7 @@ mod tests {
                     name: Some("release-branch".to_string()),
                     priority: Some(5),
                     claim_filters: Some(json!({"ref": ["refs/heads/main", "refs/heads/release"]})),
-                    allowed_repo_ids: None,
+                    allowed_repo_ids: Some(vec![repo_a, repo_b]),
                     is_enabled: Some(true),
                 },
             )
@@ -1145,12 +1150,46 @@ mod tests {
             .expect("mapping should update");
         assert_eq!(updated.name, "release-branch");
         assert_eq!(updated.priority, 5);
+        assert_eq!(updated.allowed_repo_ids, Some(vec![repo_a, repo_b]));
+
+        let unchanged_scope = svc
+            .update_mapping(
+                provider.id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: None,
+                    is_enabled: Some(true),
+                },
+            )
+            .await
+            .expect("missing repo scope field should preserve existing scope");
+        assert_eq!(unchanged_scope.allowed_repo_ids, Some(vec![repo_a, repo_b]));
+
+        let deny_all = svc
+            .update_mapping(
+                provider.id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: None,
+                    priority: None,
+                    claim_filters: None,
+                    allowed_repo_ids: Some(vec![]),
+                    is_enabled: Some(true),
+                },
+            )
+            .await
+            .expect("explicit empty repo scope should be persisted as deny-all");
+        assert_eq!(deny_all.allowed_repo_ids, Some(vec![]));
 
         let resolved = svc
             .resolve_mapping(provider.id, &json!({"ref": "refs/heads/release"}))
             .await
             .expect("matching claims should resolve mapping");
         assert_eq!(resolved.id, created.id);
+        assert_eq!(resolved.allowed_repo_ids, Some(vec![]));
 
         let toggled = svc
             .toggle_mapping(provider.id, created.id, false)
