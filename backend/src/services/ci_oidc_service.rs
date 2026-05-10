@@ -443,7 +443,7 @@ impl CiOidcService {
         .bind(req.name)
         .bind(priority)
         .bind(req.claim_filters)
-       .bind(req.allowed_repo_ids)
+        .bind(req.allowed_repo_ids)
         .bind(is_enabled)
         .fetch_one(&self.db)
         .await
