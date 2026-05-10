@@ -705,7 +705,8 @@ pub async fn admin_middleware(
 ) -> Response {
     let extracted = extract_token(&request);
 
-    if matches!(extracted, ExtractedToken::Basic(encoded) if decode_basic_credentials(encoded).is_none()) {
+    if matches!(extracted, ExtractedToken::Basic(encoded) if decode_basic_credentials(encoded).is_none())
+    {
         return (StatusCode::UNAUTHORIZED, "Invalid Basic auth credentials").into_response();
     }
 
@@ -2522,8 +2523,10 @@ mod tests {
     #[tokio::test]
     async fn test_try_resolve_auth_basic_falls_back_to_jwt_password() {
         let secret = "test-secret-at-least-32-bytes-long-for-testing";
-        let mut cfg = crate::config::Config::default();
-        cfg.jwt_secret = secret.to_string();
+        let cfg = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
 
         let auth_service = AuthService::new(lazy_pool(), Arc::new(cfg));
         let jwt = mint_access_jwt(secret, "ci-user");

@@ -4119,23 +4119,29 @@ mod tests {
     }
 
     fn test_state_with_secret(secret: &str) -> SharedState {
-        let mut config = crate::config::Config::default();
-        config.jwt_secret = secret.to_string();
+        let config = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
 
         let storage_root = std::env::temp_dir().join(format!("ak-oci-v2-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
 
-        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
-            crate::storage::filesystem::FilesystemStorage::new(
+        let storage: Arc<dyn crate::storage::StorageBackend> =
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
                 storage_root.to_str().expect("utf8 storage path"),
-            ),
-        );
+            ));
         let registry = Arc::new(crate::storage::StorageRegistry::new(
             std::collections::HashMap::new(),
             "filesystem".to_string(),
         ));
 
-        Arc::new(crate::api::AppState::new(config, lazy_pool(), storage, registry))
+        Arc::new(crate::api::AppState::new(
+            config,
+            lazy_pool(),
+            storage,
+            registry,
+        ))
     }
 
     fn mint_access_jwt(secret: &str, username: &str) -> String {
@@ -4214,8 +4220,8 @@ mod tests {
     async fn test_version_check_rejects_basic_password_invalid_jwt() {
         let secret = "test-secret-at-least-32-bytes-long-for-testing";
         let state = test_state_with_secret(secret);
-        let basic = base64::engine::general_purpose::STANDARD
-            .encode("ci-user:not-a-valid-access-token");
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode("ci-user:not-a-valid-access-token");
 
         let mut headers = HeaderMap::new();
         headers.insert(

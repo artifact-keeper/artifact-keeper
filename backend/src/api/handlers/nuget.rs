@@ -625,9 +625,7 @@ async fn push_package(
                     .fetch_optional(&state.db)
                     .await
                     .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?
-                    .ok_or_else(|| {
-                        (StatusCode::UNAUTHORIZED, "Invalid API key").into_response()
-                    })?;
+                    .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid API key").into_response())?;
                 user.id
             } else {
                 return Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response());
@@ -948,24 +946,30 @@ mod tests {
     }
 
     fn test_state_with_secret(secret: &str) -> SharedState {
-        let mut config = crate::config::Config::default();
-        config.jwt_secret = secret.to_string();
+        let config = crate::config::Config {
+            jwt_secret: secret.to_string(),
+            ..crate::config::Config::default()
+        };
 
         let storage_root =
             std::env::temp_dir().join(format!("ak-nuget-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&storage_root).expect("create temp storage dir");
 
-        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
-            crate::storage::filesystem::FilesystemStorage::new(
+        let storage: Arc<dyn crate::storage::StorageBackend> =
+            Arc::new(crate::storage::filesystem::FilesystemStorage::new(
                 storage_root.to_str().expect("utf8 storage path"),
-            ),
-        );
+            ));
         let registry = Arc::new(crate::storage::StorageRegistry::new(
             std::collections::HashMap::new(),
             "filesystem".to_string(),
         ));
 
-        Arc::new(crate::api::AppState::new(config, lazy_pool(), storage, registry))
+        Arc::new(crate::api::AppState::new(
+            config,
+            lazy_pool(),
+            storage,
+            registry,
+        ))
     }
 
     fn mint_access_jwt(secret: &str, username: &str) -> String {
@@ -1010,7 +1014,10 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read body");
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "Authentication required");
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "Authentication required"
+        );
     }
 
     #[tokio::test]
