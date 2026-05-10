@@ -201,3 +201,360 @@ pub async fn toggle_mapping(
             .await?,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::require_admin;
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::api::middleware::auth::AuthExtension;
+    use axum::extract::{Extension, Path, State};
+    use axum::Json;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    fn auth_with_admin(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "ci-admin-test".to_string(),
+            email: "ci-admin-test@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn require_admin_allows_admin_user() {
+        let auth = auth_with_admin(true);
+        assert!(require_admin(&auth).is_ok());
+    }
+
+    #[test]
+    fn require_admin_rejects_non_admin_user() {
+        let auth = auth_with_admin(false);
+        let err = require_admin(&auth).expect_err("non-admin should be rejected");
+        assert!(err.to_string().contains("Admin access required"));
+    }
+
+    fn non_admin_state_and_auth() -> (crate::api::SharedState, AuthExtension) {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/artifact_keeper_test")
+            .expect("lazy pool should build for auth-guard tests");
+        let storage_path = std::env::temp_dir()
+            .join(format!("ci-auth-admin-tests-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        (
+            tdh::build_state(pool, &storage_path),
+            auth_with_admin(false),
+        )
+    }
+
+    async fn assert_admin_required<T: std::fmt::Debug>(result: crate::error::Result<T>) {
+        let err = result.expect_err("non-admin should be rejected");
+        assert!(err.to_string().contains("Admin access required"));
+    }
+
+    #[tokio::test]
+    async fn handlers_reject_non_admin_access() {
+        let (state, auth) = non_admin_state_and_auth();
+        let pid = Uuid::new_v4();
+        let mid = Uuid::new_v4();
+
+        assert_admin_required(list_providers(State(state.clone()), Extension(auth.clone())).await)
+            .await;
+        assert_admin_required(
+            get_provider(State(state.clone()), Extension(auth.clone()), Path(pid)).await,
+        )
+        .await;
+        assert_admin_required(
+            create_provider(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(CreateCiOidcProviderRequest {
+                    name: "p".to_string(),
+                    provider_type: Some("generic".to_string()),
+                    issuer_url: "https://issuer.example.com".to_string(),
+                    audience: Some("artifact-keeper".to_string()),
+                    is_enabled: Some(true),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_admin_required(
+            update_provider(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(pid),
+                Json(UpdateCiOidcProviderRequest {
+                    name: Some("x".to_string()),
+                    provider_type: Some("github".to_string()),
+                    issuer_url: Some("https://issuer.example.com".to_string()),
+                    audience: Some("artifact-keeper".to_string()),
+                    is_enabled: Some(false),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_admin_required(
+            delete_provider(State(state.clone()), Extension(auth.clone()), Path(pid)).await,
+        )
+        .await;
+        assert_admin_required(
+            toggle_provider(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(pid),
+                Json(CiOidcToggleRequest { enabled: true }),
+            )
+            .await,
+        )
+        .await;
+        assert_admin_required(
+            list_mappings(State(state.clone()), Extension(auth.clone()), Path(pid)).await,
+        )
+        .await;
+        assert_admin_required(
+            get_mapping(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path((pid, mid)),
+            )
+            .await,
+        )
+        .await;
+        assert_admin_required(
+            create_mapping(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path(pid),
+                Json(CreateCiOidcMappingRequest {
+                    name: "m".to_string(),
+                    priority: Some(1),
+                    claim_filters: serde_json::json!({"sub": "abc"}),
+                    role_id: None,
+                    allowed_repo_ids: None,
+                    is_enabled: Some(true),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_admin_required(
+            update_mapping(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path((pid, mid)),
+                Json(UpdateCiOidcMappingRequest {
+                    name: Some("m2".to_string()),
+                    priority: Some(2),
+                    claim_filters: Some(serde_json::json!({"sub": "def"})),
+                    role_id: None,
+                    allowed_repo_ids: None,
+                    is_enabled: Some(false),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_admin_required(
+            delete_mapping(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Path((pid, mid)),
+            )
+            .await,
+        )
+        .await;
+        assert_admin_required(
+            toggle_mapping(
+                State(state),
+                Extension(auth),
+                Path((pid, mid)),
+                Json(CiOidcToggleRequest { enabled: true }),
+            )
+            .await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn admin_provider_and_mapping_crud_roundtrip() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("ci-auth-admin-tests-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        let state = tdh::build_state(pool.clone(), &storage_path);
+        let auth = auth_with_admin(true);
+
+        let provider = create_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(CreateCiOidcProviderRequest {
+                name: "admin-provider-roundtrip".to_string(),
+                provider_type: Some("generic".to_string()),
+                issuer_url: "https://issuer.example.com".to_string(),
+                audience: Some("artifact-keeper".to_string()),
+                is_enabled: Some(true),
+            }),
+        )
+        .await
+        .expect("admin should create provider")
+        .0;
+
+        let listed = list_providers(State(state.clone()), Extension(auth.clone()))
+            .await
+            .expect("admin should list providers")
+            .0;
+        assert!(listed.iter().any(|p| p.id == provider.id));
+
+        let got = get_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+        )
+        .await
+        .expect("admin should get provider")
+        .0;
+        assert_eq!(got.name, "admin-provider-roundtrip");
+
+        let updated = update_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+            Json(UpdateCiOidcProviderRequest {
+                name: Some("admin-provider-updated".to_string()),
+                provider_type: Some("github".to_string()),
+                issuer_url: Some("https://issuer2.example.com".to_string()),
+                audience: Some("artifact-keeper-ci".to_string()),
+                is_enabled: Some(true),
+            }),
+        )
+        .await
+        .expect("admin should update provider")
+        .0;
+        assert_eq!(updated.name, "admin-provider-updated");
+
+        let toggled = toggle_provider(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+            Json(CiOidcToggleRequest { enabled: false }),
+        )
+        .await
+        .expect("admin should toggle provider")
+        .0;
+        assert!(!toggled.is_enabled);
+
+        let mapping = create_mapping(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+            Json(CreateCiOidcMappingRequest {
+                name: "main-branch".to_string(),
+                priority: Some(10),
+                claim_filters: serde_json::json!({"ref": "refs/heads/main"}),
+                role_id: None,
+                allowed_repo_ids: None,
+                is_enabled: Some(true),
+            }),
+        )
+        .await
+        .expect("admin should create mapping")
+        .0;
+
+        let mappings = list_mappings(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(provider.id),
+        )
+        .await
+        .expect("admin should list mappings")
+        .0;
+        assert!(mappings.iter().any(|m| m.id == mapping.id));
+
+        let mapping_got = get_mapping(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((provider.id, mapping.id)),
+        )
+        .await
+        .expect("admin should get mapping")
+        .0;
+        assert_eq!(mapping_got.name, "main-branch");
+
+        let mapping_updated = update_mapping(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((provider.id, mapping.id)),
+            Json(UpdateCiOidcMappingRequest {
+                name: Some("release-branch".to_string()),
+                priority: Some(20),
+                claim_filters: Some(serde_json::json!({"ref": ["refs/heads/release"]})),
+                role_id: None,
+                allowed_repo_ids: None,
+                is_enabled: Some(true),
+            }),
+        )
+        .await
+        .expect("admin should update mapping")
+        .0;
+        assert_eq!(mapping_updated.name, "release-branch");
+        assert_eq!(mapping_updated.priority, 20);
+
+        let mapping_toggled = toggle_mapping(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((provider.id, mapping.id)),
+            Json(CiOidcToggleRequest { enabled: false }),
+        )
+        .await
+        .expect("admin should toggle mapping")
+        .0;
+        assert!(!mapping_toggled.is_enabled);
+
+        delete_mapping(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path((provider.id, mapping.id)),
+        )
+        .await
+        .expect("admin should delete mapping");
+
+        delete_provider(State(state), Extension(auth), Path(provider.id))
+            .await
+            .expect("admin should delete provider");
+    }
+
+    #[tokio::test]
+    async fn admin_get_provider_not_found_propagates() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("ci-auth-admin-tests-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        let state = tdh::build_state(pool, &storage_path);
+
+        let err = get_provider(
+            State(state),
+            Extension(auth_with_admin(true)),
+            Path(Uuid::new_v4()),
+        )
+        .await
+        .expect_err("missing provider should return not found");
+
+        assert!(err.to_string().to_lowercase().contains("not found"));
+    }
+}

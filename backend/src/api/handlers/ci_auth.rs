@@ -186,3 +186,138 @@ fn extract_bearer_jwt(headers: &HeaderMap) -> Result<&str> {
             )
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{exchange_ci_token, extract_bearer_jwt, CiTokenRequest};
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue};
+    use axum::Json;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    fn lazy_test_state() -> crate::api::SharedState {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/artifact_keeper_test")
+            .expect("lazy pool should build for header-validation tests");
+        let storage_path = std::env::temp_dir()
+            .join(format!("ci-auth-tests-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        tdh::build_state(pool, &storage_path)
+    }
+
+    #[test]
+    fn extract_bearer_jwt_success() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ci.jwt.token"),
+        );
+
+        let token = extract_bearer_jwt(&headers).expect("Bearer token should be parsed");
+        assert_eq!(token, "ci.jwt.token");
+    }
+
+    #[test]
+    fn extract_bearer_jwt_missing_header_fails() {
+        let headers = HeaderMap::new();
+        let err = extract_bearer_jwt(&headers).expect_err("missing header must fail");
+        assert!(err.to_string().contains("Missing Authorization header"));
+    }
+
+    #[test]
+    fn extract_bearer_jwt_wrong_scheme_fails() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Basic abc123"),
+        );
+
+        let err = extract_bearer_jwt(&headers).expect_err("non-bearer scheme must fail");
+        assert!(err
+            .to_string()
+            .contains("Authorization header must use the Bearer scheme"));
+    }
+
+    #[test]
+    fn extract_bearer_jwt_empty_bearer_fails() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer "),
+        );
+
+        let err = extract_bearer_jwt(&headers).expect_err("empty bearer token must fail");
+        assert!(err
+            .to_string()
+            .contains("Authorization header must use the Bearer scheme"));
+    }
+
+    #[tokio::test]
+    async fn exchange_ci_token_missing_header_fails_before_db() {
+        let state = lazy_test_state();
+
+        let err = exchange_ci_token(
+            State(state),
+            HeaderMap::new(),
+            Json(CiTokenRequest {
+                provider_id: Uuid::new_v4(),
+            }),
+        )
+        .await
+        .expect_err("missing Authorization header must fail");
+
+        assert!(err.to_string().contains("Missing Authorization header"));
+    }
+
+    #[tokio::test]
+    async fn exchange_ci_token_rejects_disabled_provider() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let storage_path = std::env::temp_dir()
+            .join(format!("ci-auth-tests-{}", Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        let state = tdh::build_state(pool.clone(), &storage_path);
+
+        let provider_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO ci_oidc_providers
+               (id, name, provider_type, issuer_url, audience, is_enabled)
+               VALUES ($1, $2, $3, $4, $5, false)"#,
+        )
+        .bind(provider_id)
+        .bind("disabled-provider")
+        .bind("generic")
+        .bind("https://issuer.example.com")
+        .bind("artifact-keeper")
+        .execute(&pool)
+        .await
+        .expect("insert disabled provider");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ci.jwt.token"),
+        );
+
+        let err = exchange_ci_token(State(state), headers, Json(CiTokenRequest { provider_id }))
+            .await
+            .expect_err("disabled provider should be rejected");
+
+        assert!(err.to_string().contains("provider is disabled"));
+
+        let _ = sqlx::query("DELETE FROM ci_oidc_identity_mappings WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM ci_oidc_providers WHERE id = $1")
+            .bind(provider_id)
+            .execute(&pool)
+            .await;
+    }
+}

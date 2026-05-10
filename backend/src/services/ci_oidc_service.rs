@@ -838,3 +838,353 @@ impl CiOidcService {
         AuthProvider::Ci
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CiOidcIdentityMapping, CiOidcProvider, CiOidcService};
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::models::user::AuthProvider;
+    use chrono::Utc;
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    fn test_service() -> CiOidcService {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/artifact_keeper_test")
+            .expect("lazy pool creation should succeed for unit tests");
+        CiOidcService::new(pool)
+    }
+
+    fn sample_provider(provider_type: &str) -> CiOidcProvider {
+        let now = Utc::now();
+        CiOidcProvider {
+            id: Uuid::new_v4(),
+            name: "CI Provider".to_string(),
+            provider_type: provider_type.to_string(),
+            issuer_url: "https://issuer.example.com".to_string(),
+            audience: "artifact-keeper".to_string(),
+            is_enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn sample_mapping(name: &str) -> CiOidcIdentityMapping {
+        let now = Utc::now();
+        CiOidcIdentityMapping {
+            id: Uuid::parse_str("11111111-2222-3333-4444-555555555555")
+                .expect("static UUID should be valid"),
+            provider_id: Uuid::new_v4(),
+            name: name.to_string(),
+            priority: 10,
+            claim_filters: json!({"sub": "ci:example"}),
+            role_id: None,
+            allowed_repo_ids: None,
+            is_enabled: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn check_claim_policy_accepts_exact_and_array_matches() {
+        let svc = test_service();
+        let policy = json!({
+            "project_path": ["group/repo", "other/repo"],
+            "ref_type": "branch"
+        });
+        let claims = json!({
+            "project_path": "group/repo",
+            "ref_type": "branch"
+        });
+
+        assert!(svc.check_claim_policy(&policy, &claims).is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_claim_policy_rejects_non_object_policy() {
+        let svc = test_service();
+        let policy = json!("not-an-object");
+        let claims = json!({"sub": "ci:job"});
+
+        let err = svc
+            .check_claim_policy(&policy, &claims)
+            .expect_err("non-object policy must fail");
+        assert!(err
+            .to_string()
+            .contains("claim_filters must be a JSON object"));
+    }
+
+    #[tokio::test]
+    async fn check_claim_policy_rejects_mismatched_claim_value() {
+        let svc = test_service();
+        let policy = json!({"ref": "refs/heads/main"});
+        let claims = json!({"ref": "refs/heads/feature"});
+
+        let err = svc
+            .check_claim_policy(&policy, &claims)
+            .expect_err("mismatched claims must fail");
+        assert!(err
+            .to_string()
+            .contains("did not match any configured identity mapping"));
+    }
+
+    #[test]
+    fn select_jwk_key_rejects_empty_key_set() {
+        let keys = vec![];
+        let err = CiOidcService::select_jwk_key(&keys, None).expect_err("empty keys must fail");
+        assert!(err.to_string().contains("No matching JWK found"));
+    }
+
+    #[test]
+    fn select_jwk_key_rejects_missing_rsa_n() {
+        let keys = vec![json!({"kid": "k1", "kty": "RSA", "e": "AQAB"})];
+        let err = CiOidcService::select_jwk_key(&keys, Some("k1"))
+            .expect_err("RSA key without modulus must fail");
+        assert!(err.to_string().contains("JWK RSA missing 'n'"));
+    }
+
+    #[test]
+    fn select_jwk_key_rejects_missing_ec_x() {
+        let keys = vec![json!({"kid": "k1", "kty": "EC", "y": "abc"})];
+        let err = CiOidcService::select_jwk_key(&keys, Some("k1"))
+            .expect_err("EC key without x must fail");
+        assert!(err.to_string().contains("JWK EC missing 'x'"));
+    }
+
+    #[test]
+    fn select_jwk_key_rejects_unsupported_kty() {
+        let keys = vec![json!({"kid": "k1", "kty": "OKP"})];
+        let err = CiOidcService::select_jwk_key(&keys, Some("k1"))
+            .expect_err("unsupported kty must fail");
+        assert!(err.to_string().contains("Unsupported JWK kty"));
+    }
+
+    #[test]
+    fn extract_identity_from_mapping_formats_gitlab_identity() {
+        let provider = sample_provider("gitlab");
+        let mapping = sample_mapping("Deploy Main");
+        let claims = json!({
+            "project_path": "group/repo",
+            "sub": "gitlab-subject"
+        });
+
+        let identity = CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
+        assert_eq!(identity.external_id, "gitlab-subject");
+        assert!(identity.username.starts_with("ci-"));
+        assert_eq!(
+            identity.email,
+            format!("{}@ci.artifact-keeper.internal", identity.username)
+        );
+        assert_eq!(
+            identity.display_name,
+            Some("CI [GitLab] Deploy Main — group/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_identity_from_mapping_formats_github_identity() {
+        let provider = sample_provider("github");
+        let mapping = sample_mapping("Release Job");
+        let claims = json!({
+            "repository": "org/repo",
+            "sub": "github-subject"
+        });
+
+        let identity = CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
+        assert_eq!(identity.external_id, "github-subject");
+        assert_eq!(
+            identity.display_name,
+            Some("CI [GitHub] Release Job — org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_identity_from_mapping_uses_defaults_for_unknown_provider() {
+        let provider = sample_provider("custom");
+        let mapping = sample_mapping("Any Pipeline");
+        let claims = json!({});
+
+        let identity = CiOidcService::extract_identity_from_mapping(&provider, &mapping, &claims);
+        assert_eq!(
+            identity.display_name,
+            Some("CI [CI Provider] Any Pipeline".to_string())
+        );
+        assert_eq!(identity.groups, vec!["ci".to_string()]);
+        assert_eq!(identity.required_admin_group, None);
+    }
+
+    #[test]
+    fn auth_provider_is_ci() {
+        assert_eq!(CiOidcService::auth_provider(), AuthProvider::Ci);
+    }
+
+    #[tokio::test]
+    async fn fetch_discovery_rejects_non_https_url() {
+        let svc = test_service();
+        let err = svc
+            .fetch_discovery("http://issuer.example.com")
+            .await
+            .expect_err("non-https issuer must be rejected");
+        assert!(err.to_string().contains("must use HTTPS"));
+    }
+
+    #[tokio::test]
+    async fn provider_crud_roundtrip() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let svc = CiOidcService::new(pool.clone());
+
+        let created = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: "test-provider-crud".to_string(),
+                provider_type: None,
+                issuer_url: "https://issuer.example.com".to_string(),
+                audience: None,
+                is_enabled: None,
+            })
+            .await
+            .expect("provider should be created");
+
+        assert_eq!(created.provider_type, "generic");
+        assert_eq!(created.audience, "artifact-keeper");
+        assert!(created.is_enabled);
+
+        let listed = svc.list().await.expect("providers should list");
+        assert!(listed.iter().any(|p| p.id == created.id));
+
+        let got = svc
+            .get_response(created.id)
+            .await
+            .expect("provider should be readable");
+        assert_eq!(got.name, "test-provider-crud");
+
+        let updated = svc
+            .update(
+                created.id,
+                super::UpdateCiOidcProviderRequest {
+                    name: Some("test-provider-crud-updated".to_string()),
+                    provider_type: Some("github".to_string()),
+                    issuer_url: Some("https://issuer2.example.com".to_string()),
+                    audience: Some("artifact-keeper-ci".to_string()),
+                    is_enabled: Some(true),
+                },
+            )
+            .await
+            .expect("provider should update");
+        assert_eq!(updated.name, "test-provider-crud-updated");
+        assert_eq!(updated.provider_type, "github");
+
+        let toggled = svc
+            .toggle(created.id, false)
+            .await
+            .expect("provider should toggle");
+        assert!(!toggled.is_enabled);
+
+        svc.delete(created.id)
+            .await
+            .expect("provider should be deleted");
+
+        let err = svc
+            .get_response(created.id)
+            .await
+            .expect_err("deleted provider should not exist");
+        assert!(err.to_string().contains("provider not found"));
+    }
+
+    #[tokio::test]
+    async fn mapping_crud_and_resolve_mapping_roundtrip() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let svc = CiOidcService::new(pool.clone());
+        let provider = svc
+            .create(super::CreateCiOidcProviderRequest {
+                name: "test-provider-mapping".to_string(),
+                provider_type: Some("gitlab".to_string()),
+                issuer_url: "https://issuer.example.com".to_string(),
+                audience: Some("artifact-keeper".to_string()),
+                is_enabled: Some(true),
+            })
+            .await
+            .expect("provider should be created");
+
+        let created = svc
+            .create_mapping(
+                provider.id,
+                super::CreateCiOidcMappingRequest {
+                    name: "main-branch".to_string(),
+                    priority: None,
+                    claim_filters: json!({"ref": "refs/heads/main"}),
+                    role_id: None,
+                    allowed_repo_ids: None,
+                    is_enabled: None,
+                },
+            )
+            .await
+            .expect("mapping should be created");
+        assert_eq!(created.priority, 100);
+        assert!(created.is_enabled);
+
+        let listed = svc
+            .list_mappings(provider.id)
+            .await
+            .expect("mappings should list");
+        assert!(listed.iter().any(|m| m.id == created.id));
+
+        let got = svc
+            .get_mapping(provider.id, created.id)
+            .await
+            .expect("mapping should be readable");
+        assert_eq!(got.name, "main-branch");
+
+        let updated = svc
+            .update_mapping(
+                provider.id,
+                created.id,
+                super::UpdateCiOidcMappingRequest {
+                    name: Some("release-branch".to_string()),
+                    priority: Some(5),
+                    claim_filters: Some(json!({"ref": ["refs/heads/main", "refs/heads/release"]})),
+                    role_id: None,
+                    allowed_repo_ids: None,
+                    is_enabled: Some(true),
+                },
+            )
+            .await
+            .expect("mapping should update");
+        assert_eq!(updated.name, "release-branch");
+        assert_eq!(updated.priority, 5);
+
+        let resolved = svc
+            .resolve_mapping(provider.id, &json!({"ref": "refs/heads/release"}))
+            .await
+            .expect("matching claims should resolve mapping");
+        assert_eq!(resolved.id, created.id);
+
+        let toggled = svc
+            .toggle_mapping(provider.id, created.id, false)
+            .await
+            .expect("mapping should toggle");
+        assert!(!toggled.is_enabled);
+
+        let err = svc
+            .resolve_mapping(provider.id, &json!({"ref": "refs/heads/release"}))
+            .await
+            .expect_err("disabled mapping should not resolve");
+        assert!(err
+            .to_string()
+            .contains("No CI OIDC identity mappings configured"));
+
+        svc.delete_mapping(provider.id, created.id)
+            .await
+            .expect("mapping should delete");
+        svc.delete(provider.id)
+            .await
+            .expect("provider should delete");
+    }
+}
