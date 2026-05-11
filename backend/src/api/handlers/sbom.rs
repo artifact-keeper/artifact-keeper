@@ -1655,16 +1655,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sbom_inventory_row_cap_is_well_above_real_world_deps() {
-        // The biggest real-world dep tree we've measured is ~12k for a
-        // full Ubuntu 22.04 + Java + Node monorepo. The cap is 50k. Any
-        // future PR that drops this below 30k should fail this test
-        // unless the threat model has been re-evaluated.
-        assert!(
-            SBOM_INVENTORY_ROW_CAP >= 30_000,
-            "cap must remain comfortably above realistic monorepo dep \
-             counts to avoid attestation-evasion-by-truncation (#903 F1)"
-        );
-    }
+    /// The biggest real-world dep tree we've measured is ~12k for a full
+    /// Ubuntu 22.04 + Java + Node monorepo. The cap is 50k. Any future PR
+    /// that drops this below 30k breaks compilation here, forcing a
+    /// re-evaluation of the threat model documented at the const-site
+    /// (attestation-evasion-by-truncation, #903 F1).
+    const _: () = assert!(
+        SBOM_INVENTORY_ROW_CAP >= 30_000,
+        "SBOM_INVENTORY_ROW_CAP must remain comfortably above realistic \
+         monorepo dep counts; see security review F1"
+    );
 }
