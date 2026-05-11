@@ -199,6 +199,16 @@ struct TokenForm {
     grant_type: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    /// Used by the `grant_type=refresh_token` flow (per the OAuth2 + Docker
+    /// Distribution spec, see RFC 6749 §6 and
+    /// <https://distribution.github.io/distribution/spec/auth/oauth/>).
+    refresh_token: Option<String>,
+    /// `"offline"` (case-sensitive) requests that the response include a
+    /// refresh token. Anything else — including `None`, `"online"`, the
+    /// empty string, or `"OFFLINE"` — issues an access-token-only
+    /// response. Strict equality matches every real client and avoids
+    /// accidentally expanding the refresh-token surface for typos.
+    access_type: Option<String>,
 }
 
 /// Extract `(username, password)` from an OAuth2 password-grant form body.
@@ -235,6 +245,26 @@ fn extract_form_credentials(headers: &HeaderMap, body: &Bytes) -> Option<(String
         return None;
     }
     Some((username, password))
+}
+
+/// Parse the OAuth2 token-endpoint form body in full, returning every field
+/// the Docker Distribution spec defines. Unlike `extract_form_credentials`,
+/// this does NOT filter on `grant_type=="password"` — callers need to see
+/// `grant_type=refresh_token` for the refresh-grant short-circuit and
+/// `access_type` for the offline-access path.
+///
+/// Returns `None` when the body is empty, the Content-Type isn't
+/// `application/x-www-form-urlencoded` (charset suffix allowed), or the
+/// body fails to deserialize.
+fn parse_oauth2_form(headers: &HeaderMap, body: &Bytes) -> Option<TokenForm> {
+    if body.is_empty() {
+        return None;
+    }
+    let ct = headers.get(CONTENT_TYPE)?.to_str().ok()?;
+    if !ct.starts_with("application/x-www-form-urlencoded") {
+        return None;
+    }
+    serde_urlencoded::from_bytes(body).ok()
 }
 
 async fn validate_token(
@@ -3446,7 +3476,133 @@ struct TokenResponse {
     token: String,
     access_token: String,
     expires_in: u64,
+    /// Only emitted when the client explicitly requested `access_type=offline`
+    /// AND the credential isn't an API token (see security note on
+    /// `build_token_response`). `skip_serializing_if` keeps the response
+    /// byte-compatible with the pre-PR shape for every other code path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
     issued_at: String,
+}
+
+/// Decide whether the `refresh_token` field appears in the OAuth2 token
+/// response.
+///
+/// Returns `Some(refresh)` only when ALL of the following hold:
+///
+/// 1. `access_type` is exactly `"offline"` (strict, case-sensitive — matches
+///    the [Docker Distribution spec](https://distribution.github.io/distribution/spec/auth/oauth/),
+///    which spells it `offline` in the example flow).
+/// 2. The credential used was NOT an API token.
+///
+/// # Why API-token authentication suppresses the refresh token
+///
+/// API tokens (the `api_tokens` table) are the long-lived credential for
+/// non-interactive flows. They have first-class lifecycle:
+/// `revoke_api_token` flips `revoked_at`, the cache invalidates within
+/// `API_TOKEN_CACHE_TTL_SECS` (5 min), and the token is rejected
+/// everywhere.
+///
+/// Issuing a refresh-token JWT under that authentication would create a
+/// **parallel long-lived credential** signed against `JWT_SECRET` and
+/// NOT tied to the `api_tokens` row. `auth_service::refresh_tokens` does
+/// not blacklist consumed refresh tokens, so this parallel credential
+/// would survive `revoke_api_token` for up to
+/// `jwt_refresh_token_expiry_days` (default 7 days). An attacker who
+/// briefly captured the API token would have a 7-day backdoor after the
+/// defender thought they'd closed access.
+///
+/// Industry precedent for this suppression:
+///
+/// - **RFC 6749 §4.4.3** (`client_credentials` grant): *"A refresh token
+///   SHOULD NOT be included."* API-token-as-password is semantically the
+///   same flow — a machine credential authenticating itself.
+/// - **JFrog Artifactory** deprecated their API-key-as-password path
+///   entirely (End of Life Q4 2024) for this exact lifecycle-management
+///   problem: *"API Keys don't have lifecycle management features […]
+///   single user can have single active API Key — if revoked, revoked
+///   for all clients."* Replaced by reference tokens and identity
+///   tokens with per-token revocation.
+/// - **Sonatype Nexus** User Tokens are designed as first-class tokens
+///   with their own lifecycle and do not get a parallel refresh-grant.
+///
+/// The graceful-degradation choice (silent suppress vs explicit 4xx)
+/// follows the default-permissive convention used by Google, GitHub, and
+/// other major OAuth2 servers: the response is still 200 OK with a valid
+/// access token; the client simply re-authenticates with its API token
+/// when the access expires (~30 min later). Returning 400 here would
+/// break Docker daemons that send `access_type=offline` mechanically
+/// regardless of the credential type.
+fn offline_refresh_token(
+    access_type: Option<&str>,
+    authenticated_via_api_token: bool,
+    refresh: &str,
+) -> Option<String> {
+    if authenticated_via_api_token {
+        return None;
+    }
+    if access_type != Some("offline") {
+        return None;
+    }
+    Some(refresh.to_string())
+}
+
+/// Exchange a refresh token for a fresh access token (and optionally a new
+/// refresh token if `access_type=offline` is supplied again). Per
+/// [the Docker Distribution OAuth2 spec](https://distribution.github.io/distribution/spec/auth/oauth/),
+/// the refresh-grant request body is just `grant_type=refresh_token` +
+/// `refresh_token=…` with no credentials — the refresh token itself
+/// authenticates.
+///
+/// `auth_service::refresh_tokens` filters `is_active = true` and consults
+/// `is_token_invalidated`, so any of (a) deactivated user, (b) password
+/// change since issue, (c) TOTP enable/disable since issue, will surface
+/// here as a 401.
+async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response {
+    let refresh = match form.refresh_token.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DENIED",
+                "refresh_token grant requires refresh_token",
+            );
+        }
+    };
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    let (_user, tokens) = match auth_service.refresh_tokens(refresh).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            return oci_error(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "invalid refresh token",
+            );
+        }
+    };
+    // Refresh-grant always originates from a user (not API token) — the
+    // refresh token was issued at password-grant time and the API-token
+    // suppression already prevented one being issued for an API-token
+    // session. So the second argument to `offline_refresh_token` is `false`.
+    // The `access_type` filter still applies: a refresh-grant without
+    // `access_type=offline` does NOT rotate the refresh token (matches the
+    // spec, which says the same refresh is returned).
+    let resp = TokenResponse {
+        token: tokens.access_token.clone(),
+        access_token: tokens.access_token.clone(),
+        expires_in: tokens.expires_in,
+        refresh_token: offline_refresh_token(
+            form.access_type.as_deref(),
+            false,
+            &tokens.refresh_token,
+        ),
+        issued_at: chrono::Utc::now().to_rfc3339(),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&resp).unwrap()))
+        .unwrap()
 }
 
 async fn token(
@@ -3464,6 +3620,30 @@ async fn token(
             return oci_error(StatusCode::BAD_REQUEST, "DENIED", "service mismatch");
         }
     }
+
+    // Parse the full OAuth2 form body once upfront. `extract_form_credentials`
+    // filters on `grant_type=="password"`, so it won't see the refresh-grant;
+    // we need a separate handle on the form to detect that, and to thread
+    // `access_type` through to response construction.
+    let form = parse_oauth2_form(&headers, &body);
+
+    // grant_type=refresh_token short-circuit. Per the Docker Distribution
+    // OAuth2 spec[1], the refresh-grant flow doesn't carry credentials —
+    // the refresh_token itself authenticates. So this branch must be
+    // checked before the credential-resolution chain below.
+    //
+    // [1]: https://distribution.github.io/distribution/spec/auth/oauth/
+    if let Some(ref f) = form {
+        if f.grant_type.as_deref() == Some("refresh_token") {
+            return handle_refresh_grant(&state, f).await;
+        }
+    }
+
+    // `access_type=offline` is opt-in for a refresh token in the response of
+    // the credential-auth path. Captured here so it's in scope for the
+    // success-response builder later in the function.
+    let access_type = form.as_ref().and_then(|f| f.access_type.clone());
+
     // Credential extraction order, per the OCI Distribution Spec + OAuth2:
     //   1. HTTP Basic Auth header (the original code path; works for `docker
     //      login` / `curl -u`).
@@ -3555,10 +3735,17 @@ async fn token(
                         }
                     };
 
+                // The Bearer-JWT swap path is for "I already have a valid
+                // JWT, give me a fresh access token". It does NOT issue
+                // refresh tokens regardless of `access_type` — the client
+                // already has their own refresh path elsewhere, and
+                // double-issuing would just create another non-revocable
+                // long-lived credential.
                 let resp = TokenResponse {
                     token: access_token.clone(),
                     access_token,
                     expires_in,
+                    refresh_token: None,
                     issued_at: chrono::Utc::now().to_rfc3339(),
                 };
 
@@ -3590,6 +3777,7 @@ async fn token(
                 token: ANONYMOUS_TOKEN.to_string(),
                 access_token: ANONYMOUS_TOKEN.to_string(),
                 expires_in: 900,
+                refresh_token: None,
                 issued_at: chrono::Utc::now().to_rfc3339(),
             };
             return Response::builder()
@@ -3713,8 +3901,13 @@ async fn token(
 
     let resp = TokenResponse {
         token: tokens.access_token.clone(),
-        access_token: tokens.access_token,
+        access_token: tokens.access_token.clone(),
         expires_in: tokens.expires_in,
+        refresh_token: offline_refresh_token(
+            access_type.as_deref(),
+            authenticated_via_api_token,
+            &tokens.refresh_token,
+        ),
         issued_at: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -10053,6 +10246,7 @@ mod tests {
             token: "tok1".to_string(),
             access_token: "tok1".to_string(),
             expires_in: 3600,
+            refresh_token: None,
             issued_at: "2024-01-01T00:00:00Z".to_string(),
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -10060,6 +10254,58 @@ mod tests {
         assert!(json.contains("\"access_token\":\"tok1\""));
         assert!(json.contains("\"expires_in\":3600"));
         assert!(json.contains("\"issued_at\""));
+        // refresh_token: None must be omitted entirely so legacy clients
+        // and PR1102-shape consumers don't observe a behavioral change.
+        assert!(!json.contains("refresh_token"));
+    }
+
+    #[test]
+    fn test_token_response_serializes_refresh_token_when_some() {
+        let resp = TokenResponse {
+            token: "access".to_string(),
+            access_token: "access".to_string(),
+            expires_in: 3600,
+            refresh_token: Some("refresh-jwt".to_string()),
+            issued_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"refresh_token\":\"refresh-jwt\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // offline_refresh_token suppression rules
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_offline_refresh_token_returns_some_for_password_grant_offline() {
+        let rt = offline_refresh_token(Some("offline"), false, "refresh-jwt");
+        assert_eq!(rt.as_deref(), Some("refresh-jwt"));
+    }
+
+    #[test]
+    fn test_offline_refresh_token_returns_none_for_password_grant_without_offline() {
+        // `None`, `"online"`, the empty string — none of these should emit a
+        // refresh token. Strict equality on `"offline"` matches the spec and
+        // refuses to expand the surface on typos.
+        for at in [
+            None,
+            Some("online"),
+            Some(""),
+            Some("OFFLINE"),
+            Some("offline "),
+        ] {
+            let rt = offline_refresh_token(at, false, "refresh-jwt");
+            assert!(rt.is_none(), "expected None for access_type={:?}", at);
+        }
+    }
+
+    #[test]
+    fn test_offline_refresh_token_suppresses_for_api_token_even_when_offline_requested() {
+        // The security-critical case: API-token authentication must never
+        // be upgraded into a refresh-grant. See the function's doc-comment
+        // for the full rationale (industry precedent + revocation gap).
+        let rt = offline_refresh_token(Some("offline"), true, "refresh-jwt");
+        assert!(rt.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -21098,6 +21344,320 @@ mod oci_write_authz_and_size_tests {
         assert!(
             reject_oversized_content_length(&headers, 10, 10).is_none(),
             "a declared Content-Length within the limit must not be rejected"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OAuth2 refresh-grant + `access_type=offline` end-to-end tests. DB-backed
+// because the handler builds `SharedState` from a live `PgPool`, exercises
+// `auth_service::generate_tokens` + `refresh_tokens`, and several assertions
+// depend on `users.is_active` being flipped between calls.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod token_refresh_grant_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// Spin up a fresh user, a `SharedState`, and an `AuthService`. Returns
+    /// `None` when `DATABASE_URL` is unset so the test no-ops gracefully.
+    async fn setup() -> Option<(sqlx::PgPool, Uuid, String, SharedState, AuthService)> {
+        let pool = tdh::try_pool().await?;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&pwd_hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("update password_hash");
+        let storage_dir =
+            std::env::temp_dir().join(format!("oci-refresh-grant-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        Some((pool, user_id, username, state, auth_service))
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, user_id: Uuid) {
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+    }
+
+    fn form_post(uri: &str, body: String) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn read_body(resp: axum::response::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 65_536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Read response body as raw bytes — used by tests that assert the
+    /// JSON field is *absent from the wire*, not merely `Value::Null`.
+    /// Mirrors the sync `test_token_response_serialization` assertion.
+    async fn read_body_bytes(resp: axum::response::Response<Body>) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), 65_536)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Real user + `access_type=offline` → response carries `refresh_token`.
+    #[tokio::test]
+    async fn password_grant_offline_includes_refresh_token() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let body = format!(
+            "grant_type=password&username={username}&password=real-test-password&access_type=offline"
+        );
+        let app = router().with_state(state);
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let status = resp.status();
+        let body = read_body(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["refresh_token"].as_str().is_some(),
+            "expected refresh_token in response, got: {body}"
+        );
+    }
+
+    /// Real user without `access_type` → response has NO `refresh_token`.
+    /// Backwards-compatible with the pre-PR shape. Assert on raw JSON bytes
+    /// so a regression that emits `Value::Null` or `""` for the field would
+    /// still fail (matches the contract `skip_serializing_if` enforces).
+    #[tokio::test]
+    async fn password_grant_default_omits_refresh_token() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let body = format!("grant_type=password&username={username}&password=real-test-password");
+        let app = router().with_state(state);
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let status = resp.status();
+        let bytes = read_body_bytes(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        let raw = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !raw.contains("refresh_token"),
+            "default password-grant response must not mention refresh_token on the wire: {raw}"
+        );
+    }
+
+    /// Security-critical regression. See `offline_refresh_token` doc-comment
+    /// for the full motivation (RFC 6749 §4.4.3, JFrog API-key EOL, etc.).
+    /// Asserts the field is absent from the raw JSON, not just `Value::Null`,
+    /// because the security contract is that nothing called `refresh_token`
+    /// reaches the client at all.
+    #[tokio::test]
+    async fn api_token_offline_does_not_get_refresh_token() {
+        let Some((pool, user_id, username, state, auth_service)) = setup().await else {
+            return;
+        };
+        let (api_token, _) = auth_service
+            .generate_api_token(user_id, "offline-test", vec!["*".to_string()], None)
+            .await
+            .expect("generate API token");
+        let body = format!(
+            "grant_type=password&username={username}&password={api_token}&access_type=offline"
+        );
+        let app = router().with_state(state);
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let status = resp.status();
+        let bytes = read_body_bytes(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        let raw = std::str::from_utf8(&bytes).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_ne!(body["token"].as_str(), Some("anonymous"));
+        assert!(
+            !raw.contains("refresh_token"),
+            "API-token + offline must NOT mint a refresh-grant credential that survives revoke_api_token: {raw}"
+        );
+    }
+
+    /// Refresh-grant default (no `access_type`) → new access, no rotation.
+    /// Distribution spec at
+    /// <https://distribution.github.io/distribution/spec/auth/oauth/> says
+    /// "only return the same refresh token and not a new one" — we omit the
+    /// field instead so the client keeps using the original. Both real Docker
+    /// daemons and OCI clients handle either shape; revisit if we ever need
+    /// strict spec conformance. Asserts on raw bytes for the same reason as
+    /// `password_grant_default_omits_refresh_token`.
+    #[tokio::test]
+    async fn refresh_grant_default_returns_access_only() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+
+        let body = format!(
+            "grant_type=password&username={username}&password=real-test-password&access_type=offline"
+        );
+        let resp = app
+            .clone()
+            .oneshot(form_post("/token", body))
+            .await
+            .unwrap();
+        let json = read_body(resp).await;
+        let refresh = json["refresh_token"]
+            .as_str()
+            .expect("issued refresh")
+            .to_string();
+
+        let body = format!("grant_type=refresh_token&refresh_token={refresh}");
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let status = resp.status();
+        let bytes = read_body_bytes(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        let raw = std::str::from_utf8(&bytes).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert!(body["access_token"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s != "anonymous"));
+        assert!(
+            !raw.contains("refresh_token"),
+            "default refresh-grant should not rotate the refresh: {raw}"
+        );
+    }
+
+    /// Refresh-grant + `access_type=offline` rotates the refresh token.
+    #[tokio::test]
+    async fn refresh_grant_offline_rotates_refresh_token() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+
+        let body = format!(
+            "grant_type=password&username={username}&password=real-test-password&access_type=offline"
+        );
+        let resp = app
+            .clone()
+            .oneshot(form_post("/token", body))
+            .await
+            .unwrap();
+        let json = read_body(resp).await;
+        let refresh = json["refresh_token"]
+            .as_str()
+            .expect("issued refresh")
+            .to_string();
+
+        let body = format!("grant_type=refresh_token&refresh_token={refresh}&access_type=offline");
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let status = resp.status();
+        let body = read_body(resp).await;
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["access_token"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            body["refresh_token"].as_str().is_some(),
+            "offline refresh-grant should mint a new refresh: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_invalid_token_returns_401() {
+        let Some((pool, user_id, _username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(form_post(
+                "/token",
+                "grant_type=refresh_token&refresh_token=not-a-valid-jwt".to_string(),
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        cleanup(&pool, user_id).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_missing_token_returns_400() {
+        let Some((pool, user_id, _username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+        for body in [
+            "grant_type=refresh_token".to_string(),
+            "grant_type=refresh_token&refresh_token=".to_string(),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(form_post("/token", body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for body={body:?}"
+            );
+        }
+        cleanup(&pool, user_id).await;
+    }
+
+    /// Deactivated user can't refresh — `auth_service::refresh_tokens`
+    /// filters on `is_active = true`.
+    #[tokio::test]
+    async fn refresh_grant_deactivated_user_returns_401() {
+        let Some((pool, user_id, username, state, _)) = setup().await else {
+            return;
+        };
+        let app = router().with_state(state);
+
+        let body = format!(
+            "grant_type=password&username={username}&password=real-test-password&access_type=offline"
+        );
+        let resp = app
+            .clone()
+            .oneshot(form_post("/token", body))
+            .await
+            .unwrap();
+        let json = read_body(resp).await;
+        let refresh = json["refresh_token"]
+            .as_str()
+            .expect("issued refresh")
+            .to_string();
+
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("deactivate user");
+
+        let body = format!("grant_type=refresh_token&refresh_token={refresh}");
+        let resp = app.oneshot(form_post("/token", body)).await.unwrap();
+        let status = resp.status();
+        cleanup(&pool, user_id).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "deactivated user must not mint fresh tokens via refresh-grant"
         );
     }
 }
