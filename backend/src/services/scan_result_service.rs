@@ -596,16 +596,20 @@ impl ScanResultService {
     // -----------------------------------------------------------------------
 
     /// Batch insert the full package inventory for a completed scan (#903).
-    /// Each row is one package the scanner saw — vulnerable or not — so the
-    /// SBOM read path can return the complete dep tree.
+    /// Each row is one package the scanner saw — vulnerable or not — so
+    /// the SBOM read path can return the complete dep tree.
     ///
-    /// The `(scan_result_id, name, COALESCE(version, ''))` unique index
-    /// catches the case where a scanner emits the same package twice within
-    /// a single report (e.g. Trivy listing a Maven artifact both in its
-    /// standalone Packages block and inline on a vulnerability row). The
-    /// duplicate is silently skipped via `ON CONFLICT DO NOTHING` rather
-    /// than aborting the whole insert; one rogue duplicate must not lose
-    /// the rest of the inventory.
+    /// Conflict handling: the unique index is
+    /// `(scan_result_id, name, COALESCE(version, ''))`. When a scanner
+    /// emits the same `(name, version)` twice within a single report (e.g.
+    /// Trivy listing a Maven artifact both in its standalone Packages
+    /// block AND inline on a vulnerability row, often with one PURL set
+    /// and the other empty) the second insert promotes any newly-supplied
+    /// `purl`, `license`, or `source_target` value over a previously-NULL
+    /// row. `ON CONFLICT DO NOTHING` would lose whichever value lost the
+    /// race; `DO UPDATE ... COALESCE(scan_packages.col, EXCLUDED.col)`
+    /// keeps the first non-null value, which is the closest thing to
+    /// "more specific wins" without inventing an ordering rule.
     pub async fn create_packages(
         &self,
         scan_result_id: Uuid,
@@ -619,7 +623,11 @@ impl ScanResultService {
                     version, purl, license, source_target)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (scan_result_id, name, COALESCE(version, ''))
-                    DO NOTHING
+                    DO UPDATE SET
+                        purl = COALESCE(scan_packages.purl, EXCLUDED.purl),
+                        license = COALESCE(scan_packages.license, EXCLUDED.license),
+                        source_target = COALESCE(scan_packages.source_target,
+                                                 EXCLUDED.source_target)
                 "#,
                 scan_result_id,
                 artifact_id,

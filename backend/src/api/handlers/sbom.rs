@@ -307,9 +307,21 @@ async fn generate_sbom(
 )]
 async fn list_sboms(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<Vec<SbomResponse>>> {
+    // #903 F6: when a specific artifact is requested, verify caller access
+    // to its repository before enumerating. The repository_id filter below
+    // also enforces access (callers cannot list a repo's SBOMs without
+    // having access to that repo).
+    if let Some(artifact_id) = query.artifact_id {
+        ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    }
+    if let Some(repo_id) = query.repository_id {
+        if !auth.can_access_repo(repo_id) {
+            return Err(AppError::NotFound("Repository not found".into()));
+        }
+    }
     let service = SbomService::new(state.db.clone());
 
     let sboms = if let Some(artifact_id) = query.artifact_id {
@@ -335,6 +347,16 @@ async fn list_sboms(
             })
             .collect()
     } else {
+        // #903 F6: a scope-restricted token (allowed_repo_ids = Some) MUST
+        // narrow by repository or artifact. Listing all SBOMs would let
+        // a token scoped to repo A enumerate dep trees of every other
+        // repo. Force the caller to be explicit about the repo scope.
+        if auth.is_api_token && auth.allowed_repo_ids.is_some() {
+            return Err(AppError::Validation(
+                "Scope-restricted tokens must filter by repository_id or artifact_id"
+                    .into(),
+            ));
+        }
         // List all SBOMs (with optional filters)
         let mut sql = "SELECT * FROM sbom_documents WHERE 1=1".to_string();
         if query.repository_id.is_some() {
@@ -393,9 +415,10 @@ async fn list_sboms(
 )]
 async fn get_sbom(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SbomContentResponse>> {
+    ensure_sbom_repo_access(&state.db, &auth, id).await?;
     let service = SbomService::new(state.db.clone());
     let doc = service
         .get_sbom(id)
@@ -422,10 +445,11 @@ async fn get_sbom(
 )]
 async fn get_sbom_by_artifact(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<SbomContentResponse>> {
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     let service = SbomService::new(state.db.clone());
     let format = query
         .format
@@ -458,9 +482,10 @@ async fn get_sbom_by_artifact(
 )]
 async fn delete_sbom(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    ensure_sbom_repo_access(&state.db, &auth, id).await?;
     let service = SbomService::new(state.db.clone());
     service.delete_sbom(id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
@@ -483,9 +508,10 @@ async fn delete_sbom(
 )]
 async fn get_sbom_components(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<ComponentResponse>>> {
+    ensure_sbom_repo_access(&state.db, &auth, id).await?;
     let service = SbomService::new(state.db.clone());
     let components = service.get_sbom_components(id).await?;
     let responses: Vec<ComponentResponse> = components
@@ -544,9 +570,10 @@ async fn convert_sbom(
 )]
 async fn get_cve_history(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     let service = SbomService::new(state.db.clone());
     let entries = service.get_cve_history(artifact_id).await?;
     Ok(Json(entries))
@@ -776,80 +803,133 @@ async fn check_license_compliance(
 
 // === Helpers ===
 
+/// Upper bound on rows surfaced into one SBOM document. Realistic
+/// monorepos (Ubuntu 22.04 base + Java + Node) can exceed 5k packages
+/// once `--list-all-pkgs` enumerates every apt package, JAR, and
+/// node_module. The cap exists to keep one runaway scan from
+/// generating an unbounded response; the alphabetical ordering on
+/// `name` previously meant an attacker could position malicious
+/// packages late in the alphabet to evade attestation. The new
+/// ceiling is well above any realistic dep tree, and a truncated
+/// response would log a warning so operators see it.
+const SBOM_INVENTORY_ROW_CAP: i64 = 50_000;
+
+/// Build a [`DependencyInfo`] from raw row fields, dropping rows whose
+/// `name` is empty (data-quality filter shared by both read paths).
+fn build_dep(
+    name: String,
+    version: Option<String>,
+    purl: Option<String>,
+    license: Option<String>,
+) -> Option<DependencyInfo> {
+    if name.is_empty() {
+        None
+    } else {
+        Some(DependencyInfo {
+            name,
+            version,
+            purl,
+            license,
+            sha256: None,
+        })
+    }
+}
+
 /// Extract dependencies for SBOM generation.
 ///
 /// Read-path order (#903):
 ///
-/// 1. **`scan_packages`** — canonical inventory written by scanners invoked
-///    with `--list-all-pkgs`. Every package the scanner saw, regardless of
-///    CVE status. Source of truth post-#903.
-/// 2. **`scan_findings`** — legacy fallback for artifacts scanned before
+/// 1. **`scan_packages`** restricted to each scan_type's latest completed
+///    scan per artifact. This mirrors the #1126 / #1136 DISTINCT-ON CTE
+///    used for `scan_findings` aggregation; without it, a rescan that
+///    removed a dep would still surface the removed dep forever because
+///    the old scan's row lingers.
+/// 2. **`scan_findings`** legacy fallback for artifacts scanned before
 ///    the inventory table existed, or by scanners that do not enumerate
 ///    packages (Grype, OpenSCAP, custom WASM plugins). Returns only
 ///    CVE-bearing components — exactly the bug #903 fixes for new scans,
 ///    but the best we can do for legacy data.
 ///
-/// The fallback only fires when scan_packages is genuinely empty for the
-/// artifact, not when it contains rows the caller finds incomplete. This
-/// avoids "best-of-both" merging that would re-introduce duplicate entries.
+/// Soft-deleted artifacts (`artifacts.is_deleted = true`) are excluded
+/// from both paths so consumers cannot rehydrate dep trees for content
+/// the operator has deliberately retired.
 async fn extract_dependencies_for_artifact(
     db: &sqlx::PgPool,
     artifact_id: Uuid,
 ) -> Result<Vec<DependencyInfo>> {
-    // Primary path: the inventory table.
-    // Row tuple: (name, version, purl, license). Kept as a tuple rather
-    // than a derived row struct so the sqlx::query_as call needs no
-    // additional FromRow plumbing — the SBOM read path is the only consumer.
+    // Primary path: the inventory table, windowed to each scan_type's
+    // latest completed scan. The DISTINCT ON inside `latest_scans`
+    // picks the most recent scan per (artifact, scan_type); the outer
+    // DISTINCT collapses cross-scan-type packages with identical
+    // (name, version, purl, license) tuples (e.g. Trivy fs + Grype
+    // both reporting the same lockfile dep).
+    //
+    // Row tuple: (name, version, purl, license). Tuple is local to this
+    // read path — the SBOM endpoint is the only consumer, so a derived
+    // FromRow type would pay no dividend.
     #[allow(clippy::type_complexity)]
     let packages: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT DISTINCT
-            sp.name,
-            sp.version,
-            sp.purl,
-            sp.license
+        WITH latest_scans AS (
+            SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+            FROM scan_results sr
+            JOIN artifacts a ON a.id = sr.artifact_id
+            WHERE sr.artifact_id = $1
+              AND NOT a.is_deleted
+              AND sr.status = 'completed'
+            ORDER BY sr.artifact_id, sr.scan_type,
+                     sr.completed_at DESC NULLS LAST, sr.created_at DESC
+        )
+        SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
         FROM scan_packages sp
-        WHERE sp.artifact_id = $1
+        WHERE sp.scan_result_id IN (SELECT id FROM latest_scans)
         ORDER BY sp.name
-        LIMIT 5000
+        LIMIT $2
         "#,
     )
     .bind(artifact_id)
+    .bind(SBOM_INVENTORY_ROW_CAP)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     if !packages.is_empty() {
+        if packages.len() as i64 >= SBOM_INVENTORY_ROW_CAP {
+            tracing::warn!(
+                "SBOM read for artifact {} hit the {} row cap; output may \
+                 be truncated. Investigate scanner output sizes.",
+                artifact_id,
+                SBOM_INVENTORY_ROW_CAP
+            );
+        }
         return Ok(packages
             .into_iter()
-            .filter_map(|(name, version, purl, license)| {
-                if name.is_empty() {
-                    None
-                } else {
-                    Some(DependencyInfo {
-                        name,
-                        version,
-                        purl,
-                        license,
-                        sha256: None,
-                    })
-                }
-            })
+            .filter_map(|(name, version, purl, license)| build_dep(name, version, purl, license))
             .collect());
     }
 
-    // Legacy fallback: derive a component list from scan_findings. This is
-    // the pre-#903 vulnerability-only shape; preferable to returning empty
-    // for artifacts scanned before the inventory table existed.
-    let findings: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+    // Legacy fallback: derive a component list from scan_findings, also
+    // windowed to the latest scan per scan_type for consistency with
+    // the primary path. This is the pre-#903 vulnerability-only shape;
+    // preferable to returning empty for artifacts scanned before the
+    // inventory table existed.
+    let findings: Vec<(String, Option<String>)> = sqlx::query_as(
         r#"
+        WITH latest_scans AS (
+            SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+            FROM scan_results sr
+            JOIN artifacts a ON a.id = sr.artifact_id
+            WHERE sr.artifact_id = $1
+              AND NOT a.is_deleted
+              AND sr.status = 'completed'
+            ORDER BY sr.artifact_id, sr.scan_type,
+                     sr.completed_at DESC NULLS LAST, sr.created_at DESC
+        )
         SELECT DISTINCT
-            COALESCE(affected_component, title) as name,
-            affected_version as version,
-            NULL::text as purl
+            COALESCE(sf.affected_component, sf.title) AS name,
+            sf.affected_version AS version
         FROM scan_findings sf
-        JOIN scan_results sr ON sf.scan_result_id = sr.id
-        WHERE sr.artifact_id = $1
+        WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
         ORDER BY name
         LIMIT 1000
         "#,
@@ -857,26 +937,62 @@ async fn extract_dependencies_for_artifact(
     .bind(artifact_id)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let deps: Vec<DependencyInfo> = findings
+    Ok(findings
         .into_iter()
-        .filter_map(|(name, version, purl)| {
-            if name.is_empty() {
-                None
-            } else {
-                Some(DependencyInfo {
-                    name,
-                    version,
-                    purl,
-                    license: None,
-                    sha256: None,
-                })
-            }
-        })
-        .collect();
+        .filter_map(|(name, version)| build_dep(name, version, None, None))
+        .collect())
+}
 
-    Ok(deps)
+/// Resolve `artifact_id → repository_id` and return Err(NotFound) when
+/// either the artifact does not exist (or is soft-deleted) or the caller
+/// lacks `allowed_repo_ids` access to its repository.
+///
+/// The 404 (rather than 403) on the access-denied case is deliberate:
+/// returning 403 leaks the existence of the artifact id, which itself
+/// can be sensitive (e.g. private package names enumerated by guessing).
+/// Same pattern format-handler routes use, kept consistent here. (#903 F6.)
+async fn ensure_artifact_repo_access(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    artifact_id: Uuid,
+) -> Result<()> {
+    let repo_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT repository_id FROM artifacts WHERE id = $1 AND NOT is_deleted",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let repo_id = repo_id.ok_or_else(|| AppError::NotFound("Artifact not found".into()))?;
+    if !auth.can_access_repo(repo_id) {
+        return Err(AppError::NotFound("Artifact not found".into()));
+    }
+    Ok(())
+}
+
+/// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
+/// when the caller has only the SBOM id.
+async fn ensure_sbom_repo_access(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    sbom_id: Uuid,
+) -> Result<()> {
+    let repo_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT repository_id FROM sbom_documents WHERE id = $1",
+    )
+    .bind(sbom_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let repo_id = repo_id.ok_or_else(|| AppError::NotFound("SBOM not found".into()))?;
+    if !auth.can_access_repo(repo_id) {
+        return Err(AppError::NotFound("SBOM not found".into()));
+    }
+    Ok(())
 }
 
 #[derive(OpenApi)]

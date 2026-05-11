@@ -24,6 +24,14 @@ impl SbomService {
     }
 
     /// Generate an SBOM for an artifact.
+    ///
+    /// #903 cache-invalidation contract: a cached SBOM document is only
+    /// returned when its `content_hash` matches the hash of the freshly-
+    /// generated content. Pre-#903 the function returned any existing row
+    /// unconditionally, which pinned empty / vulnerability-shaped SBOMs
+    /// forever for artifacts uploaded before this fix shipped. With the
+    /// hash-gated cache, a rescan that surfaces 30 new packages re-emits
+    /// the document; identical re-generations skip the write.
     pub async fn generate_sbom(
         &self,
         artifact_id: Uuid,
@@ -31,13 +39,7 @@ impl SbomService {
         format: SbomFormat,
         dependencies: Vec<DependencyInfo>,
     ) -> Result<SbomDocument> {
-        // Check if SBOM already exists
-        let existing = self.get_sbom_by_artifact(artifact_id, format).await?;
-        if let Some(doc) = existing {
-            return Ok(doc);
-        }
-
-        // Generate SBOM content based on format
+        // Generate first so we can hash and compare against any cached row.
         let (content, components) = match format {
             SbomFormat::CycloneDX => self.generate_cyclonedx(&dependencies)?,
             SbomFormat::SPDX => self.generate_spdx(&dependencies)?,
@@ -46,6 +48,33 @@ impl SbomService {
         // Calculate content hash
         let content_str = serde_json::to_string(&content)?;
         let content_hash = format!("{:x}", Sha256::digest(content_str.as_bytes()));
+
+        // Cache check: a stored row whose content_hash matches the freshly-
+        // generated content is reusable. Anything else is stale (likely
+        // generated before #903 against an empty / vulnerability-only
+        // dependency list) and must be replaced.
+        let existing = self.get_sbom_by_artifact(artifact_id, format).await?;
+        if let Some(doc) = &existing {
+            if doc.content_hash == content_hash {
+                return Ok(doc.clone());
+            }
+        }
+
+        // Stale cache: drop components first (FK from sbom_components to
+        // sbom_documents) then the document row. Using ON CONFLICT on the
+        // (artifact_id, format) unique index for the insert below would
+        // leave orphaned component rows, since sbom_components is keyed
+        // on sbom_id which the upsert path preserves.
+        if let Some(doc) = existing {
+            sqlx::query("DELETE FROM sbom_components WHERE sbom_id = $1")
+                .bind(doc.id)
+                .execute(&self.db)
+                .await?;
+            sqlx::query("DELETE FROM sbom_documents WHERE id = $1")
+                .bind(doc.id)
+                .execute(&self.db)
+                .await?;
+        }
 
         // Extract licenses
         let licenses: Vec<String> = dependencies

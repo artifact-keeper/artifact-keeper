@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO scan_packages (scan_result_id, artifact_id, name,\n                    version, purl, license, source_target)\n                VALUES ($1, $2, $3, $4, $5, $6, $7)\n                ON CONFLICT (scan_result_id, name, COALESCE(version, ''))\n                    DO UPDATE SET\n                        purl = COALESCE(scan_packages.purl, EXCLUDED.purl),\n                        license = COALESCE(scan_packages.license, EXCLUDED.license),\n                        source_target = COALESCE(scan_packages.source_target,\n                                                 EXCLUDED.source_target)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9743e40c0da3e92fcc9e9dad5fc79d51a3a2b510cf271ee896597077e3415e53"
+}

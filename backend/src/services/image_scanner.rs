@@ -253,12 +253,18 @@ impl ImageScanner {
         // POST /twirp/trivy.scanner.v1.Scanner/Scan
         let url = format!("{}/twirp/trivy.scanner.v1.Scanner/Scan", self.trivy_url);
 
+        // `list_all_packages: true` mirrors the `--list-all-pkgs` CLI flag
+        // (#903): without it the Twirp endpoint returns no `Packages`
+        // block, and any environment that falls through to this HTTP
+        // path (ARC runners + demo EC2 without the trivy CLI binary)
+        // would silently keep the empty-SBOM bug for image scans.
         let body = serde_json::json!({
             "target": image_ref,
             "artifact_type": "container_image",
             "options": {
                 "vuln_type": ["os", "library"],
                 "scanners": ["vuln"],
+                "list_all_packages": true,
             }
         });
 
@@ -348,7 +354,12 @@ impl Scanner for ImageScanner {
         info!("Starting Trivy scan for image: {}", image_ref);
 
         let report = self.scan_with_trivy(&image_ref).await?;
-        let output = ScanOutput::from_trivy_report(&report, "trivy-image");
+        // Source label is intentionally "trivy" (not "trivy-image") to
+        // preserve back-compat with dashboards / filters that group
+        // findings by `source = 'trivy'`. The pre-#903 ImageScanner used
+        // the same string. Changing it here would silently drop
+        // existing image-scanner rows from any operator filter.
+        let output = ScanOutput::from_trivy_report(&report, "trivy");
 
         info!(
             "Trivy scan complete for {}: {} vulnerabilities, {} packages",
