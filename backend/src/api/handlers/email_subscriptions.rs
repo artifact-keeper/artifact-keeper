@@ -629,4 +629,125 @@ mod tests {
         assert!(VALID_EVENT_TYPES.contains(&"license.violation"));
         assert!(VALID_EVENT_TYPES.contains(&"vulnerability.detected"));
     }
+
+    #[test]
+    fn test_valid_event_types_includes_repository_class() {
+        assert!(VALID_EVENT_TYPES.contains(&"repository.created"));
+        assert!(VALID_EVENT_TYPES.contains(&"repository.deleted"));
+    }
+
+    #[test]
+    fn test_validate_event_types_accepts_all_known_tokens() {
+        // Round-trip every token in VALID_EVENT_TYPES through the
+        // validator. If any token in the constant fails its own
+        // validator, the constant is internally inconsistent.
+        for et in VALID_EVENT_TYPES {
+            validate_event_types(&[et.to_string()])
+                .unwrap_or_else(|_| panic!("event type {:?} must validate", et));
+        }
+    }
+
+    #[test]
+    fn test_validate_event_types_partial_unknown_still_rejects() {
+        // Mix one valid + one unknown. Must still error so the typo
+        // doesn't silently subscribe the caller only to the valid half.
+        let err =
+            validate_event_types(&["artifact.uploaded".to_string(), "typo.invalid".to_string()])
+                .unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("typo.invalid"),
+                    "msg should name the bad token: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_recipients_accepts_exactly_at_cap() {
+        // Boundary: exactly MAX is allowed, MAX+1 is the rejection threshold
+        // (already covered by test_validate_recipients_rejects_over_cap).
+        let exactly: Vec<String> = (0..MAX_RECIPIENTS_PER_SUBSCRIPTION)
+            .map(|i| format!("u{}@x.com", i))
+            .collect();
+        validate_recipients(&exactly).expect("exactly cap-many must pass");
+    }
+
+    #[test]
+    fn test_validate_recipients_accepts_single() {
+        validate_recipients(&["sole@example.com".to_string()]).expect("single recipient must pass");
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_whitespace_only() {
+        let err = validate_recipients(&["   ".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_no_at_sign() {
+        let err = validate_recipients(&["plain-no-at".to_string()]).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("plain-no-at")),
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_recipients_first_bad_in_batch_short_circuits() {
+        // The validator iterates in order and bails on the first bad
+        // entry. A batch with [good, bad, good] must error with the
+        // BAD entry's message, not the trailing good entry.
+        let err = validate_recipients(&[
+            "first@good.com".to_string(),
+            "no-at-here".to_string(),
+            "third@good.com".to_string(),
+        ])
+        .unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("no-at-here")),
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_default_enabled_returns_true() {
+        // The serde `default = "default_enabled"` plumbing is exercised
+        // by test_create_request_enabled_defaults_to_true, but pin the
+        // raw default value too in case the wiring is ever changed.
+        assert!(default_enabled());
+    }
+
+    #[test]
+    fn test_router_builds_without_panic() {
+        // Smoke: the router constructor itself has no behaviour beyond
+        // wiring routes, but exercising it covers the route-table
+        // construction lines. Axum's Router doesn't expose route
+        // introspection without consuming so this is just construction.
+        let _r = router();
+    }
+
+    #[test]
+    fn test_email_subscription_row_construction_round_trip() {
+        // The FromRow struct itself is not a free function but its
+        // field ordering is part of the SQL contract. Construct,
+        // convert, and verify shape.
+        let now = Utc::now();
+        let row = EmailSubscriptionRow {
+            id: Uuid::nil(),
+            repository_id: None,
+            recipients: vec![],
+            event_types: vec![],
+            enabled: false,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(!row.enabled);
+        let r: EmailSubscriptionResponse = row.into();
+        assert_eq!(r.created_at, now);
+        assert_eq!(r.updated_at, now);
+    }
 }
