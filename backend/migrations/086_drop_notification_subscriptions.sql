@@ -1,0 +1,21 @@
+-- Drop the deprecated notification_subscriptions table (artifact-keeper#920).
+--
+-- This table backed "System B", the original notification subscriptions
+-- introduced in migration 078. The v1.1.9 release shipped the dedicated
+-- webhook system (System A, the `webhooks` + `webhook_deliveries` tables),
+-- migrated webhook-channel rows over via migration 081, and seeded the
+-- dedicated email_subscriptions table from email-channel rows via
+-- migration 082. The notifications API and the notification_dispatcher
+-- service stayed live through v1.1.x with RFC 8594 deprecation headers
+-- and a fixed 2026-08-01 sunset date so customers had a full release cycle
+-- to migrate.
+--
+-- v1.2.0 closes the deprecation window. The Rust code that reads from this
+-- table is removed in the same commit; once both land, this DROP is safe.
+--
+-- Idempotency: DROP TABLE IF EXISTS so re-running the migration on a fresh
+-- DB (which has no notification_subscriptions) is a no-op. The associated
+-- indexes (idx_notification_subs_repo, idx_notification_subs_enabled) drop
+-- with the table.
+
+DROP TABLE IF EXISTS notification_subscriptions;

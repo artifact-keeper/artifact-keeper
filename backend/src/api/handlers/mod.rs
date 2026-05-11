@@ -123,7 +123,6 @@ pub mod lifecycle;
 pub mod maven;
 pub mod migration;
 pub mod monitoring;
-pub mod notifications;
 pub mod npm;
 pub mod nuget;
 pub mod oci_v2;

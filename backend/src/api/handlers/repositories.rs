@@ -247,8 +247,6 @@ pub fn router() -> Router<SharedState> {
         .merge(super::repository_labels::repo_labels_router())
         // Token management routes nested under repository
         .merge(super::repo_tokens::repo_tokens_router())
-        // Notification subscription routes nested under repository
-        .merge(super::notifications::repo_notifications_router())
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]

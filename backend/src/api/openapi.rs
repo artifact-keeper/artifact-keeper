@@ -51,7 +51,6 @@ use utoipa::{Modify, OpenApi};
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
         (name = "system", description = "Public system configuration"),
-        (name = "notifications", description = "Repository notification subscriptions"),
     ),
     components(schemas(ErrorResponse))
 )]
@@ -137,7 +136,6 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::system_config::SystemConfigApiDoc::openapi());
     doc.merge(super::handlers::repo_tokens::RepoTokensApiDoc::openapi());
     doc.merge(super::handlers::smtp::SmtpApiDoc::openapi());
-    doc.merge(super::handlers::notifications::NotificationsApiDoc::openapi());
 
     doc
 }
@@ -397,7 +395,6 @@ mod tests {
                     include_str!("handlers/repository_labels.rs"),
                     include_str!("handlers/security.rs"),
                     include_str!("handlers/repo_tokens.rs"),
-                    include_str!("handlers/notifications.rs"),
                 ],
             ),
             (
