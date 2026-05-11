@@ -7774,4 +7774,166 @@ mod tests {
         let out = ScanOutput::default();
         assert!(out.is_empty());
     }
+
+    /// `convert_trivy_packages` extracts PURLs via the optional
+    /// `Identifier.PURL` nested field. The other tests do not populate
+    /// `identifier`, so the extraction code path remains uncovered
+    /// without this test. Verify both the happy-path extraction AND the
+    /// "identifier present but PURL empty" branch (must yield None,
+    /// not Some("")).
+    #[test]
+    fn test_convert_trivy_packages_extracts_purl_from_identifier() {
+        use crate::services::image_scanner::{
+            TrivyPackage, TrivyPackageIdentifier, TrivyReport, TrivyResult,
+        };
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    TrivyPackage {
+                        name: "lodash".to_string(),
+                        version: "4.17.21".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            purl: Some("pkg:npm/lodash@4.17.21".to_string()),
+                        }),
+                    },
+                    TrivyPackage {
+                        // identifier present, but PURL empty — must collapse
+                        // to None on persistence so downstream consumers
+                        // don't see a vacuous Some("").
+                        name: "express".to_string(),
+                        version: "4.18.2".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier {
+                            purl: Some(String::new()),
+                        }),
+                    },
+                    TrivyPackage {
+                        // identifier present, PURL None — yields None.
+                        name: "body-parser".to_string(),
+                        version: "1.20.1".to_string(),
+                        licenses: None,
+                        identifier: Some(TrivyPackageIdentifier { purl: None }),
+                    },
+                ]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 3);
+
+        let lodash = pkgs.iter().find(|p| p.name == "lodash").unwrap();
+        assert_eq!(lodash.purl.as_deref(), Some("pkg:npm/lodash@4.17.21"));
+
+        let express = pkgs.iter().find(|p| p.name == "express").unwrap();
+        assert!(
+            express.purl.is_none(),
+            "empty PURL string must collapse to None"
+        );
+
+        let bp = pkgs.iter().find(|p| p.name == "body-parser").unwrap();
+        assert!(
+            bp.purl.is_none(),
+            "identifier with PURL=None must stay None"
+        );
+    }
+
+    /// Packages with empty `name` strings must be filtered out at conversion
+    /// time, not left to the DB-side data-quality filter in `build_dep`.
+    /// Scanners occasionally emit blank-name entries for failed-resolution
+    /// fixtures (e.g. unparseable line in a requirements.txt); persisting
+    /// them would pollute the SBOM and cause downstream tooling crashes.
+    #[test]
+    fn test_convert_trivy_packages_skips_empty_name_packages() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "requirements.txt".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "pip".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    TrivyPackage {
+                        name: "".to_string(),
+                        version: "1.0".to_string(),
+                        licenses: None,
+                        identifier: None,
+                    },
+                    TrivyPackage {
+                        name: "requests".to_string(),
+                        version: "2.31.0".to_string(),
+                        licenses: None,
+                        identifier: None,
+                    },
+                ]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 1, "empty-name entry must be filtered");
+        assert_eq!(pkgs[0].name, "requests");
+    }
+
+    /// Version-empty handling: Trivy occasionally reports a package with
+    /// `Version: ""` (e.g. C runtime libraries it could not pin). The
+    /// inventory persistence layer maps that to `None` so the unique
+    /// index `(scan_result_id, name, COALESCE(version, ''))` collapses
+    /// duplicates correctly.
+    #[test]
+    fn test_convert_trivy_packages_empty_version_becomes_none() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "OS".to_string(),
+                class: "os-pkgs".to_string(),
+                result_type: "alpine".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![TrivyPackage {
+                    name: "musl".to_string(),
+                    version: "".to_string(),
+                    licenses: None,
+                    identifier: None,
+                }]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 1);
+        assert!(
+            pkgs[0].version.is_none(),
+            "empty Version string must collapse to None for index correctness"
+        );
+    }
+
+    /// Empty `Target` string on the Trivy result must yield
+    /// `source_target = None` rather than `Some("")`. Source target is
+    /// surfaced into the SBOM as a hint about *where* the package was
+    /// found (e.g. "package-lock.json") and an empty hint is worse than
+    /// no hint at all.
+    #[test]
+    fn test_convert_trivy_packages_empty_target_becomes_none() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "".to_string(),
+                class: "".to_string(),
+                result_type: "".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![TrivyPackage {
+                    name: "anonymous".to_string(),
+                    version: "1.0".to_string(),
+                    licenses: None,
+                    identifier: None,
+                }]),
+            }],
+        };
+        let pkgs = convert_trivy_packages(&report);
+        assert_eq!(pkgs.len(), 1);
+        assert!(pkgs[0].source_target.is_none());
+    }
 }
