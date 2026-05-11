@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +13,18 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+
+/// Result of a streaming put operation. Returned by [`StorageBackend::put_stream`]
+/// / [`StorageService::put_stream`] so callers can verify the bytes-written count
+/// and the SHA-256 the storage layer observed (used by proxy caching to set the
+/// cache metadata sidecar without buffering the full body first; #895).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutStreamResult {
+    /// Hex-encoded SHA-256 over the streamed bytes.
+    pub checksum_sha256: String,
+    /// Total number of bytes the stream produced.
+    pub bytes_written: u64,
+}
 
 /// Storage backend trait
 #[async_trait]
@@ -36,6 +49,49 @@ pub trait StorageBackend: Send + Sync {
 
     /// Get content size without fetching full content
     async fn size(&self, key: &str) -> Result<u64>;
+
+    /// Retrieve content as a byte stream instead of buffering the full
+    /// object in memory. Default implementation wraps `get()` in a
+    /// single-item stream; backends should override to actually stream
+    /// from the underlying store (filesystem `read_buf` loop, S3 ranged
+    /// GET, etc.). Used by the proxy cache fast path to serve large
+    /// cached artifacts without OOM on 1 GiB-limited pods (#895 / #737).
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let content = self.get(key).await?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(content) })))
+    }
+
+    /// Store content from a byte stream and return the observed SHA-256
+    /// plus byte count. Default implementation buffers into memory and
+    /// delegates to `put()`; backends should override to actually stream
+    /// into the underlying store. Used by the proxy cache slow path to
+    /// tee an upstream response simultaneously to client + storage
+    /// without buffering the full body (#895 / #737).
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        use futures::StreamExt;
+
+        let mut hasher = Sha256::new();
+        let mut buf = Vec::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+            buf.extend_from_slice(&chunk);
+        }
+
+        self.put(key, Bytes::from(buf)).await?;
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
+    }
 }
 
 /// Filesystem storage backend
@@ -159,6 +215,97 @@ impl StorageBackend for FilesystemBackend {
         })?;
         Ok(metadata.len())
     }
+
+    /// Stream file contents in 64 KiB chunks instead of buffering the whole
+    /// file into memory. Used by the proxy cache fast path on large
+    /// artifacts (`.deb`, container blobs) so a 1 GiB pod can serve
+    /// 800 MiB cached objects without OOM (#895).
+    async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        use tokio::io::AsyncReadExt;
+
+        let path = self.key_to_path(key);
+        let file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(e.to_string())
+            }
+        })?;
+
+        // 64 KiB matches the page-aligned chunk size most HTTP clients
+        // and S3 SDKs use on the read side; tuning higher risks doubling
+        // the working set when many concurrent streams are in flight,
+        // tuning lower defeats kernel readahead.
+        const CHUNK: usize = 64 * 1024;
+        let stream = async_stream::try_stream! {
+            let mut file = file;
+            loop {
+                let mut buf = vec![0u8; CHUNK];
+                let n = file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| AppError::Storage(format!("filesystem stream read: {}", e)))?;
+                if n == 0 {
+                    break;
+                }
+                buf.truncate(n);
+                yield Bytes::from(buf);
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    /// Write a stream to the filesystem atomically via a temp file +
+    /// rename, hashing chunks as they arrive. Used by the proxy cache
+    /// slow path so an upstream response can be tee'd to the client
+    /// AND to the local cache without buffering the full body (#895).
+    async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        use futures::StreamExt;
+
+        let path = self.key_to_path(key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let temp_path = path.with_extension("tmp");
+        let mut file = fs::File::create(&temp_path).await?;
+
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+
+        tokio::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    // Best-effort temp-file cleanup. If the rename has not
+                    // happened the partial bytes never reach the final
+                    // path; we just drop the tmp file. Ignore the cleanup
+                    // result since the original stream error is the one
+                    // the caller cares about.
+                    let _ = fs::remove_file(&temp_path).await;
+                    return Err(e);
+                }
+            };
+            hasher.update(&chunk);
+            total += chunk.len() as u64;
+            if let Err(e) = file.write_all(&chunk).await {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(AppError::Storage(format!("filesystem stream write: {}", e)));
+            }
+        }
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&temp_path, &path).await?;
+
+        Ok(PutStreamResult {
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            bytes_written: total,
+        })
+    }
 }
 
 /// Generate a StorageBackend wrapper that delegates to an inner backend.
@@ -189,6 +336,26 @@ macro_rules! impl_storage_wrapper {
             }
             async fn size(&self, key: &str) -> Result<u64> {
                 self.inner.size(key).await
+            }
+            // Streaming methods (#895): forward to the inner backend's
+            // streaming impls so we pick up S3 ranged GETs, GCS chunked
+            // reads, etc., without buffering through this wrapper.
+            async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+                crate::storage::StorageBackend::get_stream(&self.inner, key).await
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: BoxStream<'static, Result<Bytes>>,
+            ) -> Result<PutStreamResult> {
+                let inner_result =
+                    crate::storage::StorageBackend::put_stream(&self.inner, key, stream).await?;
+                // The two PutStreamResult types are structurally identical
+                // (sha256 hex + byte count); translate at the boundary.
+                Ok(PutStreamResult {
+                    checksum_sha256: inner_result.checksum_sha256,
+                    bytes_written: inner_result.bytes_written,
+                })
             }
         }
     };
@@ -341,6 +508,24 @@ impl StorageService {
     /// Copy content
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         self.backend.copy(source, dest).await
+    }
+
+    /// Stream content out instead of buffering the full body. Used by
+    /// proxy cache fast-path serves of large artifacts (#895).
+    pub async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
+        self.backend.get_stream(key).await
+    }
+
+    /// Write a stream into the backend, returning the SHA-256 and byte count
+    /// observed without buffering the body. Used by the proxy cache slow
+    /// path to tee an upstream response simultaneously to the client and
+    /// to the local cache (#895).
+    pub async fn put_stream(
+        &self,
+        key: &str,
+        stream: BoxStream<'static, Result<Bytes>>,
+    ) -> Result<PutStreamResult> {
+        self.backend.put_stream(key, stream).await
     }
 
     /// Get content size
