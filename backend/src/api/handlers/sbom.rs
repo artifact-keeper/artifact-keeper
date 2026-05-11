@@ -353,8 +353,7 @@ async fn list_sboms(
         // repo. Force the caller to be explicit about the repo scope.
         if auth.is_api_token && auth.allowed_repo_ids.is_some() {
             return Err(AppError::Validation(
-                "Scope-restricted tokens must filter by repository_id or artifact_id"
-                    .into(),
+                "Scope-restricted tokens must filter by repository_id or artifact_id".into(),
             ));
         }
         // List all SBOMs (with optional filters)
@@ -958,13 +957,12 @@ async fn ensure_artifact_repo_access(
     auth: &AuthExtension,
     artifact_id: Uuid,
 ) -> Result<()> {
-    let repo_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT repository_id FROM artifacts WHERE id = $1 AND NOT is_deleted",
-    )
-    .bind(artifact_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let repo_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1 AND NOT is_deleted")
+            .bind(artifact_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
     let repo_id = repo_id.ok_or_else(|| AppError::NotFound("Artifact not found".into()))?;
     if !auth.can_access_repo(repo_id) {
@@ -980,13 +978,12 @@ async fn ensure_sbom_repo_access(
     auth: &AuthExtension,
     sbom_id: Uuid,
 ) -> Result<()> {
-    let repo_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT repository_id FROM sbom_documents WHERE id = $1",
-    )
-    .bind(sbom_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    let repo_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT repository_id FROM sbom_documents WHERE id = $1")
+            .bind(sbom_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
     let repo_id = repo_id.ok_or_else(|| AppError::NotFound("SBOM not found".into()))?;
     if !auth.can_access_repo(repo_id) {
