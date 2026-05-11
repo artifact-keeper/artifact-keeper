@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
-    DashboardSummary, Grade, RawFinding, RepoSecurityScore, ScanFinding, ScanResult, Severity,
+    DashboardSummary, Grade, RawFinding, RawPackage, RepoSecurityScore, ScanFinding, ScanResult,
+    Severity,
 };
 
 // ---------------------------------------------------------------------------
@@ -593,6 +594,47 @@ impl ScanResultService {
     // -----------------------------------------------------------------------
     // Findings
     // -----------------------------------------------------------------------
+
+    /// Batch insert the full package inventory for a completed scan (#903).
+    /// Each row is one package the scanner saw — vulnerable or not — so the
+    /// SBOM read path can return the complete dep tree.
+    ///
+    /// The `(scan_result_id, name, COALESCE(version, ''))` unique index
+    /// catches the case where a scanner emits the same package twice within
+    /// a single report (e.g. Trivy listing a Maven artifact both in its
+    /// standalone Packages block and inline on a vulnerability row). The
+    /// duplicate is silently skipped via `ON CONFLICT DO NOTHING` rather
+    /// than aborting the whole insert; one rogue duplicate must not lose
+    /// the rest of the inventory.
+    pub async fn create_packages(
+        &self,
+        scan_result_id: Uuid,
+        artifact_id: Uuid,
+        packages: &[RawPackage],
+    ) -> Result<()> {
+        for pkg in packages {
+            sqlx::query!(
+                r#"
+                INSERT INTO scan_packages (scan_result_id, artifact_id, name,
+                    version, purl, license, source_target)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (scan_result_id, name, COALESCE(version, ''))
+                    DO NOTHING
+                "#,
+                scan_result_id,
+                artifact_id,
+                pkg.name,
+                pkg.version,
+                pkg.purl,
+                pkg.license,
+                pkg.source_target,
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
 
     /// Batch insert findings for a completed scan.
     pub async fn create_findings(

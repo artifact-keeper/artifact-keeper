@@ -10,11 +10,9 @@ use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
-    VersionCache,
+    cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
@@ -80,6 +78,11 @@ impl TrivyFsScanner {
             "json",
             "--severity",
             "CRITICAL,HIGH,MEDIUM,LOW",
+            // #903: enumerate every package the scanner saw (not just
+            // CVE-bearing rows) so SBOM generation reflects the complete
+            // dependency tree. `convert_trivy_packages` reads from the
+            // `Packages` block this flag adds to the JSON report.
+            "--list-all-pkgs",
             "--quiet",
             "--timeout",
             "5m",
@@ -138,9 +141,9 @@ impl Scanner for TrivyFsScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         if !Self::is_applicable(artifact) {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         info!(
@@ -175,17 +178,18 @@ impl Scanner for TrivyFsScanner {
             }
         };
 
-        let findings = convert_trivy_findings(&report, "trivy-filesystem");
+        let output = ScanOutput::from_trivy_report(&report, "trivy-filesystem");
 
         info!(
-            "Trivy filesystem scan complete for {}: {} vulnerabilities found",
+            "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages",
             artifact.name,
-            findings.len()
+            output.findings.len(),
+            output.packages.len()
         );
 
         ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
 
-        Ok(findings)
+        Ok(output)
     }
 }
 
@@ -193,6 +197,7 @@ impl Scanner for TrivyFsScanner {
 mod tests {
     use super::*;
     use crate::models::security::Severity;
+    use crate::services::scanner_service::convert_trivy_findings;
     use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
     #[test]
@@ -269,6 +274,7 @@ mod tests {
                     description: Some("A vulnerability in requests allows SSRF".to_string()),
                     primary_url: Some("https://avd.aquasec.com/nvd/cve-2023-12345".to_string()),
                 }]),
+                packages: None,
             }],
         };
 

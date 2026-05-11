@@ -16,7 +16,8 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanWorkspace, Scanner, VersionCache,
+    cached_cli_version, fail_scan, sanitize_artifact_filename, ScanOutput, ScanWorkspace, Scanner,
+    VersionCache,
 };
 
 /// Response shape from the OpenSCAP wrapper sidecar's `/health` endpoint.
@@ -241,9 +242,9 @@ impl Scanner for OpenScapScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         if !Self::is_applicable(artifact) {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         info!(
@@ -281,7 +282,9 @@ impl Scanner for OpenScapScanner {
 
         ScanWorkspace::cleanup(&self.scan_workspace, Some("openscap"), artifact).await;
 
-        Ok(findings)
+        // OpenSCAP is a compliance scanner, not an inventory enumerator;
+        // packages list intentionally empty.
+        Ok(ScanOutput::findings_only(findings))
     }
 }
 

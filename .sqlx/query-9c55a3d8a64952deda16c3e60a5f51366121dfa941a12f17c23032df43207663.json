@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO scan_packages (scan_result_id, artifact_id, name,\n                    version, purl, license, source_target)\n                VALUES ($1, $2, $3, $4, $5, $6, $7)\n                ON CONFLICT (scan_result_id, name, COALESCE(version, ''))\n                    DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c55a3d8a64952deda16c3e60a5f51366121dfa941a12f17c23032df43207663"
+}

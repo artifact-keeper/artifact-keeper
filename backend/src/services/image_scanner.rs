@@ -5,8 +5,14 @@ use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
-use crate::services::scanner_service::{cached_trivy_cli_version, Scanner, VersionCache};
+use crate::services::scanner_service::{
+    cached_trivy_cli_version, ScanOutput, Scanner, VersionCache,
+};
+
+#[cfg(test)]
+use crate::models::security::RawFinding;
+#[cfg(test)]
+use crate::services::scanner_service::convert_trivy_findings;
 
 // Trivy JSON report structures
 #[derive(Debug, Deserialize)]
@@ -25,6 +31,12 @@ pub struct TrivyResult {
     pub result_type: String,
     #[serde(rename = "Vulnerabilities", default)]
     pub vulnerabilities: Option<Vec<TrivyVulnerability>>,
+    /// Populated when Trivy is invoked with `--list-all-pkgs`. Lists every
+    /// package the scanner enumerated for this target, including ones with
+    /// no known vulnerabilities, so SBOM generation (#903) can reflect the
+    /// full dependency tree rather than only the CVE-bearing subset.
+    #[serde(rename = "Packages", default)]
+    pub packages: Option<Vec<TrivyPackage>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +57,31 @@ pub struct TrivyVulnerability {
     pub description: Option<String>,
     #[serde(rename = "PrimaryURL")]
     pub primary_url: Option<String>,
+}
+
+/// A package entry from a Trivy `Packages` block. Only fields used by
+/// inventory persistence are deserialized; everything else (DependsOn,
+/// SrcVersion, Layer, etc.) is dropped silently via the default
+/// `deny_unknown_fields` policy being absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrivyPackage {
+    #[serde(rename = "Name", default)]
+    pub name: String,
+    #[serde(rename = "Version", default)]
+    pub version: String,
+    /// Trivy emits `Licenses` as an array of strings. Multi-license packages
+    /// produce multiple entries; persistence joins them with `" OR "` per
+    /// CycloneDX convention.
+    #[serde(rename = "Licenses", default)]
+    pub licenses: Option<Vec<String>>,
+    #[serde(rename = "Identifier", default)]
+    pub identifier: Option<TrivyPackageIdentifier>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrivyPackageIdentifier {
+    #[serde(rename = "PURL", default)]
+    pub purl: Option<String>,
 }
 
 /// Container image scanner that delegates to a Trivy server instance.
@@ -180,6 +217,10 @@ impl ImageScanner {
                 &self.trivy_url,
                 "--format",
                 "json",
+                // #903: enumerate the full package inventory, not just
+                // CVE-bearing rows. Adds the `Packages` block to the
+                // JSON report which `convert_trivy_packages` consumes.
+                "--list-all-pkgs",
                 "--quiet",
                 "--timeout",
                 "5m",
@@ -243,36 +284,14 @@ impl ImageScanner {
             .map_err(|e| AppError::Internal(format!("Failed to parse Trivy response: {}", e)))
     }
 
-    /// Convert Trivy vulnerabilities to RawFindings.
-    fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
-        let mut findings = Vec::new();
-
-        for result in &report.results {
-            if let Some(ref vulns) = result.vulnerabilities {
-                for vuln in vulns {
-                    let severity =
-                        Severity::from_str_loose(&vuln.severity).unwrap_or(Severity::Info);
-
-                    let title = vuln.title.clone().unwrap_or_else(|| {
-                        format!("{} in {}", vuln.vulnerability_id, vuln.pkg_name)
-                    });
-
-                    findings.push(RawFinding {
-                        severity,
-                        title,
-                        description: vuln.description.clone(),
-                        cve_id: Some(vuln.vulnerability_id.clone()),
-                        affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
-                        affected_version: Some(vuln.installed_version.clone()),
-                        fixed_version: vuln.fixed_version.clone(),
-                        source: Some("trivy".to_string()),
-                        source_url: vuln.primary_url.clone(),
-                    });
-                }
-            }
-        }
-
-        findings
+    /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
+    /// around the shared [`convert_trivy_findings`] helper so the existing
+    /// tests can call `ImageScanner::convert_findings(report)` as before.
+    /// Production code uses `ScanOutput::from_trivy_report` instead, which
+    /// also extracts the package inventory (#903).
+    #[cfg(test)]
+    pub(crate) fn convert_findings(report: &TrivyReport) -> Vec<RawFinding> {
+        convert_trivy_findings(report, "trivy")
     }
 }
 
@@ -298,10 +317,10 @@ impl Scanner for ImageScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         _content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         // Only scan OCI/Docker image manifests
         if !Self::is_container_image(artifact) {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         let image_ref = match Self::extract_image_ref(artifact) {
@@ -311,7 +330,7 @@ impl Scanner for ImageScanner {
                     "Could not extract image reference from artifact path: {}",
                     artifact.path
                 );
-                return Ok(vec![]);
+                return Ok(ScanOutput::default());
             }
         };
 
@@ -329,21 +348,23 @@ impl Scanner for ImageScanner {
         info!("Starting Trivy scan for image: {}", image_ref);
 
         let report = self.scan_with_trivy(&image_ref).await?;
-        let findings = Self::convert_findings(&report);
+        let output = ScanOutput::from_trivy_report(&report, "trivy-image");
 
         info!(
-            "Trivy scan complete for {}: {} vulnerabilities found",
+            "Trivy scan complete for {}: {} vulnerabilities, {} packages",
             image_ref,
-            findings.len()
+            output.findings.len(),
+            output.packages.len()
         );
 
-        Ok(findings)
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::security::Severity;
 
     /// Build an Artifact fixture for scanner tests. Most fields are not
     /// load-bearing for the scanner — the scanner only branches on `path`
@@ -442,6 +463,7 @@ mod tests {
                         primary_url: None,
                     },
                 ]),
+                packages: None,
             }],
         };
 
@@ -472,6 +494,7 @@ mod tests {
                 class: "os-pkgs".to_string(),
                 result_type: "alpine".to_string(),
                 vulnerabilities: None,
+                packages: None,
             }],
         };
 

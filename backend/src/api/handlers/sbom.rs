@@ -776,12 +776,71 @@ async fn check_license_compliance(
 
 // === Helpers ===
 
-/// Extract dependencies from scan results to populate SBOM.
+/// Extract dependencies for SBOM generation.
+///
+/// Read-path order (#903):
+///
+/// 1. **`scan_packages`** — canonical inventory written by scanners invoked
+///    with `--list-all-pkgs`. Every package the scanner saw, regardless of
+///    CVE status. Source of truth post-#903.
+/// 2. **`scan_findings`** — legacy fallback for artifacts scanned before
+///    the inventory table existed, or by scanners that do not enumerate
+///    packages (Grype, OpenSCAP, custom WASM plugins). Returns only
+///    CVE-bearing components — exactly the bug #903 fixes for new scans,
+///    but the best we can do for legacy data.
+///
+/// The fallback only fires when scan_packages is genuinely empty for the
+/// artifact, not when it contains rows the caller finds incomplete. This
+/// avoids "best-of-both" merging that would re-introduce duplicate entries.
 async fn extract_dependencies_for_artifact(
     db: &sqlx::PgPool,
     artifact_id: Uuid,
 ) -> Result<Vec<DependencyInfo>> {
-    // Try to get findings from the latest scan
+    // Primary path: the inventory table.
+    // Row tuple: (name, version, purl, license). Kept as a tuple rather
+    // than a derived row struct so the sqlx::query_as call needs no
+    // additional FromRow plumbing — the SBOM read path is the only consumer.
+    #[allow(clippy::type_complexity)]
+    let packages: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT
+            sp.name,
+            sp.version,
+            sp.purl,
+            sp.license
+        FROM scan_packages sp
+        WHERE sp.artifact_id = $1
+        ORDER BY sp.name
+        LIMIT 5000
+        "#,
+    )
+    .bind(artifact_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    if !packages.is_empty() {
+        return Ok(packages
+            .into_iter()
+            .filter_map(|(name, version, purl, license)| {
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(DependencyInfo {
+                        name,
+                        version,
+                        purl,
+                        license,
+                        sha256: None,
+                    })
+                }
+            })
+            .collect());
+    }
+
+    // Legacy fallback: derive a component list from scan_findings. This is
+    // the pre-#903 vulnerability-only shape; preferable to returning empty
+    // for artifacts scanned before the inventory table existed.
     let findings: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
         SELECT DISTINCT

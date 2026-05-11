@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::{RawFinding, Severity};
+use crate::models::security::{RawFinding, RawPackage, Severity};
 use crate::services::grype_scanner::GrypeScanner;
 use crate::services::image_scanner::ImageScanner;
 use crate::services::scan_config_service::ScanConfigService;
@@ -360,6 +360,12 @@ pub(crate) async fn fail_scan(
 /// Convert a Trivy report into `RawFinding` values. Shared by all scanners
 /// that consume Trivy JSON output (trivy_fs_scanner, incus_scanner,
 /// image_scanner).
+///
+/// `affected_component` holds the bare package name. The scanner-internal
+/// target (e.g. `"package-lock.json"`) used to be appended in parentheses,
+/// but consumers (SBOM, CVE-mapping lookup, UI) need the raw name to do
+/// cross-source joins — see #903. Callers that still need the target string
+/// can read it from the parallel `RawPackage` row's `source_target` field.
 pub(crate) fn convert_trivy_findings(
     report: &crate::services::image_scanner::TrivyReport,
     source_label: &str,
@@ -380,7 +386,8 @@ pub(crate) fn convert_trivy_findings(
                     }),
                     description: vuln.description.clone(),
                     cve_id: Some(vuln.vulnerability_id.clone()),
-                    affected_component: Some(format!("{} ({})", vuln.pkg_name, result.target)),
+                    // Bare package name; target moves to RawPackage.source_target.
+                    affected_component: Some(vuln.pkg_name.clone()),
                     affected_version: Some(vuln.installed_version.clone()),
                     fixed_version: vuln.fixed_version.clone(),
                     source: Some(source_label.to_string()),
@@ -388,6 +395,113 @@ pub(crate) fn convert_trivy_findings(
                 })
         })
         .collect()
+}
+
+/// Convert a Trivy report's `Packages` blocks into [`RawPackage`] values.
+/// Produces one row per (target, package, version) triple. Trivy emits both
+/// a standalone `Packages` block and inline `PkgName`/`InstalledVersion` on
+/// each vulnerability row; this function ignores the vulnerability-inline
+/// shape entirely and reads only the canonical `Packages` block.
+///
+/// De-duplication within a single scan is handled by the database's
+/// `scan_packages_unique_per_scan` index — callers do not need to pre-dedup.
+///
+/// Returns an empty Vec when no Trivy result carries a `Packages` block
+/// (i.e. the scanner was invoked without `--list-all-pkgs`); legacy reports
+/// degrade gracefully to "no inventory data" rather than producing
+/// findings-derived stand-ins, which would silently re-introduce the #903
+/// vulnerability-shaped-SBOM bug.
+pub(crate) fn convert_trivy_packages(
+    report: &crate::services::image_scanner::TrivyReport,
+) -> Vec<RawPackage> {
+    report
+        .results
+        .iter()
+        .flat_map(|result| {
+            result
+                .packages
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter(|p| !p.name.is_empty())
+                .map(move |pkg| RawPackage {
+                    name: pkg.name.clone(),
+                    version: if pkg.version.is_empty() {
+                        None
+                    } else {
+                        Some(pkg.version.clone())
+                    },
+                    purl: pkg
+                        .identifier
+                        .as_ref()
+                        .and_then(|id| id.purl.clone())
+                        .filter(|s| !s.is_empty()),
+                    // Trivy may emit multiple license strings per package
+                    // (e.g. `["MIT", "Apache-2.0"]`). Join with " OR " per
+                    // CycloneDX convention; an empty list becomes None.
+                    license: pkg.licenses.as_ref().and_then(|ls| {
+                        let joined = ls
+                            .iter()
+                            .filter(|s| !s.is_empty())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" OR ");
+                        if joined.is_empty() {
+                            None
+                        } else {
+                            Some(joined)
+                        }
+                    }),
+                    source_target: if result.target.is_empty() {
+                        None
+                    } else {
+                        Some(result.target.clone())
+                    },
+                })
+        })
+        .collect()
+}
+
+/// Output of a single scanner run: vulnerability findings AND a package
+/// inventory (#903). Scanners that only produce findings (OpenSCAP, custom
+/// WASM plugins) construct a [`ScanOutput`] with an empty `packages` Vec
+/// via [`ScanOutput::findings_only`]; scanners that enumerate packages
+/// (Trivy, Grype if extended) populate both.
+#[derive(Debug, Default)]
+pub struct ScanOutput {
+    pub findings: Vec<RawFinding>,
+    pub packages: Vec<RawPackage>,
+}
+
+impl ScanOutput {
+    /// Convenience constructor for scanners that do not enumerate an
+    /// inventory. The package list is empty; SBOM generation will fall
+    /// back to scan_findings for legacy data.
+    pub fn findings_only(findings: Vec<RawFinding>) -> Self {
+        Self {
+            findings,
+            packages: Vec::new(),
+        }
+    }
+
+    /// Convenience constructor for the common Trivy path where both halves
+    /// of the report are converted via the shared helpers above.
+    pub fn from_trivy_report(
+        report: &crate::services::image_scanner::TrivyReport,
+        source_label: &str,
+    ) -> Self {
+        Self {
+            findings: convert_trivy_findings(report, source_label),
+            packages: convert_trivy_packages(report),
+        }
+    }
+
+    /// True when the scanner produced neither findings nor inventory rows.
+    /// Useful for test assertions and for the orchestrator's early-return
+    /// on non-applicable artifacts.
+    pub fn is_empty(&self) -> bool {
+        self.findings.is_empty() && self.packages.is_empty()
+    }
 }
 
 /// Extract a tar.gz archive into `target_dir` while guarding against tar-slip
@@ -446,13 +560,21 @@ pub trait Scanner: Send + Sync {
     /// The scan_type value stored in scan_results.
     fn scan_type(&self) -> &str;
 
-    /// Run the scan against artifact content and metadata.
+    /// Run the scan against artifact content and metadata. Returns both
+    /// vulnerability findings AND the full package inventory observed by
+    /// the scanner — the inventory drives SBOM generation (#903) and must
+    /// be enumerated regardless of whether any package is CVE-bearing.
+    ///
+    /// Scanners that do not enumerate packages (e.g. policy-only scanners
+    /// like OpenSCAP) return a [`ScanOutput`] with an empty `packages`
+    /// vector via [`ScanOutput::findings_only`]; SBOM generation falls
+    /// back to scan_findings for those legacy paths.
     async fn scan(
         &self,
         artifact: &Artifact,
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>>;
+    ) -> Result<ScanOutput>;
 
     /// Best-effort scanner-binary version string (e.g. `trivy-0.62.1`,
     /// `grype-0.83.0`). Persisted on `scan_results.scanner_version` so
@@ -1482,10 +1604,10 @@ impl Scanner for DependencyScanner {
         artifact: &Artifact,
         metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         let deps = Self::extract_dependencies(artifact, metadata, content);
         if deps.is_empty() {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         info!(
@@ -1493,6 +1615,22 @@ impl Scanner for DependencyScanner {
             deps.len(),
             artifact.id
         );
+
+        // The extracted dependency list is itself a package inventory — every
+        // declared dep belongs in the SBOM regardless of advisory hits
+        // (#903). Build the inventory snapshot up-front so that even if the
+        // advisory call hangs and we fall back to an empty findings list,
+        // SBOM consumers still see the full dep tree.
+        let packages: Vec<RawPackage> = deps
+            .iter()
+            .map(|d| RawPackage {
+                name: d.name.clone(),
+                version: d.version.clone().filter(|s| !s.is_empty()),
+                purl: None,
+                license: None,
+                source_target: Some("dependency-scanner".to_string()),
+            })
+            .collect();
 
         // Query both sources in parallel
         let (osv_results, gh_results) = tokio::join!(
@@ -1548,7 +1686,7 @@ impl Scanner for DependencyScanner {
             });
         }
 
-        Ok(findings)
+        Ok(ScanOutput { findings, packages })
     }
 }
 
@@ -1874,7 +2012,7 @@ impl ScannerService {
             // See issue #902.
             let started_at = chrono::Utc::now();
             match scanner.scan(&artifact, metadata.as_ref(), &content).await {
-                Ok(findings) => {
+                Ok(ScanOutput { findings, packages }) => {
                     let total = findings.len() as i32;
                     let count = |sev: Severity| -> i32 {
                         findings.iter().filter(|f| f.severity == sev).count() as i32
@@ -1896,6 +2034,28 @@ impl ScannerService {
                     self.scan_result_service
                         .create_findings(scan_result.id, artifact_id, &findings)
                         .await?;
+
+                    // Persist the package inventory (#903). Failures here
+                    // are logged but do not fail the scan: the inventory is
+                    // an enhancement layered on top of the findings path,
+                    // and a scanner that ran successfully should not be
+                    // marked as failed because a non-critical INSERT
+                    // tripped over a constraint. SBOM generation falls back
+                    // to scan_findings when the inventory is empty.
+                    if !packages.is_empty() {
+                        if let Err(e) = self
+                            .scan_result_service
+                            .create_packages(scan_result.id, artifact_id, &packages)
+                            .await
+                        {
+                            warn!(
+                                "Failed to persist scan_packages for scan {}: {}. \
+                                 Findings were persisted; SBOM generation will fall \
+                                 back to the findings-derived component list.",
+                                scan_result.id, e
+                            );
+                        }
+                    }
 
                     // Mark scan complete
                     self.scan_result_service
@@ -2418,7 +2578,7 @@ pub(crate) mod test_helpers {
 
     /// Assert that a scan result is an error containing the expected label.
     pub fn assert_scan_failed(
-        result: &crate::error::Result<Vec<crate::models::security::RawFinding>>,
+        result: &crate::error::Result<crate::services::scanner_service::ScanOutput>,
         expected_label: &str,
     ) {
         assert!(
@@ -2797,8 +2957,8 @@ mod tests {
                 _: &Artifact,
                 _: Option<&ArtifactMetadata>,
                 _: &Bytes,
-            ) -> Result<Vec<RawFinding>> {
-                Ok(vec![])
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
             }
         }
         let s = DummyScanner;
@@ -7406,5 +7566,212 @@ mod tests {
     fn test_checksum_log_prefix_exactly_eight_chars() {
         let cs = "12345678";
         assert_eq!(checksum_log_prefix(cs), "12345678");
+    }
+
+    // -----------------------------------------------------------------------
+    // SBOM inventory (issue #903): convert_trivy_packages + ScanOutput
+    // -----------------------------------------------------------------------
+
+    /// A Trivy report whose `Packages` block contains 5 packages but only
+    /// 1 vulnerability must yield 5 RawPackage rows and 1 RawFinding.
+    /// This is the regression-test for #903: pre-fix, the SBOM endpoint
+    /// produced an empty component list because it derived components
+    /// from scan_findings (which had only the CVE-bearing row).
+    #[test]
+    fn test_convert_trivy_packages_full_inventory_independent_of_findings() {
+        use crate::services::image_scanner::{
+            TrivyPackage, TrivyReport, TrivyResult, TrivyVulnerability,
+        };
+
+        let pkg = |name: &str, ver: &str| TrivyPackage {
+            name: name.to_string(),
+            version: ver.to_string(),
+            licenses: None,
+            identifier: None,
+        };
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "package-lock.json".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "npm".to_string(),
+                vulnerabilities: Some(vec![TrivyVulnerability {
+                    vulnerability_id: "CVE-2024-12345".to_string(),
+                    pkg_name: "body-parser".to_string(),
+                    installed_version: "1.20.1".to_string(),
+                    fixed_version: Some("1.20.2".to_string()),
+                    severity: "HIGH".to_string(),
+                    title: None,
+                    description: None,
+                    primary_url: None,
+                }]),
+                packages: Some(vec![
+                    pkg("express", "4.18.2"),
+                    pkg("body-parser", "1.20.1"),
+                    pkg("cookie-parser", "1.4.6"),
+                    pkg("debug", "2.6.9"),
+                    pkg("send", "0.18.0"),
+                ]),
+            }],
+        };
+
+        let output = ScanOutput::from_trivy_report(&report, "trivy-filesystem");
+
+        // 5 packages enumerated, regardless of CVE status — the #903 contract.
+        assert_eq!(
+            output.packages.len(),
+            5,
+            "#903: scan_packages must include every package the scanner saw, \
+             not just CVE-bearing rows. Counting 1 here would mean the SBOM \
+             endpoint is back to surfacing only the vulnerable subset."
+        );
+        // 1 finding for the 1 vulnerability — the existing contract.
+        assert_eq!(output.findings.len(), 1);
+
+        // Inventory carries source_target so SBOM consumers can bucket by
+        // ecosystem without re-parsing names.
+        let body_parser = output
+            .packages
+            .iter()
+            .find(|p| p.name == "body-parser")
+            .expect("body-parser must be in inventory");
+        assert_eq!(body_parser.version.as_deref(), Some("1.20.1"));
+        assert_eq!(
+            body_parser.source_target.as_deref(),
+            Some("package-lock.json")
+        );
+
+        // Finding name is bare (no parenthetical target) — the other half
+        // of the #903 fix.
+        assert_eq!(
+            output.findings[0].affected_component.as_deref(),
+            Some("body-parser"),
+            "post-#903, finding names must be bare so SBOM/CVE-lookup/UI \
+             can join across sources without stripping the (target) suffix"
+        );
+    }
+
+    /// Trivy emits `Licenses` as an array; multi-license packages must be
+    /// joined with " OR " per CycloneDX convention. Empty licenses must
+    /// not produce empty strings.
+    #[test]
+    fn test_convert_trivy_packages_license_join_and_empty_handling() {
+        use crate::services::image_scanner::{TrivyPackage, TrivyReport, TrivyResult};
+
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "pom.xml".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "maven".to_string(),
+                vulnerabilities: None,
+                packages: Some(vec![
+                    TrivyPackage {
+                        name: "log4j-core".to_string(),
+                        version: "2.17.1".to_string(),
+                        licenses: Some(vec!["Apache-2.0".to_string(), "MIT".to_string()]),
+                        identifier: None,
+                    },
+                    TrivyPackage {
+                        name: "no-license-pkg".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec![]),
+                        identifier: None,
+                    },
+                    TrivyPackage {
+                        name: "license-with-empty-string".to_string(),
+                        version: "1.0.0".to_string(),
+                        licenses: Some(vec!["".to_string(), "MIT".to_string()]),
+                        identifier: None,
+                    },
+                ]),
+            }],
+        };
+
+        let pkgs = convert_trivy_packages(&report);
+
+        let log4j = pkgs.iter().find(|p| p.name == "log4j-core").unwrap();
+        assert_eq!(log4j.license.as_deref(), Some("Apache-2.0 OR MIT"));
+
+        let no_lic = pkgs.iter().find(|p| p.name == "no-license-pkg").unwrap();
+        assert!(
+            no_lic.license.is_none(),
+            "empty license array must collapse to None, not Some(\"\")"
+        );
+
+        let mixed = pkgs
+            .iter()
+            .find(|p| p.name == "license-with-empty-string")
+            .unwrap();
+        assert_eq!(
+            mixed.license.as_deref(),
+            Some("MIT"),
+            "empty strings in license array must be filtered before joining"
+        );
+    }
+
+    /// A Trivy report with no `Packages` block at all (legacy Trivy or
+    /// the scanner was invoked without `--list-all-pkgs`) must yield an
+    /// empty inventory rather than synthesizing packages from the
+    /// vulnerability rows. Synthesizing would silently re-introduce the
+    /// #903 vulnerability-shaped-SBOM bug.
+    #[test]
+    fn test_convert_trivy_packages_no_block_returns_empty() {
+        use crate::services::image_scanner::{TrivyReport, TrivyResult, TrivyVulnerability};
+        let report = TrivyReport {
+            results: vec![TrivyResult {
+                target: "go.sum".to_string(),
+                class: "lang-pkgs".to_string(),
+                result_type: "gomod".to_string(),
+                vulnerabilities: Some(vec![TrivyVulnerability {
+                    vulnerability_id: "CVE-2024-00099".to_string(),
+                    pkg_name: "github.com/example/lib".to_string(),
+                    installed_version: "1.0.0".to_string(),
+                    fixed_version: None,
+                    severity: "LOW".to_string(),
+                    title: None,
+                    description: None,
+                    primary_url: None,
+                }]),
+                packages: None,
+            }],
+        };
+        let output = ScanOutput::from_trivy_report(&report, "trivy-filesystem");
+        assert!(
+            output.packages.is_empty(),
+            "no Packages block must yield empty inventory — falling back \
+             to findings-derived synthesis would mask the #903 bug"
+        );
+        assert_eq!(output.findings.len(), 1);
+    }
+
+    /// ScanOutput::findings_only is the right constructor for scanners
+    /// that don't enumerate inventory (OpenSCAP, Grype's default JSON
+    /// shape). It must yield an empty packages Vec and the supplied
+    /// findings unchanged.
+    #[test]
+    fn test_scan_output_findings_only_has_empty_packages() {
+        let findings = vec![RawFinding {
+            severity: Severity::Medium,
+            title: "x".to_string(),
+            description: None,
+            cve_id: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            source: None,
+            source_url: None,
+        }];
+        let out = ScanOutput::findings_only(findings);
+        assert_eq!(out.findings.len(), 1);
+        assert!(out.packages.is_empty());
+        assert!(!out.is_empty());
+    }
+
+    /// Default ScanOutput is empty on both axes; orchestrator uses this
+    /// for non-applicable artifacts.
+    #[test]
+    fn test_scan_output_default_is_empty() {
+        let out = ScanOutput::default();
+        assert!(out.is_empty());
     }
 }

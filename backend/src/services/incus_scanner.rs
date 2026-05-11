@@ -18,11 +18,9 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::formats::incus::{IncusFileType, IncusHandler};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
-    VersionCache,
+    cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
@@ -235,9 +233,16 @@ impl IncusScanner {
         run_trivy_scan(rootfs, None, "Trivy standalone Incus scan").await
     }
 
-    /// Convert Trivy report into RawFinding values.
-    fn convert_findings(report: &crate::services::image_scanner::TrivyReport) -> Vec<RawFinding> {
-        convert_trivy_findings(report, "trivy-incus")
+    /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
+    /// around the shared helper so the existing tests can keep calling
+    /// `IncusScanner::convert_findings(report)`. Production code paths use
+    /// `ScanOutput::from_trivy_report` which also extracts the package
+    /// inventory (#903).
+    #[cfg(test)]
+    pub(crate) fn convert_findings(
+        report: &crate::services::image_scanner::TrivyReport,
+    ) -> Vec<crate::models::security::RawFinding> {
+        crate::services::scanner_service::convert_trivy_findings(report, "trivy-incus")
     }
 }
 
@@ -264,13 +269,13 @@ impl Scanner for IncusScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         if !Self::is_applicable(artifact) {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         if content.is_empty() {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         info!(
@@ -317,17 +322,18 @@ impl Scanner for IncusScanner {
             }
         };
 
-        let findings = Self::convert_findings(&report);
+        let output = ScanOutput::from_trivy_report(&report, "trivy-incus");
 
         info!(
-            "Incus image scan complete for {}: {} vulnerabilities found",
+            "Incus image scan complete for {}: {} vulnerabilities, {} packages",
             artifact.name,
-            findings.len()
+            output.findings.len(),
+            output.packages.len()
         );
 
         self.cleanup_workspace(artifact).await;
 
-        Ok(findings)
+        Ok(output)
     }
 }
 
@@ -416,6 +422,7 @@ mod tests {
                         primary_url: None,
                     },
                 ]),
+                packages: None,
             }],
         };
 
@@ -622,6 +629,7 @@ mod tests {
                 class: "os-pkgs".to_string(),
                 result_type: "ubuntu".to_string(),
                 vulnerabilities: None,
+                packages: None,
             }],
         };
         let findings = IncusScanner::convert_findings(&report);
@@ -636,6 +644,7 @@ mod tests {
                 class: "lang-pkgs".to_string(),
                 result_type: "gomod".to_string(),
                 vulnerabilities: Some(vec![]),
+                packages: None,
             }],
         };
         let findings = IncusScanner::convert_findings(&report);
@@ -662,6 +671,7 @@ mod tests {
                             primary_url: None,
                         },
                     ]),
+                    packages: None,
                 },
                 crate::services::image_scanner::TrivyResult {
                     target: "go.sum".to_string(),
@@ -679,6 +689,7 @@ mod tests {
                             primary_url: None,
                         },
                     ]),
+                    packages: None,
                 },
             ],
         };
@@ -686,13 +697,14 @@ mod tests {
         let findings = IncusScanner::convert_findings(&report);
         assert_eq!(findings.len(), 2);
 
-        // First from os-pkgs result
+        // First from os-pkgs result.
+        // affected_component is the bare package name post-#903 — the
+        // `(target)` suffix was dropped because it broke cross-source
+        // joins (SBOM, CVE lookup, UI search). The target moves to
+        // RawPackage.source_target.
         assert_eq!(findings[0].severity, Severity::Critical);
         assert_eq!(findings[0].cve_id, Some("CVE-2024-00001".to_string()));
-        assert_eq!(
-            findings[0].affected_component,
-            Some("openssl (dpkg/status)".to_string())
-        );
+        assert_eq!(findings[0].affected_component, Some("openssl".to_string()));
         assert_eq!(findings[0].fixed_version, Some("1.0.1".to_string()));
 
         // Second from gomod result
@@ -703,7 +715,7 @@ mod tests {
         );
         assert_eq!(
             findings[1].affected_component,
-            Some("github.com/example/lib (go.sum)".to_string())
+            Some("github.com/example/lib".to_string())
         );
         assert!(findings[1].fixed_version.is_none());
         assert!(findings[1].description.is_none());
@@ -735,6 +747,7 @@ mod tests {
                     make_vuln("CVE-4", "LOW"),
                     make_vuln("CVE-5", "UNKNOWN"),
                 ]),
+                packages: None,
             }],
         };
 
@@ -765,6 +778,7 @@ mod tests {
                     description: Some("Heap overflow in musl libc".to_string()),
                     primary_url: Some("https://avd.aquasec.com/nvd/cve-2024-99999".to_string()),
                 }]),
+                packages: None,
             }],
         };
 
@@ -798,6 +812,7 @@ mod tests {
                     description: None,
                     primary_url: None,
                 }]),
+                packages: None,
             }],
         };
 
