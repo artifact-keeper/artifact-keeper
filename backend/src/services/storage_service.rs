@@ -1053,4 +1053,183 @@ mod tests {
         assert!(presigned.url.contains("test-key"));
         assert_eq!(presigned.source, PresignedUrlSource::S3);
     }
+
+    // -----------------------------------------------------------------------
+    // #895 streaming primitives — FilesystemBackend put_stream / get_stream
+    //
+    // The trait defaults buffer the body; the real OOM relief only kicks in
+    // when the FilesystemBackend overrides actually stream from disk + write
+    // in chunks. These tests exercise that override.
+    // -----------------------------------------------------------------------
+
+    use futures::stream::StreamExt as _StreamExt;
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_round_trip_through_get_stream() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        let payload = Bytes::from_static(b"streaming hello world");
+        let upload_stream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::iter(vec![Ok(payload.clone())]));
+
+        let put_result = backend
+            .put_stream("k1", upload_stream)
+            .await
+            .expect("put_stream must succeed");
+        assert_eq!(put_result.bytes_written, payload.len() as u64);
+        // SHA-256 is a 64-char lowercase hex string; verify shape rather
+        // than the literal value to keep the test independent of payload
+        // changes. Empty + known values are covered by other tests.
+        assert_eq!(put_result.checksum_sha256.len(), 64);
+        assert!(put_result
+            .checksum_sha256
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // Round-trip read via streaming
+        let mut read_stream = backend
+            .get_stream("k1")
+            .await
+            .expect("get_stream must succeed");
+        let mut received: Vec<u8> = Vec::new();
+        while let Some(chunk) = read_stream.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, payload.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_multi_chunk_streams_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        let chunks: Vec<&[u8]> = vec![b"alpha-", b"beta-", b"gamma"];
+        let total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        let upload: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(
+            chunks
+                .iter()
+                .map(|c| Ok(Bytes::from_static(c)))
+                .collect::<Vec<_>>(),
+        ));
+
+        let result = backend.put_stream("k-multi", upload).await.unwrap();
+        assert_eq!(result.bytes_written, total);
+
+        // Read back end-to-end and confirm reassembled content.
+        let mut stream = backend.get_stream("k-multi").await.unwrap();
+        let mut got = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            got.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(got, b"alpha-beta-gamma");
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_cleans_temp_on_stream_error() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        // A stream that yields one chunk then an error.
+        let upload: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"partial")),
+            Err(AppError::Storage(
+                "simulated mid-stream failure".to_string(),
+            )),
+        ]));
+
+        let err = backend
+            .put_stream("k-fail", upload)
+            .await
+            .expect_err("stream error must propagate from put_stream");
+        match err {
+            AppError::Storage(_) => {}
+            other => panic!("expected Storage error, got {:?}", other),
+        }
+
+        // The final key must not exist (atomic rename never ran).
+        let exists = backend.exists("k-fail").await.unwrap();
+        assert!(
+            !exists,
+            "atomic temp file must NOT promote to final key on stream error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_get_stream_missing_key_returns_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        match backend.get_stream("nope").await {
+            Ok(_) => panic!("missing key must error, not yield empty stream"),
+            Err(AppError::NotFound(_)) => {}
+            Err(other) => panic!(
+                "missing key must map to AppError::NotFound (cache-miss \
+                 contract from #1016 / #1089); got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_put_stream_empty_stream_writes_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf());
+
+        let empty: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![]));
+        let result = backend.put_stream("k-empty", empty).await.unwrap();
+        assert_eq!(result.bytes_written, 0);
+        // SHA-256 of empty input is well-known:
+        assert_eq!(
+            result.checksum_sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        // The key exists and reads back as 0 bytes via streaming.
+        let mut stream = backend.get_stream("k-empty").await.unwrap();
+        let mut bytes_seen: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            bytes_seen += chunk.unwrap().len() as u64;
+        }
+        assert_eq!(bytes_seen, 0);
+    }
+
+    #[tokio::test]
+    async fn test_storage_service_put_stream_get_stream_delegate_to_backend() {
+        // StorageService is the facade ProxyService uses; verify the
+        // pub get_stream / put_stream methods round-trip through the
+        // underlying backend rather than silently no-op'ing.
+        let tmp = TempDir::new().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(FilesystemBackend::new(tmp.path().to_path_buf()));
+        let service = StorageService::new(backend);
+
+        let upload: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![Ok(
+            Bytes::from_static(b"via facade"),
+        )]));
+        let put_result = service.put_stream("facade-key", upload).await.unwrap();
+        assert_eq!(put_result.bytes_written, 10);
+
+        let mut stream = service.get_stream("facade-key").await.unwrap();
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(buf, b"via facade");
+    }
+
+    #[tokio::test]
+    async fn test_put_stream_result_equality_and_clone() {
+        let r1 = PutStreamResult {
+            checksum_sha256: "abc".to_string(),
+            bytes_written: 42,
+        };
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+        let r3 = PutStreamResult {
+            checksum_sha256: "def".to_string(),
+            bytes_written: 42,
+        };
+        assert_ne!(r1, r3);
+    }
 }
