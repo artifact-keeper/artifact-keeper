@@ -75,6 +75,33 @@ fn format_to_purl_type(format: &str) -> &'static str {
     }
 }
 
+/// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
+/// recently-completed scan_result row. Bind `$1 = artifact_id` and follow
+/// with `SELECT ... FROM <table> WHERE <table>.scan_result_id IN
+/// (SELECT id FROM latest_scans)`.
+///
+/// Shared across the SBOM read path (`extract_dependencies_for_artifact` in
+/// `api::handlers::sbom`) and the Dependency-Track submission path
+/// (`submit_sbom_to_dependency_track` below) so a rescan that removed a dep
+/// stops surfacing the removed dep from either surface. Mirror of the
+/// pattern already used by `recalculate_score` and `get_dashboard_summary`
+/// for vulnerability aggregation (issues #962 / #1126 / #1136).
+///
+/// Soft-deleted artifacts are excluded so consumers cannot rehydrate dep
+/// trees for content the operator retired (#903 fresh-eyes review #5).
+pub(crate) const LATEST_SCANS_FOR_ARTIFACT_CTE: &str = "
+WITH latest_scans AS (
+    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+    FROM scan_results sr
+    JOIN artifacts a ON a.id = sr.artifact_id
+    WHERE sr.artifact_id = $1
+      AND NOT a.is_deleted
+      AND sr.status = 'completed'
+    ORDER BY sr.artifact_id, sr.scan_type,
+             sr.completed_at DESC NULLS LAST, sr.created_at DESC
+)
+";
+
 /// Derive the Dependency-Track project name and purl type from an optional
 /// repo name and format. When the repo row is missing, falls back to the
 /// raw repository UUID string.
@@ -117,6 +144,41 @@ pub(crate) fn build_dependency_info_from_findings(
                 version,
                 purl,
                 license: None,
+                sha256: None,
+            }
+        })
+        .collect()
+}
+
+/// Build a list of [`DependencyInfo`] from scan_packages rows.
+///
+/// Each row is `(name, optional_version, optional_purl, optional_license)` as
+/// stored by Trivy's package enumeration. This is the inventory-table read
+/// path used to forward SBOMs to Dependency-Track even when a scan found
+/// zero vulnerabilities (#965). Prefers the persisted `purl` column when
+/// present; otherwise synthesizes one from the supplied `purl_type` and
+/// version, matching the shape produced by
+/// [`build_dependency_info_from_findings`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_dependency_info_from_packages(
+    package_rows: Vec<(String, Option<String>, Option<String>, Option<String>)>,
+    purl_type: &str,
+) -> Vec<crate::services::sbom_service::DependencyInfo> {
+    use crate::services::sbom_service::DependencyInfo;
+
+    package_rows
+        .into_iter()
+        .map(|(name, version, purl, license)| {
+            let purl = purl.or_else(|| {
+                version
+                    .as_deref()
+                    .map(|v| format!("pkg:{}/{}@{}", purl_type, name, v))
+            });
+            DependencyInfo {
+                name,
+                version,
+                purl,
+                license,
                 sha256: None,
             }
         })
@@ -2197,9 +2259,12 @@ impl ScannerService {
             .await?;
 
         // Submit SBOM to Dependency-Track if integration is configured.
-        // This generates a CycloneDX SBOM from scan findings and uploads it
-        // to the corresponding DT project, closing the gap where scans
-        // completed but SBOMs were never forwarded to DT.
+        // Generates a CycloneDX SBOM from the scan_packages inventory
+        // (falling back to scan_findings for legacy artifacts) and uploads
+        // it to the corresponding DT project. Submission happens whenever
+        // any scan signal exists, including clean scans with zero CVEs,
+        // so DT can run its own independent vulnerability correlation
+        // against the dep tree. #965.
         if let Some(ref dt) = self.dependency_track {
             self.submit_sbom_to_dependency_track(dt, &artifact).await;
         }
@@ -2207,9 +2272,14 @@ impl ScannerService {
         Ok(())
     }
 
-    /// Generate a CycloneDX SBOM from scan findings for the given artifact and
-    /// submit it to Dependency-Track. Errors are logged but do not fail the
-    /// scan pipeline, since DT submission is best-effort.
+    /// Generate a CycloneDX SBOM for the given artifact and submit it to
+    /// Dependency-Track. Components come from the `scan_packages` inventory
+    /// (latest scan per scan_type), falling back to `scan_findings` for
+    /// pre-#903 legacy artifacts. Submission happens whenever any scan
+    /// signal exists, including clean scans with zero vulnerabilities, so
+    /// DT performs its own independent CVE correlation against the dep
+    /// tree (#965). Errors are logged but do not fail the scan pipeline,
+    /// since DT submission is best-effort.
     async fn submit_sbom_to_dependency_track(
         &self,
         dt: &crate::services::dependency_track_service::DependencyTrackService,
@@ -2230,30 +2300,65 @@ impl ScannerService {
         let (project_name, purl_type) =
             derive_dt_project_info(repo_row, &artifact.repository_id.to_string());
 
-        // Fetch scan findings to build dependency info for the SBOM.
-        // The scan_findings table stores affected components in the
-        // `affected_component` and `affected_version` columns.
-        let findings_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT DISTINCT f.affected_component, f.affected_version, f.source
-            FROM scan_findings f
-            JOIN scan_results sr ON f.scan_result_id = sr.id
-            WHERE sr.artifact_id = $1
-              AND f.affected_component IS NOT NULL
-              AND f.affected_component != ''
-            "#,
-        )
-        .bind(artifact.id)
-        .fetch_all(&self.db)
-        .await
-        .unwrap_or_default();
+        // Build the dependency list, preferring the scan_packages inventory
+        // (#903) so we forward the full dep tree even when Grype found zero
+        // CVEs. DT does its own correlation and needs the components. #965.
+        //
+        // Both queries are windowed to the latest completed scan per
+        // (artifact, scan_type), mirroring the read pattern used by the
+        // /sbom handler in `extract_dependencies_for_artifact`. Without
+        // that window, an artifact rescanned after a dep removal would
+        // still ship the removed dep to DT forever.
+        let package_sql = format!(
+            "{}
+            SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
+            FROM scan_packages sp
+            WHERE sp.scan_result_id IN (SELECT id FROM latest_scans)
+              AND sp.name IS NOT NULL
+              AND sp.name != ''",
+            LATEST_SCANS_FOR_ARTIFACT_CTE,
+        );
+        #[allow(clippy::type_complexity)]
+        let package_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(&package_sql)
+                .bind(artifact.id)
+                .fetch_all(&self.db)
+                .await
+                .unwrap_or_default();
 
-        let deps = build_dependency_info_from_findings(findings_rows, purl_type);
+        let mut deps = build_dependency_info_from_packages(package_rows, purl_type);
 
+        // Legacy fallback: artifacts scanned before migration 085 (scan_packages)
+        // existed only have scan_findings rows. Same DISTINCT ON window so the
+        // CVE-only component list matches the latest scan, not stale history.
+        if deps.is_empty() {
+            let findings_sql = format!(
+                "{}
+                SELECT DISTINCT f.affected_component, f.affected_version, f.source
+                FROM scan_findings f
+                WHERE f.scan_result_id IN (SELECT id FROM latest_scans)
+                  AND f.affected_component IS NOT NULL
+                  AND f.affected_component != ''",
+                LATEST_SCANS_FOR_ARTIFACT_CTE,
+            );
+            let findings_rows: Vec<(String, Option<String>, Option<String>)> =
+                sqlx::query_as(&findings_sql)
+                    .bind(artifact.id)
+                    .fetch_all(&self.db)
+                    .await
+                    .unwrap_or_default();
+
+            deps = build_dependency_info_from_findings(findings_rows, purl_type);
+        }
+
+        // Only skip when there is literally no signal: neither an inventory
+        // row nor a finding for any completed scan. A clean scan with 30
+        // packages and 0 CVEs must still submit to DT so DT can run its own
+        // independent vulnerability correlation against the dep tree. #965.
         if deps.is_empty() {
             info!(
                 artifact_id = %artifact.id,
-                "No scan findings with package info, skipping Dependency-Track SBOM submission"
+                "No scan inventory or findings recorded, skipping Dependency-Track SBOM submission"
             );
             return;
         }
@@ -7445,6 +7550,113 @@ mod tests {
         assert_eq!(deps[0].name, "zzz");
         assert_eq!(deps[1].name, "aaa");
         assert_eq!(deps[2].name, "mmm");
+    }
+
+    // ===================================================================
+    // build_dependency_info_from_packages (#965)
+    //
+    // Mirrors the build_deps_from_findings suite above, but exercises the
+    // scan_packages inventory read path used by the Dependency-Track
+    // submission flow. The crucial behaviour vs. the findings helper is:
+    //   - the stored `purl` column is preferred when present
+    //   - the persisted `license` column flows through to the SBOM
+    //   - clean packages (zero vulnerabilities) still produce dep entries
+    // ===================================================================
+
+    #[test]
+    fn test_build_deps_from_packages_empty() {
+        let deps = build_dependency_info_from_packages(vec![], "npm");
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_prefers_stored_purl() {
+        // When scan_packages.purl is populated, use it verbatim. Trivy
+        // produces canonical purls with qualifiers (?type=foo) we must not
+        // round-trip through string formatting.
+        let rows = vec![(
+            "lodash".to_string(),
+            Some("4.17.21".to_string()),
+            Some("pkg:npm/lodash@4.17.21?type=module".to_string()),
+            Some("MIT".to_string()),
+        )];
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "lodash");
+        assert_eq!(deps[0].version.as_deref(), Some("4.17.21"));
+        assert_eq!(
+            deps[0].purl.as_deref(),
+            Some("pkg:npm/lodash@4.17.21?type=module")
+        );
+        assert_eq!(deps[0].license.as_deref(), Some("MIT"));
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_synthesizes_purl_when_missing() {
+        // scan_packages rows produced by scanners that don't emit purls
+        // fall back to the format-derived purl_type, matching the findings
+        // helper's behaviour.
+        let rows = vec![(
+            "express".to_string(),
+            Some("4.18.2".to_string()),
+            None,
+            None,
+        )];
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].purl.as_deref(), Some("pkg:npm/express@4.18.2"));
+        assert!(deps[0].license.is_none());
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_no_version_no_purl() {
+        // A package without a version cannot be assigned a synthesized
+        // purl. The component still flows through to the SBOM so DT can
+        // see the dep tree.
+        let rows = vec![("mystery-dep".to_string(), None, None, None)];
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "mystery-dep");
+        assert!(deps[0].version.is_none());
+        assert!(deps[0].purl.is_none());
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_clean_scan_30_packages() {
+        // Regression for #965: 30 packages, 0 CVEs (the scan_findings
+        // table is empty) must still produce a non-empty dep list so the
+        // submission gate fires. This is the exact shape we expect for a
+        // newly-uploaded clean npm package.
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = (0..30)
+            .map(|i| {
+                (
+                    format!("pkg-{}", i),
+                    Some(format!("1.0.{}", i)),
+                    None,
+                    Some("MIT".to_string()),
+                )
+            })
+            .collect();
+        let deps = build_dependency_info_from_packages(rows, "npm");
+        assert_eq!(deps.len(), 30);
+        assert!(deps.iter().all(|d| d.purl.is_some()));
+        assert!(deps.iter().all(|d| d.license.as_deref() == Some("MIT")));
+    }
+
+    #[test]
+    fn test_build_deps_from_packages_sha256_always_none() {
+        // sha256 is not yet sourced from scan_packages (matches the
+        // `extract_dependencies_for_artifact` shape; see the comment at
+        // backend/src/api/handlers/sbom.rs around line 1542).
+        let rows = vec![(
+            "serde".to_string(),
+            Some("1.0.200".to_string()),
+            Some("pkg:cargo/serde@1.0.200".to_string()),
+            None,
+        )];
+        let deps = build_dependency_info_from_packages(rows, "cargo");
+        assert!(deps[0].sha256.is_none());
     }
 
     // -----------------------------------------------------------------------

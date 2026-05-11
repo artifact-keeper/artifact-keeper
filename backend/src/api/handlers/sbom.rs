@@ -866,31 +866,23 @@ async fn extract_dependencies_for_artifact(
     // Row tuple: (name, version, purl, license). Tuple is local to this
     // read path — the SBOM endpoint is the only consumer, so a derived
     // FromRow type would pay no dividend.
-    #[allow(clippy::type_complexity)]
-    let packages: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"
-        WITH latest_scans AS (
-            SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-            FROM scan_results sr
-            JOIN artifacts a ON a.id = sr.artifact_id
-            WHERE sr.artifact_id = $1
-              AND NOT a.is_deleted
-              AND sr.status = 'completed'
-            ORDER BY sr.artifact_id, sr.scan_type,
-                     sr.completed_at DESC NULLS LAST, sr.created_at DESC
-        )
+    let packages_sql = format!(
+        "{}
         SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
         FROM scan_packages sp
         WHERE sp.scan_result_id IN (SELECT id FROM latest_scans)
         ORDER BY sp.name
-        LIMIT $2
-        "#,
-    )
-    .bind(artifact_id)
-    .bind(SBOM_INVENTORY_ROW_CAP)
-    .fetch_all(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+        LIMIT $2",
+        crate::services::scanner_service::LATEST_SCANS_FOR_ARTIFACT_CTE,
+    );
+    #[allow(clippy::type_complexity)]
+    let packages: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(&packages_sql)
+            .bind(artifact_id)
+            .bind(SBOM_INVENTORY_ROW_CAP)
+            .fetch_all(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
     if !packages.is_empty() {
         if packages.len() as i64 >= SBOM_INVENTORY_ROW_CAP {
@@ -912,31 +904,22 @@ async fn extract_dependencies_for_artifact(
     // the primary path. This is the pre-#903 vulnerability-only shape;
     // preferable to returning empty for artifacts scanned before the
     // inventory table existed.
-    let findings: Vec<(String, Option<String>)> = sqlx::query_as(
-        r#"
-        WITH latest_scans AS (
-            SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-            FROM scan_results sr
-            JOIN artifacts a ON a.id = sr.artifact_id
-            WHERE sr.artifact_id = $1
-              AND NOT a.is_deleted
-              AND sr.status = 'completed'
-            ORDER BY sr.artifact_id, sr.scan_type,
-                     sr.completed_at DESC NULLS LAST, sr.created_at DESC
-        )
+    let findings_sql = format!(
+        "{}
         SELECT DISTINCT
             COALESCE(sf.affected_component, sf.title) AS name,
             sf.affected_version AS version
         FROM scan_findings sf
         WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
         ORDER BY name
-        LIMIT 1000
-        "#,
-    )
-    .bind(artifact_id)
-    .fetch_all(db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+        LIMIT 1000",
+        crate::services::scanner_service::LATEST_SCANS_FOR_ARTIFACT_CTE,
+    );
+    let findings: Vec<(String, Option<String>)> = sqlx::query_as(&findings_sql)
+        .bind(artifact_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(findings
         .into_iter()
