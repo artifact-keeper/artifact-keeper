@@ -944,14 +944,28 @@ async fn extract_dependencies_for_artifact(
         .collect())
 }
 
-/// Resolve `artifact_id → repository_id` and return Err(NotFound) when
-/// either the artifact does not exist (or is soft-deleted) or the caller
-/// lacks `allowed_repo_ids` access to its repository.
+/// Decide whether a caller can access a repo-scoped resource, returning
+/// Err(NotFound, missing_msg) for both "resource does not exist" and
+/// "exists but caller lacks access". 404-not-403 is deliberate: a 403
+/// leaks existence of the resource id, which can be sensitive (private
+/// package names enumerated by UUID guessing). Same pattern as format-
+/// handler routes. (#903 F6.)
 ///
-/// The 404 (rather than 403) on the access-denied case is deliberate:
-/// returning 403 leaks the existence of the artifact id, which itself
-/// can be sensitive (e.g. private package names enumerated by guessing).
-/// Same pattern format-handler routes use, kept consistent here. (#903 F6.)
+/// Extracted from `ensure_*_access` so the decision logic is unit-
+/// testable without a DB; the helpers below are thin DB-lookup wrappers.
+fn require_repo_access(
+    auth: &AuthExtension,
+    repo_id: Option<Uuid>,
+    missing_msg: &'static str,
+) -> Result<()> {
+    let repo_id = repo_id.ok_or_else(|| AppError::NotFound(missing_msg.into()))?;
+    if !auth.can_access_repo(repo_id) {
+        return Err(AppError::NotFound(missing_msg.into()));
+    }
+    Ok(())
+}
+
+/// Resolve `artifact_id → repository_id` and apply [`require_repo_access`].
 async fn ensure_artifact_repo_access(
     db: &sqlx::PgPool,
     auth: &AuthExtension,
@@ -964,11 +978,7 @@ async fn ensure_artifact_repo_access(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let repo_id = repo_id.ok_or_else(|| AppError::NotFound("Artifact not found".into()))?;
-    if !auth.can_access_repo(repo_id) {
-        return Err(AppError::NotFound("Artifact not found".into()));
-    }
-    Ok(())
+    require_repo_access(auth, repo_id, "Artifact not found")
 }
 
 /// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
@@ -985,11 +995,7 @@ async fn ensure_sbom_repo_access(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let repo_id = repo_id.ok_or_else(|| AppError::NotFound("SBOM not found".into()))?;
-    if !auth.can_access_repo(repo_id) {
-        return Err(AppError::NotFound("SBOM not found".into()));
-    }
-    Ok(())
+    require_repo_access(auth, repo_id, "SBOM not found")
 }
 
 #[derive(OpenApi)]
@@ -1501,5 +1507,164 @@ mod tests {
         let q: GetCveTrendsQuery = serde_json::from_str(json).unwrap();
         assert_eq!(q.days, Some(30));
         assert!(q.repository_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_dep: shared row→DependencyInfo helper used by both SBOM read
+    // paths (scan_packages primary, scan_findings legacy fallback). #903.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dep_drops_empty_name() {
+        assert!(
+            build_dep(String::new(), Some("1.0".to_string()), None, None).is_none(),
+            "data-quality filter: rows with empty name must not produce \
+             a DependencyInfo (would otherwise serialize as a nameless \
+             entry in the CycloneDX components array)"
+        );
+    }
+
+    #[test]
+    fn test_build_dep_preserves_all_fields() {
+        let dep = build_dep(
+            "body-parser".to_string(),
+            Some("1.20.1".to_string()),
+            Some("pkg:npm/body-parser@1.20.1".to_string()),
+            Some("MIT".to_string()),
+        )
+        .expect("non-empty name must produce a DependencyInfo");
+        assert_eq!(dep.name, "body-parser");
+        assert_eq!(dep.version.as_deref(), Some("1.20.1"));
+        assert_eq!(dep.purl.as_deref(), Some("pkg:npm/body-parser@1.20.1"));
+        assert_eq!(dep.license.as_deref(), Some("MIT"));
+        assert!(
+            dep.sha256.is_none(),
+            "sha256 is not yet sourced from scan_packages"
+        );
+    }
+
+    #[test]
+    fn test_build_dep_optional_fields_pass_through_as_none() {
+        // Legacy scan_findings fallback supplies only (name, version); purl
+        // and license are None. The helper must round-trip those Nones as
+        // is — substituting empty strings would pollute CycloneDX output.
+        let dep = build_dep("zlib".to_string(), None, None, None).unwrap();
+        assert_eq!(dep.name, "zlib");
+        assert!(dep.version.is_none());
+        assert!(dep.purl.is_none());
+        assert!(dep.license.is_none());
+    }
+
+    #[test]
+    fn test_build_dep_single_char_name_is_allowed() {
+        // Defensive: the empty-name check is exact, not length-bounded.
+        // A single-char name (rare but valid: e.g. Go's `q`, Crates `c`)
+        // must round-trip.
+        let dep = build_dep("c".to_string(), None, None, None).unwrap();
+        assert_eq!(dep.name, "c");
+    }
+
+    // -----------------------------------------------------------------------
+    // SBOM_INVENTORY_ROW_CAP: enforce the documented contract that this
+    // cap is set well above any realistic monorepo, and is the SAME
+    // ceiling for the SBOM read path. Pinning the constant catches
+    // accidental down-tunes that would re-introduce the truncation-by-
+    // alphabetical-position attestation-evasion finding (security F1).
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // require_repo_access: pure decision used by ensure_*_access helpers.
+    // Tests the four-way truth table without touching the DB. (#903 F6.)
+    // -----------------------------------------------------------------------
+
+    fn make_auth(allowed: Option<Vec<Uuid>>, is_api_token: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::nil(),
+            username: "test".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin: false,
+            is_api_token,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: allowed,
+        }
+    }
+
+    #[test]
+    fn test_require_repo_access_missing_resource_yields_404() {
+        // The resource doesn't exist (or is soft-deleted) — the DB
+        // lookup returned None. Must return NotFound regardless of
+        // the caller's scope.
+        let auth = make_auth(None, false);
+        let err = require_repo_access(&auth, None, "SBOM not found").unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_require_repo_access_unrestricted_jwt_passes() {
+        // JWT session (is_api_token = false): allowed_repo_ids is None,
+        // can_access_repo always returns true.
+        let auth = make_auth(None, false);
+        let repo_id = Uuid::new_v4();
+        require_repo_access(&auth, Some(repo_id), "SBOM not found")
+            .expect("unrestricted auth must access any existing resource");
+    }
+
+    #[test]
+    fn test_require_repo_access_scoped_token_with_access_passes() {
+        // API token scoped to a whitelist that includes the resource's repo.
+        let repo_id = Uuid::new_v4();
+        let auth = make_auth(Some(vec![repo_id]), true);
+        require_repo_access(&auth, Some(repo_id), "Artifact not found")
+            .expect("scoped token whose whitelist includes repo must pass");
+    }
+
+    #[test]
+    fn test_require_repo_access_scoped_token_without_access_yields_404_not_403() {
+        // API token scoped to a different repo. Must return 404 (not 403)
+        // so the caller cannot enumerate which UUIDs exist by status code.
+        let auth = make_auth(Some(vec![Uuid::new_v4()]), true);
+        let other_repo = Uuid::new_v4();
+        let err = require_repo_access(&auth, Some(other_repo), "Artifact not found").unwrap_err();
+        match err {
+            AppError::NotFound(msg) => assert_eq!(msg, "Artifact not found"),
+            other => panic!(
+                "scoped token without access MUST return NotFound (404) \
+                 to avoid existence-disclosure; got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_require_repo_access_missing_msg_propagates() {
+        // The same helper is used by both ensure_artifact_repo_access and
+        // ensure_sbom_repo_access; the per-call missing_msg must round-trip
+        // unchanged so the response body matches the endpoint's contract.
+        let auth = make_auth(None, false);
+        let err = require_repo_access(&auth, None, "SBOM not found").unwrap_err();
+        match err {
+            AppError::NotFound(msg) => assert_eq!(msg, "SBOM not found"),
+            _ => panic!("expected NotFound with the supplied missing_msg"),
+        }
+
+        let err = require_repo_access(&auth, None, "Artifact not found").unwrap_err();
+        match err {
+            AppError::NotFound(msg) => assert_eq!(msg, "Artifact not found"),
+            _ => panic!("expected NotFound with the supplied missing_msg"),
+        }
+    }
+
+    #[test]
+    fn test_sbom_inventory_row_cap_is_well_above_real_world_deps() {
+        // The biggest real-world dep tree we've measured is ~12k for a
+        // full Ubuntu 22.04 + Java + Node monorepo. The cap is 50k. Any
+        // future PR that drops this below 30k should fail this test
+        // unless the threat model has been re-evaluated.
+        assert!(
+            SBOM_INVENTORY_ROW_CAP >= 30_000,
+            "cap must remain comfortably above realistic monorepo dep \
+             counts to avoid attestation-evasion-by-truncation (#903 F1)"
+        );
     }
 }
