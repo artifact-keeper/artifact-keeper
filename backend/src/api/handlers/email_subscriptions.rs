@@ -16,7 +16,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -83,6 +82,37 @@ pub struct EmailSubscriptionResponse {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// FromRow shape for the seven columns the handlers read out of
+/// `email_subscriptions`. Splitting this from the response struct lets
+/// the DB read use the typed `query_as!` style and lets the pure
+/// row->response conversion be unit-tested without spinning up a
+/// database (the response derives `Serialize` for the JSON output but
+/// nothing in serde's macro pipeline understands `sqlx::FromRow`).
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct EmailSubscriptionRow {
+    pub id: Uuid,
+    pub repository_id: Option<Uuid>,
+    pub recipients: Vec<String>,
+    pub event_types: Vec<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<EmailSubscriptionRow> for EmailSubscriptionResponse {
+    fn from(row: EmailSubscriptionRow) -> Self {
+        Self {
+            id: row.id,
+            repository_id: row.repository_id,
+            recipients: row.recipients,
+            event_types: row.event_types,
+            enabled: row.enabled,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -199,7 +229,7 @@ pub async fn list_subscriptions(
         )));
     }
 
-    let rows = sqlx::query(
+    let rows: Vec<EmailSubscriptionRow> = sqlx::query_as(
         r#"
         SELECT id, repository_id, recipients, event_types, enabled,
                created_at, updated_at
@@ -213,19 +243,7 @@ pub async fn list_subscriptions(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let subscriptions: Vec<EmailSubscriptionResponse> = rows
-        .into_iter()
-        .map(|r| EmailSubscriptionResponse {
-            id: r.get("id"),
-            repository_id: r.get("repository_id"),
-            recipients: r.get("recipients"),
-            event_types: r.get("event_types"),
-            enabled: r.get("enabled"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        })
-        .collect();
-
+    let subscriptions = rows.into_iter().map(Into::into).collect();
     Ok(Json(EmailSubscriptionListResponse { subscriptions }))
 }
 
@@ -266,7 +284,7 @@ pub async fn create_subscription(
     validate_event_types(&body.event_types)?;
     validate_recipients(&body.recipients)?;
 
-    let row = sqlx::query(
+    let row: EmailSubscriptionRow = sqlx::query_as(
         r#"
         INSERT INTO email_subscriptions
             (repository_id, recipients, event_types, enabled)
@@ -283,15 +301,7 @@ pub async fn create_subscription(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    Ok(Json(EmailSubscriptionResponse {
-        id: row.get("id"),
-        repository_id: row.get("repository_id"),
-        recipients: row.get("recipients"),
-        event_types: row.get("event_types"),
-        enabled: row.get("enabled"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }))
+    Ok(Json(row.into()))
 }
 
 /// Delete an email subscription by id.
@@ -435,5 +445,188 @@ mod tests {
     #[test]
     fn test_max_recipients_per_subscription_is_documented_constant() {
         assert_eq!(MAX_RECIPIENTS_PER_SUBSCRIPTION, 32);
+    }
+
+    // -----------------------------------------------------------------------
+    // EmailSubscriptionRow -> EmailSubscriptionResponse: pure conversion
+    // that lives between the sqlx Row layer and the JSON response layer.
+    // Unit-tested here without a DB so the coverage gate can see it
+    // exercised; integration coverage on the surrounding handler is
+    // implicit via the smoke / E2E tiers.
+    // -----------------------------------------------------------------------
+
+    fn sample_row() -> EmailSubscriptionRow {
+        EmailSubscriptionRow {
+            id: Uuid::new_v4(),
+            repository_id: Some(Uuid::new_v4()),
+            recipients: vec![
+                "ops@example.com".to_string(),
+                "team@example.com".to_string(),
+            ],
+            event_types: vec!["artifact.uploaded".to_string()],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_row_into_response_preserves_all_scalars() {
+        let row = sample_row();
+        let expected_id = row.id;
+        let expected_repo = row.repository_id;
+        let expected_created = row.created_at;
+        let expected_updated = row.updated_at;
+        let response: EmailSubscriptionResponse = row.into();
+        assert_eq!(response.id, expected_id);
+        assert_eq!(response.repository_id, expected_repo);
+        assert_eq!(response.created_at, expected_created);
+        assert_eq!(response.updated_at, expected_updated);
+        assert!(response.enabled);
+    }
+
+    #[test]
+    fn test_row_into_response_preserves_vec_fields_in_order() {
+        // Order matters for the UI's "recipient list" display + for any
+        // checksum-based caching downstream. The conversion is a value
+        // move so order is preserved by Vec's iteration, but verify
+        // since this is the contract.
+        let row = EmailSubscriptionRow {
+            id: Uuid::nil(),
+            repository_id: None,
+            recipients: vec![
+                "a@x.com".to_string(),
+                "b@x.com".to_string(),
+                "c@x.com".to_string(),
+            ],
+            event_types: vec![
+                "artifact.uploaded".to_string(),
+                "scan.completed".to_string(),
+            ],
+            enabled: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let response: EmailSubscriptionResponse = row.into();
+        assert_eq!(
+            response.recipients,
+            vec![
+                "a@x.com".to_string(),
+                "b@x.com".to_string(),
+                "c@x.com".to_string()
+            ]
+        );
+        assert_eq!(
+            response.event_types,
+            vec![
+                "artifact.uploaded".to_string(),
+                "scan.completed".to_string()
+            ]
+        );
+        assert!(!response.enabled);
+        assert!(response.repository_id.is_none());
+    }
+
+    #[test]
+    fn test_row_into_response_handles_empty_recipients_and_events() {
+        // The DB schema has NOT NULL constraints on the arrays but allows
+        // empty arrays. The conversion must not drop or rewrite them.
+        let row = EmailSubscriptionRow {
+            id: Uuid::new_v4(),
+            repository_id: Some(Uuid::new_v4()),
+            recipients: vec![],
+            event_types: vec![],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let response: EmailSubscriptionResponse = row.into();
+        assert!(response.recipients.is_empty());
+        assert!(response.event_types.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Request / response serialization round-trips. These exercise the
+    // serde derives so the wire shape is locked in even when no handler
+    // runs (which is the coverage gate's blind spot on DB-bound code).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_create_request_deserialize_full() {
+        let json = r#"{
+            "recipients": ["ops@x.com"],
+            "event_types": ["scan.completed"],
+            "enabled": true
+        }"#;
+        let req: CreateEmailSubscriptionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.recipients, vec!["ops@x.com".to_string()]);
+        assert_eq!(req.event_types, vec!["scan.completed".to_string()]);
+        assert!(req.enabled);
+    }
+
+    #[test]
+    fn test_create_request_enabled_defaults_to_true() {
+        let json = r#"{
+            "recipients": ["ops@x.com"],
+            "event_types": ["scan.completed"]
+        }"#;
+        let req: CreateEmailSubscriptionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.enabled, "missing `enabled` field must default to true");
+    }
+
+    #[test]
+    fn test_response_serialize_round_trip() {
+        let response = EmailSubscriptionResponse {
+            id: Uuid::nil(),
+            repository_id: Some(Uuid::nil()),
+            recipients: vec!["x@y.com".to_string()],
+            event_types: vec!["artifact.uploaded".to_string()],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&response).expect("serializes");
+        assert!(json.contains("\"recipients\""));
+        assert!(json.contains("\"event_types\""));
+        assert!(json.contains("\"enabled\":true"));
+    }
+
+    #[test]
+    fn test_list_response_serialize_includes_subscriptions_field() {
+        let list = EmailSubscriptionListResponse {
+            subscriptions: vec![],
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        assert!(
+            json.contains("\"subscriptions\""),
+            "list response must wrap entries under `subscriptions`; got {}",
+            json
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // VALID_EVENT_TYPES pin: the dispatcher's substring filter relies on
+    // this list having coverage for every event class operators expect
+    // to subscribe to. Locking this in via test catches accidental
+    // deletes that would silently drop notifications for the missing
+    // class. Also doubles as documentation of the public contract.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_valid_event_types_includes_artifact_class() {
+        assert!(VALID_EVENT_TYPES.contains(&"artifact.uploaded"));
+        assert!(VALID_EVENT_TYPES.contains(&"artifact.deleted"));
+    }
+
+    #[test]
+    fn test_valid_event_types_includes_scan_class() {
+        assert!(VALID_EVENT_TYPES.contains(&"scan.completed"));
+        assert!(VALID_EVENT_TYPES.contains(&"scan.failed"));
+    }
+
+    #[test]
+    fn test_valid_event_types_includes_security_classes() {
+        assert!(VALID_EVENT_TYPES.contains(&"license.violation"));
+        assert!(VALID_EVENT_TYPES.contains(&"vulnerability.detected"));
     }
 }
