@@ -10,11 +10,9 @@ use tracing::{info, warn};
 
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
-    VersionCache,
+    cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
 /// Filesystem-based Trivy scanner for packages, libraries, and archives.
@@ -80,6 +78,11 @@ impl TrivyFsScanner {
             "json",
             "--severity",
             "CRITICAL,HIGH,MEDIUM,LOW",
+            // #903: enumerate every package the scanner saw (not just
+            // CVE-bearing rows) so SBOM generation reflects the complete
+            // dependency tree. `convert_trivy_packages` reads from the
+            // `Packages` block this flag adds to the JSON report.
+            "--list-all-pkgs",
             "--quiet",
             "--timeout",
             "5m",
@@ -126,6 +129,13 @@ impl Scanner for TrivyFsScanner {
         "filesystem"
     }
 
+    /// Surface the inherent applicability check through the trait so the
+    /// orchestrator can gate on it without creating a `scan_results` row
+    /// (issues #961, #994).
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_applicable(artifact)
+    }
+
     /// Probe `trivy --version` once and cache the parsed version string.
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed; `scan_results.scanner_version` is nullable for that case.
@@ -138,10 +148,15 @@ impl Scanner for TrivyFsScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
-        if !Self::is_applicable(artifact) {
-            return Ok(vec![]);
-        }
+    ) -> Result<ScanOutput> {
+        // The orchestrator gates on `is_applicable` (issues #961, #994), so
+        // by the time we get here the artifact should match. Keep a
+        // defensive assertion so a future caller bypassing the orchestrator
+        // does not silently smuggle a non-applicable artifact through.
+        debug_assert!(
+            Self::is_applicable(artifact),
+            "TrivyFsScanner::scan called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
+        );
 
         info!(
             "Starting Trivy filesystem scan for artifact: {} ({})",
@@ -175,17 +190,18 @@ impl Scanner for TrivyFsScanner {
             }
         };
 
-        let findings = convert_trivy_findings(&report, "trivy-filesystem");
+        let output = ScanOutput::from_trivy_report(&report, "trivy-filesystem");
 
         info!(
-            "Trivy filesystem scan complete for {}: {} vulnerabilities found",
+            "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages",
             artifact.name,
-            findings.len()
+            output.findings.len(),
+            output.packages.len()
         );
 
         ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
 
-        Ok(findings)
+        Ok(output)
     }
 }
 
@@ -193,6 +209,7 @@ impl Scanner for TrivyFsScanner {
 mod tests {
     use super::*;
     use crate::models::security::Severity;
+    use crate::services::scanner_service::convert_trivy_findings;
     use crate::services::scanner_service::test_helpers::{assert_scan_failed, make_test_artifact};
 
     #[test]
@@ -269,6 +286,7 @@ mod tests {
                     description: Some("A vulnerability in requests allows SSRF".to_string()),
                     primary_url: Some("https://avd.aquasec.com/nvd/cve-2023-12345".to_string()),
                 }]),
+                packages: None,
             }],
         };
 

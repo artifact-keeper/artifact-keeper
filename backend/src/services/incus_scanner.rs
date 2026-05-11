@@ -18,11 +18,9 @@ use tracing::{info, warn};
 use crate::error::{AppError, Result};
 use crate::formats::incus::{IncusFileType, IncusHandler};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
-use crate::models::security::RawFinding;
 use crate::services::image_scanner::TrivyReport;
 use crate::services::scanner_service::{
-    cached_trivy_cli_version, convert_trivy_findings, fail_scan, ScanWorkspace, Scanner,
-    VersionCache,
+    cached_trivy_cli_version, fail_scan, ScanOutput, ScanWorkspace, Scanner, VersionCache,
 };
 
 /// Write content to a temporary file in the workspace, returning an error with the given label.
@@ -235,9 +233,16 @@ impl IncusScanner {
         run_trivy_scan(rootfs, None, "Trivy standalone Incus scan").await
     }
 
-    /// Convert Trivy report into RawFinding values.
-    fn convert_findings(report: &crate::services::image_scanner::TrivyReport) -> Vec<RawFinding> {
-        convert_trivy_findings(report, "trivy-incus")
+    /// Convert Trivy vulnerabilities into RawFinding rows. Thin wrapper
+    /// around the shared helper so the existing tests can keep calling
+    /// `IncusScanner::convert_findings(report)`. Production code paths use
+    /// `ScanOutput::from_trivy_report` which also extracts the package
+    /// inventory (#903).
+    #[cfg(test)]
+    pub(crate) fn convert_findings(
+        report: &crate::services::image_scanner::TrivyReport,
+    ) -> Vec<crate::models::security::RawFinding> {
+        crate::services::scanner_service::convert_trivy_findings(report, "trivy-incus")
     }
 }
 
@@ -249,6 +254,13 @@ impl Scanner for IncusScanner {
 
     fn scan_type(&self) -> &str {
         "incus"
+    }
+
+    /// Surface the inherent applicability check through the trait so the
+    /// orchestrator can gate on it without creating a `scan_results` row
+    /// (issues #961, #994).
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_applicable(artifact)
     }
 
     /// Probe `trivy --version` once and cache the parsed version string.
@@ -264,13 +276,14 @@ impl Scanner for IncusScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
-        if !Self::is_applicable(artifact) {
-            return Ok(vec![]);
-        }
+    ) -> Result<ScanOutput> {
+        debug_assert!(
+            Self::is_applicable(artifact),
+            "IncusScanner::scan called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
+        );
 
         if content.is_empty() {
-            return Ok(vec![]);
+            return Ok(ScanOutput::default());
         }
 
         info!(
@@ -317,17 +330,18 @@ impl Scanner for IncusScanner {
             }
         };
 
-        let findings = Self::convert_findings(&report);
+        let output = ScanOutput::from_trivy_report(&report, "trivy-incus");
 
         info!(
-            "Incus image scan complete for {}: {} vulnerabilities found",
+            "Incus image scan complete for {}: {} vulnerabilities, {} packages",
             artifact.name,
-            findings.len()
+            output.findings.len(),
+            output.packages.len()
         );
 
         self.cleanup_workspace(artifact).await;
 
-        Ok(findings)
+        Ok(output)
     }
 }
 
@@ -416,6 +430,7 @@ mod tests {
                         primary_url: None,
                     },
                 ]),
+                packages: None,
             }],
         };
 
@@ -622,6 +637,7 @@ mod tests {
                 class: "os-pkgs".to_string(),
                 result_type: "ubuntu".to_string(),
                 vulnerabilities: None,
+                packages: None,
             }],
         };
         let findings = IncusScanner::convert_findings(&report);
@@ -636,6 +652,7 @@ mod tests {
                 class: "lang-pkgs".to_string(),
                 result_type: "gomod".to_string(),
                 vulnerabilities: Some(vec![]),
+                packages: None,
             }],
         };
         let findings = IncusScanner::convert_findings(&report);
@@ -662,6 +679,7 @@ mod tests {
                             primary_url: None,
                         },
                     ]),
+                    packages: None,
                 },
                 crate::services::image_scanner::TrivyResult {
                     target: "go.sum".to_string(),
@@ -679,6 +697,7 @@ mod tests {
                             primary_url: None,
                         },
                     ]),
+                    packages: None,
                 },
             ],
         };
@@ -686,13 +705,14 @@ mod tests {
         let findings = IncusScanner::convert_findings(&report);
         assert_eq!(findings.len(), 2);
 
-        // First from os-pkgs result
+        // First from os-pkgs result.
+        // affected_component is the bare package name post-#903 — the
+        // `(target)` suffix was dropped because it broke cross-source
+        // joins (SBOM, CVE lookup, UI search). The target moves to
+        // RawPackage.source_target.
         assert_eq!(findings[0].severity, Severity::Critical);
         assert_eq!(findings[0].cve_id, Some("CVE-2024-00001".to_string()));
-        assert_eq!(
-            findings[0].affected_component,
-            Some("openssl (dpkg/status)".to_string())
-        );
+        assert_eq!(findings[0].affected_component, Some("openssl".to_string()));
         assert_eq!(findings[0].fixed_version, Some("1.0.1".to_string()));
 
         // Second from gomod result
@@ -703,7 +723,7 @@ mod tests {
         );
         assert_eq!(
             findings[1].affected_component,
-            Some("github.com/example/lib (go.sum)".to_string())
+            Some("github.com/example/lib".to_string())
         );
         assert!(findings[1].fixed_version.is_none());
         assert!(findings[1].description.is_none());
@@ -735,6 +755,7 @@ mod tests {
                     make_vuln("CVE-4", "LOW"),
                     make_vuln("CVE-5", "UNKNOWN"),
                 ]),
+                packages: None,
             }],
         };
 
@@ -765,6 +786,7 @@ mod tests {
                     description: Some("Heap overflow in musl libc".to_string()),
                     primary_url: Some("https://avd.aquasec.com/nvd/cve-2024-99999".to_string()),
                 }]),
+                packages: None,
             }],
         };
 
@@ -798,6 +820,7 @@ mod tests {
                     description: None,
                     primary_url: None,
                 }]),
+                packages: None,
             }],
         };
 
@@ -809,39 +832,48 @@ mod tests {
     // scan method: non-applicable artifact and empty content
     // -----------------------------------------------------------------------
 
+    /// Non-applicable artifacts must be filtered out via
+    /// `Scanner::is_applicable` rather than absorbed inside `scan()` as
+    /// `Ok(ScanOutput::default())`. The latter pattern is what produced the
+    /// silent-success bug class behind #961 and #994: the orchestrator
+    /// recorded a completed-with-zero-findings row for a scanner that
+    /// never inspected the artifact.
+    ///
+    /// For an applicable artifact with empty content, `scan()` still
+    /// returns `Ok` with an empty output — that is a real "applicable but
+    /// nothing to scan" path, not a silent skip.
     #[tokio::test]
-    async fn test_scan_returns_empty_for_skipped_artifacts() {
+    async fn test_non_applicable_filtered_by_is_applicable_not_scan() {
+        use crate::services::scanner_service::Scanner;
+
         let scanner = IncusScanner::new(
             "http://trivy:8090".to_string(),
             "/tmp/test-workspace".to_string(),
         );
 
-        // Non-applicable artifact (streams index)
-        let cases: Vec<(Artifact, Bytes)> = vec![
-            (
-                make_incus_artifact("index.json", "streams/v1/index.json"),
-                Bytes::from_static(b"{}"),
-            ),
-            // Empty content for an applicable artifact
-            (
-                make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz"),
-                Bytes::new(),
-            ),
-            // Metadata-only tarball (not applicable)
-            (
-                make_incus_artifact("metadata.tar.xz", "ubuntu-noble/20240215/metadata.tar.xz"),
-                Bytes::from_static(b"some content"),
-            ),
+        // Non-applicable artifacts: the trait gate must reject them so the
+        // orchestrator never calls `scan()`.
+        let non_applicable = [
+            make_incus_artifact("index.json", "streams/v1/index.json"),
+            make_incus_artifact("metadata.tar.xz", "ubuntu-noble/20240215/metadata.tar.xz"),
         ];
-
-        for (artifact, content) in &cases {
-            let findings = scanner.scan(artifact, None, content).await.unwrap();
+        for artifact in &non_applicable {
             assert!(
-                findings.is_empty(),
-                "expected empty findings for {}",
+                !Scanner::is_applicable(&scanner, artifact),
+                "Scanner::is_applicable must return false for {} so the orchestrator skips it before creating a scan_results row",
                 artifact.name
             );
         }
+
+        // Applicable artifact with empty content: scanner is invoked and
+        // legitimately reports zero findings.
+        let applicable = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+        assert!(Scanner::is_applicable(&scanner, &applicable));
+        let output = scanner
+            .scan(&applicable, None, &Bytes::new())
+            .await
+            .unwrap();
+        assert!(output.is_empty());
     }
 
     // -----------------------------------------------------------------------

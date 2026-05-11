@@ -307,9 +307,21 @@ async fn generate_sbom(
 )]
 async fn list_sboms(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<Vec<SbomResponse>>> {
+    // #903 F6: when a specific artifact is requested, verify caller access
+    // to its repository before enumerating. The repository_id filter below
+    // also enforces access (callers cannot list a repo's SBOMs without
+    // having access to that repo).
+    if let Some(artifact_id) = query.artifact_id {
+        ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    }
+    if let Some(repo_id) = query.repository_id {
+        if !auth.can_access_repo(repo_id) {
+            return Err(AppError::NotFound("Repository not found".into()));
+        }
+    }
     let service = SbomService::new(state.db.clone());
 
     let sboms = if let Some(artifact_id) = query.artifact_id {
@@ -335,6 +347,15 @@ async fn list_sboms(
             })
             .collect()
     } else {
+        // #903 F6: a scope-restricted token (allowed_repo_ids = Some) MUST
+        // narrow by repository or artifact. Listing all SBOMs would let
+        // a token scoped to repo A enumerate dep trees of every other
+        // repo. Force the caller to be explicit about the repo scope.
+        if auth.is_api_token && auth.allowed_repo_ids.is_some() {
+            return Err(AppError::Validation(
+                "Scope-restricted tokens must filter by repository_id or artifact_id".into(),
+            ));
+        }
         // List all SBOMs (with optional filters)
         let mut sql = "SELECT * FROM sbom_documents WHERE 1=1".to_string();
         if query.repository_id.is_some() {
@@ -393,9 +414,10 @@ async fn list_sboms(
 )]
 async fn get_sbom(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SbomContentResponse>> {
+    ensure_sbom_repo_access(&state.db, &auth, id).await?;
     let service = SbomService::new(state.db.clone());
     let doc = service
         .get_sbom(id)
@@ -422,10 +444,11 @@ async fn get_sbom(
 )]
 async fn get_sbom_by_artifact(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<SbomContentResponse>> {
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     let service = SbomService::new(state.db.clone());
     let format = query
         .format
@@ -458,9 +481,10 @@ async fn get_sbom_by_artifact(
 )]
 async fn delete_sbom(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
+    ensure_sbom_repo_access(&state.db, &auth, id).await?;
     let service = SbomService::new(state.db.clone());
     service.delete_sbom(id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
@@ -483,9 +507,10 @@ async fn delete_sbom(
 )]
 async fn get_sbom_components(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<ComponentResponse>>> {
+    ensure_sbom_repo_access(&state.db, &auth, id).await?;
     let service = SbomService::new(state.db.clone());
     let components = service.get_sbom_components(id).await?;
     let responses: Vec<ComponentResponse> = components
@@ -544,9 +569,10 @@ async fn convert_sbom(
 )]
 async fn get_cve_history(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     let service = SbomService::new(state.db.clone());
     let entries = service.get_cve_history(artifact_id).await?;
     Ok(Json(entries))
@@ -776,21 +802,133 @@ async fn check_license_compliance(
 
 // === Helpers ===
 
-/// Extract dependencies from scan results to populate SBOM.
+/// Upper bound on rows surfaced into one SBOM document. Realistic
+/// monorepos (Ubuntu 22.04 base + Java + Node) can exceed 5k packages
+/// once `--list-all-pkgs` enumerates every apt package, JAR, and
+/// node_module. The cap exists to keep one runaway scan from
+/// generating an unbounded response; the alphabetical ordering on
+/// `name` previously meant an attacker could position malicious
+/// packages late in the alphabet to evade attestation. The new
+/// ceiling is well above any realistic dep tree, and a truncated
+/// response would log a warning so operators see it.
+const SBOM_INVENTORY_ROW_CAP: i64 = 50_000;
+
+/// Build a [`DependencyInfo`] from raw row fields, dropping rows whose
+/// `name` is empty (data-quality filter shared by both read paths).
+fn build_dep(
+    name: String,
+    version: Option<String>,
+    purl: Option<String>,
+    license: Option<String>,
+) -> Option<DependencyInfo> {
+    if name.is_empty() {
+        None
+    } else {
+        Some(DependencyInfo {
+            name,
+            version,
+            purl,
+            license,
+            sha256: None,
+        })
+    }
+}
+
+/// Extract dependencies for SBOM generation.
+///
+/// Read-path order (#903):
+///
+/// 1. **`scan_packages`** restricted to each scan_type's latest completed
+///    scan per artifact. This mirrors the #1126 / #1136 DISTINCT-ON CTE
+///    used for `scan_findings` aggregation; without it, a rescan that
+///    removed a dep would still surface the removed dep forever because
+///    the old scan's row lingers.
+/// 2. **`scan_findings`** legacy fallback for artifacts scanned before
+///    the inventory table existed, or by scanners that do not enumerate
+///    packages (Grype, OpenSCAP, custom WASM plugins). Returns only
+///    CVE-bearing components — exactly the bug #903 fixes for new scans,
+///    but the best we can do for legacy data.
+///
+/// Soft-deleted artifacts (`artifacts.is_deleted = true`) are excluded
+/// from both paths so consumers cannot rehydrate dep trees for content
+/// the operator has deliberately retired.
 async fn extract_dependencies_for_artifact(
     db: &sqlx::PgPool,
     artifact_id: Uuid,
 ) -> Result<Vec<DependencyInfo>> {
-    // Try to get findings from the latest scan
-    let findings: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+    // Primary path: the inventory table, windowed to each scan_type's
+    // latest completed scan. The DISTINCT ON inside `latest_scans`
+    // picks the most recent scan per (artifact, scan_type); the outer
+    // DISTINCT collapses cross-scan-type packages with identical
+    // (name, version, purl, license) tuples (e.g. Trivy fs + Grype
+    // both reporting the same lockfile dep).
+    //
+    // Row tuple: (name, version, purl, license). Tuple is local to this
+    // read path — the SBOM endpoint is the only consumer, so a derived
+    // FromRow type would pay no dividend.
+    #[allow(clippy::type_complexity)]
+    let packages: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
+        WITH latest_scans AS (
+            SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+            FROM scan_results sr
+            JOIN artifacts a ON a.id = sr.artifact_id
+            WHERE sr.artifact_id = $1
+              AND NOT a.is_deleted
+              AND sr.status = 'completed'
+            ORDER BY sr.artifact_id, sr.scan_type,
+                     sr.completed_at DESC NULLS LAST, sr.created_at DESC
+        )
+        SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
+        FROM scan_packages sp
+        WHERE sp.scan_result_id IN (SELECT id FROM latest_scans)
+        ORDER BY sp.name
+        LIMIT $2
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(SBOM_INVENTORY_ROW_CAP)
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    if !packages.is_empty() {
+        if packages.len() as i64 >= SBOM_INVENTORY_ROW_CAP {
+            tracing::warn!(
+                "SBOM read for artifact {} hit the {} row cap; output may \
+                 be truncated. Investigate scanner output sizes.",
+                artifact_id,
+                SBOM_INVENTORY_ROW_CAP
+            );
+        }
+        return Ok(packages
+            .into_iter()
+            .filter_map(|(name, version, purl, license)| build_dep(name, version, purl, license))
+            .collect());
+    }
+
+    // Legacy fallback: derive a component list from scan_findings, also
+    // windowed to the latest scan per scan_type for consistency with
+    // the primary path. This is the pre-#903 vulnerability-only shape;
+    // preferable to returning empty for artifacts scanned before the
+    // inventory table existed.
+    let findings: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"
+        WITH latest_scans AS (
+            SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+            FROM scan_results sr
+            JOIN artifacts a ON a.id = sr.artifact_id
+            WHERE sr.artifact_id = $1
+              AND NOT a.is_deleted
+              AND sr.status = 'completed'
+            ORDER BY sr.artifact_id, sr.scan_type,
+                     sr.completed_at DESC NULLS LAST, sr.created_at DESC
+        )
         SELECT DISTINCT
-            COALESCE(affected_component, title) as name,
-            affected_version as version,
-            NULL::text as purl
+            COALESCE(sf.affected_component, sf.title) AS name,
+            sf.affected_version AS version
         FROM scan_findings sf
-        JOIN scan_results sr ON sf.scan_result_id = sr.id
-        WHERE sr.artifact_id = $1
+        WHERE sf.scan_result_id IN (SELECT id FROM latest_scans)
         ORDER BY name
         LIMIT 1000
         "#,
@@ -798,26 +936,66 @@ async fn extract_dependencies_for_artifact(
     .bind(artifact_id)
     .fetch_all(db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let deps: Vec<DependencyInfo> = findings
+    Ok(findings
         .into_iter()
-        .filter_map(|(name, version, purl)| {
-            if name.is_empty() {
-                None
-            } else {
-                Some(DependencyInfo {
-                    name,
-                    version,
-                    purl,
-                    license: None,
-                    sha256: None,
-                })
-            }
-        })
-        .collect();
+        .filter_map(|(name, version)| build_dep(name, version, None, None))
+        .collect())
+}
 
-    Ok(deps)
+/// Decide whether a caller can access a repo-scoped resource, returning
+/// Err(NotFound, missing_msg) for both "resource does not exist" and
+/// "exists but caller lacks access". 404-not-403 is deliberate: a 403
+/// leaks existence of the resource id, which can be sensitive (private
+/// package names enumerated by UUID guessing). Same pattern as format-
+/// handler routes. (#903 F6.)
+///
+/// Extracted from `ensure_*_access` so the decision logic is unit-
+/// testable without a DB; the helpers below are thin DB-lookup wrappers.
+fn require_repo_access(
+    auth: &AuthExtension,
+    repo_id: Option<Uuid>,
+    missing_msg: &'static str,
+) -> Result<()> {
+    let repo_id = repo_id.ok_or_else(|| AppError::NotFound(missing_msg.into()))?;
+    if !auth.can_access_repo(repo_id) {
+        return Err(AppError::NotFound(missing_msg.into()));
+    }
+    Ok(())
+}
+
+/// Resolve `artifact_id → repository_id` and apply [`require_repo_access`].
+async fn ensure_artifact_repo_access(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    artifact_id: Uuid,
+) -> Result<()> {
+    let repo_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1 AND NOT is_deleted")
+            .bind(artifact_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    require_repo_access(auth, repo_id, "Artifact not found")
+}
+
+/// Like [`ensure_artifact_repo_access`] but resolves through `sbom_documents`
+/// when the caller has only the SBOM id.
+async fn ensure_sbom_repo_access(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    sbom_id: Uuid,
+) -> Result<()> {
+    let repo_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT repository_id FROM sbom_documents WHERE id = $1")
+            .bind(sbom_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+    require_repo_access(auth, repo_id, "SBOM not found")
 }
 
 #[derive(OpenApi)]
@@ -1330,4 +1508,161 @@ mod tests {
         assert_eq!(q.days, Some(30));
         assert!(q.repository_id.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // build_dep: shared row→DependencyInfo helper used by both SBOM read
+    // paths (scan_packages primary, scan_findings legacy fallback). #903.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dep_drops_empty_name() {
+        assert!(
+            build_dep(String::new(), Some("1.0".to_string()), None, None).is_none(),
+            "data-quality filter: rows with empty name must not produce \
+             a DependencyInfo (would otherwise serialize as a nameless \
+             entry in the CycloneDX components array)"
+        );
+    }
+
+    #[test]
+    fn test_build_dep_preserves_all_fields() {
+        let dep = build_dep(
+            "body-parser".to_string(),
+            Some("1.20.1".to_string()),
+            Some("pkg:npm/body-parser@1.20.1".to_string()),
+            Some("MIT".to_string()),
+        )
+        .expect("non-empty name must produce a DependencyInfo");
+        assert_eq!(dep.name, "body-parser");
+        assert_eq!(dep.version.as_deref(), Some("1.20.1"));
+        assert_eq!(dep.purl.as_deref(), Some("pkg:npm/body-parser@1.20.1"));
+        assert_eq!(dep.license.as_deref(), Some("MIT"));
+        assert!(
+            dep.sha256.is_none(),
+            "sha256 is not yet sourced from scan_packages"
+        );
+    }
+
+    #[test]
+    fn test_build_dep_optional_fields_pass_through_as_none() {
+        // Legacy scan_findings fallback supplies only (name, version); purl
+        // and license are None. The helper must round-trip those Nones as
+        // is — substituting empty strings would pollute CycloneDX output.
+        let dep = build_dep("zlib".to_string(), None, None, None).unwrap();
+        assert_eq!(dep.name, "zlib");
+        assert!(dep.version.is_none());
+        assert!(dep.purl.is_none());
+        assert!(dep.license.is_none());
+    }
+
+    #[test]
+    fn test_build_dep_single_char_name_is_allowed() {
+        // Defensive: the empty-name check is exact, not length-bounded.
+        // A single-char name (rare but valid: e.g. Go's `q`, Crates `c`)
+        // must round-trip.
+        let dep = build_dep("c".to_string(), None, None, None).unwrap();
+        assert_eq!(dep.name, "c");
+    }
+
+    // -----------------------------------------------------------------------
+    // SBOM_INVENTORY_ROW_CAP: enforce the documented contract that this
+    // cap is set well above any realistic monorepo, and is the SAME
+    // ceiling for the SBOM read path. Pinning the constant catches
+    // accidental down-tunes that would re-introduce the truncation-by-
+    // alphabetical-position attestation-evasion finding (security F1).
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // require_repo_access: pure decision used by ensure_*_access helpers.
+    // Tests the four-way truth table without touching the DB. (#903 F6.)
+    // -----------------------------------------------------------------------
+
+    fn make_auth(allowed: Option<Vec<Uuid>>, is_api_token: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::nil(),
+            username: "test".to_string(),
+            email: "test@example.com".to_string(),
+            is_admin: false,
+            is_api_token,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: allowed,
+        }
+    }
+
+    #[test]
+    fn test_require_repo_access_missing_resource_yields_404() {
+        // The resource doesn't exist (or is soft-deleted) — the DB
+        // lookup returned None. Must return NotFound regardless of
+        // the caller's scope.
+        let auth = make_auth(None, false);
+        let err = require_repo_access(&auth, None, "SBOM not found").unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_require_repo_access_unrestricted_jwt_passes() {
+        // JWT session (is_api_token = false): allowed_repo_ids is None,
+        // can_access_repo always returns true.
+        let auth = make_auth(None, false);
+        let repo_id = Uuid::new_v4();
+        require_repo_access(&auth, Some(repo_id), "SBOM not found")
+            .expect("unrestricted auth must access any existing resource");
+    }
+
+    #[test]
+    fn test_require_repo_access_scoped_token_with_access_passes() {
+        // API token scoped to a whitelist that includes the resource's repo.
+        let repo_id = Uuid::new_v4();
+        let auth = make_auth(Some(vec![repo_id]), true);
+        require_repo_access(&auth, Some(repo_id), "Artifact not found")
+            .expect("scoped token whose whitelist includes repo must pass");
+    }
+
+    #[test]
+    fn test_require_repo_access_scoped_token_without_access_yields_404_not_403() {
+        // API token scoped to a different repo. Must return 404 (not 403)
+        // so the caller cannot enumerate which UUIDs exist by status code.
+        let auth = make_auth(Some(vec![Uuid::new_v4()]), true);
+        let other_repo = Uuid::new_v4();
+        let err = require_repo_access(&auth, Some(other_repo), "Artifact not found").unwrap_err();
+        match err {
+            AppError::NotFound(msg) => assert_eq!(msg, "Artifact not found"),
+            other => panic!(
+                "scoped token without access MUST return NotFound (404) \
+                 to avoid existence-disclosure; got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_require_repo_access_missing_msg_propagates() {
+        // The same helper is used by both ensure_artifact_repo_access and
+        // ensure_sbom_repo_access; the per-call missing_msg must round-trip
+        // unchanged so the response body matches the endpoint's contract.
+        let auth = make_auth(None, false);
+        let err = require_repo_access(&auth, None, "SBOM not found").unwrap_err();
+        match err {
+            AppError::NotFound(msg) => assert_eq!(msg, "SBOM not found"),
+            _ => panic!("expected NotFound with the supplied missing_msg"),
+        }
+
+        let err = require_repo_access(&auth, None, "Artifact not found").unwrap_err();
+        match err {
+            AppError::NotFound(msg) => assert_eq!(msg, "Artifact not found"),
+            _ => panic!("expected NotFound with the supplied missing_msg"),
+        }
+    }
+
+    /// The biggest real-world dep tree we've measured is ~12k for a full
+    /// Ubuntu 22.04 + Java + Node monorepo. The cap is 50k. Any future PR
+    /// that drops this below 30k breaks compilation here, forcing a
+    /// re-evaluation of the threat model documented at the const-site
+    /// (attestation-evasion-by-truncation, #903 F1).
+    const _: () = assert!(
+        SBOM_INVENTORY_ROW_CAP >= 30_000,
+        "SBOM_INVENTORY_ROW_CAP must remain comfortably above realistic \
+         monorepo dep counts; see security review F1"
+    );
 }

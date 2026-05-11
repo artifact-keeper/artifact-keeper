@@ -13,8 +13,8 @@ use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata};
 use crate::models::security::{RawFinding, Severity};
 use crate::services::scanner_service::{
-    cached_cli_version, capture_cli_version, fail_scan, format_grype_version, ScanWorkspace,
-    Scanner, VersionCache,
+    cached_cli_version, capture_cli_version, fail_scan, format_grype_version, ScanOutput,
+    ScanWorkspace, Scanner, VersionCache,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ impl Scanner for GrypeScanner {
         artifact: &Artifact,
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
-    ) -> Result<Vec<RawFinding>> {
+    ) -> Result<ScanOutput> {
         info!(
             "Starting Grype scan for artifact: {} ({})",
             artifact.name, artifact.id
@@ -199,7 +199,11 @@ impl Scanner for GrypeScanner {
 
         ScanWorkspace::cleanup(&self.scan_workspace, None, artifact).await;
 
-        Ok(findings)
+        // Grype's default JSON shape does not enumerate non-vulnerable
+        // packages; SBOM generation for Grype-scanned artifacts depends on
+        // Trivy's filesystem inventory running alongside. Returning an
+        // empty packages Vec is correct rather than misleading.
+        Ok(ScanOutput::findings_only(findings))
     }
 }
 

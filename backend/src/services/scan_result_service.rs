@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
-    DashboardSummary, Grade, RawFinding, RepoSecurityScore, ScanFinding, ScanResult, Severity,
+    DashboardSummary, Grade, RawFinding, RawPackage, RepoSecurityScore, ScanFinding, ScanResult,
+    Severity,
 };
 
 // ---------------------------------------------------------------------------
@@ -593,6 +594,55 @@ impl ScanResultService {
     // -----------------------------------------------------------------------
     // Findings
     // -----------------------------------------------------------------------
+
+    /// Batch insert the full package inventory for a completed scan (#903).
+    /// Each row is one package the scanner saw — vulnerable or not — so
+    /// the SBOM read path can return the complete dep tree.
+    ///
+    /// Conflict handling: the unique index is
+    /// `(scan_result_id, name, COALESCE(version, ''))`. When a scanner
+    /// emits the same `(name, version)` twice within a single report (e.g.
+    /// Trivy listing a Maven artifact both in its standalone Packages
+    /// block AND inline on a vulnerability row, often with one PURL set
+    /// and the other empty) the second insert promotes any newly-supplied
+    /// `purl`, `license`, or `source_target` value over a previously-NULL
+    /// row. `ON CONFLICT DO NOTHING` would lose whichever value lost the
+    /// race; `DO UPDATE ... COALESCE(scan_packages.col, EXCLUDED.col)`
+    /// keeps the first non-null value, which is the closest thing to
+    /// "more specific wins" without inventing an ordering rule.
+    pub async fn create_packages(
+        &self,
+        scan_result_id: Uuid,
+        artifact_id: Uuid,
+        packages: &[RawPackage],
+    ) -> Result<()> {
+        for pkg in packages {
+            sqlx::query!(
+                r#"
+                INSERT INTO scan_packages (scan_result_id, artifact_id, name,
+                    version, purl, license, source_target)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (scan_result_id, name, COALESCE(version, ''))
+                    DO UPDATE SET
+                        purl = COALESCE(scan_packages.purl, EXCLUDED.purl),
+                        license = COALESCE(scan_packages.license, EXCLUDED.license),
+                        source_target = COALESCE(scan_packages.source_target,
+                                                 EXCLUDED.source_target)
+                "#,
+                scan_result_id,
+                artifact_id,
+                pkg.name,
+                pkg.version,
+                pkg.purl,
+                pkg.license,
+                pkg.source_target,
+            )
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
 
     /// Batch insert findings for a completed scan.
     pub async fn create_findings(
