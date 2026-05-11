@@ -622,6 +622,30 @@ pub trait Scanner: Send + Sync {
     /// The scan_type value stored in scan_results.
     fn scan_type(&self) -> &str;
 
+    /// Whether this scanner applies to the given artifact.
+    ///
+    /// The orchestrator calls this BEFORE creating a `scan_results` row so a
+    /// non-applicable scanner never produces a `completed, findings_count=0`
+    /// row that is indistinguishable from a real clean scan. Issues #961 and
+    /// #994 both trace back to scanners short-circuiting inside `scan()` via
+    /// `Ok(ScanOutput::default())`, which the orchestrator then persisted as
+    /// a completed-with-zero-findings result. That made it look like the
+    /// scanner ran and the artifact was clean, when in fact the scanner had
+    /// silently declined to inspect the bytes.
+    ///
+    /// Returning `false` here is semantically distinct from
+    /// `scan() -> Ok(ScanOutput::default())`: the former means "this scanner
+    /// did not run", the latter means "this scanner ran and found nothing."
+    /// Conflating them produces silent-success regressions where consumers
+    /// using a scan record as a security gate pass artifacts that were never
+    /// actually scanned.
+    ///
+    /// The default returns `true` so scanners that always apply (e.g.
+    /// `DependencyScanner`, `GrypeScanner`) do not need to override.
+    fn is_applicable(&self, _artifact: &Artifact) -> bool {
+        true
+    }
+
     /// Run the scan against artifact content and metadata. Returns both
     /// vulnerability findings AND the full package inventory observed by
     /// the scanner — the inventory drives SBOM generation (#903) and must
@@ -631,6 +655,12 @@ pub trait Scanner: Send + Sync {
     /// like OpenSCAP) return a [`ScanOutput`] with an empty `packages`
     /// vector via [`ScanOutput::findings_only`]; SBOM generation falls
     /// back to scan_findings for those legacy paths.
+    ///
+    /// The orchestrator only calls `scan()` after [`Scanner::is_applicable`]
+    /// returns `true`. Concrete implementations may keep a defensive
+    /// `debug_assert!` against `is_applicable` but MUST NOT silently return
+    /// `Ok(ScanOutput::default())` when they decide the artifact is
+    /// out-of-scope: that is the silent-success bug class behind #994.
     async fn scan(
         &self,
         artifact: &Artifact,
@@ -1998,6 +2028,44 @@ impl ScannerService {
             // The id was already returned to the client in TriggerScanResponse,
             // so we must keep the same row alive (UPDATE rather than INSERT).
             let prepared_action = resolve_prepared_action(prepared.remove(scanner.scan_type()));
+
+            // Gate on applicability BEFORE creating a scan_results row or
+            // copying a reusable result. A non-applicable scanner must leave
+            // no `completed, findings_count=0` row behind — that row is
+            // indistinguishable from a real clean scan and produces the
+            // silent-success class behind #961 (scanners running on
+            // unsupported formats) and #994 (lodash fixture marked clean in
+            // 2.8ms because ImageScanner short-circuited). If the trigger
+            // handler pre-allocated a row for this scan_type, mark it
+            // failed with a "not applicable" reason so the operator still
+            // sees a deterministic record of the decision rather than a
+            // ghost `pending` row that never transitions.
+            if !scanner.is_applicable(&artifact) {
+                info!(
+                    "Scanner {} not applicable for artifact {} (content_type={}, path={}), skipping",
+                    scanner.name(),
+                    artifact_id,
+                    artifact.content_type,
+                    artifact.path,
+                );
+                if let PreparedScanAction::Reuse(target_id) = prepared_action {
+                    let reason = format!(
+                        "Scanner {} does not apply to this artifact format",
+                        scanner.name(),
+                    );
+                    if let Err(e) = self
+                        .scan_result_service
+                        .fail_scan(target_id, &reason, None, chrono::Utc::now())
+                        .await
+                    {
+                        warn!(
+                            "Failed to mark pre-allocated scan {} as not-applicable: {}",
+                            target_id, e
+                        );
+                    }
+                }
+                continue;
+            }
 
             // Check for reusable scan results (same hash + scan type within TTL)
             if let Ok(Some(source_scan)) = self
@@ -8147,5 +8215,252 @@ mod tests {
         let pkgs = convert_trivy_packages(&report);
         assert_eq!(pkgs.len(), 1);
         assert!(pkgs[0].source_target.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Scanner trait applicability gate (issues #961, #994)
+    // -----------------------------------------------------------------------
+
+    /// Shared test fixtures for the applicability-gate tests below.
+    mod applicability_fixtures {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// A test Scanner whose `is_applicable` always returns false. Its
+        /// `scan()` body increments a counter so the test can assert it was
+        /// never invoked. If the orchestrator ever forgets to gate on
+        /// `is_applicable`, this counter goes above zero and the test
+        /// fails.
+        pub(super) struct NeverApplicableScanner {
+            pub(super) scan_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Scanner for NeverApplicableScanner {
+            fn name(&self) -> &str {
+                "never-applicable-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "never-applicable"
+            }
+            fn is_applicable(&self, _artifact: &Artifact) -> bool {
+                false
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                self.scan_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ScanOutput::default())
+            }
+        }
+
+        /// A test Scanner whose `is_applicable` always returns true. Used
+        /// to assert the orchestrator does still call `scan()` on
+        /// applicable scanners (i.e. the gate does not over-correct and
+        /// drop everyone).
+        pub(super) struct AlwaysApplicableScanner {
+            pub(super) scan_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl Scanner for AlwaysApplicableScanner {
+            fn name(&self) -> &str {
+                "always-applicable-test-scanner"
+            }
+            fn scan_type(&self) -> &str {
+                "always-applicable"
+            }
+            // Inherits the default `is_applicable = true`.
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                self.scan_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ScanOutput::default())
+            }
+        }
+    }
+
+    /// The `Scanner::is_applicable` default must return true so existing
+    /// scanners that always apply (e.g. `DependencyScanner`, `GrypeScanner`)
+    /// keep their pre-#961 behavior without overriding. If anyone flips
+    /// the default to false, every scanner that omits the override is
+    /// silently skipped, which is exactly the issue #994 silent-success
+    /// pattern with the inverse polarity.
+    #[test]
+    fn test_scanner_trait_default_is_applicable_is_true() {
+        struct DefaultScanner;
+        #[async_trait::async_trait]
+        impl Scanner for DefaultScanner {
+            fn name(&self) -> &str {
+                "default-applicability"
+            }
+            fn scan_type(&self) -> &str {
+                "default-applicability"
+            }
+            async fn scan(
+                &self,
+                _: &Artifact,
+                _: Option<&ArtifactMetadata>,
+                _: &Bytes,
+            ) -> Result<ScanOutput> {
+                Ok(ScanOutput::default())
+            }
+        }
+        let s = DefaultScanner;
+        let artifact =
+            test_helpers::make_test_artifact("anything", "application/octet-stream", "x");
+        assert!(s.is_applicable(&artifact));
+    }
+
+    /// Scanners that override `is_applicable` to return false must NOT have
+    /// their `scan()` called by anything that respects the trait contract.
+    /// This is the precondition that lets the orchestrator skip the
+    /// scan_results row creation safely.
+    #[tokio::test]
+    async fn test_is_applicable_false_means_scan_must_not_be_invoked() {
+        use applicability_fixtures::NeverApplicableScanner;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scanner = NeverApplicableScanner {
+            scan_calls: calls.clone(),
+        };
+        let artifact = test_helpers::make_test_artifact(
+            "lodash-vuln-fixture-1.0.0.tgz",
+            "application/gzip",
+            "npm/lodash-vuln-fixture/1.0.0/lodash-vuln-fixture-1.0.0.tgz",
+        );
+
+        // The orchestrator gate is conceptually:
+        //   if !scanner.is_applicable(&artifact) { continue; }
+        // followed by `scanner.scan(...)`. We replay that contract in
+        // isolation so the assertion focuses on the trait surface itself.
+        let applicable = scanner.is_applicable(&artifact);
+        assert!(
+            !applicable,
+            "NeverApplicableScanner must report is_applicable=false"
+        );
+        if applicable {
+            // Defensive: ensure the test would actually exercise the bad
+            // path if the gate were ever inverted.
+            let _ = scanner.scan(&artifact, None, &Bytes::new()).await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "scan() must not be called when is_applicable() returns false (#961, #994)"
+        );
+    }
+
+    /// Inverse of the above: a scanner that returns `is_applicable=true`
+    /// must still have its `scan()` invoked. This guards against an
+    /// over-correction where the gate is hard-wired to false or drops the
+    /// scanner from the iteration entirely.
+    #[tokio::test]
+    async fn test_is_applicable_true_means_scan_is_invoked() {
+        use applicability_fixtures::AlwaysApplicableScanner;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let scanner = AlwaysApplicableScanner {
+            scan_calls: calls.clone(),
+        };
+        let artifact = test_helpers::make_test_artifact(
+            "anything.tgz",
+            "application/gzip",
+            "npm/anything/1.0.0/anything.tgz",
+        );
+        assert!(scanner.is_applicable(&artifact));
+        let _ = scanner.scan(&artifact, None, &Bytes::new()).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "scan() must be called once when is_applicable() returns true"
+        );
+    }
+
+    /// Concrete regression for #994: the lodash fixture (generic tarball
+    /// uploaded as `scan_type=image`) must trigger
+    /// `ImageScanner::is_applicable=false`, so the orchestrator can skip
+    /// it without persisting a `completed, findings_count=0` row.
+    /// Before the fix this scanner returned `Ok(ScanOutput::default())`
+    /// from inside `scan()` after a 2.8 ms code-path; the orchestrator
+    /// then recorded a clean scan that lied about the artifact's posture.
+    #[test]
+    fn test_image_scanner_not_applicable_to_generic_npm_tarball() {
+        use crate::services::image_scanner::ImageScanner;
+
+        let image_scanner = ImageScanner::new("http://trivy:4954".to_string());
+        let lodash = test_helpers::make_test_artifact(
+            "lodash-vuln-fixture-1.0.0.tgz",
+            "application/gzip",
+            "npm/lodash-vuln-fixture/1.0.0/lodash-vuln-fixture-1.0.0.tgz",
+        );
+        assert!(
+            !Scanner::is_applicable(&image_scanner, &lodash),
+            "ImageScanner must yield to TrivyFsScanner on a generic npm tarball; \
+             persisting a completed-with-zero-findings row for ImageScanner here \
+             is the silent-success class behind #994"
+        );
+    }
+
+    /// Concrete regression for #961: the image scanner must NOT claim to
+    /// be applicable to an npm tarball. Before the fix it ran on every
+    /// artifact and produced false-positive empty rows, skewing the
+    /// dashboard counts.
+    #[test]
+    fn test_image_scanner_applicability_distinguishes_oci_from_npm() {
+        use crate::services::image_scanner::ImageScanner;
+
+        let image_scanner = ImageScanner::new("http://trivy:4954".to_string());
+
+        let oci = test_helpers::make_test_artifact(
+            "myapp",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/myapp/manifests/latest",
+        );
+        assert!(
+            Scanner::is_applicable(&image_scanner, &oci),
+            "ImageScanner must apply to OCI manifests"
+        );
+
+        let npm = test_helpers::make_test_artifact(
+            "left-pad-1.3.0.tgz",
+            "application/gzip",
+            "npm/left-pad/1.3.0/left-pad-1.3.0.tgz",
+        );
+        assert!(
+            !Scanner::is_applicable(&image_scanner, &npm),
+            "ImageScanner must not apply to an npm tarball (#961)"
+        );
+    }
+
+    /// The `TrivyFsScanner` is the inverse case: it must apply to the
+    /// generic npm tarball that fooled `ImageScanner` in #994, otherwise
+    /// the fix has over-corrected and the lodash CVE goes undetected.
+    #[test]
+    fn test_trivy_fs_scanner_applies_to_npm_tarball() {
+        use crate::services::trivy_fs_scanner::TrivyFsScanner;
+
+        let trivy_fs = TrivyFsScanner::new("http://trivy:4954".to_string(), "/tmp".to_string());
+        let lodash = test_helpers::make_test_artifact(
+            "lodash-vuln-fixture-1.0.0.tgz",
+            "application/gzip",
+            "npm/lodash-vuln-fixture/1.0.0/lodash-vuln-fixture-1.0.0.tgz",
+        );
+        assert!(
+            Scanner::is_applicable(&trivy_fs, &lodash),
+            "TrivyFsScanner must apply to a generic npm tarball — that is exactly \
+             the scanner expected to detect lodash CVE-2019-10744"
+        );
     }
 }

@@ -311,6 +311,16 @@ impl Scanner for ImageScanner {
         "image"
     }
 
+    /// Surface the container-image content-type check through the trait so
+    /// the orchestrator can gate on it without creating a `scan_results`
+    /// row for non-image artifacts (issues #961, #994). This is the exact
+    /// case that produced the lodash silent-success: a generic tarball
+    /// uploaded as `scan_type=image` should never have flowed into
+    /// `ImageScanner::scan` at all.
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_container_image(artifact)
+    }
+
     /// Probe `trivy --version` once and cache the parsed version string.
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed.
@@ -324,19 +334,23 @@ impl Scanner for ImageScanner {
         _metadata: Option<&ArtifactMetadata>,
         _content: &Bytes,
     ) -> Result<ScanOutput> {
-        // Only scan OCI/Docker image manifests
-        if !Self::is_container_image(artifact) {
-            return Ok(ScanOutput::default());
-        }
+        debug_assert!(
+            Self::is_container_image(artifact),
+            "ImageScanner::scan called on a non-container artifact; the orchestrator must gate on is_applicable first"
+        );
 
+        // Image reference extraction can still fail even on an applicable
+        // (content-type-matching) artifact when the path is malformed.
+        // That is a real error, not a "not applicable" case: surface it as
+        // a failed scan so the operator sees error_message rather than a
+        // silent completed-with-zero-findings row (issue #994).
         let image_ref = match Self::extract_image_ref(artifact) {
             Some(r) => r,
             None => {
-                info!(
+                return Err(AppError::Internal(format!(
                     "Could not extract image reference from artifact path: {}",
                     artifact.path
-                );
-                return Ok(ScanOutput::default());
+                )));
             }
         };
 
@@ -595,19 +609,26 @@ mod tests {
         );
     }
 
-    /// When the artifact is not a container image, the scanner returns
-    /// Ok(vec![]) without ever contacting Trivy. This must remain true
-    /// even after the #888 fix — non-applicable artifacts are not failures.
-    #[tokio::test]
-    async fn test_scan_non_image_returns_ok_empty_without_trivy() {
+    /// Non-container artifacts must report `is_applicable=false` so the
+    /// orchestrator never calls `scan()` on them, rather than the scanner
+    /// silently swallowing them inside `scan()` and producing a
+    /// completed-with-zero-findings row. This is the trait-level contract
+    /// behind the fix for issues #961 and #994.
+    ///
+    /// `scan()` itself is now allowed to panic on a non-applicable artifact
+    /// via `debug_assert!`, because the orchestrator is the single gate
+    /// point. Asserting on `is_applicable` here keeps the regression-test
+    /// pressure on the right surface.
+    #[test]
+    fn test_is_applicable_rejects_non_container_artifact() {
+        use crate::services::scanner_service::Scanner;
+
         let scanner = ImageScanner::new("http://127.0.0.1:1".to_string());
         let artifact = make_test_artifact("pypi/pkg/1.0.0/pkg-1.0.0.tar.gz", "application/gzip");
-        let result = scanner.scan(&artifact, None, &Bytes::new()).await;
         assert!(
-            result.is_ok(),
-            "non-container artifacts should not cause the image scanner to error"
+            !Scanner::is_applicable(&scanner, &artifact),
+            "ImageScanner must yield to a filesystem scanner for non-container artifacts (#961, #994)"
         );
-        assert!(result.unwrap().is_empty());
     }
 
     #[test]

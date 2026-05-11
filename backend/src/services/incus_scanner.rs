@@ -256,6 +256,13 @@ impl Scanner for IncusScanner {
         "incus"
     }
 
+    /// Surface the inherent applicability check through the trait so the
+    /// orchestrator can gate on it without creating a `scan_results` row
+    /// (issues #961, #994).
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_applicable(artifact)
+    }
+
     /// Probe `trivy --version` once and cache the parsed version string.
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed. The Incus scanner shells out to the same `trivy` binary as
@@ -270,9 +277,10 @@ impl Scanner for IncusScanner {
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
-        if !Self::is_applicable(artifact) {
-            return Ok(ScanOutput::default());
-        }
+        debug_assert!(
+            Self::is_applicable(artifact),
+            "IncusScanner::scan called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
+        );
 
         if content.is_empty() {
             return Ok(ScanOutput::default());
@@ -824,39 +832,48 @@ mod tests {
     // scan method: non-applicable artifact and empty content
     // -----------------------------------------------------------------------
 
+    /// Non-applicable artifacts must be filtered out via
+    /// `Scanner::is_applicable` rather than absorbed inside `scan()` as
+    /// `Ok(ScanOutput::default())`. The latter pattern is what produced the
+    /// silent-success bug class behind #961 and #994: the orchestrator
+    /// recorded a completed-with-zero-findings row for a scanner that
+    /// never inspected the artifact.
+    ///
+    /// For an applicable artifact with empty content, `scan()` still
+    /// returns `Ok` with an empty output — that is a real "applicable but
+    /// nothing to scan" path, not a silent skip.
     #[tokio::test]
-    async fn test_scan_returns_empty_for_skipped_artifacts() {
+    async fn test_non_applicable_filtered_by_is_applicable_not_scan() {
+        use crate::services::scanner_service::Scanner;
+
         let scanner = IncusScanner::new(
             "http://trivy:8090".to_string(),
             "/tmp/test-workspace".to_string(),
         );
 
-        // Non-applicable artifact (streams index)
-        let cases: Vec<(Artifact, Bytes)> = vec![
-            (
-                make_incus_artifact("index.json", "streams/v1/index.json"),
-                Bytes::from_static(b"{}"),
-            ),
-            // Empty content for an applicable artifact
-            (
-                make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz"),
-                Bytes::new(),
-            ),
-            // Metadata-only tarball (not applicable)
-            (
-                make_incus_artifact("metadata.tar.xz", "ubuntu-noble/20240215/metadata.tar.xz"),
-                Bytes::from_static(b"some content"),
-            ),
+        // Non-applicable artifacts: the trait gate must reject them so the
+        // orchestrator never calls `scan()`.
+        let non_applicable = [
+            make_incus_artifact("index.json", "streams/v1/index.json"),
+            make_incus_artifact("metadata.tar.xz", "ubuntu-noble/20240215/metadata.tar.xz"),
         ];
-
-        for (artifact, content) in &cases {
-            let findings = scanner.scan(artifact, None, content).await.unwrap();
+        for artifact in &non_applicable {
             assert!(
-                findings.is_empty(),
-                "expected empty findings for {}",
+                !Scanner::is_applicable(&scanner, artifact),
+                "Scanner::is_applicable must return false for {} so the orchestrator skips it before creating a scan_results row",
                 artifact.name
             );
         }
+
+        // Applicable artifact with empty content: scanner is invoked and
+        // legitimately reports zero findings.
+        let applicable = make_incus_artifact("incus.tar.xz", "ubuntu-noble/20240215/incus.tar.xz");
+        assert!(Scanner::is_applicable(&scanner, &applicable));
+        let output = scanner
+            .scan(&applicable, None, &Bytes::new())
+            .await
+            .unwrap();
+        assert!(output.is_empty());
     }
 
     // -----------------------------------------------------------------------

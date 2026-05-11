@@ -129,6 +129,13 @@ impl Scanner for TrivyFsScanner {
         "filesystem"
     }
 
+    /// Surface the inherent applicability check through the trait so the
+    /// orchestrator can gate on it without creating a `scan_results` row
+    /// (issues #961, #994).
+    fn is_applicable(&self, artifact: &Artifact) -> bool {
+        Self::is_applicable(artifact)
+    }
+
     /// Probe `trivy --version` once and cache the parsed version string.
     /// Returns `None` if the binary is missing or its output cannot be
     /// parsed; `scan_results.scanner_version` is nullable for that case.
@@ -142,9 +149,14 @@ impl Scanner for TrivyFsScanner {
         _metadata: Option<&ArtifactMetadata>,
         content: &Bytes,
     ) -> Result<ScanOutput> {
-        if !Self::is_applicable(artifact) {
-            return Ok(ScanOutput::default());
-        }
+        // The orchestrator gates on `is_applicable` (issues #961, #994), so
+        // by the time we get here the artifact should match. Keep a
+        // defensive assertion so a future caller bypassing the orchestrator
+        // does not silently smuggle a non-applicable artifact through.
+        debug_assert!(
+            Self::is_applicable(artifact),
+            "TrivyFsScanner::scan called on a non-applicable artifact; the orchestrator must gate on is_applicable first"
+        );
 
         info!(
             "Starting Trivy filesystem scan for artifact: {} ({})",
