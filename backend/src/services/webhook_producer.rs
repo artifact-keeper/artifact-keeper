@@ -93,6 +93,50 @@ struct MatchingWebhookRow {
     id: uuid::Uuid,
 }
 
+/// SQL used to batch-insert webhook delivery rows.
+///
+/// Extracted into a constant so the unit test in this module can verify the
+/// UNNEST-over-uuid[] pattern stays intact, and so the integration test in
+/// issue #952 can re-execute the exact same string against a real Postgres.
+/// Keep the trailing newline and indentation: equality compared in tests.
+const BATCH_INSERT_DELIVERIES_SQL: &str = r#"
+        INSERT INTO webhook_deliveries
+            (webhook_id, event, payload, attempts, next_retry_at, success)
+        SELECT id, $2, $3, 0, NOW(), false
+        FROM UNNEST($1::uuid[]) AS t(id)
+        "#;
+
+/// Collect the uuids from a slice of matching webhook rows.
+///
+/// Pulled out so we can unit-test the trivial "owned `Vec<Uuid>` for SQLx
+/// bind" step without needing a Postgres pool. Order is preserved so the
+/// per-row metric loop counts the same number of rows that were bound.
+fn collect_webhook_ids(webhooks: &[MatchingWebhookRow]) -> Vec<uuid::Uuid> {
+    webhooks.iter().map(|w| w.id).collect()
+}
+
+/// Emit per-row enqueue metrics for a completed batch insert.
+///
+/// `success = true` records `record_webhook_delivery_enqueued` once per row
+/// in the batch; `success = false` records `record_webhook_delivery_enqueue_failed`
+/// with reason `"db_error"`. Splitting this out keeps `enqueue_for_event`
+/// readable and gives unit tests a deterministic surface to assert on (the
+/// metrics layer is an in-process counter, so it is safe to drive from tests).
+fn record_batch_enqueue_outcome(mapped_event: &str, batch_size: usize, success: bool) {
+    if success {
+        for _ in 0..batch_size {
+            crate::services::metrics_service::record_webhook_delivery_enqueued(mapped_event);
+        }
+    } else {
+        for _ in 0..batch_size {
+            crate::services::metrics_service::record_webhook_delivery_enqueue_failed(
+                mapped_event,
+                "db_error",
+            );
+        }
+    }
+}
+
 /// Start the webhook producer background task.
 ///
 /// Spawns a tokio task that subscribes to the EventBus and, for each received
@@ -229,29 +273,18 @@ async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Res
     // fails the whole batch), but the only realistic failure here is a
     // database/connection error that would fail every row anyway. We log
     // and record metrics at the batch level instead.
-    let webhook_ids: Vec<uuid::Uuid> = webhooks.iter().map(|w| w.id).collect();
+    let webhook_ids = collect_webhook_ids(&webhooks);
     let batch_size = webhook_ids.len();
 
-    let result = sqlx::query(
-        r#"
-        INSERT INTO webhook_deliveries
-            (webhook_id, event, payload, attempts, next_retry_at, success)
-        SELECT id, $2, $3, 0, NOW(), false
-        FROM UNNEST($1::uuid[]) AS t(id)
-        "#,
-    )
-    .bind(&webhook_ids)
-    .bind(mapped_event)
-    .bind(&payload)
-    .execute(db)
-    .await;
+    let result = sqlx::query(BATCH_INSERT_DELIVERIES_SQL)
+        .bind(&webhook_ids)
+        .bind(mapped_event)
+        .bind(&payload)
+        .execute(db)
+        .await;
 
     match result {
-        Ok(_) => {
-            for _ in 0..batch_size {
-                crate::services::metrics_service::record_webhook_delivery_enqueued(mapped_event);
-            }
-        }
+        Ok(_) => record_batch_enqueue_outcome(mapped_event, batch_size, true),
         Err(e) => {
             tracing::warn!(
                 event = mapped_event,
@@ -259,12 +292,7 @@ async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Res
                 error = %e,
                 "Failed to batch insert webhook_deliveries rows"
             );
-            for _ in 0..batch_size {
-                crate::services::metrics_service::record_webhook_delivery_enqueue_failed(
-                    mapped_event,
-                    "db_error",
-                );
-            }
+            record_batch_enqueue_outcome(mapped_event, batch_size, false);
         }
     }
 
@@ -550,13 +578,123 @@ mod tests {
     #[test]
     fn test_batch_insert_sql_uses_unnest_over_uuid_array() {
         // Fence: if anyone reverts the producer to a per-row INSERT loop,
-        // this canary spot-checks that the file still contains the
+        // this canary spot-checks that the batch SQL still contains the
         // UNNEST-over-uuid[] pattern. The integration test in #952 will
         // exercise the actual SQL against a real Postgres.
-        let src = include_str!("webhook_producer.rs");
         assert!(
-            src.contains("UNNEST($1::uuid[])"),
+            BATCH_INSERT_DELIVERIES_SQL.contains("UNNEST($1::uuid[])"),
             "webhook producer must batch-insert via UNNEST to avoid N+1 (issue #949)"
         );
+    }
+
+    #[test]
+    fn test_batch_insert_sql_targets_webhook_deliveries_table() {
+        // The producer inserts into `webhook_deliveries`, not a renamed
+        // table. If the schema is renamed, both the migration and this
+        // string must change together.
+        assert!(
+            BATCH_INSERT_DELIVERIES_SQL.contains("INTO webhook_deliveries"),
+            "batch SQL must target the webhook_deliveries table"
+        );
+    }
+
+    #[test]
+    fn test_batch_insert_sql_binds_event_and_payload_as_scalars() {
+        // $2 is the event type, $3 is the JSON payload. They are broadcast
+        // across every row produced by the UNNEST; the SELECT list must
+        // reference them positionally so SQLx's bind order matches.
+        let sql = BATCH_INSERT_DELIVERIES_SQL;
+        assert!(sql.contains("$1::uuid[]"));
+        assert!(sql.contains("$2"));
+        assert!(sql.contains("$3"));
+        // The SELECT list shape: id (from UNNEST), $2 (event), $3 (payload),
+        // then constants for attempts/next_retry_at/success.
+        assert!(sql.contains("SELECT id, $2, $3, 0, NOW(), false"));
+    }
+
+    #[test]
+    fn test_batch_insert_sql_writes_zero_attempts_and_unscheduled_retry() {
+        // New rows start at attempts=0 and next_retry_at=NOW() so the retry
+        // scheduler picks them up on the next 30s tick. success=false marks
+        // them as needing a delivery attempt.
+        let sql = BATCH_INSERT_DELIVERIES_SQL;
+        assert!(sql.contains(", 0, NOW(), false"));
+    }
+
+    #[test]
+    fn test_collect_webhook_ids_empty_slice() {
+        let ids = collect_webhook_ids(&[]);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_collect_webhook_ids_preserves_order() {
+        // The metric loop emits one event per row in the batch and relies on
+        // the count matching `webhook_ids.len()`. Verify the helper keeps
+        // every row and preserves order so the per-row count is exact.
+        let a = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let b = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let c = uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let rows = vec![
+            MatchingWebhookRow { id: a },
+            MatchingWebhookRow { id: b },
+            MatchingWebhookRow { id: c },
+        ];
+        let ids = collect_webhook_ids(&rows);
+        assert_eq!(ids, vec![a, b, c]);
+    }
+
+    #[test]
+    fn test_collect_webhook_ids_keeps_duplicates() {
+        // The lookup query does not DISTINCT, so if the schema ever allows
+        // duplicate ids the producer would bind them all. Make sure the
+        // helper does not silently de-dup either.
+        let a = uuid::Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let rows = vec![MatchingWebhookRow { id: a }, MatchingWebhookRow { id: a }];
+        let ids = collect_webhook_ids(&rows);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], a);
+        assert_eq!(ids[1], a);
+    }
+
+    #[test]
+    fn test_record_batch_enqueue_outcome_success_does_not_panic() {
+        // The metrics layer is an in-process counter; we cannot easily read
+        // it back from a unit test without a recorder fixture. The behaviour
+        // we are pinning here is that the helper accepts both success and
+        // failure branches and does not panic on zero-batch or large-batch
+        // sizes. Future work (issue #952) wires up a real recorder.
+        record_batch_enqueue_outcome("artifact_uploaded", 0, true);
+        record_batch_enqueue_outcome("artifact_uploaded", 1, true);
+        record_batch_enqueue_outcome("artifact_uploaded", 250, true);
+    }
+
+    #[test]
+    fn test_record_batch_enqueue_outcome_failure_does_not_panic() {
+        record_batch_enqueue_outcome("artifact_uploaded", 0, false);
+        record_batch_enqueue_outcome("artifact_uploaded", 1, false);
+        record_batch_enqueue_outcome("artifact_uploaded", 250, false);
+    }
+
+    #[test]
+    fn test_record_batch_enqueue_outcome_accepts_every_mapped_event() {
+        // The mapped event string is whatever `map_event_type` returns. Make
+        // sure the metric helper accepts every value the mapper can produce.
+        for ev in [
+            "artifact.uploaded",
+            "artifact.created",
+            "artifact.deleted",
+            "repository.created",
+            "repository.deleted",
+            "user.created",
+            "user.deleted",
+            "build.started",
+            "build.completed",
+            "build.failed",
+        ] {
+            let mapped = map_event_type(ev).expect("mapper must cover this event");
+            record_batch_enqueue_outcome(mapped, 1, true);
+            record_batch_enqueue_outcome(mapped, 1, false);
+        }
     }
 }
