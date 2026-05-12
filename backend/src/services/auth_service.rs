@@ -59,7 +59,14 @@ pub struct ApiTokenValidation {
     pub allowed_repo_ids: Option<Vec<Uuid>>,
 }
 
-/// JWT claims structure
+/// JWT claims structure.
+///
+/// `jti` and `family_id` are populated on refresh tokens for reuse/replay
+/// detection per RFC 6819 §5.2.2.3 (see migration 087 and
+/// [`refresh_tokens`] for the rotation/family-revocation logic). They are
+/// serialized as standard JWT claims when present and omitted otherwise so
+/// existing access-token consumers keep parsing the JWT unchanged. Access
+/// tokens leave both fields `None`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     /// Subject (user ID)
@@ -76,6 +83,14 @@ pub struct Claims {
     pub exp: i64,
     /// Token type: "access" or "refresh"
     pub token_type: String,
+    /// JWT ID. Set on refresh tokens for replay detection (#1174).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<Uuid>,
+    /// Refresh-token family identifier. All tokens minted from the same login
+    /// share a `family_id`; replay of a consumed token revokes the whole
+    /// family. Set on refresh tokens only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_id: Option<Uuid>,
 }
 
 /// Token pair response
@@ -130,29 +145,136 @@ struct CachedApiTokenEntry {
     expires_at: Option<DateTime<Utc>>,
 }
 
-static CREDENTIAL_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, i64>>> = OnceLock::new();
+/// In-memory fast-path cache for the DB-backed credential-invalidation
+/// check. The value is the highest of `users.password_changed_at`,
+/// `users.totp_verified_at`, `users.updated_at` (as a Unix timestamp)
+/// plus the `Instant` it was cached so entries can expire after
+/// [`CREDENTIAL_DB_CACHE_TTL_SECS`]. Process-local; DB is the source of
+/// truth so multi-replica deployments stay consistent (#1173).
+static CREDENTIAL_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, (i64, Instant)>>> = OnceLock::new();
 const INVALIDATION_RETENTION_SECS: i64 = 7 * 24 * 3600;
+/// How long a DB-backed credential-change watermark stays cached in the
+/// in-memory fast-path. 5 s is short enough that an invalidation on
+/// another replica is observed by every other replica almost immediately
+/// (worst-case latency = TTL + DB round-trip) while still avoiding a DB
+/// round-trip on every single request that comes in within a burst.
+const CREDENTIAL_DB_CACHE_TTL_SECS: u64 = 5;
 
-fn invalidation_map() -> &'static RwLock<HashMap<Uuid, i64>> {
+fn invalidation_map() -> &'static RwLock<HashMap<Uuid, (i64, Instant)>> {
     CREDENTIAL_INVALIDATIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Record a local credential invalidation in the in-memory fast-path so
+/// subsequent token-validation checks on this replica reject tokens issued
+/// before `now` without first waiting for the DB cache to refresh. The DB
+/// columns (`password_changed_at`, `totp_verified_at`, `updated_at`) remain
+/// the source of truth across replicas.
 pub fn invalidate_user_tokens(user_id: Uuid) {
     let now = Utc::now().timestamp();
     if let Ok(mut map) = invalidation_map().write() {
-        map.insert(user_id, now);
+        map.insert(user_id, (now, Instant::now()));
         let cutoff = now - INVALIDATION_RETENTION_SECS;
-        map.retain(|_, ts| *ts > cutoff);
+        map.retain(|_, (ts, _)| *ts > cutoff);
     }
 }
 
+/// In-memory fast-path version of the credential-invalidation check.
+///
+/// Returns `true` only when this replica has seen an `invalidate_user_tokens`
+/// call whose watermark is `>=` the token's `iat`. Comparison is `<=` so a
+/// token minted in the same wall-clock second as the invalidation is
+/// rejected too (1-second JWT `iat` resolution race; fixes the boundary
+/// bug at the old line 152).
+///
+/// In multi-replica deployments this is best-effort: an invalidation fired
+/// on replica A is not visible to replica B until `validate_token` /
+/// `refresh_tokens` consults the DB via [`is_user_credentials_changed_db`].
+/// The DB-backed check is the source of truth; this exists only as the
+/// fast-path for the same replica.
 pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
     if let Ok(map) = invalidation_map().read() {
-        if let Some(&changed_at) = map.get(&user_id) {
-            return issued_at < changed_at;
+        if let Some(&(changed_at, _)) = map.get(&user_id) {
+            return issued_at <= changed_at;
         }
     }
     false
+}
+
+/// DB-backed credential-change watermark per user, populated lazily on
+/// every `validate_access_token` / `refresh_tokens` call.
+///
+/// Returns the highest of `users.password_changed_at`,
+/// `users.totp_verified_at`, `users.updated_at` as a Unix timestamp (in
+/// seconds), or `None` if the user no longer exists. The value is cached
+/// in [`CREDENTIAL_INVALIDATIONS`] for [`CREDENTIAL_DB_CACHE_TTL_SECS`] so
+/// bursts don't hammer the DB.
+async fn fetch_credential_change_watermark(db: &PgPool, user_id: Uuid) -> Result<Option<i64>> {
+    // Fast-path: serve from cache if fresh.
+    if let Ok(map) = invalidation_map().read() {
+        if let Some(&(changed_at, recorded)) = map.get(&user_id) {
+            if recorded.elapsed().as_secs() < CREDENTIAL_DB_CACHE_TTL_SECS {
+                return Ok(Some(changed_at));
+            }
+        }
+    }
+
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            GREATEST(
+                password_changed_at,
+                COALESCE(totp_verified_at, password_changed_at),
+                updated_at
+            ) AS "watermark!"
+        FROM users
+        WHERE id = $1
+        "#,
+        user_id
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let Some(record) = row else {
+        return Ok(None);
+    };
+    let watermark = record.watermark.timestamp();
+
+    if let Ok(mut map) = invalidation_map().write() {
+        map.insert(user_id, (watermark, Instant::now()));
+        let cutoff = Utc::now().timestamp() - INVALIDATION_RETENTION_SECS;
+        map.retain(|_, (ts, _)| *ts > cutoff);
+    }
+
+    Ok(Some(watermark))
+}
+
+/// Replica-safe credential-invalidation check.
+///
+/// Returns `true` when the user's credentials have changed at or after the
+/// token's `iat`. The check is `<=` (not `<`) so a token minted in the same
+/// wall-clock second as the credential change is rejected as well; the DB
+/// timestamps have microsecond resolution but JWT `iat` only has seconds,
+/// so we lose precision crossing the boundary either way and must err on
+/// the side of rejecting (#1173).
+///
+/// Resolution order:
+///   1. Local fast-path map (rejects without a DB round-trip on the same
+///      replica that fired the invalidation).
+///   2. DB watermark (rejects across every replica, regardless of which one
+///      processed the password / TOTP / deactivation change).
+pub(crate) async fn is_token_invalidated_replica_safe(
+    db: &PgPool,
+    user_id: Uuid,
+    issued_at: i64,
+) -> Result<bool> {
+    if is_token_invalidated(user_id, issued_at) {
+        return Ok(true);
+    }
+    match fetch_credential_change_watermark(db, user_id).await? {
+        Some(watermark) => Ok(issued_at <= watermark),
+        None => Ok(false),
+    }
 }
 
 /// Global record of users whose API-token cache entries have been forcibly
@@ -480,14 +602,30 @@ impl AuthService {
             info!(user_id = %user.id, "password expired, forcing change on next login");
         }
 
-        // Generate tokens
+        // Generate tokens and persist the refresh `jti` for replay detection.
         let tokens = self.generate_tokens(&user)?;
+        self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
 
         Ok((user, tokens))
     }
 
-    /// Generate access and refresh tokens for a user
+    /// Generate access and refresh tokens for a user.
+    ///
+    /// Mints fresh `jti` and `family_id` for the refresh token. The `family_id`
+    /// is what links rotated tokens to a single login event; on detected
+    /// replay (see [`AuthService::refresh_tokens`]) every row in the family
+    /// gets revoked. Callers that perform rotation (rather than a new login)
+    /// must use [`AuthService::generate_tokens_with_family`] to preserve the
+    /// existing family. The DB row for the refresh token is **not** inserted
+    /// here; callers persist it through
+    /// [`AuthService::record_refresh_token_jti`] after generation.
     pub fn generate_tokens(&self, user: &User) -> Result<TokenPair> {
+        self.generate_tokens_with_family(user, Uuid::new_v4())
+    }
+
+    /// Generate tokens with a specific `family_id` (refresh rotation path).
+    /// See [`AuthService::generate_tokens`] for the new-login case.
+    pub fn generate_tokens_with_family(&self, user: &User, family_id: Uuid) -> Result<TokenPair> {
         let now = Utc::now();
         let access_exp = now + Duration::minutes(self.config.jwt_access_token_expiry_minutes);
         let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
@@ -500,8 +638,11 @@ impl AuthService {
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
         };
 
+        let refresh_jti = Uuid::new_v4();
         let refresh_claims = Claims {
             sub: user.id,
             username: user.username.clone(),
@@ -510,6 +651,8 @@ impl AuthService {
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(refresh_jti),
+            family_id: Some(family_id),
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
@@ -525,6 +668,66 @@ impl AuthService {
         })
     }
 
+    /// Persist a refresh-token `jti` so future presentations can detect
+    /// replay (`consumed_at IS NOT NULL`) and admin-revocations can sweep
+    /// the whole family. Idempotent: a duplicate `jti` is a no-op because
+    /// of the primary-key conflict.
+    ///
+    /// The exact `jti` / `family_id` / `iat` / `exp` values come from the
+    /// claims encoded into the refresh JWT itself, so callers should decode
+    /// the JWT they just generated and pass the embedded values in.
+    pub async fn record_refresh_token_jti(
+        &self,
+        jti: Uuid,
+        user_id: Uuid,
+        family_id: Uuid,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO refresh_token_jti (jti, user_id, family_id, issued_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (jti) DO NOTHING
+            "#,
+            jti,
+            user_id,
+            family_id,
+            issued_at,
+            expires_at,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Decode the refresh JWT we just generated and persist its `jti` row.
+    /// Convenience wrapper around [`AuthService::record_refresh_token_jti`]
+    /// for the common case where the caller has a `TokenPair` in hand.
+    pub async fn persist_refresh_jti_from_pair(
+        &self,
+        tokens: &TokenPair,
+        user_id: Uuid,
+    ) -> Result<()> {
+        let token_data = self.decode_token(&tokens.refresh_token)?;
+        let claims = &token_data.claims;
+        let jti = match claims.jti {
+            Some(j) => j,
+            None => return Ok(()),
+        };
+        let family_id = match claims.family_id {
+            Some(f) => f,
+            None => return Ok(()),
+        };
+        let issued_at = DateTime::<Utc>::from_timestamp(claims.iat, 0)
+            .ok_or_else(|| AppError::Internal("Invalid iat in minted refresh token".to_string()))?;
+        let expires_at = DateTime::<Utc>::from_timestamp(claims.exp, 0)
+            .ok_or_else(|| AppError::Internal("Invalid exp in minted refresh token".to_string()))?;
+        self.record_refresh_token_jti(jti, user_id, family_id, issued_at, expires_at)
+            .await
+    }
+
     /// Borrow the underlying database pool. Used by middleware that needs
     /// to issue queries through the same connection pool the auth service uses
     /// (e.g. download-ticket fallback in the auth middleware chain).
@@ -532,6 +735,11 @@ impl AuthService {
         &self.db
     }
 
+    /// Validate an access JWT.
+    ///
+    /// Synchronous fast-path: only consults the in-memory invalidation map.
+    /// For replica-safe credential-change rejection (across multiple pods),
+    /// use [`AuthService::validate_access_token_async`].
     pub fn validate_access_token(&self, token: &str) -> Result<Claims> {
         let token_data = self.decode_token(token)?;
 
@@ -548,21 +756,159 @@ impl AuthService {
         Ok(token_data.claims)
     }
 
-    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<(User, TokenPair)> {
-        let token_data = self.decode_token(refresh_token)?;
+    /// Replica-safe variant of [`AuthService::validate_access_token`].
+    ///
+    /// Consults the DB-backed credential-change watermark
+    /// (`password_changed_at` / `totp_verified_at` / `updated_at`) as the
+    /// source of truth, with a short in-memory cache to absorb bursts.
+    /// Required for paths that issue or rotate tokens (refresh, OCI
+    /// token-exchange) so a credential change on replica A is honored on
+    /// replica B (#1173).
+    pub async fn validate_access_token_async(&self, token: &str) -> Result<Claims> {
+        let token_data = self.decode_token(token)?;
 
-        if is_token_invalidated(token_data.claims.sub, token_data.claims.iat) {
+        if token_data.claims.token_type != "access" {
+            return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+
+        if is_token_invalidated_replica_safe(&self.db, token_data.claims.sub, token_data.claims.iat)
+            .await?
+        {
             return Err(AppError::Authentication(
                 "Token invalidated by credential change".to_string(),
             ));
         }
 
+        Ok(token_data.claims)
+    }
+
+    /// Refresh-token rotation per RFC 6819 §5.2.2.3 / RFC 9700 §2.2.2.
+    ///
+    /// Validates the presented refresh JWT, then consults `refresh_token_jti`
+    /// keyed by the embedded `jti`:
+    ///
+    ///   * No row exists  -> token never recorded (issued before #1174 landed
+    ///     or against a different family) -> accept but record a row so
+    ///     subsequent replays of the same JWT are caught.
+    ///   * Row already consumed (`consumed_at IS NOT NULL`) -> reuse detected.
+    ///     Revoke every other token in the same `family_id`, emit a
+    ///     structured security event, and return 401 to the caller. This
+    ///     matches the OAuth 2.0 Security BCP guidance.
+    ///   * Row revoked  -> reject.
+    ///   * Otherwise    -> mark consumed, mint a new pair with the same
+    ///     `family_id`, persist the new `jti`.
+    ///
+    /// Also enforces the replica-safe credential-change check (#1173).
+    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<(User, TokenPair)> {
+        let token_data = self.decode_token(refresh_token)?;
+
         if token_data.claims.token_type != "refresh" {
             return Err(AppError::Authentication("Invalid token type".to_string()));
         }
 
-        // Fetch fresh user data
-        let user = sqlx::query_as!(
+        if is_token_invalidated_replica_safe(&self.db, token_data.claims.sub, token_data.claims.iat)
+            .await?
+        {
+            return Err(AppError::Authentication(
+                "Token invalidated by credential change".to_string(),
+            ));
+        }
+
+        // Reuse/replay detection per RFC 6819. Only enforced when the
+        // refresh JWT carries a `jti` (every token minted after #1174
+        // landed does; older tokens predating the migration skip this
+        // path and continue to rotate normally).
+        if let (Some(jti), Some(family_id)) = (token_data.claims.jti, token_data.claims.family_id) {
+            let row = sqlx::query!(
+                r#"
+                SELECT consumed_at, revoked_at, family_id
+                FROM refresh_token_jti
+                WHERE jti = $1
+                "#,
+                jti
+            )
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+            if let Some(row) = row {
+                if row.revoked_at.is_some() {
+                    tracing::warn!(
+                        user_id = %token_data.claims.sub,
+                        jti = %jti,
+                        family_id = %row.family_id,
+                        "Refresh token rejected: family revoked",
+                    );
+                    return Err(AppError::Authentication(
+                        "Refresh token has been revoked".to_string(),
+                    ));
+                }
+                if row.consumed_at.is_some() {
+                    // Reuse detected. Revoke the entire family so neither
+                    // the attacker nor the legitimate user can refresh
+                    // again with any sibling token. Both sides are forced
+                    // back to a full re-auth.
+                    sqlx::query!(
+                        r#"
+                        UPDATE refresh_token_jti
+                        SET revoked_at = NOW()
+                        WHERE family_id = $1 AND revoked_at IS NULL
+                        "#,
+                        row.family_id,
+                    )
+                    .execute(&self.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+
+                    tracing::warn!(
+                        user_id = %token_data.claims.sub,
+                        jti = %jti,
+                        family_id = %row.family_id,
+                        security_event = "refresh_token_replay",
+                        "Refresh-token replay detected; revoking entire token family",
+                    );
+                    return Err(AppError::Authentication(
+                        "Refresh token replay detected".to_string(),
+                    ));
+                }
+
+                // Mark consumed (single-use rotation).
+                sqlx::query!(
+                    r#"
+                    UPDATE refresh_token_jti
+                    SET consumed_at = NOW()
+                    WHERE jti = $1 AND consumed_at IS NULL
+                    "#,
+                    jti,
+                )
+                .execute(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            }
+            // (Else: row missing -> token predates the table; we record a
+            // fresh row for the rotated jti below so any future replay of
+            // the new token IS detected.)
+
+            // Fetch fresh user data.
+            let user = self.load_active_user(token_data.claims.sub).await?;
+            let tokens = self.generate_tokens_with_family(&user, family_id)?;
+            self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
+            return Ok((user, tokens));
+        }
+
+        // Legacy path: refresh JWT has no jti (predates #1174). Rotate but
+        // open a new family so subsequent rotations get replay detection.
+        let user = self.load_active_user(token_data.claims.sub).await?;
+        let tokens = self.generate_tokens(&user)?;
+        self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
+        Ok((user, tokens))
+    }
+
+    /// Fetch a user row by id, rejecting deactivated accounts. Shared by the
+    /// refresh flow and any other path that needs the "currently-active"
+    /// view of a user.
+    async fn load_active_user(&self, user_id: Uuid) -> Result<User> {
+        sqlx::query_as!(
             User,
             r#"
             SELECT
@@ -575,15 +921,46 @@ impl AuthService {
             FROM users
             WHERE id = $1 AND is_active = true
             "#,
-            token_data.claims.sub
+            user_id
         )
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::Authentication("User not found".to_string()))?;
+        .ok_or_else(|| AppError::Authentication("User not found".to_string()))
+    }
 
-        let tokens = self.generate_tokens(&user)?;
-        Ok((user, tokens))
+    /// Revoke every refresh token in every active family for `user_id`. Called
+    /// alongside [`invalidate_user_tokens`] on password reset, deactivation,
+    /// or any other "kill all sessions" operation so that even refresh JWTs
+    /// already in flight stop working immediately on every replica.
+    pub async fn revoke_all_refresh_token_families(&self, user_id: Uuid) -> Result<u64> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE refresh_token_jti
+            SET revoked_at = NOW()
+            WHERE user_id = $1 AND revoked_at IS NULL
+            "#,
+            user_id,
+        )
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete refresh-token jti rows whose underlying JWT expired more than
+    /// `grace` ago. Called by the scheduler janitor (#1174 cleanup).
+    /// Returns the number of rows removed.
+    pub async fn cleanup_expired_refresh_token_jti(db: &PgPool, grace: Duration) -> Result<u64> {
+        let cutoff = Utc::now() - grace;
+        let result = sqlx::query!(
+            "DELETE FROM refresh_token_jti WHERE expires_at < $1",
+            cutoff,
+        )
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
     }
 
     fn decode_token(&self, token: &str) -> Result<TokenData<Claims>> {
@@ -1022,6 +1399,7 @@ impl AuthService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let tokens = self.generate_tokens(&user)?;
+        self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
         Ok((user, tokens))
     }
 
@@ -1046,6 +1424,7 @@ impl AuthService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let tokens = self.generate_tokens(&user)?;
+        self.persist_refresh_jti_from_pair(&tokens, user.id).await?;
         Ok((user, tokens))
     }
 
@@ -1431,6 +1810,8 @@ impl AuthService {
             iat: now.timestamp(),
             exp: exp.timestamp(),
             token_type: "totp_pending".to_string(),
+            jti: None,
+            family_id: None,
         };
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
@@ -1680,6 +2061,8 @@ mod tests {
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
         };
 
         let refresh_claims = Claims {
@@ -1690,6 +2073,8 @@ mod tests {
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(Uuid::new_v4()),
+            family_id: Some(Uuid::new_v4()),
         };
 
         let access_token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
@@ -1734,6 +2119,8 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::days(7)).timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(Uuid::new_v4()),
+            family_id: Some(Uuid::new_v4()),
         };
 
         let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
@@ -1761,6 +2148,8 @@ mod tests {
             iat: (now - Duration::hours(2)).timestamp(),
             exp: (now - Duration::hours(1)).timestamp(), // expired 1 hour ago
             token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -1782,6 +2171,8 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -1804,6 +2195,8 @@ mod tests {
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -1812,6 +2205,41 @@ mod tests {
         assert_eq!(decoded.username, "test");
         assert!(decoded.is_admin);
         assert_eq!(decoded.token_type, "access");
+    }
+
+    #[test]
+    fn test_claims_with_jti_and_family_serialize() {
+        // Verify the new refresh-token fields round-trip through serde,
+        // and that an old JWT without them still parses (#1174).
+        let jti = Uuid::new_v4();
+        let family = Uuid::new_v4();
+        let claims = Claims {
+            sub: Uuid::new_v4(),
+            username: "u".to_string(),
+            email: "u@x.com".to_string(),
+            is_admin: false,
+            iat: 1000,
+            exp: 2000,
+            token_type: "refresh".to_string(),
+            jti: Some(jti),
+            family_id: Some(family),
+        };
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("jti"));
+        assert!(json.contains("family_id"));
+        let decoded: Claims = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.jti, Some(jti));
+        assert_eq!(decoded.family_id, Some(family));
+
+        // Legacy JWT without jti/family_id should still parse cleanly.
+        let legacy = r#"{
+            "sub":"00000000-0000-0000-0000-000000000001",
+            "username":"u","email":"u@x.com","is_admin":false,
+            "iat":1000,"exp":2000,"token_type":"refresh"
+        }"#;
+        let parsed: Claims = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.jti.is_none());
+        assert!(parsed.family_id.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -2473,13 +2901,26 @@ mod tests {
     }
 
     #[test]
-    fn test_token_issued_at_exact_invalidation_time_passes() {
-        // issued_at < changed_at is the check, so equal timestamps should pass
+    fn test_token_issued_at_exact_invalidation_time_is_rejected() {
+        // Boundary fix (#1173): `iat == changed_at` (1-second JWT resolution)
+        // must be rejected. Previously this was `<` and silently let through
+        // tokens minted in the same wall-clock second as the invalidation.
         let user_id = Uuid::new_v4();
+        let pre = Utc::now().timestamp();
         invalidate_user_tokens(user_id);
-        let now = Utc::now().timestamp();
-        // Token with iat after changed_at should not be invalidated
-        assert!(!is_token_invalidated(user_id, now + 1));
+        // A token issued in the same second as the invalidation (iat == watermark)
+        // should now be rejected.
+        let map = invalidation_map().read().unwrap();
+        let &(watermark, _) = map.get(&user_id).unwrap();
+        drop(map);
+        assert!(
+            is_token_invalidated(user_id, watermark),
+            "same-second token must be rejected"
+        );
+        // Token issued strictly before invalidation is still rejected.
+        assert!(is_token_invalidated(user_id, pre - 1));
+        // Token issued strictly after invalidation is still accepted.
+        assert!(!is_token_invalidated(user_id, watermark + 1));
     }
 
     #[test]
@@ -2784,6 +3225,8 @@ mod tests {
             iat: Utc::now().timestamp(),
             exp: (Utc::now() + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
+            jti: None,
+            family_id: None,
         };
         let payload_json = serde_json::to_vec(&claims).unwrap();
         let payload_b64 = {
@@ -2974,5 +3417,260 @@ mod tests {
             "deactivate_missing_users with no targets must succeed, got: {result:?}"
         );
         assert_eq!(result.unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1173: DB-backed credential-invalidation check.
+    //
+    // These tests need a real DB because the watermark is derived from
+    // `users.password_changed_at` / `totp_verified_at` / `updated_at`. They
+    // skip silently when `DATABASE_URL` is unset so local `cargo test --lib`
+    // still passes without docker compose. The CI coverage job runs against
+    // a postgres service and exercises every branch.
+    // -----------------------------------------------------------------------
+
+    /// Insert a fresh user row whose credential-change watermarks
+    /// (`password_changed_at`, `updated_at`) are backdated by 60 seconds so
+    /// tokens minted at `NOW()` are not immediately flagged invalidated by
+    /// the replica-safe `iat <= watermark` check. In production a token's
+    /// `iat` is always strictly later than `password_changed_at` because
+    /// the password is set at user creation, not at token issuance.
+    async fn insert_test_user(pool: &sqlx::PgPool, username: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider,
+                               is_active, is_admin, password_changed_at,
+                               failed_login_attempts, created_at, updated_at)
+            VALUES ($1, $2, $3, 'unused', 'local', true, false,
+                    NOW() - INTERVAL '60 seconds', 0,
+                    NOW() - INTERVAL '60 seconds',
+                    NOW() - INTERVAL '60 seconds')
+            "#,
+            id,
+            username,
+            format!("{username}@test.com"),
+        )
+        .execute(pool)
+        .await
+        .expect("insert test user");
+        id
+    }
+
+    #[tokio::test]
+    async fn test_replica_safe_invalidation_via_db() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let username = format!("repl_test_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+
+        // Simulate a token minted before any credential change.
+        let iat_before = (Utc::now() - Duration::seconds(60)).timestamp();
+
+        // Token issued before the user's existing password_changed_at watermark
+        // (which we just inserted as NOW()) must be flagged invalidated by the
+        // DB-backed check — this exercises the cross-replica path because the
+        // in-memory fast-path map is empty for this user_id on this process.
+        let rejected = is_token_invalidated_replica_safe(&pool, user_id, iat_before)
+            .await
+            .expect("DB check must succeed");
+        assert!(rejected, "token issued before watermark must be rejected");
+
+        // A token issued well after the watermark should be accepted.
+        let iat_after = (Utc::now() + Duration::seconds(60)).timestamp();
+        let rejected = is_token_invalidated_replica_safe(&pool, user_id, iat_after)
+            .await
+            .expect("DB check must succeed");
+        assert!(!rejected, "token issued after watermark must be accepted");
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_replica_safe_invalidation_unknown_user_accepts() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // A user the DB has never seen should not flag as invalidated; the
+        // request will be rejected at the load-user step instead.
+        let unknown = Uuid::new_v4();
+        let result = is_token_invalidated_replica_safe(&pool, unknown, 0)
+            .await
+            .expect("query succeeds even for missing user");
+        assert!(!result);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1174: refresh-token replay detection.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_refresh_token_replay_revokes_family() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg.clone());
+
+        let username = format!("replay_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username.clone();
+
+        // First rotation: legitimate refresh, mints token B in same family.
+        let token_a = service.generate_tokens(&user).expect("tokens A");
+        service
+            .persist_refresh_jti_from_pair(&token_a, user_id)
+            .await
+            .expect("persist A");
+
+        let (_, token_b) = service
+            .refresh_tokens(&token_a.refresh_token)
+            .await
+            .expect("legit rotation succeeds");
+
+        // Replay token A's refresh token: must reject AND revoke the family
+        // (which means token B's jti is now flagged revoked too).
+        let replay = service.refresh_tokens(&token_a.refresh_token).await;
+        assert!(replay.is_err(), "replay must be rejected");
+
+        // Attempt to use the rotated token B now — also rejected because the
+        // whole family is revoked.
+        let after_replay = service.refresh_tokens(&token_b.refresh_token).await;
+        assert!(
+            after_replay.is_err(),
+            "sibling token from revoked family must be rejected"
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_legitimate_rotation_succeeds() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let username = format!("rotate_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        // Issue token T0, rotate to T1, rotate to T2 — each successive
+        // rotation must succeed without tripping replay detection.
+        let t0 = service.generate_tokens(&user).expect("t0");
+        service
+            .persist_refresh_jti_from_pair(&t0, user_id)
+            .await
+            .expect("persist t0");
+
+        let (_, t1) = service
+            .refresh_tokens(&t0.refresh_token)
+            .await
+            .expect("t0 -> t1");
+        let (_, _t2) = service
+            .refresh_tokens(&t1.refresh_token)
+            .await
+            .expect("t1 -> t2");
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_refresh_token_jti() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let username = format!("cleanup_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+
+        // Insert a row whose expires_at is two days in the past.
+        let stale_jti = Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO refresh_token_jti
+                (jti, user_id, family_id, issued_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            stale_jti,
+            user_id,
+            Uuid::new_v4(),
+            Utc::now() - Duration::days(10),
+            Utc::now() - Duration::days(2),
+        )
+        .execute(&pool)
+        .await
+        .expect("insert stale row");
+
+        // Grace 1h: row with expires_at 2 days ago must be deleted.
+        let removed = AuthService::cleanup_expired_refresh_token_jti(&pool, Duration::hours(1))
+            .await
+            .expect("cleanup succeeds");
+        assert!(
+            removed >= 1,
+            "expected at least the stale row to be removed"
+        );
+
+        // Confirm row is gone.
+        let row = sqlx::query!(
+            "SELECT jti FROM refresh_token_jti WHERE jti = $1",
+            stale_jti
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("query");
+        assert!(row.is_none(), "stale row must be deleted");
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
     }
 }

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE refresh_token_jti\n            SET revoked_at = NOW()\n            WHERE user_id = $1 AND revoked_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1eddf57942d2455ce8c9e8e2f051bf8a838d17d878d69a93519900a8af1bd42a"
+}

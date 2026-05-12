@@ -101,6 +101,37 @@ pub fn spawn_all(
         }
     });
 
+    // Refresh-token jti table cleanup (every hour). Drops rows whose
+    // underlying refresh JWT expired more than the grace window ago. The
+    // grace allows admins / forensics to inspect recently-replayed tokens
+    // (their `revoked_at` row would otherwise vanish the moment the JWT
+    // expired). Issue #1174.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            let mut ticker = interval(Duration::from_secs(3600)); // 1 hour
+            let grace = chrono::Duration::hours(24);
+
+            loop {
+                ticker.tick().await;
+                match crate::services::auth_service::AuthService::cleanup_expired_refresh_token_jti(
+                    &db, grace,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!("Pruned {} expired refresh_token_jti rows", n);
+                    }
+                    Err(e) => {
+                        tracing::warn!("refresh_token_jti cleanup failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // Health monitoring (every 60 seconds)
     {
         let db = db.clone();
