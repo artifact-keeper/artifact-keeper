@@ -12,6 +12,7 @@ pub mod backup_service;
 pub mod build_service;
 pub mod dependency_track_service;
 pub mod email_dispatcher;
+pub mod email_rate_limiter;
 pub mod encryption;
 pub mod event_bus;
 pub mod grype_scanner;

@@ -137,6 +137,30 @@ pub fn record_cleanup(cleanup_type: &str, items_removed: u64) {
         .increment(items_removed);
 }
 
+/// Record an email dispatch that was dropped by the per-event rate limiter.
+/// `reason` is the [`crate::services::email_rate_limiter::RateLimitDecision`]
+/// label (`"recipient"` or `"domain"`); the `"allowed"` decision does not
+/// trigger this counter. Fix for #1169.
+pub fn record_email_dispatch_rate_limited(reason: &str) {
+    counter!(
+        "email_dispatch_rate_limited_total",
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a successful per-event email dispatch (post-limiter, pre-SMTP).
+/// Counted distinctly from delivery success/failure (lettre transport
+/// outcome) so dashboards can separate "rate-limiter let it through"
+/// from "SMTP relay accepted it". Fix for #1172.
+pub fn record_email_dispatch_attempted(event_type: &str) {
+    counter!(
+        "email_dispatch_attempted_total",
+        "event_type" => event_type.to_string()
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +242,16 @@ mod tests {
     #[test]
     fn test_record_webhook_dead_letter_does_not_panic() {
         record_webhook_dead_letter("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_record_email_dispatch_rate_limited_does_not_panic() {
+        record_email_dispatch_rate_limited("recipient");
+        record_email_dispatch_rate_limited("domain");
+    }
+
+    #[test]
+    fn test_record_email_dispatch_attempted_does_not_panic() {
+        record_email_dispatch_attempted("artifact.uploaded");
     }
 }

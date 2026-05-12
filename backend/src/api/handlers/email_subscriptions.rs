@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::repository_service::RepositoryService;
 
 /// Defense-in-depth cap on how many recipient addresses one subscription
@@ -118,6 +119,53 @@ impl From<EmailSubscriptionRow> for EmailSubscriptionResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EmailSubscriptionListResponse {
     pub subscriptions: Vec<EmailSubscriptionResponse>,
+}
+
+/// Fire-and-forget audit log for email subscription mutations (#1170).
+///
+/// Pattern follows the 2026-03-23 audit sprint shape (see
+/// `api::handlers::auth::audit_auth`): write failures are swallowed at
+/// `warn!` level so an audit-store hiccup never turns into a 500 on the
+/// caller's mutating request. The subscription is already committed
+/// (we audit AFTER the SQL) so a missed audit row is the lesser evil.
+///
+/// `resource_type = Repository, resource_id = repository_id` so audit
+/// queries scoped to a repository surface the subscription mutation
+/// (per the issue spec). `subscription_id` is carried in `details` so
+/// the row is still traceable back to the specific subscription.
+async fn audit_subscription_mutation(
+    state: &SharedState,
+    action: AuditAction,
+    actor_user_id: Uuid,
+    repository_id: Uuid,
+    subscription_id: Uuid,
+    extra_details: serde_json::Value,
+) {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "subscription_id".to_string(),
+        serde_json::Value::String(subscription_id.to_string()),
+    );
+    if let serde_json::Value::Object(extras) = extra_details {
+        for (k, v) in extras {
+            details.insert(k, v);
+        }
+    }
+
+    let entry = AuditEntry::new(action, ResourceType::Repository)
+        .user(actor_user_id)
+        .resource(repository_id)
+        .details(serde_json::Value::Object(details));
+
+    if let Err(e) = AuditService::new(state.db.clone()).log(entry).await {
+        tracing::warn!(
+            error = %e,
+            action = action.as_str(),
+            repository_id = %repository_id,
+            subscription_id = %subscription_id,
+            "Failed to write email subscription audit log; mutation already committed"
+        );
+    }
 }
 
 /// Require that the caller can mutate email subscriptions on this repository.
@@ -301,6 +349,24 @@ pub async fn create_subscription(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // #1170: audit log AFTER successful insert. recipient_count is
+    // surfaced so SOC 2 auditors can spot a sub being created with a
+    // wide fan-out without reading the raw recipient list (which is
+    // PII).
+    audit_subscription_mutation(
+        &state,
+        AuditAction::EmailSubscriptionCreated,
+        auth.user_id,
+        repo.id,
+        row.id,
+        serde_json::json!({
+            "recipient_count": row.recipients.len(),
+            "event_types": row.event_types,
+            "enabled": row.enabled,
+        }),
+    )
+    .await;
+
     Ok(Json(row.into()))
 }
 
@@ -352,6 +418,18 @@ pub async fn delete_subscription(
             subscription_id, key
         )));
     }
+
+    // #1170: audit AFTER the row is gone. Match the create-side shape so
+    // an audit consumer can pair the two events on `subscription_id`.
+    audit_subscription_mutation(
+        &state,
+        AuditAction::EmailSubscriptionDeleted,
+        auth.user_id,
+        repo.id,
+        subscription_id,
+        serde_json::json!({}),
+    )
+    .await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

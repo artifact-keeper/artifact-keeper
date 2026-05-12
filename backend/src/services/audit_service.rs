@@ -59,6 +59,10 @@ pub enum AuditAction {
     PluginUninstalled,
     PluginEnabled,
     PluginDisabled,
+
+    // Email subscriptions (#1170)
+    EmailSubscriptionCreated,
+    EmailSubscriptionDeleted,
 }
 
 impl AuditAction {
@@ -99,6 +103,8 @@ impl AuditAction {
             AuditAction::PluginUninstalled => "PLUGIN_UNINSTALLED",
             AuditAction::PluginEnabled => "PLUGIN_ENABLED",
             AuditAction::PluginDisabled => "PLUGIN_DISABLED",
+            AuditAction::EmailSubscriptionCreated => "EMAIL_SUBSCRIPTION_CREATED",
+            AuditAction::EmailSubscriptionDeleted => "EMAIL_SUBSCRIPTION_DELETED",
         }
     }
 }
@@ -474,6 +480,14 @@ mod tests {
         );
         assert_eq!(AuditAction::PluginEnabled.as_str(), "PLUGIN_ENABLED");
         assert_eq!(AuditAction::PluginDisabled.as_str(), "PLUGIN_DISABLED");
+        assert_eq!(
+            AuditAction::EmailSubscriptionCreated.as_str(),
+            "EMAIL_SUBSCRIPTION_CREATED"
+        );
+        assert_eq!(
+            AuditAction::EmailSubscriptionDeleted.as_str(),
+            "EMAIL_SUBSCRIPTION_DELETED"
+        );
     }
 
     // -----------------------------------------------------------------------
