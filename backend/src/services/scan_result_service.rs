@@ -70,6 +70,35 @@ pub(crate) fn build_dashboard_summary(
     }
 }
 
+/// Build the `details` JSON payload for a `SCAN_REAPED` audit entry (#1063).
+///
+/// Pure: takes the reaped row's identifiers and timestamps and returns the
+/// `serde_json::Value` ready to attach to an `AuditEntry`. Kept separate
+/// from `cleanup_stuck_scans` so the details schema (field names, system-
+/// actor marker, JSON shape) can be locked down by unit tests without
+/// needing a Postgres connection — SIEM rules in production parse these
+/// fields, so accidental renames are a silent regression we want a fast
+/// guard on.
+pub(crate) fn build_scan_reaped_audit_details(
+    scan_id: Uuid,
+    artifact_id: Uuid,
+    repository_id: Uuid,
+    started_at: impl serde::Serialize,
+    reaped_at: impl serde::Serialize,
+    threshold_secs: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "scan_id": scan_id,
+        "artifact_id": artifact_id,
+        "repository_id": repository_id,
+        "started_at": started_at,
+        "reaped_at": reaped_at,
+        "threshold_secs": threshold_secs,
+        "reason": "stuck_running_janitor",
+        "actor": "system:stuck_scan_janitor",
+    })
+}
+
 pub struct ScanResultService {
     db: PgPool,
 }
@@ -378,16 +407,14 @@ impl ScanResultService {
         // see this transition rather than only the prometheus counter.
         let audit = AuditService::new(self.db.clone());
         for row in &reaped {
-            let details = serde_json::json!({
-                "scan_id": row.id,
-                "artifact_id": row.artifact_id,
-                "repository_id": row.repository_id,
-                "started_at": row.started_at,
-                "reaped_at": row.completed_at,
-                "threshold_secs": secs,
-                "reason": "stuck_running_janitor",
-                "actor": "system:stuck_scan_janitor",
-            });
+            let details = build_scan_reaped_audit_details(
+                row.id,
+                row.artifact_id,
+                row.repository_id,
+                row.started_at,
+                row.completed_at,
+                secs,
+            );
             let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
                 .resource(row.id)
                 .details(details);
@@ -970,6 +997,131 @@ mod tests {
         assert_eq!(json["total_scans"], 500);
         assert_eq!(json["repos_grade_a"], 7);
         assert_eq!(json["policy_violations_blocked"], 0);
+    }
+
+    // =======================================================================
+    // build_scan_reaped_audit_details (extracted pure function, #1063)
+    //
+    // SIEM rules in production parse the `details` JSON shape, so accidental
+    // field renames are a silent regression. These tests lock the schema.
+    // =======================================================================
+
+    fn sample_reaped_details(threshold_secs: i64) -> (Uuid, Uuid, Uuid, serde_json::Value) {
+        let scan_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(45);
+        let reaped_at = chrono::Utc::now();
+        let details = build_scan_reaped_audit_details(
+            scan_id,
+            artifact_id,
+            repository_id,
+            Some(started_at),
+            Some(reaped_at),
+            threshold_secs,
+        );
+        (scan_id, artifact_id, repository_id, details)
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_carries_row_ids() {
+        let (scan_id, artifact_id, repository_id, details) = sample_reaped_details(1800);
+        assert_eq!(
+            details["scan_id"].as_str(),
+            Some(scan_id.to_string().as_str()),
+            "scan_id must round-trip so operators can join back to scan_results"
+        );
+        assert_eq!(
+            details["artifact_id"].as_str(),
+            Some(artifact_id.to_string().as_str())
+        );
+        assert_eq!(
+            details["repository_id"].as_str(),
+            Some(repository_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_carries_timestamps() {
+        let (_, _, _, details) = sample_reaped_details(1800);
+        assert!(
+            details.get("started_at").is_some() && !details["started_at"].is_null(),
+            "details.started_at must be populated when the row had a started_at"
+        );
+        assert!(
+            details.get("reaped_at").is_some() && !details["reaped_at"].is_null(),
+            "details.reaped_at must be populated"
+        );
+        assert_eq!(details["threshold_secs"], 1800);
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_marks_system_actor() {
+        // SIEM/SOAR rules distinguish janitor-initiated reaps from human-
+        // initiated state changes by `details.actor` and `details.reason`.
+        // Renaming or dropping either is a security-relevant regression.
+        let (_, _, _, details) = sample_reaped_details(900);
+        assert_eq!(details["reason"], "stuck_running_janitor");
+        assert_eq!(details["actor"], "system:stuck_scan_janitor");
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_null_timestamps_serialize() {
+        // sqlx returns started_at / completed_at as Option<DateTime>; an
+        // Option::None must serialize as JSON null rather than panic, so a
+        // race where completed_at hasn't been set is recorded honestly.
+        let details = build_scan_reaped_audit_details(
+            Uuid::nil(),
+            Uuid::nil(),
+            Uuid::nil(),
+            None::<chrono::DateTime<chrono::Utc>>,
+            None::<chrono::DateTime<chrono::Utc>>,
+            3600,
+        );
+        assert!(details["started_at"].is_null());
+        assert!(details["reaped_at"].is_null());
+        assert_eq!(details["threshold_secs"], 3600);
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_carries_threshold_value() {
+        // threshold_secs roundtrips so an audit reader can correlate the
+        // reaped row's started_at-vs-reaped_at gap against the threshold
+        // that was in effect at the time of the reap.
+        let details = build_scan_reaped_audit_details(
+            Uuid::nil(),
+            Uuid::nil(),
+            Uuid::nil(),
+            Some(chrono::Utc::now()),
+            Some(chrono::Utc::now()),
+            i64::MAX,
+        );
+        assert_eq!(details["threshold_secs"], i64::MAX);
+    }
+
+    #[test]
+    fn test_build_scan_reaped_audit_details_has_exactly_expected_fields() {
+        // Future field additions are fine, but they must come with explicit
+        // test updates rather than slipping in unnoticed. Operators relying
+        // on the audit schema (or downstream SIEM/SOAR rules that parse it)
+        // need a single source of truth for the allowed shape.
+        let (_, _, _, details) = sample_reaped_details(120);
+        let obj = details.as_object().expect("details must be a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "actor",
+                "artifact_id",
+                "reaped_at",
+                "reason",
+                "repository_id",
+                "scan_id",
+                "started_at",
+                "threshold_secs",
+            ],
+        );
     }
 
     // =======================================================================
