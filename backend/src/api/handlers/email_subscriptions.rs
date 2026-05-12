@@ -231,6 +231,17 @@ pub(crate) fn validate_recipients(recipients: &[String]) -> Result<()> {
     }
     for addr in recipients {
         let trimmed = addr.trim();
+        // Reject control characters before any other check: a recipient
+        // like `"victim@x.com\n[ERROR] forged"` is syntactically a valid
+        // email by the @-count rule below but is a log-forgery payload
+        // (it survives into the dispatcher's `tracing::warn!` lines).
+        // The dispatcher additionally sanitizes at log time, but rejecting
+        // at write time prevents bad rows from ever landing.
+        if addr.chars().any(|c| c.is_control()) {
+            return Err(AppError::Validation(
+                "recipient contains control characters".to_string(),
+            ));
+        }
         let bad = trimmed.is_empty()
             || !trimmed.contains('@')
             || trimmed.starts_with('@')
@@ -772,6 +783,39 @@ mod tests {
             AppError::Validation(msg) => assert!(msg.contains("plain-no-at")),
             other => panic!("expected Validation, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_newline_in_address() {
+        // Log-forgery prevention: a stored recipient that survives into
+        // the dispatcher's tracing logs could otherwise inject fake log
+        // lines. Reject at write time.
+        let err =
+            validate_recipients(&["victim@x.com\n[ERROR] fake".to_string()]).unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("control")),
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_carriage_return() {
+        let err = validate_recipients(&["a\rb@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_ansi_escape() {
+        // ESC (0x1b) is a control char; rejection prevents ANSI-colored
+        // log forgery in terminal log viewers.
+        let err = validate_recipients(&["a\x1b[31m@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_null_byte() {
+        let err = validate_recipients(&["a\0b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
     }
 
     #[test]

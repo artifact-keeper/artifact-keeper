@@ -149,14 +149,43 @@ pub fn record_email_dispatch_rate_limited(reason: &str) {
     .increment(1);
 }
 
-/// Record a successful per-event email dispatch (post-limiter, pre-SMTP).
-/// Counted distinctly from delivery success/failure (lettre transport
-/// outcome) so dashboards can separate "rate-limiter let it through"
-/// from "SMTP relay accepted it". Fix for #1172.
+/// Allow-list of event-type strings allowed as a Prometheus label on
+/// the email-dispatch counters. Anything outside this set collapses to
+/// `"other"` before becoming a label so a future emitter cannot blow up
+/// cardinality with a `format!("event.{id}")` string.
+const KNOWN_EMAIL_EVENT_TYPES: &[&str] = &[
+    "artifact.created",
+    "artifact.uploaded",
+    "artifact.deleted",
+    "scan.completed",
+    "scan.failed",
+    "repository.created",
+    "repository.deleted",
+    "license.violation",
+    "vulnerability.detected",
+];
+
+/// Collapse an arbitrary event-type string to a bounded label set. See
+/// [`KNOWN_EMAIL_EVENT_TYPES`] for the contract.
+fn bounded_email_event_type(event_type: &str) -> &'static str {
+    for known in KNOWN_EMAIL_EVENT_TYPES {
+        if *known == event_type {
+            return known;
+        }
+    }
+    "other"
+}
+
+/// Record a per-recipient email dispatch attempt (post-limiter,
+/// pre-SMTP). Paired with `email_dispatch_rate_limited_total`: the two
+/// counters share the per-recipient unit so `attempted + rate_limited`
+/// equals total per-recipient tries. `event_type` is collapsed to a
+/// bounded allow-list (`KNOWN_EMAIL_EVENT_TYPES`) so a future emitter
+/// cannot blow up Prometheus cardinality. Fix for #1172.
 pub fn record_email_dispatch_attempted(event_type: &str) {
     counter!(
         "email_dispatch_attempted_total",
-        "event_type" => event_type.to_string()
+        "event_type" => bounded_email_event_type(event_type)
     )
     .increment(1);
 }
@@ -253,5 +282,20 @@ mod tests {
     #[test]
     fn test_record_email_dispatch_attempted_does_not_panic() {
         record_email_dispatch_attempted("artifact.uploaded");
+    }
+
+    #[test]
+    fn test_bounded_email_event_type_passes_known() {
+        assert_eq!(bounded_email_event_type("artifact.uploaded"), "artifact.uploaded");
+        assert_eq!(bounded_email_event_type("scan.completed"), "scan.completed");
+        assert_eq!(bounded_email_event_type("vulnerability.detected"), "vulnerability.detected");
+    }
+
+    #[test]
+    fn test_bounded_email_event_type_collapses_unknown_to_other() {
+        // High-cardinality input must not become a distinct label.
+        assert_eq!(bounded_email_event_type("event.uuid-12345"), "other");
+        assert_eq!(bounded_email_event_type(""), "other");
+        assert_eq!(bounded_email_event_type("anything.else"), "other");
     }
 }

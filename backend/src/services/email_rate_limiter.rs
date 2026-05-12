@@ -53,6 +53,36 @@ pub const DEFAULT_PER_RECIPIENT_PER_MIN: u32 = 100;
 /// `AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN`.
 pub const DEFAULT_PER_DOMAIN_PER_MIN: u32 = 1000;
 
+/// Soft cap on the recipient-bucket map. When exceeded, idle entries
+/// (full bucket = behaviourally indistinguishable from a fresh one) are
+/// pruned on access so memory is bounded under subscription churn.
+const RECIPIENT_MAP_SOFT_CAP: usize = 10_000;
+
+/// Soft cap on the domain-bucket map. Same eviction trigger as the
+/// recipient map.
+const DOMAIN_MAP_SOFT_CAP: usize = 2_000;
+
+/// Parse an `AK_EMAIL_RATE_LIMIT_*_PER_MIN` env value, applying the
+/// fallback policy:
+/// - unset / unparseable / non-numeric => `default`
+/// - `0` => `default` (treated as misconfiguration: `0` would otherwise
+///   build a permanently-empty bucket and silently drop 100% of mail,
+///   which is almost never what an operator typing `=0` intends)
+/// - any other `u32` => that value
+pub(crate) fn parse_per_min_env(raw: Option<&str>, default: u32) -> u32 {
+    match raw.and_then(|v| v.parse::<u32>().ok()) {
+        Some(0) => {
+            tracing::warn!(
+                default = default,
+                "Email rate-limit env var parsed as 0, which would block all mail. Falling back to default."
+            );
+            default
+        }
+        Some(n) => n,
+        None => default,
+    }
+}
+
 /// A single token bucket: capacity, current token count, refill rate, last
 /// refill timestamp. Refill is computed lazily on `try_consume` from the
 /// elapsed wall-clock so we don't need a background ticker task.
@@ -152,17 +182,22 @@ impl EmailRateLimiter {
     }
 
     /// Construct from `AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN` and
-    /// `AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN`. Unset / unparseable values
-    /// fall back to the defaults; we never panic the boot on a typo.
+    /// `AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN`. Unset / unparseable / `0`
+    /// values fall back to defaults via [`parse_per_min_env`]; we never
+    /// panic the boot on a typo and never silently disable enforcement.
     pub fn from_env() -> Self {
-        let per_recipient = std::env::var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(DEFAULT_PER_RECIPIENT_PER_MIN);
-        let per_domain = std::env::var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(DEFAULT_PER_DOMAIN_PER_MIN);
+        let per_recipient = parse_per_min_env(
+            std::env::var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN")
+                .ok()
+                .as_deref(),
+            DEFAULT_PER_RECIPIENT_PER_MIN,
+        );
+        let per_domain = parse_per_min_env(
+            std::env::var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN")
+                .ok()
+                .as_deref(),
+            DEFAULT_PER_DOMAIN_PER_MIN,
+        );
         Self::new(per_recipient, per_domain)
     }
 
@@ -191,8 +226,9 @@ impl EmailRateLimiter {
         recipient: &str,
         now: Instant,
     ) -> RateLimitDecision {
-        let domain = extract_domain(recipient);
-        let recipient_key = (subscription_id, recipient.to_ascii_lowercase());
+        let recipient_lc = recipient.to_ascii_lowercase();
+        let domain = extract_domain(&recipient_lc);
+        let recipient_key = (subscription_id, recipient_lc);
 
         let mut state = match self.state.lock() {
             Ok(g) => g,
@@ -202,11 +238,23 @@ impl EmailRateLimiter {
             Err(p) => p.into_inner(),
         };
 
+        // Bound the maps under subscription churn / attacker-driven
+        // domain variation. Pruning runs lazily and only when we've
+        // crossed the soft cap; an idle bucket at full capacity is
+        // observationally identical to a freshly created one, so
+        // dropping it changes nothing operator-visible.
+        if state.recipients.len() > RECIPIENT_MAP_SOFT_CAP {
+            state.recipients.retain(|_, b| b.tokens < b.capacity);
+        }
+        if state.domains.len() > DOMAIN_MAP_SOFT_CAP {
+            state.domains.retain(|_, b| b.tokens < b.capacity);
+        }
+
         // Per-recipient gate first. Cheap and per-subscription scoped so
         // a runaway sub can't drain the global domain pool by itself.
         let recipient_bucket = state
             .recipients
-            .entry(recipient_key)
+            .entry(recipient_key.clone())
             .or_insert_with(|| Bucket::new_full(self.per_recipient_per_min, now));
         if !recipient_bucket.try_consume(now) {
             return RateLimitDecision::RecipientLimited;
@@ -223,16 +271,9 @@ impl EmailRateLimiter {
             // limiter would silently leak tokens out of the per-recipient
             // bucket and skew its rate.
             //
-            // We've already pulled the recipient bucket entry out, but
-            // the mutable borrow ended above; re-fetch and refund.
-            //
             // SAFETY of correctness: the recipient bucket capacity is
             // bounded so saturating at capacity is fine.
-            // We can't reuse `recipient_bucket` here because of the
-            // borrow-checker rules around two mutable map entries; do a
-            // second lookup.
-            let recipient_key2 = (subscription_id, recipient.to_ascii_lowercase());
-            if let Some(b) = state.recipients.get_mut(&recipient_key2) {
+            if let Some(b) = state.recipients.get_mut(&recipient_key) {
                 b.tokens = (b.tokens + 1.0).min(b.capacity);
             }
             return RateLimitDecision::DomainLimited;
@@ -242,13 +283,18 @@ impl EmailRateLimiter {
     }
 
     /// Number of recipient-bucket entries currently tracked. Exposed for
-    /// tests + observability; the map is bounded only by recipient
-    /// cardinality. In practice email_subscriptions caps each row at 32
-    /// recipients (see `email_subscriptions::MAX_RECIPIENTS_PER_SUBSCRIPTION`)
-    /// so total entries are O(subscriptions * 32).
+    /// tests + observability; bounded by `RECIPIENT_MAP_SOFT_CAP` via
+    /// lazy pruning in `try_acquire_at`.
     #[cfg(test)]
     pub(crate) fn recipient_entry_count(&self) -> usize {
         self.state.lock().map(|s| s.recipients.len()).unwrap_or(0)
+    }
+
+    /// Number of domain-bucket entries currently tracked. Exposed for
+    /// tests; bounded by `DOMAIN_MAP_SOFT_CAP`.
+    #[cfg(test)]
+    pub(crate) fn domain_entry_count(&self) -> usize {
+        self.state.lock().map(|s| s.domains.len()).unwrap_or(0)
     }
 }
 
@@ -306,24 +352,28 @@ mod tests {
 
     #[test]
     fn test_bucket_refills_over_time() {
-        let mut b = Bucket::new_full(60, Instant::now());
-        // Drain everything.
+        // Snapshot `t0` once and reuse for the drain loop; reading
+        // `Instant::now()` each iteration would let the bucket refill
+        // mid-drain on a slow CI runner and make the empty-check flake.
+        let t0 = Instant::now();
+        let mut b = Bucket::new_full(60, t0);
         for _ in 0..60 {
-            assert!(b.try_consume(Instant::now()));
+            assert!(b.try_consume(t0));
         }
-        // Empty now.
-        assert!(!b.try_consume(Instant::now()));
+        // Empty at `t0`.
+        assert!(!b.try_consume(t0));
         // Advance one second: refill_per_sec = 60/60 = 1 token/sec
-        let future = Instant::now() + Duration::from_secs(1);
+        let future = t0 + Duration::from_secs(1);
         assert!(b.try_consume(future));
     }
 
     #[test]
     fn test_bucket_cap_at_capacity() {
-        let mut b = Bucket::new_full(100, Instant::now());
+        let t0 = Instant::now();
+        let mut b = Bucket::new_full(100, t0);
         // Advance an hour: refill_per_sec * 3600 = 100*60 tokens worth,
         // but capacity caps at 100.
-        let future = Instant::now() + Duration::from_secs(3600);
+        let future = t0 + Duration::from_secs(3600);
         // Consume one to force refill computation.
         assert!(b.try_consume(future));
         // After the consume, tokens is capacity - 1 = 99.
@@ -525,15 +575,47 @@ mod tests {
     }
 
     #[test]
-    fn test_from_env_uses_defaults_when_unset() {
-        // We don't want to mutate process env in tests, so just verify
-        // the explicit-new path reflects the defaults and trust that
-        // from_env() chains to it; the env-parse cases are exercised
-        // implicitly via the unwrap_or(default) chain.
-        let limiter =
-            EmailRateLimiter::new(DEFAULT_PER_RECIPIENT_PER_MIN, DEFAULT_PER_DOMAIN_PER_MIN);
-        assert_eq!(limiter.per_recipient_per_min(), 100);
-        assert_eq!(limiter.per_domain_per_min(), 1000);
+    fn test_parse_per_min_env_unset_returns_default() {
+        assert_eq!(parse_per_min_env(None, 100), 100);
+    }
+
+    #[test]
+    fn test_parse_per_min_env_valid_value() {
+        assert_eq!(parse_per_min_env(Some("250"), 100), 250);
+    }
+
+    #[test]
+    fn test_parse_per_min_env_zero_clamps_to_default() {
+        // `0` would build a permanently-empty bucket and silently drop
+        // all mail. That's almost never what an operator typing `=0`
+        // intends, so we clamp.
+        assert_eq!(parse_per_min_env(Some("0"), 100), 100);
+        assert_eq!(parse_per_min_env(Some("0"), 1000), 1000);
+    }
+
+    #[test]
+    fn test_parse_per_min_env_garbage_returns_default() {
+        assert_eq!(parse_per_min_env(Some("not-a-number"), 100), 100);
+        assert_eq!(parse_per_min_env(Some(""), 100), 100);
+        assert_eq!(parse_per_min_env(Some("-1"), 100), 100); // u32 parse fails
+    }
+
+    #[test]
+    fn test_parse_per_min_env_huge_value_passes_through() {
+        // u32::MAX is parseable; we don't impose an upper bound here
+        // because the operator may want effectively-no-cap.
+        assert_eq!(parse_per_min_env(Some("4294967295"), 100), u32::MAX);
+    }
+
+    #[test]
+    fn test_from_env_constructs_limiter_with_defaults_when_unset() {
+        // The env-parse logic itself is covered by the parse_per_min_env
+        // tests above. This is a smoke test that from_env() wires the
+        // parser into the constructor — assumes the env vars are NOT
+        // set in the test environment (which is the standard CI shape).
+        let limiter = EmailRateLimiter::from_env();
+        assert!(limiter.per_recipient_per_min() > 0);
+        assert!(limiter.per_domain_per_min() > 0);
     }
 
     #[test]
@@ -548,5 +630,65 @@ mod tests {
         let _ = limiter.try_acquire_at(s, "alice@x.com", now);
         let _ = limiter.try_acquire_at(s, "ALICE@x.com", now);
         assert_eq!(limiter.recipient_entry_count(), 1);
+    }
+
+    #[test]
+    fn test_recipient_map_prunes_idle_full_buckets_past_soft_cap() {
+        // Plant SOFT_CAP+1 distinct (sub, recipient) pairs. Each consumes
+        // one token, leaving the bucket at capacity-1 = 99/100 (not full).
+        // Then advance the clock far enough for every bucket to refill
+        // to capacity, and one more acquire should trip the pruner and
+        // drop the idle entries.
+        let limiter = EmailRateLimiter::new(100, 1000);
+        let t0 = Instant::now();
+        for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
+            let s = Uuid::from_u128(i as u128);
+            assert_eq!(
+                limiter.try_acquire_at(s, "a@x.com", t0),
+                RateLimitDecision::Allowed
+            );
+        }
+        assert!(limiter.recipient_entry_count() > RECIPIENT_MAP_SOFT_CAP);
+
+        // Advance one minute so every recipient bucket refills to full.
+        let t1 = t0 + Duration::from_secs(60);
+        // One more acquire triggers the pruner because we're still over
+        // the cap and every prior entry is now at full capacity.
+        let trigger_sub = Uuid::from_u128(u128::MAX);
+        let _ = limiter.try_acquire_at(trigger_sub, "trigger@x.com", t1);
+
+        // After pruning, only entries with tokens < capacity remain.
+        // The newly-inserted trigger entry just consumed one (99/100),
+        // so it survives. Everything else was full and got dropped.
+        assert!(
+            limiter.recipient_entry_count() <= RECIPIENT_MAP_SOFT_CAP,
+            "pruner did not bring map back under soft cap; got {}",
+            limiter.recipient_entry_count()
+        );
+    }
+
+    #[test]
+    fn test_domain_map_prunes_idle_full_buckets_past_soft_cap() {
+        // Same property at the domain layer. Use a small per-domain cap
+        // and many distinct domains.
+        let limiter = EmailRateLimiter::new(100, 100);
+        let s = sub();
+        let t0 = Instant::now();
+        for i in 0..(DOMAIN_MAP_SOFT_CAP + 1) {
+            let addr = format!("a@d{}.com", i);
+            assert_eq!(
+                limiter.try_acquire_at(s, &addr, t0),
+                RateLimitDecision::Allowed
+            );
+        }
+        assert!(limiter.domain_entry_count() > DOMAIN_MAP_SOFT_CAP);
+        // Refill all buckets to full and trigger pruning.
+        let t1 = t0 + Duration::from_secs(60);
+        let _ = limiter.try_acquire_at(s, "trigger@trigger-domain.com", t1);
+        assert!(
+            limiter.domain_entry_count() <= DOMAIN_MAP_SOFT_CAP,
+            "domain pruner did not bring map back under soft cap; got {}",
+            limiter.domain_entry_count()
+        );
     }
 }

@@ -143,13 +143,28 @@ async fn dispatch_event(
     .await
     .map_err(|e| format!("Failed to query email_subscriptions: {}", e))?;
 
-    record_email_dispatch_attempted(&event.event_type);
-
     for sub in &subscriptions {
-        deliver_email(smtp_service, rate_limiter, event, &sub.recipients, sub.id).await;
+        deliver_email(smtp_service, rate_limiter, event, mapped, &sub.recipients, sub.id).await;
     }
 
     Ok(())
+}
+
+/// Sanitize a string for inclusion in a tracing log line.
+///
+/// Recipient addresses come from the `email_subscriptions.recipients`
+/// array, populated by `create_subscription` against the validator in
+/// `email_subscriptions::validate_recipients`. The validator now rejects
+/// control characters (defense in depth — see #1170 follow-up), but the
+/// dispatcher MUST NOT trust that for log emission: a row could have
+/// been inserted before the validator was tightened, or by a hand-rolled
+/// SQL path. Strip any control byte so an attacker-stored recipient like
+/// `"victim@x.com\n[ERROR] fake admin"` cannot forge log lines in the
+/// dispatcher's stdout stream.
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Build the subject line for an event notification email.
@@ -228,6 +243,7 @@ async fn deliver_email(
     smtp_service: &Option<Arc<SmtpService>>,
     rate_limiter: &EmailRateLimiter,
     event: &DomainEvent,
+    mapped_event_type: &str,
     recipients: &[String],
     subscription_id: uuid::Uuid,
 ) {
@@ -261,7 +277,7 @@ async fn deliver_email(
                 record_email_dispatch_rate_limited(decision.label());
                 tracing::warn!(
                     subscription_id = %subscription_id,
-                    recipient = %to,
+                    recipient = %sanitize_for_log(to),
                     bucket = decision.label(),
                     "Email dispatch dropped by rate limiter"
                 );
@@ -269,10 +285,15 @@ async fn deliver_email(
             }
         }
 
+        // Count attempted dispatches per-recipient, post-limiter,
+        // pre-SMTP — matching the metric docstring and making
+        // `attempted + rate_limited` the total per-recipient try count.
+        record_email_dispatch_attempted(mapped_event_type);
+
         if let Err(e) = smtp.send_email(to, &subject, &body_html, &body_text).await {
             tracing::warn!(
                 subscription_id = %subscription_id,
-                recipient = %to,
+                recipient = %sanitize_for_log(to),
                 error = %e,
                 "Failed to send email notification"
             );
@@ -527,6 +548,7 @@ mod tests {
             &None,
             &limiter,
             &event,
+            "artifact.uploaded",
             &["a@x.com".to_string()],
             uuid::Uuid::nil(),
         )
@@ -542,18 +564,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_deliver_email_empty_recipients_short_circuits() {
-        // Empty list: warn-and-return. The bucket should not be touched
-        // because there's nothing to send.
+    async fn test_deliver_email_no_smtp_with_empty_recipients_is_safe() {
+        // Both shorting branches in play: SMTP=None returns first, but
+        // even if SMTP were configured the empty list would warn-and-
+        // return. We can only exercise the SMTP-None path without a
+        // live SmtpService stub; the empty-recipients branch is
+        // additionally defended by validate_recipients at the API layer
+        // (rejects empty lists), so this test pins the no-panic
+        // contract against both inputs collapsing to a no-op.
         let limiter = EmailRateLimiter::new(100, 1000);
         let event = sample_event();
-        // We need a "configured" SmtpService for the empty-list branch
-        // to actually run. The early SMTP-None branch above returns
-        // first. Pass None still: the function returns at the SMTP
-        // check, NOT the empty-recipients check, but coverage-wise the
-        // empty-recipients code path is exercised by integration tests.
-        deliver_email(&None, &limiter, &event, &[], uuid::Uuid::nil()).await;
+        deliver_email(
+            &None,
+            &limiter,
+            &event,
+            "artifact.uploaded",
+            &[],
+            uuid::Uuid::nil(),
+        )
+        .await;
         assert_eq!(limiter.recipient_entry_count(), 0);
+    }
+
+    #[test]
+    fn test_sanitize_for_log_strips_newlines() {
+        // Forged log line attempt: validator rejects this at write time
+        // now, but the dispatcher must still defend at read time for
+        // pre-validation rows.
+        assert_eq!(
+            sanitize_for_log("victim@x.com\n[ERROR] forged"),
+            "victim@x.com?[ERROR] forged"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_for_log_strips_carriage_return_and_null() {
+        assert_eq!(sanitize_for_log("a\rb"), "a?b");
+        assert_eq!(sanitize_for_log("a\0b"), "a?b");
+    }
+
+    #[test]
+    fn test_sanitize_for_log_strips_ansi_escape() {
+        // ESC (0x1b) is a control char; folded to '?'.
+        assert_eq!(sanitize_for_log("a\x1b[31mred\x1b[0m"), "a?[31mred?[0m");
+    }
+
+    #[test]
+    fn test_sanitize_for_log_passes_normal_email_unchanged() {
+        assert_eq!(
+            sanitize_for_log("alice@example.com"),
+            "alice@example.com"
+        );
     }
 
     #[test]
