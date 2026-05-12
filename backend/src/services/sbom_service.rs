@@ -39,10 +39,36 @@ impl SbomService {
         format: SbomFormat,
         dependencies: Vec<DependencyInfo>,
     ) -> Result<SbomDocument> {
+        self.generate_sbom_with_completeness(artifact_id, repository_id, format, dependencies, None)
+            .await
+    }
+
+    /// Variant of [`generate_sbom`] that surfaces the per-scan completeness
+    /// signal (#1153) inside the generated SBOM document. Pass
+    /// `inventory_completeness = Some("partial")` when the latest scanner
+    /// pass for this artifact saw a target it could not parse; the
+    /// CycloneDX output gains a `metadata.properties` entry and the SPDX
+    /// output gains a creator `Comment:` line so a downstream consumer
+    /// can distinguish "no lockfile present" from "lockfile present but
+    /// unparseable".
+    ///
+    /// `None` is treated as `"complete"` and produces SBOM content
+    /// byte-identical to the pre-#1153 generator output, preserving the
+    /// stored `content_hash` cache for unchanged artifacts.
+    pub async fn generate_sbom_with_completeness(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        format: SbomFormat,
+        dependencies: Vec<DependencyInfo>,
+        inventory_completeness: Option<&str>,
+    ) -> Result<SbomDocument> {
         // Generate first so we can hash and compare against any cached row.
         let (content, components) = match format {
-            SbomFormat::CycloneDX => self.generate_cyclonedx(&dependencies)?,
-            SbomFormat::SPDX => self.generate_spdx(&dependencies)?,
+            SbomFormat::CycloneDX => {
+                self.generate_cyclonedx_inner(&dependencies, inventory_completeness)?
+            }
+            SbomFormat::SPDX => self.generate_spdx_inner(&dependencies, inventory_completeness)?,
         };
 
         // Calculate content hash
@@ -534,9 +560,10 @@ impl SbomService {
         }
     }
 
-    fn generate_cyclonedx(
+    fn generate_cyclonedx_inner(
         &self,
         dependencies: &[DependencyInfo],
+        inventory_completeness: Option<&str>,
     ) -> Result<(serde_json::Value, Vec<ComponentInfo>)> {
         let mut components = Vec::new();
         let mut cdx_components = Vec::new();
@@ -574,27 +601,43 @@ impl SbomService {
             cdx_components.push(cdx_comp);
         }
 
+        let mut metadata = serde_json::json!({
+            "timestamp": Utc::now().to_rfc3339(),
+            "tools": [{
+                "vendor": "Artifact Keeper",
+                "name": "artifact-keeper",
+                "version": env!("CARGO_PKG_VERSION")
+            }]
+        });
+
+        // #1153: thread the scanner completeness signal into the SBOM
+        // document via CycloneDX 1.5 `metadata.properties` so downstream
+        // attestation tooling can tell "no lockfile present" from
+        // "lockfile present but unparseable". The property is omitted
+        // when `inventory_completeness` is None so legacy SBOMs hash
+        // identically and the content_hash cache stays warm.
+        if let Some(c) = inventory_completeness {
+            metadata["properties"] = serde_json::json!([{
+                "name": "artifact-keeper:scan-completeness",
+                "value": c
+            }]);
+        }
+
         let sbom = serde_json::json!({
             "bomFormat": "CycloneDX",
             "specVersion": "1.5",
             "version": 1,
-            "metadata": {
-                "timestamp": Utc::now().to_rfc3339(),
-                "tools": [{
-                    "vendor": "Artifact Keeper",
-                    "name": "artifact-keeper",
-                    "version": env!("CARGO_PKG_VERSION")
-                }]
-            },
+            "metadata": metadata,
             "components": cdx_components
         });
 
         Ok((sbom, components))
     }
 
-    fn generate_spdx(
+    fn generate_spdx_inner(
         &self,
         dependencies: &[DependencyInfo],
+        inventory_completeness: Option<&str>,
     ) -> Result<(serde_json::Value, Vec<ComponentInfo>)> {
         let mut components = Vec::new();
         let mut spdx_packages = Vec::new();
@@ -645,16 +688,27 @@ impl SbomService {
             spdx_packages.push(pkg);
         }
 
+        let mut creation_info = serde_json::json!({
+            "created": Utc::now().to_rfc3339(),
+            "creators": [format!("Tool: artifact-keeper-{}", env!("CARGO_PKG_VERSION"))]
+        });
+
+        // #1153: SPDX 2.3 `creationInfo.comment` is the canonical place to
+        // signal that the underlying scan was partial. Like the CycloneDX
+        // variant above, the field is omitted when None so legacy SBOMs
+        // hash identically.
+        if let Some(c) = inventory_completeness {
+            creation_info["comment"] =
+                serde_json::json!(format!("artifact-keeper scan-completeness: {}", c));
+        }
+
         let sbom = serde_json::json!({
             "spdxVersion": "SPDX-2.3",
             "dataLicense": "CC0-1.0",
             "SPDXID": "SPDXRef-DOCUMENT",
             "name": "artifact-sbom",
             "documentNamespace": format!("https://artifact-keeper.com/sbom/{}", Uuid::new_v4()),
-            "creationInfo": {
-                "created": Utc::now().to_rfc3339(),
-                "creators": [format!("Tool: artifact-keeper-{}", env!("CARGO_PKG_VERSION"))]
-            },
+            "creationInfo": creation_info,
             "packages": spdx_packages
         });
 
