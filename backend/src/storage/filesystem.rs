@@ -65,9 +65,21 @@ impl StorageBackend for FilesystemStorage {
 
     async fn get(&self, key: &str) -> Result<Bytes> {
         let path = self.key_to_path(key);
-        let content = fs::read(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read {}: {}", key, e)))?;
+        let content = fs::read(&path).await.map_err(|e| {
+            // #1016: missing keys MUST map to AppError::NotFound so callers
+            // that branch on cache-miss (proxy_service::get_cached_artifact,
+            // OCI blob lookups, etc.) treat ENOENT as "not present" rather
+            // than as a 500-class storage failure. The S3 backend already
+            // distinguishes NotFound; the filesystem backend was
+            // historically lumping every io::Error into AppError::Storage,
+            // which surfaced as "Internal server error / os error 2" on
+            // cached-package re-downloads.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to read {}: {}", key, e))
+            }
+        })?;
         Ok(Bytes::from(content))
     }
 
@@ -78,9 +90,16 @@ impl StorageBackend for FilesystemStorage {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.key_to_path(key);
-        fs::remove_file(&path)
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to delete {}: {}", key, e)))?;
+        fs::remove_file(&path).await.map_err(|e| {
+            // Same #1016 contract for delete: ENOENT → NotFound so callers
+            // (artifact deletion, cache eviction) can handle "already gone"
+            // as idempotent rather than as a hard failure.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::NotFound(format!("Storage key not found: {}", key))
+            } else {
+                AppError::Storage(format!("Failed to delete {}: {}", key, e))
+            }
+        })?;
         Ok(())
     }
 
@@ -580,5 +599,103 @@ mod tests {
             collected.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(collected, original);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1016 / #1089 regression tests
+    //
+    // The filesystem backend previously mapped every io::Error from
+    // `fs::read` and `fs::remove_file` into `AppError::Storage`, including
+    // `ErrorKind::NotFound` (ENOENT / "os error 2"). Callers that branched
+    // on `AppError::NotFound` for cache-miss handling (notably
+    // `proxy_service::get_cached_artifact`) would never match, so a
+    // missing proxy cache key surfaced as a 500 with "os error 2" rather
+    // than as a cache miss that re-fetched from upstream. The S3 backend
+    // had the right behaviour for years; the filesystem one drifted.
+    // -----------------------------------------------------------------------
+
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_get_missing_key_returns_not_found_not_storage_error() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let err = storage.get("does-not-exist-xyz").await.unwrap_err();
+        match err {
+            AppError::NotFound(_) => {}
+            other => panic!(
+                "missing key must map to AppError::NotFound (closes #1016 / \
+                 #1089); got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_key_message_mentions_key() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let key = "proxy-cache/debian/pool/main/p/php/php_7.4.deb/__content__";
+        let err = storage.get(key).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains(key),
+            "NotFound error must include the missing key for log correlation; got {:?}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_missing_key_returns_not_found_not_storage_error() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        let err = storage.delete("never-existed").await.unwrap_err();
+        match err {
+            AppError::NotFound(_) => {}
+            other => panic!(
+                "delete of missing key must map to AppError::NotFound so \
+                 cache eviction can treat 'already gone' as idempotent; \
+                 got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_existing_key_round_trips() {
+        // Sanity / non-regression for the happy path of the modified
+        // map_err closure. A successful read must still return Ok(Bytes).
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        storage
+            .put("existing-key", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let bytes = storage.get("existing-key").await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn test_get_then_delete_then_get_yields_not_found() {
+        // Full lifecycle: a put + get works, delete succeeds, second
+        // get returns NotFound. This is the exact sequence
+        // proxy_service::get_cached_artifact relies on to treat a
+        // cache-miss after an eviction as a real miss rather than a
+        // 500-class storage failure.
+        let tmp = TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(tmp.path());
+        storage
+            .put("lifecycle-key", Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get("lifecycle-key").await.unwrap(),
+            Bytes::from_static(b"data")
+        );
+        storage.delete("lifecycle-key").await.unwrap();
+        match storage.get("lifecycle-key").await.unwrap_err() {
+            AppError::NotFound(_) => {}
+            other => panic!("post-delete get must be NotFound, got {:?}", other),
+        }
     }
 }

@@ -16,7 +16,7 @@ use crate::api::handlers::auth::set_auth_cookies;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
-use crate::services::auth_service::AuthService;
+use crate::services::auth_service::{invalidate_user_tokens, AuthService};
 
 /// Build a TOTP instance from raw secret bytes and a username label.
 fn build_totp(secret_bytes: Vec<u8>, username: String) -> Result<TOTP> {
@@ -203,6 +203,14 @@ pub async fn enable_totp(
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Enabling 2FA is a credential change: invalidate every JWT/refresh token
+    // issued before this point so existing sessions cannot keep operating
+    // under the old (TOTP-not-required) policy. Without this, a refresh token
+    // issued before TOTP was enabled stays valid until natural expiry, and
+    // the holder can swap it for a fresh access token via the refresh-grant
+    // path — bypassing the new factor.
+    invalidate_user_tokens(auth.user_id);
 
     Ok(Json(TotpEnableResponse { backup_codes }))
 }
@@ -419,6 +427,12 @@ pub async fn disable_totp(
     .execute(&state.db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
+
+    // Symmetric with `enable_totp`: removing 2FA is a credential change too.
+    // Invalidate prior tokens issued under the stricter (TOTP-required)
+    // policy so the user re-authenticates and existing sessions don't keep
+    // operating with elevated trust they no longer satisfy.
+    invalidate_user_tokens(auth.user_id);
 
     Ok(())
 }
@@ -704,5 +718,174 @@ mod tests {
         let non_empty: Vec<_> = hashed_codes.iter().filter(|h| !h.is_empty()).collect();
         assert_eq!(non_empty.len(), 1);
         assert_eq!(*non_empty[0], "valid_hash");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TOTP enable/disable must invalidate tokens issued before the change so
+// stale refresh tokens cannot bypass the new (or old) factor via
+// refresh-grant. DB-backed because the bug is observable only after
+// `is_token_invalidated` is consulted with a real user row in place.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod totp_token_invalidation_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::is_token_invalidated;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    /// Pre-fix `enable_totp` UPDATEd `users.totp_enabled = true` but did not
+    /// bump the credential-invalidation timestamp. A refresh token issued
+    /// *before* TOTP was enabled stayed valid until natural expiry, letting
+    /// the bearer swap it for a fresh access token via the refresh-grant
+    /// path — bypassing the new factor. This test pins the invalidation
+    /// call.
+    #[tokio::test]
+    async fn enable_totp_invalidates_pre_change_user_tokens() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+
+        let secret = totp_rs::Secret::generate_secret();
+        let secret_b32 = secret.to_encoded().to_string();
+        let secret_bytes = secret.to_bytes().expect("secret bytes");
+        sqlx::query("UPDATE users SET totp_secret = $1 WHERE id = $2")
+            .bind(&secret_b32)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("set totp_secret");
+
+        let storage_dir =
+            std::env::temp_dir().join(format!("totp-invalidate-enable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
+        let code = totp.generate_current().expect("generate code");
+
+        let auth = AuthExtension {
+            user_id,
+            username: format!("test-{user_id}"),
+            email: format!("test-{user_id}@example.test"),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+
+        // Token issued one minute before the change — should fail
+        // is_token_invalidated after enable_totp runs.
+        let pre_change_iat = Utc::now().timestamp() - 60;
+        assert!(
+            !is_token_invalidated(user_id, pre_change_iat),
+            "fresh user must not be pre-invalidated"
+        );
+
+        let result = enable_totp(
+            State(state),
+            Extension(auth),
+            Json(TotpCodeRequest { code }),
+        )
+        .await;
+
+        // Cleanup BEFORE assertions so DB stays clean even on failure.
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            result.is_ok(),
+            "enable_totp must succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            is_token_invalidated(user_id, pre_change_iat),
+            "enable_totp must invalidate tokens issued before this point"
+        );
+    }
+
+    /// Symmetric check for `disable_totp`. Removing 2FA is also a credential
+    /// change and must invalidate tokens issued under the stricter (TOTP-
+    /// required) policy.
+    #[tokio::test]
+    async fn disable_totp_invalidates_pre_change_user_tokens() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+
+        // disable_totp wants the user to have totp_enabled=true, a real
+        // password_hash to bcrypt-verify against, and a totp_secret. Set all
+        // three directly.
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let secret = totp_rs::Secret::generate_secret();
+        let secret_b32 = secret.to_encoded().to_string();
+        let secret_bytes = secret.to_bytes().expect("secret bytes");
+        sqlx::query(
+            "UPDATE users SET totp_secret = $1, totp_enabled = true, password_hash = $2 \
+             WHERE id = $3",
+        )
+        .bind(&secret_b32)
+        .bind(&pwd_hash)
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("set totp+password");
+
+        let storage_dir =
+            std::env::temp_dir().join(format!("totp-invalidate-disable-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let totp = build_totp(secret_bytes, format!("test-{user_id}")).expect("build totp");
+        let code = totp.generate_current().expect("generate code");
+
+        let auth = AuthExtension {
+            user_id,
+            username: format!("test-{user_id}"),
+            email: format!("test-{user_id}@example.test"),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+
+        let pre_change_iat = Utc::now().timestamp() - 60;
+        // Note: enable_totp already invalidates by other tests' side effects
+        // potentially, but `tdh::create_user` returns a fresh Uuid, so this
+        // user_id has never been invalidated before.
+        assert!(!is_token_invalidated(user_id, pre_change_iat));
+
+        let result = disable_totp(
+            State(state),
+            Extension(auth),
+            Json(TotpDisableRequest {
+                password: "real-test-password".to_string(),
+                code,
+            }),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            result.is_ok(),
+            "disable_totp must succeed: {:?}",
+            result.err()
+        );
+        assert!(
+            is_token_invalidated(user_id, pre_change_iat),
+            "disable_totp must invalidate tokens issued before this point"
+        );
     }
 }
