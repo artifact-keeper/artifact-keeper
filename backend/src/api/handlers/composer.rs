@@ -66,6 +66,40 @@ async fn resolve_composer_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, 
 // Composer metadata helpers
 // ---------------------------------------------------------------------------
 
+/// Build the upstream path for the Composer v2 metadata document of a package.
+///
+/// The Composer v2 wire shape is `p2/{vendor}/{package}.json`. Helper-extracted
+/// so the proxy fallback in `metadata_v2` is unit-testable without spinning up
+/// a database + proxy_service (#1096).
+fn composer_v2_upstream_path(full_name: &str) -> String {
+    format!("p2/{}.json", full_name)
+}
+
+/// Build the upstream path for the Composer v1 metadata document of a package.
+///
+/// The Composer v1 wire shape is `p/{vendor}/{package}.json`. Helper-extracted
+/// for the same reason as [`composer_v2_upstream_path`] (#1096).
+fn composer_v1_upstream_path(full_name: &str) -> String {
+    format!("p/{}.json", full_name)
+}
+
+/// Build the 200 response that the metadata_v1 / metadata_v2 proxy fallback
+/// returns to the composer client. Extracted from the handler body so the
+/// response-construction path (status, content-type default, body wiring) is
+/// unit-testable without DB or proxy_service (#1096).
+///
+/// `content_type` is taken from the upstream response when present; we default
+/// to `application/json` because the composer client treats anything else as
+/// a fetch error.
+fn build_composer_proxy_response(content: Bytes, content_type: Option<String>) -> Response {
+    let ct = content_type.unwrap_or_else(|| "application/json".to_string());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, ct)
+        .body(Body::from(content))
+        .unwrap()
+}
+
 /// Keys from composer.json that should be merged into version entries.
 const COMPOSER_METADATA_KEYS: &[&str] = &[
     "description",
@@ -227,6 +261,29 @@ async fn metadata_v2(
     })?;
 
     if artifacts.is_empty() {
+        // #1096: For remote repos, proxy the v2 metadata document from
+        // upstream when we have nothing cached locally. The composer CLI
+        // hits `/p2/{vendor}/{package}.json` as its first lookup; returning
+        // 404 here means `composer install` fails even when the upstream
+        // (packagist.org or any mirror) has the package. The proxy_service
+        // also caches the response body so subsequent requests hit the
+        // cache, matching the behaviour of the PyPI and OCI handlers.
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let upstream_path = composer_v2_upstream_path(&full_name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                return Ok(build_composer_proxy_response(content, content_type));
+            }
+        }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -300,6 +357,24 @@ async fn metadata_v1(
     })?;
 
     if artifacts.is_empty() {
+        // #1096: Also proxy the v1 metadata format for older composer
+        // clients. The upstream path mirrors the v1 URL shape (`p/`).
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let upstream_path = composer_v1_upstream_path(&full_name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                return Ok(build_composer_proxy_response(content, content_type));
+            }
+        }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -1315,5 +1390,158 @@ mod tests {
         assert_eq!(metadata["name"], "vendor/pkg");
         assert_eq!(metadata["version"], "2.0.0");
         assert_eq!(metadata["composer"]["description"], "Test");
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream path construction for remote-proxy fallback (#1096)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_composer_v2_upstream_path_simple() {
+        // The v2 wire shape is `p2/{vendor}/{package}.json` (no leading slash;
+        // proxy_service prepends the upstream base URL itself).
+        assert_eq!(
+            composer_v2_upstream_path("monolog/monolog"),
+            "p2/monolog/monolog.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v2_upstream_path_keeps_full_name_verbatim() {
+        // No re-canonicalization: a hyphen-separated package name flows
+        // through unchanged so Packagist sees the same path the client used.
+        assert_eq!(
+            composer_v2_upstream_path("symfony/http-foundation"),
+            "p2/symfony/http-foundation.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v2_upstream_path_does_not_include_leading_slash() {
+        // proxy_service::build_upstream_url joins base + "/" + path; a leading
+        // slash here would produce `https://packagist.org//p2/...` which some
+        // mirrors reject.
+        let path = composer_v2_upstream_path("acme/widget");
+        assert!(!path.starts_with('/'), "path must be relative: {}", path);
+    }
+
+    #[test]
+    fn test_composer_v1_upstream_path_simple() {
+        // The v1 wire shape is `p/{vendor}/{package}.json` (older Composer
+        // clients hit this before p2).
+        assert_eq!(
+            composer_v1_upstream_path("monolog/monolog"),
+            "p/monolog/monolog.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v1_upstream_path_keeps_full_name_verbatim() {
+        assert_eq!(
+            composer_v1_upstream_path("symfony/http-foundation"),
+            "p/symfony/http-foundation.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v1_and_v2_paths_diverge_on_p_segment() {
+        // Regression guard: the only difference between v1 and v2 in the
+        // upstream URL is the leading `p/` vs `p2/`. If a future refactor
+        // unifies the two helpers, this assertion fails loudly.
+        let v1 = composer_v1_upstream_path("vendor/pkg");
+        let v2 = composer_v2_upstream_path("vendor/pkg");
+        assert_ne!(v1, v2);
+        assert!(v1.starts_with("p/"));
+        assert!(v2.starts_with("p2/"));
+        assert!(v1.ends_with(".json"));
+        assert!(v2.ends_with(".json"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_composer_proxy_response (#1096)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_composer_proxy_response_status_is_ok() {
+        let body = Bytes::from_static(br#"{"packages":{}}"#);
+        let resp = build_composer_proxy_response(body, Some("application/json".to_string()));
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_uses_upstream_content_type() {
+        // Upstream told us the body is JSON: pass that through unchanged.
+        let body = Bytes::from_static(b"{}");
+        let resp = build_composer_proxy_response(body, Some("application/json".to_string()));
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("response must set Content-Type");
+        assert_eq!(ct.to_str().unwrap(), "application/json");
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_defaults_content_type_to_json() {
+        // Cache hits with empty metadata can land here without a content_type;
+        // default to `application/json` because the composer client treats
+        // anything else as a fetch error.
+        let body = Bytes::from_static(b"{}");
+        let resp = build_composer_proxy_response(body, None);
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("response must set Content-Type");
+        assert_eq!(ct.to_str().unwrap(), "application/json");
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_preserves_custom_content_type() {
+        // If the upstream returns a vendor-prefixed JSON content type
+        // (some mirrors do), we must not silently rewrite it.
+        let body = Bytes::from_static(b"{}");
+        let resp = build_composer_proxy_response(
+            body,
+            Some("application/vnd.composer+json; charset=utf-8".to_string()),
+        );
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("response must set Content-Type");
+        assert_eq!(
+            ct.to_str().unwrap(),
+            "application/vnd.composer+json; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn test_build_composer_proxy_response_empty_body_is_ok() {
+        // Upstream returned an empty body but a 200 status: pass through.
+        let resp = build_composer_proxy_response(Bytes::new(), None);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_composer_v2_upstream_path_with_subnamespace() {
+        // Vendor namespaces with dots / numeric suffixes (e.g.
+        // `phpunit/phpunit`, `psr/log`, `aws/aws-sdk-php-v2`) must round-trip
+        // through the helper untouched.
+        assert_eq!(composer_v2_upstream_path("psr/log"), "p2/psr/log.json");
+        assert_eq!(
+            composer_v2_upstream_path("aws/aws-sdk-php-v2"),
+            "p2/aws/aws-sdk-php-v2.json"
+        );
+        assert_eq!(
+            composer_v2_upstream_path("phpunit/phpunit"),
+            "p2/phpunit/phpunit.json"
+        );
+    }
+
+    #[test]
+    fn test_composer_v1_upstream_path_with_subnamespace() {
+        assert_eq!(composer_v1_upstream_path("psr/log"), "p/psr/log.json");
+        assert_eq!(
+            composer_v1_upstream_path("aws/aws-sdk-php-v2"),
+            "p/aws/aws-sdk-php-v2.json"
+        );
     }
 }
