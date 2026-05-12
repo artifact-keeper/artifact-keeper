@@ -17,7 +17,7 @@ use crate::services::webhook_secret_crypto;
 
 /// Versions the backend currently knows how to render. Adding a new
 /// version is an additive change; removing one is a breaking change.
-pub const SUPPORTED_EVENT_VERSIONS: &[&str] = &["2026-04-01"];
+const SUPPORTED_EVENT_VERSIONS: &[&str] = &["2026-04-01"];
 
 fn validate_event_version(v: &str) -> std::result::Result<(), AppError> {
     if SUPPORTED_EVENT_VERSIONS.contains(&v) {
@@ -868,7 +868,7 @@ const SECRET_ROTATION_OVERLAP: chrono::Duration = chrono::Duration::hours(24);
 /// without standing up a Postgres test harness. The SQL UPDATE in
 /// `rotate_webhook_secret` and this helper must agree.
 #[cfg(test)]
-pub(crate) fn rotation_guard_allows(
+fn rotation_guard_allows(
     previous: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
@@ -1028,7 +1028,7 @@ pub async fn cleanup_expired_previous_secrets(
 ///
 /// Blocks URLs pointing to private/internal networks, loopback addresses,
 /// link-local addresses (AWS/cloud metadata), and known internal hostnames.
-pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
+fn validate_webhook_url(url_str: &str) -> Result<()> {
     crate::api::validation::validate_outbound_url(url_str, "Webhook URL")
 }
 
@@ -1047,10 +1047,7 @@ pub(crate) fn validate_webhook_url(url_str: &str) -> Result<()> {
 /// `load_active_secrets` directly). External call sites and tests may
 /// still reference this helper. Removed in v1.3.0.
 #[allow(dead_code)]
-pub(crate) fn has_signing_secret(
-    secret_hash: &Option<String>,
-    secret_encrypted: Option<&[u8]>,
-) -> bool {
+fn has_signing_secret(secret_hash: &Option<String>, secret_encrypted: Option<&[u8]>) -> bool {
     let hash_present = secret_hash.as_deref().is_some_and(|s| !s.is_empty());
     let enc_present = secret_encrypted.is_some_and(|b| !b.is_empty());
     hash_present || enc_present
@@ -1064,14 +1061,14 @@ pub(crate) fn has_signing_secret(
 /// the first hour. Each computed delay is jittered +/- 20% so a herd of
 /// receivers that all fail at the same instant don't synchronize their
 /// next retry.
-pub(crate) fn webhook_retry_delay_secs(attempt: i32) -> i64 {
+fn webhook_retry_delay_secs(attempt: i32) -> i64 {
     let base = base_delay_secs(attempt);
     apply_jitter(base, deterministic_jitter_seed(attempt))
 }
 
 /// Pure base-schedule lookup, exposed for tests so they can pin the
 /// schedule without dealing with jitter randomness.
-pub(crate) fn base_delay_secs(attempt: i32) -> i64 {
+fn base_delay_secs(attempt: i32) -> i64 {
     match attempt {
         1 => 30,
         2 => 60,
@@ -1090,7 +1087,7 @@ pub(crate) fn base_delay_secs(attempt: i32) -> i64 {
 
 /// Apply +/- 20% jitter to a base delay. A `seed` of 0 returns the base
 /// unchanged so unit tests can opt out of randomness.
-pub(crate) fn apply_jitter(base: i64, seed: u64) -> i64 {
+fn apply_jitter(base: i64, seed: u64) -> i64 {
     if seed == 0 {
         return base;
     }
@@ -1114,7 +1111,7 @@ fn deterministic_jitter_seed(attempt: i32) -> u64 {
 
 /// Outcome of a webhook delivery retry attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RetryOutcome {
+enum RetryOutcome {
     /// Delivery succeeded (2xx status).
     Success,
     /// Max attempts exhausted, delivery is dead-lettered.
@@ -1127,7 +1124,7 @@ pub(crate) enum RetryOutcome {
 ///
 /// Given the current attempt count, max attempts, and whether the HTTP call
 /// succeeded, returns whether to mark success, dead-letter, or schedule a retry.
-pub(crate) fn determine_retry_outcome(
+fn determine_retry_outcome(
     success: bool,
     current_attempts: i32,
     max_attempts: i32,
@@ -1145,7 +1142,7 @@ pub(crate) fn determine_retry_outcome(
 }
 
 /// Check whether an HTTP status code indicates a successful webhook delivery.
-pub(crate) fn is_webhook_delivery_success(status_code: u16) -> bool {
+fn is_webhook_delivery_success(status_code: u16) -> bool {
     (200..300).contains(&status_code)
 }
 
@@ -1163,7 +1160,7 @@ struct RetryDeliveryRow {
 /// Inputs to the v2-wire-contract header builder. Captured as a struct so
 /// the three delivery paths (test endpoint, retry path, manual redeliver)
 /// can share one well-tested header set.
-pub(crate) struct DeliveryHeaderInputs<'a> {
+struct DeliveryHeaderInputs<'a> {
     pub delivery_id: Uuid,
     pub event: &'a str,
     pub event_version: &'a str,
@@ -1187,9 +1184,7 @@ pub(crate) struct DeliveryHeaderInputs<'a> {
 /// `reqwest::RequestBuilder` or assert against them in tests. The order
 /// matches the spec: required headers first, custom headers second,
 /// signature headers last.
-pub(crate) fn build_delivery_request_headers(
-    inputs: &DeliveryHeaderInputs<'_>,
-) -> Vec<(String, String)> {
+fn build_delivery_request_headers(inputs: &DeliveryHeaderInputs<'_>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::with_capacity(16);
 
     out.push(("Content-Type".into(), "application/json".into()));
@@ -1257,7 +1252,7 @@ pub(crate) fn build_delivery_request_headers(
 /// Returns a tuple `(secrets, decrypt_failures)` so the wrapper can log
 /// each failure with a stable message format. The Vec contents matter
 /// for the wire contract; the failure count is purely diagnostic.
-pub(crate) fn decide_active_secrets(
+fn decide_active_secrets(
     current_encrypted: Option<&[u8]>,
     previous_encrypted: Option<&[u8]>,
     previous_expires_at: Option<chrono::DateTime<chrono::Utc>>,

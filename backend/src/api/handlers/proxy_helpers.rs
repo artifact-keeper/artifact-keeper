@@ -170,11 +170,33 @@ pub fn reject_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// Map a proxy service error to an HTTP error response.
 ///
 /// `NotFound` errors become 404; everything else becomes 502 Bad Gateway.
-/// The error is logged at `warn` level with the repo key and path for context.
+///
+/// Log-level discipline (#1139): an upstream 404 (`AppError::NotFound`) is
+/// **normal proxy traffic**, not a failure of artifact-keeper. Docker / OCI
+/// clients routinely probe for tags that do not exist (`:latest` for a project
+/// that only publishes versioned tags), and PyPI / npm clients probe optional
+/// metadata files (`.metadata`, `.sig`) the same way. Logging those at WARN
+/// floods operators with false-positive alerts and reads as "the proxy is
+/// broken" when the proxy is in fact doing its job correctly.
+///
+/// * **`NotFound`** is logged at `info` with wording that names the cause
+///   (upstream returned 404). Operators triaging "why is my mirror not
+///   working" see immediately that the upstream does not have the requested
+///   artifact, not that artifact-keeper malfunctioned.
+/// * **`Validation`** stays at `warn` because it indicates a malformed path
+///   (often a probe / attack attempt the path-traversal guard rejected).
+/// * **Everything else** (timeouts, TLS errors, 5xx, auth challenge parse
+///   failures, body read errors) stays at `warn` because those genuinely
+///   warrant operator attention.
 fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
-    tracing::warn!("Proxy fetch failed for {}/{}: {}", repo_key, path, e);
     match &e {
         crate::error::AppError::NotFound(_) => {
+            tracing::info!(
+                repo_key = %repo_key,
+                path = %path,
+                "Upstream returned 404 (artifact or tag does not exist): {}",
+                e
+            );
             (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
         }
         // AppError::Validation here means the request path failed
@@ -185,13 +207,27 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         // letting an attacker enumerate which characters/segments are
         // blocked.
         crate::error::AppError::Validation(_) => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %path,
+                "Proxy rejected request path: {}",
+                e
+            );
             (StatusCode::BAD_REQUEST, "Invalid artifact path").into_response()
         }
-        _ => (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to fetch from upstream: {}", e),
-        )
-            .into_response(),
+        _ => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %path,
+                "Proxy fetch failed: {}",
+                e
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to fetch from upstream: {}", e),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1791,6 +1827,21 @@ mod tests {
         );
         let response = map_proxy_error("repo-key", "pkg", err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // #1139 regression: upstream-404 must still resolve to a 404 response.
+    // The log-level change (`warn` -> `info` with re-worded message) is a
+    // behavioural change visible to operators only; the API contract for the
+    // OCI / PyPI / generic-proxy client is unchanged. This guards against an
+    // accidental re-routing of NotFound through the 502 branch.
+    #[test]
+    fn test_map_proxy_error_not_found_still_returns_404_after_logging_rework() {
+        let err = crate::error::AppError::NotFound(
+            "Artifact not found at upstream: https://ghcr.io/v2/example/manifests/latest"
+                .to_string(),
+        );
+        let response = map_proxy_error("ghcr", "v2/example/manifests/latest", err);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     // ── RepoInfo::storage_location tests ───────────────────────────────
@@ -3571,4 +3622,81 @@ mod tests {
             Some(weird)
         );
     }
+
+    // -------------------------------------------------------------------
+    // #1183: behaviour-pin tests for the streaming-migration handlers.
+    //
+    // The slow-path remote fetch in five handlers (maven catch-all,
+    // goproxy `.zip`, gitlfs blob, alpine `.apk`, debian pool) was
+    // migrated from the buffered `proxy_fetch` helper to the streaming
+    // `proxy_fetch_streaming` helper in #1181 to avoid the OOM kills
+    // tracked in #895 / #737. The migration is invisible to existing
+    // tests because both helpers return the same `Response` type and
+    // the streaming helper has its own coverage via
+    // `proxy_service::tests` — a silent rebase that swapped
+    // `proxy_fetch_streaming` back to `proxy_fetch` would compile and
+    // pass the suite while quietly re-introducing the OOM regression.
+    //
+    // These tests read each handler's source at test time (the file
+    // is part of the same crate so the path is stable) and assert
+    // that the remote-fetch arm still calls `proxy_fetch_streaming`.
+    // Failure here means a contributor must either fix the regression
+    // or, if the migration is intentionally being rolled back, delete
+    // the matching test and document the reason in the PR.
+    //
+    // The matched substring is intentionally narrow (the
+    // `proxy_helpers::proxy_fetch_streaming(` token) so a passing
+    // mention in a comment or a different helper does not satisfy it.
+    // -------------------------------------------------------------------
+
+    const STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming(";
+
+    /// One pin test per handler. Kept as separate `#[test]` functions
+    /// (rather than a single loop) so a CI failure points directly at
+    /// the regressing handler. The macro keeps the surface area small
+    /// and stops the five near-identical functions from tripping the
+    /// 3% duplication gate.
+    macro_rules! streaming_pin_test {
+        ($name:ident, $module_file:literal, $what:literal) => {
+            #[test]
+            fn $name() {
+                let src = include_str!($module_file);
+                assert!(
+                    src.contains(STREAMING_CALL_TOKEN),
+                    "{} handler MUST call `{}` for {} (#1183). A revert \
+                     to the buffered `proxy_fetch` helper would re-introduce \
+                     the OOM regression closed by #895/#1181.",
+                    $module_file,
+                    STREAMING_CALL_TOKEN,
+                    $what,
+                );
+            }
+        };
+    }
+
+    streaming_pin_test!(
+        test_maven_remote_fetch_uses_streaming_helper_1183,
+        "maven.rs",
+        "the remote catch-all download"
+    );
+    streaming_pin_test!(
+        test_goproxy_remote_fetch_uses_streaming_helper_1183,
+        "goproxy.rs",
+        "the remote `@v/<ver>.zip` download"
+    );
+    streaming_pin_test!(
+        test_gitlfs_remote_fetch_uses_streaming_helper_1183,
+        "gitlfs.rs",
+        "the remote LFS blob download (large binaries)"
+    );
+    streaming_pin_test!(
+        test_alpine_remote_fetch_uses_streaming_helper_1183,
+        "alpine.rs",
+        "the remote `.apk` download"
+    );
+    streaming_pin_test!(
+        test_debian_remote_fetch_uses_streaming_helper_1183,
+        "debian.rs",
+        "the remote pool `.deb` download"
+    );
 }

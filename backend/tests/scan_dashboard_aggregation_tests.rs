@@ -150,6 +150,7 @@ async fn create_scans_with_findings(
             0,
             Some("test-scanner-1.0"),
             chrono::Utc::now(),
+            "complete",
         )
         .await
         .expect("complete scan");

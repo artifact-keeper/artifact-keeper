@@ -89,6 +89,44 @@ fn normalize_pep503(name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Upstream URL normalization for the PEP 503 simple index
+// ---------------------------------------------------------------------------
+
+/// Build the upstream path for a PyPI Simple-API request without duplicating
+/// the `simple/` segment when the configured upstream URL already ends in
+/// `/simple` or `/simple/` (issue #1130).
+///
+/// The PyPI Simple API canonically lives at `https://pypi.org/simple/`. Users
+/// reasonably copy that URL verbatim into the remote-repo "upstream URL"
+/// field. The handler also conventionally prefixes `simple/{project}/` onto
+/// the proxied path, producing requests like
+/// `https://pypi.org/simple/simple/{project}/` which return 404. Detect the
+/// suffix and emit `{project}/` (or `{project}/{filename}`) instead.
+///
+/// `tail` is the relative portion below the `simple/` segment (e.g.
+/// `flask/`, `flask/Flask-3.0.0-py3-none-any.whl`). Callers must NOT include
+/// the leading `simple/` themselves.
+///
+/// Returns `(adjusted_upstream_url, upstream_path)`. The URL has any trailing
+/// `/simple` or `/simple/` stripped so [`crate::services::proxy_service::ProxyService::build_upstream_url`]
+/// (which trims one trailing slash on the base and joins with `/`) produces
+/// a single `simple/` segment in the final outbound URL.
+fn pypi_upstream_url_and_path(upstream_url: &str, tail: &str) -> (String, String) {
+    let trimmed_url = upstream_url.trim_end_matches('/');
+    let tail = tail.trim_start_matches('/');
+    if let Some(base) = trimmed_url.strip_suffix("/simple") {
+        let normalized = if base.is_empty() {
+            "/".to_string()
+        } else {
+            base.to_string()
+        };
+        (normalized, format!("simple/{}", tail))
+    } else {
+        (upstream_url.to_string(), format!("simple/{}", tail))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal struct used to decouple DB query results from response rendering.
 // ---------------------------------------------------------------------------
 
@@ -276,12 +314,13 @@ async fn simple_project(
             if let (Some(ref upstream_url), Some(ref proxy)) =
                 (&repo.upstream_url, &state.proxy_service)
             {
-                let upstream_path = format!("simple/{}/", normalized);
+                let (effective_upstream, upstream_path) =
+                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
                 let (content, content_type) = proxy_helpers::proxy_fetch(
                     proxy,
                     repo.id,
                     &repo_key,
-                    upstream_url,
+                    &effective_upstream,
                     &upstream_path,
                 )
                 .await?;
@@ -306,7 +345,9 @@ async fn simple_project(
         // For virtual repos, iterate through members in priority order.
         // Local/staging members are queried via DB; remote members use proxy.
         if repo.repo_type == RepositoryType::Virtual {
-            let upstream_path = format!("simple/{}/", normalized);
+            // Per-member upstream_url adjustment happens inside the loop below
+            // so each remote member can carry its own `…/simple` suffix without
+            // polluting siblings.
             let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
 
             if members.is_empty() {
@@ -372,11 +413,13 @@ async fn simple_project(
                     continue;
                 };
 
+                let (effective_upstream, upstream_path) =
+                    pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
                 let result = proxy_helpers::proxy_fetch(
                     proxy,
                     member.id,
                     &member.key,
-                    upstream_url,
+                    &effective_upstream,
                     &upstream_path,
                 )
                 .await;
@@ -766,10 +809,20 @@ async fn fetch_from_pypi_remote(
 ) -> Result<Bytes, Response> {
     let normalized = PypiHandler::normalize_name(project);
 
-    let index_path = format!("simple/{}/", normalized);
-    let (index_bytes, _ct, effective_url) =
-        proxy_helpers::proxy_fetch_uncached(proxy, repo_id, repo_key, upstream_url, &index_path)
-            .await?;
+    // Strip a trailing `/simple` from the configured upstream URL so we do
+    // not produce `https://pypi.org/simple/simple/{project}/` when the user
+    // copies the canonical Simple-API base verbatim into the repo config
+    // (issue #1130).
+    let (effective_upstream, index_path) =
+        pypi_upstream_url_and_path(upstream_url, &format!("{}/", normalized));
+    let (index_bytes, _ct, effective_url) = proxy_helpers::proxy_fetch_uncached(
+        proxy,
+        repo_id,
+        repo_key,
+        &effective_upstream,
+        &index_path,
+    )
+    .await?;
 
     let index_html = String::from_utf8_lossy(&index_bytes);
 
@@ -781,10 +834,9 @@ async fn fetch_from_pypi_remote(
     let file_url = find_upstream_url_for_file(&index_html, filename, Some(&full_index_url));
 
     let fallback = || {
-        (
-            upstream_url.to_string(),
-            format!("simple/{}/{}", normalized, filename),
-        )
+        let (base, path) =
+            pypi_upstream_url_and_path(upstream_url, &format!("{}/{}", normalized, filename));
+        (base, path)
     };
 
     // Validate resolved URL against SSRF before making the outbound request.
@@ -1361,6 +1413,91 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // pypi_upstream_url_and_path (#1130)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pypi_upstream_strips_trailing_simple() {
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_strips_trailing_simple_no_slash() {
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_keeps_non_simple_url() {
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_keeps_devpi_path() {
+        let (url, path) =
+            pypi_upstream_url_and_path("https://devpi.example.com/root/pypi", "numpy/");
+        assert_eq!(url, "https://devpi.example.com/root/pypi");
+        assert_eq!(path, "simple/numpy/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_trailing_simple_with_file() {
+        let (url, path) =
+            pypi_upstream_url_and_path("https://pypi.org/simple/", "flask/Flask-3.0.0.tar.gz");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/Flask-3.0.0.tar.gz");
+    }
+
+    #[test]
+    fn test_pypi_upstream_bare_simple_collapses_to_root() {
+        // Edge case: configured upstream is literally "/simple" — strip the
+        // suffix and substitute "/" so build_upstream_url has a non-empty
+        // base to operate on. Exercises the `if base.is_empty()` branch.
+        let (url, path) = pypi_upstream_url_and_path("/simple", "flask/");
+        assert_eq!(url, "/");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_bare_simple_with_trailing_slash_collapses_to_root() {
+        let (url, path) = pypi_upstream_url_and_path("/simple/", "flask/");
+        assert_eq!(url, "/");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_strips_leading_slash_from_tail() {
+        // Tail with a stray leading slash should not produce `simple//flask/`.
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org", "/flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_simple_substring_not_stripped() {
+        // `simple-index` ends with `simple` substring but NOT the `/simple`
+        // path segment, so it must not be stripped.
+        let (url, path) =
+            pypi_upstream_url_and_path("https://mirror.example.com/pypi-simple-index", "flask/");
+        assert_eq!(url, "https://mirror.example.com/pypi-simple-index");
+        assert_eq!(path, "simple/flask/");
+    }
+
+    #[test]
+    fn test_pypi_upstream_multiple_trailing_slashes_handled() {
+        // trim_end_matches('/') strips all trailing slashes; the resulting
+        // URL must still strip the `/simple` segment correctly.
+        let (url, path) = pypi_upstream_url_and_path("https://pypi.org/simple///", "flask/");
+        assert_eq!(url, "https://pypi.org");
+        assert_eq!(path, "simple/flask/");
+    }
 
     // -----------------------------------------------------------------------
     // normalize_pep503

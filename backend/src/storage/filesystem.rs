@@ -30,16 +30,41 @@ impl FilesystemStorage {
         }
     }
 
-    /// Get full path for a key (using first 2 chars as subdirectory for distribution).
+    /// Get full path for a key.
     ///
     /// Keys are sanitized to prevent path traversal: only normal path components
     /// are kept, stripping `..`, `/`, and other special components.
+    ///
+    /// Two layouts are supported, selected by whether the key already encodes
+    /// a directory hierarchy:
+    ///
+    /// * **Hierarchical keys** (containing `/`, e.g. `proxy-cache/repo/path/__content__`,
+    ///   `maven/org/example/.../file.jar`): written under `base_path` verbatim.
+    ///   The key's own path segments provide directory distribution, and adding a
+    ///   2-char shard prefix on top of that produced the bug behind #1073, where
+    ///   `put_stream` (via `StorageService::FilesystemBackend`) and `get` (via this
+    ///   backend) ended up writing to and reading from different directories for
+    ///   the same proxy-cache key.
+    /// * **Flat keys** (no `/`, e.g. a bare sha256 hash `916f0027...`): written
+    ///   under a 2-char prefix subdirectory so a single directory does not accumulate
+    ///   millions of entries. This is the original behaviour and is preserved for
+    ///   the legacy hash-key callers.
     fn key_to_path(&self, key: &str) -> PathBuf {
         let sanitized: PathBuf = std::path::Path::new(key)
             .components()
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
             .collect();
         let sanitized_str = sanitized.to_string_lossy();
+
+        // Hierarchical keys (the key contains its own `/` separators) already
+        // distribute themselves across directories. Skip the shard prefix so
+        // path-style keys land where every other call site expects them.
+        // See #1073: proxy-cache writes went to `<base>/proxy-cache/...` while
+        // reads looked under `<base>/pr/proxy-cache/...`.
+        if sanitized.components().count() > 1 {
+            return self.base_path.join(&sanitized);
+        }
+
         let prefix = &sanitized_str[..2.min(sanitized_str.len())];
         self.base_path.join(prefix).join(&sanitized)
     }
@@ -261,29 +286,61 @@ mod tests {
     fn test_key_to_path_traversal_dot_dot() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("../../etc/passwd");
-        // "../" components are stripped; only "etc" and "passwd" remain
+        // "../" components are stripped; only "etc" and "passwd" remain.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
         assert!(!path.to_string_lossy().contains(".."));
-        assert_eq!(path, PathBuf::from("/data/et/etc/passwd"));
+        assert_eq!(path, PathBuf::from("/data/etc/passwd"));
     }
 
     #[test]
     fn test_key_to_path_absolute_key() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("/etc/passwd");
-        // Leading "/" (RootDir component) is stripped; result stays inside base
+        // Leading "/" (RootDir component) is stripped; result stays inside base.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
-        assert_eq!(path, PathBuf::from("/data/et/etc/passwd"));
+        assert_eq!(path, PathBuf::from("/data/etc/passwd"));
     }
 
     #[test]
     fn test_key_to_path_mixed_traversal() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("maven/../../../etc/passwd");
-        // ".." components stripped, only Normal components kept
+        // ".." components stripped, only Normal components kept.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
         assert!(!path.to_string_lossy().contains(".."));
-        assert_eq!(path, PathBuf::from("/data/ma/maven/etc/passwd"));
+        assert_eq!(path, PathBuf::from("/data/maven/etc/passwd"));
+    }
+
+    // #1073: proxy-cache keys must not be sharded. They already carry a
+    // hierarchical layout (`proxy-cache/<repo>/<path>/__content__`) that the
+    // proxy_service writer in `services::storage_service::FilesystemBackend`
+    // honors verbatim. Sharding under the first 2 chars made `get` look in
+    // `<base>/pr/proxy-cache/...` while the file was at `<base>/proxy-cache/...`.
+    #[test]
+    fn test_key_to_path_proxy_cache_key_not_sharded() {
+        let storage = FilesystemStorage::new("/data/storage");
+        let key = "proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__";
+        let path = storage.key_to_path(key);
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/data/storage/proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__"
+            )
+        );
+    }
+
+    #[test]
+    fn test_key_to_path_proxy_cache_meta_not_sharded() {
+        let storage = FilesystemStorage::new("/data/storage");
+        let key = "proxy-cache/pypi-remote/simple/flask/__cache_meta__.json";
+        let path = storage.key_to_path(key);
+        assert_eq!(
+            path,
+            PathBuf::from("/data/storage/proxy-cache/pypi-remote/simple/flask/__cache_meta__.json")
+        );
     }
 
     #[test]
@@ -307,10 +364,11 @@ mod tests {
     fn test_key_to_path_current_dir_traversal() {
         let storage = FilesystemStorage::new("/data");
         let path = storage.key_to_path("./secret/../passwords");
-        // "." and ".." are stripped, only "secret" and "passwords" remain
+        // "." and ".." are stripped, only "secret" and "passwords" remain.
+        // Multi-segment hierarchical key, so no shard prefix is added.
         assert!(path.starts_with("/data"));
         assert!(!path.to_string_lossy().contains(".."));
-        assert_eq!(path, PathBuf::from("/data/se/secret/passwords"));
+        assert_eq!(path, PathBuf::from("/data/secret/passwords"));
     }
 
     #[tokio::test]
@@ -325,6 +383,61 @@ mod tests {
 
         let retrieved = storage.get(key).await.unwrap();
         assert_eq!(retrieved, content);
+    }
+
+    // #1073 regression: a proxy-cache key written by the un-sharded writer
+    // (`services::storage_service::FilesystemBackend`) must be readable by
+    // this backend's `get`. Before the fix, this backend sharded the key
+    // under the first 2 chars and looked in `<base>/pr/proxy-cache/...`,
+    // missing the file that lived at `<base>/proxy-cache/...`.
+    #[tokio::test]
+    async fn test_proxy_cache_key_readable_at_unsharded_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // Simulate what the proxy writer puts on disk: file at
+        // `<base>/proxy-cache/<repo>/<path>/__content__` with no shard prefix.
+        let key = "proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__";
+        let on_disk = temp_dir
+            .path()
+            .join("proxy-cache/docker-hub-remote/v2/library/nginx/manifests/latest/__content__");
+        tokio::fs::create_dir_all(on_disk.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&on_disk, b"manifest body").await.unwrap();
+
+        // Reader path must resolve to the same on-disk location.
+        let bytes = storage.get(key).await.expect("get must find file");
+        assert_eq!(bytes.as_ref(), b"manifest body");
+    }
+
+    // #1073 regression: roundtrip via this backend's own put/get for a
+    // proxy-cache key. With sharding still enabled this previously wrote to
+    // `<base>/pr/proxy-cache/...` (matching the get path), but the bug was
+    // that the *writer* in `services::storage_service::FilesystemBackend`
+    // didn't shard. Today both paths land at `<base>/proxy-cache/...`.
+    #[tokio::test]
+    async fn test_proxy_cache_key_roundtrip_unsharded() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        let key = "proxy-cache/pypi-remote/simple/flask/__content__";
+        storage
+            .put(key, Bytes::from_static(b"index html"))
+            .await
+            .unwrap();
+
+        let expected_path = temp_dir
+            .path()
+            .join("proxy-cache/pypi-remote/simple/flask/__content__");
+        assert!(
+            expected_path.exists(),
+            "proxy-cache key must land at unsharded path; expected {} to exist",
+            expected_path.display()
+        );
+
+        let bytes = storage.get(key).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"index html");
     }
 
     #[tokio::test]
