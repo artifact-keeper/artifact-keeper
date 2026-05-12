@@ -1291,11 +1291,12 @@ mod tests {
             resp.status()
         );
         let body: Value = resp.json().await.expect("Failed to parse search response");
-        // `quick` returns `{"results": [...]}`. Accept `items[]` too as a
-        // forward-compat hedge in case the wrapper shape changes.
+        // `quick` returns `{"results": [...]}`. Assert the known shape strictly:
+        // accepting `items[]` as a fallback would silently mask a future
+        // regression if the wrapper shape ever changes back.
         assert!(
-            body["results"].is_array() || body["items"].is_array(),
-            "expected results[] or items[] in search response, got: {body}"
+            body["results"].is_array(),
+            "expected results[] in search response, got: {body}"
         );
     }
 
