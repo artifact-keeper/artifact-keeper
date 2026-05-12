@@ -44,6 +44,41 @@ async fn write_sbom_audit(
     }
 }
 
+/// Build the JSON `details` payload recorded against an `SBOM_GENERATED`
+/// audit entry. Extracted as a pure helper so the audit shape (the contract
+/// SOC 2 / EU CRA reviewers read) is unit-testable without spinning up a
+/// `SharedState` / Postgres pool.
+pub(crate) fn sbom_generated_details(
+    sbom_id: Uuid,
+    format: &str,
+    repository_id: Uuid,
+    force_regenerate: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sbom_id": sbom_id.to_string(),
+        "format": format,
+        "repository_id": repository_id.to_string(),
+        "force_regenerate": force_regenerate,
+    })
+}
+
+/// Build the JSON `details` payload recorded against an `SBOM_READ` audit
+/// entry. `lookup` distinguishes the two read endpoints (`by_id` for
+/// `GET /sbom/:id`, `by_artifact` for `GET /sbom/by-artifact/:artifact_id`)
+/// so auditors can tell automated supply-chain scrapers from interactive
+/// console viewers.
+pub(crate) fn sbom_read_details(
+    sbom_id: Uuid,
+    format: &str,
+    lookup: &'static str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sbom_id": sbom_id.to_string(),
+        "format": format,
+        "lookup": lookup,
+    })
+}
+
 /// Create SBOM routes.
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -325,12 +360,7 @@ async fn generate_sbom(
         AuditAction::SbomGenerated,
         auth.user_id,
         body.artifact_id,
-        serde_json::json!({
-            "sbom_id": doc.id.to_string(),
-            "format": doc.format,
-            "repository_id": repository_id.to_string(),
-            "force_regenerate": body.force_regenerate,
-        }),
+        sbom_generated_details(doc.id, &doc.format, repository_id, body.force_regenerate),
     )
     .await;
 
@@ -475,11 +505,7 @@ async fn get_sbom(
         AuditAction::SbomRead,
         auth.user_id,
         doc.artifact_id,
-        serde_json::json!({
-            "sbom_id": doc.id.to_string(),
-            "format": doc.format,
-            "lookup": "by_id",
-        }),
+        sbom_read_details(doc.id, &doc.format, "by_id"),
     )
     .await;
 
@@ -528,11 +554,7 @@ async fn get_sbom_by_artifact(
         AuditAction::SbomRead,
         auth.user_id,
         artifact_id,
-        serde_json::json!({
-            "sbom_id": doc.id.to_string(),
-            "format": doc.format,
-            "lookup": "by_artifact",
-        }),
+        sbom_read_details(doc.id, &doc.format, "by_artifact"),
     )
     .await;
 
@@ -1723,4 +1745,80 @@ mod tests {
         "SBOM_INVENTORY_ROW_CAP must remain comfortably above realistic \
          monorepo dep counts; see security review F1"
     );
+
+    // -----------------------------------------------------------------------
+    // Audit-log detail payloads (#1156). The handler bodies call into these
+    // pure helpers so the audit-trail shape that SOC 2 / EU CRA auditors
+    // read is exercised here without a Postgres pool.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sbom_generated_details_contains_all_fields() {
+        let sbom_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let v = sbom_generated_details(sbom_id, "cyclonedx", repo_id, true);
+        assert_eq!(v["sbom_id"], sbom_id.to_string());
+        assert_eq!(v["format"], "cyclonedx");
+        assert_eq!(v["repository_id"], repo_id.to_string());
+        assert_eq!(v["force_regenerate"], true);
+    }
+
+    #[test]
+    fn test_sbom_generated_details_force_regenerate_false_is_recorded() {
+        // The auditor needs to be able to tell a fresh generation from a
+        // deliberate overwrite of an existing SBOM, so the boolean must be
+        // present even when false (not just omitted).
+        let v = sbom_generated_details(Uuid::new_v4(), "spdx", Uuid::new_v4(), false);
+        assert_eq!(v["force_regenerate"], false);
+        assert!(v.get("force_regenerate").is_some());
+    }
+
+    #[test]
+    fn test_sbom_generated_details_preserves_format_string_verbatim() {
+        // We pass `&doc.format` from the persisted SbomDocument, not the
+        // normalized SbomFormat enum, so unusual stored values round-trip
+        // unchanged into the audit details.
+        let v = sbom_generated_details(Uuid::new_v4(), "SPDX-JSON-2.3", Uuid::new_v4(), true);
+        assert_eq!(v["format"], "SPDX-JSON-2.3");
+    }
+
+    #[test]
+    fn test_sbom_read_details_by_id_lookup() {
+        let sbom_id = Uuid::new_v4();
+        let v = sbom_read_details(sbom_id, "cyclonedx", "by_id");
+        assert_eq!(v["sbom_id"], sbom_id.to_string());
+        assert_eq!(v["format"], "cyclonedx");
+        assert_eq!(v["lookup"], "by_id");
+    }
+
+    #[test]
+    fn test_sbom_read_details_by_artifact_lookup() {
+        let sbom_id = Uuid::new_v4();
+        let v = sbom_read_details(sbom_id, "spdx", "by_artifact");
+        assert_eq!(v["lookup"], "by_artifact");
+        assert_eq!(v["format"], "spdx");
+    }
+
+    #[test]
+    fn test_sbom_read_details_lookup_field_distinguishes_endpoints() {
+        // Compliance reviewers correlate SBOM_READ entries with their
+        // originating endpoint to spot automated scrapers vs interactive
+        // viewers; the two payloads must therefore not be byte-identical.
+        let id = Uuid::new_v4();
+        let by_id = sbom_read_details(id, "cyclonedx", "by_id");
+        let by_artifact = sbom_read_details(id, "cyclonedx", "by_artifact");
+        assert_ne!(by_id, by_artifact);
+        assert_ne!(by_id["lookup"], by_artifact["lookup"]);
+    }
+
+    #[test]
+    fn test_sbom_audit_detail_payloads_are_valid_json_objects() {
+        // Audit-log persistence stores `details` as JSONB; both helpers must
+        // produce JSON *objects* (not arrays / scalars) so the column query
+        // contract (`details->>'sbom_id'`) keeps working.
+        let g = sbom_generated_details(Uuid::new_v4(), "cyclonedx", Uuid::new_v4(), false);
+        let r = sbom_read_details(Uuid::new_v4(), "cyclonedx", "by_id");
+        assert!(g.is_object(), "generated payload must be a JSON object");
+        assert!(r.is_object(), "read payload must be a JSON object");
+    }
 }

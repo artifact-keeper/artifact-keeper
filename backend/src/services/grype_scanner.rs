@@ -721,4 +721,67 @@ mod tests {
             );
         }
     }
+
+    /// Drop-restore path when `AK_GRYPE_REGISTRY_HOST` was already set
+    /// before the guard ran. The previous tests only exercise the `None`
+    /// arm because EnvGuard::new() removes the var before snapshotting; this
+    /// test pre-sets the var so the captured snapshot is `Some(...)` and
+    /// the guard's Drop must restore it on the `Some(v)` branch. Regression
+    /// guard against an EnvGuard refactor that silently lost prior values
+    /// and broke env isolation for tests further down the file.
+    #[test]
+    fn test_env_guard_restores_preexisting_grype_registry_host() {
+        // Cannot share ENV_MUTEX with EnvGuard cleanly: take it manually,
+        // do the pre-set + create + drop dance, then release.
+        let _outer = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("AK_GRYPE_REGISTRY_HOST", "pre-existing.example.com:5000");
+        std::env::remove_var("PEER_PUBLIC_ENDPOINT");
+
+        // Drop _outer so EnvGuard::new() can take it.
+        drop(_outer);
+
+        {
+            let _g = EnvGuard::new();
+            // Inside the guard, the snapshotted var has been removed.
+            assert!(std::env::var("AK_GRYPE_REGISTRY_HOST").is_err());
+            // Mutate it to confirm the guard's restore replaces our value.
+            std::env::set_var("AK_GRYPE_REGISTRY_HOST", "scratch.example.com");
+            // _g drops here: must restore pre-existing.example.com:5000.
+        }
+
+        assert_eq!(
+            std::env::var("AK_GRYPE_REGISTRY_HOST").unwrap(),
+            "pre-existing.example.com:5000",
+            "EnvGuard Drop must restore the original AK_GRYPE_REGISTRY_HOST \
+             value when it was set before the guard captured it"
+        );
+
+        // Clean up so we do not leak into the rest of the process.
+        std::env::remove_var("AK_GRYPE_REGISTRY_HOST");
+    }
+
+    /// Symmetric test for the second Some-arm in EnvGuard::drop (the
+    /// PEER_PUBLIC_ENDPOINT half). Without exercising both arms the
+    /// guard's restore behavior is only half-tested.
+    #[test]
+    fn test_env_guard_restores_preexisting_peer_public_endpoint() {
+        let _outer = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PEER_PUBLIC_ENDPOINT", "http://orig.peer.local:8080/");
+        std::env::remove_var("AK_GRYPE_REGISTRY_HOST");
+        drop(_outer);
+
+        {
+            let _g = EnvGuard::new();
+            assert!(std::env::var("PEER_PUBLIC_ENDPOINT").is_err());
+            std::env::set_var("PEER_PUBLIC_ENDPOINT", "https://scratch.local");
+        }
+
+        assert_eq!(
+            std::env::var("PEER_PUBLIC_ENDPOINT").unwrap(),
+            "http://orig.peer.local:8080/",
+            "EnvGuard Drop must restore the original PEER_PUBLIC_ENDPOINT"
+        );
+
+        std::env::remove_var("PEER_PUBLIC_ENDPOINT");
+    }
 }
