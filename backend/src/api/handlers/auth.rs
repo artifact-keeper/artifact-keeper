@@ -170,6 +170,13 @@ pub async fn login(
         tracing::warn!("Local admin login allowed via ALLOW_LOCAL_ADMIN_LOGIN while SSO is active");
     }
 
+    // Bound bcrypt-bound work to `auth_max_concurrency`. Without this,
+    // sustained-load mixed workloads saturate the tokio blocking-thread
+    // pool and the rest of the API starves (#991, #1088). Permit is
+    // held until this function returns; on saturation the client gets
+    // a fast 503 instead of waiting on a doomed queue.
+    let _auth_permit = state.try_acquire_auth_permit()?;
+
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
 
     let (user, tokens) = match auth_service

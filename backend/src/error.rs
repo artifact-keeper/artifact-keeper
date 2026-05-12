@@ -1,12 +1,16 @@
 //! Application error types and result alias.
 
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
 use thiserror::Error;
+
+/// Retry-After hint (seconds) sent on 503 Service Unavailable responses so
+/// well-behaved clients back off instead of hammering a saturated server.
+const RETRY_AFTER_SECS_ON_503: &str = "1";
 
 /// Application result type alias
 pub type Result<T> = std::result::Result<T, AppError>;
@@ -190,7 +194,16 @@ impl IntoResponse for AppError {
             "message": message,
         }));
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        // Tell well-behaved clients to back off on capacity-shed responses so
+        // they retry on a slower cadence and don't compound the saturation.
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_static(RETRY_AFTER_SECS_ON_503),
+            );
+        }
+        response
     }
 }
 
@@ -356,6 +369,7 @@ mod tests {
         assert_eq!(err.to_string(), "Bad gateway: upstream failed");
     }
 
+<<<<<<< HEAD
     // -----------------------------------------------------------------------
     // #1047: ENAMETOOLONG must map to 400, not 500, regardless of which
     // handler returned the error.
@@ -414,5 +428,33 @@ mod tests {
         ));
         let (status, _) = err.status_and_code();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1088 / #991: 503 responses must carry a Retry-After hint so well-
+    // behaved clients (cargo, npm, gha runners) back off during a saturation
+    // shed and do not amplify load while the server is recovering.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_service_unavailable_sets_retry_after_header() {
+        let err = AppError::ServiceUnavailable("at capacity".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("503 response should carry Retry-After");
+        assert_eq!(retry_after.to_str().unwrap(), RETRY_AFTER_SECS_ON_503);
+    }
+
+    #[test]
+    fn test_non_503_does_not_set_retry_after_header() {
+        // Retry-After should not leak onto non-shed errors: a 400 or 401
+        // is a client problem, not a transient capacity issue.
+        let err = AppError::Validation("bad input".to_string());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
     }
 }

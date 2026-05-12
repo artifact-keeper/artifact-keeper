@@ -11,6 +11,20 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// Default cap for concurrent bcrypt-bound auth operations.
+///
+/// bcrypt-cost-12 is CPU-bound and takes roughly 100-300 ms per verify; once
+/// in-flight verifies exceed `4 * cores`, additional requests just queue
+/// behind a saturated blocking-thread pool and the rest of the API starves.
+/// The floor of 8 keeps low-core dev environments usable, while the
+/// 4x multiplier keeps large machines from being capped artificially low.
+fn default_auth_max_concurrency() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    std::cmp::max(8, cores.saturating_mul(4))
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -161,8 +175,21 @@ pub struct Config {
     pub database_min_connections: u32,
 
     /// Timeout in seconds for acquiring a connection from the pool before
-    /// returning an error. Defaults to 30.
+    /// returning an error. Defaults to 5. Kept short so that callers fail fast
+    /// under sustained pool exhaustion instead of piling up; raise for batch
+    /// workloads where waiting is preferable to retrying.
     pub database_acquire_timeout_secs: u64,
+
+    /// Maximum number of bcrypt-bound auth operations (login,
+    /// password verification, API-token verification) allowed to run
+    /// concurrently across the process. Acts as a fast-fail load shed:
+    /// when saturated, additional requests receive 503 Service Unavailable
+    /// with `Retry-After` instead of queueing on the blocking-task pool
+    /// and starving the rest of the API.
+    ///
+    /// Defaults to `max(8, 4 * num_cpus)`. Set to 0 to disable the limit
+    /// (legacy behaviour, not recommended in production).
+    pub auth_max_concurrency: usize,
 
     /// Idle timeout in seconds. Connections idle longer than this will be
     /// closed. Defaults to 600 (10 minutes).
@@ -346,6 +373,7 @@ redacted_debug!(Config {
     show database_acquire_timeout_secs,
     show database_idle_timeout_secs,
     show database_max_lifetime_secs,
+    show auth_max_concurrency,
     show rate_limit_auth_per_window,
     show rate_limit_api_per_window,
     show rate_limit_search_per_window,
@@ -421,11 +449,12 @@ impl Default for Config {
             max_upload_size_bytes: 10_737_418_240,
             allow_local_admin_login: false,
             metrics_port: None,
-            database_max_connections: 20,
+            database_max_connections: 50,
             database_min_connections: 5,
-            database_acquire_timeout_secs: 30,
+            database_acquire_timeout_secs: 5,
             database_idle_timeout_secs: 600,
             database_max_lifetime_secs: 1800,
+            auth_max_concurrency: default_auth_max_concurrency(),
             rate_limit_auth_per_window: 120,
             rate_limit_api_per_window: 10000,
             rate_limit_search_per_window: 300,
@@ -563,11 +592,12 @@ impl Config {
                 },
                 Err(_) => None,
             },
-            database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 20),
+            database_max_connections: env_parse("DATABASE_MAX_CONNECTIONS", 50),
             database_min_connections: env_parse("DATABASE_MIN_CONNECTIONS", 5),
-            database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 30),
+            database_acquire_timeout_secs: env_parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 5),
             database_idle_timeout_secs: env_parse("DATABASE_IDLE_TIMEOUT_SECS", 600),
             database_max_lifetime_secs: env_parse("DATABASE_MAX_LIFETIME_SECS", 1800),
+            auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             rate_limit_auth_per_window: env_parse("RATE_LIMIT_AUTH_PER_MIN", 120),
             rate_limit_api_per_window: env_parse("RATE_LIMIT_API_PER_MIN", 10000),
             rate_limit_search_per_window: env_parse("RATE_LIMIT_SEARCH_PER_MIN", 300),
@@ -748,8 +778,9 @@ mod tests {
         assert_eq!(config.jwt_access_token_expiry_minutes, 30);
         assert_eq!(config.jwt_refresh_token_expiry_days, 7);
         assert!(!config.demo_mode);
-        assert_eq!(config.database_max_connections, 20);
+        assert_eq!(config.database_max_connections, 50);
         assert_eq!(config.database_min_connections, 5);
+        assert!(config.auth_max_concurrency >= 8);
         assert_eq!(config.rate_limit_api_per_window, 10000);
         assert_eq!(config.rate_limit_search_per_window, 300);
         // #1026: password-change limiter defaults must be strictly tighter
@@ -944,12 +975,13 @@ mod tests {
         assert_eq!(config.peer_public_endpoint, "http://localhost:8080");
         assert_eq!(config.max_upload_size_bytes, 10_737_418_240);
 
-        // Database pool defaults (#678)
-        assert_eq!(config.database_max_connections, 20);
+        // Database pool defaults (#678, raised for perf bundle #991/#1088)
+        assert_eq!(config.database_max_connections, 50);
         assert_eq!(config.database_min_connections, 5);
-        assert_eq!(config.database_acquire_timeout_secs, 30);
+        assert_eq!(config.database_acquire_timeout_secs, 5);
         assert_eq!(config.database_idle_timeout_secs, 600);
         assert_eq!(config.database_max_lifetime_secs, 1800);
+        assert!(config.auth_max_concurrency >= 8);
 
         // Password expiration defaults (#679)
         assert_eq!(config.password_expiry_days, 0);
@@ -1057,7 +1089,7 @@ mod tests {
         let config = Config::from_env().expect("Config should load even with invalid pool setting");
 
         // env_parse falls back to the default when the value cannot be parsed
-        assert_eq!(config.database_max_connections, 20);
+        assert_eq!(config.database_max_connections, 50);
 
         // Restore
         if let Some(v) = saved_db {
