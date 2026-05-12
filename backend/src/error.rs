@@ -369,7 +369,6 @@ mod tests {
         assert_eq!(err.to_string(), "Bad gateway: upstream failed");
     }
 
-<<<<<<< HEAD
     // -----------------------------------------------------------------------
     // #1047: ENAMETOOLONG must map to 400, not 500, regardless of which
     // handler returned the error.

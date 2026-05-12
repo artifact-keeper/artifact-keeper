@@ -14,6 +14,7 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use tracing::info;
 use uuid::Uuid;
 
@@ -189,6 +190,66 @@ static AUTH_TOKEN_CACHE_REGISTRY: OnceLock<RwLock<Vec<Weak<TokenCacheMap>>>> = O
 
 fn auth_token_cache_registry() -> &'static RwLock<Vec<Weak<TokenCacheMap>>> {
     AUTH_TOKEN_CACHE_REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide bcrypt-bound auth concurrency cap (#991, #1088)
+// ---------------------------------------------------------------------------
+//
+// `verify_password` / `hash_password` are called from many entry points:
+// - `auth.rs::login` (username + password local login)
+// - `validate_api_token` (every authenticated request that uses an API token
+//   on cache miss — cargo, npm, pip, gha-runners hit this path the most)
+// - `require_auth_with_bearer_fallback` (Bearer basic-auth fallback path)
+// - `AuthService::authenticate` invoked from middleware basic-auth fallback
+// - signup, password change, API-token issuance (hash_password)
+//
+// Wiring the permit in `auth.rs::login` alone (the original PR shape) misses
+// the API-token verify path that *dominates* sustained-load traffic, so the
+// permit must sit at the chokepoint that every bcrypt-bound call traverses:
+// `verify_password` / `hash_password`. The global cell is set once by
+// `AppState::new` from `Config::auth_max_concurrency`; tests that exercise
+// the static methods directly leave it unset and get the legacy uncapped
+// behaviour, which preserves their semantics.
+static GLOBAL_AUTH_SEMAPHORE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
+
+/// Install the process-wide bcrypt-bound auth concurrency cap. Idempotent —
+/// the first call wins, subsequent calls are silently ignored so multiple
+/// `AppState` instances (e.g., during integration-test setup) cannot
+/// re-configure the cap mid-run.
+///
+/// Pass `None` to disable the cap (legacy behaviour, `auth_max_concurrency=0`).
+pub fn install_global_auth_semaphore(sem: Option<Arc<Semaphore>>) {
+    let _ = GLOBAL_AUTH_SEMAPHORE.set(sem);
+}
+
+/// Try to claim a permit from the process-wide bcrypt-bound auth cap. Returns:
+/// - `Ok(None)` when no cap is installed (tests, or operator opt-out)
+/// - `Ok(Some(permit))` when a slot was acquired (must be held until the
+///   bcrypt work completes; release is automatic on drop, including on panic)
+/// - `Err(ServiceUnavailable)` when the cap is saturated
+pub(crate) fn acquire_auth_permit_for_bcrypt() -> Result<Option<tokio::sync::OwnedSemaphorePermit>>
+{
+    let sem_arc = GLOBAL_AUTH_SEMAPHORE.get().and_then(|cell| cell.clone());
+    try_acquire_permit_from(sem_arc.as_ref())
+}
+
+/// Pure helper that the public function delegates to. Extracted so that unit
+/// tests can exercise the shed logic on a fresh semaphore without contending
+/// with the process-wide `OnceLock` (which may have been set by an earlier
+/// test in the same binary).
+fn try_acquire_permit_from(
+    sem: Option<&Arc<Semaphore>>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    match sem {
+        None => Ok(None),
+        Some(sem) => match sem.clone().try_acquire_owned() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(_) => Err(AppError::ServiceUnavailable(
+                "Authentication service is at capacity, retry shortly".to_string(),
+            )),
+        },
+    }
 }
 
 /// Mark every cached API-token validation belonging to `user_id` as stale and
@@ -594,6 +655,10 @@ impl AuthService {
 
     /// Hash a password
     pub async fn hash_password(password: &str) -> Result<String> {
+        // Hold a process-wide auth-concurrency permit while bcrypt runs so
+        // hash() also participates in the load-shed cap (signup, password
+        // change, API-token creation all call this).
+        let _permit = acquire_auth_permit_for_bcrypt()?;
         let pwd = password.to_string();
         tokio::task::spawn_blocking(move || {
             hash(&pwd, DEFAULT_COST)
@@ -604,7 +669,14 @@ impl AuthService {
     }
 
     /// Verify a password against a hash
+    ///
+    /// Acquires a permit from the process-wide auth-concurrency semaphore
+    /// before invoking the (CPU-bound, ~100-300 ms) bcrypt verify. On
+    /// saturation this returns `AppError::ServiceUnavailable` immediately,
+    /// fast-shedding load so the rest of the API does not starve the
+    /// blocking-thread pool (#991, #1088).
     pub async fn verify_password(password: &str, hash: &str) -> Result<bool> {
+        let _permit = acquire_auth_permit_for_bcrypt()?;
         let pwd = password.to_string();
         let h = hash.to_string();
         tokio::task::spawn_blocking(move || {
@@ -1541,6 +1613,69 @@ mod tests {
         // An invalid bcrypt hash should return an error, not panic
         let result = AuthService::verify_password("password", "not-a-valid-hash").await;
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Global bcrypt-bound auth-concurrency cap (#991, #1088)
+    // -----------------------------------------------------------------------
+    //
+    // The pure `try_acquire_permit_from` helper is what `verify_password` /
+    // `hash_password` delegate to once they have resolved the global cell.
+    // Exercising it directly avoids the test-binary OnceLock contention that
+    // would otherwise make these regression assertions order-dependent.
+
+    #[test]
+    fn test_acquire_permit_returns_none_when_no_cap_installed() {
+        // The legacy "uncapped" mode must not surface as a 503.
+        assert!(try_acquire_permit_from(None)
+            .expect("must succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn test_acquire_permit_returns_some_when_slot_available() {
+        let sem = Arc::new(Semaphore::new(2));
+        let permit = try_acquire_permit_from(Some(&sem)).expect("must succeed");
+        assert!(permit.is_some(), "expected a permit when slot is free");
+    }
+
+    #[test]
+    fn test_acquire_permit_sheds_to_503_when_saturated() {
+        // This is the regression that the original PR was missing: the cap
+        // is now enforced at the bcrypt chokepoint, so EVERY bcrypt path
+        // (login, validate_api_token, basic-auth fallback) participates
+        // in the shed. When the cap is saturated, the helper must surface
+        // `ServiceUnavailable`, which `IntoResponse` maps to 503 +
+        // `Retry-After: 1`.
+        let sem = Arc::new(Semaphore::new(1));
+        let _held = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("first permit must succeed");
+        match try_acquire_permit_from(Some(&sem)) {
+            Err(AppError::ServiceUnavailable(_)) => {}
+            other => panic!("expected ServiceUnavailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_acquire_permit_releases_on_permit_drop() {
+        let sem = Arc::new(Semaphore::new(1));
+        {
+            let _p = try_acquire_permit_from(Some(&sem))
+                .expect("must succeed")
+                .expect("must yield a permit");
+            // While `_p` is alive, the second acquire sheds.
+            assert!(matches!(
+                try_acquire_permit_from(Some(&sem)),
+                Err(AppError::ServiceUnavailable(_))
+            ));
+        }
+        // After drop, the permit is back in the pool and the next acquire
+        // succeeds. This guarantees no permit leaks on bcrypt panic / error.
+        assert!(try_acquire_permit_from(Some(&sem))
+            .expect("must succeed")
+            .is_some());
     }
 
     // -----------------------------------------------------------------------

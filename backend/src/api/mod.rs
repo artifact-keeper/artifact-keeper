@@ -125,6 +125,18 @@ impl AppState {
     ) -> Self {
         let permission_service = Arc::new(PermissionService::new(db.clone()));
         let auth_semaphore = build_auth_semaphore(config.auth_max_concurrency);
+        // Install the process-wide cap that `AuthService::verify_password` /
+        // `hash_password` consult on every bcrypt-bound call. Idempotent —
+        // the first AppState wins, which keeps multi-AppState test setups
+        // deterministic.
+        crate::services::auth_service::install_global_auth_semaphore(auth_semaphore.clone());
+        if config.auth_max_concurrency == 0 {
+            tracing::warn!(
+                "AUTH_MAX_CONCURRENCY=0: bcrypt-bound auth runs without a process-wide cap. \
+                 Under sustained load this can saturate the blocking-thread pool and starve \
+                 the API (#991, #1088). Production deployments should leave this unset."
+            );
+        }
         Self {
             config,
             db,
@@ -159,6 +171,12 @@ impl AppState {
     ) -> Self {
         let permission_service = Arc::new(PermissionService::new(db.clone()));
         let auth_semaphore = build_auth_semaphore(config.auth_max_concurrency);
+        crate::services::auth_service::install_global_auth_semaphore(auth_semaphore.clone());
+        if config.auth_max_concurrency == 0 {
+            tracing::warn!(
+                "AUTH_MAX_CONCURRENCY=0: bcrypt-bound auth runs without a process-wide cap"
+            );
+        }
         Self {
             config,
             db,
@@ -266,12 +284,16 @@ impl AppState {
 
     /// Try to claim a slot for a bcrypt-bound auth operation.
     ///
-    /// Returns `Ok(Some(permit))` when a slot was acquired, `Ok(None)` when
-    /// the semaphore is disabled (legacy / `auth_max_concurrency = 0`), and
-    /// `Err(AppError::ServiceUnavailable)` when the cap is saturated.
+    /// **Deprecated as a per-handler call site**: handlers should NOT acquire
+    /// this manually. The cap is now enforced inside
+    /// [`crate::services::auth_service::AuthService::verify_password`] and
+    /// `hash_password`, so every bcrypt entry point (login, validate_api_token,
+    /// basic-auth fallback, SSO post-auth, password change) shares the same
+    /// shed boundary. Holding a permit in the handler and another inside
+    /// `verify_password` would double-count slots and cause spurious 503s.
     ///
-    /// The returned permit must be held for the duration of the bcrypt work
-    /// so the slot is released automatically on drop, even on panic.
+    /// Kept as a thin wrapper for diagnostics / external observers that want
+    /// to probe the same `auth_semaphore` used internally.
     pub fn try_acquire_auth_permit(
         &self,
     ) -> crate::error::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
