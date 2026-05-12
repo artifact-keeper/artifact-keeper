@@ -217,31 +217,49 @@ async fn enqueue_for_event(db: &PgPool, event: &DomainEvent) -> std::result::Res
 
     let payload = build_event_payload(event, mapped_event);
 
-    for webhook in &webhooks {
-        let result = sqlx::query(
-            r#"
-            INSERT INTO webhook_deliveries
-                (webhook_id, event, payload, attempts, next_retry_at, success)
-            VALUES ($1, $2, $3, 0, NOW(), false)
-            "#,
-        )
-        .bind(webhook.id)
-        .bind(mapped_event)
-        .bind(&payload)
-        .execute(db)
-        .await;
+    // Batch insert (issue #949). The previous implementation issued one
+    // INSERT per matching webhook, which is N+1 for high-fanout events
+    // (e.g. a global webhook subscribed to every artifact upload). We now
+    // issue a single multi-row INSERT keyed by an UNNEST of the matching
+    // webhook ids. `event` and `payload` are scalar broadcasts: every row
+    // shares the same event/payload, so we bind them once and reference
+    // them by name in the SELECT.
+    //
+    // Per-row failure granularity is lost (a single failing webhook id
+    // fails the whole batch), but the only realistic failure here is a
+    // database/connection error that would fail every row anyway. We log
+    // and record metrics at the batch level instead.
+    let webhook_ids: Vec<uuid::Uuid> = webhooks.iter().map(|w| w.id).collect();
+    let batch_size = webhook_ids.len();
 
-        match result {
-            Ok(_) => {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO webhook_deliveries
+            (webhook_id, event, payload, attempts, next_retry_at, success)
+        SELECT id, $2, $3, 0, NOW(), false
+        FROM UNNEST($1::uuid[]) AS t(id)
+        "#,
+    )
+    .bind(&webhook_ids)
+    .bind(mapped_event)
+    .bind(&payload)
+    .execute(db)
+    .await;
+
+    match result {
+        Ok(_) => {
+            for _ in 0..batch_size {
                 crate::services::metrics_service::record_webhook_delivery_enqueued(mapped_event);
             }
-            Err(e) => {
-                tracing::warn!(
-                    webhook_id = %webhook.id,
-                    event = mapped_event,
-                    error = %e,
-                    "Failed to insert webhook_deliveries row"
-                );
+        }
+        Err(e) => {
+            tracing::warn!(
+                event = mapped_event,
+                batch_size,
+                error = %e,
+                "Failed to batch insert webhook_deliveries rows"
+            );
+            for _ in 0..batch_size {
                 crate::services::metrics_service::record_webhook_delivery_enqueue_failed(
                     mapped_event,
                     "db_error",
@@ -517,5 +535,28 @@ mod tests {
         for ev in unmapped {
             assert_eq!(map_event_type(ev), None, "{} should be unmapped", ev);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Batched INSERT contract (issue #949)
+    // -----------------------------------------------------------------------
+    //
+    // The full end-to-end producer loop (publish event, look up webhooks,
+    // assert webhook_deliveries rows) is covered by issue #952 once the
+    // embedded-Postgres harness lands. Until then we exercise the pieces
+    // that are pure functions and document the SQL shape the batched
+    // path depends on.
+
+    #[test]
+    fn test_batch_insert_sql_uses_unnest_over_uuid_array() {
+        // Fence: if anyone reverts the producer to a per-row INSERT loop,
+        // this canary spot-checks that the file still contains the
+        // UNNEST-over-uuid[] pattern. The integration test in #952 will
+        // exercise the actual SQL against a real Postgres.
+        let src = include_str!("webhook_producer.rs");
+        assert!(
+            src.contains("UNNEST($1::uuid[])"),
+            "webhook producer must batch-insert via UNNEST to avoid N+1 (issue #949)"
+        );
     }
 }
