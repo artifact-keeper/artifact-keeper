@@ -318,13 +318,22 @@ pub async fn auth_middleware(
     let had_header_credentials = !matches!(extracted, ExtractedToken::None);
 
     let header_result: Result<AuthExtension, &'static str> = match extracted {
-        ExtractedToken::Bearer(token) => match auth_service.validate_access_token(token) {
-            Ok(claims) => Ok(AuthExtension::from(claims)),
-            Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => Ok(ext),
-                Err(_) => Err("Invalid or expired token"),
-            },
-        },
+        // Replica-safe access-token validation. The async variant consults the
+        // DB credential-change watermark (#1173) so a password reset, TOTP
+        // change, or deactivation on a peer replica is honoured here on the
+        // request path within `CREDENTIAL_DB_CACHE_TTL_SECS`. The sync variant
+        // (which only reads the in-memory map) would silently keep accepting
+        // pre-change tokens across replicas — that's the architectural gap
+        // PR #1190 was supposed to close.
+        ExtractedToken::Bearer(token) => {
+            match auth_service.validate_access_token_async(token).await {
+                Ok(claims) => Ok(AuthExtension::from(claims)),
+                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
+                    Ok(ext) => Ok(ext),
+                    Err(_) => Err("Invalid or expired token"),
+                },
+            }
+        }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => Ok(ext),
@@ -416,7 +425,10 @@ pub(crate) async fn try_resolve_auth(
 ) -> Option<AuthExtension> {
     match extracted {
         ExtractedToken::Bearer(token) => {
-            if let Ok(claims) = auth_service.validate_access_token(token) {
+            // See `auth_middleware` for why this is the async variant. Same
+            // rationale: optional-auth routes still need to reject pre-change
+            // tokens across replicas (#1173).
+            if let Ok(claims) = auth_service.validate_access_token_async(token).await {
                 return Some(AuthExtension::from(claims));
             }
             if let Ok(ext) = validate_api_token_with_scopes(auth_service, token).await {
@@ -707,15 +719,23 @@ pub async fn admin_middleware(
     let extracted = extract_token(&request);
 
     let auth_ext = match extracted {
-        ExtractedToken::Bearer(token) => match auth_service.validate_access_token(token) {
-            Ok(claims) => AuthExtension::from(claims),
-            Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
-                Ok(ext) => ext,
-                Err(_) => {
-                    return (StatusCode::UNAUTHORIZED, "Invalid or expired token").into_response()
-                }
-            },
-        },
+        // Admin middleware uses the async (replica-safe) access-token validator
+        // for the same reason as the main auth middleware (#1173). An admin
+        // who has had their privileges revoked on replica A must lose access
+        // on replica B too, even if they're holding a Bearer token whose `iat`
+        // predates the revocation.
+        ExtractedToken::Bearer(token) => {
+            match auth_service.validate_access_token_async(token).await {
+                Ok(claims) => AuthExtension::from(claims),
+                Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
+                    Ok(ext) => ext,
+                    Err(_) => {
+                        return (StatusCode::UNAUTHORIZED, "Invalid or expired token")
+                            .into_response()
+                    }
+                },
+            }
+        }
         ExtractedToken::ApiKey(token) => {
             match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => ext,

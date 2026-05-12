@@ -388,6 +388,13 @@ pub async fn update_user(
     if matches!(payload.is_active, Some(false)) {
         invalidate_user_token_cache_entries(id);
         invalidate_user_tokens(id);
+
+        // DB-backed refresh-token family revocation (#1174 / PR #1190 review):
+        // a deactivated user must lose every refresh token on every replica.
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        if let Err(e) = auth_service.revoke_all_refresh_token_families(id).await {
+            tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families on deactivation");
+        }
     }
 
     let user = sqlx::query_as!(
@@ -461,6 +468,16 @@ pub async fn delete_user(
     // user that doesn't exist, never serving a stale cache entry. Issue #931.
     invalidate_user_token_cache_entries(id);
     invalidate_user_tokens(id);
+
+    // DB-backed refresh-token family revocation (#1174 / PR #1190 review):
+    // delete-user must close out every refresh token across every replica.
+    // Note that the cascade from `users` to `refresh_token_jti` would also
+    // clean these up on commit; we revoke explicitly here so any in-flight
+    // request that races the DELETE still observes the revocation.
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    if let Err(e) = auth_service.revoke_all_refresh_token_families(id).await {
+        tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families on delete");
+    }
 
     let result = sqlx::query!("DELETE FROM users WHERE id = $1", id)
         .execute(&state.db)
@@ -907,6 +924,20 @@ pub async fn change_password(
     invalidate_user_token_cache_entries(id);
     crate::services::auth_service::invalidate_user_tokens(id);
 
+    // Replica-safe refresh-token family revocation (#1174 / PR #1190 review).
+    // The in-memory `invalidate_user_tokens` only flips THIS replica's map;
+    // a refresh JWT minted before the password change can still be replayed
+    // against peer replicas for up to `jwt_refresh_token_expiry_days` (7d
+    // default). Mark every row in `refresh_token_jti` for this user as
+    // revoked so the DB-backed replay check rejects them on every replica.
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    if let Err(e) = auth_service.revoke_all_refresh_token_families(id).await {
+        // Best-effort: a failure here is logged but does not block the
+        // password change. The user is already locally invalidated and the
+        // tokens will eventually expire on their own.
+        tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families after password change");
+    }
+
     // If this user had must_change_password, check if setup mode should be unlocked
     if had_must_change && state.setup_required.load(Ordering::Relaxed) {
         state.setup_required.store(false, Ordering::Relaxed);
@@ -1028,6 +1059,13 @@ pub async fn reset_password(
     // back through DB validation.
     invalidate_user_token_cache_entries(id);
     crate::services::auth_service::invalidate_user_tokens(id);
+
+    // DB-backed refresh-token family revocation (#1174 / PR #1190 review):
+    // see change_password for rationale.
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    if let Err(e) = auth_service.revoke_all_refresh_token_families(id).await {
+        tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families after password reset");
+    }
 
     Ok(Json(ResetPasswordResponse {
         temporary_password: temp_password,
@@ -1193,6 +1231,14 @@ pub async fn force_password_change(
     // See change_password for the cache-invalidation rationale (#1023/#1027).
     invalidate_user_token_cache_entries(id);
     crate::services::auth_service::invalidate_user_tokens(id);
+
+    // DB-backed refresh-token family revocation (#1174 / PR #1190 review):
+    // forcing a password change must immediately invalidate every refresh
+    // token in flight, on every replica.
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    if let Err(e) = auth_service.revoke_all_refresh_token_families(id).await {
+        tracing::warn!(user_id = %id, error = %e, "Failed to revoke refresh-token families after force password change");
+    }
 
     state.event_bus.emit(
         "user.force_password_change",

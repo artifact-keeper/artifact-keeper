@@ -146,11 +146,14 @@ struct CachedApiTokenEntry {
 }
 
 /// In-memory fast-path cache for the DB-backed credential-invalidation
-/// check. The value is the highest of `users.password_changed_at`,
-/// `users.totp_verified_at`, `users.updated_at` (as a Unix timestamp)
-/// plus the `Instant` it was cached so entries can expire after
-/// [`CREDENTIAL_DB_CACHE_TTL_SECS`]. Process-local; DB is the source of
-/// truth so multi-replica deployments stay consistent (#1173).
+/// check. The value is the highest of `users.password_changed_at` and
+/// `users.totp_verified_at` (as a Unix timestamp) plus the `Instant` it
+/// was cached so entries can expire after [`CREDENTIAL_DB_CACHE_TTL_SECS`].
+/// `users.updated_at` is deliberately NOT folded into the watermark — it
+/// bumps on benign profile edits (display name, email, role) so including
+/// it would invalidate tokens on changes that are not credential-bearing
+/// (regression caught in PR #1190 review). Process-local; DB is the
+/// source of truth so multi-replica deployments stay consistent (#1173).
 static CREDENTIAL_INVALIDATIONS: OnceLock<RwLock<HashMap<Uuid, (i64, Instant)>>> = OnceLock::new();
 const INVALIDATION_RETENTION_SECS: i64 = 7 * 24 * 3600;
 /// How long a DB-backed credential-change watermark stays cached in the
@@ -200,20 +203,53 @@ pub(crate) fn is_token_invalidated(user_id: Uuid, issued_at: i64) -> bool {
     false
 }
 
+/// Outcome of the DB-backed credential-change lookup for a user.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CredentialWatermark {
+    /// Unix-timestamp (seconds) of the most recent credential-bearing
+    /// change on the user row.
+    pub(crate) watermark: i64,
+    /// `users.is_active`. When `false`, [`is_token_invalidated_replica_safe`]
+    /// rejects every token regardless of `iat` so a deactivation processed
+    /// on replica A is honoured by every other replica.
+    pub(crate) is_active: bool,
+}
+
 /// DB-backed credential-change watermark per user, populated lazily on
-/// every `validate_access_token` / `refresh_tokens` call.
+/// every `validate_access_token_async` / `refresh_tokens` call.
 ///
-/// Returns the highest of `users.password_changed_at`,
-/// `users.totp_verified_at`, `users.updated_at` as a Unix timestamp (in
-/// seconds), or `None` if the user no longer exists. The value is cached
-/// in [`CREDENTIAL_INVALIDATIONS`] for [`CREDENTIAL_DB_CACHE_TTL_SECS`] so
-/// bursts don't hammer the DB.
-async fn fetch_credential_change_watermark(db: &PgPool, user_id: Uuid) -> Result<Option<i64>> {
-    // Fast-path: serve from cache if fresh.
+/// Returns the highest of `users.password_changed_at` and
+/// `users.totp_verified_at` as a Unix timestamp (in seconds), alongside
+/// `users.is_active`, or `None` if the user no longer exists.
+///
+/// Note: `users.updated_at` is deliberately NOT included. Profile edits
+/// (display name, email, last_login_at touches) bump `updated_at` without
+/// being credential changes; folding it into the watermark would reject
+/// tokens minted before benign edits (PR #1190 review regression). The
+/// fast-path map in [`invalidate_user_tokens`] (called from password /
+/// TOTP / deactivation handlers) covers the same-replica case; this DB
+/// watermark covers cross-replica fan-out.
+///
+/// The value is cached in [`CREDENTIAL_INVALIDATIONS`] for
+/// [`CREDENTIAL_DB_CACHE_TTL_SECS`] so bursts don't hammer the DB.
+async fn fetch_credential_change_watermark(
+    db: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<CredentialWatermark>> {
+    // Fast-path: serve from cache if fresh. The cached value is the watermark
+    // only; on cache hit we still must consult the DB if a strict is_active
+    // check is needed. To keep the cache lean (and unchanged in structure),
+    // a cache hit implies `is_active = true` at the time of caching — fresh
+    // deactivations are reflected through the in-memory invalidation map
+    // (which `invalidate_user_tokens` writes synchronously), and through the
+    // 5s TTL after which the DB is re-consulted.
     if let Ok(map) = invalidation_map().read() {
         if let Some(&(changed_at, recorded)) = map.get(&user_id) {
             if recorded.elapsed().as_secs() < CREDENTIAL_DB_CACHE_TTL_SECS {
-                return Ok(Some(changed_at));
+                return Ok(Some(CredentialWatermark {
+                    watermark: changed_at,
+                    is_active: true,
+                }));
             }
         }
     }
@@ -223,9 +259,9 @@ async fn fetch_credential_change_watermark(db: &PgPool, user_id: Uuid) -> Result
         SELECT
             GREATEST(
                 password_changed_at,
-                COALESCE(totp_verified_at, password_changed_at),
-                updated_at
-            ) AS "watermark!"
+                COALESCE(totp_verified_at, password_changed_at)
+            ) AS "watermark!",
+            is_active
         FROM users
         WHERE id = $1
         "#,
@@ -240,13 +276,23 @@ async fn fetch_credential_change_watermark(db: &PgPool, user_id: Uuid) -> Result
     };
     let watermark = record.watermark.timestamp();
 
-    if let Ok(mut map) = invalidation_map().write() {
-        map.insert(user_id, (watermark, Instant::now()));
-        let cutoff = Utc::now().timestamp() - INVALIDATION_RETENTION_SECS;
-        map.retain(|_, (ts, _)| *ts > cutoff);
+    // Only cache when the user is active. Caching `is_active=false` would
+    // require expanding the cache value to a tuple; instead we skip the
+    // write so the next lookup re-reads the DB and gets the authoritative
+    // status. Inactive lookups are rare on the hot path (the request will
+    // 401 anyway) so the extra DB roundtrip is acceptable.
+    if record.is_active {
+        if let Ok(mut map) = invalidation_map().write() {
+            map.insert(user_id, (watermark, Instant::now()));
+            let cutoff = Utc::now().timestamp() - INVALIDATION_RETENTION_SECS;
+            map.retain(|_, (ts, _)| *ts > cutoff);
+        }
     }
 
-    Ok(Some(watermark))
+    Ok(Some(CredentialWatermark {
+        watermark,
+        is_active: record.is_active,
+    }))
 }
 
 /// Replica-safe credential-invalidation check.
@@ -272,7 +318,16 @@ pub(crate) async fn is_token_invalidated_replica_safe(
         return Ok(true);
     }
     match fetch_credential_change_watermark(db, user_id).await? {
-        Some(watermark) => Ok(issued_at <= watermark),
+        Some(entry) => {
+            // Reject every token (regardless of iat) when the user has been
+            // deactivated. This is the cross-replica fan-out: replica A flips
+            // is_active=false; replica B observes it here on next DB lookup
+            // (within `CREDENTIAL_DB_CACHE_TTL_SECS` of the change).
+            if !entry.is_active {
+                return Ok(true);
+            }
+            Ok(issued_at <= entry.watermark)
+        }
         None => Ok(false),
     }
 }
@@ -1728,6 +1783,17 @@ impl AuthService {
         for user_id in &deactivated_ids {
             invalidate_user_token_cache_entries(*user_id);
             invalidate_user_tokens(*user_id);
+
+            // DB-backed refresh-token family revocation (#1174 / PR #1190 review):
+            // SSO offboarding must invalidate refresh tokens across every
+            // replica, not just the one that ran the sync.
+            if let Err(e) = self.revoke_all_refresh_token_families(*user_id).await {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "Failed to revoke refresh-token families during SSO sync deactivation",
+                );
+            }
         }
 
         Ok(deactivated_ids.len() as u64)
@@ -3672,5 +3738,259 @@ mod tests {
         let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
             .execute(&pool)
             .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #1190 review regressions (architectural wiring tests).
+    //
+    // These tests pin the three load-bearing wiring decisions in #1173 /
+    // #1174 / #1175 so they cannot quietly regress in future refactors.
+    //   1. Password reset revokes the refresh-token family at the DB layer.
+    //   2. Access-token validation uses the DB watermark (replica-safe).
+    //   3. A profile edit (bumps `users.updated_at` only) does NOT
+    //      invalidate active tokens.
+    //   4. Static check: `validate_access_token_async` has a real production
+    //      caller in middleware so it cannot become dead code again.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_password_reset_revokes_refresh_jti_family() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let username = format!("pwreset_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        // Mint a refresh token and persist its jti.
+        let tokens = service.generate_tokens(&user).expect("mint");
+        service
+            .persist_refresh_jti_from_pair(&tokens, user_id)
+            .await
+            .expect("persist jti");
+
+        // Simulate the password-reset cleanup that handlers/users.rs now
+        // performs alongside `invalidate_user_tokens`.
+        let revoked = service
+            .revoke_all_refresh_token_families(user_id)
+            .await
+            .expect("revoke families");
+        assert!(revoked >= 1, "expected at least one family row revoked");
+
+        // The previously-minted refresh token must now be rejected by the
+        // refresh-grant path (family is revoked at the DB level — visible on
+        // every replica).
+        let result = service.refresh_tokens(&tokens.refresh_token).await;
+        assert!(
+            result.is_err(),
+            "refresh JWT issued before password reset must 401"
+        );
+
+        // The row in refresh_token_jti must be marked revoked_at.
+        let token_data = service.decode_token(&tokens.refresh_token).expect("decode");
+        let jti = token_data.claims.jti.expect("refresh has jti");
+        let row = sqlx::query!(
+            "SELECT revoked_at FROM refresh_token_jti WHERE jti = $1",
+            jti
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("row exists");
+        assert!(row.revoked_at.is_some(), "family must be marked revoked");
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM refresh_token_jti WHERE user_id = $1", user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_access_token_validation_uses_db_watermark_after_invalidation() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let username = format!("axw_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        // Mint an access token whose `iat` predates the credential change
+        // by 60 seconds (so it's strictly older than `password_changed_at`).
+        let tokens = service.generate_tokens(&user).expect("mint");
+        // The freshly minted access token has iat=NOW and password_changed_at
+        // for the user is NOW - 60s (see `insert_test_user`), so it should
+        // currently be ACCEPTED.
+        service
+            .validate_access_token_async(&tokens.access_token)
+            .await
+            .expect("token accepted before invalidation");
+
+        // Simulate password change: bump `password_changed_at` to NOW + 60s
+        // so the token's iat is strictly less than the watermark.
+        sqlx::query!(
+            "UPDATE users SET password_changed_at = NOW() + INTERVAL '60 seconds' WHERE id = $1",
+            user_id
+        )
+        .execute(&pool)
+        .await
+        .expect("bump password_changed_at");
+
+        // Clear the in-memory cache so the next call hits the DB.
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        // The async validator must now REJECT the pre-change token via the
+        // DB watermark. This is the replica-safe guarantee: even though
+        // `invalidate_user_tokens` was never called on this process, the DB
+        // is the source of truth.
+        let result = service
+            .validate_access_token_async(&tokens.access_token)
+            .await;
+        assert!(
+            result.is_err(),
+            "access token issued before credential change must be rejected by async validator",
+        );
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_users_updated_at_bump_does_not_invalidate_tokens() {
+        // Regression for PR #1190 Issue #3: previously the watermark SQL
+        // included `users.updated_at` so a benign profile edit (display
+        // name, email, role flip) would invalidate every active token.
+        // After the fix, only `password_changed_at` and `totp_verified_at`
+        // contribute.
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cfg = make_test_config();
+        let service = AuthService::new(pool.clone(), cfg);
+
+        let username = format!("profile_{}", &Uuid::new_v4().to_string()[..8]);
+        let user_id = insert_test_user(&pool, &username).await;
+        let mut user = make_test_user();
+        user.id = user_id;
+        user.username = username;
+
+        let tokens = service.generate_tokens(&user).expect("mint");
+
+        // Drop any cached watermark for this user so the next call re-reads
+        // the DB.
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        // Simulate a profile edit that bumps ONLY `updated_at` (display name
+        // change, etc.) and pushes it well past the token's iat. If the
+        // watermark expression still folded in `updated_at`, the next
+        // validation would reject the token.
+        sqlx::query!(
+            "UPDATE users SET updated_at = NOW() + INTERVAL '120 seconds', \
+             display_name = 'New Display' WHERE id = $1",
+            user_id
+        )
+        .execute(&pool)
+        .await
+        .expect("bump updated_at");
+
+        // Clear cache again to force a DB read against the bumped row.
+        if let Ok(mut map) = invalidation_map().write() {
+            map.remove(&user_id);
+        }
+
+        // The token MUST still validate. The watermark only considers
+        // password_changed_at / totp_verified_at, neither of which moved.
+        service
+            .validate_access_token_async(&tokens.access_token)
+            .await
+            .expect("token must remain valid after benign profile edit");
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Meta-test: assert that `validate_access_token_async` has at least one
+    /// production caller in the middleware/handler tree. Prevents future
+    /// regressions where the function gets re-orphaned (the bug PR #1190
+    /// review caught: function existed, no caller, replica-safe promise was
+    /// a lie).
+    ///
+    /// Implemented as a file-text search rather than a compile-time check
+    /// because the call is behind an `async` boundary in three different
+    /// modules and the Rust type system doesn't give us a free way to
+    /// observe "function is referenced from this crate path." The test is
+    /// cheap (just reads a handful of files) and runs in `cargo test --lib`.
+    #[test]
+    fn test_validate_access_token_async_has_production_caller() {
+        // CARGO_MANIFEST_DIR points at backend/ for this test binary.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+        let surfaces = [
+            "src/api/middleware/auth.rs",
+            "src/api/handlers/oci_v2.rs",
+            "src/grpc/auth_interceptor.rs",
+        ];
+
+        let mut found_in: Vec<&str> = Vec::new();
+        for relative in &surfaces {
+            let path = std::path::Path::new(manifest_dir).join(relative);
+            let contents =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {relative}: {e}"));
+            if contents.contains("validate_access_token_async")
+                || contents.contains("is_token_invalidated_replica_safe")
+            {
+                found_in.push(relative);
+            }
+        }
+
+        assert!(
+            !found_in.is_empty(),
+            "validate_access_token_async / is_token_invalidated_replica_safe \
+             MUST be referenced by at least one of {surfaces:?}. If you are \
+             refactoring auth, do not remove the replica-safe call without \
+             a written security review (#1173 / PR #1190).",
+        );
+        // Belt-and-suspenders: at minimum middleware/auth.rs must wire it,
+        // because that is the main HTTP request path. Without it, every
+        // access-token request would bypass the DB watermark.
+        assert!(
+            found_in.contains(&"src/api/middleware/auth.rs"),
+            "middleware/auth.rs must call the replica-safe validator; \
+             found references only in: {found_in:?}",
+        );
     }
 }

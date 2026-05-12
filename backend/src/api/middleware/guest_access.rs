@@ -373,14 +373,56 @@ mod tests {
     async fn guard_allows_request_with_valid_jwt_when_disabled() {
         // Build a config / auth service pair that we can use to mint a real
         // JWT; the guard then accepts the request because the token resolves.
+        //
+        // After PR #1190 (the replica-safe rewiring for #1173), JWT validation
+        // on the request path goes through `validate_access_token_async`,
+        // which consults the DB credential-change watermark. That means this
+        // test needs a real DB connection (the previous lazy pool would error
+        // on the first DB query and the token would fall through to the
+        // API-token path and 401). When `DATABASE_URL` is unset we skip the
+        // assertion so local `cargo test --lib` keeps passing without docker;
+        // CI runs the test against the real postgres service.
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let pool = match sqlx::PgPool::connect(&url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
         let mut config = Config::test_config();
         config.guest_access_enabled = false;
         let cfg = Arc::new(config);
-        let auth_service = Arc::new(AuthService::new(lazy_pool(), cfg.clone()));
+        let auth_service = Arc::new(AuthService::new(pool.clone(), cfg.clone()));
+
+        // Insert a real user so the DB watermark check has a row to consult.
+        // Backdate the credential-bearing columns so the token's `iat` is
+        // strictly after them and the async validator accepts.
+        let user_id = uuid::Uuid::new_v4();
+        let username = format!("guest_jwt_{}", &user_id.to_string()[..8]);
+        sqlx::query!(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider,
+                               is_active, is_admin, password_changed_at,
+                               failed_login_attempts, created_at, updated_at)
+            VALUES ($1, $2, $3, 'unused', 'local', true, false,
+                    NOW() - INTERVAL '60 seconds', 0,
+                    NOW() - INTERVAL '60 seconds',
+                    NOW() - INTERVAL '60 seconds')
+            "#,
+            user_id,
+            username,
+            format!("{username}@test.com"),
+        )
+        .execute(&pool)
+        .await
+        .expect("insert test user");
+
         let now = chrono::Utc::now();
         let user = crate::models::user::User {
-            id: uuid::Uuid::new_v4(),
-            username: "alice".to_string(),
+            id: user_id,
+            username,
             email: "alice@example.com".to_string(),
             password_hash: None,
             auth_provider: crate::models::user::AuthProvider::Local,
@@ -428,6 +470,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // Cleanup.
+        let _ = sqlx::query!("DELETE FROM users WHERE id = $1", user_id)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]

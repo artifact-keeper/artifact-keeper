@@ -221,14 +221,19 @@ fn extract_form_credentials(headers: &HeaderMap, body: &Bytes) -> Option<(String
     Some((username, password))
 }
 
-fn validate_token(
+async fn validate_token(
     db: &PgPool,
     config: &crate::config::Config,
     headers: &HeaderMap,
 ) -> Result<crate::services::auth_service::Claims, ()> {
     let token = extract_bearer_token(headers).ok_or(())?;
     let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-    auth_service.validate_access_token(&token).map_err(|_| ())
+    // Replica-safe variant (#1173): consults the DB credential-change watermark
+    // so a credential change on replica A is honoured on replica B.
+    auth_service
+        .validate_access_token_async(&token)
+        .await
+        .map_err(|_| ())
 }
 
 /// Credential extracted from an OCI request's Authorization header.
@@ -271,7 +276,13 @@ async fn authenticate_oci(
     match credential {
         OciCredential::Bearer(token) => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
-            auth_service.validate_access_token(&token).map_err(|_| ())
+            // Replica-safe (#1173): same rationale as the auth middleware. A
+            // Bearer token presented to OCI must be rejected if the user's
+            // credentials changed on a peer replica after the token was minted.
+            auth_service
+                .validate_access_token_async(&token)
+                .await
+                .map_err(|_| ())
         }
         OciCredential::Basic { username, password } => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
@@ -884,8 +895,16 @@ async fn token(
     {
         Some(c) => c,
         None => {
-            // Also try Bearer token (docker may send existing token)
-            if let Ok(claims) = validate_token(&state.db, &state.config, &headers) {
+            // Also try Bearer token (docker may send existing token).
+            // We have to distinguish "no Authorization header at all" from
+            // "Authorization header present but validation failed" so that a
+            // client holding a revoked/expired/credential-changed JWT gets a
+            // 401 instead of silently being downgraded to the anonymous
+            // (public-pull) token. The `validate_token` async call now
+            // consults the DB credential-change watermark (#1173), so a
+            // deactivated user's token fails here too.
+            let had_bearer_header = extract_bearer_token(&headers).is_some();
+            if let Ok(claims) = validate_token(&state.db, &state.config, &headers).await {
                 let auth_service =
                     AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
                 // `AND is_active = true` mirrors `auth_service::authenticate`,
@@ -940,6 +959,19 @@ async fn token(
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_string(&resp).unwrap()))
                     .unwrap();
+            }
+
+            // If the caller presented a Bearer token but it failed to
+            // validate (e.g. credential change on a peer replica, account
+            // deactivated), reject with 401 instead of silently downgrading
+            // to anonymous. Falling through to anonymous would mask the
+            // revocation and hand the caller a usable pull token.
+            if had_bearer_header {
+                return oci_error(
+                    StatusCode::UNAUTHORIZED,
+                    "UNAUTHORIZED",
+                    "invalid credentials",
+                );
             }
 
             // No credentials and no existing token. Issue an anonymous pull
@@ -1057,7 +1089,10 @@ fn version_check_ok() -> Response {
 
 async fn version_check(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     // Accept Bearer token (standard Docker client flow)
-    if validate_token(&state.db, &state.config, &headers).is_ok() {
+    if validate_token(&state.db, &state.config, &headers)
+        .await
+        .is_ok()
+    {
         return version_check_ok();
     }
 

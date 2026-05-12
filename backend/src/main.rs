@@ -753,11 +753,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // Reuse the existing pool instead of creating a second one (PgPool is Arc-backed)
     let sbom_server = SbomGrpcServer::new(grpc_db_pool.clone());
     let cve_history_server = CveHistoryGrpcServer::new(grpc_db_pool.clone());
-    let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db_pool);
+    let security_policy_server = SecurityPolicyGrpcServer::new(grpc_db_pool.clone());
 
-    // gRPC auth interceptor - validates JWT Bearer tokens
-    let grpc_auth =
-        artifact_keeper_backend::grpc::auth_interceptor::AuthInterceptor::new(&config.jwt_secret);
+    // gRPC auth interceptor - validates JWT Bearer tokens. Pass the shared
+    // PgPool so the interceptor can consult the replica-safe credential-change
+    // watermark on every request (#1173 / PR #1190 review). Without the pool
+    // the interceptor would only see in-memory invalidations made on this
+    // replica, leaving a stale-token window equal to the JWT lifetime after a
+    // password reset / TOTP change on a peer replica.
+    let grpc_auth = artifact_keeper_backend::grpc::auth_interceptor::AuthInterceptor::new(
+        &config.jwt_secret,
+        Some(grpc_db_pool),
+    );
 
     // Include file descriptor for gRPC reflection
     let reflection_service = tonic_reflection::server::Builder::configure()

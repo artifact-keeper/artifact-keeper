@@ -7,6 +7,7 @@
 //! operations, matching the HTTP layer's `admin_middleware` behaviour.
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use sqlx::PgPool;
 use tonic::{Request, Status};
 
 use crate::services::auth_service::Claims;
@@ -16,15 +17,26 @@ use crate::services::auth_service::Claims;
 pub struct AuthInterceptor {
     decoding_key: DecodingKey,
     require_admin: bool,
+    /// Optional DB pool. When `Some`, the interceptor consults the replica-safe
+    /// credential-change watermark (#1173) so a credential change on a peer
+    /// replica is honoured even on the gRPC plane. When `None` (e.g. in unit
+    /// tests that don't have a DB) the interceptor falls back to the in-memory
+    /// fast-path map only.
+    db: Option<PgPool>,
 }
 
 impl AuthInterceptor {
     /// Create an interceptor that requires admin privileges (default for all
     /// current gRPC services).
-    pub fn new(jwt_secret: &str) -> Self {
+    ///
+    /// `db` is the shared PostgreSQL pool used for the replica-safe credential
+    /// invalidation check. Pass the same pool the rest of the application
+    /// uses; pass `None` only in tests that don't want a DB roundtrip.
+    pub fn new(jwt_secret: &str, db: Option<PgPool>) -> Self {
         Self {
             decoding_key: DecodingKey::from_secret(jwt_secret.as_bytes()),
             require_admin: true,
+            db,
         }
     }
 
@@ -32,10 +44,11 @@ impl AuthInterceptor {
     /// Available for future gRPC services that should be accessible to all
     /// authenticated users.
     #[allow(dead_code)]
-    pub fn new_auth_only(jwt_secret: &str) -> Self {
+    pub fn new_auth_only(jwt_secret: &str, db: Option<PgPool>) -> Self {
         Self {
             decoding_key: DecodingKey::from_secret(jwt_secret.as_bytes()),
             require_admin: false,
+            db,
         }
     }
 
@@ -57,11 +70,30 @@ impl AuthInterceptor {
         }
 
         // Check whether the token has been invalidated (e.g. password change,
-        // credential rotation). Mirrors the HTTP auth middleware check.
-        if crate::services::auth_service::is_token_invalidated(
-            token_data.claims.sub,
-            token_data.claims.iat,
-        ) {
+        // credential rotation). On replica deployments, fall through to the
+        // DB-backed watermark so a change made on a peer replica is honoured
+        // here too (#1173 / PR #1190 review). tonic interceptors are sync;
+        // we run the async DB check via `block_in_place` which is safe on
+        // the multi-threaded runtime tonic always uses.
+        let invalidated = if let Some(db) = &self.db {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    crate::services::auth_service::is_token_invalidated_replica_safe(
+                        db,
+                        token_data.claims.sub,
+                        token_data.claims.iat,
+                    ),
+                )
+            })
+            .unwrap_or(false)
+        } else {
+            // No DB pool wired (test mode) — fall back to in-memory only.
+            crate::services::auth_service::is_token_invalidated(
+                token_data.claims.sub,
+                token_data.claims.iat,
+            )
+        };
+        if invalidated {
             return Err(Status::unauthenticated("Token has been revoked"));
         }
 
@@ -116,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_missing_authorization_header() {
-        let interceptor = AuthInterceptor::new("secret");
+        let interceptor = AuthInterceptor::new("secret", None);
         let req = Request::new(());
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -125,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_invalid_token() {
-        let interceptor = AuthInterceptor::new("secret");
+        let interceptor = AuthInterceptor::new("secret", None);
         let req = request_with_token("not-a-valid-jwt");
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -135,7 +167,7 @@ mod tests {
     #[test]
     fn test_wrong_token_type_rejected() {
         let token = make_token("secret", true, "refresh");
-        let interceptor = AuthInterceptor::new("secret");
+        let interceptor = AuthInterceptor::new("secret", None);
         let req = request_with_token(&token);
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -145,7 +177,7 @@ mod tests {
     #[test]
     fn test_wrong_secret_rejected() {
         let token = make_token("secret-a", true, "access");
-        let interceptor = AuthInterceptor::new("secret-b");
+        let interceptor = AuthInterceptor::new("secret-b", None);
         let req = request_with_token(&token);
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -158,7 +190,7 @@ mod tests {
     #[test]
     fn test_admin_user_allowed() {
         let token = make_token("secret", true, "access");
-        let interceptor = AuthInterceptor::new("secret");
+        let interceptor = AuthInterceptor::new("secret", None);
         let req = request_with_token(&token);
         assert!(interceptor.intercept(req).is_ok());
     }
@@ -166,7 +198,7 @@ mod tests {
     #[test]
     fn test_non_admin_rejected_by_default() {
         let token = make_token("secret", false, "access");
-        let interceptor = AuthInterceptor::new("secret");
+        let interceptor = AuthInterceptor::new("secret", None);
         let req = request_with_token(&token);
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -176,7 +208,7 @@ mod tests {
     #[test]
     fn test_non_admin_allowed_with_auth_only() {
         let token = make_token("secret", false, "access");
-        let interceptor = AuthInterceptor::new_auth_only("secret");
+        let interceptor = AuthInterceptor::new_auth_only("secret", None);
         let req = request_with_token(&token);
         assert!(interceptor.intercept(req).is_ok());
     }
@@ -184,7 +216,7 @@ mod tests {
     #[test]
     fn test_auth_only_still_validates_token_type() {
         let token = make_token("secret", false, "refresh");
-        let interceptor = AuthInterceptor::new_auth_only("secret");
+        let interceptor = AuthInterceptor::new_auth_only("secret", None);
         let req = request_with_token(&token);
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -192,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_auth_only_still_validates_token() {
-        let interceptor = AuthInterceptor::new_auth_only("secret");
+        let interceptor = AuthInterceptor::new_auth_only("secret", None);
         let req = request_with_token("garbage");
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
@@ -228,7 +260,7 @@ mod tests {
         // Invalidate the user's tokens (timestamp will be now, after iat)
         crate::services::auth_service::invalidate_user_tokens(user_id);
 
-        let interceptor = AuthInterceptor::new("secret");
+        let interceptor = AuthInterceptor::new("secret", None);
         let req = request_with_token(&token);
         let err = interceptor.intercept(req).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
