@@ -25,6 +25,7 @@ pub mod metadata_checker;
 pub mod migration_service;
 pub mod migration_worker;
 pub mod nexus_client;
+pub mod oci_manifest_refs_backfill;
 pub mod oidc_service;
 pub mod openscap_scanner;
 pub mod opensearch_service;
