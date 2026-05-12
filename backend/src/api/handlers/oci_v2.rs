@@ -4931,4 +4931,86 @@ mod token_lockout_regression_tests {
             "API-token-as-password must not bump failed_login_attempts (got {counter})"
         );
     }
+
+    /// Sibling to the API-token-first regression: the password-fallback arm
+    /// must still mint a JWT after the reorder. Specifically, `Basic
+    /// <user>:<real_password>` is the standard human `docker login` flow and
+    /// must keep working after `validate_api_token` is tried first.
+    ///
+    /// The constant-time bcrypt pad inside `validate_api_token` makes the
+    /// fallback path correct today (the API-token-shaped lookup returns Err
+    /// for a real password, and we fall through to `authenticate`). Pinning
+    /// it here keeps that invariant from regressing if anyone later
+    /// "optimizes" the dummy-hash code path without realizing the OCI handler
+    /// depends on it.
+    #[tokio::test]
+    async fn password_basic_auth_falls_through_to_authenticate() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+            .bind(&pwd_hash)
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("update password_hash");
+
+        let storage_dir =
+            std::env::temp_dir().join(format!("oci-pwd-fallback-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{username}:real-test-password"))
+        );
+        let req = Request::builder()
+            .method("GET")
+            .uri("/token")
+            .header("Authorization", basic)
+            .body(Body::empty())
+            .unwrap();
+        let app = router().with_state(state);
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 65_536)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+
+        // Read counter BEFORE cleanup so we see the state token() left.
+        let counter: i32 =
+            sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read counter");
+
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "real-password basic auth must succeed after the reorder, \
+             got {status}: body={body}"
+        );
+        let token = body["token"].as_str().expect("token field");
+        assert_ne!(
+            token, "anonymous",
+            "password fallback must yield a real JWT, not anonymous"
+        );
+        assert_eq!(
+            counter, 0,
+            "a successful password login must not leave failed_login_attempts \
+             elevated (got {counter})"
+        );
+    }
 }
