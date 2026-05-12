@@ -287,6 +287,14 @@ pub struct CacheMetadata {
     /// means revalidation is skipped (filesystem backend or legacy
     /// sidecar written before this field existed); `#[serde(default)]`
     /// preserves wire-compat with pre-#1051 sidecars.
+    ///
+    /// Trust boundary: the pin lives in a JSON sidecar at the cache
+    /// metadata key with no integrity binding. An actor that can write
+    /// to the storage backend can rewrite both the body and the sidecar
+    /// in lockstep, defeating tamper detection. Treat this as a defense
+    /// against accidental upstream-vs-cache divergence, not against an
+    /// adversary with storage-write capability. A sidecar HMAC is the
+    /// natural hardening if that threat model becomes relevant.
     #[serde(default)]
     pub storage_etag: Option<String>,
     /// When the cache entry expires
