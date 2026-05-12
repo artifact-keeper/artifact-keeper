@@ -135,6 +135,13 @@ jobs:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
+          # SSO credential encryption tests in auth_config_service rely on at
+          # least one of these env vars being set. They skip cleanly when
+          # unset (preserving local `cargo test` ergonomics), so we provide a
+          # deterministic value here to exercise the create/update/decrypt
+          # paths in coverage. The encryption_key panic-when-unset test
+          # explicitly skips when this is set.
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
 
       - name: Coverage summary and gate

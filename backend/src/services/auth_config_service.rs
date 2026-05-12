@@ -1547,14 +1547,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[should_panic(expected = "Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set")]
     fn test_encryption_key_panics_when_unset() {
         // When neither env var is set, the function should panic with a clear
-        // message rather than falling back to a hardcoded key.
-        // Note: this test only verifies the panic path; in CI where JWT_SECRET
-        // is set, it would return that value instead. The #[should_panic] will
-        // only trigger if both env vars are truly absent.
-        let _key = encryption_key();
+        // message rather than falling back to a hardcoded key. We can only
+        // assert this when both env vars are absent; in CI (where JWT_SECRET
+        // is set so DB-backed SSO tests can encrypt credentials), the test
+        // skips this branch.
+        if std::env::var("SSO_ENCRYPTION_KEY").is_ok() || std::env::var("JWT_SECRET").is_ok() {
+            return;
+        }
+        let result = std::panic::catch_unwind(encryption_key);
+        let err = result.expect_err("encryption_key must panic when both env vars are unset");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("Neither SSO_ENCRYPTION_KEY nor JWT_SECRET is set"),
+            "unexpected panic message: {msg}"
+        );
     }
 
     #[test]
@@ -2214,5 +2226,395 @@ mod tests {
         let patch = serde_json::json!("scalar");
         let out = merge_attribute_mapping(&base, &patch);
         assert_eq!(out, serde_json::json!("scalar"));
+    }
+
+    // =======================================================================
+    // DB-backed tests for OIDC config CRUD + SSO session lifecycle.
+    //
+    // These opt into a real Postgres via test_db_helpers::try_pool(): when
+    // DATABASE_URL is unset they no-op so `cargo test --lib` stays usable
+    // without a database. The coverage CI job provisions Postgres and runs
+    // migrations, so these tests execute there and instrument the SQL paths
+    // touched by the OIDC enhancements bundle (PKCE columns, map_groups_to_
+    // groups column, attribute_mapping merge wiring, PKCE-stashing SSO
+    // session, etc.).
+    // =======================================================================
+
+    mod db {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as db_helpers;
+
+        /// Build a CreateOidcConfigRequest with a unique name suffix so
+        /// parallel tests do not collide on the UNIQUE constraint.
+        fn make_create_req(suffix: &str) -> CreateOidcConfigRequest {
+            CreateOidcConfigRequest {
+                name: format!("acs-test-{suffix}"),
+                issuer_url: "https://issuer.test.local".to_string(),
+                client_id: format!("client-{suffix}"),
+                client_secret: format!("secret-{suffix}"),
+                scopes: Some(vec!["openid".to_string(), "email".to_string()]),
+                attribute_mapping: Some(json!({"username_claim": "preferred_username"})),
+                is_enabled: Some(true),
+                auto_create_users: Some(true),
+                pkce_enabled: None,
+                map_groups_to_groups: None,
+            }
+        }
+
+        /// Skip the test cleanly if no encryption key env var is configured.
+        /// We deliberately do NOT set env vars from a test because doing so
+        /// leaks into other tests in the same process (e.g. the
+        /// `test_encryption_key_panics_when_unset` invariant). The coverage
+        /// CI job sets JWT_SECRET, so these tests run there.
+        fn encryption_key_available() -> bool {
+            std::env::var("SSO_ENCRYPTION_KEY").is_ok() || std::env::var("JWT_SECRET").is_ok()
+        }
+
+        async fn cleanup_oidc(pool: &PgPool, id: Uuid) {
+            let _ = sqlx::query("DELETE FROM oidc_configs WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        #[tokio::test]
+        async fn test_create_oidc_applies_pkce_defaults() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let req = make_create_req("pkce-default");
+            let resp = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            // pkce_enabled defaults to true; map_groups_to_groups to false.
+            assert!(resp.pkce_enabled);
+            assert!(!resp.map_groups_to_groups);
+            assert!(resp.has_secret);
+            assert!(resp.is_enabled);
+            assert!(resp.auto_create_users);
+            cleanup_oidc(&pool, resp.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_create_oidc_honors_explicit_pkce_false() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let mut req = make_create_req("pkce-off");
+            req.pkce_enabled = Some(false);
+            req.map_groups_to_groups = Some(true);
+            let resp = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            assert!(!resp.pkce_enabled);
+            assert!(resp.map_groups_to_groups);
+            cleanup_oidc(&pool, resp.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_get_oidc_round_trips_new_columns() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let mut req = make_create_req("get-roundtrip");
+            req.pkce_enabled = Some(true);
+            req.map_groups_to_groups = Some(true);
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            let fetched = AuthConfigService::get_oidc(&pool, created.id)
+                .await
+                .expect("get_oidc");
+            assert_eq!(fetched.id, created.id);
+            assert!(fetched.pkce_enabled);
+            assert!(fetched.map_groups_to_groups);
+            assert_eq!(fetched.scopes, vec!["openid", "email"]);
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_get_oidc_decrypted_decodes_secret() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let req = make_create_req("decrypt");
+            let secret = req.client_secret.clone();
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            let (row, plaintext) = AuthConfigService::get_oidc_decrypted(&pool, created.id)
+                .await
+                .expect("get_oidc_decrypted");
+            assert_eq!(plaintext, secret);
+            assert!(row.pkce_enabled); // default true
+            assert!(!row.map_groups_to_groups); // default false
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_list_oidc_includes_new_columns() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let req = make_create_req("list");
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            let configs = AuthConfigService::list_oidc(&pool)
+                .await
+                .expect("list_oidc");
+            let found = configs.iter().find(|c| c.id == created.id).expect("found");
+            assert!(found.pkce_enabled);
+            assert!(!found.map_groups_to_groups);
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_oidc_merges_attribute_mapping_by_default() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            // Seed with two attribute keys.
+            let mut req = make_create_req("merge");
+            req.attribute_mapping = Some(json!({
+                "username_claim": "preferred_username",
+                "redirect_uri": "https://ak.example.com/cb",
+            }));
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+
+            // Patch only username_claim. The other key must survive.
+            let update = UpdateOidcConfigRequest {
+                name: None,
+                issuer_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                attribute_mapping: Some(json!({"username_claim": "email"})),
+                attribute_mapping_replace: None,
+                is_enabled: None,
+                auto_create_users: None,
+                pkce_enabled: None,
+                map_groups_to_groups: None,
+            };
+            let updated = AuthConfigService::update_oidc(&pool, created.id, update)
+                .await
+                .expect("update_oidc");
+            assert_eq!(updated.attribute_mapping["username_claim"], "email");
+            // redirect_uri must be preserved by the merge.
+            assert_eq!(
+                updated.attribute_mapping["redirect_uri"],
+                "https://ak.example.com/cb"
+            );
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_oidc_replace_drops_unlisted_keys() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let mut req = make_create_req("replace");
+            req.attribute_mapping = Some(json!({
+                "username_claim": "preferred_username",
+                "redirect_uri": "https://ak.example.com/cb",
+            }));
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+
+            // Opt into legacy wholesale-replace behavior.
+            let update = UpdateOidcConfigRequest {
+                name: None,
+                issuer_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                attribute_mapping: Some(json!({"username_claim": "email"})),
+                attribute_mapping_replace: Some(true),
+                is_enabled: None,
+                auto_create_users: None,
+                pkce_enabled: None,
+                map_groups_to_groups: None,
+            };
+            let updated = AuthConfigService::update_oidc(&pool, created.id, update)
+                .await
+                .expect("update_oidc");
+            assert_eq!(updated.attribute_mapping["username_claim"], "email");
+            // redirect_uri must be GONE because we asked for replace semantics.
+            assert!(updated.attribute_mapping.get("redirect_uri").is_none());
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_oidc_flips_pkce_and_group_mapping() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let req = make_create_req("flip");
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            assert!(created.pkce_enabled);
+            assert!(!created.map_groups_to_groups);
+
+            let update = UpdateOidcConfigRequest {
+                name: None,
+                issuer_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                attribute_mapping: None,
+                attribute_mapping_replace: None,
+                is_enabled: None,
+                auto_create_users: None,
+                pkce_enabled: Some(false),
+                map_groups_to_groups: Some(true),
+            };
+            let updated = AuthConfigService::update_oidc(&pool, created.id, update)
+                .await
+                .expect("update_oidc");
+            assert!(!updated.pkce_enabled);
+            assert!(updated.map_groups_to_groups);
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_update_oidc_preserves_secret_when_not_provided() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let req = make_create_req("preserve-secret");
+            let original_secret = req.client_secret.clone();
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            let update = UpdateOidcConfigRequest {
+                name: Some("renamed".to_string()),
+                issuer_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                attribute_mapping: None,
+                attribute_mapping_replace: None,
+                is_enabled: None,
+                auto_create_users: None,
+                pkce_enabled: None,
+                map_groups_to_groups: None,
+            };
+            let updated = AuthConfigService::update_oidc(&pool, created.id, update)
+                .await
+                .expect("update_oidc");
+            assert_eq!(updated.name, "renamed");
+            assert!(updated.has_secret);
+            // Verify decryption still yields the original.
+            let (_row, plaintext) = AuthConfigService::get_oidc_decrypted(&pool, created.id)
+                .await
+                .expect("get_oidc_decrypted");
+            assert_eq!(plaintext, original_secret);
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        #[tokio::test]
+        async fn test_toggle_oidc_returns_new_column_state() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            if !encryption_key_available() {
+                return;
+            }
+            let req = make_create_req("toggle");
+            let created = AuthConfigService::create_oidc(&pool, req)
+                .await
+                .expect("create_oidc");
+            let toggled =
+                AuthConfigService::toggle_oidc(&pool, created.id, ToggleRequest { enabled: false })
+                    .await
+                    .expect("toggle_oidc");
+            assert!(!toggled.is_enabled);
+            // New columns survive the toggle.
+            assert!(toggled.pkce_enabled);
+            assert!(!toggled.map_groups_to_groups);
+            cleanup_oidc(&pool, created.id).await;
+        }
+
+        // -------------------------------------------------------------------
+        // SSO session: PKCE verifier round-trip (issue #1091).
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn test_create_sso_session_with_pkce_persists_verifier() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let verifier = generate_pkce_verifier();
+            let session = AuthConfigService::create_sso_session_with_pkce(
+                &pool,
+                "oidc",
+                Uuid::new_v4(),
+                Some(verifier.clone()),
+            )
+            .await
+            .expect("create_sso_session_with_pkce");
+            assert_eq!(
+                session.pkce_code_verifier.as_deref(),
+                Some(verifier.as_str())
+            );
+
+            // validate_sso_session deletes + returns; verifier must round-trip.
+            let validated = AuthConfigService::validate_sso_session(&pool, &session.state)
+                .await
+                .expect("validate_sso_session");
+            assert_eq!(validated.id, session.id);
+            assert_eq!(
+                validated.pkce_code_verifier.as_deref(),
+                Some(verifier.as_str())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_create_sso_session_legacy_path_has_no_verifier() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            // Legacy create_sso_session forwards None as the verifier.
+            let session = AuthConfigService::create_sso_session(&pool, "oidc", Uuid::new_v4())
+                .await
+                .expect("create_sso_session");
+            assert!(session.pkce_code_verifier.is_none());
+
+            let validated = AuthConfigService::validate_sso_session(&pool, &session.state)
+                .await
+                .expect("validate_sso_session");
+            assert!(validated.pkce_code_verifier.is_none());
+        }
     }
 }
