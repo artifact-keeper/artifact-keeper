@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
+use futures::StreamExt;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -211,6 +212,52 @@ pub async fn proxy_fetch(
         .fetch_artifact(&repo, path)
         .await
         .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
+/// Streaming sibling of [`proxy_fetch`] that does NOT buffer the artifact
+/// body in memory (#895). Returns an axum [`Response`] whose body is a
+/// stream the framework drives directly from the upstream HTTP response,
+/// teed simultaneously into the proxy cache.
+///
+/// Format handlers that fetch large binaries (.deb, .rpm, container blobs,
+/// .whl) should prefer this over [`proxy_fetch`]. Handlers that fetch
+/// small metadata indices (Packages.gz, package.json, etc.) can keep
+/// using the buffered path.
+pub async fn proxy_fetch_streaming(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<Response, Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    let result = proxy_service
+        .fetch_artifact_streaming(&repo, path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))?;
+
+    let mut builder = Response::builder().status(StatusCode::OK).header(
+        "content-type",
+        result
+            .content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream"),
+    );
+    if let Some(len) = result.content_length {
+        builder = builder.header("content-length", len);
+    }
+    let body = axum::body::Body::from_stream(
+        result
+            .body
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
+    );
+    builder.body(body).map_err(|e| {
+        map_proxy_error(
+            repo_key,
+            path,
+            crate::error::AppError::Internal(e.to_string()),
+        )
+    })
 }
 
 /// Fetch from upstream via the proxy service, returning a presigned redirect

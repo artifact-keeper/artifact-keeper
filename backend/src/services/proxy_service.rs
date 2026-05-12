@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use reqwest::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE};
+use futures::stream::{BoxStream, StreamExt};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, WWW_AUTHENTICATE};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -33,6 +34,218 @@ struct UpstreamResponse {
     etag: Option<String>,
     effective_url: String,
     link: Option<String>,
+}
+
+/// Streaming response from an upstream registry fetch. Used by the
+/// streaming proxy path (#895) to avoid buffering the full body before
+/// returning to the client.
+struct UpstreamStream {
+    /// Chunks from the upstream HTTP body, in order.
+    body: BoxStream<'static, Result<Bytes>>,
+    content_type: Option<String>,
+    etag: Option<String>,
+    /// `Content-Length` from upstream, if it sent one. Lets the proxy
+    /// decide whether to bypass the cache entirely for huge objects
+    /// (a future enhancement; currently informational only).
+    #[allow(dead_code)]
+    content_length: Option<u64>,
+}
+
+/// Output of [`ProxyService::fetch_artifact_streaming`]. Carries the
+/// streamed body bytes and the metadata the caller needs to build the
+/// outbound HTTP response (Content-Type, optional Content-Length).
+pub struct StreamingFetchResult {
+    pub body: BoxStream<'static, Result<Bytes>>,
+    pub content_type: Option<String>,
+    /// Total body length when known up-front (either from a freshly-
+    /// cached metadata sidecar or from the upstream Content-Length
+    /// header). `None` when the body is being streamed from upstream
+    /// without a length advertised, in which case the outbound response
+    /// uses chunked transfer encoding.
+    pub content_length: Option<u64>,
+}
+
+/// Metadata fields known up-front when teeing an upstream stream into
+/// the proxy cache. The size + sha-256 fields of [`CacheMetadata`] are
+/// observed during the stream itself and filled in by the writer task
+/// once the body has been fully written to storage.
+struct CacheMetadataTemplate {
+    content_type: Option<String>,
+    etag: Option<String>,
+    ttl_secs: i64,
+}
+
+/// Bound on the in-flight chunk queue between the upstream-reader task
+/// and the storage-writer task. At 64 chunks × ~64 KiB chunks this is
+/// roughly a 4 MiB ceiling on the buffer between client and cache.
+/// Slow storage applies moderate backpressure to the client read loop
+/// rather than queueing unbounded memory; fast storage drains promptly
+/// so the client sees no extra latency.
+const TEE_CHANNEL_DEPTH: usize = 64;
+
+/// Validate the upstream response status code for the streaming path.
+/// Extracted from [`ProxyService::read_upstream_response_streaming`] so
+/// the status-classification logic can be unit-tested without a real
+/// `reqwest::Response`.
+///
+/// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
+///   as a real "upstream doesn't have it" signal, not a backend failure)
+/// * Other non-2xx → `AppError::Storage` (transient/upstream-misconfig
+///   error; bubbles to the client as 500/5xx)
+/// * 2xx → `Ok(())`
+fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
+    if status == StatusCode::NOT_FOUND {
+        return Err(AppError::NotFound(format!(
+            "Artifact not found at upstream: {}",
+            url
+        )));
+    }
+    if !status.is_success() {
+        return Err(AppError::Storage(format!(
+            "Upstream returned error status {}: {}",
+            status, url
+        )));
+    }
+    Ok(())
+}
+
+/// Extract `(content_type, etag, content_length)` from an upstream
+/// response's headers. Extracted from
+/// [`ProxyService::read_upstream_response_streaming`] so the header-
+/// parsing rules (in particular the `Content-Length` parse-and-coerce
+/// to `u64`) can be unit-tested without a real `reqwest::Response`.
+fn extract_streaming_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> (Option<String>, Option<String>, Option<u64>) {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let etag = headers
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let content_length = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    (content_type, etag, content_length)
+}
+
+/// Tee an upstream byte stream into a returned client stream AND a
+/// background storage writer that populates the proxy cache. The
+/// returned stream yields the same chunks the upstream produced, in
+/// order, with no buffering beyond the bounded channel below.
+///
+/// Storage failure semantics:
+/// * Storage writer task receives chunks via a bounded mpsc channel.
+///   When the channel is full, the upstream reader awaits a slot — that
+///   is the backpressure path. When the writer is gone (e.g. it
+///   already failed and dropped its receiver), `try_send` short-
+///   circuits and we keep yielding to the client without caching.
+/// * On any error from `put_stream`, the writer logs at `warn` and
+///   exits without writing the metadata sidecar. The cache is left
+///   without a metadata sidecar so the NEXT request misses the cache
+///   and re-fetches upstream — the system self-heals.
+/// * On client disconnect mid-stream, the tee task ends, the channel
+///   drops, and the writer commits or aborts whatever it has buffered.
+///   No leaked temp files (FilesystemBackend cleans up via the
+///   `put_stream` error path).
+fn tee_upstream_to_cache(
+    upstream: BoxStream<'static, Result<Bytes>>,
+    storage: Arc<StorageService>,
+    cache_key: String,
+    metadata_key: String,
+    template: CacheMetadataTemplate,
+) -> BoxStream<'static, Result<Bytes>> {
+    // Channel for chunks flowing reader -> writer. mpsc to keep order
+    // (broadcast would let storage skip chunks under backpressure,
+    // which we explicitly want to avoid - skipping chunks corrupts the
+    // cached SHA-256).
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(TEE_CHANNEL_DEPTH);
+
+    // Spawn the storage writer. It consumes the channel as a stream
+    // and calls put_stream. On completion, writes the metadata sidecar
+    // with the observed SHA-256 + byte count.
+    let storage_clone = storage.clone();
+    let cache_key_for_writer = cache_key.clone();
+    tokio::spawn(async move {
+        // Adapter: receiver -> futures::Stream<Result<Bytes>>.
+        let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+
+        let put_result = storage_clone
+            .put_stream(&cache_key_for_writer, Box::pin(rx_stream))
+            .await;
+
+        match put_result {
+            Ok(result) => {
+                let now = Utc::now();
+                let metadata = CacheMetadata {
+                    cached_at: now,
+                    upstream_etag: template.etag,
+                    expires_at: now + chrono::Duration::seconds(template.ttl_secs),
+                    content_type: template.content_type,
+                    size_bytes: result.bytes_written as i64,
+                    checksum_sha256: result.checksum_sha256,
+                };
+                match serde_json::to_vec(&metadata) {
+                    Ok(json) => {
+                        if let Err(e) = storage_clone.put(&metadata_key, Bytes::from(json)).await {
+                            tracing::warn!(
+                                cache_key = %cache_key_for_writer,
+                                metadata_key = %metadata_key,
+                                error = %e,
+                                "proxy cache metadata sidecar write failed; cache will refetch next request"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            cache_key = %cache_key_for_writer,
+                            error = %e,
+                            "proxy cache metadata JSON serialization failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cache_key = %cache_key_for_writer,
+                    error = %e,
+                    "proxy cache put_stream failed; cache will refetch next request"
+                );
+            }
+        }
+    });
+
+    // Build the client-facing stream. For each chunk from upstream:
+    //   * forward the same chunk to the storage channel (backpressure
+    //     applies; if storage went away, drop silently and continue).
+    //   * yield the chunk to the client.
+    // On upstream error: forward the error to storage (so put_stream
+    // sees the error and aborts cleanly) and surface to the client.
+    let tee_stream = async_stream::try_stream! {
+        let mut upstream = upstream;
+        while let Some(chunk_result) = upstream.next().await {
+            // Clone the result to feed both consumers (the chunk's
+            // inner Bytes is a cheap Arc-like clone).
+            let storage_msg = match &chunk_result {
+                Ok(bytes) => Ok(bytes.clone()),
+                Err(e) => Err(AppError::Storage(format!("upstream stream error: {}", e))),
+            };
+            // Best-effort send: if the writer is gone, drop the
+            // caching half. The client still gets the data.
+            if tx.send(storage_msg).await.is_err() {
+                // writer dropped its rx; stop trying to feed it
+            }
+            yield chunk_result?;
+        }
+        // upstream EOF: drop tx so the writer sees end-of-stream
+        drop(tx);
+    };
+    Box::pin(tee_stream)
 }
 
 /// Cache metadata for a proxied artifact
@@ -259,6 +472,102 @@ impl ProxyService {
                 }
             }
         }
+    }
+
+    /// Streaming sibling of [`Self::fetch_artifact`] that does NOT buffer
+    /// the artifact body in memory (#895). Suitable for large objects
+    /// (.deb / .rpm packages, container blobs) on memory-constrained
+    /// pods where the buffered path causes OOM.
+    ///
+    /// Flow:
+    /// * **Cache hit** — returns the body as a stream from
+    ///   `StorageService::get_stream`, plus the cached content-type and
+    ///   size. Constant memory usage regardless of object size.
+    /// * **Cache miss** — fetches from upstream as a stream, tees each
+    ///   chunk simultaneously to (a) the returned client stream and
+    ///   (b) a background writer that calls `StorageService::put_stream`
+    ///   to populate the cache. The cache metadata sidecar is written
+    ///   once the storage write completes with the observed SHA-256.
+    ///
+    /// Storage backpressure: the tee uses a bounded mpsc channel (64
+    /// 64 KiB chunks ≈ 4 MiB) so slow storage applies moderate
+    /// backpressure to the client rather than queueing unbounded
+    /// memory. On storage write failure mid-stream the client still
+    /// receives the complete body; the cache is poisoned (no metadata
+    /// sidecar) and self-heals on the next request.
+    pub async fn fetch_artifact_streaming(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<StreamingFetchResult> {
+        if repo.repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "Proxy operations only supported for remote repositories".to_string(),
+            ));
+        }
+
+        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
+            AppError::Config("Remote repository missing upstream_url".to_string())
+        })?;
+
+        let cache_key = Self::cache_storage_key(&repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
+
+        // Cache hit fast path: load metadata sidecar, stream content
+        // straight from storage. The slow-path SHA verification done by
+        // the buffered `fetch_artifact_with_cache_path` is intentionally
+        // skipped here — we cannot recompute SHA without buffering, and
+        // the storage backend's own integrity guarantees apply just as
+        // they do for presigned redirects (#1018 R-tradeoff already
+        // accepted upstream).
+        if let Some(metadata) = self.load_cache_metadata(&metadata_key).await? {
+            if Utc::now() <= metadata.expires_at {
+                match self.storage.get_stream(&cache_key).await {
+                    Ok(body) => {
+                        return Ok(StreamingFetchResult {
+                            body,
+                            content_type: metadata.content_type,
+                            content_length: Some(metadata.size_bytes as u64),
+                        });
+                    }
+                    Err(AppError::NotFound(_)) => {
+                        // Metadata says cached but body is gone (probably
+                        // an out-of-band eviction). Fall through to upstream.
+                        tracing::debug!(
+                            cache_key = %cache_key,
+                            "cache metadata present but body missing; refetching"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // Cache miss: fetch upstream as a stream, tee to the cache writer
+        // and to the client.
+        let full_url = Self::build_upstream_url(upstream_url, path);
+        let upstream = self
+            .fetch_from_upstream_streaming(&full_url, repo.id)
+            .await?;
+
+        let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+        let body = tee_upstream_to_cache(
+            upstream.body,
+            self.storage.clone(),
+            cache_key,
+            metadata_key,
+            CacheMetadataTemplate {
+                content_type: upstream.content_type.clone(),
+                etag: upstream.etag,
+                ttl_secs: cache_ttl,
+            },
+        );
+
+        Ok(StreamingFetchResult {
+            body,
+            content_type: upstream.content_type,
+            content_length: upstream.content_length,
+        })
     }
 
     /// Check if upstream has a newer version of the artifact.
@@ -721,6 +1030,97 @@ impl ProxyService {
             etag,
             effective_url,
             link,
+        })
+    }
+
+    /// Streaming variant of [`Self::fetch_from_upstream`] used by the
+    /// proxy slow path (#895). Returns the upstream body as a stream of
+    /// `Bytes` chunks instead of buffering the whole body into memory.
+    /// Used by the OOM-mitigation path that tees the upstream stream
+    /// simultaneously to the client and to the storage cache.
+    ///
+    /// Auth handling (Basic + OCI bearer token exchange) mirrors the
+    /// buffered variant; only the body extraction differs.
+    async fn fetch_from_upstream_streaming(
+        &self,
+        url: &str,
+        repo_id: Uuid,
+    ) -> Result<UpstreamStream> {
+        tracing::info!("Fetching artifact from upstream (streaming): {}", url);
+
+        let upstream_auth =
+            crate::services::upstream_auth::load_upstream_auth(&self.db, repo_id).await?;
+
+        let mut request = self.http_client.get(url);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to fetch from upstream: {}", e)))?;
+
+        let status = response.status();
+
+        if status == StatusCode::UNAUTHORIZED {
+            let challenge = response
+                .headers()
+                .get(WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            if challenge.starts_with("Bearer ") {
+                let params = Self::parse_bearer_challenge(&challenge);
+                if let Some(realm) = params.get("realm") {
+                    let scope = params.get("scope").cloned().unwrap_or_default();
+                    let service = params.get("service").cloned().unwrap_or_default();
+                    crate::api::validation::validate_outbound_url(realm, "OCI token realm")?;
+                    let token = self
+                        .obtain_bearer_token(realm, &service, &scope, &upstream_auth)
+                        .await?;
+                    let retry_request = self.http_client.get(url).bearer_auth(&token);
+                    let retry_response = retry_request.send().await.map_err(|e| {
+                        AppError::Storage(format!(
+                            "Failed to fetch from upstream after token exchange: {}",
+                            e
+                        ))
+                    })?;
+                    return Self::read_upstream_response_streaming(retry_response, url);
+                }
+            }
+
+            return Err(AppError::Storage(format!(
+                "Upstream returned error status {}: {}",
+                status, url
+            )));
+        }
+
+        Self::read_upstream_response_streaming(response, url)
+    }
+
+    /// Stream the upstream HTTP response body without buffering. Mirrors
+    /// the shape of [`Self::read_upstream_response`] but returns the body
+    /// as a stream. Status/header validation happens up front; the
+    /// stream itself yields one [`Bytes`] chunk per `reqwest` body
+    /// frame.
+    fn read_upstream_response_streaming(
+        response: reqwest::Response,
+        url: &str,
+    ) -> Result<UpstreamStream> {
+        validate_upstream_status(response.status(), url)?;
+        let (content_type, etag, content_length) = extract_streaming_headers(response.headers());
+
+        let body = response.bytes_stream().map(|r| {
+            r.map_err(|e| AppError::Storage(format!("Failed to read upstream stream: {}", e)))
+        });
+
+        Ok(UpstreamStream {
+            body: Box::pin(body),
+            content_type,
+            etag,
+            content_length,
         })
     }
 
@@ -2614,5 +3014,507 @@ mod tests {
             1,
             "is_cache_fresh must read metadata exactly once and never the body"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // tee_upstream_to_cache (#895): proxy slow-path streaming
+    //
+    // The tee forwards each upstream chunk to BOTH the client stream and a
+    // background cache writer. Storage failure must not affect the client;
+    // upstream errors must propagate to the client; the cache writer must
+    // be able to keep up under realistic chunk sizes.
+    // -----------------------------------------------------------------------
+
+    use crate::services::storage_service::{
+        PutStreamResult as ServicePutStreamResult, StorageBackend as ServiceStorageBackend,
+        StorageService as RealStorageService,
+    };
+    use futures::stream::BoxStream as ServiceBoxStream;
+    use sha2::{Digest, Sha256};
+
+    /// Recording backend used by the tee tests. Tracks the chunks delivered
+    /// to put_stream + a flag for whether put_stream should fail before
+    /// consuming the stream.
+    struct TeeRecordingBackend {
+        put_stream_chunks: tokio::sync::Mutex<Vec<Bytes>>,
+        metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
+        put_stream_fails: bool,
+    }
+
+    impl TeeRecordingBackend {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
+                metadata_writes: tokio::sync::Mutex::new(Vec::new()),
+                put_stream_fails: false,
+            })
+        }
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                put_stream_chunks: tokio::sync::Mutex::new(Vec::new()),
+                metadata_writes: tokio::sync::Mutex::new(Vec::new()),
+                put_stream_fails: true,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStorageBackend for TeeRecordingBackend {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            // Metadata sidecars use this path; record so tests can assert
+            // the sidecar shape after a successful put_stream.
+            self.metadata_writes
+                .lock()
+                .await
+                .push((key.to_string(), content));
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound("not relevant for tee tests".into()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn put_stream(
+            &self,
+            _key: &str,
+            stream: ServiceBoxStream<'static, Result<Bytes>>,
+        ) -> Result<ServicePutStreamResult> {
+            if self.put_stream_fails {
+                return Err(AppError::Storage("simulated storage failure".to_string()));
+            }
+            use futures::StreamExt;
+            let mut hasher = Sha256::new();
+            let mut total: u64 = 0;
+            let mut chunks = self.put_stream_chunks.lock().await;
+            tokio::pin!(stream);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                total += chunk.len() as u64;
+                chunks.push(chunk);
+            }
+            Ok(ServicePutStreamResult {
+                checksum_sha256: format!("{:x}", hasher.finalize()),
+                bytes_written: total,
+            })
+        }
+    }
+
+    fn upstream_chunks(chunks: Vec<&'static [u8]>) -> BoxStream<'static, Result<Bytes>> {
+        Box::pin(futures::stream::iter(
+            chunks.into_iter().map(|c| Ok(Bytes::from_static(c))),
+        ))
+    }
+
+    fn template() -> CacheMetadataTemplate {
+        CacheMetadataTemplate {
+            content_type: Some("application/octet-stream".to_string()),
+            etag: None,
+            ttl_secs: 60,
+        }
+    }
+
+    /// Happy path: upstream produces 3 chunks. Client receives all 3 in
+    /// order. Storage receives all 3 in order. Metadata sidecar written
+    /// with the correct SHA-256 + byte count.
+    #[tokio::test]
+    async fn test_tee_forwards_all_chunks_to_client_and_storage() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"hello", b" ", b"world"]);
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        let mut received: Vec<u8> = Vec::new();
+        while let Some(chunk) = client.next().await {
+            received.extend_from_slice(&chunk.expect("client chunk"));
+        }
+        assert_eq!(received, b"hello world");
+
+        // Give the writer task a chance to flush.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored: Vec<u8> = backend
+            .put_stream_chunks
+            .lock()
+            .await
+            .iter()
+            .flat_map(|b| b.to_vec())
+            .collect();
+        assert_eq!(stored, b"hello world");
+
+        // Metadata sidecar: one write, JSON-parseable, hashes match.
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(writes.len(), 1, "exactly one metadata sidecar write");
+        assert_eq!(writes[0].0, "meta-key");
+        let metadata: CacheMetadata =
+            serde_json::from_slice(&writes[0].1).expect("metadata JSON parseable");
+        assert_eq!(metadata.size_bytes, 11);
+        // SHA-256("hello world") known value:
+        assert_eq!(
+            metadata.checksum_sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    /// Storage failure does NOT break the client. The client still
+    /// receives the full upstream body; only the cache write fails,
+    /// which is logged and the metadata sidecar is skipped so the
+    /// next request re-fetches.
+    #[tokio::test]
+    async fn test_tee_storage_failure_does_not_break_client() {
+        let backend = TeeRecordingBackend::failing();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"chunk-a", b"chunk-b"]);
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        let mut received: Vec<u8> = Vec::new();
+        while let Some(chunk) = client.next().await {
+            received.extend_from_slice(&chunk.expect("client must still receive"));
+        }
+        assert_eq!(
+            received, b"chunk-achunk-b",
+            "storage failure must not affect client; client gets full body"
+        );
+
+        // Give writer task time to finish failing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "failed put_stream MUST skip the metadata sidecar so the next \
+             request re-fetches upstream (cache self-heals)"
+        );
+    }
+
+    /// Empty upstream (e.g. a 0-byte upstream object) round-trips
+    /// cleanly. Edge case for the channel-drop-on-EOF sequence.
+    #[tokio::test]
+    async fn test_tee_empty_upstream_yields_empty_body_and_writes_metadata() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![]);
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        let mut total: usize = 0;
+        while let Some(chunk) = client.next().await {
+            total += chunk.unwrap().len();
+        }
+        assert_eq!(total, 0);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(writes.len(), 1, "empty-body cache still gets metadata");
+        let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
+        assert_eq!(metadata.size_bytes, 0);
+        // SHA-256 of empty input:
+        assert_eq!(
+            metadata.checksum_sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// An error mid-upstream-stream must surface to the client AND
+    /// cause the storage writer to abandon the cache (no metadata
+    /// sidecar). Chunks delivered before the error are NOT promoted
+    /// to a "partial" cache: the writer task observes the upstream
+    /// error via the channel and put_stream returns Err, so the
+    /// metadata sidecar branch is skipped.
+    #[tokio::test]
+    async fn test_tee_upstream_error_mid_stream_aborts_cache() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"first-chunk")),
+            Err(AppError::Storage("upstream connection reset".to_string())),
+        ]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        // First chunk delivered normally.
+        let first = client.next().await.expect("first chunk").expect("ok");
+        assert_eq!(first.as_ref(), b"first-chunk");
+        // Second pull surfaces the upstream error.
+        match client.next().await {
+            Some(Err(_)) => {}
+            other => panic!(
+                "expected upstream error to surface to client; got Some/Err shape: {}",
+                other.is_some()
+            ),
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "upstream error mid-stream MUST NOT leave a metadata sidecar"
+        );
+    }
+
+    /// Single-chunk upstream (small files served through the streaming
+    /// path) round-trips cleanly. Exercises the "EOF after first send"
+    /// branch separate from the many-chunk loop.
+    #[tokio::test]
+    async fn test_tee_single_chunk_round_trip() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"solo"]);
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+        let mut received = Vec::new();
+        while let Some(chunk) = client.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, b"solo");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored: Vec<u8> = backend
+            .put_stream_chunks
+            .lock()
+            .await
+            .iter()
+            .flat_map(|b| b.to_vec())
+            .collect();
+        assert_eq!(stored, b"solo");
+    }
+
+    /// Pin the metadata sidecar shape: etag, content-type, and TTL
+    /// must round-trip through the writer task. Catches regressions
+    /// that drop fields between the template and the persisted JSON.
+    #[tokio::test]
+    async fn test_tee_metadata_sidecar_carries_etag_and_ttl() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"payload"]);
+        let template = CacheMetadataTemplate {
+            content_type: Some("application/x-deb".to_string()),
+            etag: Some("\"abc123\"".to_string()),
+            ttl_secs: 7200,
+        };
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template,
+        );
+        while client.next().await.is_some() {}
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
+        assert_eq!(metadata.content_type.as_deref(), Some("application/x-deb"));
+        assert_eq!(metadata.upstream_etag.as_deref(), Some("\"abc123\""));
+        let ttl_seen = (metadata.expires_at - metadata.cached_at).num_seconds();
+        assert!(
+            (7195..=7205).contains(&ttl_seen),
+            "expected expires_at - cached_at ~= 7200s, got {}s",
+            ttl_seen
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_upstream_status: pure status-classification logic
+    // extracted from read_upstream_response_streaming so the truth
+    // table is testable without a real reqwest::Response. #895.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_upstream_status_2xx_is_ok() {
+        validate_upstream_status(StatusCode::OK, "http://x").expect("200 must pass");
+        validate_upstream_status(StatusCode::PARTIAL_CONTENT, "http://x")
+            .expect("206 (partial content) is 2xx and must pass");
+        validate_upstream_status(StatusCode::NO_CONTENT, "http://x").expect("204 must pass");
+    }
+
+    #[test]
+    fn test_validate_upstream_status_404_is_not_found() {
+        match validate_upstream_status(StatusCode::NOT_FOUND, "http://up/x") {
+            Err(AppError::NotFound(msg)) => assert!(msg.contains("http://up/x")),
+            other => panic!(
+                "404 MUST classify as NotFound so callers handle it as a \
+                 real cache-miss signal, not a 5xx-class backend failure; \
+                 got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_validate_upstream_status_5xx_is_storage_error() {
+        match validate_upstream_status(StatusCode::INTERNAL_SERVER_ERROR, "http://up/x") {
+            Err(AppError::Storage(msg)) => {
+                assert!(msg.contains("500"));
+                assert!(msg.contains("http://up/x"));
+            }
+            other => panic!("500 must map to AppError::Storage; got {:?}", other),
+        }
+        match validate_upstream_status(StatusCode::BAD_GATEWAY, "http://up/x") {
+            Err(AppError::Storage(_)) => {}
+            other => panic!("502 must map to AppError::Storage; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_upstream_status_4xx_other_is_storage_error() {
+        // Non-404 4xx (e.g. 401 if it slipped past the retry path, or
+        // 403 from a misconfigured private mirror) must NOT be mistaken
+        // for a cache miss. Falls through to Storage class.
+        match validate_upstream_status(StatusCode::FORBIDDEN, "http://up/x") {
+            Err(AppError::Storage(_)) => {}
+            other => panic!("403 must map to AppError::Storage; got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_streaming_headers: pure header parsing. Verifies the
+    // Content-Length parse-or-skip behaviour and the etag/content-type
+    // round-trip without a reqwest::Response. #895.
+    // -----------------------------------------------------------------------
+
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn test_extract_streaming_headers_full_set() {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-deb"));
+        h.insert(ETAG, HeaderValue::from_static("\"abc123\""));
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("12345"));
+        let (ct, etag, len) = extract_streaming_headers(&h);
+        assert_eq!(ct.as_deref(), Some("application/x-deb"));
+        assert_eq!(etag.as_deref(), Some("\"abc123\""));
+        assert_eq!(len, Some(12345));
+    }
+
+    #[test]
+    fn test_extract_streaming_headers_empty() {
+        let h = HeaderMap::new();
+        let (ct, etag, len) = extract_streaming_headers(&h);
+        assert!(ct.is_none());
+        assert!(etag.is_none());
+        assert!(len.is_none());
+    }
+
+    #[test]
+    fn test_extract_streaming_headers_non_numeric_content_length_yields_none() {
+        // A misbehaving upstream that returned a non-numeric
+        // Content-Length must not panic or default to 0; the proxy
+        // simply drops the value and the outbound response falls
+        // back to chunked transfer encoding.
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("not-a-number"));
+        let (_, _, len) = extract_streaming_headers(&h);
+        assert!(len.is_none());
+    }
+
+    #[test]
+    fn test_extract_streaming_headers_non_utf8_etag_is_dropped() {
+        // HTTP headers are sometimes non-UTF8 bytes (broken
+        // upstreams). The parser silently drops them rather than
+        // erroring; the outbound response simply omits the etag.
+        let mut h = HeaderMap::new();
+        let bad = HeaderValue::from_bytes(b"\xff\xfe").unwrap();
+        h.insert(ETAG, bad);
+        let (_, etag, _) = extract_streaming_headers(&h);
+        assert!(etag.is_none());
+    }
+
+    /// Pin StreamingFetchResult's content_length passthrough. The
+    /// proxy_fetch_streaming helper uses this to set Content-Length
+    /// on the outbound response; dropping it would force every
+    /// streamed proxy response to chunked transfer encoding even
+    /// when upstream advertised an exact length.
+    #[test]
+    fn test_streaming_fetch_result_carries_content_length() {
+        let dummy: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![]));
+        let r = StreamingFetchResult {
+            body: dummy,
+            content_type: Some("application/octet-stream".to_string()),
+            content_length: Some(12345),
+        };
+        assert_eq!(r.content_length, Some(12345));
+        assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));
+    }
+
+    /// Many small chunks should not regress to the buffering antipattern.
+    /// 256 chunks of 256 bytes (64 KiB total) is comfortably below the
+    /// channel depth × chunk size threshold; verifies the channel
+    /// throughput on realistic chunk counts.
+    #[tokio::test]
+    async fn test_tee_many_small_chunks_round_trip() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        const COUNT: u32 = 256;
+        const CHUNK_SIZE: usize = 256;
+        let total_expected: u64 = COUNT as u64 * CHUNK_SIZE as u64;
+        let upstream_iter = (0..COUNT).map(|i| Ok(Bytes::from(vec![(i & 0xff) as u8; CHUNK_SIZE])));
+        let upstream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::iter(upstream_iter));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        let mut received: u64 = 0;
+        while let Some(chunk) = client.next().await {
+            received += chunk.unwrap().len() as u64;
+        }
+        assert_eq!(received, total_expected);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
+        assert_eq!(metadata.size_bytes as u64, total_expected);
     }
 }
