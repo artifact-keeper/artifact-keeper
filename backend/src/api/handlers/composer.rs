@@ -227,6 +227,34 @@ async fn metadata_v2(
     })?;
 
     if artifacts.is_empty() {
+        // #1096: For remote repos, proxy the v2 metadata document from
+        // upstream when we have nothing cached locally. The composer CLI
+        // hits `/p2/{vendor}/{package}.json` as its first lookup; returning
+        // 404 here means `composer install` fails even when the upstream
+        // (packagist.org or any mirror) has the package. The proxy_service
+        // also caches the response body so subsequent requests hit the
+        // cache, matching the behaviour of the PyPI and OCI handlers.
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let upstream_path = format!("p2/{}.json", full_name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                let ct = content_type.unwrap_or_else(|| "application/json".to_string());
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, ct)
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 
@@ -300,6 +328,29 @@ async fn metadata_v1(
     })?;
 
     if artifacts.is_empty() {
+        // #1096: Also proxy the v1 metadata format for older composer
+        // clients. The upstream path mirrors the v1 URL shape (`p/`).
+        if repo.repo_type == RepositoryType::Remote {
+            if let (Some(ref upstream_url), Some(ref proxy)) =
+                (&repo.upstream_url, &state.proxy_service)
+            {
+                let upstream_path = format!("p/{}.json", full_name);
+                let (content, content_type) = proxy_helpers::proxy_fetch(
+                    proxy,
+                    repo.id,
+                    &repo_key,
+                    upstream_url,
+                    &upstream_path,
+                )
+                .await?;
+                let ct = content_type.unwrap_or_else(|| "application/json".to_string());
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, ct)
+                    .body(Body::from(content))
+                    .unwrap());
+            }
+        }
         return Err((StatusCode::NOT_FOUND, "Package not found").into_response());
     }
 

@@ -170,11 +170,33 @@ pub fn reject_write_if_not_hosted(repo_type: &str) -> Result<(), Response> {
 /// Map a proxy service error to an HTTP error response.
 ///
 /// `NotFound` errors become 404; everything else becomes 502 Bad Gateway.
-/// The error is logged at `warn` level with the repo key and path for context.
+///
+/// Log-level discipline (#1139): an upstream 404 (`AppError::NotFound`) is
+/// **normal proxy traffic**, not a failure of artifact-keeper. Docker / OCI
+/// clients routinely probe for tags that do not exist (`:latest` for a project
+/// that only publishes versioned tags), and PyPI / npm clients probe optional
+/// metadata files (`.metadata`, `.sig`) the same way. Logging those at WARN
+/// floods operators with false-positive alerts and reads as "the proxy is
+/// broken" when the proxy is in fact doing its job correctly.
+///
+/// * **`NotFound`** is logged at `info` with wording that names the cause
+///   (upstream returned 404). Operators triaging "why is my mirror not
+///   working" see immediately that the upstream does not have the requested
+///   artifact, not that artifact-keeper malfunctioned.
+/// * **`Validation`** stays at `warn` because it indicates a malformed path
+///   (often a probe / attack attempt the path-traversal guard rejected).
+/// * **Everything else** (timeouts, TLS errors, 5xx, auth challenge parse
+///   failures, body read errors) stays at `warn` because those genuinely
+///   warrant operator attention.
 fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Response {
-    tracing::warn!("Proxy fetch failed for {}/{}: {}", repo_key, path, e);
     match &e {
         crate::error::AppError::NotFound(_) => {
+            tracing::info!(
+                repo_key = %repo_key,
+                path = %path,
+                "Upstream returned 404 (artifact or tag does not exist): {}",
+                e
+            );
             (StatusCode::NOT_FOUND, "Artifact not found upstream").into_response()
         }
         // AppError::Validation here means the request path failed
@@ -185,13 +207,27 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
         // letting an attacker enumerate which characters/segments are
         // blocked.
         crate::error::AppError::Validation(_) => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %path,
+                "Proxy rejected request path: {}",
+                e
+            );
             (StatusCode::BAD_REQUEST, "Invalid artifact path").into_response()
         }
-        _ => (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to fetch from upstream: {}", e),
-        )
-            .into_response(),
+        _ => {
+            tracing::warn!(
+                repo_key = %repo_key,
+                path = %path,
+                "Proxy fetch failed: {}",
+                e
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to fetch from upstream: {}", e),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1791,6 +1827,21 @@ mod tests {
         );
         let response = map_proxy_error("repo-key", "pkg", err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // #1139 regression: upstream-404 must still resolve to a 404 response.
+    // The log-level change (`warn` -> `info` with re-worded message) is a
+    // behavioural change visible to operators only; the API contract for the
+    // OCI / PyPI / generic-proxy client is unchanged. This guards against an
+    // accidental re-routing of NotFound through the 502 branch.
+    #[test]
+    fn test_map_proxy_error_not_found_still_returns_404_after_logging_rework() {
+        let err = crate::error::AppError::NotFound(
+            "Artifact not found at upstream: https://ghcr.io/v2/example/manifests/latest"
+                .to_string(),
+        );
+        let response = map_proxy_error("ghcr", "v2/example/manifests/latest", err);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     // ── RepoInfo::storage_location tests ───────────────────────────────
