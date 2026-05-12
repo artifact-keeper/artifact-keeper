@@ -4925,7 +4925,6 @@ mod tests {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Deactivated user must not be able to swap a still-valid Bearer JWT for a
 // fresh OCI access token. DB-backed because the bug is observable only with
