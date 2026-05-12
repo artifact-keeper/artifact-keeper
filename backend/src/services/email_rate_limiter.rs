@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -53,14 +53,29 @@ pub const DEFAULT_PER_RECIPIENT_PER_MIN: u32 = 100;
 /// `AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN`.
 pub const DEFAULT_PER_DOMAIN_PER_MIN: u32 = 1000;
 
-/// Soft cap on the recipient-bucket map. When exceeded, idle entries
-/// (full bucket = behaviourally indistinguishable from a fresh one) are
-/// pruned on access so memory is bounded under subscription churn.
+/// Soft cap on the recipient-bucket map. When exceeded, entries idle
+/// longer than [`PRUNE_IDLE_THRESHOLD`] are evicted lazily on access so
+/// memory is bounded under subscription churn / attacker-driven
+/// recipient variation.
 const RECIPIENT_MAP_SOFT_CAP: usize = 10_000;
 
 /// Soft cap on the domain-bucket map. Same eviction trigger as the
 /// recipient map.
 const DOMAIN_MAP_SOFT_CAP: usize = 2_000;
+
+/// Minimum interval between prune sweeps. Caps the amortized cost of
+/// pruning at O(1) per `try_acquire` even when the map sits above the
+/// soft cap indefinitely (the case an attacker can force by creating
+/// SOFT_CAP+1 active subscriptions).
+const PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Age beyond which an idle bucket is guaranteed to have refilled to
+/// full capacity from any past consumption. With the longest refill
+/// window being `capacity / (capacity / 60) = 60s`, anything older than
+/// 90s is observationally indistinguishable from a fresh bucket, so
+/// dropping it changes no operator-visible behaviour. We pad to 120s
+/// for safety against clock jitter.
+const PRUNE_IDLE_THRESHOLD: Duration = Duration::from_secs(120);
 
 /// Parse an `AK_EMAIL_RATE_LIMIT_*_PER_MIN` env value, applying the
 /// fallback policy:
@@ -168,6 +183,9 @@ pub struct EmailRateLimiter {
 struct RateLimiterState {
     recipients: HashMap<(Uuid, String), Bucket>,
     domains: HashMap<String, Bucket>,
+    /// When the last prune sweep ran. Used to throttle sweep frequency
+    /// to at most one per [`PRUNE_MIN_INTERVAL`].
+    last_prune: Option<Instant>,
 }
 
 impl EmailRateLimiter {
@@ -239,15 +257,34 @@ impl EmailRateLimiter {
         };
 
         // Bound the maps under subscription churn / attacker-driven
-        // domain variation. Pruning runs lazily and only when we've
-        // crossed the soft cap; an idle bucket at full capacity is
-        // observationally identical to a freshly created one, so
-        // dropping it changes nothing operator-visible.
-        if state.recipients.len() > RECIPIENT_MAP_SOFT_CAP {
-            state.recipients.retain(|_, b| b.tokens < b.capacity);
-        }
-        if state.domains.len() > DOMAIN_MAP_SOFT_CAP {
-            state.domains.retain(|_, b| b.tokens < b.capacity);
+        // recipient or domain variation. Pruning is:
+        //
+        // - Lazy: only runs when over the soft cap.
+        // - Frequency-capped: at most once per `PRUNE_MIN_INTERVAL`, so
+        //   even if the map stays over-cap indefinitely the amortized
+        //   per-call cost stays O(1) (otherwise an attacker driving the
+        //   map to SOFT_CAP+1 with all-warm buckets would force an O(N)
+        //   scan on every dispatch — Security R2 B2).
+        // - Age-based: drops entries whose `last_refill` is older than
+        //   `PRUNE_IDLE_THRESHOLD`. Such buckets would refill to full on
+        //   their next access anyway, so dropping them changes nothing
+        //   operator-visible. (A `tokens < capacity` predicate would not
+        //   catch idle-but-once-consumed buckets, since `tokens` is only
+        //   updated inside `try_consume`.)
+        let over_cap = state.recipients.len() > RECIPIENT_MAP_SOFT_CAP
+            || state.domains.len() > DOMAIN_MAP_SOFT_CAP;
+        let interval_ok = state
+            .last_prune
+            .map(|t| now.saturating_duration_since(t) >= PRUNE_MIN_INTERVAL)
+            .unwrap_or(true);
+        if over_cap && interval_ok {
+            state
+                .recipients
+                .retain(|_, b| now.saturating_duration_since(b.last_refill) < PRUNE_IDLE_THRESHOLD);
+            state
+                .domains
+                .retain(|_, b| now.saturating_duration_since(b.last_refill) < PRUNE_IDLE_THRESHOLD);
+            state.last_prune = Some(now);
         }
 
         // Per-recipient gate first. Cheap and per-subscription scoped so
@@ -607,15 +644,57 @@ mod tests {
         assert_eq!(parse_per_min_env(Some("4294967295"), 100), u32::MAX);
     }
 
+    /// Serializes env-mutation tests in this module. Other tests in the
+    /// crate may inspect or set the same vars; without this lock,
+    /// parallel `cargo test` runs race the var state.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
-    fn test_from_env_constructs_limiter_with_defaults_when_unset() {
-        // The env-parse logic itself is covered by the parse_per_min_env
-        // tests above. This is a smoke test that from_env() wires the
-        // parser into the constructor — assumes the env vars are NOT
-        // set in the test environment (which is the standard CI shape).
+    fn test_from_env_uses_defaults_when_env_unset() {
+        // Tight assertion: from_env() must return defaults specifically,
+        // not just any positive number. Serialized + cleaned to defend
+        // against ambient env-var carryover.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_r = std::env::var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN").ok();
+        let prev_d = std::env::var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN").ok();
+        std::env::remove_var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN");
+        std::env::remove_var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN");
+
         let limiter = EmailRateLimiter::from_env();
-        assert!(limiter.per_recipient_per_min() > 0);
-        assert!(limiter.per_domain_per_min() > 0);
+        assert_eq!(
+            limiter.per_recipient_per_min(),
+            DEFAULT_PER_RECIPIENT_PER_MIN
+        );
+        assert_eq!(limiter.per_domain_per_min(), DEFAULT_PER_DOMAIN_PER_MIN);
+
+        if let Some(v) = prev_r {
+            std::env::set_var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN", v);
+        }
+        if let Some(v) = prev_d {
+            std::env::set_var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN", v);
+        }
+    }
+
+    #[test]
+    fn test_from_env_picks_up_overrides() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_r = std::env::var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN").ok();
+        let prev_d = std::env::var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN").ok();
+        std::env::set_var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN", "42");
+        std::env::set_var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN", "777");
+
+        let limiter = EmailRateLimiter::from_env();
+        assert_eq!(limiter.per_recipient_per_min(), 42);
+        assert_eq!(limiter.per_domain_per_min(), 777);
+
+        match prev_r {
+            Some(v) => std::env::set_var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN", v),
+            None => std::env::remove_var("AK_EMAIL_RATE_LIMIT_PER_RECIPIENT_PER_MIN"),
+        }
+        match prev_d {
+            Some(v) => std::env::set_var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN", v),
+            None => std::env::remove_var("AK_EMAIL_RATE_LIMIT_PER_DOMAIN_PER_MIN"),
+        }
     }
 
     #[test]
@@ -633,12 +712,11 @@ mod tests {
     }
 
     #[test]
-    fn test_recipient_map_prunes_idle_full_buckets_past_soft_cap() {
-        // Plant SOFT_CAP+1 distinct (sub, recipient) pairs. Each consumes
-        // one token, leaving the bucket at capacity-1 = 99/100 (not full).
-        // Then advance the clock far enough for every bucket to refill
-        // to capacity, and one more acquire should trip the pruner and
-        // drop the idle entries.
+    fn test_recipient_map_prunes_idle_entries_past_soft_cap() {
+        // Plant SOFT_CAP+1 distinct (sub, recipient) pairs at t0. Then
+        // advance past PRUNE_IDLE_THRESHOLD so all planted entries are
+        // older than the eviction threshold, and trigger one more
+        // acquire — the lazy prune fires and drops every stale entry.
         let limiter = EmailRateLimiter::new(100, 1000);
         let t0 = Instant::now();
         for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
@@ -650,27 +728,29 @@ mod tests {
         }
         assert!(limiter.recipient_entry_count() > RECIPIENT_MAP_SOFT_CAP);
 
-        // Advance one minute so every recipient bucket refills to full.
-        let t1 = t0 + Duration::from_secs(60);
-        // One more acquire triggers the pruner because we're still over
-        // the cap and every prior entry is now at full capacity.
+        // Advance past the idle threshold so every planted entry's
+        // `last_refill` is too old to survive the prune.
+        let t1 = t0 + PRUNE_IDLE_THRESHOLD + Duration::from_secs(1);
+
+        // One more acquire triggers the prune (first sweep, interval
+        // gate is vacuously satisfied; map is still over cap).
         let trigger_sub = Uuid::from_u128(u128::MAX);
         let _ = limiter.try_acquire_at(trigger_sub, "trigger@x.com", t1);
 
-        // After pruning, only entries with tokens < capacity remain.
-        // The newly-inserted trigger entry just consumed one (99/100),
-        // so it survives. Everything else was full and got dropped.
-        assert!(
-            limiter.recipient_entry_count() <= RECIPIENT_MAP_SOFT_CAP,
-            "pruner did not bring map back under soft cap; got {}",
+        // After pruning, only the freshly-inserted trigger remains.
+        assert_eq!(
+            limiter.recipient_entry_count(),
+            1,
+            "pruner should have left only the trigger entry; got {}",
             limiter.recipient_entry_count()
         );
     }
 
     #[test]
-    fn test_domain_map_prunes_idle_full_buckets_past_soft_cap() {
-        // Same property at the domain layer. Use a small per-domain cap
-        // and many distinct domains.
+    fn test_domain_map_prunes_idle_entries_past_soft_cap() {
+        // Same property at the domain layer. The per-domain cap is small
+        // so distinct addresses don't trip the per-domain limit and the
+        // map fills cleanly.
         let limiter = EmailRateLimiter::new(100, 100);
         let s = sub();
         let t0 = Instant::now();
@@ -682,13 +762,58 @@ mod tests {
             );
         }
         assert!(limiter.domain_entry_count() > DOMAIN_MAP_SOFT_CAP);
-        // Refill all buckets to full and trigger pruning.
-        let t1 = t0 + Duration::from_secs(60);
+
+        let t1 = t0 + PRUNE_IDLE_THRESHOLD + Duration::from_secs(1);
         let _ = limiter.try_acquire_at(s, "trigger@trigger-domain.com", t1);
-        assert!(
-            limiter.domain_entry_count() <= DOMAIN_MAP_SOFT_CAP,
-            "domain pruner did not bring map back under soft cap; got {}",
+        assert_eq!(
+            limiter.domain_entry_count(),
+            1,
+            "domain pruner should have left only the trigger; got {}",
             limiter.domain_entry_count()
+        );
+    }
+
+    #[test]
+    fn test_pruning_is_frequency_capped() {
+        // After a prune, subsequent over-cap acquires within
+        // `PRUNE_MIN_INTERVAL` must NOT trigger another sweep. This
+        // closes the DoS amplification path where an attacker holds
+        // the map at SOFT_CAP+1 with all-active buckets and forces
+        // an O(N) scan on every dispatch (Security R2 B2).
+        let limiter = EmailRateLimiter::new(100, 1000);
+        let t0 = Instant::now();
+
+        // First wave of stale plants, plus a triggering acquire after
+        // the idle threshold so the first prune fires.
+        for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
+            let _ =
+                limiter.try_acquire_at(Uuid::from_u128(i as u128), "a@x.com", t0);
+        }
+        let t1 = t0 + PRUNE_IDLE_THRESHOLD + Duration::from_secs(1);
+        let _ = limiter.try_acquire_at(Uuid::from_u128(u128::MAX), "trigger@x.com", t1);
+        assert_eq!(limiter.recipient_entry_count(), 1);
+
+        // Second wave: fresh entries at t1 with `last_refill=t1`. These
+        // would still be too young to evict on age. Re-cross the cap.
+        for i in 0..(RECIPIENT_MAP_SOFT_CAP + 1) {
+            let _ = limiter.try_acquire_at(
+                Uuid::from_u128((i as u128) | (1u128 << 100)),
+                "a@x.com",
+                t1,
+            );
+        }
+        assert!(limiter.recipient_entry_count() > RECIPIENT_MAP_SOFT_CAP);
+
+        // 1s later — well inside PRUNE_MIN_INTERVAL (10s). Even though
+        // we're over cap, the interval gate must suppress the sweep.
+        let t2 = t1 + Duration::from_secs(1);
+        let _ =
+            limiter.try_acquire_at(Uuid::from_u128(u128::MAX - 1), "trigger2@x.com", t2);
+
+        assert!(
+            limiter.recipient_entry_count() > RECIPIENT_MAP_SOFT_CAP,
+            "frequency cap should have suppressed second prune within interval; got {}",
+            limiter.recipient_entry_count()
         );
     }
 }

@@ -166,10 +166,13 @@ const KNOWN_EMAIL_EVENT_TYPES: &[&str] = &[
 ];
 
 /// Collapse an arbitrary event-type string to a bounded label set. See
-/// [`KNOWN_EMAIL_EVENT_TYPES`] for the contract.
+/// [`KNOWN_EMAIL_EVENT_TYPES`] for the contract. Comparison is ASCII
+/// case-insensitive so a producer that publishes `"Artifact.Uploaded"`
+/// is still recognized and reported under the canonical lowercase
+/// label (rather than silently bucketing into `"other"`).
 fn bounded_email_event_type(event_type: &str) -> &'static str {
     for known in KNOWN_EMAIL_EVENT_TYPES {
-        if *known == event_type {
+        if known.eq_ignore_ascii_case(event_type) {
             return known;
         }
     }
@@ -297,5 +300,20 @@ mod tests {
         assert_eq!(bounded_email_event_type("event.uuid-12345"), "other");
         assert_eq!(bounded_email_event_type(""), "other");
         assert_eq!(bounded_email_event_type("anything.else"), "other");
+    }
+
+    #[test]
+    fn test_bounded_email_event_type_is_ascii_case_insensitive() {
+        // A future emitter publishing `"Artifact.Uploaded"` should still
+        // map to the canonical lowercase label, not silently collapse
+        // into the "other" bucket.
+        assert_eq!(
+            bounded_email_event_type("Artifact.Uploaded"),
+            "artifact.uploaded"
+        );
+        assert_eq!(
+            bounded_email_event_type("SCAN.COMPLETED"),
+            "scan.completed"
+        );
     }
 }

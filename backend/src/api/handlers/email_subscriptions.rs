@@ -231,15 +231,23 @@ pub(crate) fn validate_recipients(recipients: &[String]) -> Result<()> {
     }
     for addr in recipients {
         let trimmed = addr.trim();
-        // Reject control characters before any other check: a recipient
+        // Reject log-forgery payloads before any other check: a recipient
         // like `"victim@x.com\n[ERROR] forged"` is syntactically a valid
         // email by the @-count rule below but is a log-forgery payload
         // (it survives into the dispatcher's `tracing::warn!` lines).
         // The dispatcher additionally sanitizes at log time, but rejecting
         // at write time prevents bad rows from ever landing.
-        if addr.chars().any(|c| c.is_control()) {
+        //
+        // Bans: ASCII control range AND Unicode line/paragraph separators
+        // (U+2028, U+2029) and U+0085 NEL. The latter are general-category
+        // Zl/Zp/Cc-but-not-C0 and `char::is_control()` does NOT cover the
+        // separators, yet many log viewers render them as newlines.
+        let forbidden = |c: char| {
+            c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}')
+        };
+        if addr.chars().any(forbidden) {
             return Err(AppError::Validation(
-                "recipient contains control characters".to_string(),
+                "recipient contains control or line-separator characters".to_string(),
             ));
         }
         let bad = trimmed.is_empty()
@@ -815,6 +823,28 @@ mod tests {
     #[test]
     fn test_validate_recipients_rejects_null_byte() {
         let err = validate_recipients(&["a\0b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_unicode_line_separator() {
+        // U+2028 LINE SEPARATOR: NOT an ASCII control char so
+        // `is_control()` alone would miss it. Many log viewers render
+        // it as a newline, enabling the same forgery as `\n`.
+        let err = validate_recipients(&["a\u{2028}b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_unicode_paragraph_separator() {
+        let err = validate_recipients(&["a\u{2029}b@x.com".to_string()]).unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_recipients_rejects_nel() {
+        // U+0085 NEXT LINE: ECMA-48 line terminator.
+        let err = validate_recipients(&["a\u{0085}b@x.com".to_string()]).unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
     }
 

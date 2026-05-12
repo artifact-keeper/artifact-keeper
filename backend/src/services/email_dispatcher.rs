@@ -155,15 +155,29 @@ async fn dispatch_event(
 /// Recipient addresses come from the `email_subscriptions.recipients`
 /// array, populated by `create_subscription` against the validator in
 /// `email_subscriptions::validate_recipients`. The validator now rejects
-/// control characters (defense in depth — see #1170 follow-up), but the
-/// dispatcher MUST NOT trust that for log emission: a row could have
+/// these same code points (defense in depth — see #1170 follow-up), but
+/// the dispatcher MUST NOT trust that for log emission: a row could have
 /// been inserted before the validator was tightened, or by a hand-rolled
-/// SQL path. Strip any control byte so an attacker-stored recipient like
-/// `"victim@x.com\n[ERROR] fake admin"` cannot forge log lines in the
-/// dispatcher's stdout stream.
+/// SQL path.
+///
+/// Strips:
+/// - `char::is_control()` — ASCII C0/C1 control range (covers `\n`,
+///   `\r`, `\0`, ESC `\x1b`, etc.)
+/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR — Unicode
+///   category `Zl`/`Zp`. NOT covered by `is_control()` but rendered
+///   as line breaks by many structured-log viewers (Grafana, Kibana,
+///   browser JSON renderers).
+/// - U+0085 NEXT LINE — historically a line terminator in some
+///   ECMA-48-aware viewers.
 fn sanitize_for_log(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{0085}') {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -239,6 +253,23 @@ pub fn build_email_body_html(event: &DomainEvent) -> String {
 /// dispatch. A drop on either bucket emits a `warn!` line, increments the
 /// `email_dispatch_rate_limited_total` counter with the bucket label, and
 /// continues to the next recipient without blocking the loop.
+/// Returns `true` (and emits the standard `warn!` line) when the
+/// supplied recipient list is empty. Extracted from `deliver_email` so
+/// the empty-list branch is directly unit-testable without spinning up
+/// an `SmtpService` instance. The branch is also defended at the API
+/// layer by `email_subscriptions::validate_recipients`; this is
+/// belt-and-suspenders for hand-rolled SQL inserts.
+fn check_recipients_empty(recipients: &[String], subscription_id: uuid::Uuid) -> bool {
+    if recipients.is_empty() {
+        tracing::warn!(
+            subscription_id = %subscription_id,
+            "Email subscription has no recipients configured"
+        );
+        return true;
+    }
+    false
+}
+
 async fn deliver_email(
     smtp_service: &Option<Arc<SmtpService>>,
     rate_limiter: &EmailRateLimiter,
@@ -258,11 +289,7 @@ async fn deliver_email(
         }
     };
 
-    if recipients.is_empty() {
-        tracing::warn!(
-            subscription_id = %subscription_id,
-            "Email subscription has no recipients configured"
-        );
+    if check_recipients_empty(recipients, subscription_id) {
         return;
     }
 
@@ -615,6 +642,49 @@ mod tests {
             sanitize_for_log("alice@example.com"),
             "alice@example.com"
         );
+    }
+
+    #[test]
+    fn test_sanitize_for_log_strips_unicode_line_separators() {
+        // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are NOT
+        // ASCII control chars but are rendered as line breaks by many
+        // log viewers, so they enable the same log-forgery payload.
+        assert_eq!(
+            sanitize_for_log("victim@x.com\u{2028}[ERROR] forged"),
+            "victim@x.com?[ERROR] forged"
+        );
+        assert_eq!(
+            sanitize_for_log("victim@x.com\u{2029}[ERROR] forged"),
+            "victim@x.com?[ERROR] forged"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_for_log_strips_unicode_next_line() {
+        // U+0085 NEXT LINE: ECMA-48 line terminator honored by some
+        // viewers.
+        assert_eq!(sanitize_for_log("a\u{0085}b"), "a?b");
+    }
+
+    #[test]
+    fn test_check_recipients_empty_returns_true_for_empty_slice() {
+        // Direct coverage for the warn-and-return branch in
+        // deliver_email. The test confirms the predicate, not the log
+        // emission — tracing has its own test harness for that and
+        // mocking it here would add no signal.
+        assert!(check_recipients_empty(&[], uuid::Uuid::nil()));
+    }
+
+    #[test]
+    fn test_check_recipients_empty_returns_false_for_nonempty_slice() {
+        assert!(!check_recipients_empty(
+            &["a@x.com".to_string()],
+            uuid::Uuid::nil()
+        ));
+        assert!(!check_recipients_empty(
+            &["a@x.com".to_string(), "b@y.com".to_string()],
+            uuid::Uuid::nil()
+        ));
     }
 
     #[test]
