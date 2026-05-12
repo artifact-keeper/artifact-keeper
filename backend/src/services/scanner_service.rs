@@ -75,6 +75,28 @@ fn format_to_purl_type(format: &str) -> &'static str {
     }
 }
 
+/// True when the artifact is an OCI / Docker container image manifest.
+///
+/// Used to gate scanner applicability: `ImageScanner` (Trivy server-mode
+/// against the registry) handles these; `TrivyFsScanner` and
+/// `GrypeScanner` reject them because their `dir:<workspace>` invocation
+/// sees only the manifest JSON, not the layer blobs that hold the
+/// installed packages (#961, #966).
+///
+/// Predicate matches against either:
+/// - content type contains `vnd.oci.image` / `vnd.docker.distribution`
+///   / `vnd.docker.container`
+/// - artifact path contains `/manifests/` — catches proxy upstream
+///   variants that serve manifests without setting the canonical
+///   content type
+pub fn is_oci_image_artifact(artifact: &Artifact) -> bool {
+    let ct = &artifact.content_type;
+    ct.contains("vnd.oci.image")
+        || ct.contains("vnd.docker.distribution")
+        || ct.contains("vnd.docker.container")
+        || artifact.path.contains("/manifests/")
+}
+
 /// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
 /// recently-completed scan_result row. Bind `$1 = artifact_id` and follow
 /// with `SELECT ... FROM <table> WHERE <table>.scan_result_id IN
@@ -3032,6 +3054,96 @@ mod tests {
             VERSION_CACHE_MISS_TTL <= Duration::from_secs(300),
             "miss TTL must be short enough that the column populates promptly after a fix"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_oci_image_artifact: shared predicate used by all 3 scanners'
+    // is_applicable impls. Centralizes the duplicated content-type +
+    // /manifests/ path check that was previously inline in each scanner.
+    // (#966 cleanup + jscpd duplication-gate fix.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_vnd_oci() {
+        let a = test_helpers::make_test_artifact(
+            "nginx",
+            "application/vnd.oci.image.manifest.v1+json",
+            "v2/library/nginx/manifests/latest",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_docker_distribution() {
+        let a = test_helpers::make_test_artifact(
+            "redis",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "v2/library/redis/manifests/latest",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_docker_container() {
+        let a = test_helpers::make_test_artifact(
+            "busybox",
+            "application/vnd.docker.container.image.v1+json",
+            "v2/library/busybox/blobs/sha256:abc",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_matches_path_manifest_segment() {
+        // Path-based detection catches proxy variants that omit the
+        // canonical OCI content type but still serve manifests under
+        // the v2/.../manifests/ convention.
+        let a = test_helpers::make_test_artifact(
+            "foo",
+            "application/octet-stream",
+            "v2/foo/manifests/v1",
+        );
+        assert!(is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_npm_tarball() {
+        let a = test_helpers::make_test_artifact(
+            "body-parser-1.20.1.tgz",
+            "application/gzip",
+            "npm/body-parser/-/body-parser-1.20.1.tgz",
+        );
+        assert!(!is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_pypi_wheel() {
+        let a = test_helpers::make_test_artifact(
+            "requests-2.31.0-py3-none-any.whl",
+            "application/zip",
+            "pypi/requests/2.31.0/requests-2.31.0-py3-none-any.whl",
+        );
+        assert!(!is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_maven_jar() {
+        let a = test_helpers::make_test_artifact(
+            "log4j-core-2.17.1.jar",
+            "application/java-archive",
+            "maven/org/apache/logging/log4j/log4j-core/2.17.1/log4j-core-2.17.1.jar",
+        );
+        assert!(!is_oci_image_artifact(&a));
+    }
+
+    #[test]
+    fn test_is_oci_image_artifact_rejects_empty_content_type_with_safe_path() {
+        // Defensive: an unset content type combined with a non-manifest
+        // path must NOT trip the gate (avoids false-positive that
+        // would deny scanners on uploads that haven't yet had their
+        // content type sniffed).
+        let a = test_helpers::make_test_artifact("foo", "", "generic/foo");
+        assert!(!is_oci_image_artifact(&a));
     }
 
     #[test]

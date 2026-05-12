@@ -109,7 +109,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .expect("Failed to install rustls CryptoProvider");
 
     // Resolve the shutdown token early so background workers spawned during
-    // startup (notification dispatcher, webhook producer) share the same
+    // startup (email dispatcher, webhook producer) share the same
     // cancellation source as the HTTP/gRPC servers spawned later. If the
     // caller did not pass one (console mode) we create our own and bind it
     // to the OS signal listener.
@@ -520,13 +520,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         }
     }
 
-    // Start notification dispatcher (subscribes to EventBus for email/webhook delivery)
-    artifact_keeper_backend::services::notification_dispatcher::start_dispatcher(
+    // Start email dispatcher (subscribes to EventBus for email_subscriptions delivery).
+    // Webhook delivery goes through the v2 webhook pipeline below; the legacy
+    // notification_dispatcher that combined both channels was removed in #920.
+    artifact_keeper_backend::services::email_dispatcher::start_dispatcher(
         app_state.event_bus.clone(),
         app_state.db.clone(),
         app_state.smtp_service.clone(),
     );
-    tracing::info!("Notification dispatcher started");
+    tracing::info!("Email dispatcher started");
 
     // Start webhooks v2 producer: subscribes to EventBus and enqueues rows
     // into webhook_deliveries. The retry scheduler (every 30s) drives
@@ -677,7 +679,7 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // The concrete shutdown token used by all servers and background tasks
     // is resolved earlier in run_server (see `runtime_shutdown_token`) so
-    // that long-lived workers (notification dispatcher, webhook producer)
+    // that long-lived workers (email dispatcher, webhook producer)
     // share the same cancellation source as the HTTP/gRPC servers.
     let shutdown_token = runtime_shutdown_token.clone();
 
