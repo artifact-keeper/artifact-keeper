@@ -107,6 +107,9 @@ class H(BaseHTTPRequestHandler):
             # DT 4.x: POST returns the unmasked key once.
             # Each POST mints a unique key so the test can verify rotation
             # actually produced a different value on subsequent runs.
+            # Status pinned to 200 to match DT 4.11 swagger (PUT-style
+            # response on this endpoint). curl -sf accepts any 2xx, so a
+            # future drift to e.g. 202 would otherwise go unnoticed.
             state["post_key_count"] += 1
             n = state["post_key_count"]
             unmasked = f"{EXPECTED_KEY}_run{n}"
@@ -117,7 +120,7 @@ class H(BaseHTTPRequestHandler):
                                   "maskedKey": new["maskedKey"]})
             with open(KEY_LOG, "a") as f:
                 f.write(unmasked + "\n")
-            return self._send(201, json.dumps(new).encode())
+            return self._send(200, json.dumps(new).encode())
         if self.path == "/api/v1/configProperty":
             return self._send(200)
         return self._send(404)
@@ -187,7 +190,7 @@ EXPECTED_FIRST="${EXPECTED_KEY}_run1"
 [ "$FIRST_KEY" = "$EXPECTED_FIRST" ] || \
   fail "API key file contents '$FIRST_KEY' != expected '$EXPECTED_FIRST'"
 
-# Assertion 4a: Idempotence (warm start) — re-running with the marker
+# Assertion 4a: Idempotence (warm start). Re-running with the marker
 # present must short-circuit cleanly without re-hitting POST /key.
 set +e
 DEPENDENCY_TRACK_URL="$MOCK_URL" \
@@ -197,7 +200,14 @@ set -e
 [ "$INIT_RC2" -eq 0 ] || fail "warm second run exited $INIT_RC2 (expected 0)"
 [ -s "$KEY_FILE" ]    || fail "$KEY_FILE missing after warm second run"
 
-# Assertion 4b: Cold-start rotation — wipe the marker and re-run. This is
+# Assertion 4a.1: Warm start MUST NOT re-hit POST /key. The mock counts every
+# successful create-key call into KEY_LOG; after one cold start (the initial
+# run above) plus one warm restart, exactly one POST should have been made.
+POST_COUNT_AFTER_WARM=$(wc -l < "$KEY_LOG" | tr -d ' ')
+[ "$POST_COUNT_AFTER_WARM" -eq 1 ] || \
+  fail "warm restart unexpectedly hit POST /key: count=${POST_COUNT_AFTER_WARM} (expected 1)"
+
+# Assertion 4b: Cold-start rotation. Wipe the marker and re-run. This is
 # the path the bug fix actually targets: DELETE old key + POST new key.
 # The new file must be non-empty AND differ from the first key, proving
 # rotation fired. Also assert the mock saw POST /key at least twice.

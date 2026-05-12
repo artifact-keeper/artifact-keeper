@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The 5 generated SDKs (TypeScript, Kotlin, Swift, Rust, Python) will lose the `notifications` tag, the `NotificationsApiDoc` schemas, and the three notification request/response types on the next API sync; downstream consumers should pin to a pre-v1.2.0 API tag or migrate before bumping.
   - Operator-visible log message changed: `Notification dispatcher started` is now `Email dispatcher started`; update any log-based alerting that keyed on the prior string.
 
+## [1.1.10] - Upcoming
+
+### Operator Notice
+
+- **Dependency-Track `Automation` team API key rotation in `dtrack-init`** (#978, #1039) -- the `docker/init-dtrack.sh` init container rotates the `Automation` team API key whenever `/shared/dtrack-api-key` is empty (new PVC, fresh cluster, or a manual volume wipe). Rotation deletes every existing `publicId` attached to the `Automation` team before minting a new key. Operators must be aware of two consequences:
+
+  1. **Do not attach external integrations to the `Automation` team.** Any third-party tool (CI job, scanner, custom dashboard) configured with an API key that belongs to the `Automation` team will have that key revoked silently the next time the init container runs against an empty marker. Provision a dedicated DT team for external integrations and attach keys there. Only the bundled artifact-keeper backend should consume keys from the `Automation` team.
+
+  2. **After upgrade, check the DT UI for orphaned `Automation` keys.** During Kubernetes rollouts two init containers can race and create two keys, leaving one orphaned (still valid in DT until the next cold-start rotation deletes it). Operators with strict key-hygiene requirements should review the `Administration` -> `Teams` -> `Automation` -> `API Keys` panel after deploying and delete any unexpected entries. Orphaned keys are cleaned up automatically on the next cold start.
+
 ## [1.2.0] - 2026-04-24
 
 ## [1.1.6] - 2026-04-20

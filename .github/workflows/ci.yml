@@ -63,6 +63,19 @@ jobs:
           SQLX_OFFLINE: true
         run: cargo test --workspace --lib --verbose
 
+  shell-tests:
+    name: 🐚 Shell Tests
+    runs-on: ubuntu-latest
+    # Self-contained bash + python3 regression tests for docker/ init scripts.
+    # Runs in seconds and uses only the dependencies pre-installed on the
+    # ubuntu-latest image (bash, python3, jq, curl). Kept off the Rust
+    # critical path so it does not gate cargo jobs.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: dtrack-init regression test
+        run: bash docker/test-init-dtrack.sh
+
   coverage:
     name: 📊 Code Coverage
     runs-on: ak-ci-runners
@@ -604,7 +617,7 @@ jobs:
   ci-complete:
     name: ✅ CI Complete
     runs-on: ak-ci-runners
-    needs: [check-rust, test-backend-unit, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
+    needs: [check-rust, test-backend-unit, shell-tests, coverage, test-backend-integration, smoke-e2e, build-backend-image, build-openscap-image, security-audit]
     if: always()
     steps:
       - name: Check CI status
@@ -615,9 +628,10 @@ jobs:
           tier1_pass=true
 
           # Tier 1 jobs (required)
-          for job in check-rust test-backend-unit; do
+          for job in check-rust test-backend-unit shell-tests; do
             result="${{ needs.check-rust.result }}"
             [ "$job" = "test-backend-unit" ] && result="${{ needs.test-backend-unit.result }}"
+            [ "$job" = "shell-tests" ] && result="${{ needs.shell-tests.result }}"
             if [[ "$result" == "success" ]]; then
               echo "✅ $job" >> $GITHUB_STEP_SUMMARY
             else
