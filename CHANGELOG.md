@@ -33,15 +33,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The 5 generated SDKs (TypeScript, Kotlin, Swift, Rust, Python) will lose the `notifications` tag, the `NotificationsApiDoc` schemas, and the three notification request/response types on the next API sync; downstream consumers should pin to a pre-v1.2.0 API tag or migrate before bumping.
   - Operator-visible log message changed: `Notification dispatcher started` is now `Email dispatcher started`; update any log-based alerting that keyed on the prior string.
 
-## [1.1.10] - Upcoming
+## [1.1.10] - 2026-05-11
 
-### Operator Notice
+### Security
 
-- **Dependency-Track `Automation` team API key rotation in `dtrack-init`** (#978, #1039) -- the `docker/init-dtrack.sh` init container rotates the `Automation` team API key whenever `/shared/dtrack-api-key` is empty (new PVC, fresh cluster, or a manual volume wipe). Rotation deletes every existing `publicId` attached to the `Automation` team before minting a new key. Operators must be aware of two consequences:
+- **`dtrack-init` no longer silently revokes operator-attached `Automation` team keys** (#978, #1039, #1041) -- prior to this release, [`docker/init-dtrack.sh`](docker/init-dtrack.sh) deleted *every* `publicId` attached to the Dependency-Track `Automation` team on each cold start (empty `/shared/dtrack-api-key`). Any third-party integration (CI scanner, dashboard, webhook receiver) with a key on that team would have its credential revoked with no audit trail. The init container now records the `publicId` it minted in `/shared/.dtrack-publicid` (mode `0600`, atomically rewritten via `.tmp` + `rename`) and **refuses to rotate (exit 2)** when any foreign `publicId` is present on the team, naming each foreign key in stderr. Operators who want the previous unconditional-rotation behavior can set `DTRACK_INIT_FORCE_ROTATE=true`; the script then logs a `WARNING` listing every revoked `publicId` so the rotation is auditable.
 
-  1. **Do not attach external integrations to the `Automation` team.** Any third-party tool (CI job, scanner, custom dashboard) configured with an API key that belongs to the `Automation` team will have that key revoked silently the next time the init container runs against an empty marker. Provision a dedicated DT team for external integrations and attach keys there. Only the bundled artifact-keeper backend should consume keys from the `Automation` team.
+  **Discoverability:** a refusal exits the init container non-zero with the diagnostic on stderr, which surfaces as `Init:CrashLoopBackOff` on the pod and as a non-zero `restartCount` in standard Kubernetes alerting (Prometheus `kube_pod_container_status_restarts_total`). Operators who page on init-container failures will see this signal without reading the CHANGELOG.
 
-  2. **After upgrade, check the DT UI for orphaned `Automation` keys.** During Kubernetes rollouts two init containers can race and create two keys, leaving one orphaned (still valid in DT until the next cold-start rotation deletes it). Operators with strict key-hygiene requirements should review the `Administration` -> `Teams` -> `Automation` -> `API Keys` panel after deploying and delete any unexpected entries. Orphaned keys are cleaned up automatically on the next cold start.
+  **To audit your `Automation` team for foreign keys before upgrading**, run (substituting your DT URL and admin token):
+
+  ```sh
+  curl -sf -H "X-Api-Key: $DT_ADMIN_KEY" "$DT_URL/api/v1/team" \
+    | jq '.[] | select(.name=="Automation") | .apiKeys[] | {publicId, maskedKey}'
+  ```
+
+  Every `publicId` in that list other than the one recorded in your running pod's `/shared/.dtrack-publicid` (or, on first install of v1.1.10, every entry) is foreign and must be either removed via the DT UI (`Administration` -> `Teams` -> `Automation` -> `API Keys`) before upgrade or explicitly accepted via `DTRACK_INIT_FORCE_ROTATE=true`.
+
+  **Recommended long-term posture:** do not attach third-party integrations to the `Automation` team. Provision a separate DT team for external integrations; only the bundled artifact-keeper backend should consume keys from the `Automation` team.
+
+### Added
+
+- **CI: shell-tests are now a Tier 1 required check** (#1040) -- new `shell-tests` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `docker/test-init-dtrack.sh` on `ubuntu-latest` (capped at `timeout-minutes: 5`) and is aggregated into `ci-complete`. Self-contained — uses only `bash`, `python3`, `jq`, `curl` from the runner image; kept off the Rust critical path so cargo jobs are not blocked.
+
+### Changed
+
+- **`dtrack-init`: post-upgrade orphaned-key hygiene check** (#1039) -- during Kubernetes rollouts two init containers can race against the same `Automation` team and create two keys, leaving one orphaned (still a valid bearer credential against the DT API until the next cold-start rotation deletes it). The orphan window can be days or weeks in a stable cluster, and an orphan that leaks via a backup, screenshot, or log scrape remains a fully-valid key for that entire period. After every `helm upgrade`, review `Administration` -> `Teams` -> `Automation` -> `API Keys` in the DT UI and delete any entry whose `publicId` does not match the value recorded in the running pod's `/shared/.dtrack-publicid` (`kubectl exec <pod> -c <init-container> -- cat /shared/.dtrack-publicid`). A leader-election fix that closes the race in code is tracked as a follow-up and will land in a future release.
+
+- **Mock fidelity and assertion coverage in `docker/test-init-dtrack.sh`** (#1041) -- the regression-test mock now returns HTTP 200 on `POST /api/v1/team/{uuid}/key` to match the DT 4.11 swagger contract, and the assertion suite was expanded to cover (a) warm-start short-circuit log content (not just `POST` count), (b) foreign-key refusal and `DTRACK_INIT_FORCE_ROTATE` override paths, (c) an injected 5xx from `POST /key` to exercise the script's negative branch, and (d) absence of half-written `dtrack-api-key` / `.tmp` files after a failed run. The mock-fidelity change alone is **not** drift detection — the init script uses `curl -sf` which accepts any 2xx — but the new explicit response-code assertions in the negative-path test do detect drift in the failure direction.
 
 ## [1.2.0] - 2026-04-24
 

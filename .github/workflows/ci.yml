@@ -70,6 +70,10 @@ jobs:
     # Runs in seconds and uses only the dependencies pre-installed on the
     # ubuntu-latest image (bash, python3, jq, curl). Kept off the Rust
     # critical path so it does not gate cargo jobs.
+    # Cap wall-clock so a hung mock HTTP server (Python BaseHTTPRequestHandler
+    # blocking in serve_forever) cannot pin a Tier 1 required check for the
+    # 6h GitHub default. The whole script runs in well under a minute.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 

@@ -11,10 +11,16 @@
 # `POST /api/v1/team/<uuid>/key`. We must therefore *create* a fresh key
 # and capture the response, rather than try to read an existing one.
 #
-# Idempotence strategy: on each run we delete every existing key on the
-# Automation team (using `publicId` from the GET listing) and then POST a
-# new one. This keeps the team to a single active key across reruns and
-# prevents accumulation across helm upgrades.
+# Idempotence strategy: on each run we delete the publicId we previously
+# minted (recorded in PUBLIC_ID_MARKER) and then POST a new one. This keeps
+# the team to a single active key across reruns and prevents accumulation
+# across helm upgrades.
+#
+# Safety rail (#1041 follow-up): if any publicId is present on the team that
+# we did NOT mint (no marker, or marker mismatch), refuse to rotate and exit
+# non-zero. This prevents the silent revocation of operator-attached
+# integration keys. Set DTRACK_INIT_FORCE_ROTATE=true to acknowledge and
+# proceed (e.g. during a planned, documented rotation).
 set -e
 
 DT_URL="${DEPENDENCY_TRACK_URL:-http://dependency-track-apiserver:8080}"
@@ -24,6 +30,8 @@ DT_NEW_PASS="${DEPENDENCY_TRACK_ADMIN_PASSWORD:-ArtifactKeeper2026!}"
 DT_TEAM_NAME="Automation"
 API_KEY_FILE="/shared/dtrack-api-key"
 BOOTSTRAP_MARKER="/shared/.dtrack-bootstrapped"
+PUBLIC_ID_MARKER="/shared/.dtrack-publicid"
+FORCE_ROTATE="${DTRACK_INIT_FORCE_ROTATE:-false}"
 
 # Login against /api/v1/user/login. DT returns a bare JWT string body on
 # success and a body containing "FORCE_PASSWORD_CHANGE" when the default
@@ -103,13 +111,46 @@ if [ -z "$TEAM_UUID" ]; then
 fi
 echo "[dtrack-init] Found $DT_TEAM_NAME team: $TEAM_UUID"
 
-# Rotate: delete every pre-existing key on the Automation team. Each helm
-# upgrade that reaches this branch (i.e. shared volume is empty) starts
-# fresh, preventing key accumulation. DELETE returns 204 on success;
-# missing/already-gone keys are ignored.
+# Rotate: delete the publicId we previously minted (tracked in
+# PUBLIC_ID_MARKER), then POST a new one below.
+#
+# Safety rail: if the team has publicIds we did NOT mint, those may belong
+# to operator-attached integrations (CI scanners, dashboards, webhooks).
+# Silently revoking them would break those integrations with no audit
+# trail. Refuse and require explicit operator acknowledgment via
+# DTRACK_INIT_FORCE_ROTATE=true.
 EXISTING_PUBLIC_IDS=$(echo "$TEAM_JSON" | jq -r --arg name "$DT_TEAM_NAME" \
   '.[] | select(.name == $name) | .apiKeys[]?.publicId // empty')
+
+OUR_PUBLIC_ID=""
+if [ -s "$PUBLIC_ID_MARKER" ]; then
+  OUR_PUBLIC_ID=$(cat "$PUBLIC_ID_MARKER")
+fi
+
 if [ -n "$EXISTING_PUBLIC_IDS" ]; then
+  if [ -n "$OUR_PUBLIC_ID" ]; then
+    FOREIGN_PUBLIC_IDS=$(echo "$EXISTING_PUBLIC_IDS" | grep -Fxv -- "$OUR_PUBLIC_ID" || true)
+  else
+    FOREIGN_PUBLIC_IDS="$EXISTING_PUBLIC_IDS"
+  fi
+
+  if [ -n "$FOREIGN_PUBLIC_IDS" ] && [ "$FORCE_ROTATE" != "true" ]; then
+    echo "[dtrack-init] ERROR: refusing to rotate $DT_TEAM_NAME team — foreign API key(s) present:" >&2
+    echo "$FOREIGN_PUBLIC_IDS" | sed 's/^/[dtrack-init]   - publicId=/' >&2
+    echo "[dtrack-init] These keys were not minted by dtrack-init and may belong to" >&2
+    echo "[dtrack-init] external integrations. Silently revoking them would break those" >&2
+    echo "[dtrack-init] integrations with no audit trail." >&2
+    echo "[dtrack-init] To proceed, EITHER remove the foreign keys via the DT UI" >&2
+    echo "[dtrack-init] (Administration -> Teams -> $DT_TEAM_NAME -> API Keys)" >&2
+    echo "[dtrack-init] OR set DTRACK_INIT_FORCE_ROTATE=true to acknowledge revocation." >&2
+    exit 2
+  fi
+
+  if [ -n "$FOREIGN_PUBLIC_IDS" ]; then
+    echo "[dtrack-init] WARNING: DTRACK_INIT_FORCE_ROTATE=true — revoking foreign keys:" >&2
+    echo "$FOREIGN_PUBLIC_IDS" | sed 's/^/[dtrack-init]   - publicId=/' >&2
+  fi
+
   echo "[dtrack-init] Rotating existing $DT_TEAM_NAME API keys..."
   echo "$EXISTING_PUBLIC_IDS" | while IFS= read -r PUBLIC_ID; do
     [ -z "$PUBLIC_ID" ] && continue
@@ -135,6 +176,7 @@ if [ -z "$KEY_RESP" ]; then
 fi
 
 API_KEY=$(echo "$KEY_RESP" | jq -r '.key // empty')
+NEW_PUBLIC_ID=$(echo "$KEY_RESP" | jq -r '.publicId // empty')
 
 if [ -z "$API_KEY" ]; then
   # Do NOT log $KEY_RESP. If the schema ever moves .key (e.g. to .data.key)
@@ -144,6 +186,14 @@ if [ -z "$API_KEY" ]; then
   echo "[dtrack-init] Response length: ${#KEY_RESP} bytes" >&2
   RESP_KEYS=$(echo "$KEY_RESP" | jq -r 'keys // []' 2>/dev/null || echo '<not-json>')
   echo "[dtrack-init] Response top-level keys: $RESP_KEYS" >&2
+  exit 1
+fi
+
+if [ -z "$NEW_PUBLIC_ID" ]; then
+  # publicId is required to track ownership for the next rotation cycle.
+  # Without it we cannot distinguish our own key from a foreign key on
+  # subsequent runs and would refuse to rotate (refuse-by-default guard).
+  echo "[dtrack-init] ERROR: Could not extract .publicId from create-key response" >&2
   exit 1
 fi
 
@@ -164,6 +214,28 @@ TMP_KEY_FILE="$API_KEY_FILE.tmp"
 chmod 600 "$TMP_KEY_FILE"
 mv "$TMP_KEY_FILE" "$API_KEY_FILE"
 echo "[dtrack-init] API key written to $API_KEY_FILE (mode 0600)"
+
+# Record the publicId we just minted so the next rotation cycle can
+# distinguish our key from operator-attached foreign keys.
+#
+# Atomicity: write to .tmp + rename so a crash mid-write cannot leave an
+# empty or truncated marker — that would cause the next run to classify
+# our own key as foreign and refuse to rotate.
+#
+# Threat model: the marker is read at line ~127 (`cat $PUBLIC_ID_MARKER`)
+# and trusted as the answer to "which publicId did we mint?". Anyone with
+# write access to /shared can therefore spoof ownership and trick a future
+# rotation into silently revoking a foreign key. /shared is expected to
+# be exclusively writable by this init container's UID; we tighten the
+# marker to mode 0600 (umask 077 in the subshell) as defense-in-depth so
+# a co-tenant sidecar that gains read access cannot also clobber it.
+TMP_PUBLIC_ID_MARKER="$PUBLIC_ID_MARKER.tmp"
+(
+  umask 077
+  printf '%s' "$NEW_PUBLIC_ID" > "$TMP_PUBLIC_ID_MARKER"
+)
+chmod 600 "$TMP_PUBLIC_ID_MARKER"
+mv "$TMP_PUBLIC_ID_MARKER" "$PUBLIC_ID_MARKER"
 
 # Enable NVD API 2.0 mirroring (NIST retired legacy feeds; DTrack 4.10.0+ supports API 2.0)
 echo "[dtrack-init] Enabling NVD API 2.0 vulnerability source..."
