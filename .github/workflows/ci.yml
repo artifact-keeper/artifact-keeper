@@ -58,6 +58,31 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      # Catch migration-slot collisions before they reach the e2e/nightly job.
+      # The nightly run on 2026-05-09 (#1128) crashed at startup with
+      # `duplicate key value violates unique constraint "_sqlx_migrations_pkey"
+      # Key (version)=(73)` because a forward-port attempted to reuse a slot
+      # already taken on main. A cheap filename-prefix dedup catches the
+      # entire class of failures without needing a Postgres to apply them.
+      - name: Lint migration slots are unique
+        run: |
+          set -euo pipefail
+          # Glob-based to keep shellcheck (SC2010/SC2012) happy and handle
+          # filenames with spaces, though migrations follow `NNN_*.sql`.
+          slots=$(for f in backend/migrations/*.sql; do
+            basename "$f" | awk -F_ '{print $1}'
+          done)
+          dupes=$(echo "$slots" | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error::duplicate migration version slot(s): $dupes"
+            pattern=$(echo "$dupes" | paste -sd'|' -)
+            for f in backend/migrations/*.sql; do
+              name=$(basename "$f")
+              echo "$name" | grep -E "^(${pattern})_" || true
+            done
+            exit 1
+          fi
+
       - name: Run unit tests
         env:
           SQLX_OFFLINE: true
@@ -135,6 +160,13 @@ jobs:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
           RUSTC_WRAPPER: ""
+          # SSO credential encryption tests in auth_config_service rely on at
+          # least one of these env vars being set. They skip cleanly when
+          # unset (preserving local `cargo test` ergonomics), so we provide a
+          # deterministic value here to exercise the create/update/decrypt
+          # paths in coverage. The encryption_key panic-when-unset test
+          # explicitly skips when this is set.
+          JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
 
       - name: Coverage summary and gate
@@ -359,11 +391,43 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      # `-- --ignored` runs the postgres-backed integration suites under
+      # `backend/tests/` that were silently skipped before (#1031). The job
+      # provisions postgres but NOT a running HTTP backend, Meilisearch,
+      # Trivy, or live cloud credentials, so the suite list below is
+      # restricted to tests that need only a Postgres connection:
+      #
+      #   - lifecycle_policy_tests, api_token_cache_flush_tests,
+      #     search_reindex_tests, scan_convert_to_reused_tests,
+      #     virtual_members_atomicity_test, virtual_members_duplicate_test,
+      #     grpc_sbom_tests (in-process gRPC, no HTTP server).
+      #
+      # Deliberately excluded (would panic on first .expect() without
+      # extra infra, so `--ignored` stays the right gate):
+      #
+      #   - azure_rbac_live_test, azure_shared_key_live_test, s3_integration,
+      #     incus_upload_tests  (live cloud creds via std::env::var().expect)
+      #   - integration_tests, replication_integration,
+      #     tag_filtered_replication_tests, storage_backend_tests
+      #     (read TEST_BASE_URL, need a running HTTP backend)
+      #
+      # `--test-threads=1` because the DB-backed suites share schema state
+      # through global DELETEs in their cleanup helpers and would race under
+      # parallel execution.
       - name: Run integration tests
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           SQLX_OFFLINE: true
-        run: cargo test --workspace --test '*' --verbose
+        run: |
+          cargo test --workspace --verbose \
+            --test lifecycle_policy_tests \
+            --test api_token_cache_flush_tests \
+            --test grpc_sbom_tests \
+            --test search_reindex_tests \
+            --test scan_convert_to_reused_tests \
+            --test virtual_members_atomicity_test \
+            --test virtual_members_duplicate_test \
+            -- --ignored --test-threads=1
 
   # ════════════════════════════════════════════════════════════════════════════
   # SMOKE E2E (Every Push/PR) — self-contained via Docker-in-Docker on ARC

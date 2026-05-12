@@ -30,6 +30,29 @@ jobs:
             --build \
             --abort-on-container-exit
 
+      # Capture container logs and migration state when the suite fails so the
+      # auto-filed `Nightly E2E Tests Failed` issue (see Notify step below) can
+      # be triaged from the issue alone, without re-running the workflow.
+      # The 2026-05-09 failure (#1128) surfaced only the final exit code; the
+      # root-cause `_sqlx_migrations_pkey` violation took a deep log dive to
+      # find. Dumping the backend log and the migrations table on failure
+      # makes the same class of failure self-diagnosing next time.
+      - name: Dump failure diagnostics
+        if: failure()
+        run: |
+          echo "::group::backend container logs"
+          docker compose -f docker-compose.test.yml logs backend || true
+          echo "::endgroup::"
+          echo "::group::postgres container logs (last 200 lines)"
+          docker compose -f docker-compose.test.yml logs --tail=200 postgres || true
+          echo "::endgroup::"
+          echo "::group::_sqlx_migrations table"
+          docker compose -f docker-compose.test.yml exec -T postgres \
+            psql -U registry -d artifact_registry \
+            -c "SELECT version, description, success, execution_time FROM _sqlx_migrations ORDER BY version" \
+            || true
+          echo "::endgroup::"
+
       - name: Cleanup
         if: always()
         run: docker compose -f docker-compose.test.yml --profile smoke down -v --remove-orphans

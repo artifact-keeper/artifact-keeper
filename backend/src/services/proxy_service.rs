@@ -100,7 +100,39 @@ struct CacheMetadataTemplate {
 ///   The `http_client::base_client_builder()` read timeout caps the
 ///   total wait; operators with tight storage budgets should verify
 ///   that timeout matches their upstream's tolerance.
+/// * **HTTP/2 client flow-control window (#1184).** The 4 MiB tee cap
+///   bounds memory between upstream reader and storage writer, but
+///   on the *client* side hyper's HTTP/2 flow-control window adds
+///   another in-flight slice that is NOT part of this channel.
+///   With reqwest's current defaults this codebase does not call
+///   `http2_adaptive_window`, so the per-stream window is fixed at
+///   `SETTINGS_INITIAL_WINDOW_SIZE` (64 KiB). One in-flight frame
+///   bounded by `SETTINGS_MAX_FRAME_SIZE` (peer-advertised, default
+///   16 KiB, ceiling 16 MiB) sits on top of the window, so the
+///   per-stream HTTP/2 overhead is conservatively ~128 KiB under
+///   default tuning. Practical worst case under the documented
+///   1 GiB pod limit is ~10 concurrent slow HTTP/2 clients =
+///   ~1.3 MiB on top of the ~14 MiB per-request peak above, i.e.
+///   ~15 MiB total. Well within budget; operators sizing pod memory
+///   should still account for the per-stream window when calculating
+///   concurrency limits, not just `TEE_CHANNEL_DEPTH * chunk_size`.
+///   The OOM-relief contract holds because the flow-control window
+///   itself is bounded by hyper.
 const TEE_CHANNEL_DEPTH: usize = 64;
+
+/// Maximum bytes per chunk forwarded through the tee channel.
+///
+/// `TEE_CHANNEL_DEPTH * TEE_MAX_CHUNK_BYTES` is the hard upper bound on the
+/// memory held in the reader -> writer channel. Without splitting, an upstream
+/// that hands us a multi-megabyte frame (HTTP/1.1 chunked with a large
+/// `Transfer-Encoding` chunk, or an HTTP/2 peer that advertises a large
+/// `SETTINGS_MAX_FRAME_SIZE`) would let `64 * upstream_chunk` blow past the
+/// documented 4 MiB cap. Splitting at this boundary inside the tee makes the
+/// budget claim a property of the code, not a property of the upstream.
+///
+/// 64 KiB matches the conservative chunk size assumed by the 4 MiB / request
+/// docstring above. Smaller upstream chunks pass through unchanged.
+const TEE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Validate the upstream response status code for the streaming path.
 /// Extracted from [`ProxyService::read_upstream_response_streaming`] so
@@ -170,6 +202,14 @@ fn extract_streaming_headers(
 ///   drops, and the writer commits or aborts whatever it has buffered.
 ///   No leaked temp files (FilesystemBackend cleans up via the
 ///   `put_stream` error path).
+///
+/// Error categories (#1185):
+/// * Upstream stream errors observed mid-body are wrapped as
+///   [`AppError::BadGateway`] before being forwarded to the writer
+///   channel and surfaced to the client. This keeps operator log /
+///   metric buckets honest: a flaky mirror does not inflate the
+///   `STORAGE_ERROR` rate, and a genuine cache backend failure does
+///   not get hidden as `BAD_GATEWAY`.
 fn tee_upstream_to_cache(
     upstream: BoxStream<'static, Result<Bytes>>,
     storage: Arc<StorageService>,
@@ -201,9 +241,16 @@ fn tee_upstream_to_cache(
         match put_result {
             Ok(result) => {
                 let now = Utc::now();
+                // Pin the storage backend's ETag at write time so the
+                // fast path can re-HEAD on each hit and detect tampering
+                // / backend-side replacement (#1051). See [`pin_storage_etag`]
+                // for the best-effort semantics on backends without an
+                // ETag concept or on transport error.
+                let storage_etag = pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
                 let metadata = CacheMetadata {
                     cached_at: now,
                     upstream_etag: template.etag,
+                    storage_etag,
                     expires_at: now + chrono::Duration::seconds(template.ttl_secs),
                     content_type: template.content_type,
                     size_bytes: result.bytes_written as i64,
@@ -248,18 +295,45 @@ fn tee_upstream_to_cache(
     let tee_stream = async_stream::try_stream! {
         let mut upstream = upstream;
         while let Some(chunk_result) = upstream.next().await {
-            // Clone the result to feed both consumers (the chunk's
-            // inner Bytes is a cheap Arc-like clone).
-            let storage_msg = match &chunk_result {
-                Ok(bytes) => Ok(bytes.clone()),
-                Err(e) => Err(AppError::Storage(format!("upstream stream error: {}", e))),
-            };
-            // Best-effort send: if the writer is gone, drop the
-            // caching half. The client still gets the data.
-            if tx.send(storage_msg).await.is_err() {
-                // writer dropped its rx; stop trying to feed it
+            match chunk_result {
+                Ok(mut bytes) => {
+                    // #1184: cap the per-channel-message size so an upstream
+                    // that hands us a multi-megabyte chunk does not blow
+                    // past the documented `TEE_CHANNEL_DEPTH * 64 KiB`
+                    // memory budget. Splitting preserves byte order and the
+                    // total payload; the client sees the same bytes, just
+                    // in smaller pieces. `Bytes::split_to` is a cheap
+                    // reference-count adjustment, not a copy.
+                    while !bytes.is_empty() {
+                        let take = bytes.len().min(TEE_MAX_CHUNK_BYTES);
+                        let slice = bytes.split_to(take);
+                        // Best-effort send to the cache writer. If the
+                        // writer is gone (it already failed and dropped
+                        // its receiver), drop the caching half silently
+                        // and keep yielding to the client.
+                        let _ = tx.send(Ok(slice.clone())).await;
+                        yield slice;
+                    }
+                }
+                Err(e) => {
+                    // #1185: upstream stream errors are upstream/network
+                    // failures, not storage failures. Tagging them
+                    // `BadGateway` on the writer channel lets operators
+                    // bucket them correctly in logs / metrics (the
+                    // previous `Storage` tag hid upstream incidents inside
+                    // the storage error rate). The cache writer treats
+                    // any Err it observes as a reason to abandon the
+                    // cache regardless of category. The original error
+                    // surfaces to the client unchanged — handlers map it
+                    // to a 502 via `map_proxy_error` on the request path.
+                    let storage_msg = Err(AppError::BadGateway(format!(
+                        "upstream stream error: {}",
+                        e
+                    )));
+                    let _ = tx.send(storage_msg).await;
+                    Err(e)?;
+                }
             }
-            yield chunk_result?;
         }
         // upstream EOF: drop tx so the writer sees end-of-stream
         drop(tx);
@@ -274,6 +348,22 @@ pub struct CacheMetadata {
     pub cached_at: DateTime<Utc>,
     /// ETag from upstream (if available)
     pub upstream_etag: Option<String>,
+    /// ETag pinned from the storage backend at cache-write time. See
+    /// [`ProxyService::is_cache_fresh`] for the revalidation contract,
+    /// per-backend behavior, and the legacy-entry fall-through. `None`
+    /// means revalidation is skipped (filesystem backend or legacy
+    /// sidecar written before this field existed); `#[serde(default)]`
+    /// preserves wire-compat with pre-#1051 sidecars.
+    ///
+    /// Trust boundary: the pin lives in a JSON sidecar at the cache
+    /// metadata key with no integrity binding. An actor that can write
+    /// to the storage backend can rewrite both the body and the sidecar
+    /// in lockstep, defeating tamper detection. Treat this as a defense
+    /// against accidental upstream-vs-cache divergence, not against an
+    /// adversary with storage-write capability. A sidecar HMAC is the
+    /// natural hardening if that threat model becomes relevant.
+    #[serde(default)]
+    pub storage_etag: Option<String>,
     /// When the cache entry expires
     pub expires_at: DateTime<Utc>,
     /// Content type from upstream
@@ -297,6 +387,25 @@ struct RegistryTokenResponse {
     token: Option<String>,
     access_token: Option<String>,
     expires_in: Option<u64>,
+}
+
+/// Best-effort fetch of the backend's ETag for a freshly-written cache
+/// object, used by both the streaming-tee and buffered cache-write paths
+/// to pin [`CacheMetadata::storage_etag`] (#1051).
+///
+/// Returns `None` on either `Ok(None)` (backend has no ETag concept) or
+/// transport error; the caller then writes the sidecar without a pin and
+/// fast-path revalidation falls back to pre-#1051 existence-only
+/// semantics for that entry.
+async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
+    storage.head_etag(cache_key).await.unwrap_or_else(|e| {
+        tracing::debug!(
+            cache_key = %cache_key,
+            error = %e,
+            "head_etag after cache write failed; skipping fast-path revalidation pin"
+        );
+        None
+    })
 }
 
 /// Proxy service for fetching and caching artifacts from upstream repositories
@@ -382,21 +491,34 @@ impl ProxyService {
     ///
     /// The fast path that this probe gates (presigned redirect to the
     /// cached object) does **not** download the body and therefore cannot
-    /// recompute the SHA-256. It trusts the storage backend's own
-    /// integrity guarantees (S3/GCS/Azure object checksums, ETags,
-    /// versioning, etc.). Concretely:
+    /// recompute the SHA-256. As of #1051 it does, however, perform an
+    /// ETag-based revalidation: we pin the storage backend's ETag at
+    /// cache-write time into [`CacheMetadata::storage_etag`] and re-HEAD
+    /// on every fast-path hit. A mismatch (object replaced, tampered, or
+    /// restored from a different version) returns `false` here so the
+    /// caller drops into the slow path, which then recomputes the SHA-256
+    /// and self-heals the cache.
     ///
-    ///   * a SHA-mismatched cache entry served via a presigned URL will
-    ///     **not** be detected or healed until either (a) the next slow-path
-    ///     access of the same key, or (b) the cache TTL expires and the
-    ///     entry is refreshed from upstream;
-    ///   * this matches existing presign+redirect semantics elsewhere in
-    ///     the codebase — presigned URLs have always trusted the storage
-    ///     backend, the proxy cache is no different.
+    /// Per-backend behavior:
     ///
-    /// ETag-based revalidation on the fast path is a deliberate follow-up
-    /// (not implemented here) so the #1018 fix stays scoped to "do not
-    /// buffer the body".
+    ///   * **S3 / GCS / Azure**: ETag is the backend's per-object value.
+    ///     For S3 single-part PUTs this equals the MD5 of the body and
+    ///     gives cryptographic-grade replacement detection; for multipart
+    ///     uploads it is an opaque per-upload identifier that still
+    ///     changes on any rewrite. Both are sufficient for tamper
+    ///     detection in the cache-poisoning threat model.
+    ///   * **Filesystem**: no native ETag. `storage_etag` is `None` for
+    ///     these entries, revalidation is a no-op, and behavior matches
+    ///     pre-#1051 semantics — i.e. the local filesystem is the trust
+    ///     boundary.
+    ///   * **Legacy cache entries** written before #1051 have
+    ///     `storage_etag = None` via `#[serde(default)]`. They also skip
+    ///     revalidation; once the TTL expires and the entry is rewritten
+    ///     the new entry picks up an ETag.
+    ///
+    /// If the HEAD itself errors (transport failure mid-revalidation), we
+    /// treat the cache as not-fresh and fall through to the slow path
+    /// rather than silently serving a possibly-stale URL.
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
         // A path that fails validation cannot have produced a cache entry
         // we'd want to redirect to anyway: treat it as a miss so the caller
@@ -415,9 +537,46 @@ impl ProxyService {
         if Utc::now() > metadata.expires_at {
             return false;
         }
-        // exists() is a HEAD-equivalent on cloud backends and does not pull
-        // the object body into memory.
-        matches!(self.storage.exists(&cache_key).await, Ok(true))
+
+        // ETag-based integrity revalidation (#1051). Only meaningful when
+        // we have a pinned ETag from cache-write time AND the backend
+        // surfaces an ETag now. Either side being `None` falls back to
+        // pre-#1051 behavior (existence check only): filesystem entries
+        // and legacy sidecars are unaffected.
+        match metadata.storage_etag {
+            Some(ref pinned) => match self.storage.head_etag(&cache_key).await {
+                Ok(Some(current)) => {
+                    if current != *pinned {
+                        tracing::warn!(
+                            cache_key = %cache_key,
+                            pinned_etag = %pinned,
+                            current_etag = %current,
+                            "proxy cache ETag mismatch on fast-path revalidation; falling back to slow path"
+                        );
+                        return false;
+                    }
+                    // ETag matched → object is present and unchanged
+                    // since cache write. Skip the redundant exists() call.
+                    true
+                }
+                // Backend lost the object (None) or errored: treat as
+                // not-fresh. The slow path will re-fetch and re-cache.
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        cache_key = %cache_key,
+                        error = %e,
+                        "proxy cache head_etag failed during revalidation; treating as not fresh"
+                    );
+                    false
+                }
+            },
+            None => {
+                // No pinned ETag (filesystem / legacy entry). Preserve
+                // pre-#1051 semantics: existence check only.
+                matches!(self.storage.exists(&cache_key).await, Ok(true))
+            }
+        }
     }
 
     /// Fetch artifact from upstream, but use `cache_path` instead of
@@ -1304,19 +1463,28 @@ impl ProxyService {
         // Calculate checksum
         let checksum = StorageService::calculate_hash(content);
 
+        // Store content first so we can read the backend's ETag back for
+        // the integrity-revalidation pin (#1051).
+        self.storage.put(cache_key, content.clone()).await?;
+
+        // Best-effort: capture the backend's ETag right after the PUT so
+        // the fast path can re-HEAD on each hit and reject tampered or
+        // replaced objects. See [`pin_storage_etag`] for the failure
+        // semantics; a failure here only disables revalidation for this
+        // entry, the cache write itself still succeeds.
+        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
+
         // Create metadata
         let now = Utc::now();
         let metadata = CacheMetadata {
             cached_at: now,
             upstream_etag: etag,
+            storage_etag,
             expires_at: now + chrono::Duration::seconds(ttl_secs),
             content_type,
             size_bytes: content.len() as i64,
             checksum_sha256: checksum.clone(),
         };
-
-        // Store content
-        self.storage.put(cache_key, content.clone()).await?;
 
         // Store metadata
         let metadata_json = serde_json::to_vec(&metadata)?;
@@ -2075,6 +2243,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: Utc::now(),
             upstream_etag: Some("\"abc123\"".to_string()),
+            storage_etag: None,
             expires_at: Utc::now() + chrono::Duration::hours(24),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 1024,
@@ -2095,6 +2264,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: now,
             upstream_etag: None,
+            storage_etag: None,
             expires_at: now + chrono::Duration::seconds(3600),
             content_type: None,
             size_bytes: 0,
@@ -2116,6 +2286,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: now,
             upstream_etag: Some("\"etag-value\"".to_string()),
+            storage_etag: Some("\"storage-etag\"".to_string()),
             expires_at: expires,
             content_type: Some("application/json".to_string()),
             size_bytes: 4096,
@@ -2134,6 +2305,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: Utc::now(),
             upstream_etag: None,
+            storage_etag: None,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: i64::MAX,
@@ -2173,6 +2345,7 @@ mod tests {
         let expired_metadata = CacheMetadata {
             cached_at: now - chrono::Duration::hours(25),
             upstream_etag: None,
+            storage_etag: None,
             expires_at: now - chrono::Duration::hours(1),
             content_type: None,
             size_bytes: 100,
@@ -2187,6 +2360,7 @@ mod tests {
         let valid_metadata = CacheMetadata {
             cached_at: now,
             upstream_etag: None,
+            storage_etag: None,
             expires_at: now + chrono::Duration::hours(23),
             content_type: None,
             size_bytes: 100,
@@ -2364,6 +2538,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: now - chrono::Duration::hours(25),
             upstream_etag: Some("\"old-etag\"".to_string()),
+            storage_etag: None,
             expires_at: now - chrono::Duration::hours(1),
             content_type: Some("application/java-archive".to_string()),
             size_bytes: 2048,
@@ -2384,6 +2559,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: now,
             upstream_etag: None,
+            storage_etag: None,
             expires_at: now + chrono::Duration::hours(23),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 512,
@@ -2400,6 +2576,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: now - chrono::Duration::seconds(DEFAULT_CACHE_TTL_SECS + 1),
             upstream_etag: None,
+            storage_etag: None,
             expires_at: now - chrono::Duration::seconds(1),
             content_type: Some("application/gzip".to_string()),
             size_bytes: 4096,
@@ -2872,20 +3049,56 @@ mod tests {
     ///   * `metadata` is the JSON bytes returned by `get(metadata_key)`,
     ///     or `None` to simulate a missing sidecar (`AppError::NotFound`).
     ///   * `content_exists` is what `exists(content_key)` returns.
+    ///   * `head_etag_value` is what `head_etag(content_key)` returns;
+    ///     `Some(Ok(...))` returns the inner result, `None` returns
+    ///     `Ok(None)`. Used by #1051 revalidation tests to drive
+    ///     match / mismatch / error / missing paths.
     ///   * `get_calls` records every `get(...)` call so tests can assert
     ///     the body was never downloaded.
+    ///   * `exists_calls` / `head_etag_calls` let revalidation tests
+    ///     verify that the ETag fast-path short-circuits the redundant
+    ///     `exists()` call.
     struct CacheFreshMock {
         metadata: Option<Bytes>,
         content_exists: bool,
+        head_etag_value: HeadEtagBehavior,
         get_calls: AtomicUsize,
+        exists_calls: AtomicUsize,
+        head_etag_calls: AtomicUsize,
+    }
+
+    /// What the mock's `head_etag` should return per call. Variant
+    /// names deliberately avoid `None` / `Some` / `Err` so callsite
+    /// literals don't visually collide with the `Option`/`Result` the
+    /// trait method returns.
+    enum HeadEtagBehavior {
+        /// Return `Ok(None)`. Models backends that do not surface ETags
+        /// (filesystem) or objects without one.
+        Absent,
+        /// Return `Ok(Some(value))`. Models S3/GCS/Azure happy path.
+        Present(String),
+        /// Return `Err(AppError::Storage(...))`. Models a transport
+        /// failure during revalidation.
+        Failed,
     }
 
     impl CacheFreshMock {
         fn new(metadata: Option<Bytes>, content_exists: bool) -> Self {
+            Self::with_head_etag(metadata, content_exists, HeadEtagBehavior::Absent)
+        }
+
+        fn with_head_etag(
+            metadata: Option<Bytes>,
+            content_exists: bool,
+            head_etag_value: HeadEtagBehavior,
+        ) -> Self {
             Self {
                 metadata,
                 content_exists,
+                head_etag_value,
                 get_calls: AtomicUsize::new(0),
+                exists_calls: AtomicUsize::new(0),
+                head_etag_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -2910,11 +3123,22 @@ mod tests {
             }
         }
         async fn exists(&self, key: &str) -> Result<bool> {
+            self.exists_calls.fetch_add(1, AtomicOrdering::SeqCst);
             if key.ends_with("__content__") {
                 Ok(self.content_exists)
             } else {
                 // Metadata sidecar exists iff metadata bytes are present.
                 Ok(self.metadata.is_some())
+            }
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            self.head_etag_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            match &self.head_etag_value {
+                HeadEtagBehavior::Absent => Ok(None),
+                HeadEtagBehavior::Present(v) => Ok(Some(v.clone())),
+                HeadEtagBehavior::Failed => {
+                    Err(AppError::Storage("mock head_etag failure".to_string()))
+                }
             }
         }
         async fn delete(&self, _key: &str) -> Result<()> {
@@ -2943,9 +3167,18 @@ mod tests {
     }
 
     fn fresh_metadata_bytes() -> Bytes {
+        fresh_metadata_bytes_with_storage_etag(None)
+    }
+
+    /// Build a fresh metadata sidecar with the supplied pinned storage
+    /// ETag. Used by #1051 revalidation tests to wire a known pin into
+    /// `is_cache_fresh` and then assert the matching / mismatching
+    /// behavior on the storage HEAD.
+    fn fresh_metadata_bytes_with_storage_etag(storage_etag: Option<String>) -> Bytes {
         let metadata = CacheMetadata {
             cached_at: Utc::now(),
             upstream_etag: None,
+            storage_etag,
             expires_at: Utc::now() + chrono::Duration::hours(1),
             content_type: Some("application/octet-stream".to_string()),
             size_bytes: 42,
@@ -2958,6 +3191,7 @@ mod tests {
         let metadata = CacheMetadata {
             cached_at: Utc::now() - chrono::Duration::hours(2),
             upstream_etag: None,
+            storage_etag: None,
             expires_at: Utc::now() - chrono::Duration::seconds(1),
             content_type: None,
             size_bytes: 0,
@@ -3033,6 +3267,205 @@ mod tests {
             1,
             "is_cache_fresh must read metadata exactly once and never the body"
         );
+    }
+
+    // =======================================================================
+    // ETag fast-path revalidation tests (#1051)
+    //
+    // The fast path pins the storage backend's ETag at cache-write time into
+    // `CacheMetadata::storage_etag`. On each hit the freshness probe must
+    // re-HEAD the object and:
+    //   * match               -> true  (object unchanged since cache write)
+    //   * mismatch            -> false (replaced/tampered; slow-path heals)
+    //   * head_etag = None    -> false (object lost since write)
+    //   * head_etag = Err     -> false (revalidation failed; fail closed)
+    //   * legacy (no pin)     -> existence-only behavior (pre-#1051 entries)
+    // The matched-ETag path must also skip the redundant `exists()` call.
+    // =======================================================================
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_true_when_storage_etag_matches_pin() {
+        // Metadata pins a known storage ETag; backend reports the same
+        // value on HEAD. Revalidation must pass and short-circuit the
+        // redundant exists() probe.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"deadbeef\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"deadbeef\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "matching storage ETag must yield is_cache_fresh=true"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "revalidation must HEAD the cached object exactly once"
+        );
+        assert_eq!(
+            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "matched-ETag path must skip the redundant exists() call"
+        );
+        assert_eq!(
+            mock.get_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "revalidation must still never download the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_storage_etag_mismatches_pin() {
+        // The object was rewritten (or tampered with) between cache write
+        // and this read. ETag mismatch must force the slow path.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"pinned\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Present("\"different\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "mismatched storage ETag must yield is_cache_fresh=false"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "mismatch path still only HEADs once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_storage_etag_pin_lost() {
+        // We pinned an ETag at write time but the backend now returns
+        // None for HEAD (object missing or stripped). Treat as not-fresh
+        // — the slow path will re-fetch and rewrite the cache.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"pinned\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Absent,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "lost storage ETag with active pin must yield is_cache_fresh=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_false_when_head_etag_errors() {
+        // Backend transport error on the revalidation HEAD: fail closed.
+        // Better to slow-path than to silently serve a possibly-stale URL.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(Some(
+                "\"pinned\"".to_string(),
+            ))),
+            /* content_exists = */ true,
+            HeadEtagBehavior::Failed,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "head_etag transport error must yield is_cache_fresh=false (fail closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_legacy_entry_falls_back_to_exists_check() {
+        // Cache entry written before #1051: `storage_etag = None`. Must
+        // preserve pre-#1051 behavior — existence check only, no HEAD for
+        // ETag — so legacy caches keep working without rewrite.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(None)),
+            /* content_exists = */ true,
+            // Even if backend would surface an ETag, the absence of a pin
+            // means revalidation is skipped entirely.
+            HeadEtagBehavior::Present("\"would-be-current\"".to_string()),
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            fresh,
+            "legacy entry without storage_etag pin must still yield true on existence"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "legacy path must not waste a HEAD when no pin is available"
+        );
+        assert_eq!(
+            mock.exists_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "legacy path must fall back to a single exists() probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_cache_fresh_legacy_entry_false_when_content_missing() {
+        // Legacy entry (no pin) plus a missing content object: existence
+        // check returns false, fast path correctly declines to redirect.
+        let mock = Arc::new(CacheFreshMock::with_head_etag(
+            Some(fresh_metadata_bytes_with_storage_etag(None)),
+            /* content_exists = */ false,
+            HeadEtagBehavior::Absent,
+        ));
+        let service = build_proxy_service_with_storage(mock.clone());
+
+        let fresh = service.is_cache_fresh("npm-proxy", "lodash").await;
+
+        assert!(
+            !fresh,
+            "legacy entry with missing content must still yield false"
+        );
+        assert_eq!(
+            mock.head_etag_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "no pin -> no revalidation HEAD"
+        );
+    }
+
+    #[test]
+    fn test_cache_metadata_legacy_sidecar_deserializes_without_storage_etag() {
+        // Sidecars written before #1051 do not include `storage_etag`.
+        // The new field must use `#[serde(default)]` so old JSON parses
+        // cleanly; otherwise the cache breaks for every existing entry on
+        // upgrade.
+        let legacy_json = r#"{
+            "cached_at": "2026-01-01T00:00:00Z",
+            "upstream_etag": "\"upstream-abc\"",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "content_type": "application/octet-stream",
+            "size_bytes": 1234,
+            "checksum_sha256": "abcd"
+        }"#;
+        let parsed: CacheMetadata = serde_json::from_str(legacy_json)
+            .expect("legacy sidecar without storage_etag must still deserialize");
+        assert!(
+            parsed.storage_etag.is_none(),
+            "legacy sidecar must default storage_etag to None"
+        );
+        assert_eq!(parsed.upstream_etag.as_deref(), Some("\"upstream-abc\""));
     }
 
     // -----------------------------------------------------------------------
@@ -3377,6 +3810,125 @@ mod tests {
         );
     }
 
+    /// Recording backend that surfaces a configurable `head_etag` so we
+    /// can prove the tee writer pins the backend's ETag (#1051) into
+    /// `CacheMetadata::storage_etag` right after `put_stream`.
+    struct TeeEtagBackend {
+        inner: tokio::sync::Mutex<Vec<(String, Bytes)>>,
+        etag: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceStorageBackend for TeeEtagBackend {
+        async fn put(&self, key: &str, content: Bytes) -> Result<()> {
+            self.inner.lock().await.push((key.to_string(), content));
+            Ok(())
+        }
+        async fn get(&self, _key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound("n/a".into()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
+            Ok(self.etag.clone())
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _p: Option<&str>) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn copy(&self, _s: &str, _d: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _k: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn put_stream(
+            &self,
+            _key: &str,
+            stream: ServiceBoxStream<'static, Result<Bytes>>,
+        ) -> Result<ServicePutStreamResult> {
+            use futures::StreamExt;
+            let mut hasher = Sha256::new();
+            let mut total: u64 = 0;
+            tokio::pin!(stream);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                total += chunk.len() as u64;
+            }
+            Ok(ServicePutStreamResult {
+                checksum_sha256: format!("{:x}", hasher.finalize()),
+                bytes_written: total,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tee_writer_pins_storage_etag_when_backend_surfaces_one() {
+        // When the backend reports an ETag after the streaming put, the
+        // tee writer must persist it into `CacheMetadata::storage_etag`
+        // so the next fast-path read can revalidate against it (#1051).
+        let backend = Arc::new(TeeEtagBackend {
+            inner: tokio::sync::Mutex::new(Vec::new()),
+            etag: Some("\"after-put-etag\"".to_string()),
+        });
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"payload"]);
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+        while client.next().await.is_some() {}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let writes = backend.inner.lock().await;
+        let (_, json) = writes.last().expect("metadata sidecar must be written");
+        let metadata: CacheMetadata = serde_json::from_slice(json).unwrap();
+        assert_eq!(
+            metadata.storage_etag.as_deref(),
+            Some("\"after-put-etag\""),
+            "tee writer must pin the backend's post-put ETag for fast-path revalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tee_writer_leaves_storage_etag_none_when_backend_has_no_etag() {
+        // Filesystem-style backends return `Ok(None)` from `head_etag`.
+        // The writer must accept that and leave `storage_etag = None` so
+        // the fast path falls back to the existence-only legacy semantics.
+        let backend = Arc::new(TeeEtagBackend {
+            inner: tokio::sync::Mutex::new(Vec::new()),
+            etag: None,
+        });
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"payload"]);
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+        while client.next().await.is_some() {}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let writes = backend.inner.lock().await;
+        let (_, json) = writes.last().expect("metadata sidecar must be written");
+        let metadata: CacheMetadata = serde_json::from_slice(json).unwrap();
+        assert!(
+            metadata.storage_etag.is_none(),
+            "no backend ETag means no pin, preserving pre-#1051 fast-path semantics"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // validate_upstream_status: pure status-classification logic
     // extracted from read_upstream_response_streaming so the truth
@@ -3535,5 +4087,232 @@ mod tests {
         assert_eq!(writes.len(), 1);
         let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
         assert_eq!(metadata.size_bytes as u64, total_expected);
+    }
+
+    /// #1185 regression (client side): on upstream error mid-body the
+    /// tee MUST (a) surface the *original* error to the client (the
+    /// BadGateway re-tag is only on the writer-channel side; the
+    /// handler maps the client-side error to a 502 via
+    /// `map_proxy_error`) and (b) NOT promote partial bytes to a
+    /// cache hit. The category assertion lives in
+    /// [`test_tee_writer_sees_bad_gateway_category_on_upstream_error`];
+    /// keeping the two concerns in separate tests makes a future
+    /// regression bisectable.
+    #[tokio::test]
+    async fn test_tee_upstream_error_surfaces_original_error_and_blocks_caching() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        // Inject an upstream error directly (simulates a `reqwest`
+        // bytes_stream yielding `Err` mid-body).
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"ok-prefix")),
+            Err(AppError::Internal("simulated upstream reset".to_string())),
+        ]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        // First chunk OK.
+        let first = client.next().await.expect("first chunk").expect("ok");
+        assert_eq!(first.as_ref(), b"ok-prefix");
+
+        // Second poll yields the *original* upstream error variant
+        // unchanged. We assert the variant explicitly so a future
+        // refactor that silently re-tags the client-side error
+        // (which would change handler error mapping) trips this test.
+        match client.next().await {
+            Some(Err(AppError::Internal(_))) => {}
+            other => panic!(
+                "expected upstream `AppError::Internal` to surface to \
+                 client unchanged; got {:?}",
+                other
+            ),
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "upstream error MUST NOT promote partial bytes to a cache hit"
+        );
+    }
+
+    /// #1185 regression: the BadGateway wrapping is observable on the
+    /// writer channel side. We assert by recording the put_stream
+    /// chunks; on upstream error the writer sees `Err(BadGateway(_))`
+    /// not `Err(Storage(_))`, so `put_stream` returns Err and the
+    /// metadata-sidecar branch is skipped.
+    ///
+    /// This complements the client-facing test above by pinning the
+    /// behaviour on the storage-writer side of the tee.
+    #[tokio::test]
+    async fn test_tee_writer_sees_bad_gateway_category_on_upstream_error() {
+        /// Recording backend that captures the FIRST error category it
+        /// sees on the put_stream input. Used to assert the tee's
+        /// error wrapping reaches the writer task with the right tag.
+        struct CategoryRecordingBackend {
+            seen_error: tokio::sync::Mutex<Option<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ServiceStorageBackend for CategoryRecordingBackend {
+            async fn put(&self, _: &str, _: Bytes) -> Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _: &str) -> Result<Bytes> {
+                Err(AppError::NotFound("n/a".into()))
+            }
+            async fn exists(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn list(&self, _: Option<&str>) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn copy(&self, _: &str, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn size(&self, _: &str) -> Result<u64> {
+                Ok(0)
+            }
+            async fn put_stream(
+                &self,
+                _: &str,
+                stream: ServiceBoxStream<'static, Result<Bytes>>,
+            ) -> Result<ServicePutStreamResult> {
+                use futures::StreamExt;
+                tokio::pin!(stream);
+                while let Some(chunk) = stream.next().await {
+                    if let Err(e) = chunk {
+                        // Variant name is stable across the codebase.
+                        let tag = match &e {
+                            AppError::BadGateway(_) => "BadGateway",
+                            AppError::Storage(_) => "Storage",
+                            AppError::Internal(_) => "Internal",
+                            other => {
+                                let s = format!("{:?}", other);
+                                Box::leak(s.into_boxed_str()) as &'static str
+                            }
+                        };
+                        *self.seen_error.lock().await = Some(tag.to_string());
+                        return Err(e);
+                    }
+                }
+                Ok(ServicePutStreamResult {
+                    checksum_sha256: String::new(),
+                    bytes_written: 0,
+                })
+            }
+        }
+
+        let backend = Arc::new(CategoryRecordingBackend {
+            seen_error: tokio::sync::Mutex::new(None),
+        });
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"prefix")),
+            Err(AppError::Internal("upstream reset".to_string())),
+        ]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+        while client.next().await.is_some() {}
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let seen = backend.seen_error.lock().await.clone();
+        assert_eq!(
+            seen.as_deref(),
+            Some("BadGateway"),
+            "tee MUST wrap upstream errors as BadGateway before forwarding \
+             to the writer channel; got {:?}",
+            seen
+        );
+    }
+
+    /// #1184 regression: pin the TEE_CHANNEL_DEPTH constant so a
+    /// future "let's just raise the buffer" change must come with a
+    /// fresh OOM-budget review. Bumping the cap silently would
+    /// invalidate the documented worst-case calculation.
+    #[test]
+    fn test_tee_channel_depth_pinned_for_oom_budget() {
+        assert_eq!(
+            TEE_CHANNEL_DEPTH, 64,
+            "TEE_CHANNEL_DEPTH is part of the per-request OOM budget; \
+             see the const's docstring for the full calculation and \
+             #1184 for the HTTP/2 flow-control overhead. Update the \
+             docstring before changing this value."
+        );
+        assert_eq!(
+            TEE_MAX_CHUNK_BYTES,
+            64 * 1024,
+            "TEE_MAX_CHUNK_BYTES * TEE_CHANNEL_DEPTH bounds the per-request \
+             tee memory; changing it changes the OOM budget. Update the \
+             docstring before changing this value."
+        );
+    }
+
+    /// #1184 regression: an upstream chunk larger than `TEE_MAX_CHUNK_BYTES`
+    /// MUST be split before being forwarded to the cache writer, so the
+    /// `TEE_CHANNEL_DEPTH * TEE_MAX_CHUNK_BYTES` memory bound holds
+    /// regardless of upstream framing. The client must still observe the
+    /// same total bytes in order.
+    #[tokio::test]
+    async fn test_tee_splits_oversize_upstream_chunks_to_cap_memory() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        // Upstream hands us a single 200 KiB chunk. With a 64 KiB cap that
+        // must surface to the client as four pieces (64 + 64 + 64 + 8 KiB).
+        let big = Bytes::from(vec![0xABu8; 200 * 1024]);
+        let upstream: BoxStream<'static, Result<Bytes>> =
+            Box::pin(futures::stream::iter(vec![Ok(big.clone())]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        let mut pieces: Vec<Bytes> = Vec::new();
+        while let Some(item) = client.next().await {
+            pieces.push(item.expect("ok chunk"));
+        }
+        assert_eq!(
+            pieces.len(),
+            4,
+            "200 KiB / 64 KiB cap => 4 client pieces, got {}",
+            pieces.len()
+        );
+        for (i, p) in pieces.iter().enumerate() {
+            let expected = if i < 3 {
+                64 * 1024
+            } else {
+                200 * 1024 - 3 * 64 * 1024
+            };
+            assert_eq!(
+                p.len(),
+                expected,
+                "piece {} length: got {}, expected {}",
+                i,
+                p.len(),
+                expected
+            );
+        }
+        let total: usize = pieces.iter().map(|p| p.len()).sum();
+        assert_eq!(total, big.len(), "client must receive every byte");
     }
 }

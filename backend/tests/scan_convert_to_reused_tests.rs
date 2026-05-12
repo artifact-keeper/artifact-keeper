@@ -68,7 +68,8 @@ async fn insert_artifact(pool: &PgPool, repo_id: Uuid, name: &str) -> Uuid {
 }
 
 /// Insert a completed source scan with a known set of findings to be copied.
-/// Returns the source scan_result id.
+/// Returns the source scan_result id. The source row records a known
+/// `scanner_version` so the #1019 propagation test can assert on it.
 async fn insert_source_scan_with_findings(
     pool: &PgPool,
     artifact_id: Uuid,
@@ -83,9 +84,10 @@ async fn insert_source_scan_with_findings(
         INSERT INTO scan_results (
             id, artifact_id, repository_id, scan_type, status,
             findings_count, critical_count, high_count, medium_count, low_count, info_count,
-            started_at, completed_at
+            scanner_version, started_at, completed_at
         )
-        VALUES ($1, $2, $3, 'dependency', 'completed', $4, $5, $6, 0, 0, 0, NOW(), NOW())
+        VALUES ($1, $2, $3, 'dependency', 'completed', $4, $5, $6, 0, 0, 0,
+                'trivy-0.50.0', NOW(), NOW())
         "#,
     )
     .bind(scan_id)
@@ -233,6 +235,15 @@ async fn test_convert_to_reused_happy_path_updates_target_and_copies_findings() 
     assert_eq!(returned.critical_count, 2);
     assert_eq!(returned.high_count, 1);
 
+    // #1019: scanner_version must be propagated from the source row, not left
+    // at the placeholder's NULL. Without the fix this assertion fails because
+    // the UPDATE never touched scanner_version.
+    assert_eq!(
+        returned.scanner_version.as_deref(),
+        Some("trivy-0.50.0"),
+        "convert_to_reused must propagate scanner_version from the source scan"
+    );
+
     // The findings table got 3 rows attributed to the target id (one row per
     // source finding, owned by the target artifact).
     assert_eq!(
@@ -297,6 +308,73 @@ async fn test_convert_to_reused_second_call_is_no_op_no_duplicate_findings() {
         count_findings_for(&pool, target_scan_id).await,
         4,
         "second convert_to_reused must not duplicate findings on the target"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+// ---------------------------------------------------------------------------
+// #1019: scanner_version propagation
+// ---------------------------------------------------------------------------
+
+/// Regression: prior to #1019, `convert_to_reused`'s UPDATE did not include
+/// `scanner_version` in its SET clause, so the row was left holding the
+/// placeholder's NULL even though dedup had copied counts and findings from a
+/// scan that recorded a concrete scanner version. This contradicted #1006's
+/// "every newly-completed scan has scanner_version set" invariant and broke
+/// migration 075's `IS NULL` legacy heuristic.
+#[tokio::test]
+#[ignore] // Requires database
+async fn test_convert_to_reused_propagates_scanner_version_from_source() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool).await;
+    let source_artifact = insert_artifact(&pool, repo_id, "source.tgz").await;
+    let target_artifact = insert_artifact(&pool, repo_id, "target.tgz").await;
+
+    // The source row is inserted with scanner_version='trivy-0.50.0' by the
+    // shared fixture. The target row starts with scanner_version=NULL.
+    let source_scan_id =
+        insert_source_scan_with_findings(&pool, source_artifact, repo_id, 1, 1, 0).await;
+    let target_scan_id = insert_running_target(&pool, target_artifact, repo_id).await;
+
+    let pre: (Option<String>,) =
+        sqlx::query_as("SELECT scanner_version FROM scan_results WHERE id = $1")
+            .bind(target_scan_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read target pre-convert");
+    assert!(
+        pre.0.is_none(),
+        "target's scanner_version must start as NULL (placeholder state)"
+    );
+
+    let svc = ScanResultService::new(pool.clone());
+    let returned = svc
+        .convert_to_reused(target_scan_id, source_scan_id, target_artifact)
+        .await
+        .expect("convert_to_reused");
+
+    assert_eq!(
+        returned.scanner_version.as_deref(),
+        Some("trivy-0.50.0"),
+        "returned row must reflect propagated scanner_version"
+    );
+
+    // Confirm the persisted row matches the returned row (no in-memory-only
+    // fixup).
+    let after: (Option<String>,) =
+        sqlx::query_as("SELECT scanner_version FROM scan_results WHERE id = $1")
+            .bind(target_scan_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read target post-convert");
+    assert_eq!(
+        after.0.as_deref(),
+        Some("trivy-0.50.0"),
+        "scanner_version must be persisted, not just returned"
     );
 
     cleanup(&pool, repo_id).await;

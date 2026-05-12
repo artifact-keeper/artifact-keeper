@@ -397,6 +397,20 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         ))
     };
 
+    // One-shot backfill of oci_manifest_refs for index manifests that
+    // pre-date migration 092 (artifact-keeper#1179). Runs after the
+    // storage registry is wired up because it needs the registry to read
+    // the parent manifest bodies from per-repo backends. Failures are
+    // logged but do not block startup. On a fresh database or after the
+    // first successful run, the candidate query returns zero rows and
+    // this is a near-instant no-op.
+    let _refs_backfill_stats =
+        artifact_keeper_backend::services::oci_manifest_refs_backfill::run_backfill(
+            &db_pool,
+            storage_registry.clone(),
+        )
+        .await;
+
     // Initialize security scanner service
     let advisory_client = Arc::new(AdvisoryClient::new(std::env::var("GITHUB_TOKEN").ok()));
     let scan_result_service = Arc::new(ScanResultService::new(db_pool.clone()));
@@ -1062,6 +1076,8 @@ fn build_oidc_request_from_values(
         attribute_mapping: Some(serde_json::Value::Object(attr_map)),
         is_enabled: Some(true),
         auto_create_users: Some(true),
+        pkce_enabled: None,
+        map_groups_to_groups: None,
     })
 }
 

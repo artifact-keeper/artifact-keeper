@@ -867,6 +867,8 @@ mod tests {
             attribute_mapping: json!({"email": "email"}),
             is_enabled: true,
             auto_create_users: false,
+            pkce_enabled: true,
+            map_groups_to_groups: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -876,6 +878,35 @@ mod tests {
         assert_eq!(json["scopes"].as_array().unwrap().len(), 2);
         assert!(json["is_enabled"].as_bool().unwrap());
         assert!(!json["auto_create_users"].as_bool().unwrap());
+        assert!(json["pkce_enabled"].as_bool().unwrap());
+        assert!(!json["map_groups_to_groups"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_update_oidc_request_pkce_and_group_mapping_fields() {
+        let json = json!({
+            "pkce_enabled": false,
+            "map_groups_to_groups": true,
+            "attribute_mapping_replace": true,
+        });
+        let req: UpdateOidcConfigRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.pkce_enabled, Some(false));
+        assert_eq!(req.map_groups_to_groups, Some(true));
+        assert_eq!(req.attribute_mapping_replace, Some(true));
+    }
+
+    #[test]
+    fn test_create_oidc_request_pkce_default_unset() {
+        let json = json!({
+            "name": "Okta",
+            "issuer_url": "https://example.okta.com",
+            "client_id": "c",
+            "client_secret": "s"
+        });
+        let req: CreateOidcConfigRequest = serde_json::from_value(json).unwrap();
+        // Default is None at the wire layer; the service applies `true`.
+        assert!(req.pkce_enabled.is_none());
+        assert!(req.map_groups_to_groups.is_none());
     }
 
     // -----------------------------------------------------------------------
