@@ -201,24 +201,12 @@ fn tee_upstream_to_cache(
         match put_result {
             Ok(result) => {
                 let now = Utc::now();
-                // Pin the storage backend's ETag at write time so the fast
-                // path can re-HEAD on each hit and detect tampering /
-                // backend-side replacement (#1051). Best-effort: if the
-                // backend errors on the HEAD or returns no ETag (e.g.
-                // filesystem) we fall back to `None`, which makes the
-                // freshness probe skip revalidation rather than fail the
-                // cache write.
-                let storage_etag = storage_clone
-                    .head_etag(&cache_key_for_writer)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::debug!(
-                            cache_key = %cache_key_for_writer,
-                            error = %e,
-                            "head_etag after put_stream failed; skipping fast-path revalidation pin"
-                        );
-                        None
-                    });
+                // Pin the storage backend's ETag at write time so the
+                // fast path can re-HEAD on each hit and detect tampering
+                // / backend-side replacement (#1051). See [`pin_storage_etag`]
+                // for the best-effort semantics on backends without an
+                // ETag concept or on transport error.
+                let storage_etag = pin_storage_etag(&storage_clone, &cache_key_for_writer).await;
                 let metadata = CacheMetadata {
                     cached_at: now,
                     upstream_etag: template.etag,
@@ -293,19 +281,12 @@ pub struct CacheMetadata {
     pub cached_at: DateTime<Utc>,
     /// ETag from upstream (if available)
     pub upstream_etag: Option<String>,
-    /// ETag the storage backend reported for the cached object at write
-    /// time, used by the fast-path integrity revalidation in
-    /// [`ProxyService::is_cache_fresh`] (#1051). On each fast-path hit we
-    /// re-HEAD the object and compare ETags; a mismatch means the object
-    /// was replaced or tampered with since we cached it, and we fall
-    /// through to the slow path (which recomputes the SHA-256 and
-    /// self-heals).
-    ///
-    /// `None` when the backend did not surface an ETag (filesystem,
-    /// older cache entries written before this field existed). In that
-    /// case revalidation is a no-op and the cache behaves as it did
-    /// pre-#1051. `#[serde(default)]` lets us load metadata sidecars
-    /// written by older builds without breaking the cache.
+    /// ETag pinned from the storage backend at cache-write time. See
+    /// [`ProxyService::is_cache_fresh`] for the revalidation contract,
+    /// per-backend behavior, and the legacy-entry fall-through. `None`
+    /// means revalidation is skipped (filesystem backend or legacy
+    /// sidecar written before this field existed); `#[serde(default)]`
+    /// preserves wire-compat with pre-#1051 sidecars.
     #[serde(default)]
     pub storage_etag: Option<String>,
     /// When the cache entry expires
@@ -331,6 +312,25 @@ struct RegistryTokenResponse {
     token: Option<String>,
     access_token: Option<String>,
     expires_in: Option<u64>,
+}
+
+/// Best-effort fetch of the backend's ETag for a freshly-written cache
+/// object, used by both the streaming-tee and buffered cache-write paths
+/// to pin [`CacheMetadata::storage_etag`] (#1051).
+///
+/// Returns `None` on either `Ok(None)` (backend has no ETag concept) or
+/// transport error; the caller then writes the sidecar without a pin and
+/// fast-path revalidation falls back to pre-#1051 existence-only
+/// semantics for that entry.
+async fn pin_storage_etag(storage: &StorageService, cache_key: &str) -> Option<String> {
+    storage.head_etag(cache_key).await.unwrap_or_else(|e| {
+        tracing::debug!(
+            cache_key = %cache_key,
+            error = %e,
+            "head_etag after cache write failed; skipping fast-path revalidation pin"
+        );
+        None
+    })
 }
 
 /// Proxy service for fetching and caching artifacts from upstream repositories
@@ -1394,16 +1394,10 @@ impl ProxyService {
 
         // Best-effort: capture the backend's ETag right after the PUT so
         // the fast path can re-HEAD on each hit and reject tampered or
-        // replaced objects. A failure here only disables revalidation for
-        // this entry; the cache write itself still succeeds.
-        let storage_etag = self.storage.head_etag(cache_key).await.unwrap_or_else(|e| {
-            tracing::debug!(
-                cache_key = %cache_key,
-                error = %e,
-                "head_etag after buffered put failed; skipping fast-path revalidation pin"
-            );
-            None
-        });
+        // replaced objects. See [`pin_storage_etag`] for the failure
+        // semantics; a failure here only disables revalidation for this
+        // entry, the cache write itself still succeeds.
+        let storage_etag = pin_storage_etag(&self.storage, cache_key).await;
 
         // Create metadata
         let now = Utc::now();
@@ -2998,21 +2992,24 @@ mod tests {
         head_etag_calls: AtomicUsize,
     }
 
-    /// What the mock's `head_etag` should return per call.
+    /// What the mock's `head_etag` should return per call. Variant
+    /// names deliberately avoid `None` / `Some` / `Err` so callsite
+    /// literals don't visually collide with the `Option`/`Result` the
+    /// trait method returns.
     enum HeadEtagBehavior {
         /// Return `Ok(None)`. Models backends that do not surface ETags
         /// (filesystem) or objects without one.
-        None,
+        Absent,
         /// Return `Ok(Some(value))`. Models S3/GCS/Azure happy path.
-        Some(String),
+        Present(String),
         /// Return `Err(AppError::Storage(...))`. Models a transport
         /// failure during revalidation.
-        Err,
+        Failed,
     }
 
     impl CacheFreshMock {
         fn new(metadata: Option<Bytes>, content_exists: bool) -> Self {
-            Self::with_head_etag(metadata, content_exists, HeadEtagBehavior::None)
+            Self::with_head_etag(metadata, content_exists, HeadEtagBehavior::Absent)
         }
 
         fn with_head_etag(
@@ -3062,9 +3059,9 @@ mod tests {
         async fn head_etag(&self, _key: &str) -> Result<Option<String>> {
             self.head_etag_calls.fetch_add(1, AtomicOrdering::SeqCst);
             match &self.head_etag_value {
-                HeadEtagBehavior::None => Ok(None),
-                HeadEtagBehavior::Some(v) => Ok(Some(v.clone())),
-                HeadEtagBehavior::Err => {
+                HeadEtagBehavior::Absent => Ok(None),
+                HeadEtagBehavior::Present(v) => Ok(Some(v.clone())),
+                HeadEtagBehavior::Failed => {
                     Err(AppError::Storage("mock head_etag failure".to_string()))
                 }
             }
@@ -3221,7 +3218,7 @@ mod tests {
                 "\"deadbeef\"".to_string(),
             ))),
             /* content_exists = */ true,
-            HeadEtagBehavior::Some("\"deadbeef\"".to_string()),
+            HeadEtagBehavior::Present("\"deadbeef\"".to_string()),
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
@@ -3257,7 +3254,7 @@ mod tests {
                 "\"pinned\"".to_string(),
             ))),
             /* content_exists = */ true,
-            HeadEtagBehavior::Some("\"different\"".to_string()),
+            HeadEtagBehavior::Present("\"different\"".to_string()),
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
@@ -3284,7 +3281,7 @@ mod tests {
                 "\"pinned\"".to_string(),
             ))),
             /* content_exists = */ true,
-            HeadEtagBehavior::None,
+            HeadEtagBehavior::Absent,
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
@@ -3305,7 +3302,7 @@ mod tests {
                 "\"pinned\"".to_string(),
             ))),
             /* content_exists = */ true,
-            HeadEtagBehavior::Err,
+            HeadEtagBehavior::Failed,
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
@@ -3327,7 +3324,7 @@ mod tests {
             /* content_exists = */ true,
             // Even if backend would surface an ETag, the absence of a pin
             // means revalidation is skipped entirely.
-            HeadEtagBehavior::Some("\"would-be-current\"".to_string()),
+            HeadEtagBehavior::Present("\"would-be-current\"".to_string()),
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
@@ -3356,7 +3353,7 @@ mod tests {
         let mock = Arc::new(CacheFreshMock::with_head_etag(
             Some(fresh_metadata_bytes_with_storage_etag(None)),
             /* content_exists = */ false,
-            HeadEtagBehavior::None,
+            HeadEtagBehavior::Absent,
         ));
         let service = build_proxy_service_with_storage(mock.clone());
 
